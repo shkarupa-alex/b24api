@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools >= 75"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "api24"
+version = "0.1.0"
+description = "Bitrix24 API"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "deepmerge>=2.0",
+    "fast-depends>=2.4.12",
+    "httpx[http2]>=0.28.1",
+    "mypy>=1.15.0",
+    "pydantic>=2.10.6",
+    "pydantic-settings>=2.8.1",
+    "pytest-httpx>=0.35.0",
+    "pytest-mock>=3.14.0",
+    "retry>=0.9.2",
+    "ruff>=0.9.9",
+]
+
+
+[tool.ruff]
+fix = true
+unsafe-fixes = true
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["EM", "TRY003", "D1", "FA"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+no-lines-before = ["standard-library"]
+known-third-party = []
+
+[tool.ruff.lint.extend-per-file-ignores]
+"*_test.py" = ["S101", "S311"]
+
+
+[tool.mypy]
+strict = true
+
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers"]
+xfail_strict = true
+
+
+[tool.coverage.report]
+exclude_also = ["if typing.TYPE_CHECKING:"]
