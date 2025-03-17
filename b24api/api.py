@@ -8,14 +8,14 @@ from fast_depends import inject
 from pydantic import ValidationError
 from retry.api import retry_call
 
-from api24.entity import ApiTypes, BatchResult, ErrorResponse, ListRequest, Request, ResultResponse
-from api24.error import RetryApiResponseError, RetryHTTPStatusError
-from api24.future import batched
-from api24.http import HttpxClient
-from api24.settings import ApiSettings
+from b24api.entity import ApiTypes, BatchResult, ErrorResponse, ListRequest, Request, ResultResponse
+from b24api.error import RetryApiResponseError, RetryHTTPStatusError
+from b24api.future import batched
+from b24api.http import HttpxClient
+from b24api.settings import ApiSettings
 
 
-class API:
+class Bitrix24:
     @inject
     def __init__(self, client: HttpxClient, settings: ApiSettings) -> None:
         self.client = client

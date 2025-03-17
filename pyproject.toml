@@ -4,25 +4,27 @@ build-backend = "setuptools.build_meta"
 
 
 [project]
-name = "api24"
-version = "0.1.0"
+name = "b24api"
+version = "0.1.1"
 description = "Bitrix24 API"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "deepmerge>=2.0",
     "fast-depends>=2.4.12",
     "httpx[http2]>=0.28.1",
-    "mypy>=1.15.0",
     "pydantic>=2.10.6",
     "pydantic-settings>=2.8.1",
+    "retry>=0.9.2",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15.0",
     "pytest-env>=1.1.5",
     "pytest-httpx>=0.35.0",
     "pytest-mock>=3.14.0",
-    "retry>=0.9.2",
     "ruff>=0.9.9",
 ]
-
 
 [tool.ruff]
 fix = true

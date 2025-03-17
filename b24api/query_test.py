@@ -1,6 +1,6 @@
 import unittest
 
-from api24.query import build_query
+from b24api.query import build_query
 
 
 class TestBuildQuery(unittest.TestCase):
