@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 
 [project]
-name = "api24"
+name = "b24api"
 version = "0.1.0"
 description = "Bitrix24 API"
 readme = "README.md"

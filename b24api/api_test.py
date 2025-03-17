@@ -5,9 +5,9 @@ import pytest
 from pytest_httpx import HTTPXMock
 from pytest_mock import MockerFixture
 
-from api24.api import API
-from api24.entity import ListRequest, ListRequestParameters, Request
-from api24.error import ApiResponseError, RetryHTTPStatusError
+from b24api.api import Bitrix24
+from b24api.entity import ListRequest, ListRequestParameters, Request
+from b24api.error import ApiResponseError, RetryHTTPStatusError
 
 
 def test_call(httpx_mock: HTTPXMock) -> None:
@@ -23,7 +23,7 @@ def test_call(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = API(tmp=123)
+    api = Bitrix24(tmp=123)
     response = api.call(Request(method="profile"))
     assert response == result
 
@@ -43,7 +43,7 @@ def test_call_list(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = API()
+    api = Bitrix24()
     response = api.call(Request(method="crm.lead.list", parameters={"select": ["ID", "STATUS_ID"]}))
     assert response == result
 
@@ -58,7 +58,7 @@ def test_call_status_error(httpx_mock: HTTPXMock) -> None:
         content=b"",
     )
 
-    api = API()
+    api = Bitrix24()
     with pytest.raises(httpx.HTTPStatusError):
         api.call(Request(method="profile"))
 
@@ -75,7 +75,7 @@ def test_call_retry_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
     )
     sleep_mock = mocker.patch("time.sleep")
 
-    api = API()
+    api = Bitrix24()
     with pytest.raises(RetryHTTPStatusError):
         api.call(Request(method="profile"))
 
@@ -95,7 +95,7 @@ def test_call_api_error(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = API()
+    api = Bitrix24()
     with pytest.raises(ApiResponseError):
         api.call(Request(method="profile"))
 
@@ -130,7 +130,7 @@ def test_batch(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = API()
+    api = Bitrix24()
     response = api.batch(
         [
             Request(method="profile"),
@@ -166,7 +166,7 @@ def test_batch_halt_on_error(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = API()
+    api = Bitrix24()
     with pytest.raises(ApiResponseError):
         list(
             api.batch(
@@ -196,7 +196,7 @@ def test_list_sequential(httpx_mock: HTTPXMock, total_items: int, list_size: int
             | ({} if start + list_size >= total_items else {"next": start + list_size}),
         )
 
-    api = API()
+    api = Bitrix24()
     response = api.list_sequential(
         Request(method="crm.lead.list"),
         list_size=list_size,
@@ -247,7 +247,7 @@ def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: int, b
             },
         )
 
-    api = API()
+    api = Bitrix24()
     response = api.list_batched(
         Request(method="crm.lead.list"),
         list_size=list_size,
@@ -336,7 +336,7 @@ def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, list_siz
             },
         )
 
-    api = API()
+    api = Bitrix24()
     response = api.list_batched_no_count(
         ListRequest(
             method="crm.lead.list",

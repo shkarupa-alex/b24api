@@ -1,7 +1,7 @@
 from datetime import datetime
 from urllib.parse import quote_plus
 
-from api24.type import ApiTypes
+from b24api.type import ApiTypes
 
 
 def build_query(parameters: dict[int | str, ApiTypes], convention: str = "%s") -> str:

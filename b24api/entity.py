@@ -3,9 +3,9 @@ from typing import Self
 
 from pydantic import BaseModel
 
-from api24.error import ApiResponseError, RetryApiResponseError
-from api24.query import build_query
-from api24.type import ApiTypes
+from b24api.error import ApiResponseError, RetryApiResponseError
+from b24api.query import build_query
+from b24api.type import ApiTypes
 
 
 class Request(BaseModel):
