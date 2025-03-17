@@ -16,6 +16,7 @@ dependencies = [
     "mypy>=1.15.0",
     "pydantic>=2.10.6",
     "pydantic-settings>=2.8.1",
+    "pytest-env>=1.1.5",
     "pytest-httpx>=0.35.0",
     "pytest-mock>=3.14.0",
     "retry>=0.9.2",
@@ -54,6 +55,9 @@ strict = true
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers"]
 xfail_strict = true
+
+[tool.pytest_env]
+BITRIX_24_API_WEBHOOK_URL = "https://bitrix24.com/rest/0/test/"
 
 
 [tool.coverage.report]

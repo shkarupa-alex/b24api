@@ -1,3 +1,7 @@
+from collections.abc import Generator
+from typing import Annotated
+
+from fast_depends import Depends
 from httpx import codes
 from pydantic import HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -10,7 +14,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    web_hook_url: HttpUrl
+    webhook_url: HttpUrl
 
     retry_statuses: list[int] = (
         codes.LOCKED,
@@ -27,5 +31,13 @@ class Settings(BaseSettings):
     retry_delay: float = 5
     retry_backoff: float = 2
 
-    batch_size: int = 50
     list_size: int = 50
+    batch_size: int = 50
+
+
+def api_settings() -> Generator[Settings, None, None]:
+    settings = Settings()
+    yield settings
+
+
+ApiSettings = Annotated[Settings, Depends(api_settings)]

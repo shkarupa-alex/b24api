@@ -1,21 +1,21 @@
 from datetime import datetime
 from typing import Self
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel
 
 from api24.error import ApiResponseError, RetryApiResponseError
 from api24.query import build_query
-from api24.type import BaseType
+from api24.type import ApiTypes
 
 
 class Request(BaseModel):
     """Common request structure."""
 
     method: str
-    parameters: dict[str, BaseType] = {}
+    parameters: dict[str, ApiTypes] = {}
 
     @property
-    def flat(self) -> str:
+    def query(self) -> str:
         if not self.parameters:
             return self.method
 
@@ -31,7 +31,7 @@ class ListRequestParameters(BaseModel):
     """Parameters of `*.list` requests."""
 
     select: list[str]
-    filter: dict[str, BaseType] | None = None
+    filter: dict[str, ApiTypes] | None = None
     order: dict[str, str] | None = None
     limit: int | None = None
     start: int | None = None
@@ -41,6 +41,24 @@ class ListRequest(Request):
     """List request structure."""
 
     parameters: ListRequestParameters = None
+
+
+class ErrorResponse(BaseModel):
+    """API error response."""
+
+    error: str
+    error_description: str | None = None
+
+    def raise_error(self, retry_errors: list[str]) -> Self:
+        if self.error in retry_errors:
+            raise RetryApiResponseError(
+                code=self.error,
+                description=self.error_description,
+            )
+        raise ApiResponseError(
+            code=self.error,
+            description=self.error_description,
+        )
 
 
 class ResponseTime(BaseModel):
@@ -56,36 +74,17 @@ class ResponseTime(BaseModel):
     operating: float
 
 
-class ErrorResponse(BaseModel):
-    """API error response."""
-
-    error: str
-    error_description: str | None = None
-
-    @model_validator(mode="after")
-    def raise_after_create(self) -> Self:
-        if self.error in {"query_limit_exceeded", "operation_time_limit"}:
-            raise RetryApiResponseError(
-                code=self.error,
-                description=self.error_description,
-            )
-        raise ApiResponseError(
-            code=self.error,
-            description=self.error_description,
-        )
-
-
 class ResultResponse(BaseModel):
     """API data response."""
 
-    result: BaseType
+    result: ApiTypes
     time: ResponseTime
     total: int | None = None
     next: int | None = None
 
 
-class ResultBatch(BaseModel):
-    result: dict[str, BaseType]
+class BatchResult(BaseModel):
+    result: dict[str, ApiTypes]
     result_time: dict[str, ResponseTime]
     result_error: dict[str, ErrorResponse]
     result_total: dict[str, int]

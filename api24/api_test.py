@@ -23,7 +23,7 @@ def test_call(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = API("https://bitrix24.com/rest/0/test/")
+    api = API(tmp=123)
     response = api.call(Request(method="profile"))
     assert response == result
 
@@ -43,7 +43,7 @@ def test_call_list(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = API("https://bitrix24.com/rest/0/test/")
+    api = API()
     response = api.call(Request(method="crm.lead.list", parameters={"select": ["ID", "STATUS_ID"]}))
     assert response == result
 
@@ -58,7 +58,7 @@ def test_call_status_error(httpx_mock: HTTPXMock) -> None:
         content=b"",
     )
 
-    api = API("https://bitrix24.com/rest/0/test/")
+    api = API()
     with pytest.raises(httpx.HTTPStatusError):
         api.call(Request(method="profile"))
 
@@ -75,7 +75,7 @@ def test_call_retry_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
     )
     sleep_mock = mocker.patch("time.sleep")
 
-    api = API("https://bitrix24.com/rest/0/test/")
+    api = API()
     with pytest.raises(RetryHTTPStatusError):
         api.call(Request(method="profile"))
 
@@ -95,7 +95,7 @@ def test_call_api_error(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = API("https://bitrix24.com/rest/0/test/")
+    api = API()
     with pytest.raises(ApiResponseError):
         api.call(Request(method="profile"))
 
@@ -130,7 +130,7 @@ def test_batch(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = API("https://bitrix24.com/rest/0/test/")
+    api = API()
     response = api.batch(
         [
             Request(method="profile"),
@@ -166,7 +166,7 @@ def test_batch_halt_on_error(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = API("https://bitrix24.com/rest/0/test/")
+    api = API()
     with pytest.raises(ApiResponseError):
         list(
             api.batch(
@@ -179,36 +179,36 @@ def test_batch_halt_on_error(httpx_mock: HTTPXMock) -> None:
         )
 
 
-@pytest.mark.parametrize(("total_items", "chunk_size"), [(150, 50), (155, 50), (10, 50), (45, 20)])
-def test_list_sequential(httpx_mock: HTTPXMock, total_items: int, chunk_size: int) -> None:
+@pytest.mark.parametrize(("total_items", "list_size"), [(150, 50), (155, 50), (10, 50), (45, 20)])
+def test_list_sequential(httpx_mock: HTTPXMock, total_items: int, list_size: int) -> None:
     result = [{"ID": str(i), "STATUS_ID": "1"} for i in range(total_items)]
-    for start in range(0, total_items, chunk_size):
+    for start in range(0, total_items, list_size):
         httpx_mock.add_response(
             method="POST",
             url="https://bitrix24.com/rest/0/test/crm.lead.list",
             match_headers={"Content-Type": "application/json"},
             match_json={} if start == 0 else {"start": start},
             json={
-                "result": result[start : start + chunk_size],
+                "result": result[start : start + list_size],
                 "total": total_items,
                 "time": _DEFAULT_TIME,
             }
-            | ({} if start + chunk_size >= total_items else {"next": start + chunk_size}),
+            | ({} if start + list_size >= total_items else {"next": start + list_size}),
         )
 
-    api = API("https://bitrix24.com/rest/0/test/")
+    api = API()
     response = api.list_sequential(
         Request(method="crm.lead.list"),
-        chunk_size=chunk_size,
+        list_size=list_size,
     )
     assert list(response) == result
 
 
 @pytest.mark.parametrize(
-    ("total_items", "chunk_size", "batch_size"),
+    ("total_items", "list_size", "batch_size"),
     [(150, 50, 1), (155, 50, 1), (10, 50, 50), (5500, 50, 50)],
 )
-def test_list_batched(httpx_mock: HTTPXMock, total_items: int, chunk_size: int, batch_size: int) -> None:
+def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: int, batch_size: int) -> None:
     result = [{"ID": str(i), "STATUS_ID": "1"} for i in range(total_items)]
     httpx_mock.add_response(
         method="POST",
@@ -216,18 +216,18 @@ def test_list_batched(httpx_mock: HTTPXMock, total_items: int, chunk_size: int, 
         match_headers={"Content-Type": "application/json"},
         match_json={},
         json={
-            "result": result[:chunk_size],
+            "result": result[:list_size],
             "total": total_items,
             "time": _DEFAULT_TIME,
         },
     )
-    for batch_start in range(chunk_size, total_items, chunk_size * batch_size):
+    for batch_start in range(list_size, total_items, list_size * batch_size):
         max_chunks = math.ceil((total_items - batch_start) / batch_size)
         commands, results, times = {}, {}, {}
         for chunk in range(min(batch_size, max_chunks)):
-            start = batch_start + chunk * chunk_size
+            start = batch_start + chunk * list_size
             commands[f"_{chunk}"] = f"crm.lead.list?start={start}"
-            results[f"_{chunk}"] = result[start : start + chunk_size]
+            results[f"_{chunk}"] = result[start : start + list_size]
             times[f"_{chunk}"] = _DEFAULT_TIME
         httpx_mock.add_response(
             method="POST",
@@ -247,20 +247,20 @@ def test_list_batched(httpx_mock: HTTPXMock, total_items: int, chunk_size: int, 
             },
         )
 
-    api = API("https://bitrix24.com/rest/0/test/")
+    api = API()
     response = api.list_batched(
         Request(method="crm.lead.list"),
-        chunk_size=chunk_size,
+        list_size=list_size,
         batch_size=batch_size,
     )
     assert list(response) == result
 
 
 @pytest.mark.parametrize(
-    ("total_items", "chunk_size", "batch_size"),
+    ("total_items", "list_size", "batch_size"),
     [(150, 50, 1), (155, 50, 1), (10, 50, 50), (5500, 50, 50)],
 )
-def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, chunk_size: int, batch_size: int) -> None:
+def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, list_size: int, batch_size: int) -> None:
     result = [{"ID": str(i), "STATUS_ID": "1"} for i in range(total_items)]
     httpx_mock.add_response(
         method="POST",
@@ -286,8 +286,8 @@ def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, chunk_si
         json={
             "result": {
                 "result": {
-                    "_0": result[:chunk_size],
-                    "_1": result[-chunk_size:][::-1],
+                    "_0": result[:list_size],
+                    "_1": result[-list_size:][::-1],
                 },
                 "result_error": [],
                 "result_total": [],
@@ -297,12 +297,12 @@ def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, chunk_si
             "time": _DEFAULT_TIME,
         },
     )
-    for batch_start in range(chunk_size, total_items - chunk_size, chunk_size * batch_size):
-        max_chunks = math.ceil((total_items - batch_start - chunk_size) / batch_size)
+    for batch_start in range(list_size, total_items - list_size, list_size * batch_size):
+        max_chunks = math.ceil((total_items - batch_start - list_size) / batch_size)
         commands, results, times = {}, {}, {}
         for chunk in range(min(batch_size, max_chunks)):
-            start = batch_start + chunk * chunk_size
-            stop = min(start + chunk_size, total_items - chunk_size)
+            start = batch_start + chunk * list_size
+            stop = min(start + list_size, total_items - list_size)
             commands[f"_{chunk}"] = (
                 "crm.lead.list"
                 "?select%5B0%5D=ID"
@@ -310,7 +310,7 @@ def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, chunk_si
                 "&filter%5B%3EDATE%5D=2025-03-14T14%3A00%3A17%2B03%3A00"
                 f"&filter%5B%3E%3DID%5D={start}"
                 f"&filter%5B%3CID%5D={stop}"
-                "&order%5BID%5D=DESC"
+                "&order%5BID%5D=ASC"
                 "&start=-1"
             )
             results[f"_{chunk}"] = result[start:stop]
@@ -336,13 +336,13 @@ def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, chunk_si
             },
         )
 
-    api = API("https://bitrix24.com/rest/0/test/")
+    api = API()
     response = api.list_batched_no_count(
         ListRequest(
             method="crm.lead.list",
             parameters=ListRequestParameters(select=["ID", "STATUS_ID"], filter={">DATE": "2025-03-14T14:00:17+03:00"}),
         ),
-        chunk_size=chunk_size,
+        list_size=list_size,
         batch_size=batch_size,
     )
     assert list(response) == result

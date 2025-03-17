@@ -1,54 +1,51 @@
 import contextlib
 from collections.abc import Generator, Iterable
-from itertools import batched, chain
+from itertools import chain
 from operator import itemgetter
 
 import httpx
+from fast_depends import inject
 from pydantic import ValidationError
-from retry import retry
+from retry.api import retry_call
 
-from api24.entity import BaseType, ErrorResponse, ListRequest, Request, ResultBatch, ResultResponse
+from api24.entity import ApiTypes, BatchResult, ErrorResponse, ListRequest, Request, ResultResponse
 from api24.error import RetryApiResponseError, RetryHTTPStatusError
+from api24.future import batched
+from api24.http import HttpxClient
+from api24.settings import ApiSettings
 
 
 class API:
-    RETRY_STATUS_CODES: tuple[int] = (
-        httpx.codes.LOCKED,
-        httpx.codes.TOO_EARLY,
-        httpx.codes.TOO_MANY_REQUESTS,
-        httpx.codes.INTERNAL_SERVER_ERROR,
-        httpx.codes.BAD_GATEWAY,
-        httpx.codes.SERVICE_UNAVAILABLE,
-        httpx.codes.INSUFFICIENT_STORAGE,
-    )
-    RETRY_ERROR_CODES: tuple[str] = ("query_limit_exceeded", "operation_time_limit")
-    MAX_BATCH_SIZE: int = 50
-    MAX_CHUNK_SIZE: int = 50
+    @inject
+    def __init__(self, client: HttpxClient, settings: ApiSettings) -> None:
+        self.client = client
+        self.settings = settings
 
-    def __init__(self, webhook: str) -> None:
-        self.webhook = webhook
-        self.httpx = httpx.Client(http2=True)
-
-    @retry(RetryApiResponseError, tries=5, delay=5, backoff=2)
-    def call(self, request: Request) -> BaseType:
-        """Call any method and return just `result` value."""
-        response = self._call(request)
+    def call(self, request: Request) -> ApiTypes:
+        """Call any method (with retries) and return just `result`."""
+        response = retry_call(
+            self._call,
+            fargs=[request],
+            exceptions=(RetryHTTPStatusError, RetryApiResponseError),
+            tries=self.settings.retry_tries,
+            delay=self.settings.retry_delay,
+            backoff=self.settings.retry_backoff,
+        )
 
         return response.result
 
-    @retry(RetryHTTPStatusError, tries=5, delay=5, backoff=2)
     def _call(self, request: Request) -> ResultResponse:
-        """Call any method (with retries) and return full response."""
-        http_response = self.httpx.post(
-            f"{self.webhook}{request.method}",
+        """Call any method and return full response."""
+        http_response = self.client.post(
+            f"{self.settings.webhook_url}{request.method}",
             headers={"Content-Type": "application/json"},
-            json=request.parameters,
+            json=request.model_dump()["parameters"],
         )
 
         try:
             json_response = http_response.raise_for_status().json()
         except httpx.HTTPStatusError as error:
-            if http_response.status_code in self.RETRY_STATUS_CODES:
+            if http_response.status_code in self.settings.retry_statuses:
                 raise RetryHTTPStatusError(
                     str(error),
                     request=error.request,
@@ -57,18 +54,20 @@ class API:
             raise
 
         with contextlib.suppress(ValidationError):
-            ErrorResponse.model_validate(json_response)
+            ErrorResponse.model_validate(json_response).raise_error(self.settings.retry_errors)
 
         return ResultResponse.model_validate(json_response)
 
     def batch(
         self,
         requests: Iterable[Request],
-        batch_size: int = MAX_BATCH_SIZE,
-    ) -> Generator[BaseType, None, None]:
-        """Call sequence of methods within batches and return just `result`s."""
-        for requests_batch in batched(requests, batch_size):
-            for response in self._batch(requests_batch):
+        batch_size: int | None = None,
+    ) -> Generator[ApiTypes, None, None]:
+        """Call infinite sequence of methods within batches and return just `result`s."""
+        batch_size = batch_size or self.settings.batch_size
+
+        for batched_requests in batched(requests, batch_size):
+            for response in self._batch(batched_requests):
                 yield response.result
 
     def _batch(self, requests: Iterable[Request]) -> Generator[ResultResponse, None, None]:
@@ -78,33 +77,32 @@ class API:
             method="batch",
             parameters={
                 "halt": True,
-                "cmd": {key: request.flat for key, request in commands.items()},
+                "cmd": {key: request.query for key, request in commands.items()},
             },
         )
 
         result = self.call(request)
+
         for fix_key in ["result_error", "result_total", "result_next"]:
             if isinstance(result[fix_key], list) and not result[fix_key]:
                 result[fix_key] = dict(result[fix_key])
-        result = ResultBatch.model_validate(result)
+
+        result = BatchResult.model_validate(result)
 
         for i in range(len(commands)):
             key = f"_{i}"
 
             if key in result.result_error:
-                error = result.result_error[key]
-                ErrorResponse(error=error.error, error_description=error.error_description)
+                ErrorResponse.model_validate(result.result_error[key]).raise_error(self.settings.retry_errors)
 
             command = commands[key]
             if key not in result.result:
                 raise ValueError(
-                    f"Expecting batch `result.result` to contain result for command {{`{key}`: {command}}}. "
-                    f"Got: {result}",
+                    f"Expecting `result` to contain result for command {{`{key}`: {command}}}. Got: {result}",
                 )
             if key not in result.result_time:
                 raise ValueError(
-                    f"Expecting batch `result.result_time` to contain result for command {{`{key}`: {command}}}. "
-                    f"Got: {result}",
+                    f"Expecting `result_time` to contain result for command {{`{key}`: {command}}}. Got: {result}",
                 )
 
             yield ResultResponse(
@@ -117,50 +115,57 @@ class API:
     def list_sequential(
         self,
         head_request: Request,
-        chunk_size: int = MAX_CHUNK_SIZE,
-    ) -> Generator[BaseType, None, None]:
-        """Call `list` method and return just `result`.
+        list_size: int | None = None,
+    ) -> Generator[ApiTypes, None, None]:
+        """Call `list` method and return full `result`.
 
-        Slow (sequential tail) fallback for methods without `filter` parameter (e.g. `department.get`).
+        Slow (sequential tail) list gathering for methods without `filter` parameter (e.g. `department.get`).
         """
+        list_size = list_size or self.settings.list_size
+
         head_response = self._call(head_request)
         yield from self._normalize_list(head_response.result)
 
-        if head_response.next and head_response.next != chunk_size:
-            raise ValueError(f"Expecting chunk size to be {chunk_size}. Got: {head_response.next}")
+        if head_response.next and head_response.next != list_size:
+            raise ValueError(f"Expecting list chunk size to be {list_size}. Got: {head_response.next}")
 
         total = head_response.total or 0
-        for start in range(chunk_size, total, chunk_size):
+        for start in range(list_size, total, list_size):
             tail_request = head_request.model_copy(deep=True)
             tail_request.parameters |= {"start": start}
             tail_response = self._call(tail_request)
 
-            if tail_response.next and tail_response.next != start + chunk_size:
-                raise ValueError(f"Expecting next chunk to start at {start + chunk_size}. Got: {tail_response.next}")
+            if tail_response.next and tail_response.next != start + list_size:
+                raise ValueError(
+                    f"Expecting next list chunk to start at {start + list_size}. Got: {tail_response.next}",
+                )
 
             yield from self._normalize_list(tail_response.result)
 
     def list_batched(
         self,
         head_request: Request,
-        chunk_size: int = MAX_CHUNK_SIZE,
-        batch_size: int = MAX_BATCH_SIZE,
-    ) -> Generator[BaseType, None, None]:
-        """Call `list` method and return just `result`.
+        list_size: int | None = None,
+        batch_size: int | None = None,
+    ) -> Generator[ApiTypes, None, None]:
+        """Call `list` method and return full `result`.
 
         Faster (batched tail) list gathering for methods without `filter` parameter (e.g. `department.get`).
         """
+        list_size = list_size or self.settings.list_size
+        batch_size = batch_size or self.settings.batch_size
+
         head_response = self._call(head_request)
         yield from self._normalize_list(head_response.result)
 
-        if head_response.next and head_response.next != chunk_size:
-            raise ValueError(f"Expecting chunk size to be {chunk_size}. Got: {head_response.next}")
+        if head_response.next and head_response.next != list_size:
+            raise ValueError(f"Expecting chunk size to be {list_size}. Got: {head_response.next}")
 
         def _tail_requests() -> Generator[Request, None, None]:
             total = head_response.total or 0
-            for start in range(chunk_size, total, chunk_size):
+            for start in range(list_size, total, list_size):
                 tail_request = head_request.model_copy(deep=True)
-                tail_request.parameters = (tail_request.parameters or {}) | {"start": start}
+                tail_request.parameters |= {"start": start}
                 yield tail_request
 
         tail_responses = self.batch(_tail_requests(), batch_size)
@@ -173,9 +178,16 @@ class API:
         self,
         request: ListRequest,
         id_key: str = "ID",
-        chunk_size: int = MAX_CHUNK_SIZE,
-        batch_size: int = MAX_BATCH_SIZE,
-    ) -> Generator[BaseType, None, None]:
+        list_size: int | None = None,
+        batch_size: int | None = None,
+    ) -> Generator[ApiTypes, None, None]:
+        """Call `list` method and return full `result`.
+
+        Fastest (batched, no count) list gathering for methods with `filter` parameter (e.g. `crm.lead.list`).
+        """
+        list_size = list_size or self.settings.list_size
+        batch_size = batch_size or self.settings.batch_size
+
         select_ = request.parameters.select
         if "*" not in select_ and id_key not in select_:
             request.select.append(id_key)
@@ -184,10 +196,12 @@ class API:
 
         filter_ = request.parameters.filter
         if filter_ and (id_from in filter_ or id_to in filter_):
-            raise ValueError(f"Fast list gathering reserves `{id_from}` and `{id_to}` filters.")
+            raise ValueError(
+                f"Filter parameters `{id_from}` and `{id_to}` are reserved in `list_batched_no_count`",
+            )
 
         if request.parameters.order:
-            raise ValueError("Fast list gathering reserves `order` parameter.")
+            raise ValueError("Ordering parameters are reserved `order`in `list_batched_no_count`")
 
         head_request = request.model_copy(deep=True)
         head_request.parameters.start = -1
@@ -209,12 +223,12 @@ class API:
         if max_head < min_tail:
 
             def _body_requests() -> Generator[Request, None, None]:
-                for start in range(max_head + 1, min_tail, chunk_size):
+                for start in range(max_head + 1, min_tail, list_size):
                     body_request = request.model_copy(deep=True)
                     body_request.parameters.start = -1
                     body_request.parameters.filter[id_from] = start
-                    body_request.parameters.filter[id_to] = min(start + chunk_size, min_tail)
-                    body_request.parameters.order = {"ID": "DESC"}
+                    body_request.parameters.filter[id_to] = min(start + list_size, min_tail)
+                    body_request.parameters.order = {"ID": "ASC"}
                     yield body_request
 
             body = self.batch(_body_requests(), batch_size)
@@ -228,12 +242,12 @@ class API:
                 yield item
 
     @staticmethod
-    def _normalize_list(result: list | dict) -> list:
-        """Normalize `list` method result to list of items structure.
+    def _normalize_list(result: list | dict[str, list]) -> list:
+        """Normalize `list` method result to `list of items` structure.
 
         There are two kinds of what `list` method `result` may contain:
         - a list of items (e.g. `department-get` and `disk.folder.getchildren`),
-        - a dictionary with single item that contains desired list of items
+        - a dictionary with single item that contains the desired list of items
             (e.g. `tasks` in `tasks.task.list`).
         """
         if not isinstance(result, list | dict):

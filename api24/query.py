@@ -1,10 +1,10 @@
 from datetime import datetime
 from urllib.parse import quote_plus
 
-from api24.type import BaseType
+from api24.type import ApiTypes
 
 
-def build_query(parameters: dict[int | str, BaseType], convention: str = "%s") -> str:
+def build_query(parameters: dict[int | str, ApiTypes], convention: str = "%s") -> str:
     query = []
 
     if parameters is None:
