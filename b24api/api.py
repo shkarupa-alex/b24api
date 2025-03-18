@@ -1,17 +1,18 @@
 import contextlib
+import logging
 from collections.abc import Generator, Iterable
-from itertools import chain
+from itertools import chain, islice
 from operator import itemgetter
 
 import httpx
 from fast_depends import inject
 from pydantic import ValidationError
-from retry.api import retry_call
+from retry import retry
 
-from b24api.entity import ApiTypes, BatchResult, ErrorResponse, ListRequest, Request, ResultResponse
+from b24api.entity import ApiTypes, BatchResult, ErrorResponse, ListRequest, Request, Response
 from b24api.error import RetryApiResponseError, RetryHTTPStatusError
 from b24api.future import batched
-from b24api.http import HttpxClient
+from b24api.httpx import HttpxClient
 from b24api.settings import ApiSettings
 
 
@@ -20,22 +21,25 @@ class Bitrix24:
     def __init__(self, client: HttpxClient, settings: ApiSettings) -> None:
         self.client = client
         self.settings = settings
-
-    def call(self, request: Request) -> ApiTypes:
-        """Call any method (with retries) and return just `result`."""
-        response = retry_call(
-            self._call,
-            fargs=[request],
+        self.logger = logging.getLogger(__name__)
+        self._call_retry = retry(
             exceptions=(RetryHTTPStatusError, RetryApiResponseError),
             tries=self.settings.retry_tries,
             delay=self.settings.retry_delay,
             backoff=self.settings.retry_backoff,
-        )
+            logger=self.logger,
+        )(self._call)
+
+    def call(self, request: Request) -> ApiTypes:
+        """Call any method (with retries) and return just `result`."""
+        response = self._call_retry(request)
 
         return response.result
 
-    def _call(self, request: Request) -> ResultResponse:
+    def _call(self, request: Request) -> Response:
         """Call any method and return full response."""
+        self.logger.debug("Sending request", extra={"request": request})
+
         http_response = self.client.post(
             f"{self.settings.webhook_url}{request.method}",
             headers={"Content-Type": "application/json"},
@@ -56,7 +60,20 @@ class Bitrix24:
         with contextlib.suppress(ValidationError):
             ErrorResponse.model_validate(json_response).raise_error(self.settings.retry_errors)
 
-        return ResultResponse.model_validate(json_response)
+        response = Response.model_validate(json_response)
+
+        self.logger.debug("Received response", extra={"request": request, "response": response})
+        self.logger.info(
+            "Received response",
+            extra={
+                "method": request.method,
+                "duration": response.time.duration,
+                "processing": response.time.processing,
+                "operating": response.time.operating,
+            },
+        )
+
+        return response
 
     def batch(
         self,
@@ -70,7 +87,7 @@ class Bitrix24:
             for response in self._batch(batched_requests):
                 yield response.result
 
-    def _batch(self, requests: Iterable[Request]) -> Generator[ResultResponse, None, None]:
+    def _batch(self, requests: Iterable[Request]) -> Generator[Response, None, None]:
         """Call batch of methods and return full responses."""
         commands = {f"_{i}": request for i, request in enumerate(requests)}
         request = Request(
@@ -105,7 +122,7 @@ class Bitrix24:
                     f"Expecting `result_time` to contain result for command {{`{key}`: {command}}}. Got: {result}",
                 )
 
-            yield ResultResponse(
+            yield Response(
                 result=result.result[key],
                 time=result.result_time[key],
                 total=result.result_total.get(key, None),
@@ -114,7 +131,7 @@ class Bitrix24:
 
     def list_sequential(
         self,
-        head_request: Request,
+        request: Request,
         list_size: int | None = None,
     ) -> Generator[ApiTypes, None, None]:
         """Call `list` method and return full `result`.
@@ -123,8 +140,11 @@ class Bitrix24:
         """
         list_size = list_size or self.settings.list_size
 
-        head_response = self._call(head_request)
-        yield from self._normalize_list(head_response.result)
+        head_request = request.model_copy(deep=True)
+        head_request.parameters["start"] = 0
+
+        head_response = self._call_retry(head_request)
+        yield from self._fix_list_result(head_response.result)
 
         if head_response.next and head_response.next != list_size:
             raise ValueError(f"Expecting list chunk size to be {list_size}. Got: {head_response.next}")
@@ -132,19 +152,18 @@ class Bitrix24:
         total = head_response.total or 0
         for start in range(list_size, total, list_size):
             tail_request = head_request.model_copy(deep=True)
-            tail_request.parameters |= {"start": start}
-            tail_response = self._call(tail_request)
+            tail_request.parameters["start"] = start
+            tail_response = self._call_retry(tail_request)
 
             if tail_response.next and tail_response.next != start + list_size:
                 raise ValueError(
                     f"Expecting next list chunk to start at {start + list_size}. Got: {tail_response.next}",
                 )
-
-            yield from self._normalize_list(tail_response.result)
+            yield from self._fix_list_result(tail_response.result)
 
     def list_batched(
         self,
-        head_request: Request,
+        request: Request,
         list_size: int | None = None,
         batch_size: int | None = None,
     ) -> Generator[ApiTypes, None, None]:
@@ -155,8 +174,11 @@ class Bitrix24:
         list_size = list_size or self.settings.list_size
         batch_size = batch_size or self.settings.batch_size
 
-        head_response = self._call(head_request)
-        yield from self._normalize_list(head_response.result)
+        head_request = request.model_copy(deep=True)
+        head_request.parameters["start"] = 0
+
+        head_response = self._call_retry(head_request)
+        yield from self._fix_list_result(head_response.result)
 
         if head_response.next and head_response.next != list_size:
             raise ValueError(f"Expecting chunk size to be {list_size}. Got: {head_response.next}")
@@ -165,13 +187,12 @@ class Bitrix24:
             total = head_response.total or 0
             for start in range(list_size, total, list_size):
                 tail_request = head_request.model_copy(deep=True)
-                tail_request.parameters |= {"start": start}
+                tail_request.parameters["start"] = start
                 yield tail_request
 
         tail_responses = self.batch(_tail_requests(), batch_size)
-        tail_responses = map(self._normalize_list, tail_responses)
+        tail_responses = map(self._fix_list_result, tail_responses)
         tail_responses = chain.from_iterable(tail_responses)
-
         yield from tail_responses
 
     def list_batched_no_count(
@@ -192,7 +213,7 @@ class Bitrix24:
         if "*" not in select_ and id_key not in select_:
             request.select.append(id_key)
 
-        id_from, id_to = f">={id_key}", f"<{id_key}"
+        id_from, id_to = f">={id_key}", f"<{id_key}"  # TODO >
 
         filter_ = request.parameters.filter
         if filter_ and (id_from in filter_ or id_to in filter_):
@@ -211,39 +232,91 @@ class Bitrix24:
         tail_request.parameters.start = -1
         tail_request.parameters.order = {"ID": "DESC"}
 
-        head_tail = self.batch([head_request, tail_request])
-        head, tail = tuple(map(self._normalize_list, head_tail))
+        head_tail_result = self.batch([head_request, tail_request])
+        head_result, tail_result = tuple(map(self._fix_list_result, head_tail_result))
+        yield from head_result
 
         get_id = itemgetter(id_key)
-        max_head = max(map(int, map(get_id, head)), default=None)
-        min_tail = min(map(int, map(get_id, tail)), default=None)
+        max_head_id = max(map(int, map(get_id, head_result)), default=None)
+        min_tail_id = min(map(int, map(get_id, tail_result)), default=None)
 
-        yield from head
+        def _body_requests() -> Generator[ListRequest, None, None]:
+            for start in range(max_head_id + 1, min_tail_id, list_size):
+                body_request = head_request.model_copy(deep=True)
+                body_request.parameters.filter[id_from] = start
+                body_request.parameters.filter[id_to] = min(start + list_size, min_tail_id)
+                yield body_request
 
-        if max_head < min_tail:
-
-            def _body_requests() -> Generator[Request, None, None]:
-                for start in range(max_head + 1, min_tail, list_size):
-                    body_request = request.model_copy(deep=True)
-                    body_request.parameters.start = -1
-                    body_request.parameters.filter[id_from] = start
-                    body_request.parameters.filter[id_to] = min(start + list_size, min_tail)
-                    body_request.parameters.order = {"ID": "ASC"}
-                    yield body_request
-
+        if max_head_id < min_tail_id:
             body = self.batch(_body_requests(), batch_size)
-            body = map(self._normalize_list, body)
+            body = map(self._fix_list_result, body)
             body = chain.from_iterable(body)
-
             yield from body
 
-        for item in reversed(tail):
-            if int(get_id(item)) > max_head:
+        for item in reversed(tail_result):
+            if int(get_id(item)) > max_head_id:
                 yield item
 
+    def reference_batched_no_count(
+        self,
+        request: ListRequest,
+        updates: Iterable[dict],
+        id_key: str = "ID",
+        list_size: int | None = None,
+        batch_size: int | None = None,
+    ) -> Generator[ApiTypes, None, None]:
+        """Call `list` method with reference `updates` to filter and return full `result`.
+
+        Fastest (batched, no count) list gathering for methods with `filter` parameter and required `reference`
+        (e.g. `crm.timeline.comment.list`).
+        """
+        list_size = list_size or self.settings.list_size
+        batch_size = batch_size or self.settings.batch_size
+
+        select_ = request.parameters.select
+        if "*" not in select_ and id_key not in select_:
+            request.select.append(id_key)
+
+        id_from = f">{id_key}"
+
+        filter_ = request.parameters.filter
+        if filter_ and id_from in filter_:
+            raise ValueError(
+                f"Filter parameters `{id_from}` is reserved in `reference_batched_no_count`",
+            )
+
+        if request.parameters.order:
+            raise ValueError("Ordering parameters are reserved `order`in `reference_batched_no_count`")
+
+        get_id = itemgetter(id_key)
+
+        def _tail_requests() -> Generator[ListRequest, None, None]:
+            for update in updates:
+                tail_request = request.model_copy(deep=True)
+                tail_request.parameters.filter |= update
+                tail_request.parameters.start = -1
+                tail_request.parameters.order = {"ID": "ASC"}
+                yield tail_request
+
+        head_requests = []
+        tail_requests = iter(_tail_requests())
+        while body_requests := head_requests + list(islice(tail_requests, batch_size - len(head_requests))):
+            body_results = self.batch(body_requests, batch_size)
+            body_results = map(self._fix_list_result, body_results)
+
+            head_requests = []
+            for body_request, body_result in zip(body_requests, body_results, strict=True):
+                if len(body_result) == list_size:
+                    max_id = max(map(int, map(get_id, body_result)), default=None)
+                    head_request = body_request.model_copy(deep=True)
+                    head_request.parameters.filter[id_from] = max_id
+                    head_requests.append(head_request)
+
+                yield from body_result
+
     @staticmethod
-    def _normalize_list(result: list | dict[str, list]) -> list:
-        """Normalize `list` method result to `list of items` structure.
+    def _fix_list_result(result: list | dict[str, list]) -> list:
+        """Fix `list` method result to `list of items` structure.
 
         There are two kinds of what `list` method `result` may contain:
         - a list of items (e.g. `department-get` and `disk.folder.getchildren`),

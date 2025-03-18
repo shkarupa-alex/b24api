@@ -9,7 +9,7 @@ from b24api.type import ApiTypes
 
 
 class Request(BaseModel):
-    """Common request structure."""
+    """API request."""
 
     method: str
     parameters: dict[str, ApiTypes] = {}
@@ -31,16 +31,15 @@ class ListRequestParameters(BaseModel):
     """Parameters of `*.list` requests."""
 
     select: list[str]
-    filter: dict[str, ApiTypes] | None = None
-    order: dict[str, str] | None = None
-    limit: int | None = None
-    start: int | None = None
+    filter: dict[str, ApiTypes] = {}
+    order: dict[str, str] = {}
+    start: int = -1
 
 
 class ListRequest(Request):
-    """List request structure."""
+    """API `*.list` request."""
 
-    parameters: ListRequestParameters = None
+    parameters: ListRequestParameters
 
 
 class ErrorResponse(BaseModel):
@@ -62,7 +61,7 @@ class ErrorResponse(BaseModel):
 
 
 class ResponseTime(BaseModel):
-    """Time structure of response."""
+    """API Response `time` structure."""
 
     start: float
     finish: float
@@ -70,12 +69,12 @@ class ResponseTime(BaseModel):
     processing: float
     date_start: datetime
     date_finish: datetime
-    operating_reset_at: float
+    operating_reset_at: float  # TODO: None?
     operating: float
 
 
-class ResultResponse(BaseModel):
-    """API data response."""
+class Response(BaseModel):
+    """API response."""
 
     result: ApiTypes
     time: ResponseTime
@@ -84,8 +83,10 @@ class ResultResponse(BaseModel):
 
 
 class BatchResult(BaseModel):
+    """API response `result` structure for `batch` method."""
     result: dict[str, ApiTypes]
     result_time: dict[str, ResponseTime]
     result_error: dict[str, ErrorResponse]
     result_total: dict[str, int]
     result_next: dict[str, int]
+

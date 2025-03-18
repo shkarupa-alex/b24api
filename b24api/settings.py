@@ -16,6 +16,10 @@ class Settings(BaseSettings):
 
     webhook_url: HttpUrl
 
+    # TODO
+    # http_http2: bool = True
+    # http_timeout: float = 30
+
     retry_statuses: list[int] = (
         codes.LOCKED,
         codes.TOO_EARLY,
@@ -36,7 +40,7 @@ class Settings(BaseSettings):
 
 
 def api_settings() -> Generator[Settings, None, None]:
-    settings = Settings()
+    settings = Settings()  # TODO
     yield settings
 
 

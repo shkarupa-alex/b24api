@@ -1,4 +1,6 @@
+import json
 import math
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -114,7 +116,7 @@ def test_batch(httpx_mock: HTTPXMock) -> None:
             "halt": True,
             "cmd": {
                 "_0": "profile",
-                "_1": "crm.lead.list?select%5B0%5D=ID&select%5B1%5D=STATUS_ID",
+                "_1": "crm.lead.list?select%5B0%5D=ID&select%5B1%5D=STATUS_ID&start=-1",
                 "_2": "department.get?ID=1",
             },
         },
@@ -187,7 +189,7 @@ def test_list_sequential(httpx_mock: HTTPXMock, total_items: int, list_size: int
             method="POST",
             url="https://bitrix24.com/rest/0/test/crm.lead.list",
             match_headers={"Content-Type": "application/json"},
-            match_json={} if start == 0 else {"start": start},
+            match_json={"start": start},
             json={
                 "result": result[start : start + list_size],
                 "total": total_items,
@@ -214,7 +216,7 @@ def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: int, b
         method="POST",
         url="https://bitrix24.com/rest/0/test/crm.lead.list",
         match_headers={"Content-Type": "application/json"},
-        match_json={},
+        match_json={"start": 0},
         json={
             "result": result[:list_size],
             "total": total_items,
@@ -346,6 +348,78 @@ def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, list_siz
         batch_size=batch_size,
     )
     assert list(response) == result
+
+
+@pytest.mark.parametrize(
+    ("total_items", "list_size", "batch_size"),
+    [(150, 50, 1), (155, 50, 1), (10, 50, 50)],
+)
+def test_reference_batched_no_count(httpx_mock: HTTPXMock, total_items: int, list_size: int, batch_size: int) -> None:
+    result = [
+        {"ID": i + j * total_items, "ENTITY_TYPE": "deal", "ENTITY_ID": j}
+        for i in range(total_items)
+        for j in range(total_items - i)
+    ]
+    result = sorted(result, key=lambda r: r["ID"])
+
+    def custom_response(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://bitrix24.com/rest/0/test/batch"
+
+        output = {}
+        for key, value in json.loads(request.content)["cmd"].items():
+            method, command = value.split("?")
+            assert method == "crm.timeline.comment.list"
+
+            command = parse_qs(command)
+            assert command.pop("select[0]", None) == ["ID"]
+            assert command.pop("select[1]", None) == ["ENTITY_ID"]
+            assert command.pop("filter[=ENTITY_TYPE]", None) == ["deal"]
+            assert command.pop("order[ID]", None) == ["ASC"]
+            assert command.pop("start", None) == ["-1"]
+
+            entity_id = command.pop("filter[=ENTITY_ID]", [-1])
+            assert entity_id
+            assert len(entity_id) == 1
+
+            from_id = command.pop("filter[>ID]", [-1])
+            assert from_id
+            assert len(from_id) == 1
+
+            assert not command
+
+            entity_id = int(entity_id[0])
+            from_id = int(from_id[0])
+
+            row = [r for r in result if r["ENTITY_ID"] == entity_id and r["ID"] > from_id]
+            output[key] = row[:list_size]
+
+        return httpx.Response(
+            status_code=200,
+            json={
+                "result": {
+                    "result": output,
+                    "result_error": [],
+                    "result_total": [],
+                    "result_next": [],
+                    "result_time": dict.fromkeys(output, _DEFAULT_TIME),
+                },
+                "time": _DEFAULT_TIME,
+            },
+        )
+
+    httpx_mock.add_callback(custom_response, is_reusable=True)
+
+    api = Bitrix24()
+    response = api.reference_batched_no_count(
+        ListRequest(
+            method="crm.timeline.comment.list",
+            parameters=ListRequestParameters(select=["ID", "ENTITY_ID"], filter={"=ENTITY_TYPE": "deal"}),
+        ),
+        ({"=ENTITY_ID": i} for i in range(total_items)),
+        list_size=list_size,
+        batch_size=batch_size,
+    )
+    assert sorted(response, key=lambda r: r["ID"]) == result
 
 
 _DEFAULT_TIME = {
