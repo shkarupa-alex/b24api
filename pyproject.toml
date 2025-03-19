@@ -19,11 +19,9 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "mypy>=1.15.0",
     "pytest-env>=1.1.5",
     "pytest-httpx>=0.35.0",
     "pytest-mock>=3.14.0",
-    "ruff>=0.9.9",
 ]
 
 [tool.ruff]
