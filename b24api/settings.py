@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="bitrix_24_api_",
+        env_prefix="bitrix24_api_",
         env_file=".env",
         extra="ignore",
     )
@@ -35,8 +35,8 @@ class Settings(BaseSettings):
     batch_size: int = 50
 
 
-def api_settings() -> Generator[Settings, None, None]:
-    settings = Settings()
+def api_settings(**kwargs: dict) -> Generator[Settings, None, None]:
+    settings = Settings(**kwargs)
     yield settings
 
 

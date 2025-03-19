@@ -1,4 +1,7 @@
+import json
 import math
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -6,7 +9,6 @@ from pytest_httpx import HTTPXMock
 from pytest_mock import MockerFixture
 
 from b24api.api import Bitrix24
-from b24api.entity import ListRequest, ListRequestParameters, Request
 from b24api.error import ApiResponseError, RetryHTTPStatusError
 
 
@@ -23,8 +25,8 @@ def test_call(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = Bitrix24(tmp=123)
-    response = api.call(Request(method="profile"))
+    api = Bitrix24()
+    response = api.call({"method": "profile"})
     assert response == result
 
 
@@ -44,7 +46,7 @@ def test_call_list(httpx_mock: HTTPXMock) -> None:
     )
 
     api = Bitrix24()
-    response = api.call(Request(method="crm.lead.list", parameters={"select": ["ID", "STATUS_ID"]}))
+    response = api.call({"method": "crm.lead.list", "parameters": {"select": ["ID", "STATUS_ID"]}})
     assert response == result
 
 
@@ -60,7 +62,7 @@ def test_call_status_error(httpx_mock: HTTPXMock) -> None:
 
     api = Bitrix24()
     with pytest.raises(httpx.HTTPStatusError):
-        api.call(Request(method="profile"))
+        api.call({"method": "profile"})
 
 
 def test_call_retry_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
@@ -77,7 +79,7 @@ def test_call_retry_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
 
     api = Bitrix24()
     with pytest.raises(RetryHTTPStatusError):
-        api.call(Request(method="profile"))
+        api.call({"method": "profile"})
 
     num_retries = 5
     assert sleep_mock.call_count == num_retries - 1
@@ -97,7 +99,7 @@ def test_call_api_error(httpx_mock: HTTPXMock) -> None:
 
     api = Bitrix24()
     with pytest.raises(ApiResponseError):
-        api.call(Request(method="profile"))
+        api.call({"method": "profile"})
 
 
 def test_batch(httpx_mock: HTTPXMock) -> None:
@@ -114,7 +116,7 @@ def test_batch(httpx_mock: HTTPXMock) -> None:
             "halt": True,
             "cmd": {
                 "_0": "profile",
-                "_1": "crm.lead.list?select%5B0%5D=ID&select%5B1%5D=STATUS_ID",
+                "_1": "crm.lead.list?select%5B0%5D=ID&select%5B1%5D=STATUS_ID&start=-1",
                 "_2": "department.get?ID=1",
             },
         },
@@ -133,9 +135,9 @@ def test_batch(httpx_mock: HTTPXMock) -> None:
     api = Bitrix24()
     response = api.batch(
         [
-            Request(method="profile"),
-            ListRequest(method="crm.lead.list", parameters=ListRequestParameters(select=["ID", "STATUS_ID"])),
-            Request(method="department.get", parameters={"ID": 1}),
+            {"method": "profile"},
+            {"method": "crm.lead.list", "parameters": {"select": ["ID", "STATUS_ID"], "start": -1}},
+            {"method": "department.get", "parameters": {"ID": 1}},
         ],
     )
     assert list(response) == result
@@ -171,9 +173,9 @@ def test_batch_halt_on_error(httpx_mock: HTTPXMock) -> None:
         list(
             api.batch(
                 [
-                    Request(method="profile"),
-                    Request(method="telephony.externalLine.get"),
-                    Request(method="department.get", parameters={"ID": 1}),
+                    {"method": "profile"},
+                    {"method": "telephony.externalLine.get"},
+                    {"method": "department.get", "parameters": {"ID": 1}},
                 ],
             ),
         )
@@ -187,7 +189,7 @@ def test_list_sequential(httpx_mock: HTTPXMock, total_items: int, list_size: int
             method="POST",
             url="https://bitrix24.com/rest/0/test/crm.lead.list",
             match_headers={"Content-Type": "application/json"},
-            match_json={} if start == 0 else {"start": start},
+            match_json={"start": start},
             json={
                 "result": result[start : start + list_size],
                 "total": total_items,
@@ -198,7 +200,7 @@ def test_list_sequential(httpx_mock: HTTPXMock, total_items: int, list_size: int
 
     api = Bitrix24()
     response = api.list_sequential(
-        Request(method="crm.lead.list"),
+        {"method": "crm.lead.list"},
         list_size=list_size,
     )
     assert list(response) == result
@@ -214,7 +216,7 @@ def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: int, b
         method="POST",
         url="https://bitrix24.com/rest/0/test/crm.lead.list",
         match_headers={"Content-Type": "application/json"},
-        match_json={},
+        match_json={"start": 0},
         json={
             "result": result[:list_size],
             "total": total_items,
@@ -249,7 +251,7 @@ def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: int, b
 
     api = Bitrix24()
     response = api.list_batched(
-        Request(method="crm.lead.list"),
+        {"method": "crm.lead.list"},
         list_size=list_size,
         batch_size=batch_size,
     )
@@ -261,91 +263,144 @@ def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: int, b
     [(150, 50, 1), (155, 50, 1), (10, 50, 50), (5500, 50, 50)],
 )
 def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, list_size: int, batch_size: int) -> None:
-    result = [{"ID": str(i), "STATUS_ID": "1"} for i in range(total_items)]
-    httpx_mock.add_response(
-        method="POST",
-        url="https://bitrix24.com/rest/0/test/batch",
-        match_headers={"Content-Type": "application/json"},
-        match_json={
-            "halt": True,
-            "cmd": {
-                "_0": "crm.lead.list"
-                "?select%5B0%5D=ID"
-                "&select%5B1%5D=STATUS_ID"
-                "&filter%5B%3EDATE%5D=2025-03-14T14%3A00%3A17%2B03%3A00"
-                "&order%5BID%5D=ASC"
-                "&start=-1",
-                "_1": "crm.lead.list"
-                "?select%5B0%5D=ID"
-                "&select%5B1%5D=STATUS_ID"
-                "&filter%5B%3EDATE%5D=2025-03-14T14%3A00%3A17%2B03%3A00"
-                "&order%5BID%5D=DESC"
-                "&start=-1",
-            },
-        },
-        json={
-            "result": {
-                "result": {
-                    "_0": result[:list_size],
-                    "_1": result[-list_size:][::-1],
-                },
-                "result_error": [],
-                "result_total": [],
-                "result_next": [],
-                "result_time": {"_0": _DEFAULT_TIME, "_1": _DEFAULT_TIME},
-            },
-            "time": _DEFAULT_TIME,
-        },
-    )
-    for batch_start in range(list_size, total_items - list_size, list_size * batch_size):
-        max_chunks = math.ceil((total_items - batch_start - list_size) / batch_size)
-        commands, results, times = {}, {}, {}
-        for chunk in range(min(batch_size, max_chunks)):
-            start = batch_start + chunk * list_size
-            stop = min(start + list_size, total_items - list_size)
-            commands[f"_{chunk}"] = (
-                "crm.lead.list"
-                "?select%5B0%5D=ID"
-                "&select%5B1%5D=STATUS_ID"
-                "&filter%5B%3EDATE%5D=2025-03-14T14%3A00%3A17%2B03%3A00"
-                f"&filter%5B%3E%3DID%5D={start}"
-                f"&filter%5B%3CID%5D={stop}"
-                "&order%5BID%5D=ASC"
-                "&start=-1"
-            )
-            results[f"_{chunk}"] = result[start:stop]
-            times[f"_{chunk}"] = _DEFAULT_TIME
-        httpx_mock.add_response(
-            method="POST",
-            url="https://bitrix24.com/rest/0/test/batch",
-            match_headers={"Content-Type": "application/json"},
-            match_json={
-                "halt": True,
-                "cmd": commands,
-            },
+    result = [{"ID": i, "STATUS_ID": "1"} for i in range(total_items)]
+
+    def custom_response(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://bitrix24.com/rest/0/test/batch"
+
+        output = {}
+        for key, value in json.loads(request.content)["cmd"].items():
+            method, command = value.split("?")
+            assert method == "crm.lead.list"
+
+            command = parse_qs(command)
+            assert command.pop("select[0]", None) == ["ID"]
+            assert command.pop("select[1]", None) == ["STATUS_ID"]
+            assert command.pop("filter[>DATE]", None) == ["2025-03-14T14:00:17+03:00"]
+            assert command.pop("start", None) == ["-1"]
+
+            reverse = command.pop("order[ID]", None) == ["DESC"]
+
+            from_id = command.pop("filter[>ID]", [-1])
+            assert from_id
+            assert len(from_id) == 1
+
+            to_id = command.pop("filter[<ID]", [total_items])
+            assert to_id
+            assert len(to_id) == 1
+
+            assert not command
+
+            from_id = int(from_id[0])
+            to_id = int(to_id[0])
+
+            data = [r for r in result if from_id < r["ID"] < to_id]
+            data = data[::-1] if reverse else data
+            output[key] = data[:list_size]
+
+        return httpx.Response(
+            status_code=200,
             json={
                 "result": {
-                    "result": results,
+                    "result": output,
                     "result_error": [],
                     "result_total": [],
                     "result_next": [],
-                    "result_time": times,
+                    "result_time": dict.fromkeys(output, _DEFAULT_TIME),
                 },
-                "total": total_items,
                 "time": _DEFAULT_TIME,
             },
         )
 
+    httpx_mock.add_callback(custom_response, is_reusable=True)
+
     api = Bitrix24()
     response = api.list_batched_no_count(
-        ListRequest(
-            method="crm.lead.list",
-            parameters=ListRequestParameters(select=["ID", "STATUS_ID"], filter={">DATE": "2025-03-14T14:00:17+03:00"}),
-        ),
+        {
+            "method": "crm.lead.list",
+            "parameters": {
+                "select": ["ID", "STATUS_ID"],
+                "filter": {
+                    ">DATE": datetime(2025, 3, 14, 14, 0, 17, tzinfo=timezone(timedelta(hours=3))),
+                },
+            },
+        },
         list_size=list_size,
         batch_size=batch_size,
     )
     assert list(response) == result
+
+
+@pytest.mark.parametrize(
+    ("total_items", "list_size", "batch_size"),
+    [(150, 50, 1), (155, 50, 1), (10, 50, 50)],
+)
+def test_reference_batched_no_count(httpx_mock: HTTPXMock, total_items: int, list_size: int, batch_size: int) -> None:
+    result = [
+        {"ID": i + j * total_items, "ENTITY_TYPE": "deal", "ENTITY_ID": j}
+        for i in range(total_items)
+        for j in range(total_items - i)
+    ]
+    result = sorted(result, key=lambda r: r["ID"])
+
+    def custom_response(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://bitrix24.com/rest/0/test/batch"
+
+        output = {}
+        for key, value in json.loads(request.content)["cmd"].items():
+            method, command = value.split("?")
+            assert method == "crm.timeline.comment.list"
+
+            command = parse_qs(command)
+            assert command.pop("select[0]", None) == ["ID"]
+            assert command.pop("select[1]", None) == ["ENTITY_ID"]
+            assert command.pop("filter[=ENTITY_TYPE]", None) == ["deal"]
+            assert command.pop("order[ID]", None) == ["ASC"]
+            assert command.pop("start", None) == ["-1"]
+
+            entity_id = command.pop("filter[=ENTITY_ID]", [-1])
+            assert entity_id
+            assert len(entity_id) == 1
+
+            from_id = command.pop("filter[>ID]", [-1])
+            assert from_id
+            assert len(from_id) == 1
+
+            assert not command
+
+            entity_id = int(entity_id[0])
+            from_id = int(from_id[0])
+
+            data = [r for r in result if r["ENTITY_ID"] == entity_id and r["ID"] > from_id]
+            output[key] = data[:list_size]
+
+        return httpx.Response(
+            status_code=200,
+            json={
+                "result": {
+                    "result": output,
+                    "result_error": [],
+                    "result_total": [],
+                    "result_next": [],
+                    "result_time": dict.fromkeys(output, _DEFAULT_TIME),
+                },
+                "time": _DEFAULT_TIME,
+            },
+        )
+
+    httpx_mock.add_callback(custom_response, is_reusable=True)
+
+    api = Bitrix24()
+    response = api.reference_batched_no_count(
+        {
+            "method": "crm.timeline.comment.list",
+            "parameters": {"select": ["ID", "ENTITY_ID"], "filter": {"=ENTITY_TYPE": "deal"}},
+        },
+        ({"=ENTITY_ID": i} for i in range(total_items)),
+        list_size=list_size,
+        batch_size=batch_size,
+    )
+    assert sorted(response, key=lambda r: r["ID"]) == result
 
 
 _DEFAULT_TIME = {
