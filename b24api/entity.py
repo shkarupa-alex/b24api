@@ -69,8 +69,8 @@ class ResponseTime(BaseModel):
     processing: float
     date_start: datetime
     date_finish: datetime
-    operating_reset_at: float  # TODO: None?
-    operating: float
+    operating_reset_at: float | None = None
+    operating: float | None = None
 
 
 class Response(BaseModel):
@@ -84,9 +84,9 @@ class Response(BaseModel):
 
 class BatchResult(BaseModel):
     """API response `result` structure for `batch` method."""
+
     result: dict[str, ApiTypes]
     result_time: dict[str, ResponseTime]
     result_error: dict[str, ErrorResponse]
     result_total: dict[str, int]
     result_next: dict[str, int]
-

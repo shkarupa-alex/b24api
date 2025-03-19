@@ -11,8 +11,7 @@ from retry import retry
 
 from b24api.entity import ApiTypes, BatchResult, ErrorResponse, ListRequest, Request, Response
 from b24api.error import RetryApiResponseError, RetryHTTPStatusError
-from b24api.future import batched
-from b24api.httpx import HttpxClient
+from b24api.httpc import HttpxClient
 from b24api.settings import ApiSettings
 
 
@@ -83,7 +82,8 @@ class Bitrix24:
         """Call infinite sequence of methods within batches and return just `result`s."""
         batch_size = batch_size or self.settings.batch_size
 
-        for batched_requests in batched(requests, batch_size):
+        tail_requests = iter(requests)
+        while batched_requests := list(islice(tail_requests, batch_size)):
             for response in self._batch(batched_requests):
                 yield response.result
 
@@ -213,7 +213,8 @@ class Bitrix24:
         if "*" not in select_ and id_key not in select_:
             request.select.append(id_key)
 
-        id_from, id_to = f">={id_key}", f"<{id_key}"  # TODO >
+        id_from, id_to = f">{id_key}", f"<{id_key}"
+        get_id = itemgetter(id_key)
 
         filter_ = request.parameters.filter
         if filter_ and (id_from in filter_ or id_to in filter_):
@@ -236,15 +237,14 @@ class Bitrix24:
         head_result, tail_result = tuple(map(self._fix_list_result, head_tail_result))
         yield from head_result
 
-        get_id = itemgetter(id_key)
         max_head_id = max(map(int, map(get_id, head_result)), default=None)
         min_tail_id = min(map(int, map(get_id, tail_result)), default=None)
 
         def _body_requests() -> Generator[ListRequest, None, None]:
-            for start in range(max_head_id + 1, min_tail_id, list_size):
+            for start in range(max_head_id, min_tail_id, list_size):
                 body_request = head_request.model_copy(deep=True)
                 body_request.parameters.filter[id_from] = start
-                body_request.parameters.filter[id_to] = min(start + list_size, min_tail_id)
+                body_request.parameters.filter[id_to] = min(start + list_size + 1, min_tail_id)
                 yield body_request
 
         if max_head_id < min_tail_id:
@@ -278,6 +278,7 @@ class Bitrix24:
             request.select.append(id_key)
 
         id_from = f">{id_key}"
+        get_id = itemgetter(id_key)
 
         filter_ = request.parameters.filter
         if filter_ and id_from in filter_:
@@ -288,10 +289,12 @@ class Bitrix24:
         if request.parameters.order:
             raise ValueError("Ordering parameters are reserved `order`in `reference_batched_no_count`")
 
-        get_id = itemgetter(id_key)
-
         def _tail_requests() -> Generator[ListRequest, None, None]:
             for update in updates:
+                if id_from in update:
+                    raise ValueError(
+                        f"Filter parameters `{id_from}` is reserved in `reference_batched_no_count`",
+                    )
                 tail_request = request.model_copy(deep=True)
                 tail_request.parameters.filter |= update
                 tail_request.parameters.start = -1
