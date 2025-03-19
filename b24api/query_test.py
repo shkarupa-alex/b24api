@@ -5,9 +5,16 @@ def test_build_query_simple() -> None:
     query = build_query({"foo": 1, "bar": None, "rest": "abc"})
     assert query == "foo=1&rest=abc"
 
+
+def test_build_query_empty() -> None:
+    query = build_query({"none": None, "empty": "", "zero": 0, "list": []})
+    assert query == "empty=&zero=0"
+
+
 def test_build_query_list() -> None:
     query = build_query({"select": ["ID", "TITLE"]})
     assert query == "select%5B0%5D=ID&select%5B1%5D=TITLE"
+
 
 def test_build_query_deep() -> None:
     query = build_query(

@@ -1,5 +1,6 @@
 import json
 import math
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs
 
 import httpx
@@ -8,7 +9,6 @@ from pytest_httpx import HTTPXMock
 from pytest_mock import MockerFixture
 
 from b24api.api import Bitrix24
-from b24api.entity import ListRequest, ListRequestParameters, Request
 from b24api.error import ApiResponseError, RetryHTTPStatusError
 
 
@@ -25,8 +25,8 @@ def test_call(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = Bitrix24(tmp=123)
-    response = api.call(Request(method="profile"))
+    api = Bitrix24()
+    response = api.call({"method": "profile"})
     assert response == result
 
 
@@ -46,7 +46,7 @@ def test_call_list(httpx_mock: HTTPXMock) -> None:
     )
 
     api = Bitrix24()
-    response = api.call(Request(method="crm.lead.list", parameters={"select": ["ID", "STATUS_ID"]}))
+    response = api.call({"method": "crm.lead.list", "parameters": {"select": ["ID", "STATUS_ID"]}})
     assert response == result
 
 
@@ -62,7 +62,7 @@ def test_call_status_error(httpx_mock: HTTPXMock) -> None:
 
     api = Bitrix24()
     with pytest.raises(httpx.HTTPStatusError):
-        api.call(Request(method="profile"))
+        api.call({"method": "profile"})
 
 
 def test_call_retry_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
@@ -79,7 +79,7 @@ def test_call_retry_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
 
     api = Bitrix24()
     with pytest.raises(RetryHTTPStatusError):
-        api.call(Request(method="profile"))
+        api.call({"method": "profile"})
 
     num_retries = 5
     assert sleep_mock.call_count == num_retries - 1
@@ -99,7 +99,7 @@ def test_call_api_error(httpx_mock: HTTPXMock) -> None:
 
     api = Bitrix24()
     with pytest.raises(ApiResponseError):
-        api.call(Request(method="profile"))
+        api.call({"method": "profile"})
 
 
 def test_batch(httpx_mock: HTTPXMock) -> None:
@@ -135,9 +135,9 @@ def test_batch(httpx_mock: HTTPXMock) -> None:
     api = Bitrix24()
     response = api.batch(
         [
-            Request(method="profile"),
-            ListRequest(method="crm.lead.list", parameters=ListRequestParameters(select=["ID", "STATUS_ID"])),
-            Request(method="department.get", parameters={"ID": 1}),
+            {"method": "profile"},
+            {"method": "crm.lead.list", "parameters": {"select": ["ID", "STATUS_ID"], "start": -1}},
+            {"method": "department.get", "parameters": {"ID": 1}},
         ],
     )
     assert list(response) == result
@@ -173,9 +173,9 @@ def test_batch_halt_on_error(httpx_mock: HTTPXMock) -> None:
         list(
             api.batch(
                 [
-                    Request(method="profile"),
-                    Request(method="telephony.externalLine.get"),
-                    Request(method="department.get", parameters={"ID": 1}),
+                    {"method": "profile"},
+                    {"method": "telephony.externalLine.get"},
+                    {"method": "department.get", "parameters": {"ID": 1}},
                 ],
             ),
         )
@@ -200,7 +200,7 @@ def test_list_sequential(httpx_mock: HTTPXMock, total_items: int, list_size: int
 
     api = Bitrix24()
     response = api.list_sequential(
-        Request(method="crm.lead.list"),
+        {"method": "crm.lead.list"},
         list_size=list_size,
     )
     assert list(response) == result
@@ -251,7 +251,7 @@ def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: int, b
 
     api = Bitrix24()
     response = api.list_batched(
-        Request(method="crm.lead.list"),
+        {"method": "crm.lead.list"},
         list_size=list_size,
         batch_size=batch_size,
     )
@@ -316,10 +316,15 @@ def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, list_siz
 
     api = Bitrix24()
     response = api.list_batched_no_count(
-        ListRequest(
-            method="crm.lead.list",
-            parameters=ListRequestParameters(select=["ID", "STATUS_ID"], filter={">DATE": "2025-03-14T14:00:17+03:00"}),
-        ),
+        {
+            "method": "crm.lead.list",
+            "parameters": {
+                "select": ["ID", "STATUS_ID"],
+                "filter": {
+                    ">DATE": datetime(2025, 3, 14, 14, 0, 17, tzinfo=timezone(timedelta(hours=3))),
+                },
+            },
+        },
         list_size=list_size,
         batch_size=batch_size,
     )
@@ -387,10 +392,10 @@ def test_reference_batched_no_count(httpx_mock: HTTPXMock, total_items: int, lis
 
     api = Bitrix24()
     response = api.reference_batched_no_count(
-        ListRequest(
-            method="crm.timeline.comment.list",
-            parameters=ListRequestParameters(select=["ID", "ENTITY_ID"], filter={"=ENTITY_TYPE": "deal"}),
-        ),
+        {
+            "method": "crm.timeline.comment.list",
+            "parameters": {"select": ["ID", "ENTITY_ID"], "filter": {"=ENTITY_TYPE": "deal"}},
+        },
         ({"=ENTITY_ID": i} for i in range(total_items)),
         list_size=list_size,
         batch_size=batch_size,

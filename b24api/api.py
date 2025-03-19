@@ -29,14 +29,16 @@ class Bitrix24:
             logger=self.logger,
         )(self._call)
 
-    def call(self, request: Request) -> ApiTypes:
+    def call(self, request: Request | dict) -> ApiTypes:
         """Call any method (with retries) and return just `result`."""
         response = self._call_retry(request)
 
         return response.result
 
-    def _call(self, request: Request) -> Response:
+    def _call(self, request: Request | dict) -> Response:
         """Call any method and return full response."""
+        request = Request.model_validate(request)
+
         self.logger.debug("Sending request", extra={"request": request})
 
         http_response = self.client.post(
@@ -76,7 +78,7 @@ class Bitrix24:
 
     def batch(
         self,
-        requests: Iterable[Request],
+        requests: Iterable[Request | dict],
         batch_size: int | None = None,
     ) -> Generator[ApiTypes, None, None]:
         """Call infinite sequence of methods within batches and return just `result`s."""
@@ -87,9 +89,9 @@ class Bitrix24:
             for response in self._batch(batched_requests):
                 yield response.result
 
-    def _batch(self, requests: Iterable[Request]) -> Generator[Response, None, None]:
+    def _batch(self, requests: Iterable[Request | dict]) -> Generator[Response, None, None]:
         """Call batch of methods and return full responses."""
-        commands = {f"_{i}": request for i, request in enumerate(requests)}
+        commands = {f"_{i}": Request.model_validate(request) for i, request in enumerate(requests)}
         request = Request(
             method="batch",
             parameters={
@@ -131,13 +133,14 @@ class Bitrix24:
 
     def list_sequential(
         self,
-        request: Request,
+        request: Request | dict,
         list_size: int | None = None,
     ) -> Generator[ApiTypes, None, None]:
         """Call `list` method and return full `result`.
 
         Slow (sequential tail) list gathering for methods without `filter` parameter (e.g. `department.get`).
         """
+        request = Request.model_validate(request)
         list_size = list_size or self.settings.list_size
 
         head_request = request.model_copy(deep=True)
@@ -163,7 +166,7 @@ class Bitrix24:
 
     def list_batched(
         self,
-        request: Request,
+        request: Request | dict,
         list_size: int | None = None,
         batch_size: int | None = None,
     ) -> Generator[ApiTypes, None, None]:
@@ -171,6 +174,7 @@ class Bitrix24:
 
         Faster (batched tail) list gathering for methods without `filter` parameter (e.g. `department.get`).
         """
+        request = Request.model_validate(request)
         list_size = list_size or self.settings.list_size
         batch_size = batch_size or self.settings.batch_size
 
@@ -197,7 +201,7 @@ class Bitrix24:
 
     def list_batched_no_count(
         self,
-        request: ListRequest,
+        request: ListRequest | dict,
         id_key: str = "ID",
         list_size: int | None = None,
         batch_size: int | None = None,
@@ -206,6 +210,7 @@ class Bitrix24:
 
         Fastest (batched, no count) list gathering for methods with `filter` parameter (e.g. `crm.lead.list`).
         """
+        request = ListRequest.model_validate(request)
         list_size = list_size or self.settings.list_size
         batch_size = batch_size or self.settings.batch_size
 
@@ -259,7 +264,7 @@ class Bitrix24:
 
     def reference_batched_no_count(
         self,
-        request: ListRequest,
+        request: ListRequest | dict,
         updates: Iterable[dict],
         id_key: str = "ID",
         list_size: int | None = None,
@@ -270,6 +275,7 @@ class Bitrix24:
         Fastest (batched, no count) list gathering for methods with `filter` parameter and required `reference`
         (e.g. `crm.timeline.comment.list`).
         """
+        request = ListRequest.model_validate(request)
         list_size = list_size or self.settings.list_size
         batch_size = batch_size or self.settings.batch_size
 

@@ -30,10 +30,10 @@ class Request(BaseModel):
 class ListRequestParameters(BaseModel):
     """Parameters of `*.list` requests."""
 
-    select: list[str]
+    select: list[str] = []
     filter: dict[str, ApiTypes] = {}
     order: dict[str, str] = {}
-    start: int = -1
+    start: int | None = None
 
 
 class ListRequest(Request):
