@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Self
+from typing import Annotated, Any, Self
 
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator
 
 from b24api.error import ApiResponseError, RetryApiResponseError
 from b24api.query import build_query
@@ -46,7 +46,7 @@ class ErrorResponse(BaseModel):
     """API error response."""
 
     error: str
-    error_description: str | None = None
+    error_description: str
 
     def raise_error(self, retry_errors: list[str]) -> Self:
         if self.error in retry_errors:
@@ -82,11 +82,17 @@ class Response(BaseModel):
     next: int | None = None
 
 
+def _php_dict(value: Any) -> Any:  # noqa: ANN401
+    if isinstance(value, list) and not value:
+        return {}
+    return value
+
+
 class BatchResult(BaseModel):
     """API response `result` structure for `batch` method."""
 
-    result: dict[str, ApiTypes]
-    result_time: dict[str, ResponseTime]
-    result_error: dict[str, ErrorResponse]
-    result_total: dict[str, int]
-    result_next: dict[str, int]
+    result: Annotated[dict[str, ApiTypes], BeforeValidator(_php_dict)]
+    result_time: Annotated[dict[str, ResponseTime], BeforeValidator(_php_dict)]
+    result_error: Annotated[dict[str, ErrorResponse], BeforeValidator(_php_dict)]
+    result_total: Annotated[dict[str, int], BeforeValidator(_php_dict)]
+    result_next: Annotated[dict[str, int], BeforeValidator(_php_dict)]

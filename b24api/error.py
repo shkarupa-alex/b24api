@@ -14,7 +14,12 @@ class ApiResponseError(Exception):
         code: str,
         description: str | None,
     ) -> None:
-        message = f"API error [{code}]: {description}"
+        if code and description:
+            message = f"API error [{code}]: {description}"
+        elif code:
+            message = f"API error [{code}]"
+        else:
+            message = f"API error: {description}"
         super().__init__(message)
 
 

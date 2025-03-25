@@ -38,6 +38,7 @@ print(list(result))
 ## Gathering full list (faster)
 Applicable to list methods with `start=<offset>` support. 
 Fetches first list chunk with regular call, then fetches other chunks with `batch`.
+Approximately 3 times faster then `list_sequential`. 
 
 ```python
 from b24api import Bitrix24
@@ -50,6 +51,7 @@ print(list(result))
 ## Gathering full list (fastest)
 Applicable to list methods with `filter={<parameters>}` support. 
 Fetches first and last list chunk with batch call, then fetches other chunks with `batch`. Doesn't use counting (`start=-1`).
+Approximately 2 times faster then `list_batched`. 
 
 ```python
 from b24api import Bitrix24

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "b24api"
-version = "0.2.0"
+version = "0.3.0"
 description = "Bitrix24 API"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,11 +19,9 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "mypy>=1.15.0",
     "pytest-env>=1.1.5",
     "pytest-httpx>=0.35.0",
     "pytest-mock>=3.14.0",
-    "ruff>=0.9.9",
 ]
 
 [tool.ruff]

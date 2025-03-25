@@ -85,6 +85,24 @@ def test_call_retry_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
     assert sleep_mock.call_count == num_retries - 1
 
 
+def test_call_status_and_api_error(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/profile",
+        match_headers={"Content-Type": "application/json"},
+        match_json={},
+        status_code=httpx.codes.FORBIDDEN,
+        json={
+            "error": "ACCESS_DENIED",
+            "error_description": "REST API is available only on commercial plans",
+        },
+    )
+
+    api = Bitrix24()
+    with pytest.raises(ApiResponseError):
+        api.call({"method": "profile"})
+
+
 def test_call_api_error(httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(
         method="POST",

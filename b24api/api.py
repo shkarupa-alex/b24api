@@ -1,4 +1,5 @@
 import contextlib
+import json
 import logging
 from collections.abc import Generator, Iterable
 from itertools import chain, islice
@@ -20,7 +21,7 @@ class Bitrix24:
     def __init__(self, client: HttpxClient, settings: ApiSettings) -> None:
         self.client = client
         self.settings = settings
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger("b24api")
         self._call_retry = retry(
             exceptions=(RetryHTTPStatusError, RetryApiResponseError),
             tries=self.settings.retry_tries,
@@ -46,6 +47,9 @@ class Bitrix24:
             headers={"Content-Type": "application/json"},
             json=request.model_dump()["parameters"],
         )
+
+        with contextlib.suppress(httpx.ResponseNotRead, json.JSONDecodeError, ValidationError):
+            ErrorResponse.model_validate(http_response.json()).raise_error(self.settings.retry_errors)
 
         try:
             json_response = http_response.raise_for_status().json()
@@ -101,10 +105,6 @@ class Bitrix24:
         )
 
         result = self.call(request)
-
-        for fix_key in ["result_error", "result_total", "result_next"]:
-            if isinstance(result[fix_key], list) and not result[fix_key]:
-                result[fix_key] = dict(result[fix_key])
 
         result = BatchResult.model_validate(result)
 
@@ -252,7 +252,7 @@ class Bitrix24:
                 body_request.parameters.filter[id_to] = min(start + list_size + 1, min_tail_id)
                 yield body_request
 
-        if max_head_id < min_tail_id:
+        if max_head_id and min_tail_id and max_head_id < min_tail_id:
             body = self.batch(_body_requests(), batch_size)
             body = map(self._fix_list_result, body)
             body = chain.from_iterable(body)
