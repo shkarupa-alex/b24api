@@ -40,7 +40,7 @@ class Bitrix24:
         """Call any method and return full response."""
         request = Request.model_validate(request)
 
-        self.logger.debug("Sending request", extra={"request": request})
+        self.logger.debug("Sending request: %s", request)
 
         http_response = self.client.post(
             f"{self.settings.webhook_url}{request.method}",
@@ -67,16 +67,7 @@ class Bitrix24:
 
         response = Response.model_validate(json_response)
 
-        self.logger.debug("Received response", extra={"request": request, "response": response})
-        self.logger.info(
-            "Received response",
-            extra={
-                "method": request.method,
-                "duration": response.time.duration,
-                "processing": response.time.processing,
-                "operating": response.time.operating,
-            },
-        )
+        self.logger.debug("Received response: %s", response)
 
         return response
 
