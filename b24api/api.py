@@ -12,8 +12,8 @@ from retry import retry
 
 from b24api.entity import ApiTypes, BatchResult, ErrorResponse, ListRequest, Request, Response
 from b24api.error import RetryApiResponseError, RetryHTTPStatusError
-from b24api.httpc import HttpxClient
 from b24api.settings import ApiSettings
+from b24api.transport import HttpxClient
 
 
 class Bitrix24:
@@ -23,7 +23,13 @@ class Bitrix24:
         self.settings = settings
         self.logger = logging.getLogger("b24api")
         self._call_retry = retry(
-            exceptions=(RetryHTTPStatusError, RetryApiResponseError),
+            exceptions=(
+                httpx.ConnectError,
+                httpx.ConnectTimeout,
+                httpx.RemoteProtocolError,
+                RetryHTTPStatusError,
+                RetryApiResponseError,
+            ),
             tries=self.settings.retry_tries,
             delay=self.settings.retry_delay,
             backoff=self.settings.retry_backoff,
