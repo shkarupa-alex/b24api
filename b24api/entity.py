@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Annotated, Any, Self
 
-from pydantic import BaseModel, BeforeValidator
+from pydantic import BaseModel, BeforeValidator, constr
 
 from b24api.error import ApiResponseError, RetryApiResponseError
 from b24api.query import build_query
@@ -45,7 +45,7 @@ class ListRequest(Request):
 class ErrorResponse(BaseModel):
     """API error response."""
 
-    error: str
+    error: constr(to_lower=True)
     error_description: str
 
     def raise_error(self, retry_errors: list[str]) -> Self:

@@ -9,7 +9,7 @@ from pytest_httpx import HTTPXMock
 from pytest_mock import MockerFixture
 
 from b24api.api import Bitrix24
-from b24api.error import ApiResponseError, RetryHTTPStatusError
+from b24api.error import ApiResponseError, RetryApiResponseError, RetryHTTPStatusError
 
 
 def test_call(httpx_mock: HTTPXMock) -> None:
@@ -65,7 +65,7 @@ def test_call_status_error(httpx_mock: HTTPXMock) -> None:
         api.call({"method": "profile"})
 
 
-def test_call_retry_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
+def test_call_retry_status_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
     httpx_mock.add_response(
         method="POST",
         url="https://bitrix24.com/rest/0/test/profile",
@@ -79,6 +79,28 @@ def test_call_retry_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
 
     api = Bitrix24()
     with pytest.raises(RetryHTTPStatusError):
+        api.call({"method": "profile"})
+
+    num_retries = 5
+    assert sleep_mock.call_count == num_retries - 1
+
+
+def test_call_retry_api_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/profile",
+        match_headers={"Content-Type": "application/json"},
+        match_json={},
+        json={
+            "error": "operation_time_limit".upper(),
+            "error_description": "Method is blocked due to operation time limit.",
+        },
+        is_reusable=True,
+    )
+    sleep_mock = mocker.patch("time.sleep")
+
+    api = Bitrix24()
+    with pytest.raises(RetryApiResponseError):
         api.call({"method": "profile"})
 
     num_retries = 5
