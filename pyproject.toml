@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "b24api"
-version = "0.3.2"
+version = "0.3.3"
 description = "Bitrix24 API"
 readme = "README.md"
 requires-python = ">=3.11"
