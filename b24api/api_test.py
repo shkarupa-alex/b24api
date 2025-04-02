@@ -273,16 +273,16 @@ def test_batch_retry_api_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> 
     sleep_mock = mocker.patch("time.sleep")
 
     api = Bitrix24()
-    # with pytest.raises(RetryApiResponseError):
-    list(
-        api.batch(
-            [
-                {"method": "profile"},
-                {"method": "telephony.externalLine.get"},
-                {"method": "department.get", "parameters": {"ID": 1}},
-            ],
-        ),
-    )
+    with pytest.raises(RetryApiResponseError):
+        list(
+            api.batch(
+                [
+                    {"method": "profile"},
+                    {"method": "telephony.externalLine.get"},
+                    {"method": "department.get", "parameters": {"ID": 1}},
+                ],
+            ),
+        )
 
     num_retries = 5
     assert sleep_mock.call_count == num_retries - 1

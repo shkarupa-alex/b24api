@@ -93,7 +93,7 @@ class Bitrix24:
             for response in self._batch_retry(batched_requests):
                 yield response.result
 
-    def _batch(self, requests: Iterable[Request | dict]) -> Generator[Response, None, None]:
+    def _batch(self, requests: Iterable[Request | dict]) -> list[Response]:
         """Call batch of methods and return full responses."""
         commands = {f"_{i}": Request.model_validate(request) for i, request in enumerate(requests)}
         request = Request(
@@ -107,6 +107,7 @@ class Bitrix24:
         result = self._call(request).result
         result = BatchResult.model_validate(result)
 
+        responses = []
         for i in range(len(commands)):
             key = f"_{i}"
 
@@ -123,12 +124,16 @@ class Bitrix24:
                     f"Expecting `result_time` to contain result for command {{`{key}`: {command}}}. Got: {result}",
                 )
 
-            yield Response(
-                result=result.result[key],
-                time=result.result_time[key],
-                total=result.result_total.get(key, None),
-                next=result.result_next.get(key, None),
+            responses.append(
+                Response(
+                    result=result.result[key],
+                    time=result.result_time[key],
+                    total=result.result_total.get(key, None),
+                    next=result.result_next.get(key, None),
+                ),
             )
+
+        return responses
 
     def list_sequential(
         self,
