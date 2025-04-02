@@ -2,6 +2,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Generator, Iterable
+from functools import partial
 from itertools import chain, islice
 from operator import itemgetter
 
@@ -22,7 +23,9 @@ class Bitrix24:
         self.client = client
         self.settings = settings
         self.logger = logging.getLogger("b24api")
-        self._call_retry = retry(
+
+        retry_ = partial(
+            retry,
             exceptions=(
                 httpx.ConnectError,
                 httpx.ConnectTimeout,
@@ -34,13 +37,13 @@ class Bitrix24:
             delay=self.settings.retry_delay,
             backoff=self.settings.retry_backoff,
             logger=self.logger,
-        )(self._call)
+        )
+        self._call_retry = retry_()(self._call)
+        self._batch_retry = retry_()(self._batch)
 
     def call(self, request: Request | dict) -> ApiTypes:
         """Call any method (with retries) and return just `result`."""
-        response = self._call_retry(request)
-
-        return response.result
+        return self._call_retry(request).result
 
     def _call(self, request: Request | dict) -> Response:
         """Call any method and return full response."""
@@ -87,10 +90,10 @@ class Bitrix24:
 
         tail_requests = iter(requests)
         while batched_requests := list(islice(tail_requests, batch_size)):
-            for response in self._batch(batched_requests):
+            for response in self._batch_retry(batched_requests):
                 yield response.result
 
-    def _batch(self, requests: Iterable[Request | dict]) -> Generator[Response, None, None]:
+    def _batch(self, requests: Iterable[Request | dict]) -> list[Response]:
         """Call batch of methods and return full responses."""
         commands = {f"_{i}": Request.model_validate(request) for i, request in enumerate(requests)}
         request = Request(
@@ -101,10 +104,10 @@ class Bitrix24:
             },
         )
 
-        result = self.call(request)
-
+        result = self._call(request).result
         result = BatchResult.model_validate(result)
 
+        responses = []
         for i in range(len(commands)):
             key = f"_{i}"
 
@@ -121,12 +124,16 @@ class Bitrix24:
                     f"Expecting `result_time` to contain result for command {{`{key}`: {command}}}. Got: {result}",
                 )
 
-            yield Response(
-                result=result.result[key],
-                time=result.result_time[key],
-                total=result.result_total.get(key, None),
-                next=result.result_next.get(key, None),
+            responses.append(
+                Response(
+                    result=result.result[key],
+                    time=result.result_time[key],
+                    total=result.result_total.get(key, None),
+                    next=result.result_next.get(key, None),
+                ),
             )
+
+        return responses
 
     def list_sequential(
         self,

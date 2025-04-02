@@ -85,6 +85,24 @@ def test_call_retry_status_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -
     assert sleep_mock.call_count == num_retries - 1
 
 
+def test_call_api_error(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/profile",
+        match_headers={"Content-Type": "application/json"},
+        match_json={},
+        json={
+            "error": "ACCESS_DENIED",
+            "error_description": "Method is blocked due to operation time limit.",
+        },
+        is_reusable=True,
+    )
+
+    api = Bitrix24()
+    with pytest.raises(ApiResponseError):
+        api.call({"method": "profile"})
+
+
 def test_call_retry_api_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
     httpx_mock.add_response(
         method="POST",
@@ -125,21 +143,27 @@ def test_call_status_and_api_error(httpx_mock: HTTPXMock) -> None:
         api.call({"method": "profile"})
 
 
-def test_call_api_error(httpx_mock: HTTPXMock) -> None:
+def test_call_retry_status_and_api_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
     httpx_mock.add_response(
         method="POST",
         url="https://bitrix24.com/rest/0/test/profile",
         match_headers={"Content-Type": "application/json"},
         match_json={},
+        status_code=httpx.codes.FORBIDDEN,
         json={
-            "error": "ACCESS_DENIED",
-            "error_description": "REST API is available only on commercial plans",
+            "error": "operation_time_limit".upper(),
+            "error_description": "Method is blocked due to operation time limit.",
         },
+        is_reusable=True,
     )
+    sleep_mock = mocker.patch("time.sleep")
 
     api = Bitrix24()
-    with pytest.raises(ApiResponseError):
+    with pytest.raises(RetryApiResponseError):
         api.call({"method": "profile"})
+
+    num_retries = 5
+    assert sleep_mock.call_count == num_retries - 1
 
 
 def test_batch(httpx_mock: HTTPXMock) -> None:
@@ -183,7 +207,7 @@ def test_batch(httpx_mock: HTTPXMock) -> None:
     assert list(response) == result
 
 
-def test_batch_halt_on_error(httpx_mock: HTTPXMock) -> None:
+def test_batch_api_error(httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(
         method="POST",
         url="https://bitrix24.com/rest/0/test/batch",
@@ -219,6 +243,49 @@ def test_batch_halt_on_error(httpx_mock: HTTPXMock) -> None:
                 ],
             ),
         )
+
+
+def test_batch_retry_api_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/batch",
+        match_headers={"Content-Type": "application/json"},
+        match_json={
+            "halt": True,
+            "cmd": {"_0": "profile", "_1": "telephony.externalLine.get", "_2": "department.get?ID=1"},
+        },
+        json={
+            "result": {
+                "result": {
+                    "_0": _DEFAULT_PROFILE,
+                },
+                "result_error": {"_1": {"error": "operation_time_limit", "error_description": ""}},
+                "result_total": [],
+                "result_next": [],
+                "result_time": {
+                    "_0": _DEFAULT_TIME,
+                },
+            },
+            "time": _DEFAULT_TIME,
+        },
+        is_reusable=True,
+    )
+    sleep_mock = mocker.patch("time.sleep")
+
+    api = Bitrix24()
+    with pytest.raises(RetryApiResponseError):
+        list(
+            api.batch(
+                [
+                    {"method": "profile"},
+                    {"method": "telephony.externalLine.get"},
+                    {"method": "department.get", "parameters": {"ID": 1}},
+                ],
+            ),
+        )
+
+    num_retries = 5
+    assert sleep_mock.call_count == num_retries - 1
 
 
 @pytest.mark.parametrize(("total_items", "list_size"), [(150, 50), (155, 50), (10, 50), (45, 20)])
