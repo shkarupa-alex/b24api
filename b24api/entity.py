@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Annotated, Any, Self
 
-from pydantic import BaseModel, BeforeValidator, constr
+from pydantic import BaseModel, BeforeValidator, field_validator
 
 from b24api.error import ApiResponseError, RetryApiResponseError
 from b24api.query import build_query
@@ -45,8 +45,17 @@ class ListRequest(Request):
 class ErrorResponse(BaseModel):
     """API error response."""
 
-    error: constr(to_lower=True)
+    error: str | int
     error_description: str
+
+    @field_validator("error")
+    @classmethod
+    def error_to_lower_str(cls, value: Any) -> Any:  # noqa: ANN401
+        if not isinstance(value, int):
+            value = str(value)
+        if isinstance(value, str):
+            value = value.lower()
+        return value
 
     def raise_error(self, retry_errors: list[str]) -> Self:
         if self.error in retry_errors:
