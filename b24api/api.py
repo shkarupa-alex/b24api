@@ -54,7 +54,7 @@ class Bitrix24:
         http_response = self.client.post(
             f"{self.settings.webhook_url}{request.method}",
             headers={"Content-Type": "application/json"},
-            json=request.model_dump()["parameters"],
+            json=request.model_dump(mode="json")["parameters"],
         )
 
         with contextlib.suppress(httpx.ResponseNotRead, json.JSONDecodeError, ValidationError):

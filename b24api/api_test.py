@@ -36,7 +36,7 @@ def test_call_list(httpx_mock: HTTPXMock) -> None:
         method="POST",
         url="https://bitrix24.com/rest/0/test/crm.lead.list",
         match_headers={"Content-Type": "application/json"},
-        match_json={"select": ["ID", "STATUS_ID"]},
+        match_json={"select": ["ID", "STATUS_ID"], "filter": {">DATE_CREATE": "2024-01-02T03:04:00+03:00"}},
         json={
             "result": result,
             "next": 3,
@@ -46,7 +46,15 @@ def test_call_list(httpx_mock: HTTPXMock) -> None:
     )
 
     api = Bitrix24()
-    response = api.call({"method": "crm.lead.list", "parameters": {"select": ["ID", "STATUS_ID"]}})
+    response = api.call(
+        {
+            "method": "crm.lead.list",
+            "parameters": {
+                "select": ["ID", "STATUS_ID"],
+                "filter": {">DATE_CREATE": datetime(2024, 1, 2, 3, 4, tzinfo=timezone(timedelta(hours=3)))},
+            },
+        },
+    )
     assert response == result
 
 
