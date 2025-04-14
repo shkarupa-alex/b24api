@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "b24api"
-version = "0.3.6"
+version = "0.3.7"
 description = "Bitrix24 API"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "fast-depends>=2.4.12",
     "httpx[http2]>=0.28.1",
@@ -28,7 +28,7 @@ dev = [
 fix = true
 unsafe-fixes = true
 line-length = 120
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.format]
 docstring-code-format = true
