@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Annotated, Any, Self
+from typing import Annotated, Any
 
 from pydantic import BaseModel, BeforeValidator, field_validator
 
@@ -57,7 +57,7 @@ class ErrorResponse(BaseModel):
             value = value.lower()
         return value
 
-    def raise_error(self, retry_errors: list[str]) -> Self:
+    def raise_error(self, retry_errors: list[str]) -> None:
         if self.error in retry_errors:
             raise RetryApiResponseError(
                 code=self.error,
