@@ -1,11 +1,17 @@
 [build-system]
-requires = ["setuptools >= 75"]
+requires = [
+    "setuptools>=41",
+    "wheel",
+    "setuptools-git-versioning>=2.0,<3"
+]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools-git-versioning]
+enabled = true
 
 [project]
 name = "b24api"
-version = "0.3.8"
+dynamic = ["version"]
 description = "Bitrix24 API"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,6 +28,9 @@ dev = [
     "pytest-env>=1.1.5",
     "pytest-httpx>=0.35.0",
     "pytest-mock>=3.14.0",
+    "setuptools>=80.9.0",
+    "setuptools-git-versioning>=2.1.0",
+    "wheel>=0.45.1",
 ]
 
 [tool.ruff]
