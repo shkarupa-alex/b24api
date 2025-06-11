@@ -6,6 +6,7 @@ from functools import partial
 from itertools import chain, islice
 from operator import itemgetter
 
+import h2.exceptions
 import httpx
 from fast_depends import inject
 from pydantic import ValidationError
@@ -27,9 +28,8 @@ class Bitrix24:
         retry_ = partial(
             retry,
             exceptions=(
-                httpx.ConnectError,
-                httpx.ConnectTimeout,
-                httpx.RemoteProtocolError,
+                httpx.TransportError,
+                h2.exceptions.ProtocolError,
                 RetryHTTPStatusError,
                 RetryApiResponseError,
             ),
