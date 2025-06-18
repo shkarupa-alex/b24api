@@ -5,10 +5,7 @@ from b24api.type import ApiTypes
 
 
 def build_query(parameters: dict[int | str, ApiTypes], path: str = "%s") -> str:
-    query = []
-
-    if parameters is None:
-        return ""
+    query: list[str] = []
 
     for key, value in parameters.items():
         if value is None:
