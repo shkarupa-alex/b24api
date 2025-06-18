@@ -1,49 +1,49 @@
 import contextlib
-import json
 import logging
 from collections.abc import Generator, Iterable
-from functools import partial
 from itertools import chain, islice
 from operator import itemgetter
 
 import h2.exceptions
 import httpx
 from fast_depends import inject
+from httpx import Client
 from pydantic import ValidationError
-from retry import retry
+from tenacity import Retrying, before_sleep_log, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from b24api.entity import ApiTypes, BatchResult, ErrorResponse, ListRequest, Request, Response
 from b24api.error import RetryApiResponseError, RetryHTTPStatusError
 from b24api.settings import ApiSettings
-from b24api.transport import HttpxClient
 
 
 class Bitrix24:
+    http: Client = Client(http2=True)
+
     @inject
-    def __init__(self, client: HttpxClient, settings: ApiSettings) -> None:
-        self.client = client
+    def __init__(self, settings: ApiSettings) -> None:
         self.settings = settings
         self.logger = logging.getLogger("b24api")
 
-        retry_ = partial(
-            retry,
-            exceptions=(
-                httpx.TransportError,
-                h2.exceptions.ProtocolError,
-                RetryHTTPStatusError,
-                RetryApiResponseError,
+        self.http.timeout = self.settings.http_timeout
+
+        self.retry = Retrying(
+            retry=retry_if_exception_type(
+                (
+                    httpx.TransportError,
+                    h2.exceptions.ProtocolError,
+                    RetryHTTPStatusError,
+                    RetryApiResponseError,
+                ),
             ),
-            tries=self.settings.retry_tries,
-            delay=self.settings.retry_delay,
-            backoff=self.settings.retry_backoff,
-            logger=self.logger,
+            wait=wait_exponential(multiplier=self.settings.retry_delay, exp_base=self.settings.retry_backoff),
+            stop=stop_after_attempt(self.settings.retry_attempts),
+            before_sleep=before_sleep_log(self.logger, logging.WARNING),
+            reraise=True,
         )
-        self._call_retry = retry_()(self._call)
-        self._batch_retry = retry_()(self._batch)
 
     def call(self, request: Request | dict) -> ApiTypes:
-        """Call any method (with retries) and return just `result`."""
-        return self._call_retry(request).result
+        """Call any method (with retries) and return `result` from response."""
+        return self.retry(self._call, request).result
 
     def _call(self, request: Request | dict) -> Response:
         """Call any method and return full response."""
@@ -51,17 +51,17 @@ class Bitrix24:
 
         self.logger.debug("Sending request: %s", request)
 
-        http_response = self.client.post(
+        http_response = self.http.post(
             f"{self.settings.webhook_url}{request.method}",
             headers={"Content-Type": "application/json"},
             json=request.model_dump(mode="json")["parameters"],
         )
 
-        with contextlib.suppress(httpx.ResponseNotRead, json.JSONDecodeError, ValidationError):
-            ErrorResponse.model_validate(http_response.json()).raise_error(self.settings.retry_errors)
+        with contextlib.suppress(httpx.ResponseNotRead, ValidationError):
+            ErrorResponse.model_validate_json(http_response.content).raise_error(self.settings.retry_errors)
 
         try:
-            json_response = http_response.raise_for_status().json()
+            http_response.raise_for_status()
         except httpx.HTTPStatusError as error:
             if http_response.status_code in self.settings.retry_statuses:
                 raise RetryHTTPStatusError(
@@ -71,11 +71,7 @@ class Bitrix24:
                 ) from error
             raise
 
-        with contextlib.suppress(ValidationError):
-            ErrorResponse.model_validate(json_response).raise_error(self.settings.retry_errors)
-
-        response = Response.model_validate(json_response)
-
+        response = Response.model_validate_json(http_response.content)
         self.logger.debug("Received response: %s", response)
 
         return response
@@ -84,17 +80,17 @@ class Bitrix24:
         self,
         requests: Iterable[Request | dict],
         batch_size: int | None = None,
-    ) -> Generator[ApiTypes, None, None]:
-        """Call infinite sequence of methods within batches and return just `result`s."""
+    ) -> Generator[ApiTypes]:
+        """Call unlimited sequence of methods within batches and return `result` from responses."""
         batch_size = batch_size or self.settings.batch_size
 
         tail_requests = iter(requests)
         while batched_requests := list(islice(tail_requests, batch_size)):
-            for response in self._batch_retry(batched_requests):
+            for response in self.retry(self._batch, batched_requests):
                 yield response.result
 
     def _batch(self, requests: Iterable[Request | dict]) -> list[Response]:
-        """Call batch of methods and return full responses."""
+        """Call limited batch of methods and return full responses."""
         commands = {f"_{i}": Request.model_validate(request) for i, request in enumerate(requests)}
         request = Request(
             method="batch",
@@ -139,7 +135,7 @@ class Bitrix24:
         self,
         request: Request | dict,
         list_size: int | None = None,
-    ) -> Generator[ApiTypes, None, None]:
+    ) -> Generator[ApiTypes]:
         """Call `list` method and return full `result`.
 
         Slow (sequential tail) list gathering for methods without `filter` parameter (e.g. `department.get`).
@@ -150,7 +146,7 @@ class Bitrix24:
         head_request = request.model_copy(deep=True)
         head_request.parameters["start"] = 0
 
-        head_response = self._call_retry(head_request)
+        head_response = self.retry(self._call, head_request)
         yield from self._fix_list_result(head_response.result)
 
         if head_response.next and head_response.next != list_size:
@@ -160,7 +156,7 @@ class Bitrix24:
         for start in range(list_size, total, list_size):
             tail_request = head_request.model_copy(deep=True)
             tail_request.parameters["start"] = start
-            tail_response = self._call_retry(tail_request)
+            tail_response = self.retry(self._call, tail_request)
 
             if tail_response.next and tail_response.next != start + list_size:
                 raise ValueError(
@@ -173,7 +169,7 @@ class Bitrix24:
         request: Request | dict,
         list_size: int | None = None,
         batch_size: int | None = None,
-    ) -> Generator[ApiTypes, None, None]:
+    ) -> Generator[ApiTypes]:
         """Call `list` method and return full `result`.
 
         Faster (batched tail) list gathering for methods without `filter` parameter (e.g. `department.get`).
@@ -185,13 +181,13 @@ class Bitrix24:
         head_request = request.model_copy(deep=True)
         head_request.parameters["start"] = 0
 
-        head_response = self._call_retry(head_request)
+        head_response = self.retry(self._call, head_request)
         yield from self._fix_list_result(head_response.result)
 
         if head_response.next and head_response.next != list_size:
             raise ValueError(f"Expecting chunk size to be {list_size}. Got: {head_response.next}")
 
-        def _tail_requests() -> Generator[Request, None, None]:
+        def _tail_requests() -> Generator[Request]:
             total = head_response.total or 0
             for start in range(list_size, total, list_size):
                 tail_request = head_request.model_copy(deep=True)
@@ -209,7 +205,7 @@ class Bitrix24:
         id_key: str = "ID",
         list_size: int | None = None,
         batch_size: int | None = None,
-    ) -> Generator[ApiTypes, None, None]:
+    ) -> Generator[ApiTypes]:
         """Call `list` method and return full `result`.
 
         Fastest (batched, no count) list gathering for methods with `filter` parameter (e.g. `crm.lead.list`).
@@ -232,7 +228,7 @@ class Bitrix24:
             )
 
         if request.parameters.order:
-            raise ValueError("Ordering parameters are reserved `order`in `list_batched_no_count`")
+            raise ValueError("Ordering parameters are reserved in `list_batched_no_count`")
 
         head_request = request.model_copy(deep=True)
         head_request.parameters.start = -1
@@ -249,7 +245,7 @@ class Bitrix24:
         max_head_id = max(map(int, map(get_id, head_result)), default=None)
         min_tail_id = min(map(int, map(get_id, tail_result)), default=None)
 
-        def _body_requests() -> Generator[ListRequest, None, None]:
+        def _body_requests() -> Generator[ListRequest]:
             for start in range(max_head_id, min_tail_id, list_size):
                 body_request = head_request.model_copy(deep=True)
                 body_request.parameters.filter[id_from] = start
@@ -273,8 +269,8 @@ class Bitrix24:
         id_key: str = "ID",
         list_size: int | None = None,
         batch_size: int | None = None,
-    ) -> Generator[ApiTypes, None, None]:
-        """Call `list` method with reference `updates` to filter and return full `result`.
+    ) -> Generator[ApiTypes]:
+        """Call `list` method with reference `updates` for `filter` and return full `result`.
 
         Fastest (batched, no count) list gathering for methods with `filter` parameter and required `reference`
         (e.g. `crm.timeline.comment.list`).
@@ -299,7 +295,7 @@ class Bitrix24:
         if request.parameters.order:
             raise ValueError("Ordering parameters are reserved `order`in `reference_batched_no_count`")
 
-        def _tail_requests() -> Generator[ListRequest, None, None]:
+        def _tail_requests() -> Generator[ListRequest]:
             for update in updates:
                 if id_from in update:
                     raise ValueError(
@@ -354,6 +350,6 @@ class Bitrix24:
         value = result[key]
 
         if not isinstance(value, list):
-            raise TypeError(f"If `result` is a `dict`, expecting single `list` item. Got: {result}")
+            raise TypeError(f"If `result` is a `dict`, expecting single item to be a `list`. Got: {result}")
 
         return value
