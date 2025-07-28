@@ -215,6 +215,48 @@ def test_batch(httpx_mock: HTTPXMock) -> None:
     assert list(response) == result
 
 
+def test_batch_payload(httpx_mock: HTTPXMock) -> None:
+    result = [
+        _DEFAULT_PROFILE,
+        {"items": _DEFAULT_LEADS},
+        [{"ID": "1", "NAME": "Main department", "SORT": 500, "UF_HEAD": "1"}],
+    ]
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/batch",
+        match_headers={"Content-Type": "application/json"},
+        match_json={
+            "halt": True,
+            "cmd": {
+                "_0": "profile",
+                "_1": "crm.lead.list?select%5B0%5D=ID&select%5B1%5D=STATUS_ID&start=-1",
+                "_2": "department.get?ID=1",
+            },
+        },
+        json={
+            "result": {
+                "result": {f"_{i}": r for i, r in enumerate(result)},
+                "result_error": [],
+                "result_total": {"_1": 2, "_2": 1},
+                "result_next": [],
+                "result_time": {f"_{i}": _DEFAULT_TIME for i in range(3)},
+            },
+            "time": _DEFAULT_TIME,
+        },
+    )
+
+    api = Bitrix24()
+    response = api.batch(
+        [
+            ({"method": "profile"}, {"payload": 0}),
+            ({"method": "crm.lead.list", "parameters": {"select": ["ID", "STATUS_ID"], "start": -1}}, {"payload": 1}),
+            ({"method": "department.get", "parameters": {"ID": 1}}, {"payload": 2}),
+        ],
+        with_payload=True,
+    )
+    assert list(response) == [(r, {"payload": i}) for i, r in enumerate(result)]
+
+
 def test_batch_api_error(httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(
         method="POST",
@@ -516,6 +558,90 @@ def test_reference_batched_no_count(httpx_mock: HTTPXMock, total_items: int, lis
         batch_size=batch_size,
     )
     assert sorted(response, key=lambda r: r["ID"]) == result
+
+
+@pytest.mark.parametrize(
+    ("total_items", "list_size", "batch_size"),
+    [(150, 50, 1), (155, 50, 1), (10, 50, 50)],
+)
+def test_reference_batched_no_count_payload(
+    httpx_mock: HTTPXMock,
+    total_items: int,
+    list_size: int,
+    batch_size: int,
+) -> None:
+    result = [
+        {"ID": i + j * total_items, "ENTITY_TYPE": "deal", "ENTITY_ID": j}
+        for i in range(total_items)
+        for j in range(total_items - i)
+    ]
+    result = sorted(result, key=lambda r: r["ID"])
+
+    def custom_response(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://bitrix24.com/rest/0/test/batch"
+
+        output = {}
+        for key, value in json.loads(request.content)["cmd"].items():
+            method, command = value.split("?")
+            assert method == "crm.timeline.comment.list"
+
+            command = parse_qs(command)
+            assert command.pop("select[0]", None) == ["ID"]
+            assert command.pop("select[1]", None) == ["ENTITY_ID"]
+            assert command.pop("filter[=ENTITY_TYPE]", None) == ["deal"]
+            assert command.pop("order[ID]", None) == ["ASC"]
+            assert command.pop("start", None) == ["-1"]
+
+            entity_id = command.pop("filter[=ENTITY_ID]", [-1])
+            assert entity_id
+            assert len(entity_id) == 1
+
+            from_id = command.pop("filter[>ID]", [-1])
+            assert from_id
+            assert len(from_id) == 1
+
+            assert not command
+
+            entity_id = int(entity_id[0])
+            from_id = int(from_id[0])
+
+            data = [r for r in result if r["ENTITY_ID"] == entity_id and r["ID"] > from_id]
+            output[key] = data[:list_size]
+
+        return httpx.Response(
+            status_code=200,
+            json={
+                "result": {
+                    "result": output,
+                    "result_error": [],
+                    "result_total": [],
+                    "result_next": [],
+                    "result_time": dict.fromkeys(output, _DEFAULT_TIME),
+                },
+                "time": _DEFAULT_TIME,
+            },
+        )
+
+    httpx_mock.add_callback(custom_response, is_reusable=True)
+
+    api = Bitrix24()
+    response = api.reference_batched_no_count(
+        {
+            "method": "crm.timeline.comment.list",
+            "parameters": {"select": ["ID", "ENTITY_ID"], "filter": {"=ENTITY_TYPE": "deal"}},
+        },
+        (({"=ENTITY_ID": i}, {"payload": i}) for i in range(total_items)),
+        list_size=list_size,
+        batch_size=batch_size,
+        with_payload=True,
+    )
+    response = list(response)
+    assert len(response)
+    assert len(response[0]) == 2
+
+    response, payload = zip(*response, strict=False)
+    assert sorted(response, key=lambda r: r["ID"]) == result
+    assert payload[0] == {"payload": 0}
 
 
 _DEFAULT_TIME = {

@@ -3,6 +3,7 @@ import logging
 from collections.abc import Generator, Iterable
 from itertools import chain, islice
 from operator import itemgetter
+from typing import Any
 
 import h2.exceptions
 import httpx
@@ -78,16 +79,26 @@ class Bitrix24:
 
     def batch(
         self,
-        requests: Iterable[Request | dict],
+        requests: Iterable[Request | dict | tuple[Request | dict, Any]],
+        *,
         batch_size: int | None = None,
-    ) -> Generator[ApiTypes]:
+        with_payload: bool = False,
+    ) -> Generator[ApiTypes | tuple[ApiTypes, Any]]:
         """Call unlimited sequence of methods within batches and return `result` from responses."""
         batch_size = batch_size or self.settings.batch_size
 
         tail_requests = iter(requests)
         while batched_requests := list(islice(tail_requests, batch_size)):
-            for response in self.retry(self._batch, batched_requests):
-                yield response.result
+            if with_payload:
+                batched_requests, batched_payloads = zip(*batched_requests, strict=True)
+            else:
+                batched_payloads = None
+
+            for i, response in enumerate(self.retry(self._batch, batched_requests)):
+                if with_payload:
+                    yield response.result, batched_payloads[i]
+                else:
+                    yield response.result
 
     def _batch(self, requests: Iterable[Request | dict]) -> list[Response]:
         """Call limited batch of methods and return full responses."""
@@ -134,6 +145,7 @@ class Bitrix24:
     def list_sequential(
         self,
         request: Request | dict,
+        *,
         list_size: int | None = None,
     ) -> Generator[ApiTypes]:
         """Call `list` method and return full `result`.
@@ -167,6 +179,7 @@ class Bitrix24:
     def list_batched(
         self,
         request: Request | dict,
+        *,
         list_size: int | None = None,
         batch_size: int | None = None,
     ) -> Generator[ApiTypes]:
@@ -194,7 +207,7 @@ class Bitrix24:
                 tail_request.parameters["start"] = start
                 yield tail_request
 
-        tail_responses = self.batch(_tail_requests(), batch_size)
+        tail_responses = self.batch(_tail_requests(), batch_size=batch_size)
         tail_responses = map(self._fix_list_result, tail_responses)
         tail_responses = chain.from_iterable(tail_responses)
         yield from tail_responses
@@ -202,6 +215,7 @@ class Bitrix24:
     def list_batched_no_count(
         self,
         request: ListRequest | dict,
+        *,
         id_key: str = "ID",
         list_size: int | None = None,
         batch_size: int | None = None,
@@ -238,7 +252,7 @@ class Bitrix24:
         tail_request.parameters.start = -1
         tail_request.parameters.order = {"ID": "DESC"}
 
-        head_tail_result = self.batch([head_request, tail_request])
+        head_tail_result = self.batch([head_request, tail_request], batch_size=batch_size)
         head_result, tail_result = tuple(map(self._fix_list_result, head_tail_result))
         yield from head_result
 
@@ -253,7 +267,7 @@ class Bitrix24:
                 yield body_request
 
         if max_head_id and min_tail_id and max_head_id < min_tail_id:
-            body = self.batch(_body_requests(), batch_size)
+            body = self.batch(_body_requests(), batch_size=batch_size)
             body = map(self._fix_list_result, body)
             body = chain.from_iterable(body)
             yield from body
@@ -265,11 +279,13 @@ class Bitrix24:
     def reference_batched_no_count(
         self,
         request: ListRequest | dict,
-        updates: Iterable[dict],
+        updates: Iterable[dict | tuple[dict, Any]],
+        *,
         id_key: str = "ID",
         list_size: int | None = None,
         batch_size: int | None = None,
-    ) -> Generator[ApiTypes]:
+        with_payload: bool = False,
+    ) -> Generator[ApiTypes | tuple[ApiTypes, Any]]:
         """Call `list` method with reference `updates` for `filter` and return full `result`.
 
         Fastest (batched, no count) list gathering for methods with `filter` parameter and required `reference`
@@ -295,8 +311,13 @@ class Bitrix24:
         if request.parameters.order:
             raise ValueError("Ordering parameters are reserved `order`in `reference_batched_no_count`")
 
-        def _tail_requests() -> Generator[ListRequest]:
+        def _tail_requests() -> Generator[ListRequest | tuple[ListRequest, Any]]:
             for update in updates:
+                if with_payload:
+                    update, payload = update
+                else:
+                    payload = None
+
                 if id_from in update:
                     raise ValueError(
                         f"Filter parameters `{id_from}` is reserved in `reference_batched_no_count`",
@@ -305,21 +326,37 @@ class Bitrix24:
                 tail_request.parameters.filter |= update
                 tail_request.parameters.start = -1
                 tail_request.parameters.order = {"ID": "ASC"}
-                yield tail_request
+
+                if with_payload:
+                    yield tail_request, payload
+                else:
+                    yield tail_request
 
         head_requests = []
         tail_requests = iter(_tail_requests())
         while body_requests := head_requests + list(islice(tail_requests, batch_size - len(head_requests))):
-            body_results = self.batch(body_requests, batch_size)
+            if with_payload:
+                body_requests, body_payloads = zip(*body_requests, strict=True)
+            else:
+                body_payloads = None
+
+            body_results = self.batch(body_requests, batch_size=batch_size)
             body_results = map(self._fix_list_result, body_results)
 
             head_requests = []
-            for body_request, body_result in zip(body_requests, body_results, strict=True):
+            for i, (body_request, body_result) in enumerate(zip(body_requests, body_results, strict=True)):
                 if len(body_result) == list_size:
                     max_id = max(map(int, map(get_id, body_result)), default=None)
                     head_request = body_request.model_copy(deep=True)
                     head_request.parameters.filter[id_from] = max_id
-                    head_requests.append(head_request)
+                    if with_payload:
+                        head_requests.append((head_request, body_payloads[i]))
+                    else:
+                        head_requests.append(head_request)
+
+                if with_payload:
+                    body_payload = [body_payloads[i]] * len(body_result)
+                    body_result = zip(body_result, body_payload, strict=True)
 
                 yield from body_result
 
