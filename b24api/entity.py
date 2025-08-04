@@ -57,15 +57,17 @@ class ErrorResponse(BaseModel):
             value = value.lower()
         return value
 
-    def raise_error(self, retry_errors: list[str]) -> None:
+    def raise_error(self, request: Request, retry_errors: list[str]) -> None:
         if self.error in retry_errors:
             raise RetryApiResponseError(
                 code=self.error,
                 description=self.error_description,
+                request=str(request),
             )
         raise ApiResponseError(
             code=self.error,
             description=self.error_description,
+            request=str(request),
         )
 
 

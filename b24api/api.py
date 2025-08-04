@@ -59,7 +59,7 @@ class Bitrix24:
         )
 
         with contextlib.suppress(httpx.ResponseNotRead, ValidationError):
-            ErrorResponse.model_validate_json(http_response.content).raise_error(self.settings.retry_errors)
+            ErrorResponse.model_validate_json(http_response.content).raise_error(request, self.settings.retry_errors)
 
         try:
             http_response.raise_for_status()
@@ -119,7 +119,10 @@ class Bitrix24:
             key = f"_{i}"
 
             if key in result.result_error:
-                ErrorResponse.model_validate(result.result_error[key]).raise_error(self.settings.retry_errors)
+                ErrorResponse.model_validate(result.result_error[key]).raise_error(
+                    commands[key],
+                    self.settings.retry_errors,
+                )
 
             command = commands[key]
             if key not in result.result:
