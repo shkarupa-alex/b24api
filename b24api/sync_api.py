@@ -56,11 +56,11 @@ class SyncBitrix24(BaseBitrix24):
         """Call unlimited sequence of methods within batches and return `result` from responses."""
         batch_size = batch_size or self.settings.batch_size
 
-        for batched_requests in batched(requests, batch_size):
+        for batched_requests_ in batched(requests, batch_size):
             if with_payload:
-                batched_requests, batched_payloads = zip(*batched_requests, strict=True)
+                batched_requests, batched_payloads = zip(*batched_requests_, strict=True)
             else:
-                batched_payloads = None
+                batched_requests, batched_payloads = batched_requests_, None
 
             batched_responses = self.retry(self._batch, batched_requests)
 

@@ -638,7 +638,7 @@ def test_reference_batched_no_count_payload(
     )
     response = list(response)
     assert response
-    assert len(response[0]) == 2
+    assert len(response[0]) == 2  # noqa: PLR2004
 
     response, payload = zip(*response, strict=False)
     assert sorted(response, key=lambda r: r["ID"]) == result
