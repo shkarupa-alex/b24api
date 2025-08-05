@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 from datetime import datetime, timedelta, timezone
@@ -409,10 +410,11 @@ async def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: 
         max_chunks = math.ceil((total_items - batch_start) / batch_size)
         commands, results, times = {}, {}, {}
         for chunk in range(min(batch_size, max_chunks)):
+            width = len(str(min(batch_size, max_chunks)))
             start = batch_start + chunk * list_size
-            commands[f"_{chunk}"] = f"crm.lead.list?start={start}"
-            results[f"_{chunk}"] = result[start : start + list_size]
-            times[f"_{chunk}"] = _DEFAULT_TIME
+            commands[f"_{chunk:0>{width}d}"] = f"crm.lead.list?start={start}"
+            results[f"_{chunk:0>{width}d}"] = result[start : start + list_size]
+            times[f"_{chunk:0>{width}d}"] = _DEFAULT_TIME
         httpx_mock.add_response(
             method="POST",
             url="https://bitrix24.com/rest/0/test/batch",
@@ -687,6 +689,92 @@ async def test_reference_batched_no_count_payload(
     response, payload = zip(*response, strict=False)
     assert sorted(response, key=lambda r: r["ID"]) == result
     assert payload[0] == {"payload": 0}
+
+
+@pytest.mark.parametrize(
+    ("total_items", "list_size", "batch_size"),
+    [(150, 50, 1), (155, 50, 10), (10, 50, 50)],
+)
+@mark.asyncio
+async def test_reference_batched_no_count_async_updates(
+    httpx_mock: HTTPXMock,
+    total_items: int,
+    list_size: int,
+    batch_size: int,
+) -> None:
+    result = [
+        {"ID": i + j * total_items, "ENTITY_TYPE": "deal", "ENTITY_ID": j}
+        for i in range(total_items)
+        for j in range(total_items - i)
+    ]
+    result = sorted(result, key=lambda r: r["ID"])
+
+    def custom_response(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://bitrix24.com/rest/0/test/batch"
+
+        output = {}
+        for key, value in json.loads(request.content)["cmd"].items():
+            method, command = value.split("?")
+            assert method == "crm.timeline.comment.list"
+
+            command = parse_qs(command)
+            assert command.pop("select[0]", None) == ["ID"]
+            assert command.pop("select[1]", None) == ["ENTITY_ID"]
+            assert command.pop("filter[=ENTITY_TYPE]", None) == ["deal"]
+            assert command.pop("order[ID]", None) == ["ASC"]
+            assert command.pop("start", None) == ["-1"]
+
+            entity_id = command.pop("filter[=ENTITY_ID]", [-1])
+            assert entity_id
+            assert len(entity_id) == 1
+
+            from_id = command.pop("filter[>ID]", [-1])
+            assert from_id
+            assert len(from_id) == 1
+
+            assert not command
+
+            entity_id = int(entity_id[0])
+            from_id = int(from_id[0])
+
+            data = [r for r in result if r["ENTITY_ID"] == entity_id and r["ID"] > from_id]
+            output[key] = data[:list_size]
+
+        return httpx.Response(
+            status_code=200,
+            json={
+                "result": {
+                    "result": output,
+                    "result_error": [],
+                    "result_total": [],
+                    "result_next": [],
+                    "result_time": dict.fromkeys(output, _DEFAULT_TIME),
+                },
+                "time": _DEFAULT_TIME,
+            },
+        )
+
+    httpx_mock.add_callback(custom_response, is_reusable=True)
+
+    async def _updates():
+        for i in range(total_items):
+            await asyncio.sleep(0.0001)
+            yield {"=ENTITY_ID": i}
+
+    api = AsyncBitrix24()
+    response = [
+        r
+        async for r in api.reference_batched_no_count(
+            {
+                "method": "crm.timeline.comment.list",
+                "parameters": {"select": ["ID", "ENTITY_ID"], "filter": {"=ENTITY_TYPE": "deal"}},
+            },
+            _updates(),
+            list_size=list_size,
+            batch_size=batch_size,
+        )
+    ]
+    assert sorted(response, key=lambda r: r["ID"]) == result
 
 
 _DEFAULT_TIME = {

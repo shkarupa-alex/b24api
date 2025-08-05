@@ -3,6 +3,15 @@ revision = 2
 requires-python = ">=3.12"
 
 [[package]]
+name = "aioitertools"
+version = "0.12.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/de/38491a84ab323b47c7f86e94d2830e748780525f7a10c8600b67ead7e9ea/aioitertools-0.12.0.tar.gz", hash = "sha256:c2a9055b4fbb7705f561b9d86053e8af5d10cc845d22c32008c43490b2d8dd6b", size = 19369, upload-time = "2024-09-02T03:33:40.349Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/85/13/58b70a580de00893223d61de8fea167877a3aed97d4a5e1405c9159ef925/aioitertools-0.12.0-py3-none-any.whl", hash = "sha256:fc1f5fac3d737354de8831cbba3eb04f79dd649d8f3afb4c5b114925e662a796", size = 24345, upload-time = "2024-09-02T03:34:59.454Z" },
+]
+
+[[package]]
 name = "annotated-types"
 version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
@@ -29,6 +38,7 @@ wheels = [
 name = "b24api"
 source = { editable = "." }
 dependencies = [
+    { name = "aioitertools" },
     { name = "fast-depends" },
     { name = "httpx", extra = ["http2"] },
     { name = "pydantic" },
@@ -49,6 +59,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aioitertools", specifier = ">=0.12.0" },
     { name = "fast-depends", specifier = ">=2.4.12" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.28.1" },
     { name = "pydantic", specifier = ">=2.11.7" },

@@ -384,10 +384,11 @@ def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: int, b
         max_chunks = math.ceil((total_items - batch_start) / batch_size)
         commands, results, times = {}, {}, {}
         for chunk in range(min(batch_size, max_chunks)):
+            width = len(str(min(batch_size, max_chunks)))
             start = batch_start + chunk * list_size
-            commands[f"_{chunk}"] = f"crm.lead.list?start={start}"
-            results[f"_{chunk}"] = result[start : start + list_size]
-            times[f"_{chunk}"] = _DEFAULT_TIME
+            commands[f"_{chunk:0>{width}d}"] = f"crm.lead.list?start={start}"
+            results[f"_{chunk:0>{width}d}"] = result[start : start + list_size]
+            times[f"_{chunk:0>{width}d}"] = _DEFAULT_TIME
         httpx_mock.add_response(
             method="POST",
             url="https://bitrix24.com/rest/0/test/batch",
