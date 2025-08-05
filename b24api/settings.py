@@ -10,6 +10,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     webhook_url: HttpUrl
 
+    logger_name: str = "b24api"
+
     http_timeout: int = 30
 
     retry_statuses: list[int] = (

@@ -1,8 +1,8 @@
 [build-system]
 requires = [
-    "setuptools>=41",
-    "wheel",
-    "setuptools-git-versioning>=2.0,<3"
+    "setuptools>=80.9.0",
+    "setuptools-git-versioning>=2.1.0",
+    "wheel>=0.45.1",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -14,12 +14,13 @@ name = "b24api"
 dynamic = ["version"]
 description = "Bitrix24 API"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "fast-depends>=2.4.12",
     "httpx[http2]>=0.28.1",
-    "pydantic>=2.10.6",
-    "pydantic-settings>=2.8.1",
+    "pydantic>=2.11.7",
+    "pydantic-settings>=2.10.1",
+    "pytest-asyncio>=1.1.0",
     "tenacity>=9.1.2",
 ]
 
@@ -27,7 +28,7 @@ dependencies = [
 dev = [
     "pytest-env>=1.1.5",
     "pytest-httpx>=0.35.0",
-    "pytest-mock>=3.14.0",
+    "pytest-mock>=3.14.1",
     "setuptools>=80.9.0",
     "setuptools-git-versioning>=2.1.0",
     "wheel>=0.45.1",
@@ -37,7 +38,7 @@ dev = [
 fix = true
 unsafe-fixes = true
 line-length = 120
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.format]
 docstring-code-format = true

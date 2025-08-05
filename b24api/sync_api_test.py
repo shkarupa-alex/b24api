@@ -8,8 +8,8 @@ import pytest
 from pytest_httpx import HTTPXMock
 from pytest_mock import MockerFixture
 
-from b24api.api import Bitrix24
 from b24api.error import ApiResponseError, RetryApiResponseError, RetryHTTPStatusError
+from b24api.sync_api import SyncBitrix24
 
 
 def test_call(httpx_mock: HTTPXMock) -> None:
@@ -25,7 +25,7 @@ def test_call(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     response = api.call({"method": "profile"})
     assert response == result
 
@@ -45,7 +45,7 @@ def test_call_list(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     response = api.call(
         {
             "method": "crm.lead.list",
@@ -68,7 +68,7 @@ def test_call_status_error(httpx_mock: HTTPXMock) -> None:
         content=b"",
     )
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     with pytest.raises(httpx.HTTPStatusError):
         api.call({"method": "profile"})
 
@@ -85,7 +85,7 @@ def test_call_retry_status_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -
     )
     sleep_mock = mocker.patch("time.sleep")
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     with pytest.raises(RetryHTTPStatusError):
         api.call({"method": "profile"})
 
@@ -106,7 +106,7 @@ def test_call_api_error(httpx_mock: HTTPXMock) -> None:
         is_reusable=True,
     )
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     with pytest.raises(ApiResponseError):
         api.call({"method": "profile"})
 
@@ -125,7 +125,7 @@ def test_call_retry_api_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> N
     )
     sleep_mock = mocker.patch("time.sleep")
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     with pytest.raises(RetryApiResponseError):
         api.call({"method": "profile"})
 
@@ -146,7 +146,7 @@ def test_call_status_and_api_error(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     with pytest.raises(ApiResponseError):
         api.call({"method": "profile"})
 
@@ -166,7 +166,7 @@ def test_call_retry_status_and_api_error(httpx_mock: HTTPXMock, mocker: MockerFi
     )
     sleep_mock = mocker.patch("time.sleep")
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     with pytest.raises(RetryApiResponseError):
         api.call({"method": "profile"})
 
@@ -204,7 +204,7 @@ def test_batch(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     response = api.batch(
         [
             {"method": "profile"},
@@ -245,7 +245,7 @@ def test_batch_payload(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     response = api.batch(
         [
             ({"method": "profile"}, {"payload": 0}),
@@ -282,7 +282,7 @@ def test_batch_api_error(httpx_mock: HTTPXMock) -> None:
         },
     )
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     with pytest.raises(ApiResponseError):
         list(
             api.batch(
@@ -322,7 +322,7 @@ def test_batch_retry_api_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> 
     )
     sleep_mock = mocker.patch("time.sleep")
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     with pytest.raises(RetryApiResponseError):
         list(
             api.batch(
@@ -355,7 +355,7 @@ def test_list_sequential(httpx_mock: HTTPXMock, total_items: int, list_size: int
             | ({} if start + list_size >= total_items else {"next": start + list_size}),
         )
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     response = api.list_sequential(
         {"method": "crm.lead.list"},
         list_size=list_size,
@@ -406,7 +406,7 @@ def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: int, b
             },
         )
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     response = api.list_batched(
         {"method": "crm.lead.list"},
         list_size=list_size,
@@ -471,7 +471,7 @@ def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, list_siz
 
     httpx_mock.add_callback(custom_response, is_reusable=True)
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     response = api.list_batched_no_count(
         {
             "method": "crm.lead.list",
@@ -547,7 +547,7 @@ def test_reference_batched_no_count(httpx_mock: HTTPXMock, total_items: int, lis
 
     httpx_mock.add_callback(custom_response, is_reusable=True)
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     response = api.reference_batched_no_count(
         {
             "method": "crm.timeline.comment.list",
@@ -624,7 +624,7 @@ def test_reference_batched_no_count_payload(
 
     httpx_mock.add_callback(custom_response, is_reusable=True)
 
-    api = Bitrix24()
+    api = SyncBitrix24()
     response = api.reference_batched_no_count(
         {
             "method": "crm.timeline.comment.list",
@@ -636,7 +636,7 @@ def test_reference_batched_no_count_payload(
         with_payload=True,
     )
     response = list(response)
-    assert len(response)
+    assert response
     assert len(response[0]) == 2
 
     response, payload = zip(*response, strict=False)
