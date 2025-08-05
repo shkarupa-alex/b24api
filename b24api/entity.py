@@ -130,7 +130,7 @@ class BatchResult(BaseModel):
 
     @field_validator("result", "result_time", "result_error", "result_total", "result_next", mode="before")
     @classmethod
-    def php_dict(cls, value: Any) -> Any:
+    def php_dict(cls, value: Any) -> Any:  # noqa: ANN401
         if isinstance(value, list) and not value:
             return {}
         return value

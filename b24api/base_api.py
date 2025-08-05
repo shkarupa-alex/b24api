@@ -200,14 +200,14 @@ class BatchedNoCountHelper:
 
 
 class ReferenceNoCountHelper:
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         request: ListRequest | dict,
         updates: Iterable[dict | tuple[dict, Any]] | AsyncIterable[dict | tuple[dict, Any]],
         id_key: str,
         list_size: int,
         batch_size: int,
-        with_payload: bool,
+        with_payload: bool,  # noqa: FBT001
     ) -> None:
         request = ListRequest.model_validate(request)
 
@@ -278,12 +278,12 @@ class ReferenceNoCountHelper:
         body_results: list[ApiTypes | tuple[ApiTypes, Any]],
     ) -> tuple[ListRequest | tuple[ListRequest, Any], ...]:
         requests = []
-        for body_request, body_result in zip(body_requests, body_results, strict=True):
+        for body_request_, body_result_ in zip(body_requests, body_results, strict=True):
             if self.with_payload:
-                body_request, body_payload = body_request
-                body_result, _ = body_result
+                body_request, body_payload = body_request_
+                body_result, _ = body_result_
             else:
-                body_payload = None
+                body_request, body_result, body_payload = body_request_, body_result_, None
 
             id_from = f">{self.id_key}"
 
@@ -304,7 +304,6 @@ class ReferenceNoCountHelper:
     ) -> Generator[ApiTypes | tuple[ApiTypes, Any]]:
         if self.with_payload:
             for result, payload in results:
-                result = zip(result, [payload] * len(result), strict=False)
-                yield from result
+                yield from zip(result, [payload] * len(result), strict=False)
         else:
             yield from chain.from_iterable(results)

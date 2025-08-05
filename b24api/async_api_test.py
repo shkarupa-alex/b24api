@@ -1,12 +1,12 @@
 import asyncio
 import json
 import math
+from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs
 
 import httpx
 import pytest
-from pytest import mark
 from pytest_httpx import HTTPXMock
 from pytest_mock import MockerFixture
 
@@ -14,7 +14,7 @@ from b24api.async_api import AsyncBitrix24
 from b24api.error import ApiResponseError, RetryApiResponseError, RetryHTTPStatusError
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_call(httpx_mock: HTTPXMock) -> None:
     result = _DEFAULT_PROFILE
     httpx_mock.add_response(
@@ -33,7 +33,7 @@ async def test_call(httpx_mock: HTTPXMock) -> None:
     assert response == result
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_call_list(httpx_mock: HTTPXMock) -> None:
     result = _DEFAULT_LEADS
     httpx_mock.add_response(
@@ -62,7 +62,7 @@ async def test_call_list(httpx_mock: HTTPXMock) -> None:
     assert response == result
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_call_status_error(httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(
         method="POST",
@@ -78,7 +78,7 @@ async def test_call_status_error(httpx_mock: HTTPXMock) -> None:
         await api.call({"method": "profile"})
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_call_retry_status_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
     httpx_mock.add_response(
         method="POST",
@@ -99,7 +99,7 @@ async def test_call_retry_status_error(httpx_mock: HTTPXMock, mocker: MockerFixt
     assert sleep_mock.call_count == num_retries - 1
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_call_api_error(httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(
         method="POST",
@@ -118,7 +118,7 @@ async def test_call_api_error(httpx_mock: HTTPXMock) -> None:
         await api.call({"method": "profile"})
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_call_retry_api_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
     httpx_mock.add_response(
         method="POST",
@@ -141,7 +141,7 @@ async def test_call_retry_api_error(httpx_mock: HTTPXMock, mocker: MockerFixture
     assert sleep_mock.call_count == num_retries - 1
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_call_status_and_api_error(httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(
         method="POST",
@@ -160,7 +160,7 @@ async def test_call_status_and_api_error(httpx_mock: HTTPXMock) -> None:
         await api.call({"method": "profile"})
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_call_retry_status_and_api_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
     httpx_mock.add_response(
         method="POST",
@@ -184,7 +184,7 @@ async def test_call_retry_status_and_api_error(httpx_mock: HTTPXMock, mocker: Mo
     assert sleep_mock.call_count == num_retries - 1
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_batch(httpx_mock: HTTPXMock) -> None:
     result = [
         _DEFAULT_PROFILE,
@@ -229,7 +229,7 @@ async def test_batch(httpx_mock: HTTPXMock) -> None:
     assert response == result
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_batch_payload(httpx_mock: HTTPXMock) -> None:
     result = [
         _DEFAULT_PROFILE,
@@ -278,7 +278,7 @@ async def test_batch_payload(httpx_mock: HTTPXMock) -> None:
     assert response == [(r, {"payload": i}) for i, r in enumerate(result)]
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_batch_api_error(httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(
         method="POST",
@@ -316,7 +316,7 @@ async def test_batch_api_error(httpx_mock: HTTPXMock) -> None:
             pass
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_batch_retry_api_error(httpx_mock: HTTPXMock, mocker: MockerFixture) -> None:
     httpx_mock.add_response(
         method="POST",
@@ -359,7 +359,7 @@ async def test_batch_retry_api_error(httpx_mock: HTTPXMock, mocker: MockerFixtur
     assert sleep_mock.call_count == num_retries - 1
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("total_items", "list_size"), [(150, 50), (155, 50), (10, 50), (45, 20)])
 async def test_list_sequential(httpx_mock: HTTPXMock, total_items: int, list_size: int) -> None:
     result = [{"ID": str(i), "STATUS_ID": "1"} for i in range(total_items)]
@@ -388,7 +388,7 @@ async def test_list_sequential(httpx_mock: HTTPXMock, total_items: int, list_siz
     assert response == result
 
 
-@mark.asyncio
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("total_items", "list_size", "batch_size"),
     [(150, 50, 1), (155, 50, 1), (10, 50, 50), (5500, 50, 50)],
@@ -449,7 +449,7 @@ async def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: 
     ("total_items", "list_size", "batch_size"),
     [(150, 50, 1), (155, 50, 1), (10, 50, 50), (5500, 50, 50)],
 )
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, list_size: int, batch_size: int) -> None:
     result = [{"ID": i, "STATUS_ID": "1"} for i in range(total_items)]
 
@@ -526,7 +526,7 @@ async def test_list_batched_no_count(httpx_mock: HTTPXMock, total_items: int, li
     ("total_items", "list_size", "batch_size"),
     [(150, 50, 1), (155, 50, 1), (10, 50, 50)],
 )
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_reference_batched_no_count(
     httpx_mock: HTTPXMock,
     total_items: int,
@@ -607,7 +607,7 @@ async def test_reference_batched_no_count(
     ("total_items", "list_size", "batch_size"),
     [(150, 50, 1), (155, 50, 1), (10, 50, 50)],
 )
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_reference_batched_no_count_payload(
     httpx_mock: HTTPXMock,
     total_items: int,
@@ -684,7 +684,7 @@ async def test_reference_batched_no_count_payload(
     ]
     response = list(response)
     assert response
-    assert len(response[0]) == 2
+    assert len(response[0]) == 2  # noqa: PLR2004
 
     response, payload = zip(*response, strict=False)
     assert sorted(response, key=lambda r: r["ID"]) == result
@@ -695,7 +695,7 @@ async def test_reference_batched_no_count_payload(
     ("total_items", "list_size", "batch_size"),
     [(150, 50, 1), (155, 50, 10), (10, 50, 50)],
 )
-@mark.asyncio
+@pytest.mark.asyncio
 async def test_reference_batched_no_count_async_updates(
     httpx_mock: HTTPXMock,
     total_items: int,
@@ -756,7 +756,7 @@ async def test_reference_batched_no_count_async_updates(
 
     httpx_mock.add_callback(custom_response, is_reusable=True)
 
-    async def _updates():
+    async def _updates() -> AsyncGenerator[dict]:
         for i in range(total_items):
             await asyncio.sleep(0.0001)
             yield {"=ENTITY_ID": i}
