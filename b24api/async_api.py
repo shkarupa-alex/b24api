@@ -71,8 +71,8 @@ class AsyncBitrix24(BaseBitrix24):
     async def _batch_common_body(
         self,
         requests: tuple[Request | dict | tuple[Request | dict, Any], ...],
-        list_method: bool = False,
-        with_payload: bool = False,
+        list_method: bool = False,  # noqa: FBT001, FBT002
+        with_payload: bool = False,  # noqa: FBT001, FBT002
     ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
         if with_payload:
             batched_requests, batched_payloads = zip(*requests, strict=True)
