@@ -2,6 +2,7 @@ from collections.abc import AsyncGenerator, AsyncIterable, Iterable
 from itertools import batched, islice
 from typing import Any
 
+from aioitertools.itertools import batched as abatched
 from aioitertools.itertools import chain as achain
 from httpx import AsyncClient
 from tenacity import AsyncRetrying
@@ -48,7 +49,8 @@ class AsyncBitrix24(BaseBitrix24):
 
     async def batch(
         self,
-        requests: Iterable[Request | dict | tuple[Request | dict, Any]],
+        requests: Iterable[Request | dict | tuple[Request | dict, Any]]
+        | AsyncIterable[Request | dict | tuple[Request | dict, Any]],
         *,
         batch_size: int | None = None,
         list_method: bool = False,
@@ -57,20 +59,34 @@ class AsyncBitrix24(BaseBitrix24):
         """Call unlimited sequence of methods within batches and return `result` from responses."""
         batch_size = batch_size or self.settings.batch_size
 
-        for batched_requests_ in batched(requests, batch_size):
+        if isinstance(requests, AsyncIterable):
+            async for batched_requests_ in abatched(requests, batch_size):
+                async for item in self._batch_common_body(batched_requests_, list_method, with_payload):
+                    yield item
+        else:
+            for batched_requests_ in batched(requests, batch_size):
+                async for item in self._batch_common_body(batched_requests_, list_method, with_payload):
+                    yield item
+
+    async def _batch_common_body(
+        self,
+        requests: tuple[Request | dict | tuple[Request | dict, Any], ...],
+        list_method: bool = False,
+        with_payload: bool = False,
+    ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
+        if with_payload:
+            batched_requests, batched_payloads = zip(*requests, strict=True)
+        else:
+            batched_requests, batched_payloads = requests, None
+
+        batched_responses = await self.retry(self._batch, batched_requests)
+
+        for i, response in enumerate(batched_responses):
+            result = response.list_result if list_method else response.result
             if with_payload:
-                batched_requests, batched_payloads = zip(*batched_requests_, strict=True)
+                yield result, batched_payloads[i]
             else:
-                batched_requests, batched_payloads = batched_requests_, None
-
-            batched_responses = await self.retry(self._batch, batched_requests)
-
-            for i, response in enumerate(batched_responses):
-                result = response.list_result if list_method else response.result
-                if with_payload:
-                    yield result, batched_payloads[i]
-                else:
-                    yield result
+                yield result
 
     async def list_sequential(
         self,

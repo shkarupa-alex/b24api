@@ -691,6 +691,52 @@ async def test_reference_batched_no_count_payload(
     assert payload[0] == {"payload": 0}
 
 
+@pytest.mark.asyncio
+async def test_batch_async_requests(httpx_mock: HTTPXMock) -> None:
+    result = [
+        _DEFAULT_PROFILE,
+        {"items": _DEFAULT_LEADS},
+        [{"ID": "1", "NAME": "Main department", "SORT": 500, "UF_HEAD": "1"}],
+    ]
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/batch",
+        match_headers={"Content-Type": "application/json"},
+        match_json={
+            "halt": True,
+            "cmd": {
+                "_0": "profile",
+                "_1": "crm.lead.list?select%5B0%5D=ID&select%5B1%5D=STATUS_ID&start=-1",
+                "_2": "department.get?ID=1",
+            },
+        },
+        json={
+            "result": {
+                "result": {f"_{i}": r for i, r in enumerate(result)},
+                "result_error": [],
+                "result_total": {"_1": 2, "_2": 1},
+                "result_next": [],
+                "result_time": {f"_{i}": _DEFAULT_TIME for i in range(3)},
+            },
+            "time": _DEFAULT_TIME,
+        },
+    )
+
+    async def _requests() -> AsyncGenerator[dict]:
+        requests = [
+            {"method": "profile"},
+            {"method": "crm.lead.list", "parameters": {"select": ["ID", "STATUS_ID"], "start": -1}},
+            {"method": "department.get", "parameters": {"ID": 1}},
+        ]
+        for request in requests:
+            await asyncio.sleep(0.0001)
+            yield request
+
+    api = AsyncBitrix24()
+    response = [r async for r in api.batch(_requests())]
+    assert response == result
+
+
 @pytest.mark.parametrize(
     ("total_items", "list_size", "batch_size"),
     [(150, 50, 1), (155, 50, 10), (10, 50, 50)],
