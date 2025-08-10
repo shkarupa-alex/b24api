@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -5,6 +6,7 @@ from pydantic import BaseModel, field_validator
 
 from b24api.error import ApiResponseError, RetryApiResponseError
 from b24api.query import build_query
+from b24api.settings import Settings
 from b24api.type import ApiTypes
 
 
@@ -57,12 +59,14 @@ class ErrorResponse(BaseModel):
             value = value.lower()
         return value
 
-    def raise_error(self, request: Request, retry_errors: list[str]) -> None:
-        error_cls = RetryApiResponseError if self.error in retry_errors else ApiResponseError
+    def raise_error(self, request: Request, settings: Settings) -> None:
+        logger = logging.getLogger(settings.logger_name)
+        logger.debug("Request: %s", request)
+
+        error_cls = RetryApiResponseError if self.error in settings.retry_errors else ApiResponseError
         raise error_cls(
             code=self.error,
             description=self.error_description,
-            request=str(request),
         )
 
 

@@ -60,7 +60,7 @@ class BaseBitrix24(ABC):
     def _validate_call_response(self, request: Request, response: httpx.Response) -> Response:
         # Checking more informative errors first (content may exist with 5xx status)
         with contextlib.suppress(httpx.ResponseNotRead, ValidationError):
-            ErrorResponse.model_validate_json(response.content).raise_error(request, self.settings.retry_errors)
+            ErrorResponse.model_validate_json(response.content).raise_error(request, self.settings)
 
         try:
             response.raise_for_status()
@@ -102,7 +102,7 @@ class BaseBitrix24(ABC):
             if key in result.result_error:
                 ErrorResponse.model_validate(result.result_error[key]).raise_error(
                     command,
-                    self.settings.retry_errors,
+                    self.settings,
                 )
             if key not in result.result:
                 raise ValueError(
