@@ -8,13 +8,13 @@ class RetryHTTPStatusError(httpx.HTTPStatusError):
 class ApiResponseError(Exception):
     """API error with description."""
 
-    def __init__(self, *, code: str, description: str | None, request: str) -> None:
+    def __init__(self, *, code: str, description: str | None) -> None:
         if code and description:
-            message = f"API error [{code}]: {description} for <Request {request}>"
+            message = f"API error [{code}]: {description}"
         elif code:
-            message = f"API error [{code}] for <Request {request}>"
+            message = f"API error [{code}]"
         else:
-            message = f"API error: {description} for <Request {request}>"
+            message = f"API error: {description}"
         super().__init__(message)
 
 
