@@ -61,9 +61,14 @@ class ErrorResponse(BaseModel):
 
     def raise_error(self, request: Request, settings: Settings) -> None:
         logger = logging.getLogger(settings.logger_name)
-        logger.debug("Request: %s", request)
 
-        error_cls = RetryApiResponseError if self.error in settings.retry_errors else ApiResponseError
+        if self.error in settings.retry_errors:
+            logger.debug("Request: %s", request)
+            error_cls = RetryApiResponseError
+        else:
+            logger.warning("Request: %s", request)
+            error_cls = ApiResponseError
+
         raise error_cls(
             code=self.error,
             description=self.error_description,
