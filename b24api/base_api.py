@@ -57,6 +57,10 @@ class BaseBitrix24(ABC):
     def _retry() -> type[Retrying | AsyncRetrying]:
         pass
 
+    @property
+    def host(self) -> str:
+        return self.settings.webhook_url.host
+
     def _validate_call_response(self, request: Request, response: httpx.Response) -> Response:
         # Checking more informative errors first (content may exist with 5xx status)
         with contextlib.suppress(httpx.ResponseNotRead, ValidationError):
