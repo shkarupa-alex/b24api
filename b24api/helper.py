@@ -1,39 +1,51 @@
 from collections.abc import AsyncGenerator, AsyncIterable, Generator, Iterable
+from itertools import repeat
 from typing import Any
 
 from b24api.entity import ListRequest, Response
 from b24api.type import ApiTypes
 
 
-class BatchedNoCountHelper:
-    def __init__(self, request: ListRequest | dict[str, Any], id_key: str, list_size: int, batch_size: int) -> None:
-        request = ListRequest.model_validate(request)
-
-        select_ = request.parameters.select
-        if "*" not in select_ and id_key not in select_:
-            request.parameters.select.append(id_key)
-
-        self.id_from = f">{id_key}"
-        self.id_to = f"<{id_key}"
-
-        filter_ = request.parameters.filter
-        if filter_ and (self.id_from in filter_ or self.id_to in filter_):
-            raise ValueError(
-                f"Filter parameters `{self.id_from}` and `{self.id_to}` are reserved in `list_batched_no_count`",
-            )
-
-        if request.parameters.order:
-            raise ValueError("Ordering parameters are reserved in `list_batched_no_count`")
-
-        self.request = request
+class _NoCountHelperBase:
+    def __init__(
+        self,
+        request: ListRequest | dict[str, Any],
+        id_key: str,
+        list_size: int,
+        batch_size: int,
+    ) -> None:
+        self.request = ListRequest.model_validate(request)
         self.id_key = id_key
         self.list_size = list_size
         self.batch_size = batch_size
+        self.id_from = f">{id_key}"
+        self.id_to = f"<{id_key}"
+
+        select_ = self.request.parameters.select
+        if "*" not in select_ and id_key not in select_:
+            self.request.parameters.select.append(id_key)
 
     def _get_id(self, item: ApiTypes) -> int:
         if not isinstance(item, dict):
             raise TypeError(f"Expecting dict, got {type(item)}")
         return int(item[self.id_key])
+
+    def _max_head_id(self, head_result: Response) -> int | None:
+        return max(map(self._get_id, head_result.list_result), default=None)
+
+
+class BatchedNoCountHelper(_NoCountHelperBase):
+    def __init__(self, request: ListRequest | dict[str, Any], id_key: str, list_size: int, batch_size: int) -> None:
+        super().__init__(request, id_key, list_size, batch_size)
+
+        filter_ = self.request.parameters.filter
+        if filter_ and (self.id_from in filter_ or self.id_to in filter_):
+            raise ValueError(
+                f"Filter parameters `{self.id_from}` and `{self.id_to}` are reserved in `list_batched_no_count`",
+            )
+
+        if self.request.parameters.order:
+            raise ValueError("Ordering parameters are reserved in `list_batched_no_count`")
 
     def head_request(self) -> ListRequest:
         request = self.request.model_copy(deep=True)
@@ -48,7 +60,7 @@ class BatchedNoCountHelper:
         return request
 
     def body_requests(self, head_result: Response, tail_result: Response) -> Generator[ListRequest]:
-        max_head_id = max(map(self._get_id, head_result.list_result), default=None)
+        max_head_id = self._max_head_id(head_result)
         min_tail_id = min(map(self._get_id, tail_result.list_result), default=None)
 
         if max_head_id and min_tail_id and max_head_id < min_tail_id:
@@ -59,13 +71,13 @@ class BatchedNoCountHelper:
                 yield body_request
 
     def tail_results(self, head_result: Response, tail_result: Response) -> Generator[ApiTypes]:
-        max_head_id = max(map(self._get_id, head_result.list_result), default=None)
+        max_head_id = self._max_head_id(head_result)
         for item in reversed(tail_result.list_result):
             if max_head_id is not None and self._get_id(item) > max_head_id:
                 yield item
 
 
-class ReferenceNoCountHelper:
+class ReferenceNoCountHelper(_NoCountHelperBase):
     def __init__(  # noqa: PLR0913
         self,
         request: ListRequest | dict[str, Any],
@@ -78,35 +90,19 @@ class ReferenceNoCountHelper:
         batch_size: int,
         with_payload: bool,  # noqa: FBT001
     ) -> None:
-        request = ListRequest.model_validate(request)
+        super().__init__(request, id_key, list_size, batch_size)
 
-        select_ = request.parameters.select
-        if "*" not in select_ and id_key not in select_:
-            request.parameters.select.append(id_key)
-
-        self.id_from = f">{id_key}"
-        self.id_to = f"<{id_key}"
-
-        filter_ = request.parameters.filter
+        filter_ = self.request.parameters.filter
         if filter_ and self.id_from in filter_:
             raise ValueError(
                 f"Filter parameters `{self.id_from}` is reserved in `reference_batched_no_count`",
             )
 
-        if request.parameters.order:
+        if self.request.parameters.order:
             raise ValueError("Ordering parameters are reserved in `reference_batched_no_count`")
 
-        self.request = request
         self.updates = updates
-        self.id_key = id_key
-        self.list_size = list_size
-        self.batch_size = batch_size
         self.with_payload = with_payload
-
-    def _get_id(self, item: ApiTypes) -> int:
-        if not isinstance(item, dict):
-            raise TypeError(f"Expecting dict, got {type(item)}")
-        return int(item[self.id_key])
 
     def tail_requests(self) -> Generator[ListRequest | tuple[ListRequest, Any]]:
         if isinstance(self.updates, AsyncIterable):
@@ -188,7 +184,7 @@ class ReferenceNoCountHelper:
                     raise TypeError(f"Expecting tuple (result, payload), got {type(item)}")
                 result, payload = item
                 if isinstance(result, list):
-                    yield from zip(result, [payload] * len(result), strict=False)
+                    yield from zip(result, repeat(payload, len(result)), strict=False)
         else:
             for item in results:
                 if isinstance(item, list):

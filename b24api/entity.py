@@ -2,7 +2,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from b24api.error import ApiResponseError, RetryApiResponseError
 from b24api.query import build_query
@@ -41,7 +41,7 @@ class ListRequestParameters(BaseModel):
 class ListRequest(Request):
     """API `*.list` request."""
 
-    parameters: ListRequestParameters = ListRequestParameters()  # type: ignore[assignment]
+    parameters: ListRequestParameters = Field(default_factory=ListRequestParameters)  # type: ignore[assignment]
 
 
 class ErrorResponse(BaseModel):

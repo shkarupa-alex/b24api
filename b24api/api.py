@@ -148,9 +148,10 @@ class Bitrix24:
         tail_requests = self._list_tail_requests(head_request, head_response, list_size=list_size)
         tail_responses = self.batch(tail_requests, batch_size=batch_size, list_method=True)
         async for tail_response in tail_responses:
-            if isinstance(tail_response, list):
-                for item in tail_response:
-                    yield item
+            if not isinstance(tail_response, list):
+                raise TypeError(f"Expecting list result from batch, got {type(tail_response)}")
+            for item in tail_response:
+                yield item
 
     async def list_batched_no_count(
         self,
@@ -178,9 +179,10 @@ class Bitrix24:
         body_requests = batched_helper.body_requests(head_result, tail_result)
         body_results = self.batch(body_requests, batch_size=batch_size, list_method=True)
         async for body_result in body_results:
-            if isinstance(body_result, list):
-                for item in body_result:
-                    yield item
+            if not isinstance(body_result, list):
+                raise TypeError(f"Expecting list result from batch, got {type(body_result)}")
+            for item in body_result:
+                yield item
 
         for item in batched_helper.tail_results(head_result, tail_result):
             yield item
