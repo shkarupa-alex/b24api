@@ -6,19 +6,9 @@ All methods support retries.
 ## Regular call (any method)
 
 ```python
-from b24api import SyncBitrix24
+from b24api import Bitrix24
 
-b24 = SyncBitrix24()
-result = b24.call({"method": "user.access", "parameters": {"ACCESS": ["G2", "AU"]}})
-print(result)
-```
-
-or the same with async
-
-```python
-from b24api import AsyncBitrix24
-
-b24 = AsyncBitrix24()
+b24 = Bitrix24()
 result = await b24.call({"method": "user.access", "parameters": {"ACCESS": ["G2", "AU"]}})
 print(result)
 ```
@@ -26,12 +16,12 @@ print(result)
 ## Batch call (any method, no limit)
 
 ```python
-from b24api import SyncBitrix24
+from b24api import Bitrix24
 
-b24 = SyncBitrix24()
+b24 = Bitrix24()
 
 requests = ({"method": "user.update", "parameters": {"ID": u, "UF_SKYPE": ""}} for u in range(1000))
-result = b24.batch(requests)
+result = await b24.batch(requests)
 print(result)
 ```
 
@@ -40,10 +30,10 @@ Applicable to list methods with `start=<offset>` support.
 Fetches list chunks one by one.
 
 ```python
-from b24api import SyncBitrix24
+from b24api import Bitrix24
 
-b24 = SyncBitrix24()
-result = b24.list_sequential({"method": "user.get"})
+b24 = Bitrix24()
+result = await b24.list_sequential({"method": "user.get"})
 print(list(result))
 ```
 
@@ -53,10 +43,10 @@ Fetches first list chunk with regular call, then fetches other chunks with `batc
 Approximately 3 times faster then `list_sequential`.
 
 ```python
-from b24api import SyncBitrix24
+from b24api import Bitrix24
 
-b24 = SyncBitrix24()
-result = b24.list_batched({"method": "user.get"})
+b24 = Bitrix24()
+result = await b24.list_batched({"method": "user.get"})
 print(list(result))
 ```
 
@@ -66,10 +56,10 @@ Fetches first and last list chunk with batch call, then fetches other chunks wit
 Approximately 2 times faster then `list_batched`.
 
 ```python
-from b24api import SyncBitrix24
+from b24api import Bitrix24
 
-b24 = SyncBitrix24()
-result = b24.list_batched_no_count({"method": "user.get"})
+b24 = Bitrix24()
+result = await b24.list_batched_no_count({"method": "user.get"})
 print(list(result))
 ```
 
@@ -78,12 +68,12 @@ Applicable to list methods with `select=[<fields>]` and `filter={<parameters>}` 
 Fetches first and last list chunk with batch call, then fetches other chunks with `batch`. Doesn't use counting (`start=-1`).
 
 ```python
-from b24api import SyncBitrix24
+from b24api import Bitrix24
 
-b24 = SyncBitrix24()
+b24 = Bitrix24()
 deal_ids = [1, 2, 3]  # deals IDs (e.g. from "crm.deal.list" call)
 filter_updates = ({"=ENTITY_ID": i} for i in deal_ids)
-result = b24.reference_batched_no_count(
+result = await b24.reference_batched_no_count(
     {"method": "crm.timeline.comment.list", "parameters": {"ENTITY_TYPE": "deal"}},
     filter_updates,
 )

@@ -30,6 +30,7 @@ dev = [
     "pytest-env>=1.1.5",
     "pytest-httpx>=0.35.0",
     "pytest-mock>=3.14.1",
+    "ruff>=0.15.5",
     "setuptools>=80.9.0",
     "setuptools-git-versioning>=2.1.0",
     "wheel>=0.45.1",

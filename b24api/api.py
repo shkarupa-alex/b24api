@@ -1,51 +1,52 @@
-from collections.abc import AsyncGenerator, AsyncIterable, Iterable
+import contextlib
+import logging
+from collections.abc import AsyncGenerator, AsyncIterable, Generator, Iterable
 from itertools import batched, islice
 from typing import Any
 
+import h2
+import httpx
 from aioitertools.itertools import batched as abatched
 from aioitertools.itertools import chain as achain
-from httpx import AsyncClient
-from tenacity import AsyncRetrying
+from fast_depends import inject
+from pydantic import ValidationError
+from tenacity import AsyncRetrying, before_sleep_log, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from b24api.base_api import BaseBitrix24, BatchedNoCountHelper, ReferenceNoCountHelper
-from b24api.entity import ApiTypes, ListRequest, Request, Response
+from b24api.entity import ApiTypes, BatchResult, ErrorResponse, ListRequest, Request, Response
+from b24api.error import RetryApiResponseError, RetryHTTPStatusError
+from b24api.helper import BatchedNoCountHelper, ReferenceNoCountHelper
+from b24api.settings import ApiSettings
 
 
-class AsyncBitrix24(BaseBitrix24):
-    @staticmethod
-    def _http() -> type[AsyncClient]:
-        return AsyncClient
+class Bitrix24:
+    @inject
+    def __init__(self, settings: ApiSettings) -> None:
+        self._settings = settings
 
-    @staticmethod
-    def _retry() -> type[AsyncRetrying]:
-        return AsyncRetrying
-
-    async def _call(self, request: Request | dict) -> Response:
-        """Call any method and return full response."""
-        request = Request.model_validate(request)
-        self.logger.debug("Sending request: %s", request)
-
-        response = await self.http.post(
-            f"{self.settings.webhook_url}{request.method}",
-            headers={"Content-Type": "application/json"},
-            json=request.model_dump(mode="json")["parameters"],
+        self._logger = logging.getLogger(self._settings.logger_name)
+        self._http = httpx.AsyncClient(http2=True, timeout=self._settings.http_timeout)
+        self._retry = AsyncRetrying(
+            retry=retry_if_exception_type(
+                (
+                    httpx.TransportError,
+                    h2.exceptions.ProtocolError,
+                    RetryHTTPStatusError,
+                    RetryApiResponseError,
+                ),
+            ),
+            wait=wait_exponential(multiplier=self._settings.retry_delay, exp_base=self._settings.retry_backoff),
+            stop=stop_after_attempt(self._settings.retry_attempts),
+            before_sleep=before_sleep_log(self._logger, logging.WARNING),
+            reraise=True,
         )
-        response = self._validate_call_response(request, response)
-        self.logger.debug("Received response: %s", response)
 
-        return response
+    @property
+    def host(self) -> str:
+        return self._settings.webhook_url.host
 
     async def call(self, request: Request | dict) -> ApiTypes:
         """Call any method (with retries) and return `result` from response."""
-        return (await self.retry(self._call, request)).result
-
-    async def _batch(self, requests: tuple[Request | dict, ...]) -> list[Response]:
-        """Call limited batch of methods and return full responses."""
-        commands, request = self._batch_requests(requests)
-
-        response = await self._call(request)
-
-        return self._batch_responses(commands, response)
+        return (await self._retry(self._call, request)).result
 
     async def batch(
         self,
@@ -57,7 +58,7 @@ class AsyncBitrix24(BaseBitrix24):
         with_payload: bool = False,
     ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
         """Call unlimited sequence of methods within batches and return `result` from responses."""
-        batch_size = batch_size or self.settings.batch_size
+        batch_size = batch_size or self._settings.batch_size
 
         if isinstance(requests, AsyncIterable):
             async for batched_requests_ in abatched(requests, batch_size):
@@ -67,6 +68,110 @@ class AsyncBitrix24(BaseBitrix24):
             for batched_requests_ in batched(requests, batch_size):
                 async for item in self._batch_common_body(batched_requests_, list_method, with_payload):
                     yield item
+
+    async def _call(self, request: Request | dict) -> Response:
+        """Call any method and return full response."""
+        request = Request.model_validate(request)
+        self._logger.debug("Sending request: %s", request)
+
+        response = await self._http.post(
+            f"{self._settings.webhook_url}{request.method}",
+            headers={"Content-Type": "application/json"},
+            json=request.model_dump(mode="json")["parameters"],
+        )
+
+        # Checking more informative errors first (content may exist with 5xx status)
+        with contextlib.suppress(httpx.ResponseNotRead, ValidationError):
+            ErrorResponse.model_validate_json(response.content).raise_error(request, self._settings)
+
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            if response.status_code in self._settings.retry_statuses:
+                raise RetryHTTPStatusError(
+                    str(error),
+                    request=error.request,
+                    response=error.response,
+                ) from error
+            raise
+
+        response = Response.model_validate_json(response.content)
+
+        self._logger.debug("Received response: %s", response)
+
+        return response
+
+    async def _batch(self, requests: tuple[Request | dict, ...]) -> list[Response]:
+        """Call limited batch of methods and return full responses."""
+        commands, request = self._batch_requests(requests)
+
+        response = await self._call(request)
+
+        return self._batch_responses(commands, response)
+
+    @staticmethod
+    def _batch_requests(requests: tuple[Request | dict, ...]) -> tuple[dict[str, Request], Request]:
+        # Using string keys with equal length to keep requests order and simplify errors extraction
+        width = len(str(len(requests)))
+        commands = {f"_{i:0>{width}d}": Request.model_validate(request) for i, request in enumerate(requests)}
+        request = Request(
+            method="batch",
+            parameters={
+                "halt": True,
+                "cmd": {key: request.query for key, request in commands.items()},
+            },
+        )
+
+        return commands, request
+
+    def _batch_responses(
+        self,
+        commands: dict[str, Request],
+        response: Response,
+    ) -> list[Response]:
+        result = BatchResult.model_validate(response.result)
+
+        responses = []
+        for key, command in commands.items():
+            if key in result.result_error:
+                ErrorResponse.model_validate(result.result_error[key]).raise_error(
+                    command,
+                    self._settings,
+                )
+            if key not in result.result:
+                raise ValueError(
+                    f"Expecting `result` to contain result for command {{'{key}': '{command}'}}. Got: {result}",
+                )
+            if key not in result.result_time:
+                raise ValueError(
+                    f"Expecting `result_time` to contain result for command {{'{key}': '{command}'}}. Got: {result}",
+                )
+
+            responses.append(
+                Response(
+                    result=result.result[key],
+                    time=result.result_time[key],
+                    total=result.result_total.get(key, None),
+                    next=result.result_next.get(key, None),
+                ),
+            )
+        return responses
+
+    @staticmethod
+    def _list_tail_requests(
+        head_request: Request,
+        head_response: Response,
+        *,
+        list_size: int,
+    ) -> Generator[Request]:
+        if head_response.next and head_response.next != list_size:
+            raise ValueError(f"Expecting list chunk size to be {list_size}. Got: {head_response.next}")
+
+        total = head_response.total or 0
+        for start in range(list_size, total, list_size):
+            tail_request = head_request.model_copy(deep=True)
+            tail_request.parameters["start"] = start
+            yield tail_request
 
     async def _batch_common_body(
         self,
@@ -79,7 +184,7 @@ class AsyncBitrix24(BaseBitrix24):
         else:
             batched_requests, batched_payloads = requests, None
 
-        batched_responses = await self.retry(self._batch, batched_requests)
+        batched_responses = await self._retry(self._batch, batched_requests)
 
         for i, response in enumerate(batched_responses):
             result = response.list_result if list_method else response.result
@@ -99,18 +204,18 @@ class AsyncBitrix24(BaseBitrix24):
         Slow (sequential tail) list gathering for methods without `filter` parameter (e.g. `department.get`).
         """
         request = Request.model_validate(request)
-        list_size = list_size or self.settings.list_size
+        list_size = list_size or self._settings.list_size
 
         head_request = request.model_copy(deep=True)
         head_request.parameters["start"] = 0
 
-        head_response = await self.retry(self._call, head_request)
+        head_response = await self._retry(self._call, head_request)
         for item in head_response.list_result:
             yield item
 
         tail_requests = self._list_tail_requests(head_request, head_response, list_size=list_size)
         for tail_request in tail_requests:
-            tail_response = await self.retry(self._call, tail_request)
+            tail_response = await self._retry(self._call, tail_request)
 
             start = tail_request.parameters["start"]
             if tail_response.next and tail_response.next != start + list_size:
@@ -133,13 +238,13 @@ class AsyncBitrix24(BaseBitrix24):
         Faster (batched tail) list gathering for methods without `filter` parameter (e.g. `department.get`).
         """
         request = Request.model_validate(request)
-        list_size = list_size or self.settings.list_size
-        batch_size = batch_size or self.settings.batch_size
+        list_size = list_size or self._settings.list_size
+        batch_size = batch_size or self._settings.batch_size
 
         head_request = request.model_copy(deep=True)
         head_request.parameters["start"] = 0
 
-        head_response = await self.retry(self._call, head_request)
+        head_response = await self._retry(self._call, head_request)
         for item in head_response.list_result:
             yield item
 
@@ -161,13 +266,13 @@ class AsyncBitrix24(BaseBitrix24):
 
         Fastest (batched, no count) list gathering for methods with `filter` parameter (e.g. `crm.lead.list`).
         """
-        list_size = list_size or self.settings.list_size
-        batch_size = batch_size or self.settings.batch_size
+        list_size = list_size or self._settings.list_size
+        batch_size = batch_size or self._settings.batch_size
 
         batched_helper = BatchedNoCountHelper(request, id_key, list_size, batch_size)
 
         boundary_requests = batched_helper.head_request(), batched_helper.tail_request()
-        head_result, tail_result = await self.retry(self._batch, boundary_requests)
+        head_result, tail_result = await self._retry(self._batch, boundary_requests)
         for item in head_result.list_result:
             yield item
 
@@ -194,8 +299,8 @@ class AsyncBitrix24(BaseBitrix24):
         Fastest (batched, no count) list gathering for methods with `filter` parameter and required `reference`
         (e.g. `crm.timeline.comment.list`).
         """
-        list_size = list_size or self.settings.list_size
-        batch_size = batch_size or self.settings.batch_size
+        list_size = list_size or self._settings.list_size
+        batch_size = batch_size or self._settings.batch_size
 
         reference_helper = ReferenceNoCountHelper(request, updates, id_key, list_size, batch_size, with_payload)
 

@@ -22,7 +22,7 @@ def build_query(parameters: dict[int | str, ApiTypes], path: str = "%s") -> str:
             key_ = quote_plus(path % key)
 
             if isinstance(value_, datetime):
-                value_ = value.astimezone().isoformat()
+                value_ = value.isoformat()
             value_ = quote_plus(str(value_))
 
             subquery = f"{key_}={value_}"
