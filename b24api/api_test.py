@@ -11,6 +11,7 @@ from pytest_httpx import HTTPXMock
 from pytest_mock import MockerFixture
 
 from b24api.api import Bitrix24
+from b24api.entity import ListRequest
 from b24api.error import ApiResponseError, RetryApiResponseError, RetryHTTPStatusError
 
 
@@ -368,7 +369,7 @@ async def test_list_sequential(httpx_mock: HTTPXMock, total_items: int, list_siz
             method="POST",
             url="https://bitrix24.com/rest/0/test/crm.lead.list",
             match_headers={"Content-Type": "application/json"},
-            match_json={"start": start},
+            match_json={"select": [], "filter": {}, "order": {}, "start": start},
             json={
                 "result": result[start : start + list_size],
                 "total": total_items,
@@ -399,7 +400,7 @@ async def test_list_batched(httpx_mock: HTTPXMock, total_items: int, list_size: 
         method="POST",
         url="https://bitrix24.com/rest/0/test/crm.lead.list",
         match_headers={"Content-Type": "application/json"},
-        match_json={"start": 0},
+        match_json={"select": [], "filter": {}, "order": {}, "start": 0},
         json={
             "result": result[:list_size],
             "total": total_items,
@@ -843,3 +844,152 @@ _DEFAULT_PROFILE = {
     "TIME_ZONE_OFFSET": 10800,
 }
 _DEFAULT_LEADS = [{"ID": "38945", "STATUS_ID": "1"}, {"ID": "43595", "STATUS_ID": "1"}]
+
+
+# --- Regression tests for fixed bugs ---
+
+
+@pytest.mark.asyncio
+async def test_call_integer_error_code(httpx_mock: HTTPXMock) -> None:
+    """ErrorResponse.error can be an integer (e.g. 0). Must be normalized to str."""
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/profile",
+        match_headers={"Content-Type": "application/json"},
+        match_json={},
+        json={
+            "error": 0,
+            "error_description": "Unknown error",
+        },
+    )
+
+    api = Bitrix24()
+    with pytest.raises(ApiResponseError, match=r"API error \[0\]"):
+        await api.call({"method": "profile"})
+
+
+@pytest.mark.asyncio
+async def test_list_sequential_accepts_list_request(httpx_mock: HTTPXMock) -> None:
+    """list_sequential must work when passed a ListRequest instance (not just dict)."""
+    result = [{"ID": str(i), "STATUS_ID": "1"} for i in range(3)]
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/crm.lead.list",
+        match_headers={"Content-Type": "application/json"},
+        json={
+            "result": result,
+            "total": 3,
+            "time": _DEFAULT_TIME,
+        },
+    )
+
+    request = ListRequest.model_validate({"method": "crm.lead.list"})
+    api = Bitrix24()
+    response = [r async for r in api.list_sequential(request)]
+    assert response == result
+
+
+@pytest.mark.asyncio
+async def test_list_batched_no_count_custom_id_key(httpx_mock: HTTPXMock) -> None:
+    """id_key != 'ID' must use that key in both filter and order."""
+    total_items = 10
+    result = [{"ELEMENT_ID": i, "VALUE": "x"} for i in range(total_items)]
+
+    def custom_response(request: httpx.Request) -> httpx.Response:
+        output = {}
+        for key, value in json.loads(request.content)["cmd"].items():
+            _method, command = value.split("?")
+
+            command = parse_qs(command)
+            assert command.pop("start", None) == ["-1"]
+
+            order = command.pop("order[ELEMENT_ID]", None)
+            assert order is not None, "order must use custom id_key, not hardcoded 'ID'"
+
+            reverse = order == ["DESC"]
+
+            from_id = int(command.pop("filter[>ELEMENT_ID]", ["-1"])[0])
+            to_id = int(command.pop("filter[<ELEMENT_ID]", [str(total_items)])[0])
+
+            data = [r for r in result if from_id < r["ELEMENT_ID"] < to_id]
+            data = data[::-1] if reverse else data
+            output[key] = data[:50]
+
+        return httpx.Response(
+            status_code=200,
+            json={
+                "result": {
+                    "result": output,
+                    "result_error": [],
+                    "result_total": [],
+                    "result_next": [],
+                    "result_time": dict.fromkeys(output, _DEFAULT_TIME),
+                },
+                "time": _DEFAULT_TIME,
+            },
+        )
+
+    httpx_mock.add_callback(custom_response, is_reusable=True)
+
+    api = Bitrix24()
+    response = [
+        r
+        async for r in api.list_batched_no_count(
+            {"method": "crm.item.list", "parameters": {"select": ["ELEMENT_ID", "VALUE"]}},
+            id_key="ELEMENT_ID",
+        )
+    ]
+    assert response == result
+
+
+@pytest.mark.asyncio
+async def test_list_batched_no_count_id_not_in_select(httpx_mock: HTTPXMock) -> None:
+    """If id_key is not in select, it must be appended automatically (was AttributeError)."""
+    result = [{"ID": i, "STATUS_ID": "1"} for i in range(3)]
+
+    def custom_response(request: httpx.Request) -> httpx.Response:
+        output = {}
+        for key, value in json.loads(request.content)["cmd"].items():
+            _method, command = value.split("?")
+            command = parse_qs(command)
+
+            # ID must have been auto-appended to select
+            select_keys = [k for k in command if k.startswith("select[")]
+            assert any(command[k] == ["ID"] for k in select_keys), "ID must be auto-appended to select"
+
+            command.pop("start", None)
+            command.pop("order[ID]", None)
+            for k in list(command):
+                if k.startswith(("select[", "filter[")):
+                    command.pop(k)
+
+            from_id = -1
+            to_id = len(result)
+            data = [r for r in result if from_id < r["ID"] < to_id]
+            output[key] = data[:50]
+
+        return httpx.Response(
+            status_code=200,
+            json={
+                "result": {
+                    "result": output,
+                    "result_error": [],
+                    "result_total": [],
+                    "result_next": [],
+                    "result_time": dict.fromkeys(output, _DEFAULT_TIME),
+                },
+                "time": _DEFAULT_TIME,
+            },
+        )
+
+    httpx_mock.add_callback(custom_response, is_reusable=True)
+
+    api = Bitrix24()
+    # select does NOT include "ID" — helper must append it
+    response = [
+        r
+        async for r in api.list_batched_no_count(
+            {"method": "crm.lead.list", "parameters": {"select": ["STATUS_ID"]}},
+        )
+    ]
+    assert response == result

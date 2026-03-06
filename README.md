@@ -8,9 +8,9 @@ All methods support retries.
 ```python
 from b24api import Bitrix24
 
-b24 = Bitrix24()
-result = await b24.call({"method": "user.access", "parameters": {"ACCESS": ["G2", "AU"]}})
-print(result)
+async with Bitrix24() as b24:
+    result = await b24.call({"method": "user.access", "parameters": {"ACCESS": ["G2", "AU"]}})
+    print(result)
 ```
 
 ## Batch call (any method, no limit)
@@ -74,7 +74,7 @@ b24 = Bitrix24()
 deal_ids = [1, 2, 3]  # deals IDs (e.g. from "crm.deal.list" call)
 filter_updates = ({"=ENTITY_ID": i} for i in deal_ids)
 result = await b24.reference_batched_no_count(
-    {"method": "crm.timeline.comment.list", "parameters": {"ENTITY_TYPE": "deal"}},
+    {"method": "crm.timeline.comment.list", "parameters": {"filter": {"ENTITY_TYPE": "deal"}}},
     filter_updates,
 )
 print(list(result))

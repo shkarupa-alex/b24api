@@ -1,5 +1,4 @@
-from collections.abc import Generator
-from typing import Annotated
+from typing import Annotated, Any
 
 from fast_depends import Depends
 from httpx import codes
@@ -14,7 +13,7 @@ class Settings(BaseSettings):
 
     http_timeout: int = 30
 
-    retry_statuses: list[int] = (
+    retry_statuses: list[int] = [
         codes.LOCKED,
         codes.TOO_EARLY,
         codes.TOO_MANY_REQUESTS,
@@ -22,7 +21,7 @@ class Settings(BaseSettings):
         codes.BAD_GATEWAY,
         codes.SERVICE_UNAVAILABLE,
         codes.INSUFFICIENT_STORAGE,
-    )
+    ]
     retry_errors: list[str] = ["query_limit_exceeded", "operation_time_limit"]
 
     retry_attempts: int = 5
@@ -39,9 +38,8 @@ class Settings(BaseSettings):
     )
 
 
-def api_settings(**kwargs: dict) -> Generator[Settings]:
-    settings = Settings(**kwargs)
-    yield settings
+def api_settings(**kwargs: Any) -> Settings:  # noqa: ANN401
+    return Settings(**kwargs)
 
 
 ApiSettings = Annotated[Settings, Depends(api_settings)]

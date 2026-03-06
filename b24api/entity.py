@@ -41,27 +41,24 @@ class ListRequestParameters(BaseModel):
 class ListRequest(Request):
     """API `*.list` request."""
 
-    parameters: ListRequestParameters
+    parameters: ListRequestParameters = ListRequestParameters()  # type: ignore[assignment]
 
 
 class ErrorResponse(BaseModel):
     """API error response."""
 
-    error: str | int
+    error: str
     error_description: str
 
-    @field_validator("error")
+    @field_validator("error", mode="before")
     @classmethod
-    def error_to_lower_str(cls, value: Any) -> Any:  # noqa: ANN401
-        if not isinstance(value, int):
-            value = str(value)
-        if isinstance(value, str):
-            value = value.lower()
-        return value
+    def error_to_lower_str(cls, value: int | str) -> str:
+        return str(value).lower()
 
     def raise_error(self, request: Request, settings: Settings) -> None:
         logger = logging.getLogger(settings.logger_name)
 
+        error_cls: type[ApiResponseError]
         if self.error in settings.retry_errors:
             logger.debug("Request: %s", request)
             error_cls = RetryApiResponseError
