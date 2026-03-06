@@ -13,12 +13,13 @@ class BatchedNoCountHelper:
         if "*" not in select_ and id_key not in select_:
             request.parameters.select.append(id_key)
 
-        id_from, id_to = f">{id_key}", f"<{id_key}"
+        self.id_from = f">{id_key}"
+        self.id_to = f"<{id_key}"
 
         filter_ = request.parameters.filter
-        if filter_ and (id_from in filter_ or id_to in filter_):
+        if filter_ and (self.id_from in filter_ or self.id_to in filter_):
             raise ValueError(
-                f"Filter parameters `{id_from}` and `{id_to}` are reserved in `list_batched_no_count`",
+                f"Filter parameters `{self.id_from}` and `{self.id_to}` are reserved in `list_batched_no_count`",
             )
 
         if request.parameters.order:
@@ -28,9 +29,6 @@ class BatchedNoCountHelper:
         self.id_key = id_key
         self.list_size = list_size
         self.batch_size = batch_size
-
-        self.id_from = f">{self.id_key}"
-        self.id_to = f"<{self.id_key}"
 
     def _get_id(self, item: ApiTypes) -> int:
         if not isinstance(item, dict):
@@ -86,11 +84,13 @@ class ReferenceNoCountHelper:
         if "*" not in select_ and id_key not in select_:
             request.parameters.select.append(id_key)
 
-        id_from = f">{id_key}"
+        self.id_from = f">{id_key}"
+        self.id_to = f"<{id_key}"
+
         filter_ = request.parameters.filter
-        if filter_ and id_from in filter_:
+        if filter_ and self.id_from in filter_:
             raise ValueError(
-                f"Filter parameters `{id_from}` is reserved in `reference_batched_no_count`",
+                f"Filter parameters `{self.id_from}` is reserved in `reference_batched_no_count`",
             )
 
         if request.parameters.order:
@@ -102,9 +102,6 @@ class ReferenceNoCountHelper:
         self.list_size = list_size
         self.batch_size = batch_size
         self.with_payload = with_payload
-
-        self.id_from = f">{self.id_key}"
-        self.id_to = f"<{self.id_key}"
 
     def _get_id(self, item: ApiTypes) -> int:
         if not isinstance(item, dict):
@@ -120,7 +117,7 @@ class ReferenceNoCountHelper:
 
     async def atail_requests(self) -> AsyncGenerator[ListRequest | tuple[ListRequest, Any]]:
         if isinstance(self.updates, Iterable):
-            raise TypeError("Use `atail_requests` to get asynchronous tail requests")
+            raise TypeError("Use `tail_requests` to get synchronous tail requests")
 
         async for update in self.updates:
             yield self._updated_request(update)
@@ -131,8 +128,6 @@ class ReferenceNoCountHelper:
         payload: Any = None
         if self.with_payload:
             update, payload = update  # type: ignore[assignment]
-        else:
-            payload = None
 
         if not isinstance(update, dict):
             raise TypeError(f"Expecting dict update, got {type(update)}")
