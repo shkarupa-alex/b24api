@@ -69,130 +69,6 @@ class Bitrix24:
                 async for item in self._batch_common_body(batched_requests_, list_method, with_payload):
                     yield item
 
-    async def _call(self, request: Request | dict) -> Response:
-        """Call any method and return full response."""
-        request = Request.model_validate(request)
-        self._logger.debug("Sending request: %s", request)
-
-        response = await self._http.post(
-            f"{self._settings.webhook_url}{request.method}",
-            headers={"Content-Type": "application/json"},
-            json=request.model_dump(mode="json")["parameters"],
-        )
-
-        # Checking more informative errors first (content may exist with 5xx status)
-        with contextlib.suppress(httpx.ResponseNotRead, ValidationError):
-            ErrorResponse.model_validate_json(response.content).raise_error(request, self._settings)
-
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            if response.status_code in self._settings.retry_statuses:
-                raise RetryHTTPStatusError(
-                    str(error),
-                    request=error.request,
-                    response=error.response,
-                ) from error
-            raise
-
-        response = Response.model_validate_json(response.content)
-
-        self._logger.debug("Received response: %s", response)
-
-        return response
-
-    async def _batch(self, requests: tuple[Request | dict, ...]) -> list[Response]:
-        """Call limited batch of methods and return full responses."""
-        commands, request = self._batch_requests(requests)
-
-        response = await self._call(request)
-
-        return self._batch_responses(commands, response)
-
-    @staticmethod
-    def _batch_requests(requests: tuple[Request | dict, ...]) -> tuple[dict[str, Request], Request]:
-        # Using string keys with equal length to keep requests order and simplify errors extraction
-        width = len(str(len(requests)))
-        commands = {f"_{i:0>{width}d}": Request.model_validate(request) for i, request in enumerate(requests)}
-        request = Request(
-            method="batch",
-            parameters={
-                "halt": True,
-                "cmd": {key: request.query for key, request in commands.items()},
-            },
-        )
-
-        return commands, request
-
-    def _batch_responses(
-        self,
-        commands: dict[str, Request],
-        response: Response,
-    ) -> list[Response]:
-        result = BatchResult.model_validate(response.result)
-
-        responses = []
-        for key, command in commands.items():
-            if key in result.result_error:
-                ErrorResponse.model_validate(result.result_error[key]).raise_error(
-                    command,
-                    self._settings,
-                )
-            if key not in result.result:
-                raise ValueError(
-                    f"Expecting `result` to contain result for command {{'{key}': '{command}'}}. Got: {result}",
-                )
-            if key not in result.result_time:
-                raise ValueError(
-                    f"Expecting `result_time` to contain result for command {{'{key}': '{command}'}}. Got: {result}",
-                )
-
-            responses.append(
-                Response(
-                    result=result.result[key],
-                    time=result.result_time[key],
-                    total=result.result_total.get(key, None),
-                    next=result.result_next.get(key, None),
-                ),
-            )
-        return responses
-
-    @staticmethod
-    def _list_tail_requests(
-        head_request: Request,
-        head_response: Response,
-        *,
-        list_size: int,
-    ) -> Generator[Request]:
-        if head_response.next and head_response.next != list_size:
-            raise ValueError(f"Expecting list chunk size to be {list_size}. Got: {head_response.next}")
-
-        total = head_response.total or 0
-        for start in range(list_size, total, list_size):
-            tail_request = head_request.model_copy(deep=True)
-            tail_request.parameters["start"] = start
-            yield tail_request
-
-    async def _batch_common_body(
-        self,
-        requests: tuple[Request | dict | tuple[Request | dict, Any], ...],
-        list_method: bool = False,  # noqa: FBT001, FBT002
-        with_payload: bool = False,  # noqa: FBT001, FBT002
-    ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
-        if with_payload:
-            batched_requests, batched_payloads = zip(*requests, strict=True)
-        else:
-            batched_requests, batched_payloads = requests, None
-
-        batched_responses = await self._retry(self._batch, batched_requests)
-
-        for i, response in enumerate(batched_responses):
-            result = response.list_result if list_method else response.result
-            if with_payload:
-                yield result, batched_payloads[i]
-            else:
-                yield result
-
     async def list_sequential(
         self,
         request: Request | dict,
@@ -310,6 +186,117 @@ class Bitrix24:
         else:
             async for item in self._reference_batched_no_count_sync_updates(reference_helper):
                 yield item
+
+    async def _call(self, request: Request | dict) -> Response:
+        """Call any method and return full response."""
+        request = Request.model_validate(request)
+        self._logger.debug("Sending request: %s", request)
+
+        response = await self._http.post(
+            f"{self._settings.webhook_url}{request.method}",
+            headers={"Content-Type": "application/json"},
+            json=request.model_dump(mode="json")["parameters"],
+        )
+
+        # Checking more informative errors first (content may exist with 5xx status)
+        with contextlib.suppress(httpx.ResponseNotRead, ValidationError):
+            ErrorResponse.model_validate_json(response.content).raise_error(request, self._settings)
+
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            if response.status_code in self._settings.retry_statuses:
+                raise RetryHTTPStatusError(
+                    str(error),
+                    request=error.request,
+                    response=error.response,
+                ) from error
+            raise
+
+        response = Response.model_validate_json(response.content)
+
+        self._logger.debug("Received response: %s", response)
+
+        return response
+
+    async def _batch(self, requests: tuple[Request | dict, ...]) -> list[Response]:
+        """Call limited batch of methods and return full responses."""
+        # Using string keys with equal length to keep requests order and simplify errors extraction
+        width = len(str(len(requests)))
+        commands = {f"_{i:0>{width}d}": Request.model_validate(request) for i, request in enumerate(requests)}
+        request = Request(
+            method="batch",
+            parameters={
+                "halt": True,
+                "cmd": {key: request.query for key, request in commands.items()},
+            },
+        )
+
+        response = await self._call(request)
+
+        result = BatchResult.model_validate(response.result)
+
+        responses = []
+        for key, command in commands.items():
+            if key in result.result_error:
+                ErrorResponse.model_validate(result.result_error[key]).raise_error(
+                    command,
+                    self._settings,
+                )
+            if key not in result.result:
+                raise ValueError(
+                    f"Expecting `result` to contain result for command {{'{key}': '{command}'}}. Got: {result}",
+                )
+            if key not in result.result_time:
+                raise ValueError(
+                    f"Expecting `result_time` to contain result for command {{'{key}': '{command}'}}. Got: {result}",
+                )
+
+            responses.append(
+                Response(
+                    result=result.result[key],
+                    time=result.result_time[key],
+                    total=result.result_total.get(key, None),
+                    next=result.result_next.get(key, None),
+                ),
+            )
+        return responses
+
+    @staticmethod
+    def _list_tail_requests(
+        head_request: Request,
+        head_response: Response,
+        *,
+        list_size: int,
+    ) -> Generator[Request]:
+        if head_response.next and head_response.next != list_size:
+            raise ValueError(f"Expecting list chunk size to be {list_size}. Got: {head_response.next}")
+
+        total = head_response.total or 0
+        for start in range(list_size, total, list_size):
+            tail_request = head_request.model_copy(deep=True)
+            tail_request.parameters["start"] = start
+            yield tail_request
+
+    async def _batch_common_body(
+        self,
+        requests: tuple[Request | dict | tuple[Request | dict, Any], ...],
+        list_method: bool = False,  # noqa: FBT001, FBT002
+        with_payload: bool = False,  # noqa: FBT001, FBT002
+    ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
+        if with_payload:
+            batched_requests, batched_payloads = zip(*requests, strict=True)
+        else:
+            batched_requests, batched_payloads = requests, None
+
+        batched_responses = await self._retry(self._batch, batched_requests)
+
+        for i, response in enumerate(batched_responses):
+            result = response.list_result if list_method else response.result
+            if with_payload:
+                yield result, batched_payloads[i]
+            else:
+                yield result
 
     async def _reference_batched_no_count_async_updates(
         self,
