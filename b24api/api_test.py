@@ -824,6 +824,306 @@ async def test_reference_batched_no_count_async_updates(
     assert sorted(response, key=lambda r: r["ID"]) == result
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dialogs", "list_size", "batch_size"),
+    [({"chat1": 5, "chat2": 3, "chat3": 7}, 2, 2), ({"only": 4}, 4, 2), ({"a": 1, "b": 1}, 5, 1)],
+)
+async def test_reference_cursor_no_count(
+    httpx_mock: HTTPXMock,
+    dialogs: dict[str, int],
+    list_size: int,
+    batch_size: int,
+) -> None:
+    messages = {d: [{"id": i + 1, "text": f"{d}-{i + 1}"} for i in range(n)] for d, n in dialogs.items()}
+
+    def custom_response(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://bitrix24.com/rest/0/test/batch"
+        output = {}
+        for key, value in json.loads(request.content)["cmd"].items():
+            method, command = value.split("?")
+            assert method == "im.dialog.messages.get"
+            command = parse_qs(command)
+
+            dialog_id = command.pop("DIALOG_ID")[0]
+            assert int(command.pop("LIMIT")[0]) == list_size
+            last_id_raw = command.pop("LAST_ID", None)
+            assert not command
+
+            msgs = messages[dialog_id]
+            if last_id_raw is None:
+                page = list(reversed(msgs[-list_size:]))
+            else:
+                older = [m for m in msgs if m["id"] < int(last_id_raw[0])]
+                page = list(reversed(older[-list_size:]))
+            output[key] = {"messages": page}
+
+        return httpx.Response(
+            status_code=200,
+            json={
+                "result": {
+                    "result": output,
+                    "result_error": [],
+                    "result_total": [],
+                    "result_next": [],
+                    "result_time": dict.fromkeys(output, _DEFAULT_TIME),
+                },
+                "time": _DEFAULT_TIME,
+            },
+        )
+
+    httpx_mock.add_callback(custom_response, is_reusable=True)
+
+    api = Bitrix24()
+    response = [
+        r
+        async for r in api.reference_cursor_no_count(
+            {"method": "im.dialog.messages.get", "parameters": {}},
+            ({"DIALOG_ID": d} for d in dialogs),
+            cursor_param="LAST_ID",
+            cursor_field="id",
+            cursor_take="min",
+            list_size=list_size,
+            list_size_param="LIMIT",
+            batch_size=batch_size,
+            result_key="messages",
+        )
+    ]
+
+    expected = sorted(f"{d}-{i + 1}" for d, n in dialogs.items() for i in range(n))
+    assert sorted(str(r["text"]) for r in response) == expected
+
+
+@pytest.mark.asyncio
+async def test_reference_cursor_no_count_with_payload(httpx_mock: HTTPXMock) -> None:
+    list_size = 2
+    messages = [{"id": i + 1, "text": f"m-{i + 1}"} for i in range(3)]
+
+    def custom_response(request: httpx.Request) -> httpx.Response:
+        output = {}
+        for key, value in json.loads(request.content)["cmd"].items():
+            command = parse_qs(value.split("?")[1])
+            assert command.pop("DIALOG_ID") == ["chat"]
+            assert int(command.pop("LIMIT")[0]) == list_size
+            last_id_raw = command.pop("LAST_ID", None)
+
+            if last_id_raw is None:
+                page = list(reversed(messages[-list_size:]))
+            else:
+                older = [m for m in messages if m["id"] < int(last_id_raw[0])]
+                page = list(reversed(older[-list_size:]))
+            output[key] = {"messages": page}
+
+        return httpx.Response(
+            status_code=200,
+            json={
+                "result": {
+                    "result": output,
+                    "result_error": [],
+                    "result_total": [],
+                    "result_next": [],
+                    "result_time": dict.fromkeys(output, _DEFAULT_TIME),
+                },
+                "time": _DEFAULT_TIME,
+            },
+        )
+
+    httpx_mock.add_callback(custom_response, is_reusable=True)
+
+    api = Bitrix24()
+    response = [
+        r
+        async for r in api.reference_cursor_no_count(
+            {"method": "im.dialog.messages.get", "parameters": {}},
+            [({"DIALOG_ID": "chat"}, {"tag": "p"})],
+            cursor_param="LAST_ID",
+            cursor_field="id",
+            cursor_take="min",
+            list_size=list_size,
+            list_size_param="LIMIT",
+            result_key="messages",
+            with_payload=True,
+        )
+    ]
+    assert len(response) == len(messages)
+    items, payloads = zip(*response, strict=True)
+    assert sorted(item["id"] for item in items) == [m["id"] for m in messages]
+    assert all(p == {"tag": "p"} for p in payloads)
+
+
+@pytest.mark.asyncio
+async def test_reference_cursor_no_count_async_updates(httpx_mock: HTTPXMock) -> None:
+    list_size = 2
+    dialogs = {"a": 3, "b": 2}
+    messages = {d: [{"id": i + 1, "text": f"{d}-{i + 1}"} for i in range(n)] for d, n in dialogs.items()}
+
+    def custom_response(request: httpx.Request) -> httpx.Response:
+        output = {}
+        for key, value in json.loads(request.content)["cmd"].items():
+            command = parse_qs(value.split("?")[1])
+            dialog_id = command.pop("DIALOG_ID")[0]
+            command.pop("LIMIT")
+            last_id_raw = command.pop("LAST_ID", None)
+
+            msgs = messages[dialog_id]
+            if last_id_raw is None:
+                page = list(reversed(msgs[-list_size:]))
+            else:
+                older = [m for m in msgs if m["id"] < int(last_id_raw[0])]
+                page = list(reversed(older[-list_size:]))
+            output[key] = {"messages": page}
+
+        return httpx.Response(
+            status_code=200,
+            json={
+                "result": {
+                    "result": output,
+                    "result_error": [],
+                    "result_total": [],
+                    "result_next": [],
+                    "result_time": dict.fromkeys(output, _DEFAULT_TIME),
+                },
+                "time": _DEFAULT_TIME,
+            },
+        )
+
+    httpx_mock.add_callback(custom_response, is_reusable=True)
+
+    async def _updates() -> AsyncGenerator[dict]:
+        for d in dialogs:
+            await asyncio.sleep(0.0001)
+            yield {"DIALOG_ID": d}
+
+    api = Bitrix24()
+    response = [
+        r
+        async for r in api.reference_cursor_no_count(
+            {"method": "im.dialog.messages.get", "parameters": {}},
+            _updates(),
+            cursor_param="LAST_ID",
+            cursor_field="id",
+            cursor_take="min",
+            list_size=list_size,
+            list_size_param="LIMIT",
+            result_key="messages",
+        )
+    ]
+    expected = sorted(f"{d}-{i + 1}" for d, n in dialogs.items() for i in range(n))
+    assert sorted(str(r["text"]) for r in response) == expected
+
+
+@pytest.mark.asyncio
+async def test_reference_cursor_no_count_reserved_in_base() -> None:
+    api = Bitrix24()
+    gen = api.reference_cursor_no_count(
+        {"method": "im.dialog.messages.get", "parameters": {"LAST_ID": 100}},
+        [{"DIALOG_ID": "x"}],
+        cursor_param="LAST_ID",
+        cursor_field="id",
+        cursor_take="min",
+        result_key="messages",
+    )
+    with pytest.raises(ValueError, match=r"`LAST_ID` is reserved"):
+        async for _ in gen:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_reference_cursor_no_count_reserved_in_update() -> None:
+    api = Bitrix24()
+    gen = api.reference_cursor_no_count(
+        {"method": "im.dialog.messages.get", "parameters": {}},
+        [{"DIALOG_ID": "x", "LAST_ID": 100}],
+        cursor_param="LAST_ID",
+        cursor_field="id",
+        cursor_take="min",
+        result_key="messages",
+    )
+    with pytest.raises(ValueError, match=r"`LAST_ID` is reserved"):
+        async for _ in gen:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_reference_cursor_no_count_invalid_result_key(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/batch",
+        json={
+            "result": {
+                "result": {"_0": {"unexpected": []}},
+                "result_error": [],
+                "result_total": [],
+                "result_next": [],
+                "result_time": {"_0": _DEFAULT_TIME},
+            },
+            "time": _DEFAULT_TIME,
+        },
+    )
+
+    api = Bitrix24()
+    with pytest.raises(KeyError, match="messages"):
+        async for _ in api.reference_cursor_no_count(
+            {"method": "im.dialog.messages.get", "parameters": {}},
+            [{"DIALOG_ID": "x"}],
+            cursor_param="LAST_ID",
+            cursor_field="id",
+            cursor_take="min",
+            list_size=10,
+            list_size_param="LIMIT",
+            result_key="messages",
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_reference_cursor_no_count_missing_cursor_field(httpx_mock: HTTPXMock) -> None:
+    list_size = 2
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/batch",
+        json={
+            "result": {
+                "result": {"_0": {"messages": [{"text": "no id"}, {"text": "still no id"}]}},
+                "result_error": [],
+                "result_total": [],
+                "result_next": [],
+                "result_time": {"_0": _DEFAULT_TIME},
+            },
+            "time": _DEFAULT_TIME,
+        },
+    )
+
+    api = Bitrix24()
+    with pytest.raises(KeyError, match="`id`"):
+        async for _ in api.reference_cursor_no_count(
+            {"method": "im.dialog.messages.get", "parameters": {}},
+            [{"DIALOG_ID": "x"}],
+            cursor_param="LAST_ID",
+            cursor_field="id",
+            cursor_take="min",
+            list_size=list_size,
+            list_size_param="LIMIT",
+            result_key="messages",
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_reference_cursor_no_count_invalid_cursor_take() -> None:
+    api = Bitrix24()
+    with pytest.raises(ValueError, match=r"cursor_take"):
+        async for _ in api.reference_cursor_no_count(
+            {"method": "im.dialog.messages.get", "parameters": {}},
+            [{"DIALOG_ID": "x"}],
+            cursor_param="LAST_ID",
+            cursor_field="id",
+            cursor_take="oops",
+            result_key="messages",
+        ):
+            pass
+
+
 _DEFAULT_TIME = {
     "start": 1741699660.029826,
     "finish": 1741699660.111687,

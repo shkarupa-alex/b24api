@@ -3,7 +3,7 @@ import logging
 from collections.abc import AsyncGenerator, AsyncIterable, Generator, Iterable
 from itertools import batched, islice
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import h2
 import httpx
@@ -14,14 +14,17 @@ from tenacity import AsyncRetrying, before_sleep_log, retry_if_exception_type, s
 
 from b24api.entity import BatchResult, ErrorResponse, ListRequest, Request, Response
 from b24api.error import RetryApiResponseError, RetryHTTPStatusError
-from b24api.helper import BatchedNoCountHelper, ReferenceNoCountHelper
+from b24api.helper import BatchedNoCountHelper, CursorNoCountHelper, ReferenceNoCountHelper
 from b24api.settings import ApiSettings
 from b24api.type import ApiTypes
 
 
 class Bitrix24:
+    """Async Bitrix24 REST client with retries and several list-gathering strategies."""
+
     @inject
     def __init__(self, settings: ApiSettings) -> None:
+        """Build a long-lived HTTP/2 client and retry policy shared by every call."""
         self._settings = settings
 
         self._logger = logging.getLogger(self._settings.logger_name)
@@ -42,9 +45,11 @@ class Bitrix24:
         )
 
     async def aclose(self) -> None:
+        """Release pooled HTTP connections; call once when finished with the client."""
         await self._http.aclose()
 
     async def __aenter__(self) -> Self:
+        """Enable `async with Bitrix24()` so connections close cleanly on exit."""
         return self
 
     async def __aexit__(
@@ -53,10 +58,12 @@ class Bitrix24:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
+        """Close the underlying HTTP client when leaving the `async with` block."""
         await self.aclose()
 
     @property
     def host(self) -> str:
+        """Webhook host extracted from configuration (for logging, metrics, routing)."""
         host = self._settings.webhook_url.host
         if host is None:
             raise ValueError("webhook_url must have a host")
@@ -215,6 +222,51 @@ class Bitrix24:
             async for item in self._reference_batched_no_count_sync_updates(reference_helper):
                 yield item
 
+    async def reference_cursor_no_count(  # noqa: PLR0913
+        self,
+        request: Request | dict[str, Any],
+        updates: (
+            Iterable[dict[str, Any] | tuple[dict[str, Any], Any]]
+            | AsyncIterable[dict[str, Any] | tuple[dict[str, Any], Any]]
+        ),
+        *,
+        cursor_param: str = "LAST_ID",
+        cursor_field: str = "id",
+        cursor_take: Literal["max", "min"] = "max",
+        list_size: int | None = None,
+        list_size_param: str = "LIMIT",
+        batch_size: int | None = None,
+        result_key: str | None = None,
+        with_payload: bool = False,
+    ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
+        """Call `list` method with reference `updates` for cursor pagination and return full `result`.
+
+        Cursor (no count) list gathering for methods with per-reference top-level cursor parameter instead of
+        `>ID` filter (e.g. `im.dialog.messages.get`).
+        """
+        list_size = list_size or self._settings.list_size
+        batch_size = batch_size or self._settings.batch_size
+
+        helper = CursorNoCountHelper(
+            request=request,
+            updates=updates,
+            cursor_param=cursor_param,
+            cursor_field=cursor_field,
+            cursor_take=cursor_take,
+            list_size=list_size,
+            list_size_param=list_size_param,
+            batch_size=batch_size,
+            result_key=result_key,
+            with_payload=with_payload,
+        )
+
+        if isinstance(updates, AsyncIterable):
+            async for item in self._reference_cursor_no_count_async_updates(helper):
+                yield item
+        else:
+            async for item in self._reference_cursor_no_count_sync_updates(helper):
+                yield item
+
     async def _call(self, request: Request | dict[str, Any]) -> Response:
         """Call any method and return full response."""
         request = Request.model_validate(request)
@@ -297,6 +349,7 @@ class Bitrix24:
         *,
         list_size: int,
     ) -> Generator[ListRequest]:
+        """Build the per-chunk requests needed to fetch everything past the head response."""
         if head_response.next and head_response.next != list_size:
             raise ValueError(f"Expecting list chunk size to be {list_size}. Got: {head_response.next}")
 
@@ -312,6 +365,7 @@ class Bitrix24:
         list_method: bool = False,  # noqa: FBT001, FBT002
         with_payload: bool = False,  # noqa: FBT001, FBT002
     ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
+        """Shared core of `batch()` for both sync and async update streams."""
         batched_payloads: tuple[Any, ...] | None
         if with_payload:
             batched_requests, batched_payloads = zip(*requests, strict=True)
@@ -331,6 +385,7 @@ class Bitrix24:
         self,
         reference_helper: ReferenceNoCountHelper,
     ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
+        """Drive reference-batched gathering when references arrive as an `AsyncIterable`."""
         head_requests: tuple[ListRequest | tuple[ListRequest, Any], ...] = ()
         body_requests: list[ListRequest | tuple[ListRequest, Any]] = []
         async for tail_request in reference_helper.atail_requests():
@@ -363,6 +418,7 @@ class Bitrix24:
         body_requests: list[ListRequest | tuple[ListRequest, Any]],
         head_requests: tuple[ListRequest | tuple[ListRequest, Any], ...],
     ) -> tuple[list[ApiTypes | tuple[ApiTypes, Any]], tuple[ListRequest | tuple[ListRequest, Any], ...]]:
+        """Run one batch round-trip combining body and re-issued head requests."""
         all_requests = head_requests + tuple(body_requests)
         body_results: list[ApiTypes | tuple[ApiTypes, Any]] = [
             r
@@ -381,6 +437,7 @@ class Bitrix24:
         self,
         reference_helper: ReferenceNoCountHelper,
     ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
+        """Drive reference-batched gathering when references are a synchronous iterable."""
         head_requests: tuple[ListRequest | tuple[ListRequest, Any], ...] = ()
         tail_requests = iter(reference_helper.tail_requests())
         while body_requests := head_requests + tuple(
@@ -398,3 +455,61 @@ class Bitrix24:
             head_requests = reference_helper.head_requests(body_requests, body_results)
             for item in reference_helper.body_results(body_results):
                 yield item
+
+    async def _reference_cursor_no_count_async_updates(
+        self,
+        helper: CursorNoCountHelper,
+    ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
+        """Async-updates branch of `reference_cursor_no_count`."""
+        if not isinstance(helper.updates, AsyncIterable):
+            raise TypeError("async branch requires AsyncIterable updates")
+
+        pending: list[tuple[Request, Any]] = []
+        async for update in helper.updates:
+            pending.append(helper.first_request(update))
+            if len(pending) >= helper.batch_size:
+                async for item in self._reference_cursor_drain(helper, pending):
+                    yield item
+
+        while pending:
+            async for item in self._reference_cursor_drain(helper, pending):
+                yield item
+
+    async def _reference_cursor_no_count_sync_updates(
+        self,
+        helper: CursorNoCountHelper,
+    ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
+        """Sync-updates branch of `reference_cursor_no_count`."""
+        if isinstance(helper.updates, AsyncIterable):
+            raise TypeError("sync branch requires synchronous Iterable updates")
+
+        pending: list[tuple[Request, Any]] = []
+        for update in helper.updates:
+            pending.append(helper.first_request(update))
+            if len(pending) >= helper.batch_size:
+                async for item in self._reference_cursor_drain(helper, pending):
+                    yield item
+
+        while pending:
+            async for item in self._reference_cursor_drain(helper, pending):
+                yield item
+
+    async def _reference_cursor_drain(
+        self,
+        helper: CursorNoCountHelper,
+        pending: list[tuple[Request, Any]],
+    ) -> AsyncGenerator[ApiTypes | tuple[ApiTypes, Any]]:
+        """Advance up to `batch_size` references by one page in a single round-trip."""
+        chunk = pending[: helper.batch_size]
+        del pending[: helper.batch_size]
+
+        flat_requests = tuple(req for req, _ in chunk)
+        responses: list[Response] = await self._retry(self._batch, flat_requests)
+
+        for (req, payload), response in zip(chunk, responses, strict=True):
+            items = helper.items_from_result(response.result)
+            for item in items:
+                yield (item, payload) if helper.with_payload else item
+            cont = helper.continuation(req, items, payload)
+            if cont is not None:
+                pending.append(cont)
