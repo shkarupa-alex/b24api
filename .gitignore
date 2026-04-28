@@ -102,6 +102,9 @@ ENV/
 # this package
 .idea/
 .vscode/
+.cursor/
+.claude/
+.codex/
 .pytest_cache/
 .DS_Store
 *.pyc
