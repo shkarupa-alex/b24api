@@ -69,9 +69,11 @@ class Bitrix24:
             raise ValueError("webhook_url must have a host")
         return host
 
-    async def call(self, request: Request | dict[str, Any]) -> ApiTypes:
-        """Call any method (with retries) and return `result` from response."""
+    async def call(self, request: Request | dict[str, Any], *, raw: bool = False) -> ApiTypes | Response:
+        """Call any method (with retries) and return `result` from response by default or raw response (raw=True)."""
         response: Response = await self._retry(self._call, request)
+        if raw:
+            return response
         return response.result
 
     async def batch(
