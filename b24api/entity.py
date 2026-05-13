@@ -2,7 +2,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from b24api.error import ApiResponseError, RetryApiResponseError
 from b24api.query import build_query
@@ -31,6 +31,8 @@ class Request(BaseModel):
 
 class ListRequestParameters(BaseModel):
     """Parameters of `*.list` requests."""
+
+    model_config = ConfigDict(extra="allow")  # some methods (notably `crm.item.*`) accept additional parameters
 
     select: list[str] = []
     filter: dict[str, ApiTypes] = {}

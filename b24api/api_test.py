@@ -64,6 +64,90 @@ async def test_call_list(httpx_mock: HTTPXMock) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_batched_no_count_preserves_extra_params(httpx_mock: HTTPXMock) -> None:
+    """`entityTypeId` and other non-list top-level params must reach the server.
+
+    `crm.item.list` requires `entityTypeId` at the parameters root. Without
+    `extra="allow"` on `ListRequestParameters`, Pydantic silently drops the
+    field and the server returns ERROR_REQUIRED_FIELD_MISSING.
+    """
+    # list_batched_no_count fires head+tail boundary requests in one batch first.
+    # The internal helper labels them `_0` and `_1` by index.
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/batch",
+        match_headers={"Content-Type": "application/json"},
+        json={
+            "result": {
+                "result": {
+                    "_0": [{"id": 1, "title": "First"}],
+                    "_1": [{"id": 1, "title": "First"}],
+                },
+                "result_error": [],
+                "result_total": {"_0": 1, "_1": 1},
+                "result_next": {},
+                "result_time": {"_0": _DEFAULT_TIME, "_1": _DEFAULT_TIME},
+            },
+            "time": _DEFAULT_TIME,
+        },
+    )
+
+    api = Bitrix24()
+    seen = []
+    async for item in api.list_batched_no_count(
+        {
+            "method": "crm.item.list",
+            "parameters": {
+                "entityTypeId": 2,
+                "filter": {"CONTACT_IDS": 1},
+                "select": ["id", "title"],
+            },
+        },
+        id_key="id",
+    ):
+        seen.append(item)
+
+    assert seen == [{"id": 1, "title": "First"}]
+    # The boundary batch request must carry `entityTypeId` for both head and tail.
+    sent_calls = [r for r in httpx_mock.get_requests() if "batch" in str(r.url)]
+    assert sent_calls, "expected at least one batch request"
+    body = json.loads(sent_calls[0].content)
+    for cmd in body["cmd"].values():
+        assert "entityTypeId=2" in cmd, f"entityTypeId missing from batch command: {cmd}"
+
+
+@pytest.mark.asyncio
+async def test_call_raw_returns_full_response(httpx_mock: HTTPXMock) -> None:
+    """`raw=True` exposes envelope fields (total/next/time) without paginating."""
+    result = _DEFAULT_LEADS
+    httpx_mock.add_response(
+        method="POST",
+        url="https://bitrix24.com/rest/0/test/crm.lead.list",
+        match_headers={"Content-Type": "application/json"},
+        match_json={"select": ["ID"], "start": 0},
+        json={
+            "result": result,
+            "next": 50,
+            "total": 1234,
+            "time": _DEFAULT_TIME,
+        },
+    )
+
+    api = Bitrix24()
+    response = await api.call(
+        {
+            "method": "crm.lead.list",
+            "parameters": {"select": ["ID"], "start": 0},
+        },
+        raw=True,
+    )
+    # raw=True returns the full Response, not just `result`.
+    assert response.result == result
+    assert response.total == 1234
+    assert response.next == 50
+
+
+@pytest.mark.asyncio
 async def test_call_status_error(httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(
         method="POST",
