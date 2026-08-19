@@ -1,5 +1,10 @@
 # W3/W4 review packet v2 — corrected execution instrumentation
 
+> **Superseded after independent review.** One blocker remained in the success
+> decoder: model-construction `ValueError` escaped typed protocol handling and
+> could break tolerant-batch total correlation. See
+> `review-findings-v2-resolution.md` and `review-packet-v3.md`.
+
 ## Decision requested
 
 Review immutable implementation SHA
