@@ -21,6 +21,7 @@ from b24api.models import (
     ReplayDisposition,
     ReplaySafety,
     Request,
+    Response,
     SnapshotState,
     TerminalState,
 )
@@ -50,6 +51,8 @@ class _Command:
 class _BatchEnvelope:
     results: Mapping[str, object]
     errors: Mapping[str, object]
+    totals: Mapping[str, object]
+    continuations: Mapping[str, object]
 
 
 @runtime_checkable
@@ -124,7 +127,7 @@ class BatchExecutor:
             raise ValueError("batch_size must be within the portal command cap")
         return size
 
-    async def _execute_chunk(
+    async def _execute_chunk(  # noqa: C901
         self,
         commands: tuple[_Command, ...],
         *,
@@ -173,6 +176,25 @@ class BatchExecutor:
                     raise missing_error
                 outcomes.append(_command_failure(command, missing_error, evidence=evidence))
                 continue
+            try:
+                command_response = Response(
+                    envelope.results[command.stable_key],
+                    total=_optional_batch_integer(envelope.totals, command.stable_key, field="total"),
+                    next=_optional_batch_integer(envelope.continuations, command.stable_key, field="next"),
+                    evidence=response.evidence,
+                )
+            except (TypeError, ValueError) as error:
+                protocol_error = ProtocolError(
+                    "Batch command metadata is malformed",
+                    origin=ErrorOrigin.PROTOCOL,
+                    request_summary=command.request.summary,
+                    evidence=response.evidence,
+                )
+                protocol_error.__cause__ = error
+                if not tolerant:
+                    raise protocol_error from error
+                outcomes.append(_command_failure(command, protocol_error, evidence=evidence))
+                continue
             outcomes.append(
                 BatchSuccess(
                     command.index,
@@ -181,9 +203,37 @@ class BatchExecutor:
                     envelope.results[command.stable_key],
                     command.payload,
                     evidence,
+                    response=command_response,
                 ),
             )
         return await self._fallback(tuple(outcomes), fallback_failed=fallback_failed, context=context)
+
+    async def execute_requests(
+        self,
+        requests: tuple[Request, ...],
+        *,
+        context: ExecutionContext,
+        fallback_failed: Literal["none", "direct"] = "none",
+    ) -> tuple[BatchOutcome, ...]:
+        """Execute one scheduler-owned chunk with total per-command correlation."""
+        if not requests or len(requests) > self.portal_command_cap:
+            raise ValueError("scheduler batch chunk must contain 1..portal_command_cap requests")
+        commands = tuple(
+            _Command(
+                index=index,
+                stable_key=f"c{index:012d}",
+                request=request,
+                payload=None,
+                has_payload=False,
+            )
+            for index, request in enumerate(requests)
+        )
+        return await self._execute_chunk(
+            commands,
+            tolerant=True,
+            fallback_failed=fallback_failed,
+            context=context,
+        )
 
     def _command_error(
         self,
@@ -259,6 +309,7 @@ class BatchExecutor:
                         outcome.payload,
                         outcome.evidence,
                         replay_disposition=ReplayDisposition.REPLAYED_DIRECT,
+                        response=response,
                     ),
                 )
         return tuple(resolved)
@@ -480,7 +531,29 @@ def _decode_batch_envelope(raw: JsonValue) -> _BatchEnvelope:
         raise ProtocolError("Batch result envelope is missing result_error", origin=ErrorOrigin.PROTOCOL)
     results = _decode_php_map(raw.get("result"), field="result")
     errors = _decode_php_map(raw["result_error"], field="result_error")
-    return _BatchEnvelope(results=results, errors=errors)
+    totals = _decode_optional_php_map(raw, field="result_total")
+    continuations = _decode_optional_php_map(raw, field="result_next")
+    return _BatchEnvelope(
+        results=results,
+        errors=errors,
+        totals=totals,
+        continuations=continuations,
+    )
+
+
+def _decode_optional_php_map(raw: dict[str, JsonValue], *, field: str) -> dict[str, JsonValue]:
+    if field not in raw:
+        return {}
+    return _decode_php_map(raw[field], field=field)
+
+
+def _optional_batch_integer(values: Mapping[str, object], key: str, *, field: str) -> int | None:
+    if key not in values:
+        return None
+    value = values[key]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"batch {field} must be an integer")
+    return value
 
 
 def _decode_php_map(raw: JsonValue, *, field: str) -> dict[str, JsonValue]:

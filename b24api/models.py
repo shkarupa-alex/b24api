@@ -850,6 +850,7 @@ class BatchSuccess:
     payload: object = field(default=None, repr=False)
     evidence: BatchCommandEvidence | None = None
     replay_disposition: ReplayDisposition | None = None
+    response: Response | None = field(default=None, repr=False)
 
     def __init__(  # noqa: PLR0913
         self,
@@ -860,17 +861,24 @@ class BatchSuccess:
         payload: object = None,
         evidence: BatchCommandEvidence | None = None,
         replay_disposition: ReplayDisposition | None = None,
+        response: Response | None = None,
     ) -> None:
         _validate_batch_correlation(command_index, stable_key, request, evidence)
         if replay_disposition is not None and not isinstance(replay_disposition, ReplayDisposition):
             raise TypeError("replay_disposition must be a ReplayDisposition or None")
+        if response is not None and not isinstance(response, Response):
+            raise TypeError("response must be a Response or None")
+        frozen_result = _freeze_json(result)
+        if response is not None and response.result != _thaw_json(frozen_result):
+            raise ValueError("batch response result must match the correlated command result")
         object.__setattr__(self, "command_index", command_index)
         object.__setattr__(self, "stable_key", stable_key)
         object.__setattr__(self, "request", request)
-        object.__setattr__(self, "_result", _freeze_json(result))
+        object.__setattr__(self, "_result", frozen_result)
         object.__setattr__(self, "payload", payload)
         object.__setattr__(self, "evidence", evidence)
         object.__setattr__(self, "replay_disposition", replay_disposition)
+        object.__setattr__(self, "response", response)
 
     @property
     def result(self) -> JsonValue:
@@ -921,8 +929,14 @@ type BatchOutcome = BatchSuccess | BatchFailure
 class ReferenceRequest:
     """Immutable request correlated to a reference key."""
 
-    request: Request
-    reference_key: str
+    request: Request = field(repr=False)
+    reference_key: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, Request):
+            raise TypeError("reference request must contain a canonical Request")
+        if not self.reference_key or len(self.reference_key) > STABLE_KEY_MAXIMUM:
+            raise ValueError("reference_key must be 1..100 characters")
 
 
 @dataclass(frozen=True, slots=True)
@@ -930,33 +944,87 @@ class ReferenceBinding:
     """Safe immutable reference summary and caller payload correlation key."""
 
     reference_summary: str
-    payload_key: str
+    payload_key: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "reference_summary", DEFAULT_REDACTOR.redact_text(self.reference_summary))
+        if not self.reference_summary or len(self.reference_summary) > VIOLATION_MESSAGE_MAXIMUM:
+            raise ValueError("reference_summary must be 1..500 characters")
+        if not self.payload_key or len(self.payload_key) > STABLE_KEY_MAXIMUM:
+            raise ValueError("payload_key must be 1..100 characters")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ReferenceItem:
     """Successful reference item; raw item and payload are hidden from repr."""
 
-    reference_key: str
-    item: JsonValue = field(repr=False)
+    reference_key: str = field(repr=False)
+    _item: FrozenJson = field(repr=False)
     payload: object = field(default=None, repr=False)
 
+    def __init__(self, reference_key: str, item: object, payload: object = None) -> None:
+        if not reference_key or len(reference_key) > STABLE_KEY_MAXIMUM:
+            raise ValueError("reference_key must be 1..100 characters")
+        object.__setattr__(self, "reference_key", reference_key)
+        object.__setattr__(self, "_item", _freeze_json(item))
+        object.__setattr__(self, "payload", payload)
 
-@dataclass(frozen=True, slots=True)
+    @property
+    def item(self) -> JsonValue:
+        return _thaw_json(self._item)
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class ReferenceFailure:
     """Failed reference state with raw correlation excluded from repr."""
 
-    reference_key: str
+    reference_key: str = field(repr=False)
     request: Request = field(repr=False)
     error: object = field(repr=False)
-    cursor: JsonValue = field(default=None, repr=False)
+    _cursor: FrozenJson = field(repr=False)
+    page_state: int = 0
     partial_rows: int = 0
     replay_safety: ReplaySafety = ReplaySafety.UNKNOWN
+    replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
     payload: object = field(default=None, repr=False)
 
-    def __post_init__(self) -> None:
-        if self.partial_rows < 0:
+    def __init__(  # noqa: PLR0913
+        self,
+        reference_key: str,
+        request: Request,
+        error: object,
+        cursor: object = None,
+        page_state: int = 0,
+        partial_rows: int = 0,
+        replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
+        replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE,
+        payload: object = None,
+    ) -> None:
+        if not reference_key or len(reference_key) > STABLE_KEY_MAXIMUM:
+            raise ValueError("reference_key must be 1..100 characters")
+        if not isinstance(request, Request):
+            raise TypeError("reference failure request must be canonical Request")
+        if not _is_plain_int(page_state) or page_state < 0:
+            raise ValueError("page_state cannot be negative")
+        if not _is_plain_int(partial_rows) or partial_rows < 0:
             raise ValueError("partial_rows cannot be negative")
+        if not isinstance(replay_safety, ReplaySafety):
+            raise TypeError("replay_safety must be ReplaySafety")
+        if not isinstance(replay_disposition, ReplayDisposition):
+            raise TypeError("replay_disposition must be ReplayDisposition")
+        object.__setattr__(self, "reference_key", reference_key)
+        object.__setattr__(self, "request", request)
+        object.__setattr__(self, "error", error)
+        object.__setattr__(self, "_cursor", _freeze_json(cursor))
+        object.__setattr__(self, "page_state", page_state)
+        object.__setattr__(self, "partial_rows", partial_rows)
+        object.__setattr__(self, "replay_safety", replay_safety)
+        object.__setattr__(self, "replay_disposition", replay_disposition)
+        object.__setattr__(self, "payload", payload)
+
+    @property
+    def cursor(self) -> JsonValue:
+        return _thaw_json(self._cursor)
 
 
 type ReferenceOutcome = ReferenceItem | ReferenceFailure

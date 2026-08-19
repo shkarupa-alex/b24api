@@ -8,7 +8,7 @@ import itertools
 import json
 import sqlite3
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator, Iterable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol, Self, cast
 
@@ -52,6 +52,7 @@ from b24api.plans import (
 )
 
 type IdentityValue = str | int
+type PageFetch = Callable[[Request], Awaitable[Response]]
 _MISSING = object()
 _PLAN_TYPES = (
     SingleResponsePlan,
@@ -182,6 +183,8 @@ class PaginationDriver:
         selector: ResultSelector | None,
         identity: IdentitySpec | None,
         context: ExecutionContext,
+        fetch: PageFetch | None = None,
+        single_result_as_item: bool = False,
     ) -> None:
         self.executor = executor
         self.request = _traversal_request(request)
@@ -189,7 +192,10 @@ class PaginationDriver:
         self.selector = plan.selector or selector or ResultSelector.root()
         self.identity = identity
         self.context = context
+        self._fetch_override = fetch
+        self._single_result_as_item = single_result_as_item
         self.terminal_reason: str | None = None
+        self.cursor_state: JsonValue = None
         self.violations: list[Violation] = []
         self.validated_rows = 0
         self._fingerprints: set[str] = set()
@@ -229,7 +235,11 @@ class PaginationDriver:
 
     async def _single(self, plan: SingleResponsePlan) -> AsyncGenerator[_Page]:
         response = await self._fetch(self.request)
-        items = _response_items(response, self.selector, single=True)
+        items = (
+            [response.result]
+            if self._single_result_as_item and self.selector.path == ()
+            else _response_items(response, self.selector, single=True)
+        )
         if plan.reject_continuation and response.next is not None:
             raise CapabilityError("single-response plan observed a continuation")
         if plan.reject_positive_total_over_result and response.total is not None and response.total > len(items):
@@ -240,6 +250,7 @@ class PaginationDriver:
 
     async def _offset(self, plan: OffsetSequentialPlan) -> AsyncGenerator[_Page]:  # noqa: C901
         offset = 0
+        self.cursor_state = offset
         expected_total: int | None = None
         visited_offsets: set[int] = set()
         while True:
@@ -277,9 +288,11 @@ class PaginationDriver:
             if next_offset <= offset:
                 raise PaginationError("offset did not advance")
             offset = next_offset
+            self.cursor_state = offset
 
     async def _counted(self, plan: CountedOffsetPlan) -> AsyncGenerator[_Page]:  # noqa: C901
         offset = 0
+        self.cursor_state = offset
         expected_total: int | None = None
         visited_offsets: set[int] = set()
         while True:
@@ -317,6 +330,7 @@ class PaginationDriver:
             if next_offset <= offset:
                 raise PaginationError("counted offset did not advance")
             offset = next_offset
+            self.cursor_state = offset
 
     async def _keyset(self, plan: KeysetPlan) -> AsyncGenerator[_Page]:  # noqa: C901
         identity = self._require_identity("keyset")
@@ -358,6 +372,7 @@ class PaginationDriver:
             if cursor is not None and next_cursor == cursor:
                 raise PaginationError("keyset cursor repeated")
             cursor = next_cursor
+            self.cursor_state = cursor
 
     async def _cursor(self, plan: ItemCursorPlan) -> AsyncGenerator[_Page]:  # noqa: C901, PLR0912
         identity = self._require_identity("item cursor")
@@ -407,8 +422,11 @@ class PaginationDriver:
                 if plan.direction == "desc" and _compare_identities(next_cursor, cursor) > 0:
                     raise PaginationError("item cursor moved in the wrong direction")
             cursor = next_cursor
+            self.cursor_state = cursor
 
     async def _fetch(self, request: Request) -> Response:
+        if self._fetch_override is not None:
+            return await self._fetch_override(request)
         response = await self.executor.execute(
             request,
             context=self.context,

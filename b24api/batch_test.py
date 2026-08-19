@@ -30,6 +30,7 @@ EXPECTED_CHUNKS = 4
 MIXED_COMMAND_COUNT = 3
 FALLBACK_HTTP_CALLS = 2
 HTTP_OK = 200
+EXPECTED_TOTAL = 3
 
 
 class CallbackTransport:
@@ -326,6 +327,51 @@ async def test_batch_success_result_is_detached_from_caller_mutation() -> None:
     assert isinstance(nested, list)
     nested.append(3)
     assert success.result == {"nested": [1]}
+
+
+@pytest.mark.asyncio
+async def test_batch_success_preserves_validated_per_command_pagination_metadata() -> None:
+    def with_metadata(request: Request) -> WireResponse:
+        key = _batch_keys(request)[0]
+        body = json.dumps(
+            {
+                "result": {
+                    "result": {key: [{"ID": 1}]},
+                    "result_error": [],
+                    "result_total": {key: EXPECTED_TOTAL},
+                    "result_next": {key: 1},
+                },
+            },
+        ).encode()
+        return WireResponse(status_code=HTTP_OK, headers=(), body=body)
+
+    stream = BatchExecutor(Executor(CallbackTransport(with_metadata))).batch_outcomes([Request("profile")])
+    outcome = await anext(stream)
+    assert isinstance(outcome, BatchSuccess)
+    assert outcome.response is not None
+    assert outcome.response.total == EXPECTED_TOTAL
+    assert outcome.response.next == 1
+
+
+@pytest.mark.asyncio
+async def test_malformed_batch_pagination_metadata_is_correlated_failure() -> None:
+    def malformed_metadata(request: Request) -> WireResponse:
+        key = _batch_keys(request)[0]
+        body = json.dumps(
+            {
+                "result": {
+                    "result": {key: [{"ID": 1}]},
+                    "result_error": [],
+                    "result_total": {key: "three"},
+                },
+            },
+        ).encode()
+        return WireResponse(status_code=HTTP_OK, headers=(), body=body)
+
+    stream = BatchExecutor(Executor(CallbackTransport(malformed_metadata))).batch_outcomes([Request("profile")])
+    outcome = await anext(stream)
+    assert isinstance(outcome, BatchFailure)
+    assert isinstance(outcome.error, ProtocolError)
 
 
 @pytest.mark.asyncio

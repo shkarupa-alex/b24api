@@ -414,6 +414,14 @@ class ExecutionContext:
         async with self._lock:
             self._counters = self._counters.with_buffered_rows(self.policy, rows)
 
+    async def adjust_buffered_rows(self, delta: int) -> None:
+        """Atomically account concurrent scheduler buffers by a signed delta."""
+        if not isinstance(delta, int) or isinstance(delta, bool):
+            raise TypeError("buffer delta must be an integer")
+        async with self._lock:
+            target = self._counters.buffered_rows + delta
+            self._counters = self._counters.with_buffered_rows(self.policy, target)
+
     def remaining_time(self, *, retry_started: float) -> float:
         return min(
             self.policy.max_elapsed - self.elapsed,

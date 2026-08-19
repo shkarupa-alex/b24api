@@ -16,6 +16,10 @@ from b24api.models import (
     JsonValue,
     OperationReport,
     ParameterPath,
+    ReferenceFailure,
+    ReferenceItem,
+    ReferenceRequest,
+    ReplayDisposition,
     ReplaySafety,
     Request,
     Response,
@@ -29,6 +33,7 @@ from b24api.models import (
 
 EXAMPLE_CREDENTIAL = "n1x2y3z4q5w6e7r8"
 TEST_LIMIT = 2
+TEST_CURSOR = 99
 
 
 def _identity_list(parameters: Mapping[str, JsonValue]) -> list[JsonValue]:
@@ -226,3 +231,33 @@ def test_failure_repr_excludes_request_error_and_payload_values() -> None:
     )
 
     assert EXAMPLE_CREDENTIAL not in repr(failure)
+
+
+def test_reference_values_hide_correlation_and_detach_mutable_items() -> None:
+    request = Request("profile", {"auth": EXAMPLE_CREDENTIAL})
+    reference = ReferenceRequest(request, EXAMPLE_CREDENTIAL)
+    source = {"rows": [1]}
+    item = ReferenceItem(EXAMPLE_CREDENTIAL, source, payload={"secret": EXAMPLE_CREDENTIAL})
+    source["rows"].append(2)
+    exposed = item.item
+    assert isinstance(exposed, dict)
+    rows = exposed["rows"]
+    assert isinstance(rows, list)
+    rows.append(3)
+    failure = ReferenceFailure(
+        EXAMPLE_CREDENTIAL,
+        request,
+        RuntimeError(EXAMPLE_CREDENTIAL),
+        cursor=TEST_CURSOR,
+        page_state=TEST_LIMIT,
+        partial_rows=1,
+        replay_disposition=ReplayDisposition.NOT_ELIGIBLE,
+        payload={"secret": EXAMPLE_CREDENTIAL},
+    )
+
+    assert item.item == {"rows": [1]}
+    assert EXAMPLE_CREDENTIAL not in repr(reference)
+    assert EXAMPLE_CREDENTIAL not in repr(item)
+    assert EXAMPLE_CREDENTIAL not in repr(failure)
+    assert failure.cursor == TEST_CURSOR
+    assert failure.page_state == TEST_LIMIT
