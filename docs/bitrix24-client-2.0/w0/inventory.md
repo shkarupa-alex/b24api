@@ -16,6 +16,7 @@ implementation to a baseline.
 | Corpus HEAD | `a353a58fb1de7abf2c81dd86fc7d8ad1caea8f2f` |
 | Current corpus recipe-tree SHA-256 | `7c6c83487df9913076f16f1cab8630b065df2250f026c4679871957e51343b66` |
 | Corpus Git-status SHA-256 | `237cdb8c384441c71869dbb5e5b2f13246f050d792d9a2e9a69399ff9f9a6340` |
+| Census source files | 1,255 `scripts/recipes/*.py` files + 2 top-level Python files = 1,257 total |
 
 The specification and corpus are uncommitted/dirty inputs owned by the user.
 Their hashes make the census reproducible without committing, stashing, or
@@ -46,6 +47,13 @@ individual hunk.
 The tracked diff against original HEAD was 1,889 insertions and 213 deletions;
 its SHA-256 was
 `e707b50fb23d66bd81521291faf3a2223f6b01299829b40866accd3c0b563a27`.
+It was produced with Git 2.55.0 using this exact locale/configuration and path
+set (the working-tree diff is relative to the checked-out HEAD, whose copies of
+these paths equal original HEAD):
+
+```text
+LC_ALL=C git -c core.autocrlf=false diff --binary --no-ext-diff --no-renames -- README.md b24api/__init__.py b24api/api.py b24api/api_test.py b24api/entity.py b24api/error.py b24api/helper.py | shasum -a 256
+```
 
 ## Committed public-symbol ledger
 
@@ -112,7 +120,8 @@ No dirty-tree hunk is adopted merely because the current dirty suite passes.
 
 The read-only corpus is
 `/Users/alex/Develop/b24api/skills/bitrix24`. The census covers 1,255 current
-Python recipe files under `scripts/recipes/` plus top-level Python scripts.
+Python recipe files under `scripts/recipes/` and 2 top-level Python scripts,
+for an exact total of 1,257 source files.
 Counts are lexical call occurrences and distinct files, so wrappers/spies are
 intentionally included as compatibility pressure rather than claimed runtime
 traffic.
@@ -142,6 +151,14 @@ Keyword pressure in the same corpus:
 | `errors=` | 15 | Dirty-corpus dependency only; migrate to tolerant streams rather than freezing polymorphism. |
 | `retry=` | 0 | No current recipe pressure to freeze the dirty retry keyword broadly. |
 
+Import compatibility in the same 1,257-file scope:
+
+| Import or symbol | Files | Consequence |
+|---|---:|---|
+| Root `Bitrix24` import | 1,246 | Root construction/import compatibility is the broadest corpus contract. |
+| `from b24api.error import ...` | 647 | W1 must preserve error module paths and aliases explicitly. |
+| `BatchedNoCountHelper`, `ReferenceNoCountHelper`, or `CursorNoCountHelper` mention | 0 | Treating these as non-root implementation details has direct corpus support. |
+
 The dominant compatibility risk is `list_batched`: it appears in 716 recipe
 files and cannot receive a silent performance regression. Any correctness-first
 fallback is measured against representative consumers and requires the release
@@ -149,12 +166,14 @@ approval specified in section 4.3.
 
 ## Baseline gates
 
-All baseline commands ran against original HEAD in a detached clean worktree.
-The current dirty candidate was measured separately in the main tree.
+All normative baseline commands ran against original HEAD in a detached clean
+worktree on the project's `.python-version` pin. The current dirty candidate was
+measured separately with the same interpreter and tool versions: CPython
+3.12.10, pytest 9.0.3, Ruff 0.15.12, mypy 1.20.2, and httpx 0.28.1.
 
 | Source | Command | Result |
 |---|---|---|
-| Original HEAD, CPython 3.14.0 | `uv run pytest` | 54 collected, 54 passed in 2.35s. |
+| Original HEAD, CPython 3.12.10 | `uv run pytest` | 54 collected, 54 passed in 2.53s. |
 | Original HEAD | `uv run ruff check .` | Failed with 3 existing test findings: `PERF401` at `api_test.py:108`, `PLR2004` at lines 146 and 147. |
 | Original HEAD | `uv run mypy b24api` | Failed with 24 existing `union-attr` errors at `api_test.py:145-147`. |
 | Dirty candidate, CPython 3.12.10 | `uv run pytest` | 73 collected, 73 passed in 2.16s. |
@@ -167,19 +186,28 @@ configuration.
 
 ## Preregistered evidence boundaries
 
-The schemas beside this ledger lock the W9/W10 evidence shape before any live
-measurement:
+The schemas and semantic validator beside this ledger lock the W9/W10 evidence
+shape before any live measurement:
 
 - `dataset-plan.schema.json`: read-only estimate and explicit write authorization;
 - `dataset-manifest-record.schema.json`: append-only, resumable ownership records;
 - `oracle-record.schema.json`: qualification, expected set/multiset/order, and mutation state;
 - `benchmark-plan.schema.json`: preregistered cases, controls, repetitions, and gates;
 - `evidence-artifact.schema.json`: same-SHA outcome and metric envelope.
+- `batch-chaining-probe.schema.json`: exact runner, request shape, and bounded response summary.
+- `validate_contracts.py`: cross-field equality/order/uniqueness/lineage checks and recursive secret-pattern scanning that JSON Schema cannot express.
 
 Live credentials are never schema fields. Runtime selects exactly one credential
-through `BITRIX24_API_WEBHOOK_URL`; artifacts retain only the host and a
-non-reversible portal fingerprint. The four supplied roles are represented only
-as `admin_full`, `admin_limited`, `employee_full`, and `employee_limited`.
+through `BITRIX24_API_WEBHOOK_URL`; artifacts retain only the host and an
+HMAC-SHA-256 portal fingerprint whose key is never stored. The host is
+intentionally public metadata required by section 16.3; paths and tokens are not
+retained. The four supplied roles are represented only as `admin_full`,
+`admin_limited`, `employee_full`, and `employee_limited`.
+
+The schemas bound and type free-text surfaces and reject known credential forms,
+but they are not claimed to prove redaction by themselves. The semantic
+validator recursively scans every string. W1 owns canonical redaction, and W9
+must run the repository/artifact leak scanner before accepting any artifact.
 
 No large seeding is authorized by W0. It additionally requires a reviewed
 generator SHA, a concrete plan instance, dry-run estimates, explicit user write

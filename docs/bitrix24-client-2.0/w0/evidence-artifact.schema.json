@@ -1,62 +1,157 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://b24api.local/schemas/evidence-artifact-1.0.json",
+  "$id": "https://b24api.local/schemas/evidence-artifact-1.1.json",
   "title": "Bitrix24 client evidence artifact",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "schema_version",
     "run_id",
+    "lineage_id",
     "portal_fingerprint",
     "host",
     "command",
     "phase",
+    "case_id",
     "original_head_sha",
     "fixed_1x_sha",
     "candidate_sha",
     "skills_corpus_sha",
+    "skills_recipe_tree_sha256",
+    "dataset_plan_content_hash",
+    "manifest_content_hash",
     "profile_versions",
     "plan_versions",
+    "runtime",
     "started_at",
     "finished_at",
     "outcome",
     "terminal_state",
     "assurance",
+    "snapshot_requirement",
     "snapshot_state",
     "metrics",
-    "evidence_refs"
+    "controls",
+    "evidence_refs",
+    "safe_violations"
   ],
   "properties": {
-    "schema_version": {"const": "1.0"},
-    "run_id": {"type": "string", "format": "uuid"},
-    "portal_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "host": {"type": "string", "pattern": "^[A-Za-z0-9.-]+$"},
+    "schema_version": {"const": "1.1"},
+    "run_id": {"$ref": "#/$defs/uuid"},
+    "lineage_id": {"$ref": "#/$defs/uuid"},
+    "portal_fingerprint": {"$ref": "#/$defs/sha256"},
+    "host": {"type": "string", "pattern": "^[A-Za-z0-9.-]+$", "maxLength": 253},
     "command": {"enum": ["plan", "seed", "verify", "benchmark", "resume", "cleanup", "recover-manifest"]},
-    "phase": {"type": "string", "minLength": 1},
-    "case_id": {"type": ["string", "null"]},
+    "phase": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "maxLength": 100},
+    "case_id": {"oneOf": [{"$ref": "#/$defs/caseId"}, {"type": "null"}]},
     "original_head_sha": {"$ref": "#/$defs/sha"},
     "fixed_1x_sha": {"$ref": "#/$defs/sha"},
     "candidate_sha": {"$ref": "#/$defs/sha"},
     "skills_corpus_sha": {"$ref": "#/$defs/sha"},
-    "profile_versions": {"type": "array", "items": {"type": "string"}},
-    "plan_versions": {"type": "array", "items": {"type": "string"}},
-    "started_at": {"type": "string", "format": "date-time"},
-    "finished_at": {"type": "string", "format": "date-time"},
-    "outcome": {"enum": ["PASS", "FAIL", "ORACLE_SUSPECT", "INCONCLUSIVE", "SKIP"]},
-    "terminal_state": {"enum": ["not_started", "completed", "incomplete", "failed", "cancelled"]},
-    "assurance": {"enum": ["oracle_verified", "profile_verified", "caller_asserted"]},
-    "snapshot_state": {"enum": ["not_requested", "verified", "unverified", "changed"]},
-    "metrics": {
+    "skills_recipe_tree_sha256": {"$ref": "#/$defs/sha256"},
+    "dataset_plan_content_hash": {"$ref": "#/$defs/sha256"},
+    "manifest_content_hash": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+    "profile_versions": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "maxLength": 100}},
+    "plan_versions": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "maxLength": 100}},
+    "runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["http_attempts", "logical_pages", "batch_requests", "batch_commands", "wall_seconds", "retries", "cooldown_seconds", "raw_rows", "unique_rows", "duplicates", "shortfall", "overfetch", "buffered_rows_high_water"],
+      "required": ["python", "b24api", "httpx"],
       "properties": {
+        "python": {"type": "string", "pattern": "^3\\.(12|13|14)(?:\\.[0-9]+)?$"},
+        "b24api": {"type": "string", "minLength": 1, "maxLength": 50},
+        "httpx": {"type": "string", "minLength": 1, "maxLength": 50}
+      }
+    },
+    "started_at": {"$ref": "#/$defs/timestamp"},
+    "finished_at": {"$ref": "#/$defs/timestamp"},
+    "outcome": {"enum": ["PASS", "FAIL", "ORACLE_SUSPECT", "INCONCLUSIVE", "SKIP"]},
+    "terminal_state": {"enum": ["completed", "incomplete", "failed", "cancelled"]},
+    "assurance": {"enum": ["oracle_verified", "profile_verified", "caller_asserted"]},
+    "snapshot_requirement": {"enum": ["traversal_only", "frozen_manifest", "independent_pre_post_oracle"]},
+    "snapshot_state": {"enum": ["not_requested", "verified", "unverified", "changed"]},
+    "metrics": {"oneOf": [{"$ref": "#/$defs/operationMetrics"}, {"$ref": "#/$defs/benchmarkMetrics"}]},
+    "controls": {"oneOf": [{"$ref": "#/$defs/benchmarkControls"}, {"type": "null"}]},
+    "evidence_refs": {"type": "array", "items": {"$ref": "#/$defs/safeRef"}, "maxItems": 200},
+    "safe_violations": {"type": "array", "items": {"$ref": "#/$defs/safeViolation"}, "maxItems": 100}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"const": "PASS"}}, "required": ["outcome"]},
+      "then": {
+        "properties": {
+          "terminal_state": {"const": "completed"},
+          "snapshot_state": {"enum": ["not_requested", "verified", "unverified"]}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "PASS"}, "snapshot_requirement": {"enum": ["frozen_manifest", "independent_pre_post_oracle"]}}, "required": ["outcome", "snapshot_requirement"]},
+      "then": {"properties": {"snapshot_state": {"const": "verified"}}}
+    },
+    {
+      "if": {"properties": {"command": {"const": "benchmark"}}, "required": ["command"]},
+      "then": {
+        "properties": {
+          "case_id": {"$ref": "#/$defs/caseId"},
+          "manifest_content_hash": {"$ref": "#/$defs/sha256"},
+          "metrics": {"$ref": "#/$defs/benchmarkMetrics"},
+          "controls": {"$ref": "#/$defs/benchmarkControls"},
+          "assurance": {"const": "oracle_verified"}
+        }
+      },
+      "else": {
+        "properties": {
+          "case_id": {"type": "null"},
+          "metrics": {"$ref": "#/$defs/operationMetrics"},
+          "controls": {"type": "null"}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "uuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"},
+    "safeText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "not": {"pattern": "(?:[Rr][Ee][Ss][Tt]/[0-9]+/[A-Za-z0-9_-]{8,}|[?&](?:auth|access_token)=|[Bb]earer[ ]+[A-Za-z0-9._~-]{8,})"}
+    },
+    "safeRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^(?:sha256:[0-9a-f]{64}|[A-Za-z0-9._/-]+)$",
+      "not": {"pattern": "(?:^/|\\.\\.|[Rr][Ee][Ss][Tt]/[0-9]+/)"}
+    },
+    "caseId": {
+      "enum": ["T-S", "T-M", "T-D", "T-SP", "T-B", "T-ID", "T-OR", "E-OFF", "H-REF", "C-REF", "CRM-I", "CRM-A", "CRM-T", "CRM-NO-ID", "IM-X", "IM-DEEP", "IM-RECENT", "V-SIZE", "S-SHORT", "L-NEST", "SR"]
+    },
+    "operationMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "http_attempts", "wall_seconds"],
+      "properties": {
+        "kind": {"const": "operation"},
+        "http_attempts": {"type": "integer", "minimum": 0},
+        "wall_seconds": {"type": "number", "minimum": 0}
+      }
+    },
+    "benchmarkMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "http_attempts", "logical_pages", "batch_requests", "batch_commands", "time_to_first_row_seconds", "wall_seconds", "server_operating_seconds", "retries", "cooldown_seconds", "buffered_rows_high_water", "rss_delta_bytes", "raw_rows", "unique_rows", "overlap", "duplicates", "shortfall", "overfetch", "reference_failures"],
+      "properties": {
+        "kind": {"const": "benchmark"},
         "http_attempts": {"type": "integer", "minimum": 0},
         "logical_pages": {"type": "integer", "minimum": 0},
         "batch_requests": {"type": "integer", "minimum": 0},
         "batch_commands": {"type": "integer", "minimum": 0},
         "time_to_first_row_seconds": {"type": ["number", "null"], "minimum": 0},
-        "wall_seconds": {"type": "number", "minimum": 0},
+        "wall_seconds": {"type": "number", "exclusiveMinimum": 0},
         "server_operating_seconds": {"type": ["number", "null"], "minimum": 0},
         "retries": {"type": "integer", "minimum": 0},
         "cooldown_seconds": {"type": "number", "minimum": 0},
@@ -64,15 +159,17 @@
         "rss_delta_bytes": {"type": ["integer", "null"]},
         "raw_rows": {"type": "integer", "minimum": 0},
         "unique_rows": {"type": "integer", "minimum": 0},
+        "overlap": {"type": "integer", "minimum": 0},
         "duplicates": {"type": "integer", "minimum": 0},
         "shortfall": {"type": "integer", "minimum": 0},
         "overfetch": {"type": "integer", "minimum": 0},
         "reference_failures": {"type": "integer", "minimum": 0}
       }
     },
-    "controls": {
+    "benchmarkControls": {
       "type": "object",
       "additionalProperties": false,
+      "required": ["rtt_before_seconds", "rtt_after_seconds", "operating_before_seconds", "operating_after_seconds", "drift_quarantined"],
       "properties": {
         "rtt_before_seconds": {"type": ["number", "null"], "minimum": 0},
         "rtt_after_seconds": {"type": ["number", "null"], "minimum": 0},
@@ -81,10 +178,15 @@
         "drift_quarantined": {"type": "boolean"}
       }
     },
-    "evidence_refs": {"type": "array", "items": {"type": "string", "maxLength": 200}},
-    "safe_violations": {"type": "array", "items": {"type": "object", "maxProperties": 10}, "maxItems": 100}
-  },
-  "$defs": {
-    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+    "safeViolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "field"],
+      "properties": {
+        "code": {"$ref": "#/$defs/safeText"},
+        "message": {"$ref": "#/$defs/safeText"},
+        "field": {"oneOf": [{"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "maxLength": 200}, {"type": "null"}]}
+      }
+    }
   }
 }

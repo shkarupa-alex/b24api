@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b24api.local/schemas/batch-chaining-probe-1.1.json",
+  "title": "Read-only Bitrix24 batch command-chaining probe",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "observed_at",
+    "runner",
+    "host",
+    "portal_fingerprint",
+    "portal_fingerprint_algorithm",
+    "credential_role",
+    "read_only",
+    "request_count",
+    "command_keys",
+    "request_shape",
+    "response_summary",
+    "outcome",
+    "conclusion",
+    "authorization_effect"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.1"},
+    "observed_at": {"$ref": "#/$defs/timestamp"},
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "repository_head_sha", "source_sha256", "python", "httpx"],
+      "properties": {
+        "kind": {"const": "committed_python_httpx"},
+        "repository_head_sha": {"$ref": "#/$defs/sha"},
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "python": {"type": "string", "pattern": "^3\\.(12|13|14)(?:\\.[0-9]+)?$"},
+        "httpx": {"type": "string", "minLength": 1, "maxLength": 50}
+      }
+    },
+    "host": {"type": "string", "pattern": "^[A-Za-z0-9.-]+$", "maxLength": 253},
+    "portal_fingerprint": {"$ref": "#/$defs/sha256"},
+    "portal_fingerprint_algorithm": {"const": "hmac-sha256-v1"},
+    "credential_role": {"enum": ["admin_full", "admin_limited", "employee_full", "employee_limited"]},
+    "read_only": {"const": true},
+    "request_count": {"const": 1},
+    "command_keys": {"const": ["who", "dependent"]},
+    "request_shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["halt", "cmd"],
+      "properties": {
+        "halt": {"const": 0},
+        "cmd": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["who", "dependent"],
+          "properties": {
+            "who": {"const": "profile"},
+            "dependent": {"const": "user.get?ID=$result[who][ID]"}
+          }
+        }
+      }
+    },
+    "response_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_status", "structured_error", "command_error_keys", "profile_identity_present", "dependent_row_count", "dependent_identity_matched"],
+      "properties": {
+        "http_status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "structured_error": {"type": "boolean"},
+        "command_error_keys": {"type": "array", "items": {"enum": ["who", "dependent"]}, "uniqueItems": true},
+        "profile_identity_present": {"type": "boolean"},
+        "dependent_row_count": {"type": "integer", "minimum": 0},
+        "dependent_identity_matched": {"type": "boolean"}
+      }
+    },
+    "outcome": {"enum": ["PASS", "FAIL", "INCONCLUSIVE"]},
+    "conclusion": {"enum": ["supported_for_observed_query_shape_only", "not_observed", "environment_unavailable"]},
+    "authorization_effect": {"const": "none"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"const": "PASS"}}, "required": ["outcome"]},
+      "then": {
+        "properties": {
+          "conclusion": {"const": "supported_for_observed_query_shape_only"},
+          "response_summary": {
+            "properties": {
+              "http_status": {"const": 200},
+              "structured_error": {"const": false},
+              "command_error_keys": {"maxItems": 0},
+              "profile_identity_present": {"const": true},
+              "dependent_identity_matched": {"const": true}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"}
+  }
+}
