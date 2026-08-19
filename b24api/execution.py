@@ -23,6 +23,7 @@ from b24api.error import (
     BudgetExceededError,
     FailurePhase,
     HTTPGatewayError,
+    ProtocolError,
     RetryApiResponseError,
     TransportError,
 )
@@ -31,6 +32,7 @@ from b24api.models import (
     ExecutionPolicy,
     ReplaySafety,
     Request,
+    RequestSummary,
     Response,
     ResponseEvidence,
     ResponseTime,
@@ -92,10 +94,8 @@ class _PhaseTracker:
 
     def __init__(self) -> None:
         self.phase = FailurePhase.NOT_DISPATCHED
-        self.observed = False
 
     async def __call__(self, event_name: str, _info: Mapping[str, object]) -> None:
-        self.observed = True
         if event_name.endswith(("connect_tcp.complete", "start_tls.complete")):
             self.phase = FailurePhase.CONNECTION_ESTABLISHED
         elif ".send_request_" in event_name and event_name.endswith(".started"):
@@ -504,7 +504,7 @@ class Executor:
                 retry_codes=context.policy.retry.transient_api_codes,
             )
             if response_error is None:
-                return _decode_success(wire)
+                return _decode_success(wire, request_summary=request.summary)
             await self._prepare_retry(
                 request,
                 response_error,
@@ -605,46 +605,60 @@ def _throttle_reason(error: B24ApiError) -> str:
     return f"http_{error.http_status}"
 
 
-def _decode_success(wire: WireResponse) -> Response:
+def _decode_success(wire: WireResponse, *, request_summary: RequestSummary) -> Response:
+    evidence = _wire_evidence(wire)
     try:
         payload = json.loads(wire.body, parse_constant=_reject_json_constant)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
         raise HTTPGatewayError(
             "Malformed successful HTTP response",
-            evidence=_wire_evidence(wire),
+            request_summary=request_summary,
+            evidence=evidence,
         ) from error
     if not isinstance(payload, Mapping) or "result" not in payload:
         raise HTTPGatewayError(
             "Successful response is missing the result envelope",
-            evidence=_wire_evidence(wire),
+            request_summary=request_summary,
+            evidence=evidence,
         )
     total = payload.get("total")
     next_value = payload.get("next")
     if total is not None and (not isinstance(total, int) or isinstance(total, bool)):
-        raise HTTPGatewayError("Response total must be an integer", evidence=_wire_evidence(wire))
+        raise HTTPGatewayError("Response total must be an integer", request_summary=request_summary, evidence=evidence)
     if isinstance(total, int) and total < -1:
-        raise HTTPGatewayError("Response total must be -1 or non-negative", evidence=_wire_evidence(wire))
+        raise HTTPGatewayError(
+            "Response total must be -1 or non-negative",
+            request_summary=request_summary,
+            evidence=evidence,
+        )
     if next_value is not None and (not isinstance(next_value, int) or isinstance(next_value, bool)):
-        raise HTTPGatewayError("Response next must be an integer", evidence=_wire_evidence(wire))
-    return Response(
-        payload["result"],
-        time=_decode_response_time(payload.get("time")),
-        total=total,
-        next=next_value,
-        evidence=_wire_evidence(wire),
-    )
+        raise HTTPGatewayError("Response next must be an integer", request_summary=request_summary, evidence=evidence)
+    try:
+        return Response(
+            payload["result"],
+            time=_decode_response_time(payload.get("time")),
+            total=total,
+            next=next_value,
+            evidence=evidence,
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ProtocolError(
+            "Successful response violates the canonical response contract",
+            request_summary=request_summary,
+            evidence=evidence,
+        ) from error
 
 
 def _decode_response_time(raw: object) -> ResponseTime | None:
     if raw is None:
         return None
     if not isinstance(raw, Mapping):
-        raise HTTPGatewayError("Response time must be an object")
+        raise TypeError("response time must be an object")
 
     def number(name: str, *, default: float = 0.0) -> float:
         value = raw.get(name, default)
         if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(float(value)):
-            raise HTTPGatewayError("Response time contains an invalid number")
+            raise ValueError("response time contains an invalid number")
         return float(value)
 
     operating = raw.get("operating")

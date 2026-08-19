@@ -6,7 +6,14 @@ import asyncio
 import httpx
 import pytest
 
-from b24api.error import AmbiguousExecutionError, BudgetExceededError, FailurePhase, HTTPGatewayError, TransportError
+from b24api.error import (
+    AmbiguousExecutionError,
+    BudgetExceededError,
+    FailurePhase,
+    HTTPGatewayError,
+    ProtocolError,
+    TransportError,
+)
 from b24api.execution import (
     CoordinatorState,
     Executor,
@@ -386,3 +393,24 @@ async def test_negative_one_total_sentinel_is_preserved_but_lower_values_are_typ
     with pytest.raises(HTTPGatewayError) as captured:
         await Executor(invalid).execute(Request("profile"), policy=_policy())
     assert captured.value.http_status == HTTP_OK
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(b'{"result":[],"next":-1}', id="negative-next"),
+        pytest.param(b'{"result":1e400}', id="overflowed-result-number"),
+        pytest.param(b'{"result":[],"time":{"duration":-1}}', id="negative-server-duration"),
+    ],
+)
+async def test_success_model_contract_failures_are_typed_and_keep_http_evidence(body: bytes) -> None:
+    transport = SequenceTransport([_success(body)])
+
+    with pytest.raises(ProtocolError) as captured:
+        await Executor(transport).execute(Request("profile"), policy=_policy())
+
+    assert captured.value.http_status == HTTP_OK
+    assert captured.value.request_summary is not None
+    assert captured.value.request_summary.method == "profile"
+    assert isinstance(captured.value.__cause__, ValueError)

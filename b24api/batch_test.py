@@ -29,6 +29,7 @@ TEST_COMMAND_COUNT = 23
 EXPECTED_CHUNKS = 4
 MIXED_COMMAND_COUNT = 3
 FALLBACK_HTTP_CALLS = 2
+HTTP_OK = 200
 
 
 class CallbackTransport:
@@ -236,6 +237,26 @@ async def test_chunk_transport_failure_synthesizes_every_unresolved_outcome() ->
     assert len(outcomes) == TEST_BATCH_SIZE
     assert all(isinstance(outcome, BatchFailure) for outcome in outcomes)
     assert [outcome.command_index for outcome in outcomes] == list(range(TEST_BATCH_SIZE))
+    assert stream.report.state is TerminalState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_overflowed_batch_result_becomes_totally_correlated_protocol_failure() -> None:
+    def overflowed(request: Request) -> WireResponse:
+        key = _batch_keys(request)[0]
+        body = ('{"result":{"result":{"' + key + '":1e400},"result_error":[]}}').encode()
+        return WireResponse(status_code=HTTP_OK, headers=(("content-type", "application/json"),), body=body)
+
+    stream = BatchExecutor(Executor(CallbackTransport(overflowed))).batch_outcomes(
+        [Request("profile", replay_safety=ReplaySafety.SAFE)],
+    )
+    outcomes = cast("list[BatchOutcome]", [outcome async for outcome in stream])
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], BatchFailure)
+    assert isinstance(outcomes[0].error, ProtocolError)
+    assert outcomes[0].error.http_status == HTTP_OK
+    assert outcomes[0].command_index == 0
     assert stream.report.state is TerminalState.COMPLETED
 
 
