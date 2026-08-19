@@ -1,5 +1,10 @@
 # W3/W4 review packet — execution instrumentation and batch correlation
 
+> **Superseded after review.** The immutable subject below was rejected. The
+> gate table also incorrectly mixed results from that clean SHA with the
+> protected working-tree overlay. See `review-findings-v1-resolution.md` and
+> `review-packet-v2.md` for the corrected subject and clean-checkout evidence.
+
 ## Decision requested
 
 Review immutable implementation SHA
