@@ -194,6 +194,15 @@ class ReplaySafety(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ReplayDisposition(StrEnum):
+    """Recorded automatic replay/fallback decision for a failed command."""
+
+    NOT_ELIGIBLE = "not_eligible"
+    ELIGIBLE = "eligible"
+    REPLAYED_DIRECT = "replayed_direct"
+    DIRECT_REPLAY_FAILED = "direct_replay_failed"
+
+
 class IdentityCoercion(StrEnum):
     """Reproducible identity normalization modes."""
 
@@ -830,16 +839,42 @@ class OperationReport:
         return self.state is TerminalState.COMPLETED
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class BatchSuccess:
     """One successful command with raw values excluded from repr."""
 
     command_index: int
     stable_key: str
     request: Request = field(repr=False)
-    result: JsonValue = field(repr=False)
+    _result: FrozenJson = field(repr=False)
     payload: object = field(default=None, repr=False)
     evidence: BatchCommandEvidence | None = None
+    replay_disposition: ReplayDisposition | None = None
+
+    def __init__(  # noqa: PLR0913
+        self,
+        command_index: int,
+        stable_key: str,
+        request: Request,
+        result: object,
+        payload: object = None,
+        evidence: BatchCommandEvidence | None = None,
+        replay_disposition: ReplayDisposition | None = None,
+    ) -> None:
+        _validate_batch_correlation(command_index, stable_key, request, evidence)
+        if replay_disposition is not None and not isinstance(replay_disposition, ReplayDisposition):
+            raise TypeError("replay_disposition must be a ReplayDisposition or None")
+        object.__setattr__(self, "command_index", command_index)
+        object.__setattr__(self, "stable_key", stable_key)
+        object.__setattr__(self, "request", request)
+        object.__setattr__(self, "_result", _freeze_json(result))
+        object.__setattr__(self, "payload", payload)
+        object.__setattr__(self, "evidence", evidence)
+        object.__setattr__(self, "replay_disposition", replay_disposition)
+
+    @property
+    def result(self) -> JsonValue:
+        return _thaw_json(self._result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -851,8 +886,32 @@ class BatchFailure:
     request: Request = field(repr=False)
     error: object = field(repr=False)
     replay_safety: ReplaySafety = ReplaySafety.UNKNOWN
+    replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
     payload: object = field(default=None, repr=False)
     evidence: BatchCommandEvidence | None = None
+
+    def __post_init__(self) -> None:
+        _validate_batch_correlation(self.command_index, self.stable_key, self.request, self.evidence)
+        if not isinstance(self.replay_safety, ReplaySafety):
+            raise TypeError("replay_safety must be a ReplaySafety")
+        if not isinstance(self.replay_disposition, ReplayDisposition):
+            raise TypeError("replay_disposition must be a ReplayDisposition")
+
+
+def _validate_batch_correlation(
+    command_index: int,
+    stable_key: str,
+    request: Request,
+    evidence: BatchCommandEvidence | None,
+) -> None:
+    if not _is_plain_int(command_index) or command_index < 0:
+        raise ValueError("command_index cannot be negative")
+    if not stable_key or len(stable_key) > STABLE_KEY_MAXIMUM:
+        raise ValueError("stable_key must be 1..100 characters")
+    if not isinstance(request, Request):
+        raise TypeError("request must be canonical Request")
+    if evidence is not None and not isinstance(evidence, BatchCommandEvidence):
+        raise TypeError("evidence must be BatchCommandEvidence or None")
 
 
 type BatchOutcome = BatchSuccess | BatchFailure
@@ -927,6 +986,7 @@ __all__ = [
     "ReferenceItem",
     "ReferenceOutcome",
     "ReferenceRequest",
+    "ReplayDisposition",
     "ReplaySafety",
     "Request",
     "RequestSummary",

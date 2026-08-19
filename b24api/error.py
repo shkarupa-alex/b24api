@@ -27,6 +27,17 @@ class ErrorOrigin(StrEnum):
     AMBIGUOUS_EXECUTION = "ambiguous_execution"
 
 
+class FailurePhase(StrEnum):
+    """Last transport lifecycle phase conclusively reached before failure."""
+
+    NOT_DISPATCHED = "not_dispatched"
+    CONNECTION_ESTABLISHED = "connection_established"
+    DISPATCH_STARTED = "dispatch_started"
+    HEADERS_RECEIVED = "headers_received"
+    BODY_PARTIALLY_RECEIVED = "body_partially_received"
+    RESPONSE_COMPLETE = "response_complete"
+
+
 class B24ApiError(Exception):
     """Base error whose default text and serialization contain safe evidence only."""
 
@@ -79,6 +90,37 @@ class TransportError(B24ApiError):
     """Transport lifecycle failure."""
 
     default_origin = ErrorOrigin.TRANSPORT
+
+    def __init__(  # noqa: PLR0913
+        self,
+        message: str,
+        *,
+        phase: FailurePhase = FailurePhase.DISPATCH_STARTED,
+        request_summary: RequestSummary | None = None,
+        evidence: ResponseEvidence | None = None,
+        retryable: bool = True,
+        redactor: Redactor = DEFAULT_REDACTOR,
+    ) -> None:
+        if not isinstance(phase, FailurePhase):
+            raise TypeError("phase must be a FailurePhase")
+        self.phase = phase
+        super().__init__(
+            message,
+            request_summary=request_summary,
+            evidence=evidence,
+            retryable=retryable,
+            redactor=redactor,
+        )
+
+    @property
+    def possible_acceptance(self) -> bool:
+        """Whether any request bytes may have reached the server."""
+        return self.phase not in {FailurePhase.NOT_DISPATCHED, FailurePhase.CONNECTION_ESTABLISHED}
+
+    def to_safe_dict(self) -> dict[str, object]:
+        safe = super().to_safe_dict()
+        safe.update({"phase": self.phase.value, "possible_acceptance": self.possible_acceptance})
+        return safe
 
 
 class HTTPGatewayError(B24ApiError):
@@ -243,6 +285,7 @@ __all__ = [
     "BudgetExceededError",
     "CapabilityError",
     "ErrorOrigin",
+    "FailurePhase",
     "HTTPGatewayError",
     "IncompleteTraversalError",
     "PaginationError",
