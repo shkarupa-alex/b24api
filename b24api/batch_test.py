@@ -58,9 +58,10 @@ def _wire_batch(
     errors: object = None,
     omit_error_key: bool = False,
     omit_result_keys: frozenset[str] = frozenset(),
+    empty_results: bool = False,
 ) -> WireResponse:
     batch_result: dict[str, object] = {
-        "result": {key: {"key": key} for key in keys if key not in omit_result_keys},
+        "result": [] if empty_results else {key: {"key": key} for key in keys if key not in omit_result_keys},
     }
     if not omit_error_key:
         batch_result["result_error"] = [] if errors is None else errors
@@ -70,7 +71,9 @@ def _wire_batch(
 
 def _echo_batch(request: Request) -> WireResponse:
     assert request.method == "batch"
-    assert request.copy_parameters()["halt"] in {True, False}
+    halt = request.copy_parameters()["halt"]
+    assert type(halt) is int
+    assert halt in {0, 1}
     return _wire_batch(_batch_keys(request))
 
 
@@ -105,7 +108,7 @@ async def test_fail_fast_stream_is_lazy_bounded_ordered_and_payload_correlated()
 
     assert len(results) == TEST_COMMAND_COUNT
     assert len(transport.requests) == EXPECTED_CHUNKS
-    assert all(request.copy_parameters()["halt"] is True for request in transport.requests)
+    assert all(request.copy_parameters()["halt"] == 1 for request in transport.requests)
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.batch_commands == TEST_COMMAND_COUNT
     assert stream.report.batch_requests == EXPECTED_CHUNKS
@@ -122,7 +125,8 @@ async def test_async_unlimited_input_pulls_only_one_bounded_chunk_before_first_y
             pulled += 1
             yield Request("profile", replay_safety=ReplaySafety.SAFE)
 
-    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes(
+    transport = CallbackTransport(_echo_batch)
+    stream = BatchExecutor(Executor(transport)).batch_outcomes(
         requests(),
         batch_size=TEST_BATCH_SIZE,
     )
@@ -130,6 +134,7 @@ async def test_async_unlimited_input_pulls_only_one_bounded_chunk_before_first_y
 
     assert isinstance(first, BatchSuccess)
     assert pulled == TEST_BATCH_SIZE
+    assert transport.requests[0].copy_parameters()["halt"] == 0
     await stream.aclose()
     assert stream.report.state is TerminalState.CANCELLED
 
@@ -160,6 +165,32 @@ async def test_php_empty_error_array_is_valid_but_missing_or_nonempty_array_is_m
     with pytest.raises(ProtocolError):
         await anext(malformed_stream)
     assert malformed_stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_php_empty_result_array_preserves_all_command_errors() -> None:
+    def all_failed(request: Request) -> WireResponse:
+        keys = _batch_keys(request)
+        return _wire_batch(
+            keys,
+            errors={key: {"error": "error_not_found", "error_description": "gone"} for key in keys},
+            empty_results=True,
+        )
+
+    requests = [Request("entity.get", {"id": index}, ReplaySafety.SAFE) for index in range(3)]
+    tolerant = BatchExecutor(Executor(CallbackTransport(all_failed))).batch_outcomes(requests)
+    outcomes = cast("list[BatchOutcome]", [outcome async for outcome in tolerant])
+
+    assert all(isinstance(outcome, BatchFailure) for outcome in outcomes)
+    failures = [outcome for outcome in outcomes if isinstance(outcome, BatchFailure)]
+    assert [outcome.error.normalized_code for outcome in failures if isinstance(outcome.error, BatchCommandError)] == [
+        "error_not_found",
+    ] * 3
+
+    fail_fast = BatchExecutor(Executor(CallbackTransport(all_failed))).batch(requests)
+    with pytest.raises(BatchCommandError) as captured:
+        await anext(fail_fast)
+    assert captured.value.normalized_code == "error_not_found"
 
 
 @pytest.mark.asyncio
@@ -238,7 +269,7 @@ async def test_direct_fallback_reruns_only_safe_eligible_failure() -> None:
             return _wire_batch(
                 keys,
                 errors={key: {"error": "batch_hostile", "error_description": "retry direct"} for key in keys},
-                omit_result_keys=frozenset(keys),
+                empty_results=True,
             )
         return WireResponse(status_code=200, headers=(), body=b'{"result":{"direct":true}}')
 
@@ -274,6 +305,38 @@ async def test_batch_success_result_is_detached_from_caller_mutation() -> None:
     assert isinstance(nested, list)
     nested.append(3)
     assert success.result == {"nested": [1]}
+
+
+@pytest.mark.asyncio
+async def test_early_close_closes_original_sync_and_async_sources() -> None:
+    sync_closed = False
+    async_closed = False
+
+    def sync_source() -> Iterator[Request]:
+        nonlocal sync_closed
+        try:
+            while True:
+                yield Request("profile", replay_safety=ReplaySafety.SAFE)
+        finally:
+            sync_closed = True
+
+    async def async_source() -> AsyncGenerator[Request]:
+        nonlocal async_closed
+        try:
+            while True:
+                yield Request("profile", replay_safety=ReplaySafety.SAFE)
+        finally:
+            async_closed = True
+
+    sync_stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch(sync_source(), batch_size=1)
+    await anext(sync_stream)
+    await sync_stream.aclose()
+    assert sync_closed is True
+
+    async_stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch(async_source(), batch_size=1)
+    await anext(async_stream)
+    await async_stream.aclose()
+    assert async_closed is True
 
 
 def test_batch_size_and_mapping_shape_fail_before_io() -> None:

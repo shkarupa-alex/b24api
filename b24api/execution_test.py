@@ -3,9 +3,10 @@
 from __future__ import annotations
 import asyncio
 
+import httpx
 import pytest
 
-from b24api.error import AmbiguousExecutionError, BudgetExceededError, FailurePhase, TransportError
+from b24api.error import AmbiguousExecutionError, BudgetExceededError, FailurePhase, HTTPGatewayError, TransportError
 from b24api.execution import (
     CoordinatorState,
     Executor,
@@ -17,6 +18,7 @@ from b24api.execution import (
 from b24api.models import ExecutionPolicy, ReplaySafety, Request, RetryPolicy
 
 EXPECTED_RETRIED_CALLS = 2
+HTTP_OK = 200
 
 
 class SequenceTransport:
@@ -194,6 +196,24 @@ async def test_cancelled_waiter_is_removed_without_leaking_permit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancellation_after_grant_returns_capacity() -> None:
+    coordinator = RateCoordinator(max_concurrency=1)
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT)
+    waiter = asyncio.create_task(coordinator.acquire(WorkClass.TRAVERSAL_DIRECT))
+    await asyncio.sleep(0)
+
+    await held.release()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert (await coordinator.snapshot()).active_permits == 0
+    replacement = await asyncio.wait_for(coordinator.acquire(WorkClass.BATCH), timeout=1)
+    await replacement.release()
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
 async def test_permit_wait_is_bounded_without_counting_or_dispatching_an_attempt() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
     held = await coordinator.acquire(WorkClass.BATCH)
@@ -238,6 +258,59 @@ async def test_socket_connect_and_post_dispatch_failures_have_distinct_phases() 
         assert not_dispatched.value.phase is FailurePhase.NOT_DISPATCHED
     finally:
         await dead_transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_no_trace_read_failure_is_conservatively_post_dispatch_and_never_replayed() -> None:
+    class NoTraceTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.calls += 1
+            if self.calls == 1:
+                raise httpx.ReadError("delivered then reset", request=request)
+            return httpx.Response(200, request=request, json={"result": {"unexpected_replay": True}})
+
+    raw_transport = NoTraceTransport()
+    client = httpx.AsyncClient(transport=raw_transport)
+    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
+    try:
+        with pytest.raises(AmbiguousExecutionError) as captured:
+            await Executor(transport).execute(
+                Request("crm.deal.add", replay_safety=ReplaySafety.UNSAFE),
+                policy=_policy(),
+            )
+        assert raw_transport.calls == 1
+        assert isinstance(captured.value.__cause__, TransportError)
+        assert captured.value.__cause__.phase is FailurePhase.DISPATCH_STARTED
+    finally:
+        await transport.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    [httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError, httpx.TransportError],
+)
+async def test_no_trace_post_dispatch_error_classes_have_conservative_minimum_phase(
+    error_type: type[httpx.TransportError],
+) -> None:
+    class RaisingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            raise error_type("no trace evidence", request=request)
+
+    client = httpx.AsyncClient(transport=RaisingTransport())
+    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
+    try:
+        with pytest.raises(TransportError) as captured:
+            await transport.send(Request("profile"), attempt_timeout=1)
+        assert captured.value.phase is FailurePhase.DISPATCH_STARTED
+        assert captured.value.possible_acceptance is True
+    finally:
+        await transport.aclose()
+        await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -301,3 +374,15 @@ async def test_socket_cancellation_propagates_and_counts_dispatched_attempt() ->
         await transport.aclose()
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_negative_one_total_sentinel_is_preserved_but_lower_values_are_typed_errors() -> None:
+    sentinel = SequenceTransport([_success(b'{"result":[],"total":-1}')])
+    response = await Executor(sentinel).execute(Request("im.recent.list"), policy=_policy())
+    assert response.total == -1
+
+    invalid = SequenceTransport([_success(b'{"result":[],"total":-2}')])
+    with pytest.raises(HTTPGatewayError) as captured:
+        await Executor(invalid).execute(Request("profile"), policy=_policy())
+    assert captured.value.http_status == HTTP_OK

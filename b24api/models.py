@@ -447,8 +447,8 @@ class Response:
         next: int | None = None,  # noqa: A002
         evidence: ResponseEvidence | None = None,
     ) -> None:
-        if total is not None and (not _is_plain_int(total) or total < 0):
-            raise ValueError("total must be non-negative")
+        if total is not None and (not _is_plain_int(total) or total < -1):
+            raise ValueError("total must be -1 or non-negative")
         if next is not None and (not _is_plain_int(next) or next < 0):
             raise ValueError("next must be non-negative")
         if evidence is not None and not isinstance(evidence, ResponseEvidence):

@@ -92,8 +92,10 @@ class _PhaseTracker:
 
     def __init__(self) -> None:
         self.phase = FailurePhase.NOT_DISPATCHED
+        self.observed = False
 
     async def __call__(self, event_name: str, _info: Mapping[str, object]) -> None:
+        self.observed = True
         if event_name.endswith(("connect_tcp.complete", "start_tls.complete")):
             self.phase = FailurePhase.CONNECTION_ESTABLISHED
         elif ".send_request_" in event_name and event_name.endswith(".started"):
@@ -142,20 +144,20 @@ class HttpxTransport:
             ) from error
         except (httpx.WriteError, httpx.WriteTimeout) as error:
             raise TransportError(
-                "Transport failed while dispatching request",
-                phase=tracker.phase,
+                "Transport failed during or after possible request dispatch",
+                phase=_at_least_dispatch_started(tracker.phase),
                 request_summary=request.summary,
             ) from error
         except (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError) as error:
             raise TransportError(
-                "Transport failed after request dispatch",
-                phase=tracker.phase,
+                "Transport failed after possible request dispatch",
+                phase=_at_least_dispatch_started(tracker.phase),
                 request_summary=request.summary,
             ) from error
         except httpx.TransportError as error:
             raise TransportError(
                 "Unclassified transport failure after possible dispatch",
-                phase=tracker.phase,
+                phase=_at_least_dispatch_started(tracker.phase),
                 request_summary=request.summary,
             ) from error
         return WireResponse(
@@ -242,8 +244,12 @@ class RateCoordinator:
             await future
         except asyncio.CancelledError:
             async with self._condition:
-                with contextlib.suppress(ValueError):
-                    self._queues[work_class].remove(future)
+                was_granted = future.done() and not future.cancelled() and future.exception() is None
+                if was_granted:
+                    self._return_granted_locked()
+                else:
+                    with contextlib.suppress(ValueError):
+                        self._queues[work_class].remove(future)
                 self._grant_locked()
             raise
         return _Permit(self)
@@ -296,6 +302,11 @@ class RateCoordinator:
             self._active -= 1
             self._refresh_cooldown_locked()
             self._grant_locked()
+
+    def _return_granted_locked(self) -> None:
+        if self._active < 1:
+            raise RuntimeError("granted permit accounting underflow")
+        self._active -= 1
 
     def _grant_locked(self) -> None:
         if self._state is not CoordinatorState.OPEN:
@@ -459,10 +470,10 @@ class Executor:
                 raise BudgetExceededError("permit wait exhausted execution time budget") from error
             try:
                 async with permit:
-                    await context.reserve_attempt(attempts_for_request=attempts, retry_started=retry_started)
                     remaining = context.remaining_time(retry_started=retry_started)
                     if remaining <= 0:
                         raise BudgetExceededError("execution time budget exhausted before dispatch")
+                    await context.reserve_attempt(attempts_for_request=attempts, retry_started=retry_started)
                     try:
                         async with asyncio.timeout(remaining):
                             wire = await self.transport.send(request, attempt_timeout=remaining)
@@ -553,6 +564,12 @@ def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: Execution
     return isinstance(error, HTTPGatewayError) and error.http_status in policy.retry.transient_http_statuses
 
 
+def _at_least_dispatch_started(phase: FailurePhase) -> FailurePhase:
+    if phase in {FailurePhase.NOT_DISPATCHED, FailurePhase.CONNECTION_ESTABLISHED}:
+        return FailurePhase.DISPATCH_STARTED
+    return phase
+
+
 def _retry_delay(
     policy: ExecutionPolicy,
     *,
@@ -605,6 +622,8 @@ def _decode_success(wire: WireResponse) -> Response:
     next_value = payload.get("next")
     if total is not None and (not isinstance(total, int) or isinstance(total, bool)):
         raise HTTPGatewayError("Response total must be an integer", evidence=_wire_evidence(wire))
+    if isinstance(total, int) and total < -1:
+        raise HTTPGatewayError("Response total must be -1 or non-negative", evidence=_wire_evidence(wire))
     if next_value is not None and (not isinstance(next_value, int) or isinstance(next_value, bool)):
         raise HTTPGatewayError("Response next must be an integer", evidence=_wire_evidence(wire))
     return Response(

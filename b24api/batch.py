@@ -5,7 +5,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Self, cast
+from typing import Any, Literal, Protocol, Self, cast, runtime_checkable
 
 from b24api.error import B24ApiError, BatchCommandError, ErrorOrigin, ProtocolError
 from b24api.execution import ExecutionContext, Executor, WorkClass
@@ -50,6 +50,16 @@ class _Command:
 class _BatchEnvelope:
     results: Mapping[str, object]
     errors: Mapping[str, object]
+
+
+@runtime_checkable
+class _AsyncClosable(Protocol):
+    async def aclose(self) -> None: ...
+
+
+@runtime_checkable
+class _SyncClosable(Protocol):
+    def close(self) -> None: ...
 
 
 class BatchExecutor:
@@ -379,11 +389,21 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
 
 async def _iterate_source(source: BatchSource) -> AsyncGenerator[BatchInput]:
     if isinstance(source, AsyncIterable):
-        async for item in source:
-            yield item
+        iterator = aiter(source)
+        try:
+            async for item in iterator:
+                yield item
+        finally:
+            if isinstance(iterator, _AsyncClosable):
+                await iterator.aclose()
         return
-    for item in source:
-        yield item
+    sync_iterator = iter(source)
+    try:
+        for item in sync_iterator:
+            yield item
+    finally:
+        if isinstance(sync_iterator, _SyncClosable):
+            sync_iterator.close()
 
 
 async def _next_chunk(
@@ -445,7 +465,7 @@ def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
     else:
         safety = ReplaySafety.UNKNOWN
     encoded = {command.stable_key: _command_query(command.request) for command in commands}
-    return Request("batch", {"halt": halt, "cmd": encoded}, replay_safety=safety)
+    return Request("batch", {"halt": int(halt), "cmd": encoded}, replay_safety=safety)
 
 
 def _command_query(request: Request) -> str:
@@ -458,20 +478,25 @@ def _decode_batch_envelope(raw: JsonValue) -> _BatchEnvelope:
         raise ProtocolError("Batch result envelope must be an object", origin=ErrorOrigin.PROTOCOL)
     if "result_error" not in raw:
         raise ProtocolError("Batch result envelope is missing result_error", origin=ErrorOrigin.PROTOCOL)
-    results = raw.get("result")
-    errors = raw["result_error"]
-    if not isinstance(results, dict):
-        raise ProtocolError("Batch result map must be an object", origin=ErrorOrigin.PROTOCOL)
-    if isinstance(errors, list):
-        if errors:
+    results = _decode_php_map(raw.get("result"), field="result")
+    errors = _decode_php_map(raw["result_error"], field="result_error")
+    return _BatchEnvelope(results=results, errors=errors)
+
+
+def _decode_php_map(raw: JsonValue, *, field: str) -> dict[str, JsonValue]:
+    if isinstance(raw, list):
+        if raw:
             raise ProtocolError(
-                "Non-empty PHP batch result_error array is malformed",
+                f"Non-empty PHP batch {field} array is malformed",
                 origin=ErrorOrigin.PROTOCOL,
             )
-        errors = {}
-    if not isinstance(errors, dict):
-        raise ProtocolError("Batch result_error must be an object or empty array", origin=ErrorOrigin.PROTOCOL)
-    return _BatchEnvelope(results=results, errors=errors)
+        return {}
+    if not isinstance(raw, dict):
+        raise ProtocolError(
+            f"Batch {field} must be an object or empty array",
+            origin=ErrorOrigin.PROTOCOL,
+        )
+    return raw
 
 
 def _command_failure(

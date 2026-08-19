@@ -102,6 +102,9 @@ def test_response_is_deeply_immutable_and_selectors_are_exact() -> None:
     assert "changed" not in repr(response)
     with pytest.raises(ValueError, match="total"):
         Response([], total=True)
+    assert Response([], total=-1).total == -1
+    with pytest.raises(ValueError, match="total"):
+        Response([], total=-2)
 
 
 def test_paths_and_identity_validate_before_use() -> None:
