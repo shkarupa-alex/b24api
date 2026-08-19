@@ -167,9 +167,11 @@ approval specified in section 4.3.
 ## Baseline gates
 
 All normative baseline commands ran against original HEAD in a detached clean
-worktree on the project's `.python-version` pin. The current dirty candidate was
-measured separately with the same interpreter and tool versions: CPython
-3.12.10, pytest 9.0.3, Ruff 0.15.12, mypy 1.20.2, and httpx 0.28.1.
+worktree. The local ignored `.python-version` selects the `3.12` minor line and
+is not an exact evidence pin. Every W0 evidence command therefore names
+`--python 3.12.10` explicitly; artifacts also record the full patch version.
+The current dirty candidate was measured separately with CPython 3.12.10,
+pytest 9.0.3, Ruff 0.15.12, mypy 1.20.2, and httpx 0.28.1.
 
 | Source | Command | Result |
 |---|---|---|
@@ -190,6 +192,9 @@ The schemas and semantic validator beside this ledger lock the W9/W10 evidence
 shape before any live measurement:
 
 - `dataset-plan.schema.json`: read-only estimate and explicit write authorization;
+- `disposable-entity-profiles.schema.json` and
+  `disposable-entity-profiles.json`: content-addressed reviewed allowlist for
+  exact disposable create/read/delete/marker/scope tuples;
 - `dataset-manifest-record.schema.json`: append-only, resumable ownership records;
 - `oracle-record.schema.json`: qualification, expected set/multiset/order, and mutation state;
 - `benchmark-plan.schema.json`: preregistered cases, controls, repetitions, and gates;
@@ -199,36 +204,51 @@ shape before any live measurement:
 
 Live credentials are never schema fields. Runtime selects exactly one credential
 through `BITRIX24_API_WEBHOOK_URL`; artifacts retain only the host and an
-HMAC-SHA-256 portal fingerprint whose key is never stored. The host is
-intentionally public metadata required by section 16.3; paths and tokens are not
-retained. The four supplied roles are represented only as `admin_full`,
-`admin_limited`, `employee_full`, and `employee_limited`.
+HMAC-SHA-256 fingerprint whose key is never stored. The fingerprint input is a
+canonical tuple of public host, declared credential role, and the current
+principal ID observed by the read-only `profile` command. The ID itself is
+discarded. This distinguishes roles/principals on one portal without hashing a
+webhook token. The host is intentionally public metadata required by section
+16.3; paths and tokens are not retained. The four supplied roles are represented
+only as `admin_full`, `admin_limited`, `employee_full`, and `employee_limited`.
 
 The schemas bound and type free-text surfaces and reject known credential forms,
 but they are not claimed to prove redaction by themselves. The semantic
-validator recursively scans every string. W1 owns canonical redaction, and W9
-must run the repository/artifact leak scanner before accepting any artifact.
+validator recursively scans every string and already rejects URL,
+query/bearer, JSON `auth`, `AUTH_ID`, and `APPLICATION_TOKEN` forms. W1 owns
+canonical redaction, and W9 must run the repository/artifact leak scanner before
+accepting any artifact. W1 regression input explicitly includes a bare token,
+`{"auth": "..."}`, and `AUTH_ID=... APPLICATION_TOKEN=...`; bare-token
+detection must be context-aware so that lineage hashes are not false positives.
 
-No large seeding is authorized by W0. It additionally requires a reviewed
+No large seeding is authorized by W0. A plan is valid only when every cell
+matches the content-addressed disposable allowlist, its declared entity estimate
+covers `max(target_count, base_count)` per cell, and each cell remains within the
+reviewed `max_entities_per_cell`. Writes additionally require a reviewed
 generator SHA, a concrete plan instance, dry-run estimates, explicit user write
 authorization, and a resumable cleanup path.
 
 ## Read-only batch command-chaining probe
 
-At `2026-08-19T19:46:26Z`, committed runner
-`4d9cdf83b4b55571cbc8375cb712198856502b8f` made one request using the
+At `2026-08-19T20:06:59Z`, committed runner
+`cf153551640934a215a465959831a401a83358ff` made one request using the
 `admin_full` role. It ran `profile` followed by `user.get` whose `ID` came
 from `$result[who][ID]`.
-The HTTP status was 200, neither the envelope nor either command reported an
-error, and the sole dependent row matched the profile identity. Exact IDs and
-response bodies were discarded.
+The HTTP status was 200, the envelope shape was recognized, neither the envelope
+nor either command reported an error, no unexpected command-error key existed,
+and exactly one dependent row matched the profile identity. Exact IDs and
+response bodies were discarded. The runner deliberately accepts the Bitrix/PHP
+wire polymorphism where an empty PHP array becomes JSON `[]` and the same array
+with associative command keys becomes a JSON object; only exactly empty `[]` or
+an object is valid for `result_error`.
 
 The runner used CPython 3.12.10 and httpx 0.28.1. Its committed source SHA-256
-is `6a9d9858d504f154d4e5da2f6bb06882cadc1fb929a61735b60196943669620c`.
+is `8bda6eae912a956871c9106e1ed209751823a1db4e09b4a6e3cdb92c9f8bab75`.
 The artifact validates against `batch-chaining-probe.schema.json`. Its portal
-fingerprint uses `HMAC-SHA-256(key, host)` under algorithm ID
-`hmac-sha256-v1`; the one-way key and webhook were environment-only and were
-not retained.
+fingerprint uses `HMAC-SHA-256(key, canonical_json([host, role, principal_id]))`
+under algorithm ID `hmac-sha256-portal-role-principal-v1`; the principal ID,
+one-way key, and webhook were not retained. The runner handles unexpected
+exceptions with a fixed message that cannot render the webhook.
 
 This proves only that dependent command substitution works for this portal and
 query shape. It does not authorize a traversal plan or strengthen assurance.
@@ -242,8 +262,10 @@ gates before use.
   needs executable signature, import, wire, and yield characterization tests.
 - No endpoint profile or optimized plan is authorized. The single runtime probe
   can falsify an assumption but cannot promote assurance.
-- No concrete dataset plan, manifest, or oracle instance exists yet, and no live
-  write is authorized.
+- The W0 disposable allowlist contains task and CRM-deal method tuples, but no
+  concrete dataset plan, manifest, or oracle instance exists yet, and no live
+  write is authorized. Any additional family requires another reviewed allowlist
+  revision and content hash.
 - Original HEAD has recorded Ruff and mypy failures; later work must repair them
   without weakening policy.
 - The approved specification remains a user-owned untracked input. Its locked
