@@ -125,12 +125,20 @@ class OffsetSequentialPlan(PlanContract):
         _validate_page_size(self.limit_path, self.requested_page_size)
         if not self.terminal:
             raise ValueError("offset plan requires at least one terminal rule")
+        if OffsetTerminalRule.PROFILE_SHORT_PAGE in self.terminal and self.requested_page_size is None:
+            raise ValueError("short-page terminal requires a requested_page_size")
+        if (
+            OffsetTerminalRule.QUALIFIED_TOTAL in self.terminal
+            and self.total_semantics is not TotalSemantics.FILTERED_EXACT
+        ):
+            raise ValueError("qualified-total terminal requires filtered exact total semantics")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CountedOffsetPlan(PlanContract):
     """Counted offset traversal whose parallel mode has an explicit stride."""
 
+    total_semantics: TotalSemantics = TotalSemantics.FILTERED_EXACT
     mode: CountedOffsetMode = CountedOffsetMode.SEQUENTIAL_NEXT
     offset_path: ParameterPath = _START_PATH
     limit_path: ParameterPath | None = None
@@ -142,6 +150,8 @@ class CountedOffsetPlan(PlanContract):
         super(CountedOffsetPlan, self).__post_init__()
         if not isinstance(self.mode, CountedOffsetMode):
             raise TypeError("mode must be a CountedOffsetMode")
+        if self.total_semantics is not TotalSemantics.FILTERED_EXACT:
+            raise ValueError("counted offset requires filtered exact total semantics")
         _validate_page_size(self.limit_path, self.requested_page_size)
         if self.mode is CountedOffsetMode.PARALLEL_FIXED_STRIDE:
             if self.fixed_stride is None or not _is_plain_int(self.fixed_stride) or self.fixed_stride < 1:
@@ -172,6 +182,8 @@ class KeysetPlan(PlanContract):
         if not isinstance(self.terminal, KeysetTerminalRule):
             raise TypeError("terminal must be a KeysetTerminalRule")
         _validate_page_size(self.limit_path, self.requested_page_size)
+        if self.terminal is KeysetTerminalRule.PROFILE_SHORT_PAGE and self.requested_page_size is None:
+            raise ValueError("short-page terminal requires a requested_page_size")
         _require_distinct_paths(self.filter_path, self.order_path)
         if self.order_semantics is OrderSemantics.UNORDERED:
             raise ValueError("keyset plan requires declared ascending or descending order")
@@ -208,6 +220,8 @@ class ItemCursorPlan(PlanContract):
         if not isinstance(self.terminal, CursorTerminalRule):
             raise TypeError("terminal must be a CursorTerminalRule")
         _validate_page_size(self.limit_path, self.requested_page_size)
+        if self.terminal is CursorTerminalRule.PROFILE_SHORT_PAGE and self.requested_page_size is None:
+            raise ValueError("short-page terminal requires a requested_page_size")
         if self.identity_requirement is not IdentityRequirement.REQUIRED:
             raise ValueError("item cursor plan requires identity")
         expected = OrderSemantics.ASCENDING if self.direction == "asc" else OrderSemantics.DESCENDING
@@ -276,12 +290,7 @@ class DirectDispatch:
 
 
 type ListPlan = (
-    SingleResponsePlan
-    | OffsetSequentialPlan
-    | CountedOffsetPlan
-    | KeysetPlan
-    | ItemCursorPlan
-    | PartitionedKeysetPlan
+    SingleResponsePlan | OffsetSequentialPlan | CountedOffsetPlan | KeysetPlan | ItemCursorPlan | PartitionedKeysetPlan
 )
 type DispatchPlan = BatchDispatch | DirectDispatch
 

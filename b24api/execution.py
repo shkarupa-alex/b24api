@@ -404,6 +404,16 @@ class ExecutionContext:
         async with self._lock:
             self._cooldown_seconds += max(0.0, seconds)
 
+    async def reserve_page(self, *, reference: str | None = None) -> None:
+        """Charge one decoded logical page before it is accepted by a driver."""
+        async with self._lock:
+            self._counters = self._counters.reserve_page(self.policy, reference=reference)
+
+    async def set_buffered_rows(self, rows: int) -> None:
+        """Record retained decoded rows and enforce the global buffer ceiling."""
+        async with self._lock:
+            self._counters = self._counters.with_buffered_rows(self.policy, rows)
+
     def remaining_time(self, *, retry_started: float) -> float:
         return min(
             self.policy.max_elapsed - self.elapsed,

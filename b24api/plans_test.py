@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from b24api.models import IdentityRequirement, OrderSemantics, ParameterPath
+from b24api.models import IdentityRequirement, OrderSemantics, ParameterPath, TotalSemantics
 from b24api.plans import (
     BatchDispatch,
     CountedOffsetMode,
@@ -12,7 +12,9 @@ from b24api.plans import (
     DirectDispatch,
     ItemCursorPlan,
     KeysetPlan,
+    KeysetTerminalRule,
     OffsetSequentialPlan,
+    OffsetTerminalRule,
     PartitionedKeysetPlan,
     SingleResponsePlan,
 )
@@ -58,6 +60,22 @@ def test_counted_offset_mode_and_stride_are_coherent() -> None:
         CountedOffsetPlan(fixed_stride=PAGE_SIZE)
     with pytest.raises(TypeError, match="mode"):
         CountedOffsetPlan(mode="parallel_fixed_stride")  # type: ignore[arg-type]
+    assert CountedOffsetPlan().total_semantics is TotalSemantics.FILTERED_EXACT
+    with pytest.raises(ValueError, match="filtered exact"):
+        CountedOffsetPlan(total_semantics=TotalSemantics.IGNORE)
+
+
+def test_evidence_based_terminal_rules_require_their_declared_contract() -> None:
+    with pytest.raises(ValueError, match="requested_page_size"):
+        OffsetSequentialPlan(terminal=frozenset({OffsetTerminalRule.PROFILE_SHORT_PAGE}))
+    with pytest.raises(ValueError, match="filtered exact"):
+        OffsetSequentialPlan(terminal=frozenset({OffsetTerminalRule.QUALIFIED_TOTAL}))
+    with pytest.raises(ValueError, match="requested_page_size"):
+        KeysetPlan(
+            terminal=KeysetTerminalRule.PROFILE_SHORT_PAGE,
+            identity_requirement=IdentityRequirement.REQUIRED,
+            order_semantics=OrderSemantics.ASCENDING,
+        )
 
 
 def test_keyset_requires_identity_order_and_distinct_paths() -> None:
