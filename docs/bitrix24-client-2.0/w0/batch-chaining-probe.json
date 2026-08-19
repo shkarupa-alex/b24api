@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0",
+  "observed_at": "2026-08-19T22:15:35+03:00",
+  "candidate_sha": "08277c4d921b83b9252177b3e72a21a4c0c86109",
+  "host": "bxtest851.bitrix24.ru",
+  "portal_fingerprint": "75fd8ed74013d31071f6f85cf2822b1e1c3e7286d8c23da64184c85a9cf22daf",
+  "credential_role": "admin_full",
+  "request_count": 1,
+  "commands": ["profile", "dependent_user_get"],
+  "request_shape": {
+    "halt": 0,
+    "cmd": {
+      "who": "profile",
+      "dependent": "user.get?ID=$result[who][ID]"
+    }
+  },
+  "http_status": 200,
+  "structured_error": false,
+  "command_error_keys": [],
+  "profile_identity_present": true,
+  "dependent_row_count": 1,
+  "dependent_identity_matched": true,
+  "conclusion": "supported_for_observed_query_shape_only",
+  "authorization_effect": "none"
+}

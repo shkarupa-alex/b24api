@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b24api.local/schemas/evidence-artifact-1.0.json",
+  "title": "Bitrix24 client evidence artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "portal_fingerprint",
+    "host",
+    "command",
+    "phase",
+    "original_head_sha",
+    "fixed_1x_sha",
+    "candidate_sha",
+    "skills_corpus_sha",
+    "profile_versions",
+    "plan_versions",
+    "started_at",
+    "finished_at",
+    "outcome",
+    "terminal_state",
+    "assurance",
+    "snapshot_state",
+    "metrics",
+    "evidence_refs"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "run_id": {"type": "string", "format": "uuid"},
+    "portal_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "host": {"type": "string", "pattern": "^[A-Za-z0-9.-]+$"},
+    "command": {"enum": ["plan", "seed", "verify", "benchmark", "resume", "cleanup", "recover-manifest"]},
+    "phase": {"type": "string", "minLength": 1},
+    "case_id": {"type": ["string", "null"]},
+    "original_head_sha": {"$ref": "#/$defs/sha"},
+    "fixed_1x_sha": {"$ref": "#/$defs/sha"},
+    "candidate_sha": {"$ref": "#/$defs/sha"},
+    "skills_corpus_sha": {"$ref": "#/$defs/sha"},
+    "profile_versions": {"type": "array", "items": {"type": "string"}},
+    "plan_versions": {"type": "array", "items": {"type": "string"}},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "outcome": {"enum": ["PASS", "FAIL", "ORACLE_SUSPECT", "INCONCLUSIVE", "SKIP"]},
+    "terminal_state": {"enum": ["not_started", "completed", "incomplete", "failed", "cancelled"]},
+    "assurance": {"enum": ["oracle_verified", "profile_verified", "caller_asserted"]},
+    "snapshot_state": {"enum": ["not_requested", "verified", "unverified", "changed"]},
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_attempts", "logical_pages", "batch_requests", "batch_commands", "wall_seconds", "retries", "cooldown_seconds", "raw_rows", "unique_rows", "duplicates", "shortfall", "overfetch", "buffered_rows_high_water"],
+      "properties": {
+        "http_attempts": {"type": "integer", "minimum": 0},
+        "logical_pages": {"type": "integer", "minimum": 0},
+        "batch_requests": {"type": "integer", "minimum": 0},
+        "batch_commands": {"type": "integer", "minimum": 0},
+        "time_to_first_row_seconds": {"type": ["number", "null"], "minimum": 0},
+        "wall_seconds": {"type": "number", "minimum": 0},
+        "server_operating_seconds": {"type": ["number", "null"], "minimum": 0},
+        "retries": {"type": "integer", "minimum": 0},
+        "cooldown_seconds": {"type": "number", "minimum": 0},
+        "buffered_rows_high_water": {"type": "integer", "minimum": 0},
+        "rss_delta_bytes": {"type": ["integer", "null"]},
+        "raw_rows": {"type": "integer", "minimum": 0},
+        "unique_rows": {"type": "integer", "minimum": 0},
+        "duplicates": {"type": "integer", "minimum": 0},
+        "shortfall": {"type": "integer", "minimum": 0},
+        "overfetch": {"type": "integer", "minimum": 0},
+        "reference_failures": {"type": "integer", "minimum": 0}
+      }
+    },
+    "controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rtt_before_seconds": {"type": ["number", "null"], "minimum": 0},
+        "rtt_after_seconds": {"type": ["number", "null"], "minimum": 0},
+        "operating_before_seconds": {"type": ["number", "null"], "minimum": 0},
+        "operating_after_seconds": {"type": ["number", "null"], "minimum": 0},
+        "drift_quarantined": {"type": "boolean"}
+      }
+    },
+    "evidence_refs": {"type": "array", "items": {"type": "string", "maxLength": 200}},
+    "safe_violations": {"type": "array", "items": {"type": "object", "maxProperties": 10}, "maxItems": 100}
+  },
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+  }
+}

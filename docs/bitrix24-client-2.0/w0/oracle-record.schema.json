@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b24api.local/schemas/oracle-record-1.0.json",
+  "title": "Bitrix24 qualified oracle record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "candidate_sha",
+    "portal_fingerprint",
+    "qualification",
+    "normalization",
+    "expected",
+    "snapshot",
+    "outcome"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "run_id": {"type": "string", "format": "uuid"},
+    "case_id": {"type": "string", "minLength": 1},
+    "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "portal_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "cross_check", "defects", "visibility_differences"],
+      "properties": {
+        "kind": {"enum": ["immutable_manifest", "point_read_enumeration", "cross_method", "serial_reference_loop", "diagnostic_only"]},
+        "cross_check": {"type": "string", "minLength": 1},
+        "defects": {"type": "array", "items": {"type": "string"}},
+        "visibility_differences": {"type": "array", "items": {"type": "string"}},
+        "missing_row_behavior": {"type": ["string", "null"]}
+      }
+    },
+    "normalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity_mode", "ordering", "duplicate_semantics"],
+      "properties": {
+        "identity_mode": {"enum": ["exact_string", "exact_integer", "decimal_string_integer", "composite", "none"]},
+        "ordering": {"enum": ["unordered", "ascending", "descending", "input"]},
+        "duplicate_semantics": {"enum": ["set", "multiset", "ordered_sequence"]}
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw_count", "unique_count", "identity_hash", "multiset_hash", "order_hash"],
+      "properties": {
+        "raw_count": {"type": "integer", "minimum": 0},
+        "unique_count": {"type": "integer", "minimum": 0},
+        "identity_hash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "multiset_hash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "order_hash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirement", "state", "pre_hash", "post_hash", "quarantine_attempts"],
+      "properties": {
+        "requirement": {"enum": ["traversal_only", "frozen_manifest", "independent_pre_post_oracle"]},
+        "state": {"enum": ["not_requested", "verified", "unverified", "changed"]},
+        "pre_hash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "post_hash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "quarantine_attempts": {"type": "integer", "minimum": 0, "maximum": 3}
+      }
+    },
+    "outcome": {"enum": ["PASS", "FAIL", "ORACLE_SUSPECT", "INCONCLUSIVE", "SKIP"]},
+    "safe_notes": {"type": "array", "items": {"type": "string", "maxLength": 500}, "maxItems": 20}
+  }
+}

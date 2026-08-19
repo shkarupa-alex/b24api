@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b24api.local/schemas/dataset-manifest-record-1.0.json",
+  "title": "Append-only Bitrix24 evidence manifest record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sequence",
+    "run_id",
+    "lineage_id",
+    "portal_fingerprint",
+    "candidate_sha",
+    "namespace",
+    "event",
+    "cell_id",
+    "entity_family",
+    "correlation_key",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "sequence": {"type": "integer", "minimum": 0},
+    "run_id": {"type": "string", "format": "uuid"},
+    "lineage_id": {"type": "string", "format": "uuid"},
+    "portal_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "namespace": {"type": "string", "pattern": "^b24api-evidence-[0-9a-f-]{36}$"},
+    "event": {
+      "enum": ["planned", "create_dispatched", "created", "ambiguous", "reconciled", "verified", "delete_dispatched", "deleted", "absence_verified", "orphan"]
+    },
+    "cell_id": {"type": "string", "minLength": 1},
+    "entity_family": {"type": "string", "minLength": 1},
+    "correlation_key": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "entity_id": {"type": ["string", "integer", "null"]},
+    "parent_correlation_keys": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "marker_hash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "request_fingerprint": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "safe_error": {"type": ["object", "null"], "additionalProperties": true, "maxProperties": 12}
+  }
+}
