@@ -99,7 +99,7 @@ def main() -> int:
             isinstance(envelope, dict),
             isinstance(result_envelope, dict),
             isinstance(result, dict),
-            isinstance(command_errors, dict),
+            isinstance(command_errors, dict) or command_errors == [],
         ),
     )
     command_error_keys = (
