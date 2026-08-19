@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://b24api.local/schemas/evidence-artifact-1.1.json",
+  "$id": "https://b24api.local/schemas/evidence-artifact-1.2.json",
   "title": "Bitrix24 client evidence artifact",
   "type": "object",
   "additionalProperties": false,
@@ -36,7 +36,7 @@
     "safe_violations"
   ],
   "properties": {
-    "schema_version": {"const": "1.1"},
+    "schema_version": {"const": "1.2"},
     "run_id": {"$ref": "#/$defs/uuid"},
     "lineage_id": {"$ref": "#/$defs/uuid"},
     "portal_fingerprint": {"$ref": "#/$defs/sha256"},
@@ -116,6 +116,35 @@
         "required": ["command", "outcome"]
       },
       "then": {"properties": {"assurance": {"const": "oracle_verified"}}}
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "benchmark"}, "outcome": {"const": "PASS"}},
+        "required": ["command", "outcome"]
+      },
+      "then": {
+        "properties": {
+          "metrics": {
+            "properties": {
+              "shortfall": {"const": 0},
+              "overfetch": {"const": 0},
+              "reference_failures": {"const": 0}
+            }
+          },
+          "controls": {
+            "properties": {
+              "rtt_before_seconds": {"type": "number"},
+              "rtt_after_seconds": {"type": "number"},
+              "operating_before_seconds": {"type": "number"},
+              "operating_after_seconds": {"type": "number"},
+              "drift_quarantined": {"const": false}
+            }
+          },
+          "safe_violations": {
+            "not": {"contains": {"properties": {"severity": {"const": "blocking"}}, "required": ["severity"]}}
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -190,8 +219,9 @@
     "safeViolation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["code", "message", "field"],
+      "required": ["severity", "code", "message", "field"],
       "properties": {
+        "severity": {"enum": ["warning", "blocking"]},
         "code": {"$ref": "#/$defs/safeText"},
         "message": {"$ref": "#/$defs/safeText"},
         "field": {"oneOf": [{"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "maxLength": 200}, {"type": "null"}]}

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://b24api.local/schemas/oracle-record-1.1.json",
+  "$id": "https://b24api.local/schemas/oracle-record-1.2.json",
   "title": "Bitrix24 qualified oracle record",
   "type": "object",
   "additionalProperties": false,
@@ -23,7 +23,7 @@
     "safe_notes"
   ],
   "properties": {
-    "schema_version": {"const": "1.1"},
+    "schema_version": {"const": "1.2"},
     "run_id": {"$ref": "#/$defs/uuid"},
     "lineage_id": {"$ref": "#/$defs/uuid"},
     "case_id": {"$ref": "#/$defs/caseId"},
@@ -102,6 +102,13 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {"normalization": {"properties": {"identity_mode": {"const": "none"}}}},
+        "required": ["normalization"]
+      },
+      "then": {"properties": {"expected": {"properties": {"identity_hash": {"type": "null"}}}}}
     },
     {
       "if": {

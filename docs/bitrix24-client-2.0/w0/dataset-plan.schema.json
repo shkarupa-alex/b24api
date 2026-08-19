@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://b24api.local/schemas/dataset-plan-1.1.json",
+  "$id": "https://b24api.local/schemas/dataset-plan-1.2.json",
   "title": "Bitrix24 evidence dataset plan",
   "type": "object",
   "additionalProperties": false,
@@ -13,6 +13,7 @@
     "generator_sha",
     "skills_corpus_sha",
     "skills_recipe_tree_sha256",
+    "disposable_profiles_content_hash",
     "portal",
     "credential_role",
     "namespace",
@@ -22,7 +23,7 @@
     "authorization"
   ],
   "properties": {
-    "schema_version": {"const": "1.1"},
+    "schema_version": {"const": "1.2"},
     "run_id": {"$ref": "#/$defs/uuid"},
     "lineage_id": {"$ref": "#/$defs/uuid"},
     "original_head_sha": {"$ref": "#/$defs/sha"},
@@ -30,6 +31,7 @@
     "generator_sha": {"$ref": "#/$defs/sha"},
     "skills_corpus_sha": {"$ref": "#/$defs/sha"},
     "skills_recipe_tree_sha256": {"$ref": "#/$defs/sha256"},
+    "disposable_profiles_content_hash": {"$ref": "#/$defs/sha256"},
     "portal": {"$ref": "#/$defs/portal"},
     "credential_role": {"enum": ["admin_full", "admin_limited", "employee_full", "employee_limited"]},
     "namespace": {
@@ -63,13 +65,14 @@
     "authorization": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["state", "live", "allow_writes", "plan_review_sha", "approved_by_user"],
+      "required": ["state", "live", "allow_writes", "plan_review_sha", "approved_by_user", "max_entities_per_cell"],
       "properties": {
         "state": {"enum": ["preview", "approved_for_seed"]},
         "live": {"type": "boolean"},
         "allow_writes": {"type": "boolean"},
         "plan_review_sha": {"oneOf": [{"$ref": "#/$defs/sha"}, {"type": "null"}]},
         "approved_by_user": {"type": "boolean"},
+        "max_entities_per_cell": {"type": "integer", "minimum": 1},
         "approved_at": {"$ref": "#/$defs/timestamp"}
       },
       "allOf": [
@@ -114,7 +117,7 @@
       "properties": {
         "host": {"type": "string", "pattern": "^[A-Za-z0-9.-]+$", "maxLength": 253},
         "fingerprint": {"$ref": "#/$defs/sha256"},
-        "fingerprint_algorithm": {"const": "hmac-sha256-v1"},
+        "fingerprint_algorithm": {"const": "hmac-sha256-portal-role-principal-v1"},
         "build": {"type": ["string", "null"], "maxLength": 100},
         "scope_hash": {"$ref": "#/$defs/sha256"}
       }
@@ -122,9 +125,10 @@
     "cell": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "entity_family", "target_count", "marker_field", "create_method", "read_method", "delete_method"],
+      "required": ["id", "disposable_profile_id", "entity_family", "target_count", "marker_field", "create_method", "read_method", "delete_method"],
       "properties": {
         "id": {"$ref": "#/$defs/caseId"},
+        "disposable_profile_id": {"type": "string", "pattern": "^[a-z0-9-]+-v[0-9]+$", "maxLength": 100},
         "entity_family": {"$ref": "#/$defs/safeText"},
         "target_count": {"type": "integer", "minimum": 0},
         "base_count": {"type": "integer", "minimum": 0},

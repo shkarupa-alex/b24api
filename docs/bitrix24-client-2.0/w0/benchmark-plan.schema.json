@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://b24api.local/schemas/benchmark-plan-1.1.json",
+  "$id": "https://b24api.local/schemas/benchmark-plan-1.2.json",
   "title": "Preregistered Bitrix24 benchmark plan",
   "type": "object",
   "additionalProperties": false,
@@ -21,7 +21,7 @@
     "cases"
   ],
   "properties": {
-    "schema_version": {"const": "1.1"},
+    "schema_version": {"const": "1.2"},
     "plan_id": {"$ref": "#/$defs/uuid"},
     "lineage_id": {"$ref": "#/$defs/uuid"},
     "admission_state": {"enum": ["draft", "admission_ready"]},
@@ -166,7 +166,13 @@
             }
           ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"benefit_gate": {"properties": {"blocking": {"const": true}}}}, "required": ["benefit_gate"]},
+          "then": {"properties": {"compared_plans": {"minItems": 2}}}
+        }
+      ]
     }
   }
 }

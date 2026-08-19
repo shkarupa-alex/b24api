@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://b24api.local/schemas/batch-chaining-probe-1.1.json",
+  "$id": "https://b24api.local/schemas/batch-chaining-probe-1.2.json",
   "title": "Read-only Bitrix24 batch command-chaining probe",
   "type": "object",
   "additionalProperties": false,
@@ -22,7 +22,7 @@
     "authorization_effect"
   ],
   "properties": {
-    "schema_version": {"const": "1.1"},
+    "schema_version": {"const": "1.2"},
     "observed_at": {"$ref": "#/$defs/timestamp"},
     "runner": {
       "type": "object",
@@ -38,7 +38,7 @@
     },
     "host": {"type": "string", "pattern": "^[A-Za-z0-9.-]+$", "maxLength": 253},
     "portal_fingerprint": {"$ref": "#/$defs/sha256"},
-    "portal_fingerprint_algorithm": {"const": "hmac-sha256-v1"},
+    "portal_fingerprint_algorithm": {"const": "hmac-sha256-portal-role-principal-v1"},
     "credential_role": {"enum": ["admin_full", "admin_limited", "employee_full", "employee_limited"]},
     "read_only": {"const": true},
     "request_count": {"const": 1},
@@ -63,11 +63,13 @@
     "response_summary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["http_status", "structured_error", "command_error_keys", "profile_identity_present", "dependent_row_count", "dependent_identity_matched"],
+      "required": ["http_status", "envelope_shape_valid", "structured_error", "command_error_keys", "unexpected_command_error_count", "profile_identity_present", "dependent_row_count", "dependent_identity_matched"],
       "properties": {
         "http_status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "envelope_shape_valid": {"type": "boolean"},
         "structured_error": {"type": "boolean"},
         "command_error_keys": {"type": "array", "items": {"enum": ["who", "dependent"]}, "uniqueItems": true},
+        "unexpected_command_error_count": {"type": "integer", "minimum": 0},
         "profile_identity_present": {"type": "boolean"},
         "dependent_row_count": {"type": "integer", "minimum": 0},
         "dependent_identity_matched": {"type": "boolean"}
@@ -86,9 +88,12 @@
           "response_summary": {
             "properties": {
               "http_status": {"const": 200},
+              "envelope_shape_valid": {"const": true},
               "structured_error": {"const": false},
               "command_error_keys": {"maxItems": 0},
+              "unexpected_command_error_count": {"const": 0},
               "profile_identity_present": {"const": true},
+              "dependent_row_count": {"const": 1},
               "dependent_identity_matched": {"const": true}
             }
           }

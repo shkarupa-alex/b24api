@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://b24api.local/schemas/dataset-manifest-record-1.1.json",
+  "$id": "https://b24api.local/schemas/dataset-manifest-record-1.2.json",
   "title": "Append-only Bitrix24 evidence manifest record",
   "type": "object",
   "additionalProperties": false,
@@ -21,6 +21,7 @@
     "correlation_key",
     "entity_id",
     "marker_hash",
+    "marker_value",
     "request_fingerprint",
     "previous_record_hash",
     "record_hash",
@@ -28,7 +29,7 @@
     "safe_error"
   ],
   "properties": {
-    "schema_version": {"const": "1.1"},
+    "schema_version": {"const": "1.2"},
     "sequence": {"type": "integer", "minimum": 0},
     "run_id": {"$ref": "#/$defs/uuid"},
     "lineage_id": {"$ref": "#/$defs/uuid"},
@@ -51,6 +52,7 @@
     "entity_id": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 100}, {"type": "integer"}, {"type": "null"}]},
     "parent_correlation_keys": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
     "marker_hash": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+    "marker_value": {"oneOf": [{"$ref": "#/$defs/markerValue"}, {"type": "null"}]},
     "request_fingerprint": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
     "previous_record_hash": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
     "record_hash": {"$ref": "#/$defs/sha256"},
@@ -60,20 +62,32 @@
   "allOf": [
     {
       "if": {"properties": {"event": {"enum": ["create_dispatched", "ambiguous"]}}, "required": ["event"]},
-      "then": {"properties": {"request_fingerprint": {"$ref": "#/$defs/sha256"}}}
+      "then": {
+        "properties": {
+          "request_fingerprint": {"$ref": "#/$defs/sha256"},
+          "marker_hash": {"$ref": "#/$defs/sha256"},
+          "marker_value": {"$ref": "#/$defs/markerValue"}
+        }
+      }
     },
     {
       "if": {"properties": {"event": {"enum": ["created", "reconciled", "verified", "delete_dispatched", "deleted", "absence_verified", "orphan"]}}, "required": ["event"]},
       "then": {
         "properties": {
           "entity_id": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 100}, {"type": "integer"}]},
-          "marker_hash": {"$ref": "#/$defs/sha256"}
+          "marker_hash": {"$ref": "#/$defs/sha256"},
+          "marker_value": {"$ref": "#/$defs/markerValue"}
         }
       }
     },
     {
       "if": {"properties": {"event": {"const": "delete_dispatched"}}, "required": ["event"]},
       "then": {"properties": {"request_fingerprint": {"$ref": "#/$defs/sha256"}}}
+    },
+    {
+      "if": {"properties": {"sequence": {"const": 0}}, "required": ["sequence"]},
+      "then": {"properties": {"previous_record_hash": {"type": "null"}}},
+      "else": {"properties": {"previous_record_hash": {"$ref": "#/$defs/sha256"}}}
     }
   ],
   "$defs": {
@@ -86,6 +100,11 @@
       "minLength": 1,
       "maxLength": 300,
       "not": {"pattern": "(?:[Rr][Ee][Ss][Tt]/[0-9]+/[A-Za-z0-9_-]{8,}|[?&](?:auth|access_token)=|[Bb]earer[ ]+[A-Za-z0-9._~-]{8,})"}
+    },
+    "markerValue": {
+      "type": "string",
+      "pattern": "^b24api-evidence-[0-9a-f-]{36}:[A-Za-z0-9._-]{1,100}$",
+      "maxLength": 153
     },
     "safeError": {
       "type": "object",

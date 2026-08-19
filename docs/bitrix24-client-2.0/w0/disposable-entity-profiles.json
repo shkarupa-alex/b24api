@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0",
+  "profile_set_id": "w0-disposable-entities-v1",
+  "profiles": [
+    {
+      "id": "tasks-task-v1",
+      "entity_family": "task",
+      "create_method": "tasks.task.add",
+      "read_method": "tasks.task.get",
+      "delete_method": "tasks.task.delete",
+      "marker_field": "TITLE",
+      "required_scopes": ["task"],
+      "disposable": true,
+      "cleanup_contract": "exact_id_delete_then_point_read_absence"
+    },
+    {
+      "id": "crm-deal-v1",
+      "entity_family": "crm_deal",
+      "create_method": "crm.deal.add",
+      "read_method": "crm.deal.get",
+      "delete_method": "crm.deal.delete",
+      "marker_field": "TITLE",
+      "required_scopes": ["crm"],
+      "disposable": true,
+      "cleanup_contract": "exact_id_delete_then_point_read_absence"
+    }
+  ]
+}

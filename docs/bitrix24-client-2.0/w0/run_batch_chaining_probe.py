@@ -48,8 +48,10 @@ def _source_sha256() -> str:
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
-def _portal_fingerprint(host: str, key: str) -> str:
-    return hmac.new(key.encode(), host.encode(), hashlib.sha256).hexdigest()
+def _portal_fingerprint(host: str, role: str, principal_id: str | None, key: str) -> str:
+    principal = principal_id if principal_id is not None else "missing"
+    message = json.dumps([host, role, principal], ensure_ascii=True, separators=(",", ":"))
+    return hmac.new(key.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 
 def _timestamp() -> str:
@@ -76,7 +78,7 @@ def main() -> int:
 
     try:
         response = httpx.post(f"{webhook}batch.json", json=REQUEST_SHAPE, timeout=30.0)
-        envelope = cast("dict[str, Any]", response.json())
+        envelope = cast("Any", response.json())
     except (httpx.HTTPError, ValueError):
         sys.stderr.write(f"probe transport or protocol failure for host {host}\n")
         return 3
@@ -92,13 +94,39 @@ def main() -> int:
         else []
     )
     command_errors = result_envelope.get("result_error", {}) if isinstance(result_envelope, dict) else {}
-    command_error_keys = sorted(key for key in command_errors if key in COMMANDS)
+    envelope_shape_valid = all(
+        (
+            isinstance(envelope, dict),
+            isinstance(result_envelope, dict),
+            isinstance(result, dict),
+            isinstance(command_errors, dict),
+        ),
+    )
+    command_error_keys = (
+        sorted(key for key in command_errors if isinstance(key, str) and key in COMMANDS)
+        if isinstance(command_errors, dict)
+        else []
+    )
+    unexpected_command_error_count = (
+        sum(1 for key in command_errors if not isinstance(key, str) or key not in COMMANDS)
+        if isinstance(command_errors, dict)
+        else 0
+    )
     structured_error = bool(envelope.get("error")) if isinstance(envelope, dict) else True
-    matched = who_id is not None and who_id in dependent_ids
-    passed = response.status_code == HTTP_OK and not structured_error and not command_error_keys and matched
+    matched = who_id is not None and dependent_ids == [who_id]
+    passed = all(
+        (
+            response.status_code == HTTP_OK,
+            envelope_shape_valid,
+            not structured_error,
+            not command_error_keys,
+            unexpected_command_error_count == 0,
+            matched,
+        ),
+    )
 
     artifact = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "observed_at": _timestamp(),
         "runner": {
             "kind": "committed_python_httpx",
@@ -108,8 +136,8 @@ def main() -> int:
             "httpx": importlib.metadata.version("httpx"),
         },
         "host": host,
-        "portal_fingerprint": _portal_fingerprint(host, fingerprint_key),
-        "portal_fingerprint_algorithm": "hmac-sha256-v1",
+        "portal_fingerprint": _portal_fingerprint(host, role, who_id, fingerprint_key),
+        "portal_fingerprint_algorithm": "hmac-sha256-portal-role-principal-v1",
         "credential_role": role,
         "read_only": True,
         "request_count": 1,
@@ -117,8 +145,10 @@ def main() -> int:
         "request_shape": REQUEST_SHAPE,
         "response_summary": {
             "http_status": response.status_code,
+            "envelope_shape_valid": envelope_shape_valid,
             "structured_error": structured_error,
             "command_error_keys": command_error_keys,
+            "unexpected_command_error_count": unexpected_command_error_count,
             "profile_identity_present": who_id is not None,
             "dependent_row_count": len(dependent_ids),
             "dependent_identity_matched": matched,
@@ -131,5 +161,13 @@ def main() -> int:
     return 0 if passed else 5
 
 
+def _safe_entrypoint() -> int:
+    try:
+        return main()
+    except Exception:  # noqa: BLE001 - never render unexpected exception data beside a webhook.
+        sys.stderr.write("probe failed safely\n")
+        return 3
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_safe_entrypoint())
