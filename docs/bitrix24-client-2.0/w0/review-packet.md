@@ -1,5 +1,9 @@
 # W0 cross-review packet
 
+> Superseded after independent review. Do not approve this historical packet;
+> use `review-packet-v2.md` and evidence SHA
+> `d162970da03efdb319010ce9875e42f634acd27e`.
+
 ## Immutable subject
 
 - Evidence SHA: `d760c438826271b941abee291696ed7eea5c352d`
