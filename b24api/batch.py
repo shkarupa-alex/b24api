@@ -354,6 +354,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         self._fallback_failed = fallback_failed
         self._context = batch_executor.executor.context(policy)
         self._runner: AsyncGenerator[BatchStreamItem] | None = None
+        self._source_controller: AsyncIteratorController[BatchInput] | None = None
         self._prefetched: BatchStreamItem | object = _MISSING
         self._closed = False
         self._batch_requests = 0
@@ -392,6 +393,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
 
     async def aclose(self) -> None:
         if self._closed:
+            await self._observe_source_cleanup()
             return
         self._closed = True
         try:
@@ -399,11 +401,17 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                 await self._runner.aclose()
         except BaseException as error:
             if self.report.state is TerminalState.NOT_STARTED:
-                await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+                cancellation = await await_cancellation_resistant(
+                    self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
+                )
+                if cancellation is not None:
+                    _attach_report(cancellation, self.report)
+                    raise cancellation from error
             _attach_report(error, self.report)
             raise
         finally:
             self._prefetched = _MISSING
+        await self._observe_source_cleanup()
         if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
             await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
 
@@ -414,6 +422,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             input_error="batch input exceeded operation time budget",
             cleanup_error="batch source cleanup exceeded operation time budget",
         )
+        self._source_controller = source
         next_index = 0
         naturally_exhausted = False
         try:
@@ -470,7 +479,12 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             _attach_report(error, self.report)
             raise
         except BaseException as error:
-            await self._finalize(TerminalState.FAILED, type(error).__name__)
+            cancellation = await await_cancellation_resistant(
+                self._finalize(TerminalState.FAILED, type(error).__name__),
+            )
+            if cancellation is not None:
+                _attach_report(cancellation, self.report)
+                raise cancellation from error
             _attach_report(error, self.report)
             raise
         finally:
@@ -490,9 +504,20 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             )
         except BaseException as cleanup_error:
             if self.report.state is TerminalState.NOT_STARTED:
-                await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+                cancellation = await await_cancellation_resistant(
+                    self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
+                )
+                if cancellation is not None:
+                    _attach_report(cancellation, self.report)
+                    raise cancellation from cleanup_error
             _attach_report(cleanup_error, self.report)
             raise
+
+    async def _observe_source_cleanup(self) -> None:
+        controller = self._source_controller
+        if controller is None:
+            return
+        await self._cleanup_source(controller)
 
     async def _finalize(self, state: TerminalState, reason: str) -> None:
         if self.report.state is not TerminalState.NOT_STARTED:
@@ -543,7 +568,7 @@ async def _iterate_source(source: BatchSource) -> AsyncGenerator[BatchInput]:
             if isinstance(iterator, _AsyncClosable):
                 await iterator.aclose()
         return
-    if isinstance(source, list | tuple):
+    if source.__class__ is list or source.__class__ is tuple:
         for item in source:
             yield item
         return

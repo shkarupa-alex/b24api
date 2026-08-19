@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from b24api.error import ApiResponseError, BudgetExceededError, FailurePhase, TransportError
-from b24api.execution import Executor, WireResponse
+from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.models import (
     ConsistencyPolicy,
     DuplicatePolicy,
@@ -470,7 +470,11 @@ async def test_cancellation_resistant_reference_pull_is_closed_after_late_comple
             try:
                 await asyncio.Future[None]()
             except asyncio.CancelledError:
-                await release.wait()
+                while not release.is_set():
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        continue
             yield _reference("late")
         finally:
             closed.set()
@@ -490,6 +494,40 @@ async def test_cancellation_resistant_reference_pull_is_closed_after_late_comple
 
     release.set()
     await asyncio.wait_for(closed.wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_late_reference_source_cleanup_error_is_observed_by_subsequent_close() -> None:
+    release = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def source() -> AsyncGenerator[ReferenceRequest]:
+        try:
+            yield _reference("first")
+            try:
+                await asyncio.Future[None]()
+            except asyncio.CancelledError:
+                await release.wait()
+            yield _reference("late")
+        finally:
+            closed.set()
+            raise RuntimeError("late reference close boom")
+
+    stream = fan_out(
+        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        source(),
+        dispatch=DirectDispatch(),
+        policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.03),
+    )
+    assert isinstance(await anext(stream), ReferenceItem)
+    with pytest.raises(BudgetExceededError):
+        await anext(stream)
+
+    release.set()
+    await asyncio.wait_for(closed.wait(), timeout=0.2)
+    with pytest.raises(RuntimeError, match="late reference close boom") as captured:
+        await stream.aclose()
+    assert captured.value.__dict__["report"] is stream.report
 
 
 @pytest.mark.asyncio
@@ -532,7 +570,10 @@ async def test_blocking_sync_reference_pull_does_not_block_event_loop_or_deadlin
 
 
 @pytest.mark.asyncio
-async def test_reference_source_failure_drains_all_admitted_outcomes() -> None:
+@pytest.mark.parametrize("output_order", [ReferenceOutputOrder.READY, ReferenceOutputOrder.INPUT])
+async def test_reference_source_failure_drains_all_admitted_outcomes(
+    output_order: ReferenceOutputOrder,
+) -> None:
     async def source() -> AsyncGenerator[ReferenceRequest]:
         yield _reference("a")
         yield _reference("b")
@@ -542,7 +583,8 @@ async def test_reference_source_failure_drains_all_admitted_outcomes() -> None:
     stream = fan_out(
         Executor(transport),
         source(),
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        dispatch=DirectDispatch(concurrency=TWO_REFERENCES, output_order=output_order),
+        output_order=output_order,
         tolerant=True,
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES),
     )
@@ -782,6 +824,45 @@ async def test_reference_task_cancellation_closes_transport_and_buffer_state() -
 
 
 @pytest.mark.asyncio
+async def test_reference_cancellation_during_failed_finalization_preserves_failure_report() -> None:
+    locked = asyncio.Event()
+
+    class FailingSource:
+        def __init__(self) -> None:
+            self.context: ExecutionContext | None = None
+
+        def __aiter__(self) -> FailingSource:
+            return self
+
+        async def __anext__(self) -> ReferenceRequest:
+            assert self.context is not None
+            await self.context._lock.acquire()  # noqa: SLF001 - deterministic finalize-race regression
+            locked.set()
+            raise RuntimeError("reference source failed")
+
+    source = FailingSource()
+    stream = fan_out(
+        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        source,
+        dispatch=DirectDispatch(),
+    )
+    source.context = stream._scheduler.context  # noqa: SLF001 - deterministic finalize-race regression
+    task = asyncio.create_task(anext(stream))
+    await locked.wait()
+    for _ in range(50):
+        await asyncio.sleep(0)
+    task.cancel()
+    assert source.context is not None
+    source.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
+
+    with pytest.raises(RuntimeError, match="reference source failed") as captured:
+        await task
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
 async def test_batch_reference_cancellation_interrupts_inflight_batch_request() -> None:
     transport = BlockingTransport()
     stream = fan_out(
@@ -798,6 +879,65 @@ async def test_batch_reference_cancellation_interrupts_inflight_batch_request() 
 
     assert transport.cancelled.is_set()
     assert stream.report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_page() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    returned = asyncio.Event()
+
+    class CancellationResistantTransport:
+        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+            del request, attempt_timeout
+            started.set()
+            try:
+                await asyncio.Future[None]()
+            except asyncio.CancelledError:
+                while not release.is_set():
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        continue
+            returned.set()
+            body = json.dumps({"result": {"ok": True}}).encode()
+            return WireResponse(200, (("content-type", "application/json"),), body)
+
+    stream = fan_out(
+        Executor(CancellationResistantTransport()),
+        [_reference("a")],
+        dispatch=DirectDispatch(),
+        policy=ExecutionPolicy(max_elapsed=0.03),
+    )
+    task = asyncio.create_task(anext(stream))
+    await started.wait()
+    task.cancel()
+
+    async def safety_release() -> None:
+        await asyncio.sleep(0.2)
+        release.set()
+
+    safety = asyncio.create_task(safety_release())
+    started_at = asyncio.get_running_loop().time()
+    try:
+        with pytest.raises(BudgetExceededError, match="reference task cleanup") as captured:
+            await task
+    finally:
+        release.set()
+        safety.cancel()
+        await asyncio.gather(safety, return_exceptions=True)
+    assert asyncio.get_running_loop().time() - started_at < CLEANUP_TEST_TIMEOUT
+    frozen_report = stream.report
+    assert captured.value.__dict__["report"] is frozen_report
+    assert frozen_report.logical_pages == 0
+
+    await asyncio.wait_for(returned.wait(), timeout=0.2)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    snapshot = await stream._scheduler.context.snapshot()  # noqa: SLF001
+    assert snapshot.counters.logical_pages == 0
+    assert stream.report is frozen_report
+    assert stream.report.logical_pages == 0
 
 
 @pytest.mark.asyncio

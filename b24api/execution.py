@@ -526,7 +526,7 @@ class AsyncIteratorController[T]:
         except BaseException:
             if not pull.done():
                 pull.cancel()
-                self._retain_close_after(pull)
+            self._retain_close_after(pull)
             raise
         if done:
             try:
@@ -570,7 +570,7 @@ class AsyncIteratorController[T]:
         pull_error: BaseException | None = None
         try:
             await pull
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, StopAsyncIteration):
             pass
         except Exception as error:  # noqa: BLE001 - preserve the source error through owned cleanup
             pull_error = error
@@ -603,6 +603,12 @@ async def await_cancellation_resistant(awaitable: Awaitable[None]) -> asyncio.Ca
             cancellation = error
     await task
     return cancellation
+
+
+def _raise_for_pending_cancellation() -> None:
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        raise asyncio.CancelledError
 
 
 class Executor:
@@ -690,7 +696,14 @@ class Executor:
                 retry_codes=context.policy.retry.transient_api_codes,
             )
             if response_error is None:
-                return _decode_success(wire, request_summary=request.summary)
+                response = _decode_success(wire, request_summary=request.summary)
+                _raise_for_pending_cancellation()
+                if context.remaining_time(retry_started=retry_started) <= 0:
+                    raise BudgetExceededError("transport completed after execution time budget")
+                return response
+            _raise_for_pending_cancellation()
+            if context.remaining_time(retry_started=retry_started) <= 0:
+                raise BudgetExceededError("transport completed after execution time budget")
             await self._prepare_retry(
                 request,
                 response_error,

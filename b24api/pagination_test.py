@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from b24api.error import BudgetExceededError, CapabilityError, PaginationError
+from b24api.error import BudgetExceededError, CapabilityError, PaginationError, ProtocolError
 from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.models import (
     CompletionAssurance,
@@ -697,7 +697,8 @@ async def test_cancellation_after_decoded_response_cannot_rollback_logical_page(
     transport.context = stream._context  # noqa: SLF001 - deterministic commit-race regression
     task = asyncio.create_task(anext(stream))
     await transport.locked.wait()
-    await asyncio.sleep(0)
+    for _ in range(10):
+        await asyncio.sleep(0)
     task.cancel()
     await asyncio.sleep(0)
     task.cancel()
@@ -710,6 +711,39 @@ async def test_cancellation_after_decoded_response_cannot_rollback_logical_page(
     assert captured.value.__dict__["report"] is stream.report
     assert stream.report.logical_pages == 1
     assert stream.report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_failed_finalization_preserves_failure_report() -> None:
+    class MalformedAfterLockTransport:
+        def __init__(self) -> None:
+            self.context: ExecutionContext | None = None
+            self.locked = asyncio.Event()
+
+        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+            del request, attempt_timeout
+            assert self.context is not None
+            await self.context._lock.acquire()  # noqa: SLF001 - deterministic finalize-race regression
+            self.locked.set()
+            return WireResponse(200, (("content-type", "application/json"),), b"{")
+
+    transport = MalformedAfterLockTransport()
+    stream = iter_list(Executor(transport), Request("crm.item.list"), plan=SingleResponsePlan())
+    transport.context = stream._context  # noqa: SLF001 - deterministic finalize-race regression
+    task = asyncio.create_task(anext(stream))
+    await transport.locked.wait()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    task.cancel()
+    assert transport.context is not None
+    transport.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert isinstance(captured.value.__cause__, ProtocolError)
+    assert stream.report.state is TerminalState.FAILED
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,7 @@ import pytest
 
 from b24api.batch import BatchExecutor
 from b24api.error import BatchCommandError, BudgetExceededError, FailurePhase, ProtocolError, TransportError
-from b24api.execution import Executor, WireResponse
+from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.models import (
     BatchFailure,
     BatchOutcome,
@@ -262,6 +262,39 @@ async def test_cancellation_resistant_batch_pull_is_closed_after_late_completion
 
 
 @pytest.mark.asyncio
+async def test_late_batch_source_cleanup_error_is_observed_by_subsequent_close() -> None:
+    release = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def source() -> AsyncGenerator[Request]:
+        try:
+            yield Request("profile")
+            try:
+                await asyncio.Future[None]()
+            except asyncio.CancelledError:
+                await release.wait()
+            yield Request("late")
+        finally:
+            closed.set()
+            raise RuntimeError("late batch close boom")
+
+    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes(
+        source(),
+        batch_size=1,
+        policy=ExecutionPolicy(max_elapsed=0.03),
+    )
+    assert isinstance(await anext(stream), BatchSuccess)
+    with pytest.raises(BudgetExceededError):
+        await anext(stream)
+
+    release.set()
+    await asyncio.wait_for(closed.wait(), timeout=0.2)
+    with pytest.raises(RuntimeError, match="late batch close boom") as captured:
+        await stream.aclose()
+    assert captured.value.__dict__["report"] is stream.report
+
+
+@pytest.mark.asyncio
 async def test_blocking_sync_batch_pull_does_not_block_event_loop_or_deadline() -> None:
     release = threading.Event()
     closed = threading.Event()
@@ -429,6 +462,42 @@ async def test_repeated_batch_cancellation_still_carries_final_report() -> None:
 
     assert captured.value.__dict__["report"] is stream.report
     assert stream.report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_batch_cancellation_during_failed_finalization_preserves_failure_report() -> None:
+    locked = asyncio.Event()
+
+    class FailingSource:
+        def __init__(self) -> None:
+            self.context: ExecutionContext | None = None
+
+        def __aiter__(self) -> FailingSource:
+            return self
+
+        async def __anext__(self) -> Request:
+            assert self.context is not None
+            await self.context._lock.acquire()  # noqa: SLF001 - deterministic finalize-race regression
+            locked.set()
+            raise RuntimeError("batch source failed")
+
+    source = FailingSource()
+    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes(source)
+    source.context = stream._context  # noqa: SLF001 - deterministic finalize-race regression
+    task = asyncio.create_task(anext(stream))
+    await locked.wait()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    task.cancel()
+    assert source.context is not None
+    source.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert isinstance(captured.value.__cause__, RuntimeError)
+    assert stream.report.state is TerminalState.FAILED
 
 
 @pytest.mark.asyncio

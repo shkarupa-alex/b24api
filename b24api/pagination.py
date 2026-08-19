@@ -649,7 +649,12 @@ class ItemStream(AsyncIterator[JsonValue]):
                 await self._runner.aclose()
         except BaseException as error:
             if self.report.state is TerminalState.NOT_STARTED:
-                await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+                cancellation = await await_cancellation_resistant(
+                    self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
+                )
+                if cancellation is not None:
+                    _attach_report(cancellation, self.report)
+                    raise cancellation from error
             _attach_report(error, self.report)
             raise
         finally:
@@ -657,7 +662,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
             await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
 
-    async def _run(self) -> AsyncGenerator[tuple[JsonValue, bool]]:  # noqa: C901, PLR0912
+    async def _run(self) -> AsyncGenerator[tuple[JsonValue, bool]]:  # noqa: C901, PLR0912, PLR0915
         pages = self._driver.pages()
         naturally_exhausted = False
         try:
@@ -690,7 +695,12 @@ class ItemStream(AsyncIterator[JsonValue]):
             _attach_report(error, self.report)
             raise
         except BaseException as error:
-            await self._finalize(TerminalState.FAILED, type(error).__name__)
+            cancellation = await await_cancellation_resistant(
+                self._finalize(TerminalState.FAILED, type(error).__name__),
+            )
+            if cancellation is not None:
+                _attach_report(cancellation, self.report)
+                raise cancellation from error
             _attach_report(error, self.report)
             raise
         finally:
@@ -698,7 +708,12 @@ class ItemStream(AsyncIterator[JsonValue]):
                 cleanup_cancellation = await await_cancellation_resistant(self._cleanup_pages(pages))
             except BaseException as cleanup_error:
                 if self.report.state is TerminalState.NOT_STARTED:
-                    await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+                    cancellation = await await_cancellation_resistant(
+                        self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
+                    )
+                    if cancellation is not None:
+                        _attach_report(cancellation, self.report)
+                        raise cancellation from cleanup_error
                 _attach_report(cleanup_error, self.report)
                 raise
             if cleanup_cancellation is not None:

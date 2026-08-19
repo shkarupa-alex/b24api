@@ -455,6 +455,7 @@ class ReferenceScheduler:
         self.buffer = _RowBuffer(policy.max_buffered_rows, self.context, head_reserve=head_reserve)
         self.violations: list[Violation] = []
         self._delivery_uniqueness: dict[int, tuple[ReferenceItem, bool]] = {}
+        self._source_controller: AsyncIteratorController[ReferenceRequest] | None = None
 
     async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:
         await self.context.start()
@@ -463,6 +464,7 @@ class ReferenceScheduler:
             input_error="reference input exceeded operation time budget",
             cleanup_error="reference source cleanup exceeded operation time budget",
         )
+        self._source_controller = iterator
         admission = _AdmissionState(
             tasks={},
             queues={},
@@ -471,6 +473,7 @@ class ReferenceScheduler:
             changed=asyncio.Event(),
         )
         producer = asyncio.create_task(self._produce(iterator, admission))
+        primary_error: BaseException | None = None
 
         try:
             if self.output_order is ReferenceOutputOrder.READY:
@@ -479,8 +482,15 @@ class ReferenceScheduler:
             else:
                 async for outcome in self._input(admission, producer):
                     yield outcome
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            await self._cleanup(iterator, admission, producer)
+            cleanup_cancellation = await await_cancellation_resistant(
+                self._cleanup(iterator, admission, producer),
+            )
+            if cleanup_cancellation is not None and primary_error is None:
+                raise cleanup_cancellation
 
     async def _cleanup(
         self,
@@ -715,6 +725,14 @@ class ReferenceScheduler:
         stored = self._delivery_uniqueness.pop(id(item), None)
         return stored is not None and stored[0] is item and stored[1]
 
+    async def observe_source_cleanup(self) -> None:
+        controller = self._source_controller
+        if controller is None:
+            return
+        await controller.aclose(
+            remaining=max(0.0, self.context.policy.max_elapsed - self.context.elapsed),
+        )
+
 
 class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     """Lazy reference stream with one frozen report and deterministic cleanup."""
@@ -766,6 +784,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
 
     async def aclose(self) -> None:
         if self._closed:
+            await self._observe_source_cleanup()
             return
         self._closed = True
         try:
@@ -773,15 +792,35 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
                 await self._runner.aclose()
         except BaseException as error:
             if self.report.state is TerminalState.NOT_STARTED:
-                await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+                cancellation = await await_cancellation_resistant(
+                    self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
+                )
+                if cancellation is not None:
+                    _attach_report(cancellation, self.report)
+                    raise cancellation from error
             _attach_report(error, self.report)
             raise
         finally:
             self._prefetched = _MISSING
+        await self._observe_source_cleanup()
         if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
             await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
 
-    async def _run(self) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901
+    async def _observe_source_cleanup(self) -> None:
+        try:
+            await self._scheduler.observe_source_cleanup()
+        except BaseException as error:
+            if self.report.state is TerminalState.NOT_STARTED:
+                cancellation = await await_cancellation_resistant(
+                    self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
+                )
+                if cancellation is not None:
+                    _attach_report(cancellation, self.report)
+                    raise cancellation from error
+            _attach_report(error, self.report)
+            raise
+
+    async def _run(self) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912
         outcomes = self._scheduler.outcomes(self._source)
         naturally_exhausted = False
         try:
@@ -808,7 +847,12 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             _attach_report(error, self.report)
             raise
         except BaseException as error:
-            await self._finalize(TerminalState.FAILED, type(error).__name__)
+            cancellation = await await_cancellation_resistant(
+                self._finalize(TerminalState.FAILED, type(error).__name__),
+            )
+            if cancellation is not None:
+                _attach_report(cancellation, self.report)
+                raise cancellation from error
             _attach_report(error, self.report)
             raise
         finally:
@@ -816,7 +860,12 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
                 cleanup_cancellation = await await_cancellation_resistant(outcomes.aclose())
             except BaseException as cleanup_error:
                 if self.report.state is TerminalState.NOT_STARTED:
-                    await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+                    cancellation = await await_cancellation_resistant(
+                        self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
+                    )
+                    if cancellation is not None:
+                        _attach_report(cancellation, self.report)
+                        raise cancellation from cleanup_error
                 _attach_report(cleanup_error, self.report)
                 raise
             if cleanup_cancellation is not None:
@@ -935,7 +984,7 @@ async def _iterate_references(source: ReferenceSource) -> AsyncGenerator[Referen
             if isinstance(async_iterator, _AsyncClosable):
                 await async_iterator.aclose()
         return
-    if isinstance(source, list | tuple):
+    if source.__class__ is list or source.__class__ is tuple:
         for item in source:
             yield item
         return
@@ -958,10 +1007,11 @@ async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Eve
     waiter = asyncio.create_task(changed.wait())
     try:
         done, _ = await asyncio.wait((producer, waiter), return_when=asyncio.FIRST_COMPLETED)
-        if producer in done:
-            await producer
         if waiter in done:
             changed.clear()
+            return
+        if producer in done:
+            await producer
     finally:
         if not waiter.done():
             waiter.cancel()
