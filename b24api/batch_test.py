@@ -35,6 +35,8 @@ MIXED_COMMAND_COUNT = 3
 FALLBACK_HTTP_CALLS = 2
 HTTP_OK = 200
 EXPECTED_TOTAL = 3
+PULL_TEST_TIMEOUT = 0.15
+PARTIAL_COMMAND_COUNT = 2
 
 
 class CallbackTransport:
@@ -221,10 +223,144 @@ async def test_async_batch_input_pull_obeys_operation_elapsed_budget() -> None:
 
     assert isinstance(await anext(stream), BatchSuccess)
     with pytest.raises(BudgetExceededError, match="batch input") as captured:
-        await asyncio.wait_for(anext(stream), timeout=0.15)
+        await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
 
     assert captured.value.__dict__["report"] is stream.report
     assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_cancellation_resistant_batch_pull_is_closed_after_late_completion() -> None:
+    release = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def source() -> AsyncGenerator[Request]:
+        try:
+            yield Request("profile")
+            try:
+                await asyncio.Future[None]()
+            except asyncio.CancelledError:
+                await release.wait()
+            yield Request("late")
+        finally:
+            closed.set()
+
+    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes(
+        source(),
+        batch_size=1,
+        policy=ExecutionPolicy(max_elapsed=0.03),
+    )
+
+    assert isinstance(await anext(stream), BatchSuccess)
+    with pytest.raises(BudgetExceededError) as captured:
+        await asyncio.wait_for(anext(stream), timeout=0.15)
+    assert captured.value.__dict__["report"] is stream.report
+    assert not closed.is_set()
+
+    release.set()
+    await asyncio.wait_for(closed.wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_blocking_sync_batch_pull_does_not_block_event_loop_or_deadline() -> None:
+    release = threading.Event()
+    closed = threading.Event()
+
+    class BlockingPull:
+        def __init__(self) -> None:
+            self._count = 0
+
+        def __iter__(self) -> BlockingPull:
+            return self
+
+        def __next__(self) -> Request:
+            self._count += 1
+            if self._count == 1:
+                return Request("profile")
+            release.wait()
+            return Request("late")
+
+        def close(self) -> None:
+            closed.set()
+
+    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes(
+        BlockingPull(),
+        batch_size=1,
+        policy=ExecutionPolicy(max_elapsed=0.03),
+    )
+
+    assert isinstance(await anext(stream), BatchSuccess)
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(BudgetExceededError):
+        await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
+    assert asyncio.get_running_loop().time() - started < PULL_TEST_TIMEOUT
+
+    release.set()
+    assert await asyncio.to_thread(closed.wait, 0.2)
+
+
+@pytest.mark.asyncio
+async def test_partial_tolerant_chunk_gets_correlated_failures_before_source_error() -> None:
+    async def source() -> AsyncGenerator[Request]:
+        yield Request("a")
+        yield Request("b")
+        raise RuntimeError("batch source boom")
+
+    transport = CallbackTransport(_echo_batch)
+    stream = BatchExecutor(Executor(transport)).batch_outcomes(source(), batch_size=3)
+    outcomes: list[BatchOutcome] = []
+
+    async def consume() -> None:
+        while True:
+            outcome = await anext(stream)
+            assert isinstance(outcome, BatchSuccess | BatchFailure)
+            outcomes.append(outcome)
+
+    with pytest.raises(RuntimeError, match="batch source boom") as captured:
+        await consume()
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert [outcome.command_index for outcome in outcomes] == [0, 1]
+    assert all(isinstance(outcome, BatchFailure) for outcome in outcomes)
+    assert transport.requests == []
+    assert stream.report.emitted_rows == PARTIAL_COMMAND_COUNT
+    assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_batch_iteration_cancellation_propagates_source_cleanup_error() -> None:
+    pulling = asyncio.Event()
+
+    class RaisingCloseSource:
+        def __init__(self) -> None:
+            self._yielded = False
+
+        def __aiter__(self) -> RaisingCloseSource:
+            return self
+
+        async def __anext__(self) -> Request:
+            if not self._yielded:
+                self._yielded = True
+                return Request("profile")
+            pulling.set()
+            await asyncio.Future[None]()
+            raise AssertionError("unreachable")
+
+        async def aclose(self) -> None:
+            raise RuntimeError("batch close boom")
+
+    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes(
+        RaisingCloseSource(),
+        batch_size=1,
+    )
+    assert isinstance(await anext(stream), BatchSuccess)
+    task = asyncio.create_task(anext(stream))
+    await pulling.wait()
+    task.cancel()
+
+    with pytest.raises(RuntimeError, match="batch close boom") as captured:
+        await task
+    assert captured.value.__dict__["report"] is stream.report
 
 
 @pytest.mark.asyncio
@@ -261,6 +397,32 @@ async def test_batch_cancellation_carries_same_terminal_report() -> None:
     task = asyncio.create_task(anext(stream))
     await started.wait()
     task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream.report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_repeated_batch_cancellation_still_carries_final_report() -> None:
+    started = asyncio.Event()
+
+    class BlockingTransport:
+        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+            del request, attempt_timeout
+            started.set()
+            return await asyncio.Future[WireResponse]()
+
+    stream = BatchExecutor(Executor(BlockingTransport())).batch_outcomes([Request("profile")])
+    task = asyncio.create_task(anext(stream))
+    await started.wait()
+    await stream._context._lock.acquire()  # noqa: SLF001 - deterministic repeated-cancel regression
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    stream._context._lock.release()  # noqa: SLF001 - deterministic repeated-cancel regression
 
     with pytest.raises(asyncio.CancelledError) as captured:
         await task

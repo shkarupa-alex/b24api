@@ -699,12 +699,15 @@ async def test_cancellation_after_decoded_response_cannot_rollback_logical_page(
     await transport.locked.wait()
     await asyncio.sleep(0)
     task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
     assert transport.context is not None
     transport.context._lock.release()  # noqa: SLF001 - deterministic commit-race regression
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as captured:
         await task
 
+    assert captured.value.__dict__["report"] is stream.report
     assert stream.report.logical_pages == 1
     assert stream.report.state is TerminalState.CANCELLED
 

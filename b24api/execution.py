@@ -9,7 +9,7 @@ import math
 import random
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, Self
@@ -493,6 +493,116 @@ class ExecutionContext:
                 cooldown_seconds=self._cooldown_seconds,
                 elapsed=self.elapsed,
             )
+
+
+class AsyncIteratorController[T]:
+    """Own one async source pull and retain cleanup past a public deadline."""
+
+    def __init__(
+        self,
+        source: AsyncGenerator[T],
+        *,
+        input_error: str,
+        cleanup_error: str,
+    ) -> None:
+        self._source = source
+        self._input_error = input_error
+        self._cleanup_error = cleanup_error
+        self._active_pull: asyncio.Task[T] | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
+
+    async def get(self, context: ExecutionContext) -> T:
+        if self._active_pull is not None:
+            raise RuntimeError("source pull is already active")
+        if self._cleanup_task is not None:
+            raise RuntimeError("source cleanup has already started")
+        remaining = context.policy.max_elapsed - context.elapsed
+        if remaining <= 0:
+            raise BudgetExceededError(self._input_error)
+        pull = asyncio.create_task(anext(self._source))
+        self._active_pull = pull
+        try:
+            done, _ = await asyncio.wait((pull,), timeout=remaining)
+        except BaseException:
+            if not pull.done():
+                pull.cancel()
+                self._retain_close_after(pull)
+            raise
+        if done:
+            try:
+                return await pull
+            finally:
+                self._active_pull = None
+        pull.cancel()
+        self._retain_close_after(pull)
+        raise BudgetExceededError(self._input_error)
+
+    async def aclose(self, *, remaining: float) -> None:
+        if self._cleanup_task is None:
+            active = self._active_pull
+            if active is None:
+                self._retain_cleanup(asyncio.create_task(self._source.aclose()))
+            else:
+                active.cancel()
+                self._retain_close_after(active)
+        cleanup = self._cleanup_task
+        if cleanup is None:
+            return
+        await asyncio.sleep(0)
+        if cleanup.done():
+            await cleanup
+            return
+        done, _ = await asyncio.wait((cleanup,), timeout=max(0.0, remaining))
+        if done:
+            await cleanup
+            return
+        raise BudgetExceededError(self._cleanup_error)
+
+    def _retain_close_after(self, pull: asyncio.Task[T]) -> None:
+        if self._cleanup_task is None:
+            self._retain_cleanup(asyncio.create_task(self._close_after(pull)))
+
+    def _retain_cleanup(self, cleanup: asyncio.Task[None]) -> None:
+        self._cleanup_task = cleanup
+        cleanup.add_done_callback(_observe_background_cleanup)
+
+    async def _close_after(self, pull: asyncio.Task[T]) -> None:
+        pull_error: BaseException | None = None
+        try:
+            await pull
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:  # noqa: BLE001 - preserve the source error through owned cleanup
+            pull_error = error
+        if self._active_pull is pull:
+            self._active_pull = None
+        try:
+            await self._source.aclose()
+        except BaseException as close_error:
+            if pull_error is not None:
+                raise close_error from pull_error
+            raise
+        if pull_error is not None:
+            raise pull_error
+
+
+def _observe_background_cleanup(task: asyncio.Task[None]) -> None:
+    """Retrieve late exceptions while preserving them for any later await."""
+    if not task.cancelled():
+        task.exception()
+
+
+async def await_cancellation_resistant(awaitable: Awaitable[None]) -> asyncio.CancelledError | None:
+    """Finish an owned state transition and return the last concurrent cancellation."""
+    task: asyncio.Future[None] = asyncio.ensure_future(awaitable)
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    await task
+    return cancellation
 
 
 class Executor:

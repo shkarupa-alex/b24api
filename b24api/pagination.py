@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Protocol, Self, cast
 
 from b24api.error import CapabilityError, PaginationError
-from b24api.execution import ExecutionContext, Executor, WorkClass
+from b24api.execution import ExecutionContext, Executor, WorkClass, await_cancellation_resistant
 from b24api.models import (
     CompletionAssurance,
     DuplicatePolicy,
@@ -657,7 +657,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
             await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
 
-    async def _run(self) -> AsyncGenerator[tuple[JsonValue, bool]]:
+    async def _run(self) -> AsyncGenerator[tuple[JsonValue, bool]]:  # noqa: C901, PLR0912
         pages = self._driver.pages()
         naturally_exhausted = False
         try:
@@ -672,11 +672,21 @@ class ItemStream(AsyncIterator[JsonValue]):
             naturally_exhausted = True
             await self._finalize(TerminalState.COMPLETED, self._driver.terminal_reason or "terminal confirmed")
         except asyncio.CancelledError as error:
-            await self._finalize(TerminalState.CANCELLED, "iteration cancelled")
+            repeated = await await_cancellation_resistant(
+                self._finalize(TerminalState.CANCELLED, "iteration cancelled"),
+            )
+            if repeated is not None:
+                _attach_report(repeated, self.report)
+                raise repeated from error
             _attach_report(error, self.report)
             raise
         except GeneratorExit as error:
-            await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
+            cancellation = await await_cancellation_resistant(
+                self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion"),
+            )
+            if cancellation is not None:
+                _attach_report(cancellation, self.report)
+                raise cancellation from error
             _attach_report(error, self.report)
             raise
         except BaseException as error:
@@ -685,17 +695,23 @@ class ItemStream(AsyncIterator[JsonValue]):
             raise
         finally:
             try:
-                await pages.aclose()
-                await self._context.set_buffered_rows(0)
+                cleanup_cancellation = await await_cancellation_resistant(self._cleanup_pages(pages))
             except BaseException as cleanup_error:
                 if self.report.state is TerminalState.NOT_STARTED:
                     await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
                 _attach_report(cleanup_error, self.report)
                 raise
+            if cleanup_cancellation is not None:
+                _attach_report(cleanup_cancellation, self.report)
+                raise cleanup_cancellation
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
                 await self._finalize(TerminalState.CANCELLED, "stream abandoned")
             if self.report.state is not TerminalState.NOT_STARTED:
                 self._closed = True
+
+    async def _cleanup_pages(self, pages: AsyncGenerator[_Page]) -> None:
+        await pages.aclose()
+        await self._context.set_buffered_rows(0)
 
     async def _finalize(self, state: TerminalState, reason: str) -> None:
         if self.report.state is not TerminalState.NOT_STARTED:

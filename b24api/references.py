@@ -3,13 +3,19 @@
 from __future__ import annotations
 import asyncio
 import contextlib
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Protocol, Self, cast, runtime_checkable
 
 from b24api.batch import BatchExecutor
 from b24api.error import BudgetExceededError, CapabilityError
-from b24api.execution import ExecutionContext, Executor, WorkClass
+from b24api.execution import (
+    AsyncIteratorController,
+    ExecutionContext,
+    Executor,
+    WorkClass,
+    await_cancellation_resistant,
+)
 from b24api.models import (
     BatchFailure,
     CompletionAssurance,
@@ -48,6 +54,7 @@ from b24api.plans import (
 type ReferenceSource = Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]
 type ReferenceStreamItem = ReferenceItem | ReferenceFailure
 _MISSING = object()
+_SYNC_EXHAUSTED = object()
 _BATCH_COALESCE_IDLE_TURNS = 4
 
 
@@ -451,7 +458,11 @@ class ReferenceScheduler:
 
     async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:
         await self.context.start()
-        iterator = _iterate_references(source)
+        iterator = AsyncIteratorController(
+            _iterate_references(source),
+            input_error="reference input exceeded operation time budget",
+            cleanup_error="reference source cleanup exceeded operation time budget",
+        )
         admission = _AdmissionState(
             tasks={},
             queues={},
@@ -473,7 +484,7 @@ class ReferenceScheduler:
 
     async def _cleanup(
         self,
-        iterator: AsyncGenerator[ReferenceRequest],
+        iterator: AsyncIteratorController[ReferenceRequest],
         admission: _AdmissionState,
         producer: asyncio.Task[None],
     ) -> None:
@@ -498,8 +509,7 @@ class ReferenceScheduler:
             cleanup_errors.append(BudgetExceededError("reference task cleanup exceeded operation time budget"))
         else:
             try:
-                await _close_iterator_bounded(
-                    iterator,
+                await iterator.aclose(
                     remaining=max(0.0, self.context.policy.max_elapsed - self.context.elapsed),
                 )
             except BaseException as error:  # noqa: BLE001 - attach at the stream boundary
@@ -510,7 +520,7 @@ class ReferenceScheduler:
 
     async def _produce(
         self,
-        iterator: AsyncIterator[ReferenceRequest],
+        iterator: AsyncIteratorController[ReferenceRequest],
         admission: _AdmissionState,
     ) -> None:
         next_index = 0
@@ -518,7 +528,7 @@ class ReferenceScheduler:
             while True:
                 await admission.slots.acquire()
                 try:
-                    reference = await _next_reference_bounded(iterator, self.context)
+                    reference = await iterator.get(self.context)
                 except StopAsyncIteration:
                     admission.slots.release()
                     return
@@ -637,6 +647,7 @@ class ReferenceScheduler:
             await _finish_task(admission.tasks, event.work.index)
             admission.queues.pop(event.work.index, None)
             admission.slots.release()
+        await producer
 
     async def _input(
         self,
@@ -659,6 +670,7 @@ class ReferenceScheduler:
             admission.slots.release()
             next_head = min(admission.tasks) if admission.tasks else head + 1
             await self.buffer.advance_head(next_head, self.page_cap)
+        await producer
 
     def _record_event_violations(self, event: _Event) -> None:
         self.violations.extend(event.violations)
@@ -769,7 +781,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
             await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
 
-    async def _run(self) -> AsyncGenerator[ReferenceStreamItem]:
+    async def _run(self) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901
         outcomes = self._scheduler.outcomes(self._source)
         naturally_exhausted = False
         try:
@@ -778,11 +790,21 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             naturally_exhausted = True
             await self._finalize(TerminalState.COMPLETED, "reference input exhausted")
         except asyncio.CancelledError as error:
-            await self._finalize(TerminalState.CANCELLED, "iteration cancelled")
+            repeated = await await_cancellation_resistant(
+                self._finalize(TerminalState.CANCELLED, "iteration cancelled"),
+            )
+            if repeated is not None:
+                _attach_report(repeated, self.report)
+                raise repeated from error
             _attach_report(error, self.report)
             raise
         except GeneratorExit as error:
-            await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
+            cancellation = await await_cancellation_resistant(
+                self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion"),
+            )
+            if cancellation is not None:
+                _attach_report(cancellation, self.report)
+                raise cancellation from error
             _attach_report(error, self.report)
             raise
         except BaseException as error:
@@ -791,12 +813,15 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             raise
         finally:
             try:
-                await outcomes.aclose()
+                cleanup_cancellation = await await_cancellation_resistant(outcomes.aclose())
             except BaseException as cleanup_error:
                 if self.report.state is TerminalState.NOT_STARTED:
                     await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
                 _attach_report(cleanup_error, self.report)
                 raise
+            if cleanup_cancellation is not None:
+                _attach_report(cleanup_cancellation, self.report)
+                raise cleanup_cancellation
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
                 await self._finalize(TerminalState.CANCELLED, "stream abandoned")
             if self.report.state is not TerminalState.NOT_STARTED:
@@ -910,13 +935,20 @@ async def _iterate_references(source: ReferenceSource) -> AsyncGenerator[Referen
             if isinstance(async_iterator, _AsyncClosable):
                 await async_iterator.aclose()
         return
+    if isinstance(source, list | tuple):
+        for item in source:
+            yield item
+        return
     sync_iterator = iter(source)
     try:
-        for item in sync_iterator:
-            yield item
+        while True:
+            sync_item = await _next_sync_owned(sync_iterator)
+            if sync_item is _SYNC_EXHAUSTED:
+                return
+            yield cast("ReferenceRequest", sync_item)
     finally:
         if isinstance(sync_iterator, _SyncClosable):
-            await asyncio.to_thread(sync_iterator.close)
+            await _close_sync_owned(sync_iterator)
 
 
 async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Event) -> None:
@@ -936,46 +968,39 @@ async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Eve
         await asyncio.gather(waiter, return_exceptions=True)
 
 
-async def _next_reference_bounded(
-    iterator: AsyncIterator[ReferenceRequest],
-    context: ExecutionContext,
-) -> ReferenceRequest:
-    remaining = context.policy.max_elapsed - context.elapsed
-    if remaining <= 0:
-        raise BudgetExceededError("reference input exceeded operation time budget")
-    pull: asyncio.Future[ReferenceRequest] = asyncio.ensure_future(anext(iterator))
+def _next_sync(iterator: Iterator[ReferenceRequest]) -> ReferenceRequest | object:
     try:
-        done, _ = await asyncio.wait((pull,), timeout=remaining)
-        if done:
-            return await pull
-    except BaseException:
-        if not pull.done():
-            pull.cancel()
-            pull.add_done_callback(_consume_reference_pull)
+        return next(iterator)
+    except StopIteration:
+        return _SYNC_EXHAUSTED
+
+
+async def _next_sync_owned(iterator: Iterator[ReferenceRequest]) -> ReferenceRequest | object:
+    pull = asyncio.create_task(asyncio.to_thread(_next_sync, iterator))
+    try:
+        return await asyncio.shield(pull)
+    except asyncio.CancelledError:
+        with contextlib.suppress(BaseException):
+            await pull
         raise
-    pull.cancel()
-    await asyncio.sleep(0)
-    if not pull.done():
-        pull.add_done_callback(_consume_reference_pull)
-    else:
-        _consume_reference_pull(pull)
-    raise BudgetExceededError("reference input exceeded operation time budget")
 
 
-def _consume_reference_pull(task: asyncio.Future[ReferenceRequest]) -> None:
-    with contextlib.suppress(asyncio.CancelledError, Exception):
-        task.result()
+async def _close_sync_owned(iterator: _SyncClosable) -> None:
+    close = asyncio.create_task(asyncio.to_thread(iterator.close))
+    try:
+        await asyncio.shield(close)
+    except asyncio.CancelledError:
+        with contextlib.suppress(BaseException):
+            await close
+        raise
 
 
 async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[None]) -> _Event:
     if producer.done():
-        await producer
         return await queue.get()
     getter = asyncio.create_task(queue.get())
     try:
-        done, _ = await asyncio.wait((producer, getter), return_when=asyncio.FIRST_COMPLETED)
-        if producer in done:
-            await producer
+        await asyncio.wait((producer, getter), return_when=asyncio.FIRST_COMPLETED)
         return await getter
     finally:
         if not getter.done():
@@ -998,34 +1023,6 @@ async def _wait_for_cleanup_tasks(
         task.cancel()
         task.add_done_callback(_consume_task_result)
     return pending, errors
-
-
-async def _close_iterator_bounded(
-    iterator: AsyncGenerator[ReferenceRequest],
-    *,
-    remaining: float,
-) -> None:
-    close_task = asyncio.create_task(iterator.aclose())
-    timed_out = False
-    try:
-        await asyncio.sleep(0)
-        if close_task.done():
-            await close_task
-            return
-        done, _ = await asyncio.wait((close_task,), timeout=max(0.0, remaining))
-        if not done:
-            timed_out = True
-        else:
-            await close_task
-    except BaseException:
-        if not close_task.done():
-            close_task.cancel()
-            close_task.add_done_callback(_consume_task_result)
-        raise
-    if timed_out:
-        close_task.cancel()
-        close_task.add_done_callback(_consume_task_result)
-        raise BudgetExceededError("reference source cleanup exceeded operation time budget")
 
 
 def _consume_task_result(task: asyncio.Task[object]) -> None:
