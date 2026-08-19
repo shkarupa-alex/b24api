@@ -48,6 +48,7 @@ from b24api.plans import (
 type ReferenceSource = Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]
 type ReferenceStreamItem = ReferenceItem | ReferenceFailure
 _MISSING = object()
+_BATCH_COALESCE_IDLE_TURNS = 4
 
 
 @runtime_checkable
@@ -251,7 +252,7 @@ class _DirectPageDispatcher:
         reservation = await self.context.reserve_page(reference=reference_id)
         remaining = self.context.policy.max_elapsed - self.context.elapsed
         if remaining <= 0:
-            await self.context.release_page(reservation)
+            self.context.release_page(reservation)
             raise BudgetExceededError("operation elapsed budget exhausted before direct admission")
         try:
             async with asyncio.timeout(remaining):
@@ -261,12 +262,12 @@ class _DirectPageDispatcher:
                         context=self.context,
                         work_class=WorkClass.TRAVERSAL_DIRECT,
                     )
-                    await self.context.commit_page(reservation)
+                    self.context.commit_page(reservation)
         except TimeoutError as error:
-            await self.context.release_page(reservation)
+            self.context.release_page(reservation)
             raise BudgetExceededError("direct scheduler admission exceeded operation time budget") from error
         except BaseException:
-            await self.context.release_page(reservation)
+            self.context.release_page(reservation)
             raise
         return response
 
@@ -302,46 +303,54 @@ class _BatchPageDispatcher:
         pending = _PendingBatch(request, reference_id, future)
         remaining = self.context.policy.max_elapsed - self.context.elapsed
         if remaining <= 0:
-            await self.context.release_page(reservation)
+            self.context.release_page(reservation)
             raise BudgetExceededError("operation elapsed budget exhausted before batch admission")
         try:
             async with asyncio.timeout(remaining):
                 await self._queue.put(pending)
                 response = await future
-                await self.context.commit_page(reservation)
+                self.context.commit_page(reservation)
                 return response
         except asyncio.CancelledError:
             future.cancel()
-            await self.context.release_page(reservation)
+            self.context.release_page(reservation)
             raise
         except TimeoutError as error:
             future.cancel()
-            await self.context.release_page(reservation)
+            self.context.release_page(reservation)
             raise BudgetExceededError("batch scheduler admission exceeded operation time budget") from error
         except BaseException:
-            await self.context.release_page(reservation)
+            self.context.release_page(reservation)
             raise
 
     async def _run(self) -> None:  # noqa: C901, PLR0912
-        while True:
+        while not self._closed:
             first = await self._queue.get()
             if first is None:
                 return
             if first.future.done():
                 continue
             chunk = [first]
-            await asyncio.sleep(0)
-            while len(chunk) < self.plan.batch_size:
-                try:
-                    pending = self._queue.get_nowait()
-                except asyncio.QueueEmpty:
+            idle_turns = 0
+            stop_requested = False
+            while len(chunk) < self.plan.batch_size and idle_turns < _BATCH_COALESCE_IDLE_TURNS:
+                await asyncio.sleep(0)
+                added = False
+                while len(chunk) < self.plan.batch_size:
+                    try:
+                        pending = self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if pending is None:
+                        stop_requested = True
+                        break
+                    if pending.future.done():
+                        continue
+                    chunk.append(pending)
+                    added = True
+                if stop_requested:
                     break
-                if pending is None:
-                    await self._queue.put(None)
-                    break
-                if pending.future.done():
-                    continue
-                chunk.append(pending)
+                idle_turns = 0 if added else idle_turns + 1
             self.batch_requests += 1
             self.batch_commands += len(chunk)
             try:
@@ -370,6 +379,8 @@ class _BatchPageDispatcher:
                     item.future.set_exception(CapabilityError("batch page response metadata is unavailable"))
                     continue
                 item.future.set_result(success.response)
+            if stop_requested:
+                return
 
     async def aclose(self) -> None:
         if self._closed:
@@ -439,6 +450,7 @@ class ReferenceScheduler:
         self._delivery_uniqueness: dict[int, tuple[ReferenceItem, bool]] = {}
 
     async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:
+        await self.context.start()
         iterator = _iterate_references(source)
         admission = _AdmissionState(
             tasks={},
@@ -506,7 +518,7 @@ class ReferenceScheduler:
             while True:
                 await admission.slots.acquire()
                 try:
-                    reference = await anext(iterator)
+                    reference = await _next_reference_bounded(iterator, self.context)
                 except StopAsyncIteration:
                     admission.slots.release()
                     return
@@ -778,7 +790,13 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             _attach_report(error, self.report)
             raise
         finally:
-            await outcomes.aclose()
+            try:
+                await outcomes.aclose()
+            except BaseException as cleanup_error:
+                if self.report.state is TerminalState.NOT_STARTED:
+                    await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+                _attach_report(cleanup_error, self.report)
+                raise
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
                 await self._finalize(TerminalState.CANCELLED, "stream abandoned")
             if self.report.state is not TerminalState.NOT_STARTED:
@@ -898,7 +916,7 @@ async def _iterate_references(source: ReferenceSource) -> AsyncGenerator[Referen
             yield item
     finally:
         if isinstance(sync_iterator, _SyncClosable):
-            sync_iterator.close()
+            await asyncio.to_thread(sync_iterator.close)
 
 
 async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Event) -> None:
@@ -916,6 +934,37 @@ async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Eve
         if not waiter.done():
             waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
+
+
+async def _next_reference_bounded(
+    iterator: AsyncIterator[ReferenceRequest],
+    context: ExecutionContext,
+) -> ReferenceRequest:
+    remaining = context.policy.max_elapsed - context.elapsed
+    if remaining <= 0:
+        raise BudgetExceededError("reference input exceeded operation time budget")
+    pull: asyncio.Future[ReferenceRequest] = asyncio.ensure_future(anext(iterator))
+    try:
+        done, _ = await asyncio.wait((pull,), timeout=remaining)
+        if done:
+            return await pull
+    except BaseException:
+        if not pull.done():
+            pull.cancel()
+            pull.add_done_callback(_consume_reference_pull)
+        raise
+    pull.cancel()
+    await asyncio.sleep(0)
+    if not pull.done():
+        pull.add_done_callback(_consume_reference_pull)
+    else:
+        _consume_reference_pull(pull)
+    raise BudgetExceededError("reference input exceeded operation time budget")
+
+
+def _consume_reference_pull(task: asyncio.Future[ReferenceRequest]) -> None:
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        task.result()
 
 
 async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[None]) -> _Event:

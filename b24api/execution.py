@@ -390,7 +390,7 @@ class ExecutionContext:
         self._page_sequence = 0
         self._page_reservations: dict[_PageReservation, None] = {}
         self._lock = asyncio.Lock()
-        self._page_condition = asyncio.Condition(self._lock)
+        self._page_changed = asyncio.Event()
 
     @property
     def elapsed(self) -> float:
@@ -425,8 +425,8 @@ class ExecutionContext:
         """Reserve page capacity before I/O without charging the response counter."""
         try:
             async with asyncio.timeout(self.policy.max_elapsed - self.elapsed):
-                async with self._page_condition:
-                    while True:
+                while True:
+                    async with self._lock:
                         if self._counters.logical_pages >= self.policy.max_pages:
                             raise BudgetExceededError("logical page budget exhausted")
                         committed = (
@@ -446,27 +446,25 @@ class ExecutionContext:
                             self._page_sequence += 1
                             self._page_reservations[reservation] = None
                             return reservation
-                        await self._page_condition.wait()
+                        self._page_changed.clear()
+                    await self._page_changed.wait()
         except TimeoutError as error:
             raise BudgetExceededError("page reservation exceeded operation time budget") from error
 
-    async def commit_page(self, reservation: _PageReservation) -> None:
-        """Charge one successfully decoded logical page response."""
-        async with self._page_condition:
-            if reservation not in self._page_reservations:
-                raise RuntimeError("page reservation is not active")
-            counters = self._counters.reserve_page(self.policy, reference=reservation.reference)
-            self._page_reservations.pop(reservation)
-            self._counters = counters
-            self._page_condition.notify_all()
+    def commit_page(self, reservation: _PageReservation) -> None:
+        """Atomically charge one decoded response with no cancellation point."""
+        if reservation not in self._page_reservations:
+            raise RuntimeError("page reservation is not active")
+        self._counters = self._counters.reserve_page(self.policy, reference=reservation.reference)
+        self._page_reservations.pop(reservation)
+        self._page_changed.set()
 
-    async def release_page(self, reservation: _PageReservation) -> None:
-        """Release capacity for a request that produced no logical page."""
-        async with self._page_condition:
-            if reservation not in self._page_reservations:
-                return
-            self._page_reservations.pop(reservation)
-            self._page_condition.notify_all()
+    def release_page(self, reservation: _PageReservation) -> None:
+        """Atomically release capacity when no decoded response was returned."""
+        if reservation not in self._page_reservations:
+            return
+        self._page_reservations.pop(reservation)
+        self._page_changed.set()
 
     async def set_buffered_rows(self, rows: int) -> None:
         """Record retained decoded rows and enforce the global buffer ceiling."""

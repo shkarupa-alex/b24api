@@ -3,21 +3,25 @@
 from __future__ import annotations
 import asyncio
 import json
+import threading
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from b24api.batch import BatchExecutor
-from b24api.error import BatchCommandError, FailurePhase, ProtocolError, TransportError
+from b24api.error import BatchCommandError, BudgetExceededError, FailurePhase, ProtocolError, TransportError
 from b24api.execution import Executor, WireResponse
 from b24api.models import (
     BatchFailure,
     BatchOutcome,
     BatchSuccess,
+    ConsistencyPolicy,
     ExecutionPolicy,
     ReplayDisposition,
     ReplaySafety,
     Request,
+    SnapshotRequirement,
+    SnapshotState,
     TerminalState,
 )
 
@@ -138,6 +142,130 @@ async def test_async_unlimited_input_pulls_only_one_bounded_chunk_before_first_y
     assert pulled == TEST_BATCH_SIZE
     assert transport.requests[0].copy_parameters()["halt"] == 0
     await stream.aclose()
+    assert stream.report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_context_entry_starts_batch_execution_without_counting_prefetch_as_emitted() -> None:
+    transport = CallbackTransport(_echo_batch)
+    stream = BatchExecutor(Executor(transport)).batch_outcomes([Request("profile")], batch_size=1)
+
+    async with stream:
+        assert len(transport.requests) == 1
+
+    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.emitted_rows == 0
+
+
+@pytest.mark.asyncio
+async def test_batch_source_cleanup_error_carries_same_report() -> None:
+    async def source() -> AsyncGenerator[Request]:
+        try:
+            while True:
+                yield Request("profile")
+        finally:
+            raise RuntimeError("batch source close boom")
+
+    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes(source(), batch_size=1)
+    assert isinstance(await anext(stream), BatchSuccess)
+
+    with pytest.raises(RuntimeError, match="batch source close boom") as captured:
+        await stream.aclose()
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream.report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_blocking_sync_batch_source_close_obeys_cleanup_deadline() -> None:
+    release_close = threading.Event()
+    close_finished = threading.Event()
+
+    class BlockingCloseIterator:
+        def __iter__(self) -> BlockingCloseIterator:
+            return self
+
+        def __next__(self) -> Request:
+            return Request("profile")
+
+        def close(self) -> None:
+            release_close.wait()
+            close_finished.set()
+
+    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes(
+        BlockingCloseIterator(),
+        batch_size=1,
+        policy=ExecutionPolicy(max_elapsed=0.05),
+    )
+    assert isinstance(await anext(stream), BatchSuccess)
+
+    with pytest.raises(BudgetExceededError, match="batch source cleanup") as captured:
+        await asyncio.wait_for(stream.aclose(), timeout=0.2)
+
+    assert captured.value.__dict__["report"] is stream.report
+    release_close.set()
+    assert await asyncio.to_thread(close_finished.wait, 0.2)
+
+
+@pytest.mark.asyncio
+async def test_async_batch_input_pull_obeys_operation_elapsed_budget() -> None:
+    async def source() -> AsyncGenerator[Request]:
+        yield Request("profile")
+        await asyncio.Future[None]()
+
+    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes(
+        source(),
+        batch_size=1,
+        policy=ExecutionPolicy(max_elapsed=0.03),
+    )
+
+    assert isinstance(await anext(stream), BatchSuccess)
+    with pytest.raises(BudgetExceededError, match="batch input") as captured:
+        await asyncio.wait_for(anext(stream), timeout=0.15)
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_batch_snapshot_policy_controls_terminal_state() -> None:
+    default_stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes([Request("profile")])
+    assert len([item async for item in default_stream]) == 1
+    assert default_stream.report.state is TerminalState.COMPLETED
+    assert default_stream.report.snapshot is SnapshotState.NOT_REQUESTED
+
+    stable_policy = ExecutionPolicy(
+        consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST),
+    )
+    stable_stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes(
+        [Request("profile")],
+        policy=stable_policy,
+    )
+    assert len([item async for item in stable_stream]) == 1
+    assert stable_stream.report.state is TerminalState.INCOMPLETE
+    assert stable_stream.report.snapshot is SnapshotState.UNVERIFIED
+    assert [violation.code for violation in stable_stream.report.violations] == ["snapshot_unverified"]
+
+
+@pytest.mark.asyncio
+async def test_batch_cancellation_carries_same_terminal_report() -> None:
+    started = asyncio.Event()
+
+    class BlockingTransport:
+        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+            del request, attempt_timeout
+            started.set()
+            return await asyncio.Future[WireResponse]()
+
+    stream = BatchExecutor(Executor(BlockingTransport())).batch_outcomes([Request("profile")])
+    task = asyncio.create_task(anext(stream))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+
+    assert captured.value.__dict__["report"] is stream.report
     assert stream.report.state is TerminalState.CANCELLED
 
 

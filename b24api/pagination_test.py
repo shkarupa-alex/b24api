@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from b24api.error import BudgetExceededError, CapabilityError, PaginationError
-from b24api.execution import Executor, WireResponse
+from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.models import (
     CompletionAssurance,
     ConsistencyPolicy,
@@ -582,6 +582,32 @@ async def test_duplicate_report_preserves_multiset_and_exact_unique_count() -> N
 
 
 @pytest.mark.asyncio
+async def test_early_close_counts_only_unique_rows_delivered_from_later_page() -> None:
+    def handler(request: Request) -> object:
+        start = _integer_parameter(request, "start")
+        pages = {
+            0: [{"ID": 1, "revision": "a"}],
+            1: [{"ID": 1, "revision": "b"}, {"ID": 2}],
+        }
+        return {"result": pages.get(start, [])}
+
+    stream = iter_list(
+        Executor(FunctionTransport(handler)),
+        Request("crm.item.list"),
+        plan=_offset_plan(duplicate_policy=DuplicatePolicy.REPORT),
+        identity=_identity(),
+    )
+
+    assert await anext(stream) == {"ID": 1, "revision": "a"}
+    assert await anext(stream) == {"ID": 1, "revision": "b"}
+    await stream.aclose()
+
+    assert stream.report.emitted_rows == PAGE_SIZE
+    assert stream.report.unique_rows == 1
+    assert [violation.code for violation in stream.report.violations] == ["duplicate_identity"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tracker", [IdentityTracker.MEMORY, IdentityTracker.SQLITE])
 async def test_exact_identity_trackers_enforce_budget_and_cleanup(tracker: IdentityTracker) -> None:
     transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
@@ -643,6 +669,43 @@ async def test_task_cancellation_propagates_to_transport_and_finalizes_report() 
         await task
 
     assert transport.cancelled.is_set()
+    assert stream.report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_decoded_response_cannot_rollback_logical_page() -> None:
+    class CancelAfterResponseTransport:
+        def __init__(self) -> None:
+            self.context: ExecutionContext | None = None
+            self.locked = asyncio.Event()
+
+        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+            del request, attempt_timeout
+            assert self.context is not None
+            await self.context._lock.acquire()  # noqa: SLF001 - deterministic commit-race regression
+            self.locked.set()
+            body = json.dumps({"result": [{"ID": 1}]}).encode()
+            return WireResponse(200, (("content-type", "application/json"),), body)
+
+    transport = CancelAfterResponseTransport()
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=SingleResponsePlan(),
+        identity=_identity(),
+    )
+    transport.context = stream._context  # noqa: SLF001 - deterministic commit-race regression
+    task = asyncio.create_task(anext(stream))
+    await transport.locked.wait()
+    await asyncio.sleep(0)
+    task.cancel()
+    assert transport.context is not None
+    transport.context._lock.release()  # noqa: SLF001 - deterministic commit-race regression
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert stream.report.logical_pages == 1
     assert stream.report.state is TerminalState.CANCELLED
 
 

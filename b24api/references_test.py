@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 import asyncio
+import contextlib
 import json
+import threading
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
 
@@ -42,6 +44,7 @@ if TYPE_CHECKING:
 PAGE_SIZE = 1
 TWO_REFERENCES = 2
 EXPECTED_LOGICAL_PAGES = 4
+CLEANUP_TEST_TIMEOUT = 0.2
 
 
 class AsyncFunctionTransport:
@@ -435,6 +438,27 @@ async def test_blocked_second_async_input_does_not_block_ready_first_output() ->
 
 
 @pytest.mark.asyncio
+async def test_async_reference_input_pull_obeys_operation_elapsed_budget() -> None:
+    async def source() -> AsyncGenerator[ReferenceRequest]:
+        yield _reference("first")
+        await asyncio.Future[None]()
+
+    stream = fan_out(
+        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        source(),
+        dispatch=DirectDispatch(),
+        policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.03),
+    )
+
+    assert isinstance(await anext(stream), ReferenceItem)
+    with pytest.raises(BudgetExceededError, match="reference input") as captured:
+        await asyncio.wait_for(anext(stream), timeout=0.15)
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
 async def test_reference_page_budget_blocks_second_direct_request_before_io() -> None:
     transport = AsyncFunctionTransport(lambda _request: {"result": [{"ID": 1}]})
     stream = iter_references(
@@ -668,6 +692,56 @@ async def test_batch_reference_cancellation_interrupts_inflight_batch_request() 
 
 
 @pytest.mark.asyncio
+async def test_closed_batch_worker_exits_after_transport_temporarily_resists_cancellation() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class CancellationResistantTransport:
+        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+            del attempt_timeout
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+            commands = request.copy_parameters()["cmd"]
+            assert isinstance(commands, dict)
+            body = json.dumps(
+                {
+                    "result": {
+                        "result": {key: {"ok": True} for key in commands},
+                        "result_error": [],
+                    },
+                },
+            ).encode()
+            return WireResponse(200, (("content-type", "application/json"),), body)
+
+    stream = fan_out(
+        Executor(CancellationResistantTransport()),
+        [_reference("a")],
+        dispatch=BatchDispatch(batch_size=1),
+        policy=ExecutionPolicy(max_elapsed=0.05),
+    )
+    task = asyncio.create_task(anext(stream))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(BudgetExceededError) as captured:
+        await asyncio.wait_for(task, timeout=0.2)
+    assert captured.value.__dict__["report"] is stream.report
+
+    dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
+    worker = dispatcher._worker  # type: ignore[union-attr]  # noqa: SLF001
+    assert worker is not None
+    assert not worker.done()
+    release.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(worker), timeout=0.2)
+    assert worker.done()
+
+
+@pytest.mark.asyncio
 async def test_source_close_failure_does_not_skip_owned_resource_cleanup() -> None:
     class RaisingCloseSource:
         def __init__(self) -> None:
@@ -760,6 +834,48 @@ async def test_stalled_source_cleanup_is_bounded_after_owned_resources_close() -
     assert worker is not None
     assert worker.done()
     assert stream._scheduler.buffer._closed  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_blocking_sync_source_close_does_not_block_event_loop_or_cleanup_deadline() -> None:
+    release_close = threading.Event()
+    close_finished = threading.Event()
+
+    class BlockingCloseIterator:
+        def __init__(self) -> None:
+            self._yielded = False
+
+        def __iter__(self) -> BlockingCloseIterator:
+            return self
+
+        def __next__(self) -> ReferenceRequest:
+            if self._yielded:
+                return _reference("never-admitted")
+            self._yielded = True
+            return _reference("a")
+
+        def close(self) -> None:
+            release_close.wait()
+            close_finished.set()
+
+    stream = fan_out(
+        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        BlockingCloseIterator(),
+        dispatch=DirectDispatch(),
+        policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.05),
+    )
+
+    assert isinstance(await anext(stream), ReferenceItem)
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(BudgetExceededError, match="source cleanup") as captured:
+        await asyncio.wait_for(stream.aclose(), timeout=0.2)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < CLEANUP_TEST_TIMEOUT
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream._scheduler.buffer._closed  # noqa: SLF001
+    release_close.set()
+    assert await asyncio.to_thread(close_finished.wait, 0.2)
 
 
 def test_batch_reference_stream_construction_is_lazy_outside_an_event_loop() -> None:

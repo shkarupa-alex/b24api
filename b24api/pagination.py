@@ -437,9 +437,9 @@ class PaginationDriver:
                 context=self.context,
                 work_class=WorkClass.TRAVERSAL_DIRECT,
             )
-            await self.context.commit_page(reservation)
+            self.context.commit_page(reservation)
         except BaseException:
-            await self.context.release_page(reservation)
+            self.context.release_page(reservation)
             raise
         return response
 
@@ -599,10 +599,11 @@ class ItemStream(AsyncIterator[JsonValue]):
             context=self._context,
         )
         self._assurance = CompletionAssurance.CALLER_ASSERTED
-        self._runner: AsyncGenerator[JsonValue] | None = None
-        self._prefetched: JsonValue | object = _MISSING
+        self._runner: AsyncGenerator[tuple[JsonValue, bool]] | None = None
+        self._prefetched: tuple[JsonValue, bool] | object = _MISSING
         self._closed = False
         self._emitted = 0
+        self._unique_emitted = 0
         self.report = OperationReport()
 
     def __aiter__(self) -> Self:
@@ -612,15 +613,20 @@ class ItemStream(AsyncIterator[JsonValue]):
         if self._closed:
             raise StopAsyncIteration
         if self._prefetched is not _MISSING:
-            item = cast("JsonValue", self._prefetched)
+            item, is_unique = cast("tuple[JsonValue, bool]", self._prefetched)
             self._prefetched = _MISSING
-            self._emitted += 1
+            self._record_delivery(is_unique=is_unique)
             return item
         if self._runner is None:
             self._runner = self._run()
-        item = await anext(self._runner)
-        self._emitted += 1
+        item, is_unique = await anext(self._runner)
+        self._record_delivery(is_unique=is_unique)
         return item
+
+    def _record_delivery(self, *, is_unique: bool) -> None:
+        self._emitted += 1
+        if is_unique:
+            self._unique_emitted += 1
 
     async def __aenter__(self) -> Self:
         if self._closed:
@@ -651,17 +657,17 @@ class ItemStream(AsyncIterator[JsonValue]):
         if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
             await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
 
-    async def _run(self) -> AsyncGenerator[JsonValue]:
+    async def _run(self) -> AsyncGenerator[tuple[JsonValue, bool]]:
         pages = self._driver.pages()
         naturally_exhausted = False
         try:
             async for page in pages:
-                buffered = deque(page.items)
+                buffered = deque(zip(page.items, self._driver.last_page_unique_mask, strict=True))
                 await self._context.set_buffered_rows(len(buffered))
                 while buffered:
-                    item = buffered.popleft()
+                    item, is_unique = buffered.popleft()
                     await self._context.set_buffered_rows(len(buffered) + 1)
-                    yield item
+                    yield item, is_unique
                     await self._context.set_buffered_rows(len(buffered))
             naturally_exhausted = True
             await self._finalize(TerminalState.COMPLETED, self._driver.terminal_reason or "terminal confirmed")
@@ -678,8 +684,14 @@ class ItemStream(AsyncIterator[JsonValue]):
             _attach_report(error, self.report)
             raise
         finally:
-            await pages.aclose()
-            await self._context.set_buffered_rows(0)
+            try:
+                await pages.aclose()
+                await self._context.set_buffered_rows(0)
+            except BaseException as cleanup_error:
+                if self.report.state is TerminalState.NOT_STARTED:
+                    await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+                _attach_report(cleanup_error, self.report)
+                raise
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
                 await self._finalize(TerminalState.CANCELLED, "stream abandoned")
             if self.report.state is not TerminalState.NOT_STARTED:
@@ -714,7 +726,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             plan_id=type(self._driver.plan).__name__,
             dispatch_id="sequential_direct",
             emitted_rows=self._emitted,
-            unique_rows=min(self._emitted, self._driver.unique_rows),
+            unique_rows=self._unique_emitted,
             physical_requests=snapshot.counters.physical_requests,
             logical_pages=snapshot.counters.logical_pages,
             retries=snapshot.retries,

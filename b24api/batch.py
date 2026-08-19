@@ -7,7 +7,7 @@ from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterab
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, Self, cast, runtime_checkable
 
-from b24api.error import B24ApiError, BatchCommandError, ErrorOrigin, ProtocolError
+from b24api.error import B24ApiError, BatchCommandError, BudgetExceededError, ErrorOrigin, ProtocolError
 from b24api.execution import ExecutionContext, Executor, WorkClass
 from b24api.models import (
     BatchCommandEvidence,
@@ -22,8 +22,11 @@ from b24api.models import (
     ReplaySafety,
     Request,
     Response,
+    SnapshotRequirement,
     SnapshotState,
     TerminalState,
+    Violation,
+    ViolationSeverity,
 )
 from b24api.plans import PORTAL_BATCH_CAP
 from b24api.query import build_query
@@ -36,6 +39,7 @@ type FailFastItem = JsonValue | tuple[JsonValue, object]
 type BatchStreamItem = FailFastItem | BatchOutcome
 
 _REQUEST_PAYLOAD_TUPLE_LENGTH = 2
+_MISSING = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +341,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         self._fallback_failed = fallback_failed
         self._context = batch_executor.executor.context(policy)
         self._runner: AsyncGenerator[BatchStreamItem] | None = None
+        self._prefetched: BatchStreamItem | object = _MISSING
         self._closed = False
         self._batch_requests = 0
         self._batch_commands = 0
@@ -349,15 +354,24 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
     async def __anext__(self) -> BatchStreamItem:
         if self._closed:
             raise StopAsyncIteration
+        if self._prefetched is not _MISSING:
+            item = cast("BatchStreamItem", self._prefetched)
+            self._prefetched = _MISSING
+            self._emitted += 1
+            return item
         if self._runner is None:
             self._runner = self._run()
-        return await anext(self._runner)
+        item = await anext(self._runner)
+        self._emitted += 1
+        return item
 
     async def __aenter__(self) -> Self:
         if self._closed:
             raise RuntimeError("stream is closed")
         if self._runner is None:
             self._runner = self._run()
+            with contextlib.suppress(StopAsyncIteration):
+                self._prefetched = await anext(self._runner)
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
@@ -367,17 +381,31 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         if self._closed:
             return
         self._closed = True
-        if self._runner is not None:
-            await self._runner.aclose()
+        try:
+            if self._runner is not None:
+                await self._runner.aclose()
+        except BaseException as error:
+            if self.report.state is TerminalState.NOT_STARTED:
+                await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+            _attach_report(error, self.report)
+            raise
+        finally:
+            self._prefetched = _MISSING
         if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
             await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
 
     async def _run(self) -> AsyncGenerator[BatchStreamItem]:
+        await self._context.start()
         source = _iterate_source(self._source)
         next_index = 0
         naturally_exhausted = False
         try:
-            while chunk := await _next_chunk(source, self._batch_size, start_index=next_index):
+            while chunk := await _next_chunk(
+                source,
+                self._batch_size,
+                start_index=next_index,
+                context=self._context,
+            ):
                 next_index += len(chunk)
                 self._batch_requests += 1
                 self._batch_commands += len(chunk)
@@ -388,7 +416,6 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                     context=self._context,
                 )
                 for outcome in outcomes:
-                    self._emitted += 1
                     if self._tolerant:
                         yield outcome
                     else:
@@ -399,32 +426,62 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                             yield success.result
             naturally_exhausted = True
             await self._finalize(TerminalState.COMPLETED, "input exhausted")
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             await self._finalize(TerminalState.CANCELLED, "iteration cancelled")
+            _attach_report(error, self.report)
             raise
-        except GeneratorExit:
+        except GeneratorExit as error:
             await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
+            _attach_report(error, self.report)
             raise
         except BaseException as error:
             await self._finalize(TerminalState.FAILED, type(error).__name__)
-            with contextlib.suppress(AttributeError, TypeError):
-                error.report = self.report  # type: ignore[attr-defined]
+            _attach_report(error, self.report)
             raise
         finally:
-            await source.aclose()
+            await self._cleanup_source(source)
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
                 await self._finalize(TerminalState.CANCELLED, "stream abandoned")
             if self.report.state is not TerminalState.NOT_STARTED:
                 self._closed = True
 
+    async def _cleanup_source(self, source: AsyncGenerator[BatchInput]) -> None:
+        try:
+            await _close_source_bounded(
+                source,
+                remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed),
+            )
+        except BaseException as cleanup_error:
+            if self.report.state is TerminalState.NOT_STARTED:
+                await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+            _attach_report(cleanup_error, self.report)
+            raise
+
     async def _finalize(self, state: TerminalState, reason: str) -> None:
         if self.report.state is not TerminalState.NOT_STARTED:
             return
         snapshot = await self._context.snapshot()
+        consistency = self._context.policy.consistency
+        snapshot_state = (
+            SnapshotState.NOT_REQUESTED
+            if consistency.snapshot_requirement is SnapshotRequirement.TRAVERSAL_ONLY
+            else SnapshotState.UNVERIFIED
+        )
+        violations: tuple[Violation, ...] = ()
+        if state is TerminalState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
+            state = TerminalState.INCOMPLETE
+            reason = "required snapshot was not verified"
+            violations = (
+                Violation(
+                    severity=ViolationSeverity.BLOCKING,
+                    code="snapshot_unverified",
+                    message="the requested stable snapshot was not verified",
+                ),
+            )
         self.report = OperationReport(
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
-            snapshot=SnapshotState.UNVERIFIED,
+            snapshot=snapshot_state,
             plan_id="batch_outcomes" if self._tolerant else "batch",
             dispatch_id="batch",
             emitted_rows=self._emitted,
@@ -434,6 +491,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             batch_commands=self._batch_commands,
             retries=snapshot.retries,
             cooldown_seconds=snapshot.cooldown_seconds,
+            violations=violations,
             terminal_reason=reason,
         )
 
@@ -454,7 +512,41 @@ async def _iterate_source(source: BatchSource) -> AsyncGenerator[BatchInput]:
             yield item
     finally:
         if isinstance(sync_iterator, _SyncClosable):
-            sync_iterator.close()
+            await asyncio.to_thread(sync_iterator.close)
+
+
+async def _close_source_bounded(source: AsyncGenerator[BatchInput], *, remaining: float) -> None:
+    close_task = asyncio.create_task(source.aclose())
+    timed_out = False
+    try:
+        await asyncio.sleep(0)
+        if close_task.done():
+            await close_task
+            return
+        done, _ = await asyncio.wait((close_task,), timeout=max(0.0, remaining))
+        if not done:
+            timed_out = True
+        else:
+            await close_task
+    except BaseException:
+        if not close_task.done():
+            close_task.cancel()
+            close_task.add_done_callback(_consume_task_result)
+        raise
+    if timed_out:
+        close_task.cancel()
+        close_task.add_done_callback(_consume_task_result)
+        raise BudgetExceededError("batch source cleanup exceeded operation time budget")
+
+
+def _consume_task_result(task: asyncio.Task[None]) -> None:
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        task.result()
+
+
+def _attach_report(error: BaseException, report: OperationReport) -> None:
+    with contextlib.suppress(AttributeError, TypeError):
+        error.report = report  # type: ignore[attr-defined]
 
 
 async def _next_chunk(
@@ -462,17 +554,49 @@ async def _next_chunk(
     size: int,
     *,
     start_index: int,
+    context: ExecutionContext,
 ) -> tuple[_Command, ...]:
     commands: list[_Command] = []
     for offset in range(size):
         try:
-            raw = await anext(source)
+            raw = await _next_batch_input_bounded(source, context)
         except StopAsyncIteration:
             break
         request, payload, has_payload = _coerce_input(raw)
         index = start_index + offset
         commands.append(_Command(index, f"c{index:012d}", request, payload, has_payload))
     return tuple(commands)
+
+
+async def _next_batch_input_bounded(
+    source: AsyncIterator[BatchInput],
+    context: ExecutionContext,
+) -> BatchInput:
+    remaining = context.policy.max_elapsed - context.elapsed
+    if remaining <= 0:
+        raise BudgetExceededError("batch input exceeded operation time budget")
+    pull: asyncio.Future[BatchInput] = asyncio.ensure_future(anext(source))
+    try:
+        done, _ = await asyncio.wait((pull,), timeout=remaining)
+        if done:
+            return await pull
+    except BaseException:
+        if not pull.done():
+            pull.cancel()
+            pull.add_done_callback(_consume_batch_pull)
+        raise
+    pull.cancel()
+    await asyncio.sleep(0)
+    if not pull.done():
+        pull.add_done_callback(_consume_batch_pull)
+    else:
+        _consume_batch_pull(pull)
+    raise BudgetExceededError("batch input exceeded operation time budget")
+
+
+def _consume_batch_pull(task: asyncio.Future[BatchInput]) -> None:
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        task.result()
 
 
 def _coerce_input(raw: BatchInput) -> tuple[Request, object, bool]:
