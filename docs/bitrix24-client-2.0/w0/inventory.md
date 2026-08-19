@@ -176,7 +176,7 @@ measured separately with the same interpreter and tool versions: CPython
 | Original HEAD, CPython 3.12.10 | `uv run pytest` | 54 collected, 54 passed in 2.53s. |
 | Original HEAD | `uv run ruff check .` | Failed with 3 existing test findings: `PERF401` at `api_test.py:108`, `PLR2004` at lines 146 and 147. |
 | Original HEAD | `uv run mypy b24api` | Failed with 24 existing `union-attr` errors at `api_test.py:145-147`. |
-| Dirty candidate, CPython 3.12.10 | `uv run pytest` | 73 collected, 73 passed in 2.16s. |
+| Dirty candidate, CPython 3.12.10 | `uv run pytest` | 73 collected, 73 passed in 2.03s on the correction rerun. |
 | Dirty candidate | `uv run ruff check .` | Passed. |
 | Dirty candidate | `uv run mypy b24api` | Passed for 11 source files. |
 
@@ -215,11 +215,20 @@ authorization, and a resumable cleanup path.
 
 ## Read-only batch command-chaining probe
 
-At `2026-08-19T22:15:35+03:00`, one request using the `admin_full` role ran
-`profile` followed by `user.get` whose `ID` came from `$result[who][ID]`.
+At `2026-08-19T19:46:26Z`, committed runner
+`4d9cdf83b4b55571cbc8375cb712198856502b8f` made one request using the
+`admin_full` role. It ran `profile` followed by `user.get` whose `ID` came
+from `$result[who][ID]`.
 The HTTP status was 200, neither the envelope nor either command reported an
 error, and the sole dependent row matched the profile identity. Exact IDs and
 response bodies were discarded.
+
+The runner used CPython 3.12.10 and httpx 0.28.1. Its committed source SHA-256
+is `6a9d9858d504f154d4e5da2f6bb06882cadc1fb929a61735b60196943669620c`.
+The artifact validates against `batch-chaining-probe.schema.json`. Its portal
+fingerprint uses `HMAC-SHA-256(key, host)` under algorithm ID
+`hmac-sha256-v1`; the one-way key and webhook were environment-only and were
+not retained.
 
 This proves only that dependent command substitution works for this portal and
 query shape. It does not authorize a traversal plan or strengthen assurance.

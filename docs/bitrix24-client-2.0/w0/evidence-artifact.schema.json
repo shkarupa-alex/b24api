@@ -96,8 +96,7 @@
           "case_id": {"$ref": "#/$defs/caseId"},
           "manifest_content_hash": {"$ref": "#/$defs/sha256"},
           "metrics": {"$ref": "#/$defs/benchmarkMetrics"},
-          "controls": {"$ref": "#/$defs/benchmarkControls"},
-          "assurance": {"const": "oracle_verified"}
+          "controls": {"$ref": "#/$defs/benchmarkControls"}
         }
       },
       "else": {
@@ -107,6 +106,16 @@
           "controls": {"type": "null"}
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "command": {"const": "benchmark"},
+          "outcome": {"const": "PASS"}
+        },
+        "required": ["command", "outcome"]
+      },
+      "then": {"properties": {"assurance": {"const": "oracle_verified"}}}
     }
   ],
   "$defs": {

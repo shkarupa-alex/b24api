@@ -505,6 +505,9 @@ def self_test() -> None:  # noqa: PLR0915
     case = deepcopy(valid["dataset-manifest-record"])
     case["safe_error"] = {"url": SECRET_EXAMPLE + "user.get.json"}
     invalid.append(("dataset-manifest-record", case, "untyped secret-bearing error"))
+    case = deepcopy(valid["dataset-manifest-record"])
+    case["record_hash"] = OTHER_SHA256
+    invalid.append(("dataset-manifest-record", case, "incorrect canonical record hash"))
 
     case = deepcopy(valid["oracle-record"])
     case["snapshot"].update({"state": "changed", "pre_hash": None, "post_hash": None})
