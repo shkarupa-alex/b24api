@@ -254,6 +254,71 @@ async def test_offset_exact_total_must_be_present_stable_and_not_overshot() -> N
 
 
 @pytest.mark.asyncio
+async def test_empty_page_cannot_override_an_unreached_exact_total() -> None:
+    responses = [
+        {"result": [{"ID": 1}], "total": 2},
+        {"result": [], "total": 2},
+    ]
+    transport = FunctionTransport(lambda _request: responses.pop(0))
+    plan = OffsetSequentialPlan(
+        continuation=OffsetContinuation.OBSERVED_COUNT,
+        terminal=frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL}),
+        total_semantics=TotalSemantics.FILTERED_EXACT,
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        identity=_identity(),
+    )
+
+    with pytest.raises(PaginationError, match="before its exact total"):
+        await _collect(stream)
+
+
+@pytest.mark.asyncio
+async def test_short_page_does_not_escape_before_exact_total_validation() -> None:
+    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}], "total": 2})
+    plan = OffsetSequentialPlan(
+        limit_path=ParameterPath(("limit",)),
+        requested_page_size=2,
+        continuation=OffsetContinuation.OBSERVED_COUNT,
+        terminal=frozenset(
+            {OffsetTerminalRule.PROFILE_SHORT_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL},
+        ),
+        total_semantics=TotalSemantics.FILTERED_EXACT,
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        identity=_identity(),
+    )
+
+    with pytest.raises(PaginationError, match="before its exact total"):
+        await anext(stream)
+    assert stream.report.emitted_rows == 0
+
+
+@pytest.mark.asyncio
+async def test_page_budget_refuses_continuation_before_network_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=_offset_plan(),
+        identity=_identity(),
+        policy=ExecutionPolicy(max_pages=1),
+    )
+
+    with pytest.raises(BudgetExceededError, match="page budget"):
+        await _collect(stream)
+
+    assert [_integer_parameter(request, "start") for request in transport.requests] == [0]
+    assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
 async def test_selector_shape_failure_is_typed_and_reported() -> None:
     transport = FunctionTransport(lambda _request: {"result": {"items": {"ID": 1}}})
     stream = iter_list(
@@ -440,6 +505,62 @@ async def test_item_cursor_rejects_wrong_order_within_first_page() -> None:
 
 
 @pytest.mark.asyncio
+async def test_item_cursor_refuses_monotonic_identity_tracker_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1, "cursor": 1}]})
+    plan = ItemCursorPlan(
+        identity_requirement=IdentityRequirement.REQUIRED,
+        order_semantics=OrderSemantics.ASCENDING,
+        cursor_item_path=("cursor",),
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        identity=_identity(),
+        policy=ExecutionPolicy(identity_tracker=IdentityTracker.MONOTONIC),
+    )
+
+    with pytest.raises(CapabilityError, match="identity-ordered keyset"):
+        await anext(stream)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_latent_keyset_filter_collision_refuses_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list", {"filter": {">ID": 99}}),
+        plan=_keyset_plan(),
+        identity=_identity(),
+    )
+
+    with pytest.raises(CapabilityError, match="conflict"):
+        await anext(stream)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_latent_item_cursor_collision_refuses_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    plan = ItemCursorPlan(
+        identity_requirement=IdentityRequirement.REQUIRED,
+        order_semantics=OrderSemantics.ASCENDING,
+        cursor_item_path=("ID",),
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list", {"LAST_ID": 99}),
+        plan=plan,
+        identity=_identity(),
+    )
+
+    with pytest.raises(CapabilityError, match="conflict"):
+        await anext(stream)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
 async def test_duplicate_report_preserves_multiset_and_exact_unique_count() -> None:
     def handler(request: Request) -> dict[str, object]:
         start = _integer_parameter(request, "start")
@@ -526,7 +647,7 @@ async def test_task_cancellation_propagates_to_transport_and_finalizes_report() 
 
 
 @pytest.mark.asyncio
-async def test_non_traversal_snapshot_requirement_remains_unverified_and_caller_asserted() -> None:
+async def test_non_traversal_snapshot_requirement_is_unverified_and_incomplete() -> None:
     transport = FunctionTransport(lambda _request: {"result": []})
     policy = ExecutionPolicy(
         consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST),
@@ -541,6 +662,9 @@ async def test_non_traversal_snapshot_requirement_remains_unverified_and_caller_
     assert await _collect(stream) == []
     assert stream.report.assurance is CompletionAssurance.CALLER_ASSERTED
     assert stream.report.snapshot is SnapshotState.UNVERIFIED
+    assert stream.report.state is TerminalState.INCOMPLETE
+    assert not stream.report.completed
+    assert [violation.code for violation in stream.report.violations] == ["snapshot_unverified"]
 
 
 @pytest.mark.asyncio

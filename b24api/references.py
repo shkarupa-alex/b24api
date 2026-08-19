@@ -3,7 +3,7 @@
 from __future__ import annotations
 import asyncio
 import contextlib
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable
 from dataclasses import dataclass
 from typing import Protocol, Self, cast, runtime_checkable
 
@@ -77,6 +77,7 @@ class _Reservation:
 class _PageEvent:
     work: _Work
     items: tuple[JsonValue, ...]
+    unique_rows_after: int
     reservation: _Reservation
     acknowledged: asyncio.Future[None]
 
@@ -84,6 +85,7 @@ class _PageEvent:
 @dataclass(frozen=True, slots=True)
 class _DoneEvent:
     work: _Work
+    violations: tuple[Violation, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +95,7 @@ class _FailureEvent:
     cursor: JsonValue
     page_state: int
     partial_rows: int
+    violations: tuple[Violation, ...]
     replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
 
 
@@ -104,6 +107,15 @@ class _PendingBatch:
     request: Request
     reference_id: str
     future: asyncio.Future[Response]
+
+
+@dataclass(slots=True)
+class _AdmissionState:
+    tasks: dict[int, asyncio.Task[None]]
+    queues: dict[int, asyncio.Queue[_Event]]
+    ready: asyncio.Queue[_Event]
+    slots: asyncio.Semaphore
+    changed: asyncio.Event
 
 
 class _BatchPageError(Exception):
@@ -235,6 +247,7 @@ class _DirectPageDispatcher:
         self.batch_commands = 0
 
     async def fetch(self, request: Request, reference_id: str) -> Response:
+        await self.context.reserve_page(reference=reference_id)
         remaining = self.context.policy.max_elapsed - self.context.elapsed
         if remaining <= 0:
             raise BudgetExceededError("operation elapsed budget exhausted before direct admission")
@@ -248,7 +261,6 @@ class _DirectPageDispatcher:
                     )
         except TimeoutError as error:
             raise BudgetExceededError("direct scheduler admission exceeded operation time budget") from error
-        await self.context.reserve_page(reference=reference_id)
         return response
 
     async def aclose(self) -> None:
@@ -278,6 +290,7 @@ class _BatchPageDispatcher:
             raise RuntimeError("batch page dispatcher is closed")
         if self._worker is None:
             self._worker = asyncio.create_task(self._run())
+        await self.context.reserve_page(reference=reference_id)
         future: asyncio.Future[Response] = asyncio.get_running_loop().create_future()
         pending = _PendingBatch(request, reference_id, future)
         remaining = self.context.policy.max_elapsed - self.context.elapsed
@@ -287,6 +300,9 @@ class _BatchPageDispatcher:
             async with asyncio.timeout(remaining):
                 await self._queue.put(pending)
                 return await future
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
         except TimeoutError as error:
             future.cancel()
             raise BudgetExceededError("batch scheduler admission exceeded operation time budget") from error
@@ -296,6 +312,8 @@ class _BatchPageDispatcher:
             first = await self._queue.get()
             if first is None:
                 return
+            if first.future.done():
+                continue
             chunk = [first]
             await asyncio.sleep(0)
             while len(chunk) < self.plan.batch_size:
@@ -306,6 +324,8 @@ class _BatchPageDispatcher:
                 if pending is None:
                     await self._queue.put(None)
                     break
+                if pending.future.done():
+                    continue
                 chunk.append(pending)
             self.batch_requests += 1
             self.batch_commands += len(chunk)
@@ -334,12 +354,7 @@ class _BatchPageDispatcher:
                 if success.response is None:
                     item.future.set_exception(CapabilityError("batch page response metadata is unavailable"))
                     continue
-                try:
-                    await self.context.reserve_page(reference=item.reference_id)
-                except Exception as error:  # noqa: BLE001 - propagate any budget/driver failure
-                    item.future.set_exception(error)
-                else:
-                    item.future.set_result(success.response)
+                item.future.set_result(success.response)
 
     async def aclose(self) -> None:
         if self._closed:
@@ -347,11 +362,17 @@ class _BatchPageDispatcher:
         self._closed = True
         if self._worker is None:
             return
-        if self._worker.done():
+        if not self._worker.done():
+            self._worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
             await self._worker
-            return
-        await self._queue.put(None)
-        await self._worker
+        while True:
+            try:
+                pending = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if pending is not None and not pending.future.done():
+                pending.future.cancel()
 
 
 type _PageDispatcher = _DirectPageDispatcher | _BatchPageDispatcher
@@ -392,47 +413,70 @@ class ReferenceScheduler:
         head_reserve = self.page_cap if output_order is ReferenceOutputOrder.INPUT else 0
         self.buffer = _RowBuffer(policy.max_buffered_rows, self.context, head_reserve=head_reserve)
         self.violations: list[Violation] = []
+        self.unique_rows = 0
+        self._unique_by_work: dict[int, int] = {}
 
     async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:
         iterator = _iterate_references(source)
-        tasks: dict[int, asyncio.Task[None]] = {}
-        queues: dict[int, asyncio.Queue[_Event]] = {}
-        ready: asyncio.Queue[_Event] = asyncio.Queue(maxsize=self.active_limit)
-        next_index = 0
-        input_exhausted = False
+        admission = _AdmissionState(
+            tasks={},
+            queues={},
+            ready=asyncio.Queue(maxsize=self.active_limit),
+            slots=asyncio.Semaphore(self.active_limit),
+            changed=asyncio.Event(),
+        )
+        producer = asyncio.create_task(self._produce(iterator, admission))
 
-        async def admit() -> None:
-            nonlocal next_index, input_exhausted
-            while not input_exhausted and len(tasks) < self.active_limit:
+        try:
+            if self.output_order is ReferenceOutputOrder.READY:
+                async for outcome in self._ready(admission, producer):
+                    yield outcome
+            else:
+                async for outcome in self._input(admission, producer):
+                    yield outcome
+        finally:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+            for task in admission.tasks.values():
+                task.cancel()
+            if admission.tasks:
+                await asyncio.gather(*admission.tasks.values(), return_exceptions=True)
+            try:
+                await iterator.aclose()
+            finally:
+                try:
+                    await self.buffer.close()
+                finally:
+                    await self.dispatcher.aclose()
+
+    async def _produce(
+        self,
+        iterator: AsyncIterator[ReferenceRequest],
+        admission: _AdmissionState,
+    ) -> None:
+        next_index = 0
+        try:
+            while True:
+                await admission.slots.acquire()
                 try:
                     reference = await anext(iterator)
                 except StopAsyncIteration:
-                    input_exhausted = True
+                    admission.slots.release()
                     return
+                except BaseException:
+                    admission.slots.release()
+                    raise
                 if not isinstance(reference, ReferenceRequest):
+                    admission.slots.release()
                     raise TypeError("reference source must yield ReferenceRequest values")
                 work = _Work(next_index, reference)
                 next_index += 1
-                queue = ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue(maxsize=1)
-                queues[work.index] = queue
-                tasks[work.index] = asyncio.create_task(self._run_reference(work, queue))
-
-        try:
-            await admit()
-            if self.output_order is ReferenceOutputOrder.READY:
-                async for outcome in self._ready(tasks, queues, ready, admit):
-                    yield outcome
-            else:
-                async for outcome in self._input(tasks, queues, admit):
-                    yield outcome
+                queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue(maxsize=1)
+                admission.queues[work.index] = queue
+                admission.tasks[work.index] = asyncio.create_task(self._run_reference(work, queue))
+                admission.changed.set()
         finally:
-            for task in tasks.values():
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks.values(), return_exceptions=True)
-            await iterator.aclose()
-            await self.buffer.close()
-            await self.dispatcher.aclose()
+            admission.changed.set()
 
     async def _run_reference(self, work: _Work, output: asyncio.Queue[_Event]) -> None:
         reservation: _Reservation | None = None
@@ -467,14 +511,22 @@ class ReferenceScheduler:
                     raise RuntimeError("page completed without a buffer reservation")  # noqa: TRY301
                 await self.buffer.accept(reservation, len(page.items))
                 acknowledged = asyncio.get_running_loop().create_future()
-                await output.put(_PageEvent(work, page.items, reservation, acknowledged))
+                await output.put(
+                    _PageEvent(
+                        work,
+                        page.items,
+                        driver.unique_rows,
+                        reservation,
+                        acknowledged,
+                    ),
+                )
                 await acknowledged
                 partial_rows += len(page.items)
                 reservation = None
             if reservation is not None:
                 await self.buffer.abort(reservation)
                 reservation = None
-            await output.put(_DoneEvent(work))
+            await output.put(_DoneEvent(work, tuple(driver.violations)))
         except asyncio.CancelledError:
             raise
         except _BatchPageError as error:
@@ -485,6 +537,7 @@ class ReferenceScheduler:
                     driver.cursor_state,
                     page_state,
                     partial_rows,
+                    tuple(driver.violations),
                     error.failure.replay_disposition,
                 ),
             )
@@ -496,6 +549,7 @@ class ReferenceScheduler:
                     driver.cursor_state,
                     page_state,
                     partial_rows,
+                    tuple(driver.violations),
                 ),
             )
         finally:
@@ -504,39 +558,48 @@ class ReferenceScheduler:
 
     async def _ready(
         self,
-        tasks: dict[int, asyncio.Task[None]],
-        queues: dict[int, asyncio.Queue[_Event]],
-        ready: asyncio.Queue[_Event],
-        admit: _Admit,
+        admission: _AdmissionState,
+        producer: asyncio.Task[None],
     ) -> AsyncGenerator[ReferenceStreamItem]:
-        while tasks:
-            event = await ready.get()
+        while admission.tasks or not producer.done():
+            if not admission.tasks:
+                await _wait_for_admission(producer, admission.changed)
+                continue
+            event = await _wait_for_event(admission.ready, producer)
+            self._record_terminal_violations(event)
             async for outcome in self._consume_event(event):
                 yield outcome
             if isinstance(event, _PageEvent):
                 continue
-            await _finish_task(tasks, event.work.index)
-            queues.pop(event.work.index, None)
-            await admit()
+            await _finish_task(admission.tasks, event.work.index)
+            admission.queues.pop(event.work.index, None)
+            admission.slots.release()
 
     async def _input(
         self,
-        tasks: dict[int, asyncio.Task[None]],
-        queues: dict[int, asyncio.Queue[_Event]],
-        admit: _Admit,
+        admission: _AdmissionState,
+        producer: asyncio.Task[None],
     ) -> AsyncGenerator[ReferenceStreamItem]:
-        while tasks:
-            head = min(tasks)
-            event = await queues[head].get()
+        while admission.tasks or not producer.done():
+            if not admission.tasks:
+                await _wait_for_admission(producer, admission.changed)
+                continue
+            head = min(admission.tasks)
+            event = await _wait_for_event(admission.queues[head], producer)
+            self._record_terminal_violations(event)
             async for outcome in self._consume_event(event):
                 yield outcome
             if isinstance(event, _PageEvent):
                 continue
-            await _finish_task(tasks, head)
-            queues.pop(head, None)
-            await admit()
-            next_head = min(tasks) if tasks else head + 1
+            await _finish_task(admission.tasks, head)
+            admission.queues.pop(head, None)
+            admission.slots.release()
+            next_head = min(admission.tasks) if admission.tasks else head + 1
             await self.buffer.advance_head(next_head, self.page_cap)
+
+    def _record_terminal_violations(self, event: _Event) -> None:
+        if isinstance(event, _DoneEvent | _FailureEvent):
+            self.violations.extend(event.violations)
 
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
         if isinstance(event, _PageEvent):
@@ -544,6 +607,9 @@ class ReferenceScheduler:
                 for item in event.items:
                     yield ReferenceItem(event.work.reference.reference_key, item)
                     await self.buffer.release(event.reservation, 1)
+                previous = self._unique_by_work.get(event.work.index, 0)
+                self.unique_rows += event.unique_rows_after - previous
+                self._unique_by_work[event.work.index] = event.unique_rows_after
             finally:
                 if not event.acknowledged.done():
                     event.acknowledged.set_result(None)
@@ -571,9 +637,6 @@ class ReferenceScheduler:
             replay_safety=safety,
             replay_disposition=event.replay_disposition,
         )
-
-
-type _Admit = Callable[[], Awaitable[None]]
 
 
 class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
@@ -668,6 +731,18 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             if consistency.snapshot_requirement is SnapshotRequirement.TRAVERSAL_ONLY
             else SnapshotState.UNVERIFIED
         )
+        violations = tuple(self._scheduler.violations)
+        if state is TerminalState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
+            state = TerminalState.INCOMPLETE
+            reason = "required snapshot was not verified"
+            violations = (
+                *violations,
+                Violation(
+                    severity=ViolationSeverity.BLOCKING,
+                    code="snapshot_unverified",
+                    message="the requested stable snapshot was not verified",
+                ),
+            )
         self.report = OperationReport(
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
@@ -675,7 +750,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             plan_id=type(self._scheduler.plan).__name__,
             dispatch_id=type(self._scheduler.dispatch).__name__,
             emitted_rows=self._emitted,
-            unique_rows=self._emitted,
+            unique_rows=min(self._emitted, self._scheduler.unique_rows),
             physical_requests=snapshot.counters.physical_requests,
             logical_pages=snapshot.counters.logical_pages,
             batch_requests=self._scheduler.dispatcher.batch_requests,
@@ -683,7 +758,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             retries=snapshot.retries,
             cooldown_seconds=snapshot.cooldown_seconds,
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
-            violations=tuple(self._scheduler.violations),
+            violations=violations,
             terminal_reason=reason,
         )
 
@@ -761,6 +836,39 @@ async def _iterate_references(source: ReferenceSource) -> AsyncGenerator[Referen
     finally:
         if isinstance(sync_iterator, _SyncClosable):
             sync_iterator.close()
+
+
+async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Event) -> None:
+    if producer.done():
+        await producer
+        return
+    waiter = asyncio.create_task(changed.wait())
+    try:
+        done, _ = await asyncio.wait((producer, waiter), return_when=asyncio.FIRST_COMPLETED)
+        if producer in done:
+            await producer
+        if waiter in done:
+            changed.clear()
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
+async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[None]) -> _Event:
+    if producer.done():
+        await producer
+        return await queue.get()
+    getter = asyncio.create_task(queue.get())
+    try:
+        done, _ = await asyncio.wait((producer, getter), return_when=asyncio.FIRST_COMPLETED)
+        if producer in done:
+            await producer
+        return await getter
+    finally:
+        if not getter.done():
+            getter.cancel()
+        await asyncio.gather(getter, return_exceptions=True)
 
 
 async def _finish_task(tasks: dict[int, asyncio.Task[None]], index: int) -> None:

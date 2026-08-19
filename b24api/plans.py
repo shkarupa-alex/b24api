@@ -123,6 +123,7 @@ class OffsetSequentialPlan(PlanContract):
         if any(not isinstance(rule, OffsetTerminalRule) for rule in self.terminal):
             raise TypeError("terminal rules must be OffsetTerminalRule values")
         _validate_page_size(self.limit_path, self.requested_page_size)
+        _require_disjoint_paths(self.offset_path, self.limit_path)
         if not self.terminal:
             raise ValueError("offset plan requires at least one terminal rule")
         if OffsetTerminalRule.PROFILE_SHORT_PAGE in self.terminal and self.requested_page_size is None:
@@ -153,6 +154,7 @@ class CountedOffsetPlan(PlanContract):
         if self.total_semantics is not TotalSemantics.FILTERED_EXACT:
             raise ValueError("counted offset requires filtered exact total semantics")
         _validate_page_size(self.limit_path, self.requested_page_size)
+        _require_disjoint_paths(self.offset_path, self.limit_path)
         if self.mode is CountedOffsetMode.PARALLEL_FIXED_STRIDE:
             if self.fixed_stride is None or not _is_plain_int(self.fixed_stride) or self.fixed_stride < 1:
                 raise ValueError("parallel counted offset requires a positive fixed_stride")
@@ -184,7 +186,12 @@ class KeysetPlan(PlanContract):
         _validate_page_size(self.limit_path, self.requested_page_size)
         if self.terminal is KeysetTerminalRule.PROFILE_SHORT_PAGE and self.requested_page_size is None:
             raise ValueError("short-page terminal requires a requested_page_size")
-        _require_distinct_paths(self.filter_path, self.order_path)
+        _require_disjoint_paths(
+            self.filter_path,
+            self.order_path,
+            self.limit_path,
+            self.start_suppression_path,
+        )
         if self.order_semantics is OrderSemantics.UNORDERED:
             raise ValueError("keyset plan requires declared ascending or descending order")
         expected = OrderSemantics.ASCENDING if self.direction == "asc" else OrderSemantics.DESCENDING
@@ -220,6 +227,7 @@ class ItemCursorPlan(PlanContract):
         if not isinstance(self.terminal, CursorTerminalRule):
             raise TypeError("terminal must be a CursorTerminalRule")
         _validate_page_size(self.limit_path, self.requested_page_size)
+        _require_disjoint_paths(self.cursor_request_path, self.limit_path)
         if self.terminal is CursorTerminalRule.PROFILE_SHORT_PAGE and self.requested_page_size is None:
             raise ValueError("short-page terminal requires a requested_page_size")
         if self.identity_requirement is not IdentityRequirement.REQUIRED:
@@ -250,7 +258,7 @@ class PartitionedKeysetPlan(PlanContract):
         if not _is_plain_int(self.lane_count) or not MINIMUM_PARTITION_LANES <= self.lane_count <= PORTAL_BATCH_CAP:
             raise ValueError("partition lane_count must be between 2 and the hard batch cap 50")
         _validate_page_size(self.limit_path, self.requested_page_size)
-        _require_distinct_paths(self.filter_path, self.order_path)
+        _require_disjoint_paths(self.filter_path, self.order_path, self.limit_path)
         if self.identity_requirement is not IdentityRequirement.REQUIRED:
             raise ValueError("partitioned keyset requires identity")
         expected = OrderSemantics.ASCENDING if self.direction == "asc" else OrderSemantics.DESCENDING
@@ -302,11 +310,17 @@ def _validate_page_size(limit_path: ParameterPath | None, requested_page_size: i
         raise ValueError("requested_page_size requires limit_path")
 
 
-def _require_distinct_paths(left: ParameterPath, right: ParameterPath) -> None:
-    left_normalized = tuple(item.casefold() if isinstance(item, str) else item for item in left.path)
-    right_normalized = tuple(item.casefold() if isinstance(item, str) else item for item in right.path)
-    if left_normalized == right_normalized:
-        raise ValueError("filter and order paths must be case-insensitively distinct")
+def _require_disjoint_paths(*paths: ParameterPath | None) -> None:
+    normalized = [
+        tuple(item.casefold() if isinstance(item, str) else item for item in path.path)
+        for path in paths
+        if path is not None
+    ]
+    for index, left in enumerate(normalized):
+        for right in normalized[index + 1 :]:
+            shared = min(len(left), len(right))
+            if left[:shared] == right[:shared]:
+                raise ValueError("plan control paths must be case-insensitively distinct and non-overlapping")
 
 
 def _is_plain_int(value: object) -> bool:

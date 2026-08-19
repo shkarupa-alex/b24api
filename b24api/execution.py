@@ -377,7 +377,7 @@ class ExecutionContext:
         self.policy = policy
         self.coordinator = coordinator
         self._clock = clock
-        self._start = clock()
+        self._start: float | None = None
         self._counters = BudgetCounters()
         self._retries = 0
         self._cooldown_seconds = 0.0
@@ -385,7 +385,15 @@ class ExecutionContext:
 
     @property
     def elapsed(self) -> float:
+        if self._start is None:
+            return 0.0
         return max(0.0, self._clock() - self._start)
+
+    async def start(self) -> None:
+        """Start the operation clock exactly once when execution first begins."""
+        async with self._lock:
+            if self._start is None:
+                self._start = self._clock()
 
     async def reserve_attempt(self, *, attempts_for_request: int, retry_started: float) -> None:
         async with self._lock:
@@ -474,6 +482,7 @@ class Executor:
         if not isinstance(request, Request):
             raise TypeError("request must be canonical Request")
         context = context or self.context(policy)
+        await context.start()
         retry_started = self._clock()
         attempts = 0
         while True:

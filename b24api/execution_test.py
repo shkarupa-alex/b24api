@@ -112,6 +112,20 @@ async def test_safe_ambiguous_transport_retries_with_counted_attempts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_operation_elapsed_clock_starts_at_first_execution_not_context_construction() -> None:
+    now = [0.0]
+    transport = SequenceTransport([_success()])
+    executor = Executor(transport, clock=lambda: now[0])
+    context = executor.context(_policy(elapsed=1))
+    now[0] = 100.0
+
+    response = await executor.execute(Request("profile"), context=context)
+
+    assert response.result == {"ok": True}
+    assert (await context.snapshot()).elapsed == 0
+
+
+@pytest.mark.asyncio
 async def test_retry_attempt_and_delay_budgets_terminate_before_extra_io() -> None:
     always_connect: tuple[WireResponse | Exception, ...] = (
         TransportError("connect", phase=FailurePhase.NOT_DISPATCHED),

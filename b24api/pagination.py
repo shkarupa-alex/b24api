@@ -279,6 +279,8 @@ class PaginationDriver:
             if expected_total is not None and self.validated_rows > expected_total:
                 raise PaginationError("offset traversal exceeded its exact total")
             terminal = _offset_terminal(plan, response, page_size=len(items), accepted=self.validated_rows)
+            if terminal is not None and expected_total is not None and self.validated_rows != expected_total:
+                raise PaginationError("offset traversal terminated before its exact total")
             if items:
                 yield _Page(tuple(items), response)
             if terminal is not None:
@@ -427,13 +429,12 @@ class PaginationDriver:
     async def _fetch(self, request: Request) -> Response:
         if self._fetch_override is not None:
             return await self._fetch_override(request)
-        response = await self.executor.execute(
+        await self.context.reserve_page()
+        return await self.executor.execute(
             request,
             context=self.context,
             work_class=WorkClass.TRAVERSAL_DIRECT,
         )
-        await self.context.reserve_page()
-        return response
 
     def _require_identity(self, plan_name: str) -> IdentitySpec:
         if self.identity is None:
@@ -451,11 +452,43 @@ class PaginationDriver:
             raise CapabilityError("partitioned keyset requires separate reviewed authorization")
         if isinstance(self.plan, KeysetPlan) and self.plan.terminal is KeysetTerminalRule.BOUNDARY_ID_SEEN:
             raise CapabilityError("boundary-id keyset requires an externally reviewed boundary contract")
-        if self.context.policy.identity_tracker is IdentityTracker.MONOTONIC and not isinstance(
-            self.plan,
-            KeysetPlan | ItemCursorPlan,
+        if self.context.policy.identity_tracker is IdentityTracker.MONOTONIC and not isinstance(self.plan, KeysetPlan):
+            raise CapabilityError("monotonic identity tracking requires identity-ordered keyset traversal")
+        self._preflight_controls()
+
+    def _preflight_controls(self) -> None:
+        """Prove every current and future injected control is writable before I/O."""
+        first: dict[ParameterPath, object] = {}
+        second: dict[ParameterPath, object] = {}
+        allow_create = getattr(self.plan, "allow_create_controls", True)
+        if isinstance(self.plan, OffsetSequentialPlan | CountedOffsetPlan):
+            first[self.plan.offset_path] = 0
+            second[self.plan.offset_path] = 1
+        elif isinstance(self.plan, KeysetPlan):
+            identity = self._require_identity("keyset")
+            order_path = _child_path(self.plan.order_path, identity.order_key)
+            operator = ">" if self.plan.direction == "asc" else "<"
+            filter_path = _child_path(self.plan.filter_path, f"{operator}{identity.filter_key}")
+            first[order_path] = "ASC" if self.plan.direction == "asc" else "DESC"
+            second[order_path] = first[order_path]
+            first[filter_path] = 0
+            second[filter_path] = 1
+            if self.plan.start_suppression_path is not None:
+                first[self.plan.start_suppression_path] = -1
+                second[self.plan.start_suppression_path] = -1
+        elif isinstance(self.plan, ItemCursorPlan):
+            first[self.plan.cursor_request_path] = 0
+            second[self.plan.cursor_request_path] = 1
+        if (
+            isinstance(self.plan, OffsetSequentialPlan | CountedOffsetPlan | KeysetPlan | ItemCursorPlan)
+            and self.plan.limit_path is not None
+            and self.plan.requested_page_size is not None
         ):
-            raise CapabilityError("monotonic identity tracking requires an ordered cursor/keyset plan")
+            first[self.plan.limit_path] = self.plan.requested_page_size
+            second[self.plan.limit_path] = self.plan.requested_page_size
+        if first:
+            _request_with_controls(self.request, first, allow_create=allow_create)
+            _request_with_controls(self.request, second, allow_create=allow_create)
 
     def _validate_page(  # noqa: C901, PLR0912
         self,
@@ -639,6 +672,18 @@ class ItemStream(AsyncIterator[JsonValue]):
             if consistency.snapshot_requirement is SnapshotRequirement.TRAVERSAL_ONLY
             else SnapshotState.UNVERIFIED
         )
+        violations = tuple(self._driver.violations)
+        if state is TerminalState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
+            state = TerminalState.INCOMPLETE
+            reason = "required snapshot was not verified"
+            violations = (
+                *violations,
+                Violation(
+                    severity=ViolationSeverity.BLOCKING,
+                    code="snapshot_unverified",
+                    message="the requested stable snapshot was not verified",
+                ),
+            )
         self.report = OperationReport(
             state=state,
             assurance=self._assurance,
@@ -652,7 +697,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             retries=snapshot.retries,
             cooldown_seconds=snapshot.cooldown_seconds,
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
-            violations=tuple(self._driver.violations),
+            violations=violations,
             terminal_reason=reason,
         )
 
@@ -855,8 +900,8 @@ def _identity_store(policy: ExecutionPolicy, plan: ListPlan, identity: IdentityS
     if policy.identity_tracker is IdentityTracker.SQLITE:
         return _SqliteIdentityStore(policy.max_tracked_identities)
     if policy.identity_tracker is IdentityTracker.MONOTONIC:
-        if not isinstance(plan, KeysetPlan | ItemCursorPlan):
-            raise CapabilityError("monotonic identity tracking requires an ordered cursor/keyset plan")
+        if not isinstance(plan, KeysetPlan):
+            raise CapabilityError("monotonic identity tracking requires identity-ordered keyset traversal")
         return _MonotonicIdentityStore(policy.max_tracked_identities)
     return _MemoryIdentityStore(policy.max_tracked_identities)
 
