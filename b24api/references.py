@@ -486,11 +486,22 @@ class ReferenceScheduler:
             primary_error = error
             raise
         finally:
-            cleanup_cancellation = await await_cancellation_resistant(
-                self._cleanup(iterator, admission, producer),
-            )
-            if cleanup_cancellation is not None and primary_error is None:
-                raise cleanup_cancellation
+            try:
+                cleanup_cancellation = await await_cancellation_resistant(
+                    self._cleanup(iterator, admission, producer),
+                )
+            except BaseException as cleanup_error:
+                if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
+                    raise
+                self._record_cleanup_failure(cleanup_error)
+            else:
+                if cleanup_cancellation is not None and primary_error is None:
+                    raise cleanup_cancellation
+                if cleanup_cancellation is not None and not isinstance(
+                    primary_error,
+                    asyncio.CancelledError | GeneratorExit,
+                ):
+                    self._record_cleanup_failure(cleanup_cancellation)
 
     async def _cleanup(
         self,
@@ -684,6 +695,15 @@ class ReferenceScheduler:
 
     def _record_event_violations(self, event: _Event) -> None:
         self.violations.extend(event.violations)
+
+    def _record_cleanup_failure(self, error: BaseException) -> None:
+        self.violations.append(
+            Violation(
+                severity=ViolationSeverity.BLOCKING,
+                code="cleanup_failure",
+                message=f"reference cleanup also failed ({type(error).__name__})",
+            ),
+        )
 
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
         if isinstance(event, _PageEvent):

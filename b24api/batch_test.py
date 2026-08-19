@@ -23,6 +23,7 @@ from b24api.models import (
     SnapshotRequirement,
     SnapshotState,
     TerminalState,
+    ViolationSeverity,
 )
 
 if TYPE_CHECKING:
@@ -176,6 +177,35 @@ async def test_batch_source_cleanup_error_carries_same_report() -> None:
 
     assert captured.value.__dict__["report"] is stream.report
     assert stream.report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_primary_batch_failure_survives_secondary_source_cleanup_failure() -> None:
+    async def source() -> AsyncGenerator[Request]:
+        try:
+            yield Request("bad")
+            await asyncio.Future[None]()
+        finally:
+            raise RuntimeError("batch source close boom")
+
+    def malformed(_request: Request) -> WireResponse:
+        body = json.dumps({"result": {"result": {}}}).encode()
+        return WireResponse(200, (("content-type", "application/json"),), body)
+
+    stream = BatchExecutor(Executor(CallbackTransport(malformed))).batch(source(), batch_size=1)
+    with pytest.raises(ProtocolError) as captured:
+        await anext(stream)
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.terminal_reason == "ProtocolError"
+    cleanup = [violation for violation in stream.report.violations if violation.code == "cleanup_failure"]
+    assert len(cleanup) == 1
+    assert cleanup[0].severity is ViolationSeverity.BLOCKING
+
+    with pytest.raises(RuntimeError, match="batch source close boom") as cleanup_error:
+        await stream.aclose()
+    assert cleanup_error.value.__dict__["report"] is stream.report
 
 
 @pytest.mark.asyncio

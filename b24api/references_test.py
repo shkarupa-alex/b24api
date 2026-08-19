@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from b24api.error import ApiResponseError, BudgetExceededError, FailurePhase, TransportError
+from b24api.error import ApiResponseError, BudgetExceededError, FailurePhase, ProtocolError, TransportError
 from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.models import (
     ConsistencyPolicy,
@@ -26,6 +26,7 @@ from b24api.models import (
     SnapshotRequirement,
     SnapshotState,
     TerminalState,
+    ViolationSeverity,
 )
 from b24api.plans import (
     BatchDispatch,
@@ -938,6 +939,49 @@ async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_
     assert snapshot.counters.logical_pages == 0
     assert stream.report is frozen_report
     assert stream.report.logical_pages == 0
+
+
+@pytest.mark.asyncio
+async def test_primary_reference_failure_survives_secondary_cleanup_budget_failure() -> None:
+    slow_started = asyncio.Event()
+    slow_returned = asyncio.Event()
+    release = asyncio.Event()
+
+    class CancellationResistantTransport:
+        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+            del attempt_timeout
+            if request.method == "bad":
+                await slow_started.wait()
+                return WireResponse(200, (), b"{")
+            slow_started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+            slow_returned.set()
+            body = json.dumps({"result": {"ok": True}}).encode()
+            return WireResponse(200, (("content-type", "application/json"),), body)
+
+    stream = fan_out(
+        Executor(CancellationResistantTransport()),
+        [ReferenceRequest(Request("bad"), "bad"), ReferenceRequest(Request("slow"), "slow")],
+        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_elapsed=0.04),
+    )
+    try:
+        with pytest.raises(ProtocolError, match="Malformed JSON response") as captured:
+            await anext(stream)
+    finally:
+        release.set()
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.terminal_reason == "ProtocolError"
+    cleanup = [violation for violation in stream.report.violations if violation.code == "cleanup_failure"]
+    assert len(cleanup) == 1
+    assert cleanup[0].severity is ViolationSeverity.BLOCKING
+    await asyncio.wait_for(slow_returned.wait(), timeout=CLEANUP_TEST_TIMEOUT)
 
 
 @pytest.mark.asyncio

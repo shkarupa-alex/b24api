@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, Protocol, Self, cast, runtime_checkable
 
 from b24api.error import B24ApiError, BatchCommandError, ErrorOrigin, ProtocolError
@@ -425,6 +425,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         self._source_controller = source
         next_index = 0
         naturally_exhausted = False
+        primary_error: BaseException | None = None
         try:
             while True:
                 chunk = await _next_chunk(
@@ -461,37 +462,53 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             naturally_exhausted = True
             await self._finalize(TerminalState.COMPLETED, "input exhausted")
         except asyncio.CancelledError as error:
+            primary_error = error
             repeated = await await_cancellation_resistant(
                 self._finalize(TerminalState.CANCELLED, "iteration cancelled"),
             )
             if repeated is not None:
+                primary_error = repeated
                 _attach_report(repeated, self.report)
                 raise repeated from error
             _attach_report(error, self.report)
             raise
         except GeneratorExit as error:
+            primary_error = error
             cancellation = await await_cancellation_resistant(
                 self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion"),
             )
             if cancellation is not None:
+                primary_error = cancellation
                 _attach_report(cancellation, self.report)
                 raise cancellation from error
             _attach_report(error, self.report)
             raise
         except BaseException as error:
+            primary_error = error
             cancellation = await await_cancellation_resistant(
                 self._finalize(TerminalState.FAILED, type(error).__name__),
             )
             if cancellation is not None:
+                primary_error = cancellation
                 _attach_report(cancellation, self.report)
                 raise cancellation from error
             _attach_report(error, self.report)
             raise
         finally:
-            cleanup_cancellation = await await_cancellation_resistant(self._cleanup_source(source))
-            if cleanup_cancellation is not None:
-                _attach_report(cleanup_cancellation, self.report)
-                raise cleanup_cancellation
+            try:
+                cleanup_cancellation = await await_cancellation_resistant(self._cleanup_source(source))
+            except BaseException as cleanup_error:
+                if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
+                    raise
+                self._record_cleanup_failure(cleanup_error, primary_error)
+            else:
+                if cleanup_cancellation is not None and (
+                    primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit)
+                ):
+                    _attach_report(cleanup_cancellation, self.report)
+                    raise cleanup_cancellation
+                if cleanup_cancellation is not None and primary_error is not None:
+                    self._record_cleanup_failure(cleanup_cancellation, primary_error)
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
                 await self._finalize(TerminalState.CANCELLED, "stream abandoned")
             if self.report.state is not TerminalState.NOT_STARTED:
@@ -518,6 +535,15 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         if controller is None:
             return
         await self._cleanup_source(controller)
+
+    def _record_cleanup_failure(self, error: BaseException, primary_error: BaseException) -> None:
+        violation = Violation(
+            severity=ViolationSeverity.BLOCKING,
+            code="cleanup_failure",
+            message=f"batch cleanup also failed ({type(error).__name__})",
+        )
+        self.report = replace(self.report, violations=(*self.report.violations, violation))
+        _attach_report(primary_error, self.report)
 
     async def _finalize(self, state: TerminalState, reason: str) -> None:
         if self.report.state is not TerminalState.NOT_STARTED:
