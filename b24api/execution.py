@@ -364,6 +364,12 @@ class ExecutionSnapshot:
     elapsed: float
 
 
+@dataclass(frozen=True, slots=True)
+class _PageReservation:
+    sequence: int
+    reference: str | None
+
+
 class ExecutionContext:
     """Mutable operation-scoped budget ledger with immutable snapshots."""
 
@@ -381,7 +387,10 @@ class ExecutionContext:
         self._counters = BudgetCounters()
         self._retries = 0
         self._cooldown_seconds = 0.0
+        self._page_sequence = 0
+        self._page_reservations: dict[_PageReservation, None] = {}
         self._lock = asyncio.Lock()
+        self._page_condition = asyncio.Condition(self._lock)
 
     @property
     def elapsed(self) -> float:
@@ -412,10 +421,52 @@ class ExecutionContext:
         async with self._lock:
             self._cooldown_seconds += max(0.0, seconds)
 
-    async def reserve_page(self, *, reference: str | None = None) -> None:
-        """Charge one decoded logical page before it is accepted by a driver."""
-        async with self._lock:
-            self._counters = self._counters.reserve_page(self.policy, reference=reference)
+    async def reserve_page(self, *, reference: str | None = None) -> _PageReservation:
+        """Reserve page capacity before I/O without charging the response counter."""
+        try:
+            async with asyncio.timeout(self.policy.max_elapsed - self.elapsed):
+                async with self._page_condition:
+                    while True:
+                        if self._counters.logical_pages >= self.policy.max_pages:
+                            raise BudgetExceededError("logical page budget exhausted")
+                        committed = (
+                            dict(self._counters.pages_per_reference).get(reference, 0) if reference is not None else 0
+                        )
+                        if reference is not None and committed >= self.policy.max_pages_per_reference:
+                            raise BudgetExceededError("per-reference page budget exhausted")
+                        pending_for_reference = sum(item.reference == reference for item in self._page_reservations)
+                        global_available = (
+                            self._counters.logical_pages + len(self._page_reservations) < self.policy.max_pages
+                        )
+                        reference_available = (
+                            reference is None or committed + pending_for_reference < self.policy.max_pages_per_reference
+                        )
+                        if global_available and reference_available:
+                            reservation = _PageReservation(self._page_sequence, reference)
+                            self._page_sequence += 1
+                            self._page_reservations[reservation] = None
+                            return reservation
+                        await self._page_condition.wait()
+        except TimeoutError as error:
+            raise BudgetExceededError("page reservation exceeded operation time budget") from error
+
+    async def commit_page(self, reservation: _PageReservation) -> None:
+        """Charge one successfully decoded logical page response."""
+        async with self._page_condition:
+            if reservation not in self._page_reservations:
+                raise RuntimeError("page reservation is not active")
+            counters = self._counters.reserve_page(self.policy, reference=reservation.reference)
+            self._page_reservations.pop(reservation)
+            self._counters = counters
+            self._page_condition.notify_all()
+
+    async def release_page(self, reservation: _PageReservation) -> None:
+        """Release capacity for a request that produced no logical page."""
+        async with self._page_condition:
+            if reservation not in self._page_reservations:
+                return
+            self._page_reservations.pop(reservation)
+            self._page_condition.notify_all()
 
     async def set_buffered_rows(self, rows: int) -> None:
         """Record retained decoded rows and enforce the global buffer ceiling."""

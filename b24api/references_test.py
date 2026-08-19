@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from b24api.error import ApiResponseError, BudgetExceededError
+from b24api.error import ApiResponseError, BudgetExceededError, FailurePhase, TransportError
 from b24api.execution import Executor, WireResponse
 from b24api.models import (
     ConsistencyPolicy,
@@ -479,6 +479,49 @@ async def test_reference_page_budget_blocks_second_batch_request_before_io() -> 
 
 
 @pytest.mark.asyncio
+async def test_failed_reference_releases_page_slot_for_independent_work() -> None:
+    calls: list[str] = []
+    bad_started = asyncio.Event()
+    release_bad = asyncio.Event()
+
+    async def handler(request: Request) -> object:
+        reference = _string_parameter(request, "ref")
+        calls.append(reference)
+        if reference == "bad":
+            bad_started.set()
+            await release_bad.wait()
+            raise TransportError(
+                "connect failed",
+                phase=FailurePhase.NOT_DISPATCHED,
+                retryable=False,
+            )
+        return {"result": {"ok": True}}
+
+    stream = fan_out(
+        Executor(AsyncFunctionTransport(handler)),
+        [_reference("bad"), _reference("good")],
+        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        tolerant=True,
+        policy=ExecutionPolicy(
+            max_pages=1,
+            max_active_references=TWO_REFERENCES,
+            max_attempts_per_request=1,
+        ),
+    )
+
+    collecting = asyncio.create_task(_collect(stream))
+    await bad_started.wait()
+    await asyncio.sleep(0)
+    assert calls == ["bad"]
+    release_bad.set()
+    outcomes = await collecting
+    assert calls == ["bad", "good"]
+    assert isinstance(outcomes[0], ReferenceFailure)
+    assert isinstance(outcomes[1], ReferenceItem)
+    assert stream.report.logical_pages == 1
+
+
+@pytest.mark.asyncio
 async def test_required_reference_snapshot_finishes_incomplete() -> None:
     policy = ExecutionPolicy(
         consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST),
@@ -548,6 +591,40 @@ async def test_reference_report_sums_per_reference_unique_counts_and_violations(
     assert len(outcomes) == TWO_REFERENCES
     assert stream.report.emitted_rows == TWO_REFERENCES
     assert stream.report.unique_rows == PAGE_SIZE
+    assert [violation.code for violation in stream.report.violations] == ["duplicate_identity"]
+
+
+@pytest.mark.asyncio
+async def test_early_close_keeps_delivered_unique_count_and_detected_page_warning() -> None:
+    transport = AsyncFunctionTransport(
+        lambda _request: {
+            "result": [
+                {"ID": 1, "revision": "a"},
+                {"ID": 1, "revision": "b"},
+            ],
+        },
+    )
+    plan = OffsetSequentialPlan(
+        limit_path=ParameterPath(("limit",)),
+        requested_page_size=TWO_REFERENCES,
+        continuation=OffsetContinuation.SERVER_NEXT,
+        terminal=frozenset({OffsetTerminalRule.PROFILE_ABSENT_NEXT}),
+        duplicate_policy=DuplicatePolicy.REPORT,
+    )
+    stream = iter_references(
+        Executor(transport),
+        [_reference("a")],
+        plan=plan,
+        dispatch=DirectDispatch(),
+        identity=_identity(),
+        policy=ExecutionPolicy(max_buffered_rows=TWO_REFERENCES),
+    )
+
+    assert isinstance(await anext(stream), ReferenceItem)
+    await stream.aclose()
+
+    assert stream.report.emitted_rows == 1
+    assert stream.report.unique_rows == 1
     assert [violation.code for violation in stream.report.violations] == ["duplicate_identity"]
 
 
@@ -627,9 +704,57 @@ async def test_source_close_failure_does_not_skip_owned_resource_cleanup() -> No
     )
 
     assert isinstance(await anext(stream), ReferenceItem)
-    with pytest.raises(RuntimeError, match="source cleanup failed"):
+    with pytest.raises(RuntimeError, match="source cleanup failed") as captured:
         await stream.aclose()
 
+    assert captured.value.__dict__["report"] is stream.report
+    dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
+    worker = dispatcher._worker  # type: ignore[union-attr]  # noqa: SLF001
+    assert worker is not None
+    assert worker.done()
+    assert stream._scheduler.buffer._closed  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_stalled_source_cleanup_is_bounded_after_owned_resources_close() -> None:
+    class StalledCloseSource:
+        def __init__(self) -> None:
+            self._yielded = False
+
+        def __aiter__(self) -> StalledCloseSource:
+            return self
+
+        async def __anext__(self) -> ReferenceRequest:
+            if self._yielded:
+                await asyncio.Future[None]()
+            self._yielded = True
+            return _reference("a")
+
+        async def aclose(self) -> None:
+            await asyncio.Future[None]()
+
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: {"ok": True} for key in commands},
+                "result_error": [],
+            },
+        }
+
+    stream = fan_out(
+        Executor(AsyncFunctionTransport(handler)),
+        StalledCloseSource(),
+        dispatch=BatchDispatch(batch_size=1),
+        policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.05),
+    )
+
+    assert isinstance(await anext(stream), ReferenceItem)
+    with pytest.raises(BudgetExceededError, match="source cleanup") as captured:
+        await asyncio.wait_for(stream.aclose(), timeout=0.2)
+
+    assert captured.value.__dict__["report"] is stream.report
     dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
     worker = dispatcher._worker  # type: ignore[union-attr]  # noqa: SLF001
     assert worker is not None

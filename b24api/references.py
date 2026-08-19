@@ -77,7 +77,8 @@ class _Reservation:
 class _PageEvent:
     work: _Work
     items: tuple[JsonValue, ...]
-    unique_rows_after: int
+    unique_mask: tuple[bool, ...]
+    violations: tuple[Violation, ...]
     reservation: _Reservation
     acknowledged: asyncio.Future[None]
 
@@ -247,9 +248,10 @@ class _DirectPageDispatcher:
         self.batch_commands = 0
 
     async def fetch(self, request: Request, reference_id: str) -> Response:
-        await self.context.reserve_page(reference=reference_id)
+        reservation = await self.context.reserve_page(reference=reference_id)
         remaining = self.context.policy.max_elapsed - self.context.elapsed
         if remaining <= 0:
+            await self.context.release_page(reservation)
             raise BudgetExceededError("operation elapsed budget exhausted before direct admission")
         try:
             async with asyncio.timeout(remaining):
@@ -259,8 +261,13 @@ class _DirectPageDispatcher:
                         context=self.context,
                         work_class=WorkClass.TRAVERSAL_DIRECT,
                     )
+                    await self.context.commit_page(reservation)
         except TimeoutError as error:
+            await self.context.release_page(reservation)
             raise BudgetExceededError("direct scheduler admission exceeded operation time budget") from error
+        except BaseException:
+            await self.context.release_page(reservation)
+            raise
         return response
 
     async def aclose(self) -> None:
@@ -290,22 +297,30 @@ class _BatchPageDispatcher:
             raise RuntimeError("batch page dispatcher is closed")
         if self._worker is None:
             self._worker = asyncio.create_task(self._run())
-        await self.context.reserve_page(reference=reference_id)
+        reservation = await self.context.reserve_page(reference=reference_id)
         future: asyncio.Future[Response] = asyncio.get_running_loop().create_future()
         pending = _PendingBatch(request, reference_id, future)
         remaining = self.context.policy.max_elapsed - self.context.elapsed
         if remaining <= 0:
+            await self.context.release_page(reservation)
             raise BudgetExceededError("operation elapsed budget exhausted before batch admission")
         try:
             async with asyncio.timeout(remaining):
                 await self._queue.put(pending)
-                return await future
+                response = await future
+                await self.context.commit_page(reservation)
+                return response
         except asyncio.CancelledError:
             future.cancel()
+            await self.context.release_page(reservation)
             raise
         except TimeoutError as error:
             future.cancel()
+            await self.context.release_page(reservation)
             raise BudgetExceededError("batch scheduler admission exceeded operation time budget") from error
+        except BaseException:
+            await self.context.release_page(reservation)
+            raise
 
     async def _run(self) -> None:  # noqa: C901, PLR0912
         while True:
@@ -364,15 +379,23 @@ class _BatchPageDispatcher:
             return
         if not self._worker.done():
             self._worker.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._worker
-        while True:
-            try:
-                pending = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if pending is not None and not pending.future.done():
-                pending.future.cancel()
+        try:
+            await asyncio.sleep(0)
+            if not self._worker.done():
+                remaining = max(0.0, self.context.policy.max_elapsed - self.context.elapsed)
+                done, _ = await asyncio.wait((self._worker,), timeout=remaining)
+                if not done:
+                    raise BudgetExceededError("batch dispatcher cleanup exceeded operation time budget")
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker
+        finally:
+            while True:
+                try:
+                    pending = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if pending is not None and not pending.future.done():
+                    pending.future.cancel()
 
 
 type _PageDispatcher = _DirectPageDispatcher | _BatchPageDispatcher
@@ -413,8 +436,7 @@ class ReferenceScheduler:
         head_reserve = self.page_cap if output_order is ReferenceOutputOrder.INPUT else 0
         self.buffer = _RowBuffer(policy.max_buffered_rows, self.context, head_reserve=head_reserve)
         self.violations: list[Violation] = []
-        self.unique_rows = 0
-        self._unique_by_work: dict[int, int] = {}
+        self._delivery_uniqueness: dict[int, tuple[ReferenceItem, bool]] = {}
 
     async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:
         iterator = _iterate_references(source)
@@ -435,19 +457,44 @@ class ReferenceScheduler:
                 async for outcome in self._input(admission, producer):
                     yield outcome
         finally:
-            producer.cancel()
-            await asyncio.gather(producer, return_exceptions=True)
-            for task in admission.tasks.values():
-                task.cancel()
-            if admission.tasks:
-                await asyncio.gather(*admission.tasks.values(), return_exceptions=True)
+            await self._cleanup(iterator, admission, producer)
+
+    async def _cleanup(
+        self,
+        iterator: AsyncGenerator[ReferenceRequest],
+        admission: _AdmissionState,
+        producer: asyncio.Task[None],
+    ) -> None:
+        producer.cancel()
+        for task in admission.tasks.values():
+            task.cancel()
+        cleanup_errors: list[BaseException] = []
+        try:
+            await self.buffer.close()
+        except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
+            cleanup_errors.append(error)
+        try:
+            await self.dispatcher.aclose()
+        except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
+            cleanup_errors.append(error)
+        pending, task_errors = await _wait_for_cleanup_tasks(
+            (producer, *admission.tasks.values()),
+            remaining=max(0.0, self.context.policy.max_elapsed - self.context.elapsed),
+        )
+        cleanup_errors.extend(task_errors)
+        if pending:
+            cleanup_errors.append(BudgetExceededError("reference task cleanup exceeded operation time budget"))
+        else:
             try:
-                await iterator.aclose()
-            finally:
-                try:
-                    await self.buffer.close()
-                finally:
-                    await self.dispatcher.aclose()
+                await _close_iterator_bounded(
+                    iterator,
+                    remaining=max(0.0, self.context.policy.max_elapsed - self.context.elapsed),
+                )
+            except BaseException as error:  # noqa: BLE001 - attach at the stream boundary
+                cleanup_errors.append(error)
+        self._delivery_uniqueness.clear()
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
     async def _produce(
         self,
@@ -482,6 +529,7 @@ class ReferenceScheduler:
         reservation: _Reservation | None = None
         partial_rows = 0
         page_state = 0
+        violation_offset = 0
 
         async def fetch(request: Request) -> Response:
             nonlocal page_state, reservation
@@ -511,11 +559,14 @@ class ReferenceScheduler:
                     raise RuntimeError("page completed without a buffer reservation")  # noqa: TRY301
                 await self.buffer.accept(reservation, len(page.items))
                 acknowledged = asyncio.get_running_loop().create_future()
+                page_violations = tuple(driver.violations[violation_offset:])
+                violation_offset = len(driver.violations)
                 await output.put(
                     _PageEvent(
                         work,
                         page.items,
-                        driver.unique_rows,
+                        driver.last_page_unique_mask,
+                        page_violations,
                         reservation,
                         acknowledged,
                     ),
@@ -526,7 +577,7 @@ class ReferenceScheduler:
             if reservation is not None:
                 await self.buffer.abort(reservation)
                 reservation = None
-            await output.put(_DoneEvent(work, tuple(driver.violations)))
+            await output.put(_DoneEvent(work, tuple(driver.violations[violation_offset:])))
         except asyncio.CancelledError:
             raise
         except _BatchPageError as error:
@@ -537,7 +588,7 @@ class ReferenceScheduler:
                     driver.cursor_state,
                     page_state,
                     partial_rows,
-                    tuple(driver.violations),
+                    tuple(driver.violations[violation_offset:]),
                     error.failure.replay_disposition,
                 ),
             )
@@ -549,7 +600,7 @@ class ReferenceScheduler:
                     driver.cursor_state,
                     page_state,
                     partial_rows,
-                    tuple(driver.violations),
+                    tuple(driver.violations[violation_offset:]),
                 ),
             )
         finally:
@@ -566,7 +617,7 @@ class ReferenceScheduler:
                 await _wait_for_admission(producer, admission.changed)
                 continue
             event = await _wait_for_event(admission.ready, producer)
-            self._record_terminal_violations(event)
+            self._record_event_violations(event)
             async for outcome in self._consume_event(event):
                 yield outcome
             if isinstance(event, _PageEvent):
@@ -586,7 +637,7 @@ class ReferenceScheduler:
                 continue
             head = min(admission.tasks)
             event = await _wait_for_event(admission.queues[head], producer)
-            self._record_terminal_violations(event)
+            self._record_event_violations(event)
             async for outcome in self._consume_event(event):
                 yield outcome
             if isinstance(event, _PageEvent):
@@ -597,19 +648,17 @@ class ReferenceScheduler:
             next_head = min(admission.tasks) if admission.tasks else head + 1
             await self.buffer.advance_head(next_head, self.page_cap)
 
-    def _record_terminal_violations(self, event: _Event) -> None:
-        if isinstance(event, _DoneEvent | _FailureEvent):
-            self.violations.extend(event.violations)
+    def _record_event_violations(self, event: _Event) -> None:
+        self.violations.extend(event.violations)
 
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
         if isinstance(event, _PageEvent):
             try:
-                for item in event.items:
-                    yield ReferenceItem(event.work.reference.reference_key, item)
+                for item, is_unique in zip(event.items, event.unique_mask, strict=True):
+                    outcome = ReferenceItem(event.work.reference.reference_key, item)
+                    self._delivery_uniqueness[id(outcome)] = (outcome, is_unique)
+                    yield outcome
                     await self.buffer.release(event.reservation, 1)
-                previous = self._unique_by_work.get(event.work.index, 0)
-                self.unique_rows += event.unique_rows_after - previous
-                self._unique_by_work[event.work.index] = event.unique_rows_after
             finally:
                 if not event.acknowledged.done():
                     event.acknowledged.set_result(None)
@@ -638,6 +687,10 @@ class ReferenceScheduler:
             replay_disposition=event.replay_disposition,
         )
 
+    def record_delivery(self, item: ReferenceItem) -> bool:
+        stored = self._delivery_uniqueness.pop(id(item), None)
+        return stored is not None and stored[0] is item and stored[1]
+
 
 class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     """Lazy reference stream with one frozen report and deterministic cleanup."""
@@ -649,6 +702,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         self._prefetched: ReferenceStreamItem | object = _MISSING
         self._closed = False
         self._emitted = 0
+        self._unique_emitted = 0
         self.report = OperationReport()
 
     def __aiter__(self) -> Self:
@@ -671,6 +725,8 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     def _record_delivery(self, item: ReferenceStreamItem) -> None:
         if isinstance(item, ReferenceItem):
             self._emitted += 1
+            if self._scheduler.record_delivery(item):
+                self._unique_emitted += 1
 
     async def __aenter__(self) -> Self:
         if self._closed:
@@ -688,9 +744,16 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         if self._closed:
             return
         self._closed = True
-        if self._runner is not None:
-            await self._runner.aclose()
-        self._prefetched = _MISSING
+        try:
+            if self._runner is not None:
+                await self._runner.aclose()
+        except BaseException as error:
+            if self.report.state is TerminalState.NOT_STARTED:
+                await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+            _attach_report(error, self.report)
+            raise
+        finally:
+            self._prefetched = _MISSING
         if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
             await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
 
@@ -750,7 +813,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             plan_id=type(self._scheduler.plan).__name__,
             dispatch_id=type(self._scheduler.dispatch).__name__,
             emitted_rows=self._emitted,
-            unique_rows=min(self._emitted, self._scheduler.unique_rows),
+            unique_rows=self._unique_emitted,
             physical_requests=snapshot.counters.physical_requests,
             logical_pages=snapshot.counters.logical_pages,
             batch_requests=self._scheduler.dispatcher.batch_requests,
@@ -869,6 +932,56 @@ async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[N
         if not getter.done():
             getter.cancel()
         await asyncio.gather(getter, return_exceptions=True)
+
+
+async def _wait_for_cleanup_tasks(
+    tasks: tuple[asyncio.Task[None], ...],
+    *,
+    remaining: float,
+) -> tuple[set[asyncio.Task[None]], list[BaseException]]:
+    active = set(tasks)
+    if not active:
+        return set(), []
+    await asyncio.sleep(0)
+    done, pending = await asyncio.wait(active, timeout=max(0.0, remaining))
+    errors = [error for task in done if not task.cancelled() and (error := task.exception()) is not None]
+    for task in pending:
+        task.cancel()
+        task.add_done_callback(_consume_task_result)
+    return pending, errors
+
+
+async def _close_iterator_bounded(
+    iterator: AsyncGenerator[ReferenceRequest],
+    *,
+    remaining: float,
+) -> None:
+    close_task = asyncio.create_task(iterator.aclose())
+    timed_out = False
+    try:
+        await asyncio.sleep(0)
+        if close_task.done():
+            await close_task
+            return
+        done, _ = await asyncio.wait((close_task,), timeout=max(0.0, remaining))
+        if not done:
+            timed_out = True
+        else:
+            await close_task
+    except BaseException:
+        if not close_task.done():
+            close_task.cancel()
+            close_task.add_done_callback(_consume_task_result)
+        raise
+    if timed_out:
+        close_task.cancel()
+        close_task.add_done_callback(_consume_task_result)
+        raise BudgetExceededError("reference source cleanup exceeded operation time budget")
+
+
+def _consume_task_result(task: asyncio.Task[object]) -> None:
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        task.result()
 
 
 async def _finish_task(tasks: dict[int, asyncio.Task[None]], index: int) -> None:

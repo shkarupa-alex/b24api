@@ -202,6 +202,7 @@ class PaginationDriver:
         self._identity_store: _IdentityStore | None = None
         self._unique_rows_final: int | None = None
         self._last_identity: IdentityValue | None = None
+        self._last_page_unique_mask: tuple[bool, ...] = ()
 
     async def pages(self) -> AsyncGenerator[_Page]:  # noqa: C901
         self._validate_capabilities()
@@ -429,12 +430,18 @@ class PaginationDriver:
     async def _fetch(self, request: Request) -> Response:
         if self._fetch_override is not None:
             return await self._fetch_override(request)
-        await self.context.reserve_page()
-        return await self.executor.execute(
-            request,
-            context=self.context,
-            work_class=WorkClass.TRAVERSAL_DIRECT,
-        )
+        reservation = await self.context.reserve_page()
+        try:
+            response = await self.executor.execute(
+                request,
+                context=self.context,
+                work_class=WorkClass.TRAVERSAL_DIRECT,
+            )
+            await self.context.commit_page(reservation)
+        except BaseException:
+            await self.context.release_page(reservation)
+            raise
+        return response
 
     def _require_identity(self, plan_name: str) -> IdentitySpec:
         if self.identity is None:
@@ -506,6 +513,7 @@ class PaginationDriver:
             raise PaginationError("repeated page fingerprint detected")
         self._fingerprints.add(fingerprint)
         if self.identity is None:
+            self._last_page_unique_mask = (True,) * len(items)
             self.validated_rows += len(items)
             return []
         identities = [
@@ -520,10 +528,14 @@ class PaginationDriver:
                     raise PaginationError("identity order did not advance")
         local: set[IdentityValue] = set()
         duplicates: list[IdentityValue] = []
+        unique_mask: list[bool] = []
         for value in identities:
-            if value in local or self._store.contains(value):
+            duplicate = value in local or self._store.contains(value)
+            unique_mask.append(not duplicate)
+            if duplicate:
                 duplicates.append(value)
             local.add(value)
+        self._last_page_unique_mask = tuple(unique_mask)
         if duplicates and self.plan.duplicate_policy is DuplicatePolicy.ERROR:
             raise PaginationError("duplicate identity detected")
         if duplicates and self.plan.duplicate_policy is DuplicatePolicy.REPORT:
@@ -550,6 +562,10 @@ class PaginationDriver:
         if self._identity_store is None:
             return 0
         return self._store.count
+
+    @property
+    def last_page_unique_mask(self) -> tuple[bool, ...]:
+        return self._last_page_unique_mask
 
     @property
     def _store(self) -> _IdentityStore:
@@ -622,9 +638,16 @@ class ItemStream(AsyncIterator[JsonValue]):
         if self._closed:
             return
         self._closed = True
-        if self._runner is not None:
-            await self._runner.aclose()
-        self._prefetched = _MISSING
+        try:
+            if self._runner is not None:
+                await self._runner.aclose()
+        except BaseException as error:
+            if self.report.state is TerminalState.NOT_STARTED:
+                await self._finalize(TerminalState.CANCELLED, "stream cleanup failed")
+            _attach_report(error, self.report)
+            raise
+        finally:
+            self._prefetched = _MISSING
         if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
             await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
 
