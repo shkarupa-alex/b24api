@@ -330,7 +330,7 @@ def test_fingerprint_requires_exact_random_key_shape_and_hides_principal() -> No
     for invalid_host in (".bad.example", "bad_host", "-bad.example", "bad-.example", "[::1]"):
         with pytest.raises(ContractError, match="host"):
             portal_identity(
-                f"https://{invalid_host}/rest/13/abcdef",
+                f"https://{invalid_host}" + "/rest/13/abcdef",
                 role="employee_full",
                 fingerprint_key=key,
             )
