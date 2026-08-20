@@ -466,6 +466,41 @@ async def test_socket_partial_body_failure_is_classified_after_headers() -> None
 
 
 @pytest.mark.asyncio
+async def test_out_of_range_socket_status_is_typed_and_drops_webhook_locals() -> None:
+    sensitive_fragment = "synthetic-private-fragment-status-999"
+
+    async def hostile_status(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 999 Hostile\r\nContent-Length: 2\r\n\r\n{}")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(hostile_status, "127.0.0.1", 0)
+    socket = server.sockets[0]
+    assert socket is not None
+    host, port = socket.getsockname()[:2]
+    transport = HttpxTransport(f"http://{host}:{port}/rest/1/{sensitive_fragment}/")
+    try:
+        with pytest.raises(ProtocolError, match="outside the valid range") as captured:
+            await transport.send(Request("profile"), attempt_timeout=1)
+
+        error = captured.value
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        traceback = error.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code.co_filename.endswith("b24api/execution.py"):
+                for value in traceback.tb_frame.f_locals.values():
+                    assert sensitive_fragment not in repr(value)
+            traceback = traceback.tb_next
+    finally:
+        await transport.aclose()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_socket_cancellation_propagates_and_counts_dispatched_attempt() -> None:
     received = asyncio.Event()
     release_server = asyncio.Event()

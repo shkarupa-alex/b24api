@@ -230,11 +230,15 @@ def _plan(args: argparse.Namespace) -> ExitCode:
     }
     validate_dataset_plan(dataset_plan)
     plan_path = artifact_dir / "dataset-plan.json"
-    atomic_write_json(plan_path, dataset_plan)
+    _write_candidate_json(plan_path, dataset_plan, candidate_sha=candidate_sha)
     benchmark_plan = _default_benchmark_plan(dataset_plan)
     validate_benchmark_plan(benchmark_plan)
-    atomic_write_json(artifact_dir / "benchmark-plan.json", benchmark_plan)
-    atomic_write_json(artifact_dir / "model-fixture-manifest.json", _model_fixture_manifest())
+    _write_candidate_json(artifact_dir / "benchmark-plan.json", benchmark_plan, candidate_sha=candidate_sha)
+    _write_candidate_json(
+        artifact_dir / "model-fixture-manifest.json",
+        _model_fixture_manifest(),
+        candidate_sha=candidate_sha,
+    )
     artifact = _operation_artifact(
         command="plan",
         dataset_plan=dataset_plan,
@@ -245,8 +249,8 @@ def _plan(args: argparse.Namespace) -> ExitCode:
             "wall_seconds": max(time.monotonic() - started, 0.000001),
         },
     )
-    _write_validated_artifact(artifact_dir / "plan-evidence.json", artifact)
-    _scan_bundle(artifact_dir)
+    _write_validated_artifact(artifact_dir / "plan-evidence.json", artifact, candidate_sha=candidate_sha)
+    _scan_bundle(artifact_dir, expected_candidate_sha=candidate_sha)
     _safe_message(f"plan completed: {plan_path}")
     return ExitCode.COMPLETED
 
@@ -445,8 +449,12 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
         manifest_hash=manifest_content_hash(manifest_path),
         metrics={"kind": "operation", "http_attempts": http_attempts, "wall_seconds": time.monotonic() - started},
     )
-    _write_validated_artifact(artifact_dir / "seed-evidence.json", artifact)
-    _scan_bundle(artifact_dir)
+    _write_validated_artifact(
+        artifact_dir / "seed-evidence.json",
+        artifact,
+        candidate_sha=str(plan["candidate_sha"]),
+    )
+    _scan_bundle(artifact_dir, expected_candidate_sha=str(plan["candidate_sha"]))
     _safe_message(f"seed completed: {manifest_path}")
     return ExitCode.COMPLETED
 
@@ -471,8 +479,12 @@ def _seed_inconclusive(
         outcome="INCONCLUSIVE",
         terminal_state="incomplete",
     )
-    _write_validated_artifact(artifact_dir / "seed-evidence.json", artifact)
-    _scan_bundle(artifact_dir)
+    _write_validated_artifact(
+        artifact_dir / "seed-evidence.json",
+        artifact,
+        candidate_sha=str(plan["candidate_sha"]),
+    )
+    _scan_bundle(artifact_dir, expected_candidate_sha=str(plan["candidate_sha"]))
     return ExitCode.INCOMPLETE
 
 
@@ -545,7 +557,11 @@ def _verify(args: argparse.Namespace) -> ExitCode:
     }
     validate_oracle_record(oracle)
     artifact_dir = args.artifact_dir.resolve()
-    atomic_write_json(artifact_dir / "oracle.json", oracle)
+    _write_candidate_json(
+        artifact_dir / "oracle.json",
+        oracle,
+        candidate_sha=str(plan["candidate_sha"]),
+    )
     artifact = _operation_artifact(
         command="verify",
         dataset_plan=plan,
@@ -558,8 +574,12 @@ def _verify(args: argparse.Namespace) -> ExitCode:
         terminal_state="completed" if outcome == "PASS" else "incomplete",
         extra={"evidence_refs": [f"sha256:{content_sha256(oracle)}"]},
     )
-    _write_validated_artifact(artifact_dir / "verify-evidence.json", artifact)
-    _scan_bundle(artifact_dir)
+    _write_validated_artifact(
+        artifact_dir / "verify-evidence.json",
+        artifact,
+        candidate_sha=str(plan["candidate_sha"]),
+    )
+    _scan_bundle(artifact_dir, expected_candidate_sha=str(plan["candidate_sha"]))
     _safe_message(f"verify completed: {artifact_dir / 'oracle.json'}")
     return ExitCode.COMPLETED if outcome == "PASS" else ExitCode.INCOMPLETE
 
@@ -698,7 +718,11 @@ def _benchmark_runs_and_artifact(
             "outcome": run.outcome,
         }
         validate_oracle_record(oracle)
-        atomic_write_json(oracle_dir / f"{oracle_case_id}.json", oracle)
+        _write_candidate_json(
+            oracle_dir / f"{oracle_case_id}.json",
+            oracle,
+            candidate_sha=str(plan["candidate_sha"]),
+        )
         if run.outcome == "PASS":
             oracle_refs.append(f"sha256:{content_sha256(oracle)}")
     stable_observations = [
@@ -719,12 +743,20 @@ def _benchmark_runs_and_artifact(
         "benchmark_plan_content_hash": content_sha256(benchmark_plan),
         "runs": stable_observations,
     }
-    atomic_write_json(artifact_dir / "model-matrix.json", model_matrix)
+    _write_candidate_json(
+        artifact_dir / "model-matrix.json",
+        model_matrix,
+        candidate_sha=str(plan["candidate_sha"]),
+    )
     model_diagnostics = {
         "schema_version": SCHEMA_VERSION,
         "runs": [asdict(run) for run in runs if run.outcome != "PASS"],
     }
-    atomic_write_json(artifact_dir / "model-diagnostics.json", model_diagnostics)
+    _write_candidate_json(
+        artifact_dir / "model-diagnostics.json",
+        model_diagnostics,
+        candidate_sha=str(plan["candidate_sha"]),
+    )
     matrix_ref = f"sha256:{content_sha256(model_matrix)}"
     artifact = _operation_artifact(
         command="benchmark",
@@ -753,11 +785,20 @@ def _benchmark_runs_and_artifact(
             ],
         },
     )
-    atomic_write_json(artifact_dir / "benchmark-plan.json", benchmark_plan)
-    atomic_write_json(artifact_dir / "dataset-plan.json", plan)
-    atomic_write_json(artifact_dir / "model-fixture-manifest.json", _model_fixture_manifest())
-    _write_validated_artifact(artifact_dir / "benchmark-evidence.json", artifact)
-    _scan_bundle(artifact_dir)
+    candidate_sha = str(plan["candidate_sha"])
+    _write_candidate_json(artifact_dir / "benchmark-plan.json", benchmark_plan, candidate_sha=candidate_sha)
+    _write_candidate_json(artifact_dir / "dataset-plan.json", plan, candidate_sha=candidate_sha)
+    _write_candidate_json(
+        artifact_dir / "model-fixture-manifest.json",
+        _model_fixture_manifest(),
+        candidate_sha=candidate_sha,
+    )
+    _write_validated_artifact(
+        artifact_dir / "benchmark-evidence.json",
+        artifact,
+        candidate_sha=candidate_sha,
+    )
+    _scan_bundle(artifact_dir, expected_candidate_sha=candidate_sha)
     _safe_message(f"benchmark completed: {artifact_dir / 'benchmark-evidence.json'}")
     return ExitCode.COMPLETED
 
@@ -783,8 +824,9 @@ def _resume(args: argparse.Namespace) -> ExitCode:
         },
     )
     artifact_path = args.artifact_dir.resolve() / "resume-evidence.json"
-    _write_validated_artifact(artifact_path, artifact)
-    _scan_bundle(args.artifact_dir.resolve())
+    candidate_sha = str(plan["candidate_sha"])
+    _write_validated_artifact(artifact_path, artifact, candidate_sha=candidate_sha)
+    _scan_bundle(args.artifact_dir.resolve(), expected_candidate_sha=candidate_sha)
     _safe_message(f"resume validation completed: {artifact_path}")
     return ExitCode.COMPLETED
 
@@ -948,8 +990,9 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0
         terminal_state="completed" if not orphans else "failed",
     )
     artifact_path = args.artifact_dir.resolve() / "cleanup-evidence.json"
-    _write_validated_artifact(artifact_path, artifact)
-    _scan_bundle(args.artifact_dir.resolve())
+    candidate_sha = str(plan["candidate_sha"])
+    _write_validated_artifact(artifact_path, artifact, candidate_sha=candidate_sha)
+    _scan_bundle(args.artifact_dir.resolve(), expected_candidate_sha=candidate_sha)
     if orphans:
         _safe_error(RuntimeError(f"cleanup left {len(orphans)} verified orphan(s)"))
         return ExitCode.ORPHANS
@@ -1035,14 +1078,14 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0
     }
     validate_schema(preview, "recovery-preview")
     if not args.confirm_recovery:
-        atomic_write_json(preview_path, preview)
+        _write_candidate_json(preview_path, preview, candidate_sha=str(plan["candidate_sha"]))
         preview_hash = file_sha256(preview_path)
         _safe_message(
             f"recovery preview completed: {preview_path}; explicit confirmation digest: {preview_hash}",
         )
         return ExitCode.INCOMPLETE
     if prior_preview is None or prior_preview["exact_marker_candidates"] != candidates:
-        atomic_write_json(preview_path, preview)
+        _write_candidate_json(preview_path, preview, candidate_sha=str(plan["candidate_sha"]))
         _safe_message(
             f"recovery candidates changed; review the new preview SHA-256 {file_sha256(preview_path)}",
         )
@@ -1083,8 +1126,13 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0
         outcome="INCONCLUSIVE",
         terminal_state="incomplete",
     )
-    _write_validated_artifact(artifact_dir / "recovery-evidence.json", artifact)
-    _scan_bundle(artifact_dir)
+    candidate_sha = str(plan["candidate_sha"])
+    _write_validated_artifact(
+        artifact_dir / "recovery-evidence.json",
+        artifact,
+        candidate_sha=candidate_sha,
+    )
+    _scan_bundle(artifact_dir, expected_candidate_sha=candidate_sha)
     _safe_message(f"confirmed candidate manifest written: {manifest_path}")
     return ExitCode.INCOMPLETE
 
@@ -1145,10 +1193,27 @@ def _operation_artifact(  # noqa: PLR0913
     return artifact
 
 
-def _write_validated_artifact(path: Path, artifact: Mapping[str, Any]) -> None:
-    require_clean_tracked_tree(ROOT)
+def _write_candidate_json(path: Path, value: Mapping[str, Any], *, candidate_sha: str) -> None:
+    """Atomically write only while the clean executing HEAD stays the exact candidate."""
+    _require_evidence_candidate(candidate_sha)
+    atomic_write_json(path, value)
+    _require_evidence_candidate(candidate_sha)
+
+
+def _write_validated_artifact(
+    path: Path,
+    artifact: Mapping[str, Any],
+    *,
+    candidate_sha: str | None = None,
+) -> None:
+    if candidate_sha is not None:
+        _require_evidence_candidate(candidate_sha)
+    else:
+        require_clean_tracked_tree(ROOT)
     validate_evidence_artifact(artifact)
     atomic_write_json(path, artifact)
+    if candidate_sha is not None:
+        _require_evidence_candidate(candidate_sha)
 
 
 def _default_benchmark_plan(dataset_plan: Mapping[str, Any]) -> dict[str, Any]:
@@ -1289,15 +1354,16 @@ def _bind_plan_to_bundle(args: argparse.Namespace, plan: Mapping[str, Any]) -> N
     """Persist an admitted plan into its immutable artifact bundle."""
     artifact_dir = args.artifact_dir.resolve()
     bundled_plan_path = artifact_dir / "dataset-plan.json"
-    _scan_bundle(artifact_dir)
+    candidate_sha = str(plan["candidate_sha"])
+    _scan_bundle(artifact_dir, expected_candidate_sha=candidate_sha)
     if bundled_plan_path.exists():
         bundled_plan = read_json_object(bundled_plan_path)
         validate_dataset_plan(bundled_plan)
         if content_sha256(bundled_plan) != content_sha256(plan):
             raise ContractError("external dataset plan conflicts with the existing immutable evidence bundle")
     else:
-        atomic_write_json(bundled_plan_path, plan)
-    _scan_bundle(artifact_dir)
+        _write_candidate_json(bundled_plan_path, plan, candidate_sha=candidate_sha)
+    _scan_bundle(artifact_dir, expected_candidate_sha=candidate_sha)
 
 
 def _model_dataset_plan(*, run_id: str, lineage_id: str) -> dict[str, Any]:
@@ -1428,9 +1494,14 @@ def _require_review_commit(review_sha: str, *, reviewed_plan_sha256: str) -> Non
 
 def _require_exact_candidate(plan: Mapping[str, Any]) -> None:
     """Reject tracked changes and clean-HEAD drift immediately before live mutation."""
+    _require_evidence_candidate(str(plan["candidate_sha"]), purpose="live mutation")
+
+
+def _require_evidence_candidate(candidate_sha: str, *, purpose: str = "evidence execution") -> None:
+    """Bind filesystem effects to one exact clean candidate commit."""
     require_clean_tracked_tree(ROOT)
-    if git_sha(ROOT) != plan["candidate_sha"]:
-        raise ContractError("live mutation candidate SHA differs from the reviewed dataset plan")
+    if git_sha(ROOT) != candidate_sha:
+        raise ContractError(f"{purpose} candidate SHA differs from the reviewed dataset plan")
 
 
 def _require_portal_match(plan: Mapping[str, Any], portal: LivePortal) -> None:
@@ -1518,8 +1589,15 @@ def _entity_marker(entity: Mapping[str, Any], marker_field: str) -> object:
     return entity.get(marker_field, entity.get(marker_field.casefold()))
 
 
-def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912, PLR0915
-    require_clean_tracked_tree(ROOT)
+def _scan_bundle(  # noqa: C901, PLR0912, PLR0915
+    artifact_dir: Path,
+    *,
+    expected_candidate_sha: str | None = None,
+) -> None:
+    if expected_candidate_sha is not None:
+        _require_evidence_candidate(expected_candidate_sha)
+    else:
+        require_clean_tracked_tree(ROOT)
     scan_paths_for_secrets(tracked_repository_paths(ROOT))
     artifact_paths: list[Path] = []
     total_bytes = 0
@@ -1556,7 +1634,10 @@ def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912, PLR0915
             ):
                 raise ContractError(f"evidence content hash has no matching immutable JSON in {artifact_dir}")
     if not artifacts:
-        require_clean_tracked_tree(ROOT)
+        if expected_candidate_sha is not None:
+            _require_evidence_candidate(expected_candidate_sha)
+        else:
+            require_clean_tracked_tree(ROOT)
         return
     lineage_fields = (
         "run_id",
@@ -1644,7 +1725,12 @@ def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912, PLR0915
             )
         else:
             raise ContractError("oracle_verified PASS is unsupported for this command")
-    require_clean_tracked_tree(ROOT)
+    if expected_candidate_sha is not None:
+        if expected["candidate_sha"] != expected_candidate_sha:
+            raise ContractError("evidence bundle candidate differs from the executing candidate")
+        _require_evidence_candidate(expected_candidate_sha)
+    else:
+        require_clean_tracked_tree(ROOT)
 
 
 def _validate_benchmark_pass_dependencies(  # noqa: C901

@@ -6,6 +6,7 @@ import copy
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -630,6 +631,69 @@ def test_real_mid_benchmark_tracked_mutation_cannot_emit_pass(tmp_path: Path) ->
 
         assert process.returncode == ExitCode.INVALID, (stdout, stderr)
         assert "clean tracked tree" in stderr
+        assert not (artifact_dir / "benchmark-evidence.json").exists()
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate()
+        subprocess.run(  # noqa: S603 - exact disposable worktree cleanup
+            [git, "worktree", "remove", "--force", str(worktree)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_real_mid_benchmark_clean_head_switch_cannot_emit_pass(tmp_path: Path) -> None:
+    worktree = tmp_path / "candidate-head-switch"
+    artifact_dir = tmp_path / "artifacts-head-switch"
+    git = shutil.which("git")
+    assert git is not None
+    subprocess.run(  # noqa: S603 - fixed git operation in an isolated test directory
+        [git, "worktree", "add", "--detach", "--quiet", str(worktree), "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(  # noqa: S603 - fixed interpreter and detached entrypoint
+            [
+                sys.executable,
+                str(worktree / "tools/b24api_evidence.py"),
+                "benchmark",
+                "--artifact-dir",
+                str(artifact_dir),
+            ],
+            cwd=worktree,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 10
+        plan_path = artifact_dir / "dataset-plan.json"
+        while not plan_path.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert plan_path.exists(), "benchmark finished before its immutable plan became observable"
+        assert process.poll() is None, "benchmark completed before the clean-HEAD switch window"
+        os.kill(process.pid, signal.SIGSTOP)
+        try:
+            subprocess.run(  # noqa: S603 - exact clean commit switch in a disposable worktree
+                [git, "checkout", "--detach", "--quiet", "HEAD^"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            os.kill(process.pid, signal.SIGCONT)
+
+        stdout, stderr = process.communicate(timeout=30)
+
+        assert process.returncode == ExitCode.INVALID, (stdout, stderr)
+        assert "candidate SHA differs" in stderr
         assert not (artifact_dir / "benchmark-evidence.json").exists()
     finally:
         if process is not None and process.poll() is None:

@@ -139,7 +139,7 @@ class HttpxTransport:
         self._owns_client = client is None
         self._closed = False
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:  # noqa: C901
         """Send one transport request attempt."""
         if self._closed:
             raise RuntimeError("transport is closed")
@@ -197,11 +197,16 @@ class HttpxTransport:
             http_request = None
             message, phase = failure
             raise TransportError(message, phase=phase, request_summary=request.summary)
-        return WireResponse(
-            status_code=response.status_code,
-            headers=tuple(response.headers.multi_items()),
-            body=response.content,
-        )
+        status_code = response.status_code
+        if not _HTTP_STATUS_MINIMUM <= status_code <= _HTTP_STATUS_MAXIMUM:
+            del response
+            http_request = None
+            raise ProtocolError("HTTP response status is outside the valid range")
+        headers = tuple(response.headers.multi_items())
+        body = response.content
+        del response
+        http_request = None
+        return WireResponse(status_code=status_code, headers=headers, body=body)
 
     async def aclose(self) -> None:
         """Close owned asynchronous resources."""
