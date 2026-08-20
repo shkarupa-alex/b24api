@@ -1,3 +1,6 @@
+> **Superseded.** The subject `0b9dfe9...` was rejected by human review.
+> Use `review-packet-v2.md`, which requests review of the replacement code SHA.
+
 # W5/W6 review packet — bounded traversal foundation
 
 ## Decision requested
