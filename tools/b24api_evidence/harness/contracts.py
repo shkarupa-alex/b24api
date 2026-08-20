@@ -179,6 +179,14 @@ def content_sha256(value: Any) -> str:
     return hashlib.sha256(canonical_json(value)).hexdigest()
 
 
+def reviewed_dataset_plan_sha256(plan: Mapping[str, Any]) -> str:
+    """Hash a plan review subject without its circular review-commit pointer."""
+    projected = dict(plan)
+    authorization = _mapping(projected.get("authorization"), "authorization")
+    projected["authorization"] = {**authorization, "plan_review_sha": None}
+    return content_sha256(projected)
+
+
 def file_sha256(path: Path) -> str:
     """Hash a file without interpreting its contents."""
     digest = hashlib.sha256()

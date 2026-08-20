@@ -22,8 +22,11 @@ repeat its exact external review commit and full plan hash through
 `--confirm-plan-review-sha <sha>` and
 `--confirm-plan-content-sha256 <sha256>`. Both confirmations must match the
 reviewed plan's exact canonical content. The review commit message must contain
-the trailer `Dataset-Plan-SHA256: <same-sha256>`; an arbitrary hex value in the
-plan is not authorization.
+the trailer `Dataset-Plan-SHA256: <review-subject-sha256>`. The review subject
+is the canonical plan with only its circular `plan_review_sha` pointer replaced
+by `null`; all execution semantics and approval fields remain covered. The
+separate CLI content hash still binds the final executable plan including the
+actual review commit SHA.
 `benchmark` is always read-only; `benchmark --live` explicitly refuses until a reviewed live benchmark
 cell exists rather than silently substituting model evidence. Recovery is a two-step read-only exact-marker
 scan: the first run writes a preview; only a second run with

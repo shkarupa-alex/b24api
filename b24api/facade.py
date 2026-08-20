@@ -529,9 +529,9 @@ class Bitrix24:
         try:
             async for page in validator.counted_batch_pages(batch_size=batch_size, page_size=page_size):
                 evidence.append(page.response.evidence)
-                unique += sum(validator.last_page_unique_mask)
-                for item in page.items:
+                for item, is_unique in zip(page.items, validator.last_page_unique_mask, strict=True):
                     emitted += 1
+                    unique += int(is_unique)
                     yield item
             if policy.consistency.snapshot_requirement is not SnapshotRequirement.TRAVERSAL_ONLY:
                 report = await _counted_report(

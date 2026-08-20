@@ -46,6 +46,7 @@ from .contracts import (
     marker_value,
     parse_fingerprint_key,
     portal_identity,
+    reviewed_dataset_plan_sha256,
     scan_bytes_for_secrets,
     scan_paths_for_secrets,
     strict_json_loads,
@@ -180,7 +181,10 @@ def _approval_arguments(plan: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def test_approved_plan_self_claims_do_not_authorize_live_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_approved_plan_self_claims_do_not_authorize_live_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     plan = _approved_live_plan()
     with pytest.raises(ContractError, match="external exact plan review"):
         cli_module._require_approved_plan(plan, args=Namespace())  # noqa: SLF001
@@ -199,7 +203,42 @@ def test_approved_plan_self_claims_do_not_authorize_live_writes(monkeypatch: pyt
                 confirm_plan_content_sha256=content_sha256(forged),
             ),
         )
-    monkeypatch.setattr(cli_module, "_require_review_commit", lambda *_args, **_kwargs: None)
+    review_root = tmp_path / "review-root"
+    review_root.mkdir()
+    git = shutil.which("git")
+    assert git is not None
+    subprocess.run(  # noqa: S603 - fixed git operation in an isolated test repository
+        [git, "init", "--quiet"],
+        cwd=review_root,
+        check=True,
+    )
+    trailer_hash = reviewed_dataset_plan_sha256(plan)
+    subprocess.run(  # noqa: S603 - isolated exact review-commit integration fixture
+        [
+            git,
+            "-c",
+            "user.name=Evidence Reviewer",
+            "-c",
+            "user.email=reviewer@example.invalid",
+            "commit",
+            "--allow-empty",
+            "--quiet",
+            "-m",
+            f"approve dataset plan\n\nDataset-Plan-SHA256: {trailer_hash}",
+        ],
+        cwd=review_root,
+        check=True,
+    )
+    review_sha = subprocess.run(  # noqa: S603 - fixed git query in an isolated test repository
+        [git, "rev-parse", "HEAD"],
+        cwd=review_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    plan["authorization"]["plan_review_sha"] = review_sha
+    assert reviewed_dataset_plan_sha256(plan) == trailer_hash
+    monkeypatch.setattr(cli_module, "ROOT", review_root)
     cli_module._require_approved_plan(  # noqa: SLF001
         plan,
         args=Namespace(**_approval_arguments(plan)),
@@ -1435,22 +1474,34 @@ def test_seed_never_redispatches_an_unresolved_create(
     validate_manifest_against_plan(records, plan)
 
 
-def test_seed_rechecks_clean_candidate_immediately_before_create(
+@pytest.mark.parametrize("drift_kind", ["dirty", "clean_head"])
+def test_seed_rechecks_exact_candidate_and_remains_resumable_before_create(  # noqa: C901
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    drift_kind: str,
 ) -> None:
     plan = _approved_live_plan()
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan))
     dirty = False
+    head_changed = False
+    induce_drift = True
 
     class FakeAdapter:
         create_method = "tasks.task.add"
         create_calls = 0
+        marker: str | None = None
 
-        def create(self, _portal: object, _marker: str) -> str:
+        def find_exact_marker(self, _portal: object, _marker: str) -> list[str]:
+            return []
+
+        def create(self, _portal: object, marker: str) -> str:
             self.create_calls += 1
-            return "unexpected"
+            self.marker = marker
+            return "42"
+
+        def read(self, _portal: object, _entity_id: str) -> dict[str, str] | None:
+            return {"TITLE": self.marker} if self.marker is not None else None
 
     adapter = FakeAdapter()
 
@@ -1468,9 +1519,11 @@ def test_seed_rechecks_clean_candidate_immediately_before_create(
             return None
 
         def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
-            nonlocal dirty
+            nonlocal dirty, head_changed
             assert required_scopes == {"task"}
-            dirty = True
+            if induce_drift:
+                dirty = drift_kind == "dirty"
+                head_changed = drift_kind == "clean_head"
             return LivePreflight(self.identity, "build-1", frozenset({"task"}))
 
     def reject_after_preflight(_root: Path) -> None:
@@ -1480,23 +1533,31 @@ def test_seed_rechecks_clean_candidate_immediately_before_create(
     monkeypatch.delenv("PYTEST_CURRENT_TEST")
     monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
     monkeypatch.setattr(cli_module, "require_clean_tracked_tree", reject_after_preflight)
+    monkeypatch.setattr(cli_module, "git_sha", lambda _root: "f" * 40 if head_changed else SHA)
     monkeypatch.setitem(ADAPTERS, "tasks-task-v1", adapter)
     monkeypatch.setattr(cli_module, "_require_review_commit", lambda *_args, **_kwargs: None)
-    with pytest.raises(ContractError, match="before live mutation"):
-        cli_module._seed(  # noqa: SLF001 - exact pre-mutation race regression
-            Namespace(
-                live=True,
-                allow_writes=True,
-                plan=plan_path,
-                manifest=None,
-                artifact_dir=tmp_path / "artifacts",
-                run_id=None,
-                lineage_id=None,
-                credential_role="admin_full",
-                **_approval_arguments(plan),
-            ),
-        )
+    arguments = Namespace(
+        live=True,
+        allow_writes=True,
+        plan=plan_path,
+        manifest=None,
+        artifact_dir=tmp_path / "artifacts",
+        run_id=None,
+        lineage_id=None,
+        credential_role="admin_full",
+        **_approval_arguments(plan),
+    )
+    with pytest.raises(ContractError, match=r"before live mutation|candidate SHA differs"):
+        cli_module._seed(arguments)  # noqa: SLF001 - exact pre-mutation race regression
     assert adapter.create_calls == 0
+    records = load_manifest(tmp_path / "artifacts" / "manifest.jsonl")
+    assert records[-1]["event"] == "planned"
+
+    induce_drift = False
+    dirty = False
+    head_changed = False
+    assert cli_module._seed(arguments) == ExitCode.COMPLETED  # noqa: SLF001
+    assert adapter.create_calls == 1
 
 
 def test_cleanup_rechecks_clean_candidate_immediately_before_delete(

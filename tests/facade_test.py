@@ -474,7 +474,7 @@ async def test_counted_wrapper_requires_intermediate_tail_continuation() -> None
 
 @pytest.mark.asyncio
 async def test_counted_wrapper_early_close_has_shared_cancelled_report() -> None:
-    client, _transport = _client(lambda _request: {"result": [{"ID": 1}], "total": 2, "next": 1})
+    client, _transport = _client(lambda _request: {"result": [{"ID": 1}, {"ID": 2}], "total": 2})
     stream = client.list_batched({"method": "crm.item.list"}, batch_size=1)
     assert await anext(stream) == {"ID": 1}
 
@@ -486,6 +486,7 @@ async def test_counted_wrapper_early_close_has_shared_cancelled_report() -> None
     assert report.physical_requests == 1
     assert report.logical_pages == 1
     assert report.emitted_rows == 1
+    assert report.unique_rows == 1
 
 
 @pytest.mark.asyncio

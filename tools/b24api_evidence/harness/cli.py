@@ -53,6 +53,7 @@ from .contracts import (
     marker_value,
     read_json_object,
     require_clean_tracked_tree,
+    reviewed_dataset_plan_sha256,
     scan_paths_for_secrets,
     tracked_repository_paths,
     validate_benchmark_plan,
@@ -364,6 +365,7 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                     append_manifest_record(manifest_path, record)
                     previous = record
                 request_fingerprint = content_sha256([adapter.create_method, ["fields"], correlation])
+                _require_exact_candidate(plan)
                 record = build_manifest_record(
                     {
                         **base,
@@ -376,7 +378,6 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                 append_manifest_record(manifest_path, record)
                 previous = record
                 try:
-                    require_clean_tracked_tree(ROOT)
                     entity_id = adapter.create(portal, marker)
                     http_attempts += 1
                     event = "created"
@@ -863,6 +864,7 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0915
                 previous = checked
                 orphans.append(str(active_record["correlation_key"]))
                 continue
+            _require_exact_candidate(plan)
             dispatched = build_manifest_record(
                 {
                     **base,
@@ -874,7 +876,6 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0915
             )
             append_manifest_record(manifest_path, dispatched)
             previous = dispatched
-            require_clean_tracked_tree(ROOT)
             adapter.delete(portal, entity_id)
             deleted = build_manifest_record(
                 {**base, "event": "deleted", "entity_id": entity_id, "request_fingerprint": request_fingerprint},
@@ -1337,14 +1338,17 @@ def _require_approved_plan(plan: Mapping[str, Any], *, args: argparse.Namespace)
     plan_content_sha256 = content_sha256(plan)
     if getattr(args, "confirm_plan_content_sha256", None) != plan_content_sha256:
         raise ContractError("live writes require an external exact plan content hash confirmation")
-    _require_review_commit(str(review_sha), plan_content_sha256=plan_content_sha256)
+    _require_review_commit(
+        str(review_sha),
+        reviewed_plan_sha256=reviewed_dataset_plan_sha256(plan),
+    )
     if plan["portal"]["role"] == "model":
         raise ContractError("approved live-write plan cannot target the deterministic model portal")
     if sum(int(cell["target_count"]) for cell in plan["cells"]) == 0:
         raise ContractError("approved live-write plans require at least one disposable entity")
 
 
-def _require_review_commit(review_sha: str, *, plan_content_sha256: str) -> None:
+def _require_review_commit(review_sha: str, *, reviewed_plan_sha256: str) -> None:
     git = shutil.which("git")
     if git is None:
         raise ContractError("git executable is unavailable")
@@ -1358,9 +1362,16 @@ def _require_review_commit(review_sha: str, *, plan_content_sha256: str) -> None
         ).stdout
     except (OSError, subprocess.CalledProcessError) as error:
         raise ContractError("plan_review_sha must name an existing review commit") from error
-    expected = f"Dataset-Plan-SHA256: {plan_content_sha256}"
+    expected = f"Dataset-Plan-SHA256: {reviewed_plan_sha256}"
     if expected not in {line.strip() for line in message.splitlines()}:
         raise ContractError("plan review commit does not bind the exact dataset plan content hash")
+
+
+def _require_exact_candidate(plan: Mapping[str, Any]) -> None:
+    """Reject tracked changes and clean-HEAD drift immediately before live mutation."""
+    require_clean_tracked_tree(ROOT)
+    if git_sha(ROOT) != plan["candidate_sha"]:
+        raise ContractError("live mutation candidate SHA differs from the reviewed dataset plan")
 
 
 def _require_portal_match(plan: Mapping[str, Any], portal: LivePortal) -> None:
