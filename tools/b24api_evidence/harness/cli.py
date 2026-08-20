@@ -606,7 +606,6 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
             oracle_refs.append(f"sha256:{content_sha256(oracle)}")
     model_matrix = {"schema_version": SCHEMA_VERSION, "runs": [asdict(run) for run in runs]}
     atomic_write_json(artifact_dir / "model-matrix.json", model_matrix)
-    oracle_refs.append(f"sha256:{content_sha256(model_matrix)}")
     artifact = _operation_artifact(
         command="benchmark",
         dataset_plan=plan,
@@ -618,6 +617,14 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
             "controls": controls,
             "case_id": "MODEL-MATRIX",
             "evidence_refs": oracle_refs,
+            "safe_violations": [
+                {
+                    "severity": "warning",
+                    "code": "mutation_diagnostic_inconclusive",
+                    "message": "persistent-mutation runs are diagnostic and are not dependencies of stable-case PASS",
+                    "field": "model-matrix.json",
+                },
+            ],
         },
     )
     atomic_write_json(artifact_dir / "benchmark-plan.json", benchmark_plan)

@@ -66,6 +66,7 @@ FINGERPRINT_KEY_BYTES = 32
 LARGE_CASE_ROWS = 10_000
 SPARSE_BASE_MINIMUM = 100_000
 EXPECTED_MUTATION_RETRIES = 3
+EXPECTED_STABLE_MODEL_RUNS = 18
 EXPECTED_SCHEMA_COUNT = 6
 LEAK_FIXTURE = b"https://example.invalid/rest/1/realisticToken123/"
 
@@ -707,6 +708,12 @@ def test_live_benchmark_and_live_resume_never_silently_run_offline(tmp_path: Pat
 def test_benchmark_parent_hashes_detect_oracle_tampering(tmp_path: Path) -> None:
     result = _run_cli("benchmark", "--artifact-dir", str(tmp_path))
     assert result.returncode == ExitCode.COMPLETED, result.stderr
+    artifact = json.loads((tmp_path / "benchmark-evidence.json").read_text())
+    assert len(artifact["evidence_refs"]) == EXPECTED_STABLE_MODEL_RUNS
+    assert artifact["safe_violations"][0]["code"] == "mutation_diagnostic_inconclusive"
+    assert f"sha256:{content_sha256(json.loads((tmp_path / 'model-matrix.json').read_text()))}" not in artifact[
+        "evidence_refs"
+    ]
     oracle_path = tmp_path / "model-oracles/empty-offset.json"
     oracle_path.write_text("{}")
     with pytest.raises(ContractError, match="content hash"):
