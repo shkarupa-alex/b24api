@@ -765,6 +765,20 @@ def test_live_benchmark_and_live_resume_never_silently_run_offline(tmp_path: Pat
     assert "not admitted" in benchmark.stderr
     assert resume.returncode == ExitCode.INVALID
     assert "read-only validation" in resume.stderr
+    live_plan = _approved_live_plan()
+    live_plan_path = tmp_path / "live-plan.json"
+    live_plan_path.write_text(json.dumps(live_plan))
+    implicit_model = _run_cli(
+        "benchmark",
+        "--artifact-dir",
+        str(tmp_path / "live-benchmark"),
+        "--plan",
+        str(live_plan_path),
+        environment=environment,
+    )
+    assert implicit_model.returncode == ExitCode.UNAVAILABLE
+    assert "non-model dataset plans" in implicit_model.stderr
+    assert not (tmp_path / "live-benchmark/model-matrix.json").exists()
 
 
 def test_benchmark_parent_hashes_detect_oracle_tampering(tmp_path: Path) -> None:
@@ -826,6 +840,38 @@ def test_bundle_rejects_evidence_from_two_runs_even_when_each_document_is_valid(
     )
     assert second.returncode == ExitCode.INVALID
     assert "mixes run" in second.stderr
+
+
+def test_external_plan_conflict_never_overwrites_an_existing_bundle(tmp_path: Path) -> None:
+    initial = _run_cli(
+        "plan",
+        "--artifact-dir",
+        str(tmp_path),
+        "--run-id",
+        RUN_ID,
+        "--lineage-id",
+        LINEAGE_ID,
+    )
+    assert initial.returncode == ExitCode.COMPLETED, initial.stderr
+    bundled_plan_path = tmp_path / "dataset-plan.json"
+    original = bundled_plan_path.read_bytes()
+    conflicting = _plan()
+    conflicting["run_id"] = str(uuid.uuid4())
+    conflicting["lineage_id"] = str(uuid.uuid4())
+    conflicting["namespace"] = f"b24api-evidence-{conflicting['run_id']}"
+    external_path = tmp_path.parent / "conflicting-plan.json"
+    external_path.write_text(json.dumps(conflicting))
+    result = _run_cli(
+        "resume",
+        "--artifact-dir",
+        str(tmp_path),
+        "--plan",
+        str(external_path),
+        "--manifest",
+        str(tmp_path / "missing-manifest.jsonl"),
+    )
+    assert result.returncode == ExitCode.INVALID
+    assert bundled_plan_path.read_bytes() == original
 
 
 def test_bundle_refuses_unbounded_file_count_before_parsing_documents(tmp_path: Path) -> None:

@@ -543,6 +543,8 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
             "live benchmark execution is not admitted until a reviewed live benchmark cell exists",
         )
     plan = _load_plan(args, allow_generated=True)
+    if plan["portal"]["role"] != "model":
+        raise LiveUnavailableError("non-model dataset plans require the unavailable reviewed live benchmark runner")
     benchmark_plan = (
         read_json_object(args.benchmark_plan) if args.benchmark_plan is not None else _default_benchmark_plan(plan)
     )
@@ -1219,7 +1221,15 @@ def _load_plan(args: argparse.Namespace, *, allow_generated: bool = False) -> di
     if args.lineage_id is not None and args.lineage_id != plan["lineage_id"]:
         raise ContractError("requested lineage_id does not match dataset plan")
     artifact_dir = args.artifact_dir.resolve()
-    atomic_write_json(artifact_dir / "dataset-plan.json", plan)
+    bundled_plan_path = artifact_dir / "dataset-plan.json"
+    _scan_bundle(artifact_dir)
+    if bundled_plan_path.exists():
+        bundled_plan = read_json_object(bundled_plan_path)
+        validate_dataset_plan(bundled_plan)
+        if content_sha256(bundled_plan) != content_sha256(plan):
+            raise ContractError("external dataset plan conflicts with the existing immutable evidence bundle")
+    else:
+        atomic_write_json(bundled_plan_path, plan)
     _scan_bundle(artifact_dir)
     return plan
 
@@ -1539,8 +1549,16 @@ def _validate_benchmark_pass_dependencies(  # noqa: C901
         benchmark_plan["candidate_sha"] != artifact["candidate_sha"]
         or benchmark_plan["lineage_id"] != artifact["lineage_id"]
         or benchmark_plan["dataset_plan_content_hash"] != artifact["dataset_plan_content_hash"]
+        or benchmark_plan["manifest_content_hash"] != artifact["manifest_content_hash"]
     ):
         raise ContractError("benchmark plan lineage does not match its PASS artifact")
+    fixture_documents = [
+        document
+        for path, document in json_documents.get(str(benchmark_plan["manifest_content_hash"]), [])
+        if path.name == "model-fixture-manifest.json"
+    ]
+    if len(fixture_documents) != 1 or fixture_documents[0] != _model_fixture_manifest():
+        raise ContractError("benchmark PASS has no exact immutable model fixture manifest")
 
     referenced_hashes = {reference.removeprefix("sha256:") for reference in artifact["evidence_refs"]}
     matrix_hashes = referenced_hashes - qualified_oracles.keys()
@@ -1605,6 +1623,11 @@ def _validate_model_observations(
 ) -> None:
     """Enforce the exact deterministic stable-run set and recompute parent metrics."""
     cases = {case.case_id: case for case in exact_model_cases() if not case.mutation}
+    reference_runs = {
+        (run.case_id, run.plan): run
+        for run in run_exact_matrix_sync()
+        if run.outcome == "PASS"
+    }
     expected_keys = {
         (iteration, case_id, plan)
         for iteration in range(1, _MODEL_ADVISORY_RUNS + 1)
@@ -1649,8 +1672,9 @@ def _validate_model_observations(
         key = (iteration, case_id, plan_name)
         observed_keys.add(key)
         case = cases.get(case_id)
+        reference_run = reference_runs.get((case_id, plan_name))
         oracle_entry = oracle_by_case.get(f"{case_id}-{plan_name}-run-{iteration}")
-        if case is None or oracle_entry is None:
+        if case is None or reference_run is None or oracle_entry is None:
             raise ContractError("benchmark model observation has no exact reviewed case oracle")
         oracle_hash, oracle = oracle_entry
         identities = observation["identities"]
@@ -1660,18 +1684,53 @@ def _validate_model_observations(
             observation["outcome"] != "PASS"
             or observation["snapshot_state"] != "verified"
             or observation["mutation_retries"] != 0
+            or observation["pre_hash"] != oracle["pre_hash"]
+            or observation["post_hash"] != oracle["post_hash"]
             or observation["actual_hash"] != oracle["actual_result_hash"]
             or observation["expected_hash"] != oracle["expected_result_hash"]
+            or oracle["qualification"] != "independent_cross_method"
+            or oracle["snapshot_requirement"] != "independent_pre_post_oracle"
+            or oracle["manifest_content_hash"] != case.expected_hash
             or len(identities) != oracle["raw_count"]
             or len(set(identities)) != oracle["unique_count"]
         ):
             raise ContractError("benchmark model observation contradicts its PASS oracle")
+        if (
+            observation["requests"] != reference_run.requests
+            or observation["logical_pages"] != reference_run.logical_pages
+            or observation["buffered_rows_high_water"] != reference_run.buffered_rows_high_water
+            or not math.isclose(
+                float(observation["operating_seconds"]),
+                reference_run.operating_seconds,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ContractError("benchmark model observation counters contradict deterministic execution")
+        _validate_observation_timing(observation)
         required_oracle_hashes.add(oracle_hash)
     if len(observations) != len(expected_keys) or observed_keys != expected_keys:
         raise ContractError("benchmark PASS does not contain the exact stable model run set")
     if referenced_hashes != required_oracle_hashes | {matrix_hash}:
         raise ContractError("benchmark PASS references do not equal its exact matrix and oracle set")
     _validate_benchmark_metric_algebra(observations, artifact)
+
+
+def _validate_observation_timing(observation: Mapping[str, Any]) -> None:
+    wall = observation["wall_seconds"]
+    first = observation["time_to_first_row_seconds"]
+    if isinstance(wall, bool) or not isinstance(wall, int | float) or not math.isfinite(wall) or wall <= 0:
+        raise ContractError("benchmark observation wall time must be positive and finite")
+    if observation["identities"]:
+        if (
+            isinstance(first, bool)
+            or not isinstance(first, int | float)
+            or not math.isfinite(first)
+            or not 0 <= first <= wall
+        ):
+            raise ContractError("benchmark observation first-row time is invalid")
+    elif first is not None:
+        raise ContractError("empty benchmark observation cannot report a first-row time")
 
 
 def _validate_benchmark_metric_algebra(observations: list[dict[str, Any]], artifact: Mapping[str, Any]) -> None:
