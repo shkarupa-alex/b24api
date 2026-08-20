@@ -84,7 +84,12 @@ class WireResponse:
 
 
 class Transport(Protocol):
-    """One complete request attempt with classified transport failures."""
+    """One cancellable attempt that honors ``attempt_timeout`` and classifies failures.
+
+    Implementations must not suppress cancellation indefinitely. The executor's
+    operation deadline is only a hard public bound when the injected transport
+    cooperates with cancellation or returns within ``attempt_timeout``.
+    """
 
     async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse: ...
 

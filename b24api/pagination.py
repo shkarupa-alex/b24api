@@ -16,6 +16,7 @@ from b24api.error import CapabilityError, PaginationError
 from b24api.execution import ExecutionContext, Executor, WorkClass, await_cancellation_resistant
 from b24api.models import (
     CompletionAssurance,
+    ConfirmationPolicy,
     DuplicatePolicy,
     ExecutionPolicy,
     IdentityCoercion,
@@ -24,6 +25,7 @@ from b24api.models import (
     IdentityTracker,
     JsonValue,
     OperationReport,
+    OrderSemantics,
     ParameterPath,
     ReplaySafety,
     Request,
@@ -32,6 +34,7 @@ from b24api.models import (
     SnapshotRequirement,
     SnapshotState,
     TerminalState,
+    TotalSemantics,
     Violation,
     ViolationSeverity,
     inject_controls,
@@ -203,6 +206,11 @@ class PaginationDriver:
         self._unique_rows_final: int | None = None
         self._last_identity: IdentityValue | None = None
         self._last_page_unique_mask: tuple[bool, ...] = ()
+        self._duplicate_policy = plan.duplicate_policy
+        self._total_semantics = plan.total_semantics
+        self._order_direction: str | None = None
+        self._confirmation_policy = ConfirmationPolicy.NONE
+        self._expected_total: int | None = None
 
     async def pages(self) -> AsyncGenerator[_Page]:  # noqa: C901
         self._validate_capabilities()
@@ -236,23 +244,30 @@ class PaginationDriver:
 
     async def _single(self, plan: SingleResponsePlan) -> AsyncGenerator[_Page]:
         response = await self._fetch(self.request)
+        qualified_count = (
+            len(response.result)
+            if self._single_result_as_item and self.selector.path == () and isinstance(response.result, list)
+            else None
+        )
         items = (
             [response.result]
             if self._single_result_as_item and self.selector.path == ()
             else _response_items(response, self.selector, single=True)
         )
+        if qualified_count is None:
+            qualified_count = len(items)
         if plan.reject_continuation and response.next is not None:
             raise CapabilityError("single-response plan observed a continuation")
-        if plan.reject_positive_total_over_result and response.total is not None and response.total > len(items):
+        if plan.reject_positive_total_over_result and response.total is not None and response.total > qualified_count:
             raise CapabilityError("single-response plan observed a larger qualified total")
-        self._validate_page(items, response=response, ordered=False)
+        self._validate_page(items, response=response, qualified_count=qualified_count)
+        self._validate_terminal_total()
         self.terminal_reason = "single response complete"
         yield _Page(tuple(items), response)
 
-    async def _offset(self, plan: OffsetSequentialPlan) -> AsyncGenerator[_Page]:  # noqa: C901
+    async def _offset(self, plan: OffsetSequentialPlan) -> AsyncGenerator[_Page]:
         offset = 0
         self.cursor_state = offset
-        expected_total: int | None = None
         visited_offsets: set[int] = set()
         while True:
             if offset in visited_offsets:
@@ -269,19 +284,16 @@ class PaginationDriver:
                 ),
             )
             items = _response_items(response, self.selector)
-            if OffsetTerminalRule.QUALIFIED_TOTAL in plan.terminal:
-                if response.total is None or response.total < 0:
-                    raise CapabilityError("qualified-total traversal requires a non-negative exact total")
-                if expected_total is None:
-                    expected_total = response.total
-                elif response.total != expected_total:
-                    raise PaginationError("offset traversal total drifted")
-            self._validate_page(items, response=response, ordered=False)
-            if expected_total is not None and self.validated_rows > expected_total:
-                raise PaginationError("offset traversal exceeded its exact total")
-            terminal = _offset_terminal(plan, response, page_size=len(items), accepted=self.validated_rows)
-            if terminal is not None and expected_total is not None and self.validated_rows != expected_total:
-                raise PaginationError("offset traversal terminated before its exact total")
+            self._validate_page(items, response=response)
+            terminal = _offset_terminal(
+                plan,
+                response,
+                page_size=len(items),
+                accepted=self.validated_rows,
+                confirmation=self._confirmation_policy,
+            )
+            if terminal is not None:
+                self._validate_terminal_total()
             if items:
                 yield _Page(tuple(items), response)
             if terminal is not None:
@@ -293,10 +305,9 @@ class PaginationDriver:
             offset = next_offset
             self.cursor_state = offset
 
-    async def _counted(self, plan: CountedOffsetPlan) -> AsyncGenerator[_Page]:  # noqa: C901
+    async def _counted(self, plan: CountedOffsetPlan) -> AsyncGenerator[_Page]:
         offset = 0
         self.cursor_state = offset
-        expected_total: int | None = None
         visited_offsets: set[int] = set()
         while True:
             if offset in visited_offsets:
@@ -313,18 +324,11 @@ class PaginationDriver:
                 ),
             )
             items = _response_items(response, self.selector)
-            if response.total is None or response.total < 0:
-                raise CapabilityError("counted traversal requires a non-negative filtered exact total")
-            if expected_total is None:
-                expected_total = response.total
-            elif response.total != expected_total:
-                raise PaginationError("counted traversal total drifted")
-            self._validate_page(items, response=response, ordered=False)
-            if self.validated_rows > expected_total:
-                raise PaginationError("counted traversal exceeded its exact total")
+            self._validate_page(items, response=response)
             if items:
                 yield _Page(tuple(items), response)
-            if self.validated_rows == expected_total:
+            if self._expected_total is not None and self.validated_rows == self._expected_total:
+                self._validate_terminal_total()
                 self.terminal_reason = "qualified total reached"
                 return
             if not items:
@@ -357,15 +361,17 @@ class PaginationDriver:
                 ),
             )
             items = _response_items(response, self.selector)
-            identities = self._validate_page(items, response=response, ordered=True, direction=plan.direction)
+            identities = self._validate_page(items, response=response)
             if cursor is not None and identities:
                 if plan.direction == "asc" and _compare_identities(identities[0], cursor) <= 0:
                     raise PaginationError("keyset page ignored its lower bound")
                 if plan.direction == "desc" and _compare_identities(identities[0], cursor) >= 0:
                     raise PaginationError("keyset page ignored its upper bound")
+            terminal = _keyset_terminal(plan, len(items))
+            if terminal is not None:
+                self._validate_terminal_total()
             if items:
                 yield _Page(tuple(items), response)
-            terminal = _keyset_terminal(plan, len(items))
             if terminal is not None:
                 self.terminal_reason = terminal
                 return
@@ -397,7 +403,7 @@ class PaginationDriver:
             )
             response = await self._fetch(request)
             items = _response_items(response, self.selector)
-            self._validate_page(items, response=response, ordered=False)
+            self._validate_page(items, response=response)
             cursor_values = [
                 _coerce_identity(_extract_path(item, plan.cursor_item_path), identity.coercion) for item in items
             ]
@@ -408,9 +414,11 @@ class PaginationDriver:
                     raise PaginationError("item cursor page ignored its lower bound")
                 if plan.direction == "desc" and comparison >= 0:
                     raise PaginationError("item cursor page ignored its upper bound")
+            terminal = _cursor_terminal(plan, len(items), has_cursor=bool(cursor_values))
+            if terminal is not None:
+                self._validate_terminal_total()
             if items:
                 yield _Page(tuple(items), response)
-            terminal = _cursor_terminal(plan, len(items), has_cursor=bool(cursor_values))
             if terminal is not None:
                 self.terminal_reason = terminal
                 return
@@ -449,10 +457,37 @@ class PaginationDriver:
         return self.identity
 
     def _validate_capabilities(self) -> None:
-        if self.plan.identity_requirement is IdentityRequirement.COMPOSITE:
+        consistency = self.context.policy.consistency
+        if (
+            self.plan.identity_requirement is IdentityRequirement.COMPOSITE
+            or consistency.identity_requirement is IdentityRequirement.COMPOSITE
+        ):
             raise CapabilityError("composite identity requires a separately reviewed identity contract")
-        if self.plan.identity_requirement is IdentityRequirement.REQUIRED and self.identity is None:
+        if (
+            self.plan.identity_requirement is IdentityRequirement.REQUIRED
+            or consistency.identity_requirement is IdentityRequirement.REQUIRED
+        ) and self.identity is None:
             raise CapabilityError("plan requires IdentitySpec")
+        self._duplicate_policy = _effective_duplicate_policy(
+            self.plan.duplicate_policy,
+            consistency.duplicate_policy,
+        )
+        self._total_semantics = _effective_total_semantics(
+            self.plan.total_semantics,
+            consistency.total_semantics,
+        )
+        self._order_direction = _effective_order_direction(
+            self.plan.order_semantics,
+            consistency.order_semantics,
+        )
+        self._confirmation_policy = consistency.confirmation_policy
+        if self._order_direction is not None and self.identity is None:
+            raise CapabilityError("ordered traversal requires IdentitySpec")
+        _validate_confirmation_policy(
+            self.plan,
+            consistency.confirmation_policy,
+            self._total_semantics,
+        )
         if isinstance(self.plan, CountedOffsetPlan) and self.plan.mode is CountedOffsetMode.PARALLEL_FIXED_STRIDE:
             raise CapabilityError("parallel fixed-stride counted traversal requires separate reviewed authorization")
         if isinstance(self.plan, PartitionedKeysetPlan):
@@ -502,29 +537,31 @@ class PaginationDriver:
         items: list[JsonValue],
         *,
         response: Response,
-        ordered: bool,
-        direction: str | None = None,
+        qualified_count: int | None = None,
     ) -> list[IdentityValue]:
         requested_page_size = getattr(self.plan, "requested_page_size", None)
         if requested_page_size is not None and len(items) > requested_page_size:
             raise PaginationError("response exceeded the requested page cap")
-        fingerprint = _page_fingerprint(items, response)
+        fingerprint = _page_fingerprint(items)
         if fingerprint in self._fingerprints:
             raise PaginationError("repeated page fingerprint detected")
         self._fingerprints.add(fingerprint)
+        accepted_count = len(items) if qualified_count is None else qualified_count
+        self._validate_response_total(response, accepted_count)
         if self.identity is None:
             self._last_page_unique_mask = (True,) * len(items)
-            self.validated_rows += len(items)
+            self.validated_rows += accepted_count
+            self._validate_total_not_overshot()
             return []
         identities = [
             _coerce_identity(_extract_path(item, self.identity.item_path), self.identity.coercion) for item in items
         ]
-        if ordered:
-            _validate_order(identities, direction)
+        if self._order_direction is not None:
+            _validate_order(identities, self._order_direction)
             if self._last_identity is not None and identities:
-                if direction == "asc" and _compare_identities(identities[0], self._last_identity) <= 0:
+                if self._order_direction == "asc" and _compare_identities(identities[0], self._last_identity) <= 0:
                     raise PaginationError("identity order did not advance")
-                if direction == "desc" and _compare_identities(identities[0], self._last_identity) >= 0:
+                if self._order_direction == "desc" and _compare_identities(identities[0], self._last_identity) >= 0:
                     raise PaginationError("identity order did not advance")
         local: set[IdentityValue] = set()
         duplicates: list[IdentityValue] = []
@@ -536,9 +573,9 @@ class PaginationDriver:
                 duplicates.append(value)
             local.add(value)
         self._last_page_unique_mask = tuple(unique_mask)
-        if duplicates and self.plan.duplicate_policy is DuplicatePolicy.ERROR:
+        if duplicates and self._duplicate_policy is DuplicatePolicy.ERROR:
             raise PaginationError("duplicate identity detected")
-        if duplicates and self.plan.duplicate_policy is DuplicatePolicy.REPORT:
+        if duplicates and self._duplicate_policy is DuplicatePolicy.REPORT:
             self.violations.append(
                 Violation(
                     severity=ViolationSeverity.WARNING,
@@ -550,8 +587,34 @@ class PaginationDriver:
             self._store.add(value)
         if identities:
             self._last_identity = identities[-1]
-        self.validated_rows += len(items)
+        self.validated_rows += accepted_count
+        self._validate_total_not_overshot()
         return identities
+
+    def _validate_response_total(self, response: Response, accepted_count: int) -> None:
+        if self._total_semantics is TotalSemantics.FILTERED_EXACT:
+            if response.total is None or response.total < 0:
+                raise CapabilityError("filtered exact total requires a non-negative total")
+            if self._expected_total is None:
+                self._expected_total = response.total
+            elif response.total != self._expected_total:
+                raise PaginationError("traversal exact total drifted")
+        elif self._total_semantics is TotalSemantics.GLOBAL and (response.total is None or response.total < 0):
+            raise CapabilityError("global total semantics require a non-negative total")
+        if accepted_count < 0:
+            raise RuntimeError("qualified response count cannot be negative")
+
+    def _validate_total_not_overshot(self) -> None:
+        if self._expected_total is not None and self.validated_rows > self._expected_total:
+            raise PaginationError("traversal exceeded its exact total")
+
+    def _validate_terminal_total(self) -> None:
+        if self._total_semantics is not TotalSemantics.FILTERED_EXACT:
+            return
+        if self._expected_total is None:
+            raise CapabilityError("terminal traversal lacks its filtered exact total")
+        if self.validated_rows != self._expected_total:
+            raise PaginationError("traversal terminated before its exact total")
 
     @property
     def unique_rows(self) -> int:
@@ -825,14 +888,75 @@ def _response_items(response: Response, selector: ResultSelector, *, single: boo
         raise CapabilityError("response result does not satisfy the declared selector") from error
 
 
-def _page_fingerprint(items: Iterable[JsonValue], response: Response) -> str:
+def _page_fingerprint(items: Iterable[JsonValue]) -> str:
     canonical = json.dumps(
-        {"items": list(items), "next": response.next, "total": response.total},
+        list(items),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     )
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _effective_duplicate_policy(plan: DuplicatePolicy, policy: DuplicatePolicy) -> DuplicatePolicy:
+    strength = {
+        DuplicatePolicy.ALLOW_DECLARED_MULTISET: 0,
+        DuplicatePolicy.REPORT: 1,
+        DuplicatePolicy.ERROR: 2,
+    }
+    return plan if strength[plan] >= strength[policy] else policy
+
+
+def _effective_total_semantics(plan: TotalSemantics, policy: TotalSemantics) -> TotalSemantics:
+    if plan is policy or policy is TotalSemantics.IGNORE:
+        return plan
+    if plan is TotalSemantics.IGNORE:
+        return policy
+    if policy is TotalSemantics.ADVISORY:
+        return plan
+    if plan is TotalSemantics.ADVISORY:
+        return policy
+    raise CapabilityError("plan and consistency policy declare incompatible total semantics")
+
+
+def _effective_order_direction(plan: OrderSemantics, policy: OrderSemantics) -> str | None:
+    if OrderSemantics.INPUT in {plan, policy}:
+        raise CapabilityError("input order semantics are not an item traversal contract")
+    declared = {value for value in (plan, policy) if value in {OrderSemantics.ASCENDING, OrderSemantics.DESCENDING}}
+    if len(declared) > 1:
+        raise CapabilityError("plan and consistency policy declare incompatible order semantics")
+    if not declared:
+        return None
+    return "asc" if declared.pop() is OrderSemantics.ASCENDING else "desc"
+
+
+def _validate_confirmation_policy(
+    plan: ListPlan,
+    policy: ConfirmationPolicy,
+    total_semantics: TotalSemantics,
+) -> None:
+    if policy is ConfirmationPolicy.NONE:
+        return
+    if policy is ConfirmationPolicy.INDEPENDENT_ORACLE:
+        raise CapabilityError("independent oracle confirmation is unavailable inside traversal")
+    if policy is ConfirmationPolicy.QUALIFIED_TOTAL:
+        if total_semantics is not TotalSemantics.FILTERED_EXACT:
+            raise CapabilityError("qualified-total confirmation requires filtered exact total semantics")
+        return
+    if policy is ConfirmationPolicy.EMPTY_AFTER_BOUNDARY:
+        empty_confirmed = (
+            (isinstance(plan, OffsetSequentialPlan) and OffsetTerminalRule.EMPTY_PAGE in plan.terminal)
+            or (isinstance(plan, KeysetPlan) and plan.terminal is KeysetTerminalRule.EMPTY_CONFIRMATION)
+            or (isinstance(plan, ItemCursorPlan) and plan.terminal is CursorTerminalRule.EMPTY_CONFIRMATION)
+        )
+        if not empty_confirmed:
+            raise CapabilityError("plan does not provide the requested empty-boundary confirmation")
+        return
+    if policy is ConfirmationPolicy.BOUNDARY_ID_SEEN:
+        if not isinstance(plan, KeysetPlan) or plan.terminal is not KeysetTerminalRule.BOUNDARY_ID_SEEN:
+            raise CapabilityError("plan does not provide the requested boundary identity confirmation")
+        return
+    raise AssertionError("unhandled confirmation policy")
 
 
 def _extract_path(value: JsonValue, path: tuple[str | int, ...]) -> JsonValue:
@@ -893,9 +1017,12 @@ def _offset_terminal(
     *,
     page_size: int,
     accepted: int,
+    confirmation: ConfirmationPolicy,
 ) -> str | None:
     if page_size == 0 and OffsetTerminalRule.EMPTY_PAGE in plan.terminal:
         return "empty page confirmed terminal"
+    if confirmation is ConfirmationPolicy.EMPTY_AFTER_BOUNDARY:
+        return None
     if (
         OffsetTerminalRule.QUALIFIED_TOTAL in plan.terminal
         and response.total is not None

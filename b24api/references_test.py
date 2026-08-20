@@ -297,6 +297,52 @@ async def test_batch_fan_out_coalesces_whole_results_as_one_item_per_reference()
 
 
 @pytest.mark.asyncio
+async def test_fan_out_accepts_list_result_whose_total_matches_list_length() -> None:
+    transport = AsyncFunctionTransport(
+        lambda _request: {"result": [{"ID": 1}, {"ID": 2}], "total": TWO_REFERENCES},
+    )
+    stream = fan_out(
+        Executor(transport),
+        [_reference("a")],
+        dispatch=DirectDispatch(concurrency=1),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], ReferenceItem)
+    assert outcomes[0].item == [{"ID": 1}, {"ID": 2}]
+    assert stream.report.state is TerminalState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_batch_fan_out_accepts_list_result_whose_total_matches_list_length() -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: [{"ID": 1}, {"ID": 2}] for key in commands},
+                "result_error": [],
+                "result_total": dict.fromkeys(commands, TWO_REFERENCES),
+            },
+        }
+
+    stream = fan_out(
+        Executor(AsyncFunctionTransport(handler)),
+        [_reference("a")],
+        dispatch=BatchDispatch(batch_size=1),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], ReferenceItem)
+    assert outcomes[0].item == [{"ID": 1}, {"ID": 2}]
+    assert stream.report.state is TerminalState.COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_tolerant_reference_failure_preserves_total_correlation() -> None:
     def handler(request: Request) -> object:
         if request.copy_parameters()["ref"] == "bad":
@@ -755,6 +801,9 @@ async def test_reference_report_sums_per_reference_unique_counts_and_violations(
         plan=plan,
         dispatch=DirectDispatch(),
         identity=_identity(),
+        policy=ExecutionPolicy(
+            consistency=ConsistencyPolicy(duplicate_policy=DuplicatePolicy.REPORT),
+        ),
     )
 
     outcomes = [outcome async for outcome in stream]
@@ -787,7 +836,10 @@ async def test_early_close_keeps_delivered_unique_count_and_detected_page_warnin
         plan=plan,
         dispatch=DirectDispatch(),
         identity=_identity(),
-        policy=ExecutionPolicy(max_buffered_rows=TWO_REFERENCES),
+        policy=ExecutionPolicy(
+            max_buffered_rows=TWO_REFERENCES,
+            consistency=ConsistencyPolicy(duplicate_policy=DuplicatePolicy.REPORT),
+        ),
     )
 
     assert isinstance(await anext(stream), ReferenceItem)

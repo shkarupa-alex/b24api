@@ -11,6 +11,7 @@ from b24api.error import BudgetExceededError, CapabilityError, PaginationError, 
 from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.models import (
     CompletionAssurance,
+    ConfirmationPolicy,
     ConsistencyPolicy,
     DuplicatePolicy,
     ExecutionPolicy,
@@ -35,6 +36,7 @@ from b24api.plans import (
     CursorTerminalRule,
     ItemCursorPlan,
     KeysetPlan,
+    ListPlan,
     OffsetContinuation,
     OffsetSequentialPlan,
     OffsetTerminalRule,
@@ -358,6 +360,195 @@ async def test_counted_offset_requires_one_stable_non_negative_exact_total() -> 
 
 
 @pytest.mark.asyncio
+async def test_counted_offset_detects_repeated_items_when_continuation_metadata_changes() -> None:
+    responses = [
+        {"result": [{"ID": 1}, {"ID": 2}], "total": 4, "next": 2},
+        {"result": [{"ID": 1}, {"ID": 2}], "total": 4},
+    ]
+    transport = FunctionTransport(lambda _request: responses.pop(0))
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=CountedOffsetPlan(),
+    )
+
+    with pytest.raises(PaginationError, match="repeated page"):
+        await _collect(stream)
+
+    assert len(transport.requests) == PAGE_SIZE
+    assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "plan",
+    [
+        SingleResponsePlan(
+            identity_requirement=IdentityRequirement.REQUIRED,
+            order_semantics=OrderSemantics.ASCENDING,
+        ),
+        OffsetSequentialPlan(
+            identity_requirement=IdentityRequirement.REQUIRED,
+            order_semantics=OrderSemantics.ASCENDING,
+        ),
+        CountedOffsetPlan(
+            identity_requirement=IdentityRequirement.REQUIRED,
+            order_semantics=OrderSemantics.ASCENDING,
+        ),
+    ],
+)
+async def test_declared_order_is_enforced_for_single_and_offset_plans(plan: ListPlan) -> None:
+    transport = FunctionTransport(
+        lambda _request: {"result": [{"ID": 2}, {"ID": 1}], "total": PAGE_SIZE},
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        identity=_identity(),
+    )
+
+    with pytest.raises(PaginationError, match="strictly ascending"):
+        await _collect(stream)
+
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_consistency_policy_requires_identity_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": []})
+    policy = ExecutionPolicy(
+        consistency=ConsistencyPolicy(identity_requirement=IdentityRequirement.REQUIRED),
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=SingleResponsePlan(),
+        policy=policy,
+    )
+
+    with pytest.raises(CapabilityError, match="IdentitySpec"):
+        await _collect(stream)
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_consistency_policy_enforces_duplicates_order_total_and_confirmation() -> None:
+    duplicate_transport = FunctionTransport(
+        lambda _request: {"result": [{"ID": 1}, {"ID": 1}]},
+    )
+    duplicate_stream = iter_list(
+        Executor(duplicate_transport),
+        Request("crm.item.list"),
+        plan=SingleResponsePlan(duplicate_policy=DuplicatePolicy.ALLOW_DECLARED_MULTISET),
+        identity=_identity(),
+    )
+    with pytest.raises(PaginationError, match="duplicate identity"):
+        await _collect(duplicate_stream)
+
+    order_transport = FunctionTransport(
+        lambda _request: {"result": [{"ID": 2}, {"ID": 1}]},
+    )
+    order_policy = ExecutionPolicy(
+        consistency=ConsistencyPolicy(order_semantics=OrderSemantics.ASCENDING),
+    )
+    order_stream = iter_list(
+        Executor(order_transport),
+        Request("crm.item.list"),
+        plan=SingleResponsePlan(),
+        identity=_identity(),
+        policy=order_policy,
+    )
+    with pytest.raises(PaginationError, match="strictly ascending"):
+        await _collect(order_stream)
+
+    total_transport = FunctionTransport(
+        lambda _request: {"result": [{"ID": 1}, {"ID": 2}], "total": 1},
+    )
+    total_policy = ExecutionPolicy(
+        consistency=ConsistencyPolicy(total_semantics=TotalSemantics.FILTERED_EXACT),
+    )
+    total_stream = iter_list(
+        Executor(total_transport),
+        Request("crm.item.list"),
+        plan=SingleResponsePlan(),
+        policy=total_policy,
+    )
+    with pytest.raises(PaginationError, match="exact total"):
+        await _collect(total_stream)
+
+    confirmation_transport = FunctionTransport(lambda _request: {"result": []})
+    confirmation_policy = ExecutionPolicy(
+        consistency=ConsistencyPolicy(confirmation_policy=ConfirmationPolicy.EMPTY_AFTER_BOUNDARY),
+    )
+    confirmation_stream = iter_list(
+        Executor(confirmation_transport),
+        Request("crm.item.list"),
+        plan=SingleResponsePlan(),
+        policy=confirmation_policy,
+    )
+    with pytest.raises(CapabilityError, match="confirmation"):
+        await _collect(confirmation_stream)
+    assert confirmation_transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_empty_boundary_policy_requires_the_empty_offset_confirmation() -> None:
+    def handler(request: Request) -> dict[str, object]:
+        start = _integer_parameter(request, "start")
+        rows = [{"ID": 1}, {"ID": 2}] if start == 0 else []
+        return {"result": rows, "total": PAGE_SIZE}
+
+    transport = FunctionTransport(handler)
+    plan = OffsetSequentialPlan(
+        continuation=OffsetContinuation.OBSERVED_COUNT,
+        terminal=frozenset({OffsetTerminalRule.QUALIFIED_TOTAL, OffsetTerminalRule.EMPTY_PAGE}),
+        total_semantics=TotalSemantics.FILTERED_EXACT,
+    )
+    policy = ExecutionPolicy(
+        consistency=ConsistencyPolicy(
+            total_semantics=TotalSemantics.FILTERED_EXACT,
+            confirmation_policy=ConfirmationPolicy.EMPTY_AFTER_BOUNDARY,
+        ),
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        identity=_identity(),
+        policy=policy,
+    )
+
+    assert await _collect(stream) == [{"ID": 1}, {"ID": 2}]
+    assert [_integer_parameter(request, "start") for request in transport.requests] == [0, PAGE_SIZE]
+    assert stream.report.terminal_reason == "empty page confirmed terminal"
+
+
+@pytest.mark.asyncio
+async def test_conflicting_policy_and_plan_semantics_refuse_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": []})
+    plan = CountedOffsetPlan(order_semantics=OrderSemantics.ASCENDING)
+    policy = ExecutionPolicy(
+        consistency=ConsistencyPolicy(
+            total_semantics=TotalSemantics.GLOBAL,
+            order_semantics=OrderSemantics.DESCENDING,
+        ),
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        identity=_identity(),
+        policy=policy,
+    )
+
+    with pytest.raises(CapabilityError, match=r"total semantics|order semantics"):
+        await _collect(stream)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("responses", "message"),
     [
@@ -573,6 +764,9 @@ async def test_duplicate_report_preserves_multiset_and_exact_unique_count() -> N
         Request("crm.item.list"),
         plan=_offset_plan(duplicate_policy=DuplicatePolicy.REPORT),
         identity=_identity(),
+        policy=ExecutionPolicy(
+            consistency=ConsistencyPolicy(duplicate_policy=DuplicatePolicy.REPORT),
+        ),
     )
 
     assert await _collect(stream) == [{"ID": 1}, {"ID": 2}, {"ID": 2}]
@@ -596,6 +790,9 @@ async def test_early_close_counts_only_unique_rows_delivered_from_later_page() -
         Request("crm.item.list"),
         plan=_offset_plan(duplicate_policy=DuplicatePolicy.REPORT),
         identity=_identity(),
+        policy=ExecutionPolicy(
+            consistency=ConsistencyPolicy(duplicate_policy=DuplicatePolicy.REPORT),
+        ),
     )
 
     assert await anext(stream) == {"ID": 1, "revision": "a"}
