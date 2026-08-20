@@ -938,6 +938,7 @@ class ReferenceRequest:
 
     request: Request = field(repr=False)
     reference_key: str = field(repr=False)
+    payload: object = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, Request):
@@ -946,19 +947,45 @@ class ReferenceRequest:
             raise ValueError("reference_key must be 1..100 characters")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ReferenceBinding:
-    """Safe immutable reference summary and caller payload correlation key."""
+    """Immutable top-level request updates and safe reference correlation."""
 
     reference_summary: str
     payload_key: str = field(repr=False)
+    _updates: FrozenMapping = field(repr=False)
+    payload: object = field(default=None, repr=False)
+
+    def __init__(
+        self,
+        reference_summary: str,
+        payload_key: str,
+        updates: Mapping[str, object] | None = None,
+        payload: object = None,
+    ) -> None:
+        frozen = _freeze_json(updates or {})
+        if not isinstance(frozen, FrozenMapping):
+            raise TypeError("reference updates must be a mapping")
+        object.__setattr__(self, "reference_summary", DEFAULT_REDACTOR.redact_text(reference_summary))
+        object.__setattr__(self, "payload_key", payload_key)
+        object.__setattr__(self, "payload", payload)
+        object.__setattr__(self, "_updates", frozen)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "reference_summary", DEFAULT_REDACTOR.redact_text(self.reference_summary))
         if not self.reference_summary or len(self.reference_summary) > VIOLATION_MESSAGE_MAXIMUM:
             raise ValueError("reference_summary must be 1..500 characters")
         if not self.payload_key or len(self.payload_key) > STABLE_KEY_MAXIMUM:
             raise ValueError("payload_key must be 1..100 characters")
+
+    @property
+    def updates(self) -> Mapping[str, JsonValue]:
+        """Return detached top-level parameter updates for one reference."""
+        return MappingProxyType(self.copy_updates())
+
+    def copy_updates(self) -> dict[str, JsonValue]:
+        """Return a mutable detached copy of the binding updates."""
+        return cast("dict[str, JsonValue]", _thaw_json(self._updates))
 
 
 @dataclass(frozen=True, slots=True, init=False)

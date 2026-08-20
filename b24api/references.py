@@ -726,7 +726,11 @@ class ReferenceScheduler:
                     event.unique_mask,
                     strict=True,
                 ):
-                    outcome = ReferenceItem(event.work.reference.reference_key, item)
+                    outcome = ReferenceItem(
+                        event.work.reference.reference_key,
+                        item,
+                        event.work.reference.payload,
+                    )
                     self._delivery_uniqueness[id(outcome)] = (outcome, is_unique)
                     yield outcome
                     await self.buffer.release(event.reservation, weight)
@@ -756,6 +760,7 @@ class ReferenceScheduler:
             partial_rows=event.partial_rows,
             replay_safety=safety,
             replay_disposition=event.replay_disposition,
+            payload=event.work.reference.payload,
         )
 
     def record_delivery(self, item: ReferenceItem) -> bool:
