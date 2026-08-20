@@ -48,6 +48,21 @@ class SequenceTransport:
         return outcome
 
 
+class CancellationTransport(httpx.AsyncBaseTransport):
+    """Block after receiving a request so cancellation surfaces can be inspected."""
+
+    def __init__(self) -> None:
+        """Initialize synchronization state."""
+        self.entered = asyncio.Event()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        """Wait indefinitely after HTTPX has materialized the credentialed request."""
+        del request
+        self.entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
 def _success(body: bytes = b'{"result":{"ok":true},"total":1,"next":1}') -> WireResponse:
     return WireResponse(status_code=200, headers=(("content-type", "application/json"),), body=body)
 
@@ -368,6 +383,38 @@ async def test_transport_error_drops_credentialed_httpx_exception_and_request_lo
                     assert sensitive_fragment not in repr(value)
             traceback = traceback.tb_next
     finally:
+        await transport.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transport_cancellation_drops_httpx_traceback_and_request_locals() -> None:
+    sensitive_fragment = "synthetic-private-fragment-cancel"
+    blocking = CancellationTransport()
+    client = httpx.AsyncClient(transport=blocking)
+    transport = HttpxTransport(f"https://example.invalid/rest/1/{sensitive_fragment}/", client=client)
+    task = asyncio.create_task(transport.send(Request("profile"), attempt_timeout=1))
+    try:
+        await blocking.entered.wait()
+        task.cancel("caller cancelled")
+
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await task
+
+        error = captured.value
+        assert error.args == ("caller cancelled",)
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        traceback = error.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code.co_name == "send":
+                assert traceback.tb_frame.f_code.co_filename.endswith("b24api/execution.py")
+                for value in traceback.tb_frame.f_locals.values():
+                    assert sensitive_fragment not in repr(value)
+            traceback = traceback.tb_next
+    finally:
+        if not task.done():
+            task.cancel()
         await transport.aclose()
         await client.aclose()
 

@@ -900,55 +900,70 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             _attach_report(error, self.report)
             raise
 
-    async def _run(self) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912
+    async def _run(self) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912, PLR0915
         outcomes = self._scheduler.outcomes(self._source)
         naturally_exhausted = False
+        primary_error: BaseException | None = None
         try:
             async for outcome in outcomes:
                 yield outcome
             naturally_exhausted = True
             await self._finalize(TerminalState.COMPLETED, "reference input exhausted")
         except asyncio.CancelledError as error:
+            primary_error = error
             repeated = await await_cancellation_resistant(
                 self._finalize(TerminalState.CANCELLED, "iteration cancelled"),
             )
             if repeated is not None:
+                primary_error = repeated
                 _attach_report(repeated, self.report)
                 raise repeated from error
             _attach_report(error, self.report)
             raise
         except GeneratorExit as error:
+            primary_error = error
             cancellation = await await_cancellation_resistant(
                 self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion"),
             )
             if cancellation is not None:
+                primary_error = cancellation
                 _attach_report(cancellation, self.report)
                 raise cancellation from error
             _attach_report(error, self.report)
             raise
         except BaseException as error:
+            primary_error = error
             cancellation = await await_cancellation_resistant(
                 self._finalize(TerminalState.FAILED, type(error).__name__),
             )
             if cancellation is not None:
                 _attach_report(cancellation, self.report)
-                raise cancellation from error
             _attach_report(error, self.report)
             raise
         finally:
+            preserve_primary = primary_error is not None and not isinstance(
+                primary_error,
+                asyncio.CancelledError | GeneratorExit,
+            )
             try:
                 cleanup_cancellation = await await_cancellation_resistant(outcomes.aclose())
             except BaseException as cleanup_error:
-                if self.report.state is TerminalState.NOT_STARTED:
+                if preserve_primary:
+                    _attach_report(cleanup_error, self.report)
+                    cleanup_cancellation = None
+                elif self.report.state is TerminalState.NOT_STARTED:
                     cancellation = await await_cancellation_resistant(
                         self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
                     )
                     if cancellation is not None:
                         _attach_report(cancellation, self.report)
                         raise cancellation from cleanup_error
-                _attach_report(cleanup_error, self.report)
-                raise
-            if cleanup_cancellation is not None:
+                    _attach_report(cleanup_error, self.report)
+                    raise
+                else:
+                    _attach_report(cleanup_error, self.report)
+                    raise
+            if cleanup_cancellation is not None and not preserve_primary:
                 _attach_report(cleanup_cancellation, self.report)
                 raise cleanup_cancellation
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:

@@ -1218,11 +1218,10 @@ async def test_cancellation_during_failed_finalization_preserves_failure_report(
     assert transport.context is not None
     transport.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
 
-    with pytest.raises(asyncio.CancelledError) as captured:
+    with pytest.raises(ProtocolError) as captured:
         await task
 
     assert captured.value.__dict__["report"] is stream.report
-    assert isinstance(captured.value.__cause__, ProtocolError)
     assert stream.report.state is TerminalState.FAILED
 
 

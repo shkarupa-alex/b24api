@@ -636,11 +636,10 @@ async def test_batch_cancellation_during_failed_finalization_preserves_failure_r
     assert source.context is not None
     source.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
 
-    with pytest.raises(asyncio.CancelledError) as captured:
+    with pytest.raises(RuntimeError, match="batch source failed") as captured:
         await task
 
     assert captured.value.__dict__["report"] is stream.report
-    assert isinstance(captured.value.__cause__, RuntimeError)
     assert stream.report.state is TerminalState.FAILED
 
 

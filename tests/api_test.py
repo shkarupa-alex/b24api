@@ -40,6 +40,21 @@ def _client(*, attempts: int = 1) -> Bitrix24:
     )
 
 
+def test_settings_redacts_webhook_from_representations_and_serialization() -> None:
+    sensitive_fragment = "synthetic-private-token"
+    settings = Settings(webhook_url=f"https://example.invalid/rest/1/{sensitive_fragment}/")
+
+    surfaces = (
+        repr(settings),
+        str(settings),
+        repr(settings.model_dump()),
+        settings.model_dump_json(),
+    )
+
+    assert all(sensitive_fragment not in surface for surface in surfaces)
+    assert sensitive_fragment in str(settings.webhook_url)
+
+
 @pytest.mark.asyncio
 async def test_zero_explicit_argument_construction_remains_valid() -> None:
     client = Bitrix24()

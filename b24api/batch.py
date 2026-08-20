@@ -522,9 +522,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                 self._finalize(TerminalState.FAILED, type(error).__name__),
             )
             if cancellation is not None:
-                primary_error = cancellation
                 _attach_report(cancellation, self.report)
-                raise cancellation from error
             _attach_report(error, self.report)
             raise
         finally:

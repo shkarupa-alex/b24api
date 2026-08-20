@@ -133,6 +133,7 @@ class HttpxTransport:
             raise RuntimeError("transport is closed")
         tracker = _PhaseTracker()
         failure: tuple[str, FailurePhase] | None = None
+        cancellation_args: tuple[object, ...] | None = None
         http_request: httpx.Request | None = None
         try:
             http_request = self._client.build_request(
@@ -149,6 +150,9 @@ class HttpxTransport:
                 "pool": attempt_timeout,
             }
             response = await self._client.send(http_request)
+        except asyncio.CancelledError as error:
+            cancellation_args = error.args
+            http_request = None
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             failure = ("Transport failed before dispatch", tracker.phase)
         except (httpx.WriteError, httpx.WriteTimeout):
@@ -171,6 +175,10 @@ class HttpxTransport:
                 "HTTP client request failed after possible dispatch",
                 _at_least_dispatch_started(tracker.phase),
             )
+        if cancellation_args is not None:
+            # Raise outside the handler so neither HTTPX traceback frames nor
+            # their credential-bearing request locals remain reachable.
+            raise asyncio.CancelledError(*cancellation_args)
         if failure is not None:
             # Do not retain httpx's credential-bearing request on an exception
             # chain or in the outgoing traceback frame's local variables.

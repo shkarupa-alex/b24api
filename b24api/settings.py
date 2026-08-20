@@ -4,14 +4,14 @@ from typing import Annotated, Any
 
 from fast_depends import Depends
 from httpx import codes
-from pydantic import Field, HttpUrl
+from pydantic import Field, HttpUrl, field_serializer
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """Environment-backed client settings and optional verified portal context."""
 
-    webhook_url: HttpUrl
+    webhook_url: HttpUrl = Field(repr=False)
 
     logger_name: str = "b24api"
 
@@ -42,6 +42,11 @@ class Settings(BaseSettings):
         env_file=".env",
         extra="ignore",
     )
+
+    @field_serializer("webhook_url")
+    def _serialize_webhook_url(self, _value: HttpUrl) -> str:
+        """Never expose webhook credentials through public serialization."""
+        return "[REDACTED]"
 
 
 def api_settings(**kwargs: Any) -> Settings:  # noqa: ANN401
