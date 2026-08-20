@@ -573,6 +573,58 @@ def test_candidate_cleanliness_is_rechecked_before_parent_artifact_persistence(
     assert not path.exists()
 
 
+def test_candidate_drift_after_atomic_replace_rolls_back_pass_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = _benchmark_artifact()
+    candidate_sha = str(artifact["candidate_sha"])
+    calls = 0
+
+    def drifting_sha(_root: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return candidate_sha if calls == 1 else "f" * 40
+
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda _root: None)
+    monkeypatch.setattr(cli_module, "git_sha", drifting_sha)
+    path = tmp_path / "benchmark-evidence.json"
+
+    with pytest.raises(ContractError, match="candidate SHA differs"):
+        cli_module._write_validated_artifact(  # noqa: SLF001
+            path,
+            artifact,
+            candidate_sha=candidate_sha,
+        )
+
+    assert not path.exists()
+
+
+def test_terminal_bundle_scan_failure_rolls_back_pass_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = _benchmark_artifact()
+    candidate_sha = str(artifact["candidate_sha"])
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
+    monkeypatch.setattr(
+        cli_module,
+        "_scan_bundle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ContractError("final scan refused")),
+    )
+    path = tmp_path / "benchmark-evidence.json"
+
+    with pytest.raises(ContractError, match="final scan refused"):
+        cli_module._write_validated_artifact(  # noqa: SLF001
+            path,
+            artifact,
+            candidate_sha=candidate_sha,
+            scan_bundle=True,
+        )
+
+    assert not path.exists()
+
+
 def test_bundle_scan_rechecks_candidate_cleanliness_after_reading(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

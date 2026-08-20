@@ -249,8 +249,12 @@ def _plan(args: argparse.Namespace) -> ExitCode:
             "wall_seconds": max(time.monotonic() - started, 0.000001),
         },
     )
-    _write_validated_artifact(artifact_dir / "plan-evidence.json", artifact, candidate_sha=candidate_sha)
-    _scan_bundle(artifact_dir, expected_candidate_sha=candidate_sha)
+    _write_validated_artifact(
+        artifact_dir / "plan-evidence.json",
+        artifact,
+        candidate_sha=candidate_sha,
+        scan_bundle=True,
+    )
     _safe_message(f"plan completed: {plan_path}")
     return ExitCode.COMPLETED
 
@@ -453,8 +457,8 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
         artifact_dir / "seed-evidence.json",
         artifact,
         candidate_sha=str(plan["candidate_sha"]),
+        scan_bundle=True,
     )
-    _scan_bundle(artifact_dir, expected_candidate_sha=str(plan["candidate_sha"]))
     _safe_message(f"seed completed: {manifest_path}")
     return ExitCode.COMPLETED
 
@@ -483,8 +487,8 @@ def _seed_inconclusive(
         artifact_dir / "seed-evidence.json",
         artifact,
         candidate_sha=str(plan["candidate_sha"]),
+        scan_bundle=True,
     )
-    _scan_bundle(artifact_dir, expected_candidate_sha=str(plan["candidate_sha"]))
     return ExitCode.INCOMPLETE
 
 
@@ -578,8 +582,8 @@ def _verify(args: argparse.Namespace) -> ExitCode:
         artifact_dir / "verify-evidence.json",
         artifact,
         candidate_sha=str(plan["candidate_sha"]),
+        scan_bundle=True,
     )
-    _scan_bundle(artifact_dir, expected_candidate_sha=str(plan["candidate_sha"]))
     _safe_message(f"verify completed: {artifact_dir / 'oracle.json'}")
     return ExitCode.COMPLETED if outcome == "PASS" else ExitCode.INCOMPLETE
 
@@ -797,8 +801,8 @@ def _benchmark_runs_and_artifact(
         artifact_dir / "benchmark-evidence.json",
         artifact,
         candidate_sha=candidate_sha,
+        scan_bundle=True,
     )
-    _scan_bundle(artifact_dir, expected_candidate_sha=candidate_sha)
     _safe_message(f"benchmark completed: {artifact_dir / 'benchmark-evidence.json'}")
     return ExitCode.COMPLETED
 
@@ -825,8 +829,12 @@ def _resume(args: argparse.Namespace) -> ExitCode:
     )
     artifact_path = args.artifact_dir.resolve() / "resume-evidence.json"
     candidate_sha = str(plan["candidate_sha"])
-    _write_validated_artifact(artifact_path, artifact, candidate_sha=candidate_sha)
-    _scan_bundle(args.artifact_dir.resolve(), expected_candidate_sha=candidate_sha)
+    _write_validated_artifact(
+        artifact_path,
+        artifact,
+        candidate_sha=candidate_sha,
+        scan_bundle=True,
+    )
     _safe_message(f"resume validation completed: {artifact_path}")
     return ExitCode.COMPLETED
 
@@ -991,8 +999,12 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0
     )
     artifact_path = args.artifact_dir.resolve() / "cleanup-evidence.json"
     candidate_sha = str(plan["candidate_sha"])
-    _write_validated_artifact(artifact_path, artifact, candidate_sha=candidate_sha)
-    _scan_bundle(args.artifact_dir.resolve(), expected_candidate_sha=candidate_sha)
+    _write_validated_artifact(
+        artifact_path,
+        artifact,
+        candidate_sha=candidate_sha,
+        scan_bundle=True,
+    )
     if orphans:
         _safe_error(RuntimeError(f"cleanup left {len(orphans)} verified orphan(s)"))
         return ExitCode.ORPHANS
@@ -1131,8 +1143,8 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0
         artifact_dir / "recovery-evidence.json",
         artifact,
         candidate_sha=candidate_sha,
+        scan_bundle=True,
     )
-    _scan_bundle(artifact_dir, expected_candidate_sha=candidate_sha)
     _safe_message(f"confirmed candidate manifest written: {manifest_path}")
     return ExitCode.INCOMPLETE
 
@@ -1193,11 +1205,35 @@ def _operation_artifact(  # noqa: PLR0913
     return artifact
 
 
-def _write_candidate_json(path: Path, value: Mapping[str, Any], *, candidate_sha: str) -> None:
+def _write_candidate_json(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    candidate_sha: str,
+    scan_bundle: bool = False,
+) -> None:
     """Atomically write only while the clean executing HEAD stays the exact candidate."""
     _require_evidence_candidate(candidate_sha)
+    previous = read_json_object(path) if path.exists() else None
     atomic_write_json(path, value)
-    _require_evidence_candidate(candidate_sha)
+    try:
+        _require_evidence_candidate(candidate_sha)
+        if scan_bundle:
+            _scan_bundle(path.parent, expected_candidate_sha=candidate_sha)
+    except BaseException:
+        _restore_candidate_json(path, previous)
+        raise
+
+
+def _restore_candidate_json(path: Path, previous: Mapping[str, Any] | None) -> None:
+    """Best-effort rollback without masking the candidate or bundle failure."""
+    try:
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            atomic_write_json(path, previous)
+    except Exception:  # noqa: BLE001, S110 - rollback must never mask the primary refusal
+        pass
 
 
 def _write_validated_artifact(
@@ -1205,15 +1241,20 @@ def _write_validated_artifact(
     artifact: Mapping[str, Any],
     *,
     candidate_sha: str | None = None,
+    scan_bundle: bool = False,
 ) -> None:
-    if candidate_sha is not None:
-        _require_evidence_candidate(candidate_sha)
-    else:
+    if candidate_sha is None:
         require_clean_tracked_tree(ROOT)
+        validate_evidence_artifact(artifact)
+        atomic_write_json(path, artifact)
+        return
     validate_evidence_artifact(artifact)
-    atomic_write_json(path, artifact)
-    if candidate_sha is not None:
-        _require_evidence_candidate(candidate_sha)
+    _write_candidate_json(
+        path,
+        artifact,
+        candidate_sha=candidate_sha,
+        scan_bundle=scan_bundle,
+    )
 
 
 def _default_benchmark_plan(dataset_plan: Mapping[str, Any]) -> dict[str, Any]:
