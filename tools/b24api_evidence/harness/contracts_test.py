@@ -132,6 +132,29 @@ def _plan(*, count: int = 5) -> dict[str, Any]:
     }
 
 
+def _approved_live_plan(*, count: int = 1) -> dict[str, Any]:
+    plan = _plan(count=count)
+    plan["portal"].update(
+        host="portal.invalid",
+        role="admin_full",
+        fingerprint=SHA256,
+        fingerprint_algorithm=FINGERPRINT_ALGORITHM,
+        fingerprint_key_format=FINGERPRINT_KEY_FORMAT,
+        build="build-1",
+        scope_hash=content_sha256(["task"]),
+    )
+    plan["authorization"].update(
+        state="approved_for_seed",
+        live=True,
+        allow_writes=True,
+        approved_by_user=True,
+        plan_review_sha=SHA,
+        approved_at="2026-08-20T00:00:00+00:00",
+    )
+    validate_dataset_plan(plan)
+    return plan
+
+
 def _manifest_base(plan: dict[str, Any]) -> dict[str, Any]:
     correlation = content_sha256([RUN_ID, "CELL", 0])
     marker = marker_value(plan["namespace"], correlation)
@@ -258,6 +281,15 @@ def test_strict_json_rejects_every_nonfinite_form(literal: str) -> None:
 def test_strict_json_rejects_duplicate_object_keys() -> None:
     with pytest.raises(ContractError, match="duplicate"):
         strict_json_loads('{"value":1,"value":2}')
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["[" * 1_500 + "]" * 1_500, '{"value":' + "9" * 5_000 + "}"],
+)
+def test_strict_json_wraps_parser_resource_failures_as_invalid_contract(raw: str) -> None:
+    with pytest.raises(ContractError, match="invalid JSON"):
+        strict_json_loads(raw)
 
 
 def test_fingerprint_requires_exact_random_key_shape_and_hides_principal() -> None:
@@ -715,25 +747,7 @@ def test_cleanup_reconciles_an_ambiguous_create_before_claiming_absence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    plan = _plan(count=1)
-    plan["portal"].update(
-        host="portal.invalid",
-        role="admin_full",
-        fingerprint=SHA256,
-        fingerprint_algorithm=FINGERPRINT_ALGORITHM,
-        fingerprint_key_format=FINGERPRINT_KEY_FORMAT,
-        build="build-1",
-        scope_hash=content_sha256(["task"]),
-    )
-    plan["authorization"].update(
-        state="approved_for_seed",
-        live=True,
-        allow_writes=True,
-        approved_by_user=True,
-        plan_review_sha=SHA,
-        approved_at="2026-08-20T00:00:00+00:00",
-    )
-    validate_dataset_plan(plan)
+    plan = _approved_live_plan()
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan))
     manifest_path = tmp_path / "manifest.jsonl"
@@ -799,6 +813,74 @@ def test_cleanup_reconciles_an_ambiguous_create_before_claiming_absence(
     latest = load_manifest(manifest_path)[-1]
     assert latest["event"] == "absence_verified"
     validate_manifest_against_plan(load_manifest(manifest_path), plan)
+
+
+def test_seed_never_redispatches_an_unresolved_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _approved_live_plan()
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    manifest_path = tmp_path / "manifest.jsonl"
+    previous = build_manifest_record(_manifest_base(plan))
+    append_manifest_record(manifest_path, previous)
+    previous = build_manifest_record(
+        {**_manifest_base(plan), "event": "create_dispatched", "request_fingerprint": SHA256},
+        previous=previous,
+    )
+    append_manifest_record(manifest_path, previous)
+
+    class FakeAdapter:
+        create_method = "tasks.task.add"
+        create_calls = 0
+
+        def find_exact_marker(self, _portal: object, _marker: str) -> list[str]:
+            return []
+
+        def create(self, _portal: object, _marker: str) -> str:
+            self.create_calls += 1
+            return "unexpected"
+
+    adapter = FakeAdapter()
+
+    class FakePortal:
+        identity = PortalIdentity("portal.invalid", "admin_full", "1", SHA256)
+        attempts = 0
+
+        def __init__(self, *, role: str) -> None:
+            assert role == "admin_full"
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
+            assert required_scopes == {"task"}
+            return LivePreflight(self.identity, "build-1", frozenset({"task"}))
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+    monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
+    monkeypatch.setitem(ADAPTERS, "tasks-task-v1", adapter)
+    result = cli_module._seed(  # noqa: SLF001 - direct no-network ambiguity regression
+        Namespace(
+            live=True,
+            allow_writes=True,
+            plan=plan_path,
+            manifest=manifest_path,
+            artifact_dir=tmp_path,
+            run_id=None,
+            lineage_id=None,
+            credential_role="admin_full",
+        ),
+    )
+    assert result == ExitCode.INCOMPLETE
+    assert adapter.create_calls == 0
+    records = load_manifest(manifest_path)
+    assert records[-1]["event"] == "create_dispatched"
+    validate_manifest_against_plan(records, plan)
 
 
 def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) -> None:

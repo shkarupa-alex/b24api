@@ -261,6 +261,7 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                 marker = marker_value(str(plan["namespace"]), correlation)
                 base = _manifest_base(plan, cell=cell, correlation=correlation, marker=marker)
                 recovered_id: str | None = None
+                write_reconciled_event = False
                 if current is not None and current["event"] in {"created", "reconciled"}:
                     recovered_id = str(current["entity_id"])
                     recovered = adapter.read(portal, recovered_id)
@@ -279,24 +280,36 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                                 http_attempts=portal.attempts,
                                 started=started,
                             )
+                        write_reconciled_event = current["event"] == "created"
                 elif current is not None and current["event"] in {"planned", "create_dispatched", "ambiguous"}:
                     matches = adapter.find_exact_marker(portal, marker)
                     http_attempts += 1
                     if len(matches) > 1:
                         raise LiveCorrectnessError("resume found multiple exact-marker entities")
                     recovered_id = matches[0] if matches else None
+                    write_reconciled_event = recovered_id is not None
+                    if recovered_id is None and current["event"] in {"create_dispatched", "ambiguous"}:
+                        return _seed_inconclusive(
+                            artifact_dir=artifact_dir,
+                            plan=plan,
+                            manifest_path=manifest_path,
+                            http_attempts=portal.attempts,
+                            started=started,
+                        )
                 if recovered_id is not None:
-                    reconciled = build_manifest_record(
-                        {
-                            **base,
-                            "event": "reconciled",
-                            "entity_id": recovered_id,
-                            "request_fingerprint": content_sha256(["resume-exact-marker", correlation]),
-                        },
-                        previous=previous,
-                    )
-                    append_manifest_record(manifest_path, reconciled)
-                    previous = reconciled
+                    request_fingerprint = content_sha256(["resume-exact-marker", correlation])
+                    if write_reconciled_event:
+                        reconciled = build_manifest_record(
+                            {
+                                **base,
+                                "event": "reconciled",
+                                "entity_id": recovered_id,
+                                "request_fingerprint": request_fingerprint,
+                            },
+                            previous=previous,
+                        )
+                        append_manifest_record(manifest_path, reconciled)
+                        previous = reconciled
                     recovered = adapter.read(portal, recovered_id)
                     http_attempts += 1
                     if recovered is None or _entity_marker(recovered, str(cell["marker_field"])) != marker:
@@ -306,7 +319,7 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                             **base,
                             "event": "verified",
                             "entity_id": recovered_id,
-                            "request_fingerprint": reconciled["request_fingerprint"],
+                            "request_fingerprint": request_fingerprint,
                         },
                         previous=previous,
                     )

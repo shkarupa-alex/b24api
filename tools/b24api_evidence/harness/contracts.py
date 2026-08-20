@@ -118,9 +118,11 @@ def strict_json_loads(raw: str | bytes) -> Any:
 
     try:
         value = json.loads(raw, parse_constant=reject_constant, object_pairs_hook=reject_duplicate_keys)
-    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        _require_finite(value)
+    except ContractError:
+        raise
+    except (RecursionError, UnicodeDecodeError, ValueError) as error:
         raise ContractError(f"invalid JSON: {error}") from error
-    _require_finite(value)
     return value
 
 
