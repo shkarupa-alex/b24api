@@ -632,6 +632,15 @@ def test_live_benchmark_and_live_resume_never_silently_run_offline(tmp_path: Pat
     assert "read-only validation" in resume.stderr
 
 
+def test_benchmark_parent_hashes_detect_oracle_tampering(tmp_path: Path) -> None:
+    result = _run_cli("benchmark", "--artifact-dir", str(tmp_path))
+    assert result.returncode == ExitCode.COMPLETED, result.stderr
+    oracle_path = tmp_path / "model-oracles/empty-offset.json"
+    oracle_path.write_text("{}")
+    with pytest.raises(ContractError, match="content hash"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - bundle-integrity regression
+
+
 def test_resume_rejects_incompatible_run_lineage(tmp_path: Path) -> None:
     plan = _plan()
     plan_path = tmp_path / "plan.json"

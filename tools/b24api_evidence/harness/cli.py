@@ -46,6 +46,7 @@ from .contracts import (
     read_json_object,
     require_clean_tracked_tree,
     scan_paths_for_secrets,
+    strict_json_loads,
     tracked_repository_paths,
     validate_benchmark_plan,
     validate_dataset_plan,
@@ -459,7 +460,7 @@ def _verify(args: argparse.Namespace) -> ExitCode:
         "manifest_content_hash": manifest_hash,
         "expected_result_hash": pre_hash,
         "actual_result_hash": post_hash,
-        "qualification": "immutable_manifest",
+        "qualification": "bounded_point_read" if args.live else "immutable_manifest",
         "snapshot_requirement": "frozen_manifest",
         "snapshot_state": snapshot_state,
         "pre_hash": pre_hash,
@@ -1197,7 +1198,25 @@ def _entity_marker(entity: Mapping[str, Any], marker_field: str) -> object:
 
 def _scan_bundle(artifact_dir: Path) -> None:
     scan_paths_for_secrets(tracked_repository_paths(ROOT))
-    scan_paths_for_secrets(path for path in artifact_dir.rglob("*") if path.is_file())
+    artifact_paths = [path for path in artifact_dir.rglob("*") if path.is_file()]
+    scan_paths_for_secrets(artifact_paths)
+    json_hashes: set[str] = set()
+    for path in artifact_paths:
+        if path.suffix == ".json" and not path.name.endswith("-evidence.json"):
+            value = strict_json_loads(path.read_bytes())
+            json_hashes.add(content_sha256(value))
+    for path in artifact_paths:
+        if not path.name.endswith("-evidence.json"):
+            continue
+        artifact = read_json_object(path)
+        validate_evidence_artifact(artifact)
+        for reference in artifact["evidence_refs"]:
+            if (
+                isinstance(reference, str)
+                and reference.startswith("sha256:")
+                and reference.removeprefix("sha256:") not in json_hashes
+            ):
+                raise ContractError(f"evidence content hash has no matching immutable JSON in {artifact_dir}")
 
 
 def _safe_message(message: str) -> None:
