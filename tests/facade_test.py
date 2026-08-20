@@ -519,6 +519,54 @@ async def test_counted_cleanup_cancellation_preserves_detected_failure(
 
 
 @pytest.mark.asyncio
+async def test_counted_report_cancellation_preserves_detected_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_started = asyncio.Event()
+    release_report = asyncio.Event()
+    original_report = facade_module._counted_report  # noqa: SLF001 - deterministic report race regression
+
+    async def controlled_report(*args: Any, **kwargs: Any) -> OperationReport:  # noqa: ANN401
+        state = cast("TerminalState", args[1])
+        if state is TerminalState.FAILED:
+            report_started.set()
+            await release_report.wait()
+        return await original_report(*args, **kwargs)
+
+    monkeypatch.setattr(facade_module, "_counted_report", controlled_report)
+
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {"result": [{"ID": 1}], "total": 2, "next": 1}
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: [{"ID": 2}] for key in commands},
+                "result_error": [],
+                "result_total": dict.fromkeys(commands, 3),
+            },
+        }
+
+    client, _transport = _client(handler)
+
+    async def collect() -> list[JsonValue]:
+        return [item async for item in client.list_batched({"method": "crm.item.list"}, batch_size=1)]
+
+    task = asyncio.create_task(collect())
+    await report_started.wait()
+    task.cancel()
+    release_report.set()
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        await task
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.state is TerminalState.FAILED
+    assert "total contradicts" in str(caught.value.__cause__)
+
+
+@pytest.mark.asyncio
 async def test_counted_wrapper_early_close_has_shared_cancelled_report() -> None:
     client, _transport = _client(lambda _request: {"result": [{"ID": 1}, {"ID": 2}], "total": 2})
     stream = client.list_batched({"method": "crm.item.list"}, batch_size=1)

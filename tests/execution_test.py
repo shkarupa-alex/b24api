@@ -339,12 +339,18 @@ async def test_no_trace_post_dispatch_error_classes_have_conservative_minimum_ph
 
 
 @pytest.mark.asyncio
-async def test_transport_error_drops_credentialed_httpx_exception_and_request_locals() -> None:
+@pytest.mark.parametrize(
+    "error_type",
+    [httpx.ConnectError, httpx.DecodingError, httpx.TooManyRedirects],
+)
+async def test_transport_error_drops_credentialed_httpx_exception_and_request_locals(
+    error_type: type[httpx.RequestError],
+) -> None:
     sensitive_fragment = "synthetic-private-fragment-9f4a"
 
     class RefusingTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            raise httpx.ConnectError("refused", request=request)
+            raise error_type("hostile request failure", request=request)
 
     client = httpx.AsyncClient(transport=RefusingTransport())
     transport = HttpxTransport(f"https://example.invalid/rest/1/{sensitive_fragment}/", client=client)

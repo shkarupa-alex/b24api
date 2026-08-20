@@ -603,7 +603,6 @@ class Bitrix24:
             )
             if repeated is not None:
                 _attach_compatibility_report(repeated, report)
-                raise repeated from error
             raise IncompleteTraversalError(report=report) from error
 
     async def list_batched_no_count(  # noqa: PLR0913 - compatibility bridge signature

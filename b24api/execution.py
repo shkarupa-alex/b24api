@@ -166,6 +166,11 @@ class HttpxTransport:
                 "Unclassified transport failure after possible dispatch",
                 _at_least_dispatch_started(tracker.phase),
             )
+        except httpx.RequestError:
+            failure = (
+                "HTTP client request failed after possible dispatch",
+                _at_least_dispatch_started(tracker.phase),
+            )
         if failure is not None:
             # Do not retain httpx's credential-bearing request on an exception
             # chain or in the outgoing traceback frame's local variables.
