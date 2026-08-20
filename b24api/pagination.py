@@ -400,7 +400,7 @@ class PaginationDriver:
             self.cursor_state = cursor
 
     async def _cursor(self, plan: ItemCursorPlan) -> AsyncGenerator[_Page]:  # noqa: C901, PLR0912
-        identity = self._require_identity("item cursor")
+        self._require_identity("item cursor")
         cursor: IdentityValue | None = None
         while True:
             updates: dict[ParameterPath, object] = {}
@@ -420,9 +420,7 @@ class PaginationDriver:
             response = await self._fetch(request)
             items = _response_items(response, self.selector)
             self._validate_page(items, response=response)
-            cursor_values = [
-                _coerce_identity(_extract_path(item, plan.cursor_item_path), identity.coercion) for item in items
-            ]
+            cursor_values, cursor_exhausted = _cursor_values(items, plan)
             _validate_order(cursor_values, plan.direction)
             if cursor is not None and cursor_values:
                 comparison = _compare_identities(cursor_values[0], cursor)
@@ -430,7 +428,7 @@ class PaginationDriver:
                     raise PaginationError("item cursor page ignored its lower bound")
                 if plan.direction == "desc" and comparison >= 0:
                     raise PaginationError("item cursor page ignored its upper bound")
-            terminal = _cursor_terminal(plan, len(items), has_cursor=bool(cursor_values))
+            terminal = _cursor_terminal(plan, len(items), cursor_exhausted=cursor_exhausted)
             if terminal is not None:
                 self._validate_terminal_total()
             if items:
@@ -1127,7 +1125,7 @@ def _keyset_terminal(plan: KeysetPlan, page_size: int) -> str | None:
     return None
 
 
-def _cursor_terminal(plan: ItemCursorPlan, page_size: int, *, has_cursor: bool) -> str | None:
+def _cursor_terminal(plan: ItemCursorPlan, page_size: int, *, cursor_exhausted: bool) -> str | None:
     if plan.terminal is CursorTerminalRule.EMPTY_CONFIRMATION and page_size == 0:
         return "empty cursor confirmation"
     if (
@@ -1136,9 +1134,42 @@ def _cursor_terminal(plan: ItemCursorPlan, page_size: int, *, has_cursor: bool) 
         and page_size < plan.requested_page_size
     ):
         return "profile-authorized short cursor page"
-    if plan.terminal is CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED and not has_cursor:
+    if plan.terminal is CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED and cursor_exhausted:
         return "profile-authorized cursor exhaustion"
     return None
+
+
+def _cursor_values(items: list[JsonValue], plan: ItemCursorPlan) -> tuple[list[IdentityValue], bool]:
+    raw_values = [_extract_optional_path(item, plan.cursor_item_path) for item in items]
+    exhausted = [value is _MISSING or value is None for value in raw_values]
+    if plan.terminal is CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED and (not raw_values or all(exhausted)):
+        return [], True
+    if any(exhausted):
+        if plan.terminal is CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED:
+            raise PaginationError("cursor exhaustion is inconsistent within the page")
+        raise PaginationError(f"cursor path is missing: {plan.cursor_item_path!r}")
+    return [_coerce_cursor(cast("JsonValue", value), plan.cursor_coercion) for value in raw_values], False
+
+
+def _extract_optional_path(value: JsonValue, path: tuple[str | int, ...]) -> JsonValue | object:
+    current = value
+    for part in path:
+        if isinstance(part, str):
+            if not isinstance(current, dict) or part not in current:
+                return _MISSING
+            current = current[part]
+        else:
+            if not isinstance(current, list) or part >= len(current):
+                return _MISSING
+            current = current[part]
+    return current
+
+
+def _coerce_cursor(value: JsonValue, coercion: IdentityCoercion) -> IdentityValue:
+    try:
+        return _coerce_identity(value, coercion)
+    except PaginationError as error:
+        raise PaginationError("cursor value does not satisfy cursor_coercion") from error
 
 
 def _take_cursor(values: list[IdentityValue], mode: str) -> IdentityValue:

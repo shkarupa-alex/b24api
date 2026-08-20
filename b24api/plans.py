@@ -7,6 +7,7 @@ from typing import Literal
 
 from b24api.models import (
     DuplicatePolicy,
+    IdentityCoercion,
     IdentityRequirement,
     OrderSemantics,
     ParameterPath,
@@ -207,6 +208,7 @@ class ItemCursorPlan(PlanContract):
 
     cursor_request_path: ParameterPath = _LAST_ID_PATH
     cursor_item_path: tuple[str | int, ...] = ("id",)
+    cursor_coercion: IdentityCoercion = IdentityCoercion.EXACT_INTEGER
     direction: Literal["asc", "desc"] = "asc"
     cursor_take: Literal["first", "last", "min", "max"] = "max"
     limit_path: ParameterPath | None = None
@@ -220,6 +222,8 @@ class ItemCursorPlan(PlanContract):
         if not self.cursor_item_path:
             raise ValueError("cursor_item_path must not be empty")
         ParameterPath(self.cursor_item_path)
+        if not isinstance(self.cursor_coercion, IdentityCoercion):
+            raise TypeError("cursor_coercion must be an IdentityCoercion")
         if self.direction not in {"asc", "desc"}:
             raise ValueError("cursor direction must be asc or desc")
         if self.cursor_take not in {"first", "last", "min", "max"}:

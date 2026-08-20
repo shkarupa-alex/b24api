@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from b24api.models import IdentityRequirement, OrderSemantics, ParameterPath, TotalSemantics
+from b24api.models import IdentityCoercion, IdentityRequirement, OrderSemantics, ParameterPath, TotalSemantics
 from b24api.plans import (
     BatchDispatch,
     CountedOffsetMode,
@@ -122,12 +122,18 @@ def test_item_cursor_and_partition_validate_identity_direction_and_bounds() -> N
     )
 
     assert cursor.cursor_item_path == ("id",)
+    assert cursor.cursor_coercion is IdentityCoercion.EXACT_INTEGER
     assert partition.lane_count == PARTITION_LANES
     with pytest.raises(ValueError, match="cursor_item_path"):
         ItemCursorPlan(
             cursor_item_path=(),
             identity_requirement=IdentityRequirement.REQUIRED,
             order_semantics=OrderSemantics.ASCENDING,
+        )
+    with pytest.raises(TypeError, match="cursor_coercion"):
+        ItemCursorPlan(
+            cursor_coercion="integer",  # type: ignore[arg-type]
+            identity_requirement=IdentityRequirement.REQUIRED,
         )
     with pytest.raises(ValueError, match="lane_count"):
         PartitionedKeysetPlan(

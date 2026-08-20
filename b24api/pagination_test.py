@@ -732,6 +732,117 @@ async def test_item_cursor_orders_cursor_values_independently_from_row_identity(
 
 
 @pytest.mark.asyncio
+async def test_item_cursor_uses_independent_cursor_coercion() -> None:
+    responses = [
+        {"result": [{"uuid": "a", "cursor": 1}, {"uuid": "b", "cursor": 2}]},
+        {"result": []},
+    ]
+    transport = FunctionTransport(lambda _request: responses.pop(0))
+    plan = ItemCursorPlan(
+        identity_requirement=IdentityRequirement.REQUIRED,
+        cursor_item_path=("cursor",),
+        cursor_coercion=IdentityCoercion.EXACT_INTEGER,
+    )
+    identity = IdentitySpec(
+        item_path=("uuid",),
+        filter_key="uuid",
+        order_key="uuid",
+        coercion=IdentityCoercion.EXACT_STRING,
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        identity=identity,
+    )
+
+    assert await _collect(stream) == [
+        {"uuid": "a", "cursor": 1},
+        {"uuid": "b", "cursor": 2},
+    ]
+    assert [request.copy_parameters().get("LAST_ID") for request in transport.requests] == [None, 2]
+    assert stream.report.state is TerminalState.COMPLETED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row", [{"ID": 1}, {"ID": 1, "cursor": None}])
+async def test_profile_cursor_exhaustion_delivers_last_page_without_cursor(row: dict[str, JsonValue]) -> None:
+    transport = FunctionTransport(lambda _request: {"result": [row]})
+    plan = ItemCursorPlan(
+        identity_requirement=IdentityRequirement.REQUIRED,
+        cursor_item_path=("cursor",),
+        terminal=CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED,
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        identity=_identity(),
+    )
+
+    assert await _collect(stream) == [row]
+    assert len(transport.requests) == 1
+    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.terminal_reason == "profile-authorized cursor exhaustion"
+
+
+@pytest.mark.asyncio
+async def test_profile_cursor_exhaustion_rejects_mixed_cursor_presence() -> None:
+    transport = FunctionTransport(
+        lambda _request: {"result": [{"ID": 1, "cursor": 1}, {"ID": 2}]},
+    )
+    plan = ItemCursorPlan(
+        identity_requirement=IdentityRequirement.REQUIRED,
+        cursor_item_path=("cursor",),
+        terminal=CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED,
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        identity=_identity(),
+    )
+
+    with pytest.raises(PaginationError, match="cursor exhaustion is inconsistent"):
+        await _collect(stream)
+    assert stream.report.emitted_rows == 0
+    assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("plan", "policy"),
+    [
+        (
+            SingleResponsePlan(identity_requirement=IdentityRequirement.COMPOSITE),
+            ExecutionPolicy(),
+        ),
+        (
+            SingleResponsePlan(),
+            ExecutionPolicy(
+                consistency=ConsistencyPolicy(identity_requirement=IdentityRequirement.COMPOSITE),
+            ),
+        ),
+    ],
+)
+async def test_composite_identity_refuses_before_io(
+    plan: ListPlan,
+    policy: ExecutionPolicy,
+) -> None:
+    transport = FunctionTransport(lambda _request: {"result": []})
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        policy=policy,
+    )
+
+    with pytest.raises(CapabilityError, match="composite identity"):
+        await anext(stream)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
 async def test_item_cursor_rejects_wrong_order_within_first_page() -> None:
     transport = FunctionTransport(lambda _request: {"result": [{"ID": 2}, {"ID": 1}]})
     plan = ItemCursorPlan(
