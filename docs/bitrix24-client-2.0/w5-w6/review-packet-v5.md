@@ -1,5 +1,12 @@
 # W5/W6 review packet v5 — bounded traversal foundation
 
+> **Accepted semantic subject with a post-review evidence addendum.** Human
+> review accepted `a29b58f...` as the W5/W6 foundation and returned nonblocking
+> evidence/documentation findings. `review-packet-v5-addendum.md` binds their
+> test/doc-only resolution, complete eight-control refusal surface, and updated
+> gates to descendant `61345c1...`. The counts below remain the historical v5
+> packet results rather than being silently rewritten.
+
 ## Decision requested
 
 Review exact code-and-test SHA
