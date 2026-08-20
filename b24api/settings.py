@@ -7,24 +7,25 @@ from fast_depends import Depends
 from httpx import codes
 from pydantic import Field, HttpUrl, TypeAdapter, ValidationError, field_serializer, field_validator
 from pydantic.config import ExtraValues
-from pydantic_core import PydanticCustomError
+from pydantic_core import InitErrorDetails, PydanticCustomError
 from pydantic_settings import BaseSettings, SettingsConfigDict, SettingsError
 
 _WEBHOOK_ADAPTER = TypeAdapter(HttpUrl)
 _REDACTED = "[REDACTED]"
 
 
-def _settings_validation_error() -> ValidationError:
-    return ValidationError.from_exception_data(
-        "Settings",
-        [
+def _settings_validation_error(error: ValidationError | None = None) -> ValidationError:
+    if error is None:
+        details: list[InitErrorDetails] = [
             {
                 "type": PydanticCustomError("settings_validation", "Settings validation failed"),
                 "loc": (),
                 "input": _REDACTED,
             },
-        ],
-    )
+        ]
+    else:
+        details = [cast("InitErrorDetails", dict(item, input=_REDACTED)) for item in error.errors(include_url=False)]
+    return ValidationError.from_exception_data("Settings", details)
 
 
 def _settings_loading_error() -> SettingsError:
@@ -69,17 +70,17 @@ class Settings(BaseSettings):
 
     def __init__(self, **data: Any) -> None:  # noqa: ANN401
         """Validate without retaining credential-bearing framework traceback frames."""
-        validation_failed = False
+        validation_failure: ValidationError | None = None
         loading_failed = False
         try:
             super().__init__(**data)
-        except ValidationError:
-            validation_failed = True
+        except ValidationError as error:
+            validation_failure = _settings_validation_error(error)
         except SettingsError:
             loading_failed = True
         data.clear()
-        if validation_failed:
-            raise _settings_validation_error()
+        if validation_failure is not None:
+            raise validation_failure
         if loading_failed:
             raise _settings_loading_error()
 
@@ -97,7 +98,7 @@ class Settings(BaseSettings):
     ) -> Self:
         """Validate mappings without retaining credential-bearing inputs."""
         result: Self | None = None
-        failed = False
+        failure: ValidationError | None = None
         try:
             result = super().model_validate(
                 obj,
@@ -108,12 +109,12 @@ class Settings(BaseSettings):
                 by_alias=by_alias,
                 by_name=by_name,
             )
-        except ValidationError:
-            failed = True
+        except ValidationError as error:
+            failure = _settings_validation_error(error)
         obj = None
         context = None
-        if failed:
-            raise _settings_validation_error()
+        if failure is not None:
+            raise failure
         return cast("Self", result)
 
     @classmethod
@@ -129,7 +130,7 @@ class Settings(BaseSettings):
     ) -> Self:
         """Validate JSON without retaining credential-bearing inputs."""
         result: Self | None = None
-        failed = False
+        failure: ValidationError | None = None
         try:
             result = super().model_validate_json(
                 json_data,
@@ -139,12 +140,12 @@ class Settings(BaseSettings):
                 by_alias=by_alias,
                 by_name=by_name,
             )
-        except ValidationError:
-            failed = True
+        except ValidationError as error:
+            failure = _settings_validation_error(error)
         json_data = b""
         context = None
-        if failed:
-            raise _settings_validation_error()
+        if failure is not None:
+            raise failure
         return cast("Self", result)
 
     @classmethod
@@ -160,7 +161,7 @@ class Settings(BaseSettings):
     ) -> Self:
         """Validate string mappings without retaining credential-bearing inputs."""
         result: Self | None = None
-        failed = False
+        failure: ValidationError | None = None
         try:
             result = super().model_validate_strings(
                 obj,
@@ -170,12 +171,12 @@ class Settings(BaseSettings):
                 by_alias=by_alias,
                 by_name=by_name,
             )
-        except ValidationError:
-            failed = True
+        except ValidationError as error:
+            failure = _settings_validation_error(error)
         obj = None
         context = None
-        if failed:
-            raise _settings_validation_error()
+        if failure is not None:
+            raise failure
         return cast("Self", result)
 
     @field_validator("webhook_url", mode="before")
@@ -209,17 +210,17 @@ class Settings(BaseSettings):
 def api_settings(**kwargs: Any) -> Settings:  # noqa: ANN401
     """Return validated API settings."""
     result: Settings | None = None
-    validation_failed = False
+    validation_failure: ValidationError | None = None
     loading_failed = False
     try:
         result = Settings(**kwargs)
-    except ValidationError:
-        validation_failed = True
+    except ValidationError as error:
+        validation_failure = _settings_validation_error(error)
     except SettingsError:
         loading_failed = True
     kwargs.clear()
-    if validation_failed:
-        raise _settings_validation_error()
+    if validation_failure is not None:
+        raise validation_failure
     if loading_failed:
         raise _settings_loading_error()
     return cast("Settings", result)

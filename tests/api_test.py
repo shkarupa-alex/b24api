@@ -155,7 +155,8 @@ def test_alternative_settings_validation_drops_credential_surfaces(entrypoint: s
 
 
 def test_alternative_settings_validation_preserves_valid_compatibility() -> None:
-    webhook = "https://example.invalid/rest/1/synthetic-valid-token/"
+    sensitive_fragment = "synthetic-valid-token"
+    webhook = f"https://example.invalid/rest/1/{sensitive_fragment}/"
 
     assert str(Settings.model_validate({"webhook_url": webhook}).webhook_url) == webhook
     assert str(Settings.model_validate_json(json.dumps({"webhook_url": webhook})).webhook_url) == webhook
