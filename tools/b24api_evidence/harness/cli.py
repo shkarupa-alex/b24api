@@ -570,7 +570,7 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
         "batch_requests": 0,
         "batch_commands": 0,
         "time_to_first_row_seconds": min(
-            run.time_to_first_row_seconds for run in runs if run.time_to_first_row_seconds is not None
+            run.time_to_first_row_seconds for run in stable_runs if run.time_to_first_row_seconds is not None
         ),
         "wall_seconds": max(sum(run.wall_seconds for run in stable_runs), 0.000001),
         "server_operating_seconds": sum(run.operating_seconds for run in stable_runs),

@@ -734,7 +734,14 @@ def test_benchmark_parent_hashes_detect_oracle_tampering(tmp_path: Path) -> None
     result = _run_cli("benchmark", "--artifact-dir", str(tmp_path))
     assert result.returncode == ExitCode.COMPLETED, result.stderr
     artifact = json.loads((tmp_path / "benchmark-evidence.json").read_text())
+    matrix = json.loads((tmp_path / "model-matrix.json").read_text())
+    stable = [run for run in matrix["runs"] if run["outcome"] == "PASS"]
     assert len(artifact["evidence_refs"]) == EXPECTED_STABLE_MODEL_RUNS
+    assert artifact["metrics"]["http_attempts"] == sum(run["requests"] for run in stable)
+    assert artifact["metrics"]["logical_pages"] == sum(run["logical_pages"] for run in stable)
+    assert artifact["metrics"]["server_operating_seconds"] == pytest.approx(
+        sum(run["operating_seconds"] for run in stable),
+    )
     assert artifact["safe_violations"][0]["code"] == "mutation_diagnostic_inconclusive"
     assert f"sha256:{content_sha256(json.loads((tmp_path / 'model-matrix.json').read_text()))}" not in artifact[
         "evidence_refs"

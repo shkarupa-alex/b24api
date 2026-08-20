@@ -199,9 +199,12 @@ def _read_bounded_bytes(path: Path, *, ceiling: int, kind: str) -> bytes:
         raise ContractError(f"{kind} exceeds the reviewed byte ceiling: {path.name}")
     try:
         with path.open("rb") as source:
-            return source.read(ceiling + 1)
+            payload = source.read(ceiling + 1)
     except OSError as error:
         raise ContractError(f"cannot read {path}: {error}") from error
+    if len(payload) > ceiling:
+        raise ContractError(f"{kind} exceeds the reviewed byte ceiling: {path.name}")
+    return payload
 
 
 def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
