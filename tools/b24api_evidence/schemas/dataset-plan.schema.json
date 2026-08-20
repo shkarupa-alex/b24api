@@ -24,7 +24,7 @@
     "disposable_profiles_content_hash": {"const": "425cdca3d9f0682974c50afc9af4d4d3fa90dc6233ee785290ba7632bd30b754"},
     "portal": {"$ref": "#/$defs/portal"},
     "namespace": {"type": "string", "pattern": "^b24api-evidence-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
-    "cells": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/cell"}},
+    "cells": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"$ref": "#/$defs/cell"}},
     "estimated": {"$ref": "#/$defs/estimated"},
     "cleanup": {
       "type": "object", "additionalProperties": false,
@@ -80,7 +80,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["entities", "relationships", "create_strategy", "delete_strategy", "requests", "batch_commands", "duration_seconds", "quota_impact"],
       "properties": {
-        "entities": {"type": "integer", "minimum": 0},
+        "entities": {"type": "integer", "minimum": 0, "maximum": 500},
         "relationships": {"type": "integer", "minimum": 0},
         "create_strategy": {"enum": ["direct", "batch"]},
         "delete_strategy": {"enum": ["direct", "batch"]},

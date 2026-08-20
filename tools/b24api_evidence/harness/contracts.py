@@ -35,6 +35,8 @@ INSTRUMENTATION_REVIEW_SHA: Final = "521f0eb7cb107ec948c693496154f94e57dbf7c9"
 REVIEWED_PROFILE_SET_ID: Final = "w0-disposable-entities-v1"
 REVIEWED_PROFILE_SET_SHA256: Final = "425cdca3d9f0682974c50afc9af4d4d3fa90dc6233ee785290ba7632bd30b754"
 REVIEWED_MAX_ENTITIES_PER_CELL: Final = 500
+REVIEWED_MAX_DATASET_CELLS: Final = 2
+REVIEWED_MAX_TOTAL_ENTITIES: Final = 500
 FINGERPRINT_ALGORITHM: Final = "hmac-sha256-host-role-principal-v1"
 FINGERPRINT_KEY_FORMAT: Final = "base64url-no-padding-32-bytes"
 NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT: Final = 0.15
@@ -218,8 +220,14 @@ def _read_bounded_bytes(path: Path, *, ceiling: int, kind: str) -> bytes:
 
 def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
     """Persist one artifact through fsync and same-directory atomic replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = canonical_json(value) + b"\n"
+    scan_bytes_for_secrets(payload, source=str(path))
+    _atomic_write_bytes(path, payload)
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """Persist already validated bytes without exposing a partial destination."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
     try:
@@ -227,7 +235,6 @@ def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
             output.write(payload)
             output.flush()
             os.fsync(output.fileno())
-        scan_bytes_for_secrets(payload, source=str(path))
         temporary.replace(path)
         _fsync_directory(path.parent)
     except BaseException:
@@ -363,9 +370,12 @@ def validate_dataset_plan(plan: Mapping[str, Any]) -> None:  # noqa: C901, PLR09
     cells = plan["cells"]
     if not isinstance(cells, list) or not cells:
         raise ContractError("dataset plan requires at least one cell")
+    if len(cells) > REVIEWED_MAX_DATASET_CELLS:
+        raise ContractError("dataset plan exceeds the reviewed cell-count ceiling")
     total_entities = 0
     total_relationships = 0
     seen_cells: set[str] = set()
+    seen_profiles: set[str] = set()
     for index, cell in enumerate(cells):
         if not isinstance(cell, dict):
             raise ContractError(f"cells[{index}] must be an object")
@@ -374,11 +384,17 @@ def validate_dataset_plan(plan: Mapping[str, Any]) -> None:  # noqa: C901, PLR09
         if cell_id in seen_cells:
             raise ContractError(f"duplicate dataset cell id: {cell_id}")
         seen_cells.add(cell_id)
+        profile_id = str(cell["disposable_profile_id"])
+        if profile_id in seen_profiles:
+            raise ContractError(f"duplicate disposable profile in dataset plan: {profile_id}")
+        seen_profiles.add(profile_id)
         total_entities += max(
             _integer(cell.get("target_count"), f"cells[{index}].target_count"),
             _integer(cell.get("base_count", 0), f"cells[{index}].base_count"),
         )
         total_relationships += _integer(cell.get("relationship_count", 0), f"cells[{index}].relationship_count")
+    if total_entities > REVIEWED_MAX_TOTAL_ENTITIES:
+        raise ContractError("dataset plan exceeds the reviewed aggregate entity ceiling")
     estimated = _mapping(plan["estimated"], "estimated")
     entities = _nonnegative_int(estimated.get("entities"), "estimated.entities")
     relationships = _nonnegative_int(estimated.get("relationships"), "estimated.relationships")
@@ -636,28 +652,28 @@ def validate_manifest_against_plan(records: Sequence[Mapping[str, Any]], plan: M
 
 
 def append_manifest_record(path: Path, record: Mapping[str, Any]) -> None:
-    """Append one validated record with one O_APPEND write and fsync."""
+    """Commit one validated logical append through an atomic whole-file replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(f"{path.suffix}.lock")
     lock_descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
         manifest_existed = path.exists()
+        existing = (
+            _read_bounded_bytes(path, ceiling=MAX_MANIFEST_INPUT_BYTES, kind="manifest")
+            if manifest_existed
+            else b""
+        )
         previous_records = load_manifest(path) if manifest_existed else []
         previous = previous_records[-1] if previous_records else None
         validate_manifest_record(record, previous=previous)
-        payload = canonical_json(record) + b"\n"
-        scan_bytes_for_secrets(payload, source=str(path))
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            written = os.write(descriptor, payload)
-            if written != len(payload):
-                raise OSError("short manifest append")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        if not manifest_existed:
-            _fsync_directory(path.parent)
+        record_payload = canonical_json(record) + b"\n"
+        scan_bytes_for_secrets(record_payload, source=str(path))
+        separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
+        payload = existing + separator + record_payload
+        if len(payload) > MAX_MANIFEST_INPUT_BYTES:
+            raise ContractError("manifest exceeds the reviewed byte ceiling")
+        _atomic_write_bytes(path, payload)
     finally:
         fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
         os.close(lock_descriptor)

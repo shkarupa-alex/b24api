@@ -42,12 +42,25 @@
     "controls": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["warmups", "advisory_runs", "blocking_pairs", "interleaving", "drift"],
+      "required": ["warmups", "advisory_runs", "blocking_pairs", "interleaving", "timing_model", "drift"],
       "properties": {
         "warmups": {"type": "integer", "minimum": 1},
         "advisory_runs": {"type": "integer", "minimum": 5},
         "blocking_pairs": {"type": "integer", "minimum": 9},
         "interleaving": {"const": true},
+        "timing_model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "seconds_per_request"],
+          "properties": {
+            "kind": {"enum": ["deterministic_request_cost", "measured_wall"]},
+            "seconds_per_request": {"oneOf": [{"type": "number", "exclusiveMinimum": 0}, {"type": "null"}]}
+          },
+          "allOf": [
+            {"if": {"properties": {"kind": {"const": "deterministic_request_cost"}}, "required": ["kind"]}, "then": {"properties": {"seconds_per_request": {"type": "number", "exclusiveMinimum": 0}}}},
+            {"if": {"properties": {"kind": {"const": "measured_wall"}}, "required": ["kind"]}, "then": {"properties": {"seconds_per_request": {"type": "null"}}}}
+          ]
+        },
         "drift": {
           "type": "object",
           "additionalProperties": false,

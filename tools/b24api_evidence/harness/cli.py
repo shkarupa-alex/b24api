@@ -62,7 +62,7 @@ from .contracts import (
     validate_schema,
 )
 from .live import ADAPTERS, LiveCorrectnessError, LivePortal, LivePreflight, LiveUnavailableError
-from .model import ModelRun, exact_model_cases, run_exact_matrix_sync
+from .model import MODEL_REQUEST_SECONDS, ModelRun, exact_model_cases, run_exact_matrix_sync
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -142,6 +142,9 @@ def _plan(args: argparse.Namespace) -> ExitCode:
     started = time.monotonic()
     if args.allow_writes:
         raise ContractError("plan is read-only; --allow-writes is invalid")
+    artifact_dir = args.artifact_dir.resolve()
+    if artifact_dir.exists() and next(artifact_dir.iterdir(), None) is not None:
+        raise ContractError("plan requires an empty artifact directory and never overwrites an evidence bundle")
     run_id = _uuid_or_new(args.run_id, "run_id")
     lineage_id = _uuid_or_new(args.lineage_id, "lineage_id")
     if not 0 <= args.count <= REVIEWED_MAX_ENTITIES_PER_CELL:
@@ -221,7 +224,6 @@ def _plan(args: argparse.Namespace) -> ExitCode:
         },
     }
     validate_dataset_plan(dataset_plan)
-    artifact_dir = args.artifact_dir.resolve()
     plan_path = artifact_dir / "dataset-plan.json"
     atomic_write_json(plan_path, dataset_plan)
     benchmark_plan = _default_benchmark_plan(dataset_plan)
@@ -585,6 +587,8 @@ def _require_exact_model_benchmark_plan(benchmark_plan: Mapping[str, Any]) -> No
         or controls_config["advisory_runs"] != _MODEL_ADVISORY_RUNS
         or controls_config["blocking_pairs"] != _MODEL_BLOCKING_PAIRS
         or controls_config["interleaving"] is not True
+        or controls_config["timing_model"]
+        != {"kind": "deterministic_request_cost", "seconds_per_request": MODEL_REQUEST_SECONDS}
     ):
         raise ContractError("the deterministic runner accepts only its exact bounded draft run controls")
     if benchmark_plan["manifest_content_hash"] != content_sha256(_model_fixture_manifest()):
@@ -716,6 +720,12 @@ def _benchmark_runs_and_artifact(
                     "code": "mutation_diagnostic_inconclusive",
                     "message": "persistent-mutation runs are diagnostic and are not dependencies of stable-case PASS",
                     "field": "model-diagnostics.json",
+                },
+                {
+                    "severity": "warning",
+                    "code": "deterministic_latency_model",
+                    "message": "offline timings use the preregistered 1 ms/request model, not host wall clock",
+                    "field": "benchmark-plan.json.controls.timing_model",
                 },
             ],
         },
@@ -1096,6 +1106,7 @@ def _operation_artifact(  # noqa: PLR0913
 
 
 def _write_validated_artifact(path: Path, artifact: Mapping[str, Any]) -> None:
+    require_clean_tracked_tree(ROOT)
     validate_evidence_artifact(artifact)
     atomic_write_json(path, artifact)
 
@@ -1120,6 +1131,10 @@ def _default_benchmark_plan(dataset_plan: Mapping[str, Any]) -> dict[str, Any]:
             "advisory_runs": _MODEL_ADVISORY_RUNS,
             "blocking_pairs": _MODEL_BLOCKING_PAIRS,
             "interleaving": True,
+            "timing_model": {
+                "kind": "deterministic_request_cost",
+                "seconds_per_request": MODEL_REQUEST_SECONDS,
+            },
             "drift": {"status": "tbd_live", "max_rtt_ratio": "TBD-LIVE", "max_operating_ratio": "TBD-LIVE"},
         },
         "cases": [
@@ -1404,6 +1419,7 @@ def _entity_marker(entity: Mapping[str, Any], marker_field: str) -> object:
 
 
 def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912, PLR0915
+    require_clean_tracked_tree(ROOT)
     scan_paths_for_secrets(tracked_repository_paths(ROOT))
     artifact_paths: list[Path] = []
     total_bytes = 0
@@ -1440,6 +1456,7 @@ def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912, PLR0915
             ):
                 raise ContractError(f"evidence content hash has no matching immutable JSON in {artifact_dir}")
     if not artifacts:
+        require_clean_tracked_tree(ROOT)
         return
     lineage_fields = (
         "run_id",
@@ -1527,6 +1544,7 @@ def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912, PLR0915
             )
         else:
             raise ContractError("oracle_verified PASS is unsupported for this command")
+    require_clean_tracked_tree(ROOT)
 
 
 def _validate_benchmark_pass_dependencies(  # noqa: C901
@@ -1705,8 +1723,15 @@ def _validate_model_observations(
                 rel_tol=1e-12,
                 abs_tol=1e-12,
             )
+            or not math.isclose(
+                float(observation["wall_seconds"]),
+                reference_run.wall_seconds,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            or observation["time_to_first_row_seconds"] != reference_run.time_to_first_row_seconds
         ):
-            raise ContractError("benchmark model observation counters contradict deterministic execution")
+            raise ContractError("benchmark model observation counters or timing contradict deterministic execution")
         _validate_observation_timing(observation)
         required_oracle_hashes.add(oracle_hash)
     if len(observations) != len(expected_keys) or observed_keys != expected_keys:

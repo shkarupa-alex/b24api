@@ -220,6 +220,7 @@ def _benchmark_plan(*, state: str = "admission_ready") -> dict[str, Any]:
             "advisory_runs": 5,
             "blocking_pairs": 9,
             "interleaving": True,
+            "timing_model": {"kind": "deterministic_request_cost", "seconds_per_request": 0.001},
             "drift": {"status": "preregistered", "max_rtt_ratio": 1.2, "max_operating_ratio": 1.2},
         },
         "cases": [
@@ -417,6 +418,56 @@ def test_dataset_plan_rejects_self_authorized_or_underestimated_writes(
         validate_dataset_plan(plan)
 
 
+def test_dataset_plan_cannot_multiply_the_reviewed_scale_across_cells() -> None:
+    plan = _plan(count=300)
+    second = copy.deepcopy(plan["cells"][0])
+    second.update(
+        id="CRM",
+        disposable_profile_id="crm-deal-v1",
+        entity_family="crm_deal",
+        create_method="crm.deal.add",
+        read_method="crm.deal.get",
+        delete_method="crm.deal.delete",
+        required_scopes=["crm"],
+    )
+    plan["cells"].append(second)
+    plan["cleanup"]["dependency_order"].append("CRM")
+    plan["estimated"].update(entities=500, requests=3004, duration_seconds=300.4, quota_impact=3004.0)
+    with pytest.raises(ContractError, match="aggregate entity ceiling"):
+        validate_dataset_plan(plan)
+
+
+def test_candidate_cleanliness_is_rechecked_before_parent_artifact_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_dirty(_root: Path) -> None:
+        raise ContractError("tracked repository changed during evidence execution")
+
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", reject_dirty)
+    path = tmp_path / "benchmark-evidence.json"
+    with pytest.raises(ContractError, match="changed during"):
+        cli_module._write_validated_artifact(path, _benchmark_artifact())  # noqa: SLF001
+    assert not path.exists()
+
+
+def test_bundle_scan_rechecks_candidate_cleanliness_after_reading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def become_dirty(_root: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise ContractError("tracked repository changed during evidence execution")
+
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", become_dirty)
+    with pytest.raises(ContractError, match="changed during"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001
+
+
 def test_manifest_hash_chain_marker_and_resume_lineage(tmp_path: Path) -> None:
     plan = _plan()
     first = build_manifest_record(_manifest_base(plan))
@@ -485,6 +536,30 @@ def test_manifest_rejects_a_stale_concurrent_genesis_writer(tmp_path: Path) -> N
     append_manifest_record(path, first)
     with pytest.raises(ContractError, match="sequence"):
         append_manifest_record(path, stale)
+    assert load_manifest(path) == [first]
+
+
+def test_manifest_append_failure_preserves_the_last_complete_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan()
+    first = build_manifest_record(_manifest_base(plan))
+    path = tmp_path / "manifest.jsonl"
+    append_manifest_record(path, first)
+    original = path.read_bytes()
+    second = build_manifest_record(
+        {**_manifest_base(plan), "event": "create_dispatched", "request_fingerprint": "f" * 64},
+        previous=first,
+    )
+
+    def fail_replace(_source: Path, _destination: Path) -> Path:
+        raise OSError("simulated atomic replace failure")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated"):
+        append_manifest_record(path, second)
+    assert path.read_bytes() == original
     assert load_manifest(path) == [first]
 
 
@@ -816,6 +891,29 @@ def test_benchmark_parent_hashes_detect_oracle_tampering(tmp_path: Path) -> None
         cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - bundle-integrity regression
 
 
+def test_benchmark_rejects_per_observation_timing_redistribution(tmp_path: Path) -> None:
+    result = _run_cli("benchmark", "--artifact-dir", str(tmp_path))
+    assert result.returncode == ExitCode.COMPLETED, result.stderr
+    matrix_path = tmp_path / "model-matrix.json"
+    artifact_path = tmp_path / "benchmark-evidence.json"
+    matrix = json.loads(matrix_path.read_text())
+    artifact = json.loads(artifact_path.read_text())
+    old_hash = content_sha256(matrix)
+    first, second = [run for run in matrix["runs"] if run["identities"]][:2]
+    shift = min(first["wall_seconds"], second["wall_seconds"]) / 4
+    first["wall_seconds"] -= shift
+    second["wall_seconds"] += shift
+    new_hash = content_sha256(matrix)
+    artifact["evidence_refs"] = [
+        f"sha256:{new_hash}" if value == f"sha256:{old_hash}" else value
+        for value in artifact["evidence_refs"]
+    ]
+    matrix_path.write_text(json.dumps(matrix))
+    artifact_path.write_text(json.dumps(artifact))
+    with pytest.raises(ContractError, match="timing contradict"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - per-observation timing binding
+
+
 def test_bundle_rejects_evidence_from_two_runs_even_when_each_document_is_valid(tmp_path: Path) -> None:
     first = _run_cli(
         "plan",
@@ -839,7 +937,37 @@ def test_bundle_rejects_evidence_from_two_runs_even_when_each_document_is_valid(
         str(uuid.uuid4()),
     )
     assert second.returncode == ExitCode.INVALID
-    assert "mixes run" in second.stderr
+    assert "never overwrites" in second.stderr
+
+
+def test_plan_refusal_never_overwrites_an_existing_bundle(tmp_path: Path) -> None:
+    first = _run_cli(
+        "plan",
+        "--artifact-dir",
+        str(tmp_path),
+        "--run-id",
+        RUN_ID,
+        "--lineage-id",
+        LINEAGE_ID,
+    )
+    assert first.returncode == ExitCode.COMPLETED, first.stderr
+    benchmark = _run_cli("benchmark", "--artifact-dir", str(tmp_path))
+    assert benchmark.returncode == ExitCode.COMPLETED, benchmark.stderr
+    plan_path = tmp_path / "dataset-plan.json"
+    before = plan_path.read_bytes()
+    second = _run_cli(
+        "plan",
+        "--artifact-dir",
+        str(tmp_path),
+        "--run-id",
+        str(uuid.uuid4()),
+        "--lineage-id",
+        str(uuid.uuid4()),
+    )
+    assert second.returncode == ExitCode.INVALID
+    assert "never overwrites" in second.stderr
+    assert plan_path.read_bytes() == before
+    cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - prior bundle remains valid
 
 
 def test_external_plan_conflict_never_overwrites_an_existing_bundle(tmp_path: Path) -> None:

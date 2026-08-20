@@ -3,7 +3,6 @@
 from __future__ import annotations
 import asyncio
 import json
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +32,7 @@ from .contracts import MAX_MUTATION_RETRIES, content_sha256
 
 MODEL_METHOD = "model.entity.list"
 PAGE_SIZE = 50
+MODEL_REQUEST_SECONDS = 0.001
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,11 +138,11 @@ class DeterministicPortal(Transport):
         result: dict[str, Any] = {
             "result": [{"ID": value} for value in page_ids],
             "total": len(identities),
-            "time": {"duration": 0.002, "operating": 0.001},
+            "time": {"duration": MODEL_REQUEST_SECONDS * 2, "operating": MODEL_REQUEST_SECONDS},
         }
         if after is None and next_offset < len(selected):
             result["next"] = next_offset
-        self.operating_seconds += 0.001
+        self.operating_seconds += MODEL_REQUEST_SECONDS
         return WireResponse(
             status_code=200,
             headers=(("content-type", "application/json"), ("x-request-id", f"model-{self.requests}")),
@@ -203,16 +203,11 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
     )
     pre_hash = portal.oracle_snapshot()
     rows: list[dict[str, Any]] = []
-    started = time.monotonic()
-    time_to_first_row_seconds: float | None = None
     async with stream:
         async for item in stream:
             if not isinstance(item, dict) or not isinstance(item.get("ID"), int):
                 raise TypeError("model traversal emitted malformed row")
-            if time_to_first_row_seconds is None:
-                time_to_first_row_seconds = time.monotonic() - started
             rows.append(item)
-    wall_seconds = time.monotonic() - started
     report = stream.report
     identities = tuple(int(row["ID"]) for row in rows)
     actual_hash = content_sha256(list(identities))
@@ -235,8 +230,8 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
         requests=report.physical_requests,
         logical_pages=report.logical_pages,
         operating_seconds=portal.operating_seconds,
-        time_to_first_row_seconds=time_to_first_row_seconds,
-        wall_seconds=wall_seconds,
+        time_to_first_row_seconds=MODEL_REQUEST_SECONDS if identities else None,
+        wall_seconds=portal.operating_seconds,
         buffered_rows_high_water=report.buffered_rows_high_water,
         outcome=outcome,
         snapshot_state=snapshot_state,

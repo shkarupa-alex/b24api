@@ -9,7 +9,7 @@ includes only `b24api*`. The normative entry point remains
 | W9 obligation | Executable closure |
 |---|---|
 | Pin disposable entity allowlist by ID and reviewed content hash. | Runtime and dataset schema require `w0-disposable-entities-v1` plus `425cdca3...b754`; edited allowlists fail before plan/live setup. |
-| Prevent plan-self-raised scale. | Reviewed constant is 500 entities per cell; both schema and semantic validator enforce the hard maximum and any lower plan ceiling. |
+| Prevent plan-self-raised scale. | Reviewed constants cap the whole plan at 500 entities, each cell at 500, and the plan at two unique disposable profiles/cells; schema and semantic validation enforce every ceiling plus any lower plan ceiling. |
 | Conservative non-empty estimates. | The direct lifecycle model requires positive finite duration/quota, zero batch commands, and at least `5 * entities + 4` requests for preflight, create/read-back, pre-delete ownership read, delete, and absence verification. |
 | Bind marker hash/value/correlation. | Marker is exactly `<namespace>:<sha256(run, cell, index)>`; `marker_hash` is SHA-256 over UTF-8 marker bytes. Both are verified on every manifest read/append. |
 | Frozen and independent PASS snapshot hashes. | Oracle schema/validator require verified state and equal non-null pre/post SHA-256 values. Persistent changed state after three tries is only `INCONCLUSIVE`. |
@@ -58,6 +58,13 @@ persistent-mutation states with offset and keyset plans. The sparse case has
 10,000 matches over more than 100,000 base identities. Mutation produces
 distinct independent pre/post hashes through actual model mutation and three retries, ending `INCONCLUSIVE`;
 every stable model oracle has equal hashes and PASS.
+
+The offline matrix preregisters a deterministic latency model of 1 ms per
+request. Its `wall_seconds` and first-row fields are normalized model values,
+not sampled host-clock performance: every observation is recomputed exactly
+during bundle validation, so timings cannot be redistributed while preserving
+only aggregate sums. Measured wall-clock evidence remains a live-benchmark
+obligation and this draft model matrix cannot authorize a live speed claim.
 
 Ordinary pytest has no path that supplies both live/write flags. `seed` and
 `cleanup` require both flags, reject ordinary pytest, and require a plan with explicit human approval, exact
