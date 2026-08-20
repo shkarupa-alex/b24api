@@ -43,6 +43,9 @@ MINIMUM_COMPARED_PLANS: Final = 2
 MINIMUM_KEY_DISTINCT_BYTES: Final = 16
 MINIMUM_KEY_SHANNON_ENTROPY: Final = 3.5
 MAX_ASCII_CODEPOINT: Final = 0x7F
+MAX_JSON_INPUT_BYTES: Final = 16 * 1024 * 1024
+MAX_MANIFEST_INPUT_BYTES: Final = 64 * 1024 * 1024
+MAX_SCANNED_FILE_BYTES: Final = 64 * 1024 * 1024
 SCHEMA_DIR: Final = Path(__file__).resolve().parents[1] / "schemas"
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -119,7 +122,7 @@ class ManifestLineage:
 
 
 def strict_json_loads(raw: str | bytes) -> Any:
-    """Parse RFC JSON and reject every non-finite value, including 1e400."""
+    """Parse UTF-8 RFC JSON and reject duplicate keys and every non-finite value."""
 
     def reject_constant(value: str) -> None:
         raise ContractError(f"non-finite JSON constant is forbidden: {value}")
@@ -133,7 +136,8 @@ def strict_json_loads(raw: str | bytes) -> Any:
         return result
 
     try:
-        value = json.loads(raw, parse_constant=reject_constant, object_pairs_hook=reject_duplicate_keys)
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        value = json.loads(text, parse_constant=reject_constant, object_pairs_hook=reject_duplicate_keys)
         _require_finite(value)
     except ContractError:
         raise
@@ -178,14 +182,26 @@ def file_sha256(path: Path) -> str:
 
 def read_json_object(path: Path) -> dict[str, Any]:
     """Read a finite JSON object."""
-    try:
-        raw = path.read_bytes()
-    except OSError as error:
-        raise ContractError(f"cannot read {path}: {error}") from error
+    raw = _read_bounded_bytes(path, ceiling=MAX_JSON_INPUT_BYTES, kind="JSON input")
     value = strict_json_loads(raw)
     if not isinstance(value, dict):
         raise ContractError(f"{path} must contain a JSON object")
     return value
+
+
+def _read_bounded_bytes(path: Path, *, ceiling: int, kind: str) -> bytes:
+    """Read one local input only after enforcing its reviewed memory ceiling."""
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise ContractError(f"cannot read {path}: {error}") from error
+    if size > ceiling:
+        raise ContractError(f"{kind} exceeds the reviewed byte ceiling: {path.name}")
+    try:
+        with path.open("rb") as source:
+            return source.read(ceiling + 1)
+    except OSError as error:
+        raise ContractError(f"cannot read {path}: {error}") from error
 
 
 def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -534,10 +550,7 @@ def validate_manifest_record(  # noqa: C901
 
 def load_manifest(path: Path, *, expected: ManifestLineage | None = None) -> list[dict[str, Any]]:
     """Load and fully validate an append-only manifest chain."""
-    try:
-        lines = path.read_bytes().splitlines()
-    except OSError as error:
-        raise ContractError(f"cannot read manifest {path}: {error}") from error
+    lines = _read_bounded_bytes(path, ceiling=MAX_MANIFEST_INPUT_BYTES, kind="manifest").splitlines()
     if not lines:
         raise ContractError("manifest is empty")
     records: list[dict[str, Any]] = []
@@ -570,11 +583,11 @@ def validate_manifest_against_plan(records: Sequence[Mapping[str, Any]], plan: M
         "planned": frozenset({"create_dispatched"}),
         "create_dispatched": frozenset({"created", "ambiguous", "reconciled", "absence_verified"}),
         "ambiguous": frozenset({"reconciled", "absence_verified"}),
-        "created": frozenset({"reconciled", "verified", "delete_dispatched"}),
-        "reconciled": frozenset({"verified", "delete_dispatched"}),
-        "verified": frozenset({"delete_dispatched"}),
-        "delete_dispatched": frozenset({"deleted", "orphan"}),
-        "deleted": frozenset({"absence_verified", "orphan"}),
+        "created": frozenset({"reconciled", "verified", "delete_dispatched", "absence_verified", "orphan"}),
+        "reconciled": frozenset({"verified", "delete_dispatched", "absence_verified", "orphan"}),
+        "verified": frozenset({"delete_dispatched", "absence_verified", "orphan"}),
+        "delete_dispatched": frozenset({"delete_dispatched", "deleted", "absence_verified", "orphan"}),
+        "deleted": frozenset({"delete_dispatched", "absence_verified", "orphan"}),
         "orphan": frozenset({"delete_dispatched", "absence_verified"}),
         "absence_verified": frozenset(),
     }
@@ -896,7 +909,19 @@ def scan_bytes_for_secrets(data: bytes, *, source: str) -> None:
         value = int(match.group(1), 16)
         return bytes((value,)) if value <= MAX_ASCII_CODEPOINT else match.group(0)
 
-    sanitized = _ASCII_UNICODE_ESCAPE_RE.sub(decode_ascii_escape, data).replace(b"\\/", b"/")
+    normalized = data
+    for encoding, bom in (
+        ("utf-32", (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")),
+        ("utf-16", (b"\xff\xfe", b"\xfe\xff")),
+    ):
+        if data.startswith(bom):
+            try:
+                decoded = data.decode(encoding).encode("utf-8")
+            except UnicodeDecodeError:
+                decoded = b""
+            normalized += decoded
+            break
+    sanitized = _ASCII_UNICODE_ESCAPE_RE.sub(decode_ascii_escape, normalized).replace(b"\\/", b"/")
     for literal in allowlisted:
         sanitized = sanitized.replace(literal, b"")
     if _WEBHOOK_RE.search(sanitized) or _QUERY_SECRET_RE.search(sanitized) or _ENV_SECRET_RE.search(sanitized):
@@ -907,7 +932,7 @@ def scan_paths_for_secrets(paths: Iterable[Path]) -> None:
     """Scan a bounded set of files and report only the path containing a leak."""
     for path in paths:
         if path.is_file():
-            data = path.read_bytes()
+            data = _read_bounded_bytes(path, ceiling=MAX_SCANNED_FILE_BYTES, kind="secret-scan input")
             if path.name == "contracts_test.py":
                 data = b"\n".join(
                     line

@@ -46,7 +46,6 @@ from .contracts import (
     read_json_object,
     require_clean_tracked_tree,
     scan_paths_for_secrets,
-    strict_json_loads,
     tracked_repository_paths,
     validate_benchmark_plan,
     validate_dataset_plan,
@@ -129,6 +128,7 @@ def _dispatch(args: argparse.Namespace) -> ExitCode:
 
 
 def _plan(args: argparse.Namespace) -> ExitCode:
+    started = time.monotonic()
     if args.allow_writes:
         raise ContractError("plan is read-only; --allow-writes is invalid")
     run_id = _uuid_or_new(args.run_id, "run_id")
@@ -215,7 +215,11 @@ def _plan(args: argparse.Namespace) -> ExitCode:
         command="plan",
         dataset_plan=dataset_plan,
         manifest_hash=None,
-        metrics={"kind": "operation", "http_attempts": int(args.live) * 2, "wall_seconds": 0.0},
+        metrics={
+            "kind": "operation",
+            "http_attempts": int(args.live) * 2,
+            "wall_seconds": max(time.monotonic() - started, 0.000001),
+        },
     )
     _write_validated_artifact(artifact_dir / "plan-evidence.json", artifact)
     _scan_bundle(artifact_dir)
@@ -536,13 +540,19 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
         or cases[0].get("compared_plans") != ["offset", "keyset"]
     ):
         raise ContractError("the deterministic runner accepts only its exact MODEL-MATRIX offset/keyset draft")
-    started = time.monotonic()
-    runs = run_exact_matrix_sync()
-    rows = sum(len(run.identities) for run in runs if run.outcome == "PASS")
-    requests = sum(run.requests for run in runs)
-    logical_pages = sum(run.logical_pages for run in runs)
-    stable_offset = [run for run in runs if run.plan == "offset" and run.outcome == "PASS"]
-    stable_keyset = [run for run in runs if run.plan == "keyset" and run.outcome == "PASS"]
+    run_exact_matrix_sync()  # one declared warmup; its observations are intentionally discarded
+    runs = tuple(
+        run
+        for _ in range(int(benchmark_plan["controls"]["advisory_runs"]))
+        for run in run_exact_matrix_sync()
+    )
+    stable_runs = [run for run in runs if run.outcome == "PASS"]
+    rows = sum(len(run.identities) for run in stable_runs)
+    requests = sum(run.requests for run in stable_runs)
+    logical_pages = sum(run.logical_pages for run in stable_runs)
+    stable_offset = [run for run in stable_runs if run.plan == "offset"]
+    stable_keyset = [run for run in stable_runs if run.plan == "keyset"]
+    matrix_width = len(runs) // int(benchmark_plan["controls"]["advisory_runs"])
     offset_control = sum(run.operating_seconds for run in stable_offset) / sum(run.requests for run in stable_offset)
     keyset_control = sum(run.operating_seconds for run in stable_keyset) / sum(run.requests for run in stable_keyset)
     controls = derive_drift_controls(
@@ -562,11 +572,11 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
         "time_to_first_row_seconds": min(
             run.time_to_first_row_seconds for run in runs if run.time_to_first_row_seconds is not None
         ),
-        "wall_seconds": max(time.monotonic() - started, 0.000001),
-        "server_operating_seconds": sum(run.operating_seconds for run in runs),
+        "wall_seconds": max(sum(run.wall_seconds for run in stable_runs), 0.000001),
+        "server_operating_seconds": sum(run.operating_seconds for run in stable_runs),
         "retries": 0,
         "cooldown_seconds": 0.0,
-        "buffered_rows_high_water": max(run.buffered_rows_high_water for run in runs),
+        "buffered_rows_high_water": max(run.buffered_rows_high_water for run in stable_runs),
         "rss_delta_bytes": None,
         "raw_rows": rows,
         "unique_rows": rows,
@@ -579,12 +589,13 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
     artifact_dir = args.artifact_dir.resolve()
     oracle_dir = artifact_dir / "model-oracles"
     oracle_refs: list[str] = []
-    for run in runs:
+    for run_index, run in enumerate(runs):
+        oracle_case_id = f"{run.case_id}-{run.plan}-run-{run_index // matrix_width + 1}"
         oracle = {
             "schema_version": SCHEMA_VERSION,
             "run_id": plan["run_id"],
             "lineage_id": plan["lineage_id"],
-            "case_id": f"{run.case_id}-{run.plan}",
+            "case_id": oracle_case_id,
             "candidate_sha": plan["candidate_sha"],
             "dataset_plan_content_hash": content_sha256(plan),
             "manifest_content_hash": run.expected_hash,
@@ -601,7 +612,7 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
             "outcome": run.outcome,
         }
         validate_oracle_record(oracle)
-        atomic_write_json(oracle_dir / f"{run.case_id}-{run.plan}.json", oracle)
+        atomic_write_json(oracle_dir / f"{oracle_case_id}.json", oracle)
         if run.outcome == "PASS":
             oracle_refs.append(f"sha256:{content_sha256(oracle)}")
     model_matrix = {"schema_version": SCHEMA_VERSION, "runs": [asdict(run) for run in runs]}
@@ -636,6 +647,7 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
 
 
 def _resume(args: argparse.Namespace) -> ExitCode:
+    started = time.monotonic()
     if args.live or args.allow_writes:
         raise ContractError(
             "resume is read-only validation; continue writes with the idempotent seed or cleanup command",
@@ -647,7 +659,12 @@ def _resume(args: argparse.Namespace) -> ExitCode:
         command="resume",
         dataset_plan=plan,
         manifest_hash=manifest_content_hash(_manifest_path(args)),
-        metrics={"kind": "operation", "http_attempts": 0, "wall_seconds": 0.0, "records": len(records)},
+        metrics={
+            "kind": "operation",
+            "http_attempts": 0,
+            "wall_seconds": max(time.monotonic() - started, 0.000001),
+            "records": len(records),
+        },
     )
     artifact_path = args.artifact_dir.resolve() / "resume-evidence.json"
     _write_validated_artifact(artifact_path, artifact)
@@ -736,6 +753,9 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0915
                 previous = checked
                 continue
             if _entity_marker(owned, str(cell["marker_field"])) != active_record["marker_value"]:
+                if active_record["event"] == "orphan":
+                    orphans.append(str(active_record["correlation_key"]))
+                    continue
                 checked = build_manifest_record(
                     {
                         **base,
@@ -805,6 +825,7 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0915
 
 
 def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
+    started = time.monotonic()
     if not args.live:
         raise ContractError("recover-manifest requires --live")
     if args.allow_writes:
@@ -907,7 +928,7 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0
         metrics={
             "kind": "operation",
             "http_attempts": portal_attempts,
-            "wall_seconds": 0.0,
+            "wall_seconds": max(time.monotonic() - started, 0.000001),
             "records": len(candidates),
         },
         outcome="INCONCLUSIVE",
@@ -916,7 +937,7 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0
     _write_validated_artifact(artifact_dir / "recovery-evidence.json", artifact)
     _scan_bundle(artifact_dir)
     _safe_message(f"confirmed candidate manifest written: {manifest_path}")
-    return ExitCode.COMPLETED
+    return ExitCode.INCOMPLETE
 
 
 def _operation_artifact(  # noqa: PLR0913
@@ -1232,27 +1253,66 @@ def _entity_marker(entity: Mapping[str, Any], marker_field: str) -> object:
     return entity.get(marker_field, entity.get(marker_field.casefold()))
 
 
-def _scan_bundle(artifact_dir: Path) -> None:
+def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912
     scan_paths_for_secrets(tracked_repository_paths(ROOT))
     artifact_paths = [path for path in artifact_dir.rglob("*") if path.is_file()]
     scan_paths_for_secrets(artifact_paths)
-    json_hashes: set[str] = set()
+    json_documents: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
     for path in artifact_paths:
         if path.suffix == ".json" and not path.name.endswith("-evidence.json"):
-            value = strict_json_loads(path.read_bytes())
-            json_hashes.add(content_sha256(value))
+            value = read_json_object(path)
+            json_documents.setdefault(content_sha256(value), []).append((path, value))
+    artifacts: list[dict[str, Any]] = []
     for path in artifact_paths:
         if not path.name.endswith("-evidence.json"):
             continue
         artifact = read_json_object(path)
         validate_evidence_artifact(artifact)
+        artifacts.append(artifact)
         for reference in artifact["evidence_refs"]:
             if (
                 isinstance(reference, str)
                 and reference.startswith("sha256:")
-                and reference.removeprefix("sha256:") not in json_hashes
+                and reference.removeprefix("sha256:") not in json_documents
             ):
                 raise ContractError(f"evidence content hash has no matching immutable JSON in {artifact_dir}")
+    if not artifacts:
+        return
+    lineage_fields = (
+        "run_id",
+        "lineage_id",
+        "candidate_sha",
+        "dataset_plan_content_hash",
+        "portal_fingerprint",
+    )
+    lineages = {tuple(artifact[field] for field in lineage_fields) for artifact in artifacts}
+    if len(lineages) != 1:
+        raise ContractError("evidence bundle mixes run, lineage, candidate, dataset plan, or portal identity")
+    lineage = next(iter(lineages))
+    expected = dict(zip(lineage_fields, lineage, strict=True))
+    plan_hash = str(expected["dataset_plan_content_hash"])
+    plan_candidates = json_documents.get(plan_hash, [])
+    if not plan_candidates:
+        raise ContractError("evidence dataset plan content hash has no matching immutable JSON")
+    dataset_plan = plan_candidates[0][1]
+    validate_dataset_plan(dataset_plan)
+    if (
+        dataset_plan["run_id"] != expected["run_id"]
+        or dataset_plan["lineage_id"] != expected["lineage_id"]
+        or dataset_plan["candidate_sha"] != expected["candidate_sha"]
+        or dataset_plan["portal"]["fingerprint"] != expected["portal_fingerprint"]
+    ):
+        raise ContractError("evidence bundle lineage does not match its immutable dataset plan")
+    for documents in json_documents.values():
+        for path, document in documents:
+            if path.name != "oracle.json" and path.parent.name != "model-oracles":
+                continue
+            validate_oracle_record(document)
+            if any(
+                document[field] != expected[field]
+                for field in ("run_id", "lineage_id", "candidate_sha", "dataset_plan_content_hash")
+            ):
+                raise ContractError("oracle lineage does not match the evidence bundle")
 
 
 def _safe_message(message: str) -> None:

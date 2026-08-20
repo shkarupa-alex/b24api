@@ -67,7 +67,7 @@ FINGERPRINT_KEY_BYTES = 32
 LARGE_CASE_ROWS = 10_000
 SPARSE_BASE_MINIMUM = 100_000
 EXPECTED_MUTATION_RETRIES = 3
-EXPECTED_STABLE_MODEL_RUNS = 18
+EXPECTED_STABLE_MODEL_RUNS = 90
 EXPECTED_SCHEMA_COUNT = 6
 LEAK_FIXTURE = b"https://example.invalid/rest/1/realisticToken123/"
 
@@ -283,6 +283,16 @@ def test_strict_json_rejects_every_nonfinite_form(literal: str) -> None:
 def test_strict_json_rejects_duplicate_object_keys() -> None:
     with pytest.raises(ContractError, match="duplicate"):
         strict_json_loads('{"value":1,"value":2}')
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
+def test_json_inputs_are_utf8_only_and_encoded_secrets_remain_detectable(encoding: str) -> None:
+    webhook = "https://real.example" + "/rest/13/realisticToken123/"
+    raw = json.dumps({"value": webhook}).encode(encoding)
+    with pytest.raises(ContractError, match="invalid JSON"):
+        strict_json_loads(raw)
+    with pytest.raises(SecretLeakError):
+        scan_bytes_for_secrets(raw, source="encoded-artifact.json")
 
 
 @pytest.mark.parametrize(
@@ -729,10 +739,36 @@ def test_benchmark_parent_hashes_detect_oracle_tampering(tmp_path: Path) -> None
     assert f"sha256:{content_sha256(json.loads((tmp_path / 'model-matrix.json').read_text()))}" not in artifact[
         "evidence_refs"
     ]
-    oracle_path = tmp_path / "model-oracles/empty-offset.json"
+    oracle_path = tmp_path / "model-oracles/empty-offset-run-1.json"
     oracle_path.write_text("{}")
     with pytest.raises(ContractError, match="content hash"):
         cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - bundle-integrity regression
+
+
+def test_bundle_rejects_evidence_from_two_runs_even_when_each_document_is_valid(tmp_path: Path) -> None:
+    first = _run_cli(
+        "plan",
+        "--artifact-dir",
+        str(tmp_path),
+        "--run-id",
+        RUN_ID,
+        "--lineage-id",
+        LINEAGE_ID,
+    )
+    assert first.returncode == ExitCode.COMPLETED, first.stderr
+    benchmark = _run_cli("benchmark", "--artifact-dir", str(tmp_path))
+    assert benchmark.returncode == ExitCode.COMPLETED, benchmark.stderr
+    second = _run_cli(
+        "plan",
+        "--artifact-dir",
+        str(tmp_path),
+        "--run-id",
+        str(uuid.uuid4()),
+        "--lineage-id",
+        str(uuid.uuid4()),
+    )
+    assert second.returncode == ExitCode.INVALID
+    assert "mixes run" in second.stderr
 
 
 def test_admission_ready_benchmark_never_runs_the_model_matrix_as_a_substitute(tmp_path: Path) -> None:
@@ -888,6 +924,73 @@ def test_cleanup_reconciles_an_ambiguous_create_before_claiming_absence(
     latest = load_manifest(manifest_path)[-1]
     assert latest["event"] == "absence_verified"
     validate_manifest_against_plan(load_manifest(manifest_path), plan)
+
+
+def test_cleanup_resumes_after_delete_dispatch_without_corrupting_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _approved_live_plan()
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    manifest_path = tmp_path / "manifest.jsonl"
+    previous = build_manifest_record(_manifest_base(plan))
+    append_manifest_record(manifest_path, previous)
+    for event in ("create_dispatched", "created", "verified", "delete_dispatched"):
+        previous = build_manifest_record(
+            {
+                **_manifest_base(plan),
+                "event": event,
+                "entity_id": None if event == "create_dispatched" else "owned-123",
+                "request_fingerprint": SHA256,
+            },
+            previous=previous,
+        )
+        append_manifest_record(manifest_path, previous)
+
+    class FakeAdapter:
+        delete_method = "tasks.task.delete"
+        id_parameter = "taskId"
+
+        def read(self, _portal: object, _entity_id: str) -> None:
+            return None
+
+    class FakePortal:
+        identity = PortalIdentity("portal.invalid", "admin_full", "1", SHA256)
+        attempts = 0
+
+        def __init__(self, *, role: str) -> None:
+            assert role == "admin_full"
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
+            assert required_scopes == {"task"}
+            return LivePreflight(self.identity, "build-1", frozenset({"task"}))
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+    monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
+    monkeypatch.setitem(ADAPTERS, "tasks-task-v1", FakeAdapter())
+    result = cli_module._cleanup(  # noqa: SLF001 - direct crash-window regression
+        Namespace(
+            live=True,
+            allow_writes=True,
+            plan=plan_path,
+            manifest=manifest_path,
+            artifact_dir=tmp_path,
+            run_id=None,
+            lineage_id=None,
+            credential_role="admin_full",
+        ),
+    )
+    assert result == ExitCode.COMPLETED
+    records = load_manifest(manifest_path)
+    assert records[-1]["event"] == "absence_verified"
+    validate_manifest_against_plan(records, plan)
 
 
 def test_seed_never_redispatches_an_unresolved_create(

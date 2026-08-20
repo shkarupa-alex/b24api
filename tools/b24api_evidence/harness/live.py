@@ -41,6 +41,26 @@ class LivePreflight:
     scopes: frozenset[str]
 
 
+def _bounded_response_payload(response: httpx.Response, *, method: str) -> bytes:
+    """Consume a streamed response without crossing the reviewed memory ceiling."""
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError as error:
+            raise LiveCorrectnessError(f"live response has invalid content length for {method}") from error
+        if declared > MAX_RESPONSE_BYTES:
+            raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
+    chunks: list[bytes] = []
+    received = 0
+    for chunk in response.iter_bytes():
+        received += len(chunk)
+        if received > MAX_RESPONSE_BYTES:
+            raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class LivePortal:
     """Minimal synchronous webhook session whose URL never enters artifacts or errors."""
 
@@ -71,15 +91,18 @@ class LivePortal:
         """Call one REST method and return a strictly decoded, bounded envelope."""
         self.attempts += 1
         try:
-            response = self._client.post(urljoin(self._webhook_url, method), json=parameters or {})
+            with self._client.stream(
+                "POST",
+                urljoin(self._webhook_url, method),
+                json=parameters or {},
+            ) as response:
+                if response.status_code != HTTP_OK:
+                    raise LiveUnavailableError(f"live HTTP status {response.status_code} for {method}")
+                payload = _bounded_response_payload(response, method=method)
         except httpx.HTTPError as error:
             raise LiveUnavailableError(f"live transport unavailable for {method}") from error
-        if response.status_code != HTTP_OK:
-            raise LiveUnavailableError(f"live HTTP status {response.status_code} for {method}")
-        if len(response.content) > MAX_RESPONSE_BYTES:
-            raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
         try:
-            envelope = strict_json_loads(response.content)
+            envelope = strict_json_loads(payload)
         except ContractError as error:
             raise LiveCorrectnessError(f"live response is not JSON for {method}") from error
         if not isinstance(envelope, dict):

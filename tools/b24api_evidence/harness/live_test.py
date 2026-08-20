@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from .live import ADAPTERS, LiveApiError, LiveCorrectnessError, LivePortal
+from .live import ADAPTERS, MAX_RESPONSE_BYTES, LiveApiError, LiveCorrectnessError, LivePortal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -59,6 +59,20 @@ def test_live_envelope_rejects_overflow_json_and_hides_unknown_error(
         with pytest.raises(LiveCorrectnessError) as captured:
             portal.call("scope")
     assert "should-never-be-rendered" not in str(captured.value)
+
+
+def test_live_envelope_refuses_oversized_content_before_buffering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-length": str(MAX_RESPONSE_BYTES + 1)},
+            content=b"{}",
+        )
+
+    with _portal(monkeypatch, handler) as portal, pytest.raises(LiveCorrectnessError, match="byte ceiling"):
+        portal.call("scope")
 
 
 def test_point_read_classifies_typed_not_found_without_rendering_portal_text(
