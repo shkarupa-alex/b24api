@@ -38,6 +38,7 @@ from b24api.plans import (
     OffsetContinuation,
     OffsetSequentialPlan,
     OffsetTerminalRule,
+    PartitionedKeysetPlan,
     SingleResponsePlan,
 )
 from b24api.redaction import DEFAULT_REDACTOR
@@ -144,6 +145,10 @@ class CapabilitySet:
     batch_supported: bool = False
     fixed_page_cap: bool = False
 
+    def __post_init__(self) -> None:
+        if any(type(getattr(self, field_name)) is not bool for field_name in self.__dataclass_fields__):
+            raise TypeError("capability controls must be booleans")
+
 
 @dataclass(frozen=True, slots=True)
 class ProbeSpec:
@@ -195,7 +200,7 @@ class EndpointProfile:
     required_probes: tuple[ProbeSpec, ...] = ()
     source_sha256: str | None = field(default=None, repr=False, compare=False)
 
-    def __post_init__(self) -> None:  # noqa: C901, PLR0912 - one strict immutable validation boundary
+    def __post_init__(self) -> None:  # noqa: C901, PLR0912, PLR0915 - strict immutable boundary
         if self.schema_version != PROFILE_SCHEMA_VERSION:
             raise ValueError("unsupported endpoint profile schema version")
         if not _ID_RE.fullmatch(self.profile_id):
@@ -220,6 +225,16 @@ class EndpointProfile:
         object.__setattr__(self, "required_scopes", scopes)
         if not isinstance(self.query, QueryPredicate):
             raise TypeError("query must be a QueryPredicate")
+        if not isinstance(
+            self.plan,
+            SingleResponsePlan
+            | OffsetSequentialPlan
+            | CountedOffsetPlan
+            | KeysetPlan
+            | ItemCursorPlan
+            | PartitionedKeysetPlan,
+        ):
+            raise TypeError("plan must be a canonical ListPlan")
         if not isinstance(self.identity, IdentitySpec | type(None)):
             raise TypeError("identity must be an IdentitySpec or None")
         if self.page_cap is not None and (isinstance(self.page_cap, bool) or self.page_cap < 1):
@@ -232,6 +247,10 @@ class EndpointProfile:
         object.__setattr__(self, "required_probes", tuple(self.required_probes))
         if not self.evidence:
             raise ValueError("profile requires reviewed evidence anchors")
+        if any(not isinstance(anchor, EvidenceAnchor) for anchor in self.evidence):
+            raise TypeError("profile evidence must contain EvidenceAnchor values")
+        if any(not isinstance(probe, ProbeSpec) for probe in self.required_probes):
+            raise TypeError("required_probes must contain ProbeSpec values")
         if any(anchor.reviewed_at > self.verified_at for anchor in self.evidence):
             raise ValueError("profile verification cannot predate its evidence review")
         if any(anchor.expires_at < self.expires_at for anchor in self.evidence):

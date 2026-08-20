@@ -27,6 +27,11 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError
 
 SCHEMA_VERSION: Final = "2.0"
+ORIGINAL_HEAD_SHA: Final = "08277c4d921b83b9252177b3e72a21a4c0c86109"
+FIXED_1X_SHA: Final = "82f2d9ddafa50e5229c4191b66b0ad6db4ad4600"
+SKILLS_CORPUS_SHA: Final = "a353a58fb1de7abf2c81dd86fc7d8ad1caea8f2f"
+SKILLS_RECIPE_TREE_SHA256: Final = "7c6c83487df9913076f16f1cab8630b065df2250f026c4679871957e51343b66"
+INSTRUMENTATION_REVIEW_SHA: Final = "521f0eb7cb107ec948c693496154f94e57dbf7c9"
 REVIEWED_PROFILE_SET_ID: Final = "w0-disposable-entities-v1"
 REVIEWED_PROFILE_SET_SHA256: Final = "425cdca3d9f0682974c50afc9af4d4d3fa90dc6233ee785290ba7632bd30b754"
 REVIEWED_MAX_ENTITIES_PER_CELL: Final = 500
@@ -115,6 +120,10 @@ class ManifestLineage:
 
     run_id: str
     lineage_id: str
+    original_head_sha: str
+    fixed_1x_sha: str
+    skills_corpus_sha: str
+    skills_recipe_tree_sha256: str
     dataset_plan_content_hash: str
     portal_fingerprint: str
     candidate_sha: str
@@ -309,7 +318,12 @@ def validate_dataset_plan(plan: Mapping[str, Any]) -> None:  # noqa: C901, PLR09
             "schema_version",
             "run_id",
             "lineage_id",
+            "original_head_sha",
             "candidate_sha",
+            "generator_sha",
+            "skills_corpus_sha",
+            "skills_recipe_tree_sha256",
+            "credential_role",
             "disposable_profile_set_id",
             "disposable_profiles_content_hash",
             "portal",
@@ -326,6 +340,8 @@ def validate_dataset_plan(plan: Mapping[str, Any]) -> None:  # noqa: C901, PLR09
     _require_uuid(plan["run_id"], "run_id")
     _require_uuid(plan["lineage_id"], "lineage_id")
     _require_sha(plan["candidate_sha"], "candidate_sha")
+    if plan["generator_sha"] != plan["candidate_sha"]:
+        raise ContractError("dataset plan generator_sha must equal the executing candidate")
     if plan["disposable_profile_set_id"] != REVIEWED_PROFILE_SET_ID:
         raise ContractError("dataset plan profile_set_id is not reviewed")
     if plan["disposable_profiles_content_hash"] != REVIEWED_PROFILE_SET_SHA256:
@@ -334,6 +350,8 @@ def validate_dataset_plan(plan: Mapping[str, Any]) -> None:  # noqa: C901, PLR09
     if not isinstance(namespace, str) or not _NAMESPACE_RE.fullmatch(namespace):
         raise ContractError("dataset plan namespace is invalid")
     portal = _mapping(plan["portal"], "portal")
+    if plan["credential_role"] != portal["role"]:
+        raise ContractError("dataset plan credential_role must equal portal.role")
     if portal["role"] == "model":
         if portal["fingerprint_algorithm"] != "sha256-public-model-v1":
             raise ContractError("model portal must use the public deterministic fingerprint")
@@ -497,6 +515,10 @@ def validate_manifest_record(  # noqa: C901
         "sequence",
         "run_id",
         "lineage_id",
+        "original_head_sha",
+        "fixed_1x_sha",
+        "skills_corpus_sha",
+        "skills_recipe_tree_sha256",
         "dataset_plan_content_hash",
         "portal_fingerprint",
         "candidate_sha",
@@ -661,6 +683,7 @@ def validate_oracle_record(record: Mapping[str, Any]) -> None:
     for field in (
         "dataset_plan_content_hash",
         "manifest_content_hash",
+        "portal_fingerprint",
         "expected_result_hash",
         "actual_result_hash",
     ):

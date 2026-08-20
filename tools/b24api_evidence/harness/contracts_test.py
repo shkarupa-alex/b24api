@@ -10,6 +10,7 @@ import sys
 import uuid
 import zipfile
 from argparse import Namespace
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -19,10 +20,15 @@ from . import cli as cli_module
 from .contracts import (
     FINGERPRINT_ALGORITHM,
     FINGERPRINT_KEY_FORMAT,
+    FIXED_1X_SHA,
+    INSTRUMENTATION_REVIEW_SHA,
+    ORIGINAL_HEAD_SHA,
     REVIEWED_MAX_ENTITIES_PER_CELL,
     REVIEWED_PROFILE_SET_ID,
     REVIEWED_PROFILE_SET_SHA256,
     SCHEMA_VERSION,
+    SKILLS_CORPUS_SHA,
+    SKILLS_RECIPE_TREE_SHA256,
     ContractError,
     ExitCode,
     ManifestLineage,
@@ -68,7 +74,9 @@ LARGE_CASE_ROWS = 10_000
 SPARSE_BASE_MINIMUM = 100_000
 EXPECTED_MUTATION_RETRIES = 3
 EXPECTED_STABLE_MODEL_RUNS = 90
+EXPECTED_BENCHMARK_REFS = EXPECTED_STABLE_MODEL_RUNS + 1
 EXPECTED_SCHEMA_COUNT = 6
+BUNDLE_OVERFLOW_FILES = 513
 LEAK_FIXTURE = b"https://example.invalid/rest/1/realisticToken123/"
 
 
@@ -79,7 +87,12 @@ def _plan(*, count: int = 5) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "run_id": RUN_ID,
         "lineage_id": LINEAGE_ID,
+        "original_head_sha": ORIGINAL_HEAD_SHA,
         "candidate_sha": SHA,
+        "generator_sha": SHA,
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
+        "credential_role": "model",
         "disposable_profile_set_id": REVIEWED_PROFILE_SET_ID,
         "disposable_profiles_content_hash": REVIEWED_PROFILE_SET_SHA256,
         "portal": {
@@ -145,6 +158,7 @@ def _approved_live_plan(*, count: int = 1) -> dict[str, Any]:
         build="build-1",
         scope_hash=content_sha256(["task"]),
     )
+    plan["credential_role"] = "admin_full"
     plan["authorization"].update(
         state="approved_for_seed",
         live=True,
@@ -164,6 +178,10 @@ def _manifest_base(plan: dict[str, Any]) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "run_id": RUN_ID,
         "lineage_id": LINEAGE_ID,
+        "original_head_sha": ORIGINAL_HEAD_SHA,
+        "fixed_1x_sha": FIXED_1X_SHA,
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
         "dataset_plan_content_hash": content_sha256(plan),
         "portal_fingerprint": SHA256,
         "candidate_sha": SHA,
@@ -189,8 +207,14 @@ def _benchmark_plan(*, state: str = "admission_ready") -> dict[str, Any]:
         "lineage_id": LINEAGE_ID,
         "admission_state": state,
         "thresholds_normative": state == "admission_ready",
+        "original_head_sha": ORIGINAL_HEAD_SHA,
+        "fixed_1x_sha": FIXED_1X_SHA,
         "candidate_sha": SHA,
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
         "dataset_plan_content_hash": SHA256,
+        "manifest_content_hash": SHA256,
+        "instrumentation_review_sha": INSTRUMENTATION_REVIEW_SHA,
         "controls": {
             "warmups": 1,
             "advisory_runs": 5,
@@ -228,13 +252,17 @@ def _benchmark_artifact() -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "run_id": RUN_ID,
         "lineage_id": LINEAGE_ID,
+        "original_head_sha": ORIGINAL_HEAD_SHA,
+        "fixed_1x_sha": FIXED_1X_SHA,
         "portal_fingerprint": SHA256,
         "host": "model.local",
         "candidate_sha": SHA,
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
         "command": "benchmark",
         "phase": "complete",
         "case_id": "MODEL-MATRIX",
-        "manifest_content_hash": None,
+        "manifest_content_hash": SHA256,
         "profile_versions": [REVIEWED_PROFILE_SET_ID],
         "plan_versions": [SCHEMA_VERSION],
         "runtime": {"python": "3.12.10", "b24api": "test", "httpx": "0.28.1"},
@@ -397,7 +425,18 @@ def test_manifest_hash_chain_marker_and_resume_lineage(tmp_path: Path) -> None:
     second_base = {**_manifest_base(plan), "event": "verified", "entity_id": "42"}
     second = build_manifest_record(second_base, previous=first)
     append_manifest_record(path, second)
-    lineage = ManifestLineage(RUN_ID, LINEAGE_ID, content_sha256(plan), SHA256, SHA, plan["namespace"])
+    lineage = ManifestLineage(
+        run_id=RUN_ID,
+        lineage_id=LINEAGE_ID,
+        original_head_sha=ORIGINAL_HEAD_SHA,
+        fixed_1x_sha=FIXED_1X_SHA,
+        skills_corpus_sha=SKILLS_CORPUS_SHA,
+        skills_recipe_tree_sha256=SKILLS_RECIPE_TREE_SHA256,
+        dataset_plan_content_hash=content_sha256(plan),
+        portal_fingerprint=SHA256,
+        candidate_sha=SHA,
+        namespace=str(plan["namespace"]),
+    )
     assert load_manifest(path, expected=lineage) == [first, second]
     mismatched = copy.deepcopy(second)
     mismatched["marker_hash"] = "f" * 64
@@ -408,14 +447,7 @@ def test_manifest_hash_chain_marker_and_resume_lineage(tmp_path: Path) -> None:
     with pytest.raises(ContractError, match="run_id"):
         load_manifest(
             path,
-            expected=ManifestLineage(
-                str(uuid.uuid4()),
-                LINEAGE_ID,
-                content_sha256(plan),
-                SHA256,
-                SHA,
-                plan["namespace"],
-            ),
+                expected=replace(lineage, run_id=str(uuid.uuid4())),
         )
 
 
@@ -463,9 +495,14 @@ def test_oracle_snapshot_pass_requires_equal_nonnull_hashes(requirement: str) ->
         "run_id": RUN_ID,
         "lineage_id": LINEAGE_ID,
         "case_id": "MODEL-offset",
+        "original_head_sha": ORIGINAL_HEAD_SHA,
+        "fixed_1x_sha": FIXED_1X_SHA,
         "candidate_sha": SHA,
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
         "dataset_plan_content_hash": SHA256,
         "manifest_content_hash": SHA256,
+        "portal_fingerprint": SHA256,
         "expected_result_hash": SHA256,
         "actual_result_hash": SHA256,
         "outcome": "PASS",
@@ -736,16 +773,15 @@ def test_benchmark_parent_hashes_detect_oracle_tampering(tmp_path: Path) -> None
     artifact = json.loads((tmp_path / "benchmark-evidence.json").read_text())
     matrix = json.loads((tmp_path / "model-matrix.json").read_text())
     stable = [run for run in matrix["runs"] if run["outcome"] == "PASS"]
-    assert len(artifact["evidence_refs"]) == EXPECTED_STABLE_MODEL_RUNS
+    assert len(artifact["evidence_refs"]) == EXPECTED_BENCHMARK_REFS
     assert artifact["metrics"]["http_attempts"] == sum(run["requests"] for run in stable)
     assert artifact["metrics"]["logical_pages"] == sum(run["logical_pages"] for run in stable)
     assert artifact["metrics"]["server_operating_seconds"] == pytest.approx(
         sum(run["operating_seconds"] for run in stable),
     )
     assert artifact["safe_violations"][0]["code"] == "mutation_diagnostic_inconclusive"
-    assert f"sha256:{content_sha256(json.loads((tmp_path / 'model-matrix.json').read_text()))}" not in artifact[
-        "evidence_refs"
-    ]
+    assert f"sha256:{content_sha256(matrix)}" in artifact["evidence_refs"]
+    assert all(run["outcome"] == "PASS" for run in matrix["runs"])
     artifact_path = tmp_path / "benchmark-evidence.json"
     original_artifact = artifact_path.read_text()
     arbitrary = {"schema_version": SCHEMA_VERSION, "value": "not an oracle"}
@@ -753,7 +789,7 @@ def test_benchmark_parent_hashes_detect_oracle_tampering(tmp_path: Path) -> None
     arbitrary_path.write_text(json.dumps(arbitrary))
     artifact["evidence_refs"] = [f"sha256:{content_sha256(arbitrary)}"]
     artifact_path.write_text(json.dumps(artifact))
-    with pytest.raises(ContractError, match="qualified PASS oracle"):
+    with pytest.raises(ContractError, match="benchmark PASS"):
         cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - dependency-type regression
     artifact["evidence_refs"] = []
     artifact_path.write_text(json.dumps(artifact))
@@ -792,6 +828,13 @@ def test_bundle_rejects_evidence_from_two_runs_even_when_each_document_is_valid(
     assert "mixes run" in second.stderr
 
 
+def test_bundle_refuses_unbounded_file_count_before_parsing_documents(tmp_path: Path) -> None:
+    for index in range(BUNDLE_OVERFLOW_FILES):
+        (tmp_path / f"unreferenced-{index}.json").write_text("{}")
+    with pytest.raises(ContractError, match="file-count ceiling"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - aggregate-bound regression
+
+
 def test_admission_ready_benchmark_never_runs_the_model_matrix_as_a_substitute(tmp_path: Path) -> None:
     dataset_plan = _plan(count=0)
     benchmark_plan = _benchmark_plan()
@@ -812,6 +855,27 @@ def test_admission_ready_benchmark_never_runs_the_model_matrix_as_a_substitute(t
     )
     assert result.returncode == ExitCode.UNAVAILABLE
     assert "admission-ready" in result.stderr
+
+
+def test_model_benchmark_rejects_run_controls_it_cannot_execute_exactly(tmp_path: Path) -> None:
+    initial = _run_cli("plan", "--artifact-dir", str(tmp_path))
+    assert initial.returncode == ExitCode.COMPLETED, initial.stderr
+    benchmark_path = tmp_path / "benchmark-plan.json"
+    benchmark_plan = json.loads(benchmark_path.read_text())
+    benchmark_plan["controls"]["warmups"] = 3
+    benchmark_path.write_text(json.dumps(benchmark_plan))
+    result = _run_cli(
+        "benchmark",
+        "--artifact-dir",
+        str(tmp_path / "output"),
+        "--plan",
+        str(tmp_path / "dataset-plan.json"),
+        "--benchmark-plan",
+        str(benchmark_path),
+    )
+    assert result.returncode == ExitCode.INVALID
+    assert "exact bounded draft run controls" in result.stderr
+    assert not (tmp_path / "output/model-matrix.json").exists()
 
 
 def test_resume_rejects_incompatible_run_lineage(tmp_path: Path) -> None:

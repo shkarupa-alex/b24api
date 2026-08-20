@@ -3,11 +3,14 @@
   "$id": "https://b24api.local/schemas/evidence/benchmark-plan-2.0.json",
   "title": "Preregistered normalized benchmark plan",
   "type": "object", "additionalProperties": false,
-  "required": ["schema_version", "plan_id", "lineage_id", "admission_state", "thresholds_normative", "candidate_sha", "dataset_plan_content_hash", "controls", "cases"],
+  "required": ["schema_version", "plan_id", "lineage_id", "admission_state", "thresholds_normative", "original_head_sha", "fixed_1x_sha", "candidate_sha", "skills_corpus_sha", "skills_recipe_tree_sha256", "dataset_plan_content_hash", "manifest_content_hash", "instrumentation_review_sha", "controls", "cases"],
   "properties": {
     "schema_version": {"const": "2.0"}, "plan_id": {"$ref": "#/$defs/uuid"}, "lineage_id": {"$ref": "#/$defs/uuid"},
     "admission_state": {"enum": ["draft", "admission_ready"]}, "thresholds_normative": {"type": "boolean"},
+    "original_head_sha": {"const": "08277c4d921b83b9252177b3e72a21a4c0c86109"}, "fixed_1x_sha": {"const": "82f2d9ddafa50e5229c4191b66b0ad6db4ad4600"},
     "candidate_sha": {"$ref": "#/$defs/sha"}, "dataset_plan_content_hash": {"$ref": "#/$defs/sha256"},
+    "skills_corpus_sha": {"const": "a353a58fb1de7abf2c81dd86fc7d8ad1caea8f2f"}, "skills_recipe_tree_sha256": {"const": "7c6c83487df9913076f16f1cab8630b065df2250f026c4679871957e51343b66"},
+    "manifest_content_hash": {"$ref": "#/$defs/sha256"}, "instrumentation_review_sha": {"const": "521f0eb7cb107ec948c693496154f94e57dbf7c9"},
     "controls": {"$ref": "#/$defs/controls"}, "cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}}
   },
   "allOf": [

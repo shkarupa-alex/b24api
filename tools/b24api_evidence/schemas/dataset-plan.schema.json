@@ -5,7 +5,8 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version", "run_id", "lineage_id", "candidate_sha",
+    "schema_version", "run_id", "lineage_id", "original_head_sha", "candidate_sha", "generator_sha",
+    "skills_corpus_sha", "skills_recipe_tree_sha256", "credential_role",
     "disposable_profile_set_id", "disposable_profiles_content_hash",
     "portal", "namespace", "cells", "estimated", "cleanup", "authorization"
   ],
@@ -13,7 +14,12 @@
     "schema_version": {"const": "2.0"},
     "run_id": {"$ref": "#/$defs/uuid"},
     "lineage_id": {"$ref": "#/$defs/uuid"},
+    "original_head_sha": {"const": "08277c4d921b83b9252177b3e72a21a4c0c86109"},
     "candidate_sha": {"$ref": "#/$defs/sha"},
+    "generator_sha": {"$ref": "#/$defs/sha"},
+    "skills_corpus_sha": {"const": "a353a58fb1de7abf2c81dd86fc7d8ad1caea8f2f"},
+    "skills_recipe_tree_sha256": {"const": "7c6c83487df9913076f16f1cab8630b065df2250f026c4679871957e51343b66"},
+    "credential_role": {"enum": ["model", "admin_full", "admin_limited", "employee_full", "employee_limited"]},
     "disposable_profile_set_id": {"const": "w0-disposable-entities-v1"},
     "disposable_profiles_content_hash": {"const": "425cdca3d9f0682974c50afc9af4d4d3fa90dc6233ee785290ba7632bd30b754"},
     "portal": {"$ref": "#/$defs/portal"},

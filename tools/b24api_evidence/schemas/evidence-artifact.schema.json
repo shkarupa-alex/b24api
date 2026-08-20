@@ -3,12 +3,14 @@
   "$id": "https://b24api.local/schemas/evidence/evidence-artifact-2.0.json",
   "title": "Bitrix24 evidence operation artifact",
   "type": "object", "additionalProperties": false,
-  "required": ["schema_version", "run_id", "lineage_id", "portal_fingerprint", "host", "command", "phase", "case_id", "candidate_sha", "dataset_plan_content_hash", "manifest_content_hash", "profile_versions", "plan_versions", "runtime", "started_at", "finished_at", "outcome", "terminal_state", "assurance", "snapshot_requirement", "snapshot_state", "metrics", "controls", "evidence_refs", "safe_violations"],
+  "required": ["schema_version", "run_id", "lineage_id", "portal_fingerprint", "host", "command", "phase", "case_id", "original_head_sha", "fixed_1x_sha", "candidate_sha", "skills_corpus_sha", "skills_recipe_tree_sha256", "dataset_plan_content_hash", "manifest_content_hash", "profile_versions", "plan_versions", "runtime", "started_at", "finished_at", "outcome", "terminal_state", "assurance", "snapshot_requirement", "snapshot_state", "metrics", "controls", "evidence_refs", "safe_violations"],
   "properties": {
     "schema_version": {"const": "2.0"}, "run_id": {"$ref": "#/$defs/uuid"}, "lineage_id": {"$ref": "#/$defs/uuid"},
     "portal_fingerprint": {"$ref": "#/$defs/sha256"}, "host": {"type": "string", "pattern": "^[A-Za-z0-9.-]+$"},
     "command": {"enum": ["plan", "seed", "verify", "benchmark", "resume", "cleanup", "recover-manifest"]}, "phase": {"type": "string", "maxLength": 100},
-    "case_id": {"type": ["string", "null"]}, "candidate_sha": {"$ref": "#/$defs/sha"}, "dataset_plan_content_hash": {"$ref": "#/$defs/sha256"},
+    "case_id": {"type": ["string", "null"]},
+    "original_head_sha": {"const": "08277c4d921b83b9252177b3e72a21a4c0c86109"}, "fixed_1x_sha": {"const": "82f2d9ddafa50e5229c4191b66b0ad6db4ad4600"},
+    "candidate_sha": {"$ref": "#/$defs/sha"}, "skills_corpus_sha": {"const": "a353a58fb1de7abf2c81dd86fc7d8ad1caea8f2f"}, "skills_recipe_tree_sha256": {"const": "7c6c83487df9913076f16f1cab8630b065df2250f026c4679871957e51343b66"}, "dataset_plan_content_hash": {"$ref": "#/$defs/sha256"},
     "manifest_content_hash": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}, "benchmark_plan_content_hash": {"$ref": "#/$defs/sha256"},
     "profile_versions": {"type": "array", "items": {"type": "string"}}, "plan_versions": {"type": "array", "items": {"type": "string"}},
     "runtime": {"type": "object", "additionalProperties": false, "required": ["python", "b24api", "httpx"], "properties": {"python": {"type": "string"}, "b24api": {"type": "string"}, "httpx": {"type": "string"}}},
@@ -23,7 +25,7 @@
   "allOf": [
     {"if": {"properties": {"outcome": {"const": "PASS"}}, "required": ["outcome"]}, "then": {"properties": {"terminal_state": {"const": "completed"}, "safe_violations": {"not": {"contains": {"properties": {"severity": {"const": "blocking"}}, "required": ["severity"]}}}}}},
     {"if": {"properties": {"outcome": {"const": "PASS"}, "snapshot_requirement": {"enum": ["frozen_manifest", "independent_pre_post_oracle"]}}, "required": ["outcome", "snapshot_requirement"]}, "then": {"properties": {"snapshot_state": {"const": "verified"}}}},
-    {"if": {"properties": {"command": {"const": "benchmark"}}, "required": ["command"]}, "then": {"required": ["benchmark_plan_content_hash"], "properties": {"case_id": {"type": "string"}, "assurance": {"const": "oracle_verified"}, "controls": {"$ref": "#/$defs/benchmarkControls"}, "metrics": {"$ref": "#/$defs/benchmarkMetrics"}}}},
+    {"if": {"properties": {"command": {"const": "benchmark"}}, "required": ["command"]}, "then": {"required": ["benchmark_plan_content_hash"], "properties": {"case_id": {"type": "string"}, "manifest_content_hash": {"$ref": "#/$defs/sha256"}, "assurance": {"const": "oracle_verified"}, "controls": {"$ref": "#/$defs/benchmarkControls"}, "metrics": {"$ref": "#/$defs/benchmarkMetrics"}}}},
     {"if": {"properties": {"command": {"const": "cleanup"}}, "required": ["command"]}, "then": {"properties": {"metrics": {"$ref": "#/$defs/cleanupMetrics"}}}},
     {"if": {"properties": {"command": {"const": "cleanup"}, "outcome": {"const": "PASS"}}, "required": ["command", "outcome"]}, "then": {"properties": {"metrics": {"properties": {"orphan_count": {"const": 0}, "absence_verified": {"const": true}}, "required": ["orphan_count", "absence_verified"]}}}},
     {"if": {"properties": {"command": {"enum": ["plan", "seed", "verify", "resume", "recover-manifest"]}}, "required": ["command"]}, "then": {"properties": {"controls": {"type": "null"}, "metrics": {"$ref": "#/$defs/operationMetrics"}}}}

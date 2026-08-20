@@ -5,7 +5,8 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version", "sequence", "run_id", "lineage_id", "dataset_plan_content_hash",
+    "schema_version", "sequence", "run_id", "lineage_id", "original_head_sha", "fixed_1x_sha",
+    "skills_corpus_sha", "skills_recipe_tree_sha256", "dataset_plan_content_hash",
     "portal_fingerprint", "candidate_sha", "namespace", "event", "cell_id", "entity_family",
     "correlation_key", "entity_id", "marker_hash", "marker_value", "request_fingerprint",
     "previous_record_hash", "record_hash", "recorded_at", "safe_error"
@@ -14,6 +15,10 @@
     "schema_version": {"const": "2.0"},
     "sequence": {"type": "integer", "minimum": 0},
     "run_id": {"$ref": "#/$defs/uuid"}, "lineage_id": {"$ref": "#/$defs/uuid"},
+    "original_head_sha": {"const": "08277c4d921b83b9252177b3e72a21a4c0c86109"},
+    "fixed_1x_sha": {"const": "82f2d9ddafa50e5229c4191b66b0ad6db4ad4600"},
+    "skills_corpus_sha": {"const": "a353a58fb1de7abf2c81dd86fc7d8ad1caea8f2f"},
+    "skills_recipe_tree_sha256": {"const": "7c6c83487df9913076f16f1cab8630b065df2250f026c4679871957e51343b66"},
     "dataset_plan_content_hash": {"$ref": "#/$defs/sha256"},
     "portal_fingerprint": {"$ref": "#/$defs/sha256"}, "candidate_sha": {"$ref": "#/$defs/sha"},
     "namespace": {"type": "string", "pattern": "^b24api-evidence-[0-9a-f-]{36}$"},

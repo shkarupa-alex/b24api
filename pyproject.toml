@@ -98,6 +98,7 @@ disable_error_code = [
 
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers"]
+asyncio_default_fixture_loop_scope = "function"
 xfail_strict = true
 
 [tool.pytest_env]

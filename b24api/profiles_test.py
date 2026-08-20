@@ -4,11 +4,13 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import Any, cast
 
 import pytest
 
 from b24api.models import CompletionAssurance, ExecutionPolicy, ReplaySafety, Request, ResultSelector
 from b24api.profiles import (
+    CapabilitySet,
     ProbeObservation,
     ProbeStatus,
     ProfileReasonCode,
@@ -140,6 +142,18 @@ def test_strict_loader_builds_immutable_profile_with_content_provenance() -> Non
     assert profile.page_cap == _PAGE_CAP
     assert profile.identity is not None
     assert profile.evidence[0].artifact_sha256 == _ARTIFACT_SHA
+
+
+def test_runtime_profile_contract_rejects_noncanonical_plans_and_capability_values() -> None:
+    profile = load_profile_document(_document())
+
+    class FakePlan:
+        pass
+
+    with pytest.raises(TypeError, match="canonical ListPlan"):
+        replace(profile, plan=cast("Any", FakePlan()))
+    with pytest.raises(TypeError, match="booleans"):
+        CapabilitySet(stable_order=cast("Any", "true"))
 
 
 @pytest.mark.parametrize(

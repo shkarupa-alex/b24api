@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import hashlib
+import math
 import os
 import platform
 import sys
@@ -20,14 +21,19 @@ from b24api.redaction import DEFAULT_REDACTOR
 from .contracts import (
     FINGERPRINT_ALGORITHM,
     FINGERPRINT_KEY_FORMAT,
+    FIXED_1X_SHA,
+    INSTRUMENTATION_REVIEW_SHA,
     MAX_MUTATION_RETRIES,
     NORMATIVE_MAXIMUM_OPERATING_RATIO,
     NORMATIVE_MAXIMUM_SMALL_P95_RATIO,
     NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT,
+    ORIGINAL_HEAD_SHA,
     REVIEWED_MAX_ENTITIES_PER_CELL,
     REVIEWED_PROFILE_SET_ID,
     REVIEWED_PROFILE_SET_SHA256,
     SCHEMA_VERSION,
+    SKILLS_CORPUS_SHA,
+    SKILLS_RECIPE_TREE_SHA256,
     ContractError,
     ExitCode,
     ManifestLineage,
@@ -56,7 +62,7 @@ from .contracts import (
     validate_schema,
 )
 from .live import ADAPTERS, LiveCorrectnessError, LivePortal, LivePreflight, LiveUnavailableError
-from .model import run_exact_matrix_sync
+from .model import ModelRun, exact_model_cases, run_exact_matrix_sync
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -65,6 +71,11 @@ ROOT = Path(__file__).resolve().parents[3]
 PROFILE_SET_PATH = ROOT / "docs/bitrix24-client-2.0/w0/disposable-entity-profiles.json"
 DEFAULT_ARTIFACT_DIR = Path(".b24api-evidence")
 _ROLE_CHOICES = ("admin_full", "admin_limited", "employee_full", "employee_limited")
+_MODEL_WARMUPS = 1
+_MODEL_ADVISORY_RUNS = 5
+_MODEL_BLOCKING_PAIRS = 9
+_MAX_BUNDLE_FILES = 512
+_MAX_BUNDLE_BYTES = 128 * 1024 * 1024
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -174,7 +185,12 @@ def _plan(args: argparse.Namespace) -> ExitCode:
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "lineage_id": lineage_id,
+        "original_head_sha": ORIGINAL_HEAD_SHA,
         "candidate_sha": candidate_sha,
+        "generator_sha": candidate_sha,
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
+        "credential_role": portal_data["role"],
         "disposable_profile_set_id": REVIEWED_PROFILE_SET_ID,
         "disposable_profiles_content_hash": REVIEWED_PROFILE_SET_SHA256,
         "portal": portal_data,
@@ -211,6 +227,7 @@ def _plan(args: argparse.Namespace) -> ExitCode:
     benchmark_plan = _default_benchmark_plan(dataset_plan)
     validate_benchmark_plan(benchmark_plan)
     atomic_write_json(artifact_dir / "benchmark-plan.json", benchmark_plan)
+    atomic_write_json(artifact_dir / "model-fixture-manifest.json", _model_fixture_manifest())
     artifact = _operation_artifact(
         command="plan",
         dataset_plan=dataset_plan,
@@ -426,6 +443,7 @@ def _seed_inconclusive(
         terminal_state="incomplete",
     )
     _write_validated_artifact(artifact_dir / "seed-evidence.json", artifact)
+    _scan_bundle(artifact_dir)
     return ExitCode.INCOMPLETE
 
 
@@ -476,9 +494,14 @@ def _verify(args: argparse.Namespace) -> ExitCode:
         "run_id": plan["run_id"],
         "lineage_id": plan["lineage_id"],
         "case_id": "MANIFEST",
+        "original_head_sha": ORIGINAL_HEAD_SHA,
+        "fixed_1x_sha": FIXED_1X_SHA,
         "candidate_sha": plan["candidate_sha"],
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
         "dataset_plan_content_hash": content_sha256(plan),
         "manifest_content_hash": manifest_hash,
+        "portal_fingerprint": plan["portal"]["fingerprint"],
         "expected_result_hash": pre_hash,
         "actual_result_hash": post_hash,
         "qualification": "bounded_point_read" if args.live else "immutable_manifest",
@@ -532,6 +555,20 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
         raise ContractError("benchmark plan lineage does not match the dataset plan and candidate")
     if benchmark_plan["admission_state"] != "draft":
         raise LiveUnavailableError("admission-ready benchmark plans require the unavailable reviewed live runner")
+    _require_exact_model_benchmark_plan(benchmark_plan)
+    controls_config = benchmark_plan["controls"]
+
+    run_exact_matrix_sync()  # one declared warmup; its observations are intentionally discarded
+    runs = tuple(
+        run
+        for _ in range(int(controls_config["advisory_runs"]))
+        for run in run_exact_matrix_sync()
+    )
+    return _benchmark_runs_and_artifact(args, plan=plan, benchmark_plan=benchmark_plan, runs=runs)
+
+
+def _require_exact_model_benchmark_plan(benchmark_plan: Mapping[str, Any]) -> None:
+    """Refuse draft controls the deterministic runner cannot execute exactly."""
     cases = benchmark_plan["cases"]
     if (
         not isinstance(cases, list)
@@ -540,19 +577,34 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
         or cases[0].get("compared_plans") != ["offset", "keyset"]
     ):
         raise ContractError("the deterministic runner accepts only its exact MODEL-MATRIX offset/keyset draft")
-    run_exact_matrix_sync()  # one declared warmup; its observations are intentionally discarded
-    runs = tuple(
-        run
-        for _ in range(int(benchmark_plan["controls"]["advisory_runs"]))
-        for run in run_exact_matrix_sync()
-    )
+    controls_config = benchmark_plan["controls"]
+    if (
+        controls_config["warmups"] != _MODEL_WARMUPS
+        or controls_config["advisory_runs"] != _MODEL_ADVISORY_RUNS
+        or controls_config["blocking_pairs"] != _MODEL_BLOCKING_PAIRS
+        or controls_config["interleaving"] is not True
+    ):
+        raise ContractError("the deterministic runner accepts only its exact bounded draft run controls")
+    if benchmark_plan["manifest_content_hash"] != content_sha256(_model_fixture_manifest()):
+        raise ContractError("the deterministic runner requires its exact immutable model fixture manifest")
+
+
+def _benchmark_runs_and_artifact(
+    args: argparse.Namespace,
+    *,
+    plan: Mapping[str, Any],
+    benchmark_plan: Mapping[str, Any],
+    runs: tuple[ModelRun, ...],
+) -> ExitCode:
+    """Persist the already executed exact model matrix and its qualified evidence."""
+    controls_config = benchmark_plan["controls"]
     stable_runs = [run for run in runs if run.outcome == "PASS"]
     rows = sum(len(run.identities) for run in stable_runs)
     requests = sum(run.requests for run in stable_runs)
     logical_pages = sum(run.logical_pages for run in stable_runs)
     stable_offset = [run for run in stable_runs if run.plan == "offset"]
     stable_keyset = [run for run in stable_runs if run.plan == "keyset"]
-    matrix_width = len(runs) // int(benchmark_plan["controls"]["advisory_runs"])
+    matrix_width = len(runs) // int(controls_config["advisory_runs"])
     offset_control = sum(run.operating_seconds for run in stable_offset) / sum(run.requests for run in stable_offset)
     keyset_control = sum(run.operating_seconds for run in stable_keyset) / sum(run.requests for run in stable_keyset)
     controls = derive_drift_controls(
@@ -596,9 +648,14 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
             "run_id": plan["run_id"],
             "lineage_id": plan["lineage_id"],
             "case_id": oracle_case_id,
+            "original_head_sha": ORIGINAL_HEAD_SHA,
+            "fixed_1x_sha": FIXED_1X_SHA,
             "candidate_sha": plan["candidate_sha"],
+            "skills_corpus_sha": SKILLS_CORPUS_SHA,
+            "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
             "dataset_plan_content_hash": content_sha256(plan),
             "manifest_content_hash": run.expected_hash,
+            "portal_fingerprint": plan["portal"]["fingerprint"],
             "expected_result_hash": run.expected_hash,
             "actual_result_hash": run.actual_hash,
             "qualification": "independent_cross_method",
@@ -615,31 +672,55 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
         atomic_write_json(oracle_dir / f"{oracle_case_id}.json", oracle)
         if run.outcome == "PASS":
             oracle_refs.append(f"sha256:{content_sha256(oracle)}")
-    model_matrix = {"schema_version": SCHEMA_VERSION, "runs": [asdict(run) for run in runs]}
+    stable_observations = [
+        {"iteration": index // matrix_width + 1, **asdict(run)}
+        for index, run in enumerate(runs)
+        if run.outcome == "PASS"
+    ]
+    model_matrix = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": plan["run_id"],
+        "lineage_id": plan["lineage_id"],
+        "original_head_sha": ORIGINAL_HEAD_SHA,
+        "fixed_1x_sha": FIXED_1X_SHA,
+        "candidate_sha": plan["candidate_sha"],
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
+        "dataset_plan_content_hash": content_sha256(plan),
+        "benchmark_plan_content_hash": content_sha256(benchmark_plan),
+        "runs": stable_observations,
+    }
     atomic_write_json(artifact_dir / "model-matrix.json", model_matrix)
+    model_diagnostics = {
+        "schema_version": SCHEMA_VERSION,
+        "runs": [asdict(run) for run in runs if run.outcome != "PASS"],
+    }
+    atomic_write_json(artifact_dir / "model-diagnostics.json", model_diagnostics)
+    matrix_ref = f"sha256:{content_sha256(model_matrix)}"
     artifact = _operation_artifact(
         command="benchmark",
         dataset_plan=plan,
-        manifest_hash=None,
+        manifest_hash=str(benchmark_plan["manifest_content_hash"]),
         metrics=metrics,
         assurance="oracle_verified",
         extra={
             "benchmark_plan_content_hash": content_sha256(benchmark_plan),
             "controls": controls,
             "case_id": "MODEL-MATRIX",
-            "evidence_refs": oracle_refs,
+            "evidence_refs": [*oracle_refs, matrix_ref],
             "safe_violations": [
                 {
                     "severity": "warning",
                     "code": "mutation_diagnostic_inconclusive",
                     "message": "persistent-mutation runs are diagnostic and are not dependencies of stable-case PASS",
-                    "field": "model-matrix.json",
+                    "field": "model-diagnostics.json",
                 },
             ],
         },
     )
     atomic_write_json(artifact_dir / "benchmark-plan.json", benchmark_plan)
     atomic_write_json(artifact_dir / "dataset-plan.json", plan)
+    atomic_write_json(artifact_dir / "model-fixture-manifest.json", _model_fixture_manifest())
     _write_validated_artifact(artifact_dir / "benchmark-evidence.json", artifact)
     _scan_bundle(artifact_dir)
     _safe_message(f"benchmark completed: {artifact_dir / 'benchmark-evidence.json'}")
@@ -846,12 +927,24 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0
         for field in (
             "run_id",
             "lineage_id",
+            "original_head_sha",
+            "fixed_1x_sha",
+            "skills_corpus_sha",
+            "skills_recipe_tree_sha256",
             "dataset_plan_content_hash",
             "candidate_sha",
             "portal_fingerprint",
             "namespace",
         ):
             expected = content_sha256(plan) if field == "dataset_plan_content_hash" else plan.get(field)
+            if field == "original_head_sha":
+                expected = ORIGINAL_HEAD_SHA
+            if field == "fixed_1x_sha":
+                expected = FIXED_1X_SHA
+            if field == "skills_corpus_sha":
+                expected = SKILLS_CORPUS_SHA
+            if field == "skills_recipe_tree_sha256":
+                expected = SKILLS_RECIPE_TREE_SHA256
             if field == "portal_fingerprint":
                 expected = plan["portal"]["fingerprint"]
             if prior_preview.get(field) != expected:
@@ -877,6 +970,10 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0
         "schema_version": SCHEMA_VERSION,
         "run_id": plan["run_id"],
         "lineage_id": plan["lineage_id"],
+        "original_head_sha": ORIGINAL_HEAD_SHA,
+        "fixed_1x_sha": FIXED_1X_SHA,
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
         "dataset_plan_content_hash": content_sha256(plan),
         "candidate_sha": plan["candidate_sha"],
         "portal_fingerprint": plan["portal"]["fingerprint"],
@@ -961,12 +1058,16 @@ def _operation_artifact(  # noqa: PLR0913
         "schema_version": SCHEMA_VERSION,
         "run_id": dataset_plan["run_id"],
         "lineage_id": dataset_plan["lineage_id"],
+        "original_head_sha": ORIGINAL_HEAD_SHA,
+        "fixed_1x_sha": FIXED_1X_SHA,
         "portal_fingerprint": dataset_plan["portal"]["fingerprint"],
         "host": dataset_plan["portal"]["host"],
         "command": command,
         "phase": "complete",
         "case_id": None,
         "candidate_sha": dataset_plan["candidate_sha"],
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
         "dataset_plan_content_hash": content_sha256(dataset_plan),
         "manifest_content_hash": manifest_hash,
         "profile_versions": [dataset_plan["disposable_profile_set_id"]],
@@ -1004,12 +1105,18 @@ def _default_benchmark_plan(dataset_plan: Mapping[str, Any]) -> dict[str, Any]:
         "lineage_id": dataset_plan["lineage_id"],
         "admission_state": "draft",
         "thresholds_normative": False,
+        "original_head_sha": ORIGINAL_HEAD_SHA,
+        "fixed_1x_sha": FIXED_1X_SHA,
         "candidate_sha": dataset_plan["candidate_sha"],
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
         "dataset_plan_content_hash": content_sha256(dataset_plan),
+        "manifest_content_hash": content_sha256(_model_fixture_manifest()),
+        "instrumentation_review_sha": INSTRUMENTATION_REVIEW_SHA,
         "controls": {
-            "warmups": 1,
-            "advisory_runs": 5,
-            "blocking_pairs": 9,
+            "warmups": _MODEL_WARMUPS,
+            "advisory_runs": _MODEL_ADVISORY_RUNS,
+            "blocking_pairs": _MODEL_BLOCKING_PAIRS,
             "interleaving": True,
             "drift": {"status": "tbd_live", "max_rtt_ratio": "TBD-LIVE", "max_operating_ratio": "TBD-LIVE"},
         },
@@ -1029,6 +1136,24 @@ def _default_benchmark_plan(dataset_plan: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _model_fixture_manifest() -> dict[str, Any]:
+    """Return the immutable deterministic fixture lineage used by the offline matrix."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "deterministic-model-fixture",
+        "cases": [
+            {
+                "case_id": case.case_id,
+                "expected_hash": case.expected_hash,
+                "raw_count": len(case.identities),
+                "base_count": case.base_count,
+                "mutation": case.mutation,
+            }
+            for case in exact_model_cases()
+        ],
+    }
+
+
 def _manifest_base(
     plan: Mapping[str, Any],
     *,
@@ -1040,6 +1165,10 @@ def _manifest_base(
         "schema_version": SCHEMA_VERSION,
         "run_id": plan["run_id"],
         "lineage_id": plan["lineage_id"],
+        "original_head_sha": ORIGINAL_HEAD_SHA,
+        "fixed_1x_sha": FIXED_1X_SHA,
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
         "dataset_plan_content_hash": content_sha256(plan),
         "portal_fingerprint": plan["portal"]["fingerprint"],
         "candidate_sha": plan["candidate_sha"],
@@ -1059,6 +1188,10 @@ def _lineage(plan: Mapping[str, Any]) -> ManifestLineage:
     return ManifestLineage(
         run_id=str(plan["run_id"]),
         lineage_id=str(plan["lineage_id"]),
+        original_head_sha=ORIGINAL_HEAD_SHA,
+        fixed_1x_sha=FIXED_1X_SHA,
+        skills_corpus_sha=SKILLS_CORPUS_SHA,
+        skills_recipe_tree_sha256=SKILLS_RECIPE_TREE_SHA256,
         dataset_plan_content_hash=content_sha256(plan),
         portal_fingerprint=str(plan["portal"]["fingerprint"]),
         candidate_sha=str(plan["candidate_sha"]),
@@ -1074,11 +1207,10 @@ def _load_plan(args: argparse.Namespace, *, allow_generated: bool = False) -> di
             lineage_id = _uuid_or_new(args.lineage_id, "lineage_id")
             plan = _model_dataset_plan(run_id=run_id, lineage_id=lineage_id)
             validate_dataset_plan(plan)
-            return plan
-        path = default
+        else:
+            plan = read_json_object(default)
     else:
-        path = args.plan
-    plan = read_json_object(path)
+        plan = read_json_object(args.plan)
     validate_dataset_plan(plan)
     if plan["candidate_sha"] != git_sha(ROOT):
         raise ContractError("dataset plan candidate_sha does not match the executing evidence code")
@@ -1086,6 +1218,9 @@ def _load_plan(args: argparse.Namespace, *, allow_generated: bool = False) -> di
         raise ContractError("requested run_id does not match dataset plan")
     if args.lineage_id is not None and args.lineage_id != plan["lineage_id"]:
         raise ContractError("requested lineage_id does not match dataset plan")
+    artifact_dir = args.artifact_dir.resolve()
+    atomic_write_json(artifact_dir / "dataset-plan.json", plan)
+    _scan_bundle(artifact_dir)
     return plan
 
 
@@ -1096,7 +1231,12 @@ def _model_dataset_plan(*, run_id: str, lineage_id: str) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "lineage_id": lineage_id,
+        "original_head_sha": ORIGINAL_HEAD_SHA,
         "candidate_sha": git_sha(ROOT),
+        "generator_sha": git_sha(ROOT),
+        "skills_corpus_sha": SKILLS_CORPUS_SHA,
+        "skills_recipe_tree_sha256": SKILLS_RECIPE_TREE_SHA256,
+        "credential_role": "model",
         "disposable_profile_set_id": REVIEWED_PROFILE_SET_ID,
         "disposable_profiles_content_hash": REVIEWED_PROFILE_SET_SHA256,
         "portal": _model_portal(),
@@ -1253,9 +1393,22 @@ def _entity_marker(entity: Mapping[str, Any], marker_field: str) -> object:
     return entity.get(marker_field, entity.get(marker_field.casefold()))
 
 
-def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912
+def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912, PLR0915
     scan_paths_for_secrets(tracked_repository_paths(ROOT))
-    artifact_paths = [path for path in artifact_dir.rglob("*") if path.is_file()]
+    artifact_paths: list[Path] = []
+    total_bytes = 0
+    for path in artifact_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        artifact_paths.append(path)
+        if len(artifact_paths) > _MAX_BUNDLE_FILES:
+            raise ContractError("evidence bundle exceeds the reviewed file-count ceiling")
+        try:
+            total_bytes += path.stat().st_size
+        except OSError as error:
+            raise ContractError(f"cannot inspect evidence bundle file: {path.name}") from error
+        if total_bytes > _MAX_BUNDLE_BYTES:
+            raise ContractError("evidence bundle exceeds the reviewed aggregate byte ceiling")
     scan_paths_for_secrets(artifact_paths)
     json_documents: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
     for path in artifact_paths:
@@ -1281,7 +1434,11 @@ def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912
     lineage_fields = (
         "run_id",
         "lineage_id",
+        "original_head_sha",
+        "fixed_1x_sha",
         "candidate_sha",
+        "skills_corpus_sha",
+        "skills_recipe_tree_sha256",
         "dataset_plan_content_hash",
         "portal_fingerprint",
     )
@@ -1299,11 +1456,14 @@ def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912
     if (
         dataset_plan["run_id"] != expected["run_id"]
         or dataset_plan["lineage_id"] != expected["lineage_id"]
+        or dataset_plan["original_head_sha"] != expected["original_head_sha"]
         or dataset_plan["candidate_sha"] != expected["candidate_sha"]
+        or dataset_plan["skills_corpus_sha"] != expected["skills_corpus_sha"]
+        or dataset_plan["skills_recipe_tree_sha256"] != expected["skills_recipe_tree_sha256"]
         or dataset_plan["portal"]["fingerprint"] != expected["portal_fingerprint"]
     ):
         raise ContractError("evidence bundle lineage does not match its immutable dataset plan")
-    qualified_oracle_hashes: set[str] = set()
+    qualified_oracles: dict[str, dict[str, Any]] = {}
     for document_hash, documents in json_documents.items():
         for path, document in documents:
             if path.name != "oracle.json" and path.parent.name != "model-oracles":
@@ -1311,11 +1471,21 @@ def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912
             validate_oracle_record(document)
             if any(
                 document[field] != expected[field]
-                for field in ("run_id", "lineage_id", "candidate_sha", "dataset_plan_content_hash")
+                for field in (
+                    "run_id",
+                    "lineage_id",
+                    "original_head_sha",
+                    "fixed_1x_sha",
+                    "candidate_sha",
+                    "skills_corpus_sha",
+                    "skills_recipe_tree_sha256",
+                    "dataset_plan_content_hash",
+                    "portal_fingerprint",
+                )
             ):
                 raise ContractError("oracle lineage does not match the evidence bundle")
             if document["outcome"] == "PASS":
-                qualified_oracle_hashes.add(document_hash)
+                qualified_oracles[document_hash] = document
     for artifact in artifacts:
         if artifact["outcome"] != "PASS" or artifact["assurance"] != "oracle_verified":
             continue
@@ -1327,9 +1497,9 @@ def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912
         }
         if not references or len(referenced_hashes) != len(references):
             raise ContractError("oracle-verified PASS requires immutable SHA-256 oracle dependencies")
-        if not referenced_hashes <= qualified_oracle_hashes:
-            raise ContractError("oracle-verified PASS references a document that is not a qualified PASS oracle")
         if artifact["command"] == "verify":
+            if not referenced_hashes <= qualified_oracles.keys():
+                raise ContractError("oracle-verified PASS references a document that is not a qualified PASS oracle")
             matching = [
                 document
                 for document_hash in referenced_hashes
@@ -1339,6 +1509,212 @@ def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912
             ]
             if len(matching) != 1:
                 raise ContractError("verify PASS requires exactly one matching MANIFEST oracle")
+        elif artifact["command"] == "benchmark":
+            _validate_benchmark_pass_dependencies(
+                artifact,
+                json_documents=json_documents,
+                qualified_oracles=qualified_oracles,
+            )
+        else:
+            raise ContractError("oracle_verified PASS is unsupported for this command")
+
+
+def _validate_benchmark_pass_dependencies(  # noqa: C901
+    artifact: Mapping[str, Any],
+    *,
+    json_documents: Mapping[str, list[tuple[Path, dict[str, Any]]]],
+    qualified_oracles: Mapping[str, dict[str, Any]],
+) -> None:
+    """Bind a benchmark PASS to its exact plan, stable matrix, oracle set, and metric algebra."""
+    benchmark_plan_hash = str(artifact.get("benchmark_plan_content_hash"))
+    plan_documents = json_documents.get(benchmark_plan_hash, [])
+    if not plan_documents:
+        raise ContractError("benchmark PASS has no immutable benchmark plan")
+    benchmark_plan = plan_documents[0][1]
+    validate_benchmark_plan(benchmark_plan)
+    if benchmark_plan["admission_state"] != "draft":
+        raise ContractError("model benchmark PASS requires its exact draft benchmark plan")
+    _require_exact_model_benchmark_plan(benchmark_plan)
+    if (
+        benchmark_plan["candidate_sha"] != artifact["candidate_sha"]
+        or benchmark_plan["lineage_id"] != artifact["lineage_id"]
+        or benchmark_plan["dataset_plan_content_hash"] != artifact["dataset_plan_content_hash"]
+    ):
+        raise ContractError("benchmark plan lineage does not match its PASS artifact")
+
+    referenced_hashes = {reference.removeprefix("sha256:") for reference in artifact["evidence_refs"]}
+    matrix_hashes = referenced_hashes - qualified_oracles.keys()
+    if len(matrix_hashes) != 1:
+        raise ContractError("benchmark PASS requires exactly one stable model-matrix dependency")
+    matrix_hash = next(iter(matrix_hashes))
+    matrix_candidates = [
+        document
+        for path, document in json_documents.get(matrix_hash, [])
+        if path.name == "model-matrix.json"
+    ]
+    if len(matrix_candidates) != 1:
+        raise ContractError("benchmark PASS matrix hash does not resolve to model-matrix.json")
+    matrix = matrix_candidates[0]
+    if set(matrix) != {
+        "schema_version",
+        "run_id",
+        "lineage_id",
+        "original_head_sha",
+        "fixed_1x_sha",
+        "candidate_sha",
+        "skills_corpus_sha",
+        "skills_recipe_tree_sha256",
+        "dataset_plan_content_hash",
+        "benchmark_plan_content_hash",
+        "runs",
+    }:
+        raise ContractError("benchmark model matrix has an unexpected shape")
+    for field in (
+        "run_id",
+        "lineage_id",
+        "original_head_sha",
+        "fixed_1x_sha",
+        "candidate_sha",
+        "skills_corpus_sha",
+        "skills_recipe_tree_sha256",
+        "dataset_plan_content_hash",
+    ):
+        if matrix[field] != artifact[field]:
+            raise ContractError("benchmark model matrix lineage does not match its PASS artifact")
+    if matrix["benchmark_plan_content_hash"] != benchmark_plan_hash:
+        raise ContractError("benchmark model matrix does not match its benchmark plan")
+    observations = matrix["runs"]
+    if not isinstance(observations, list):
+        raise ContractError("benchmark model matrix runs must be a list")
+    _validate_model_observations(
+        observations,
+        artifact=artifact,
+        referenced_hashes=referenced_hashes,
+        matrix_hash=matrix_hash,
+        qualified_oracles=qualified_oracles,
+    )
+
+
+def _validate_model_observations(
+    observations: list[Any],
+    *,
+    artifact: Mapping[str, Any],
+    referenced_hashes: set[str],
+    matrix_hash: str,
+    qualified_oracles: Mapping[str, dict[str, Any]],
+) -> None:
+    """Enforce the exact deterministic stable-run set and recompute parent metrics."""
+    cases = {case.case_id: case for case in exact_model_cases() if not case.mutation}
+    expected_keys = {
+        (iteration, case_id, plan)
+        for iteration in range(1, _MODEL_ADVISORY_RUNS + 1)
+        for case_id in cases
+        for plan in ("offset", "keyset")
+    }
+    run_fields = {
+        "iteration",
+        "case_id",
+        "plan",
+        "identities",
+        "expected_hash",
+        "actual_hash",
+        "pre_hash",
+        "post_hash",
+        "requests",
+        "logical_pages",
+        "operating_seconds",
+        "time_to_first_row_seconds",
+        "wall_seconds",
+        "buffered_rows_high_water",
+        "outcome",
+        "snapshot_state",
+        "mutation_retries",
+    }
+    observed_keys: set[tuple[int, str, str]] = set()
+    required_oracle_hashes: set[str] = set()
+    oracle_by_case = {str(oracle["case_id"]): (value, oracle) for value, oracle in qualified_oracles.items()}
+    for observation in observations:
+        if not isinstance(observation, dict) or set(observation) != run_fields:
+            raise ContractError("benchmark model observation has an unexpected shape")
+        iteration = observation["iteration"]
+        case_id = observation["case_id"]
+        plan_name = observation["plan"]
+        if (
+            isinstance(iteration, bool)
+            or not isinstance(iteration, int)
+            or not isinstance(case_id, str)
+            or not isinstance(plan_name, str)
+        ):
+            raise ContractError("benchmark model observation identity is malformed")
+        key = (iteration, case_id, plan_name)
+        observed_keys.add(key)
+        case = cases.get(case_id)
+        oracle_entry = oracle_by_case.get(f"{case_id}-{plan_name}-run-{iteration}")
+        if case is None or oracle_entry is None:
+            raise ContractError("benchmark model observation has no exact reviewed case oracle")
+        oracle_hash, oracle = oracle_entry
+        identities = observation["identities"]
+        if identities != list(case.identities) or observation["expected_hash"] != case.expected_hash:
+            raise ContractError("benchmark model observation does not match the deterministic case oracle")
+        if (
+            observation["outcome"] != "PASS"
+            or observation["snapshot_state"] != "verified"
+            or observation["mutation_retries"] != 0
+            or observation["actual_hash"] != oracle["actual_result_hash"]
+            or observation["expected_hash"] != oracle["expected_result_hash"]
+            or len(identities) != oracle["raw_count"]
+            or len(set(identities)) != oracle["unique_count"]
+        ):
+            raise ContractError("benchmark model observation contradicts its PASS oracle")
+        required_oracle_hashes.add(oracle_hash)
+    if len(observations) != len(expected_keys) or observed_keys != expected_keys:
+        raise ContractError("benchmark PASS does not contain the exact stable model run set")
+    if referenced_hashes != required_oracle_hashes | {matrix_hash}:
+        raise ContractError("benchmark PASS references do not equal its exact matrix and oracle set")
+    _validate_benchmark_metric_algebra(observations, artifact)
+
+
+def _validate_benchmark_metric_algebra(observations: list[dict[str, Any]], artifact: Mapping[str, Any]) -> None:
+    metrics = artifact["metrics"]
+    rows = sum(len(run["identities"]) for run in observations)
+    exact_metrics = {
+        "http_attempts": sum(run["requests"] for run in observations),
+        "logical_pages": sum(run["logical_pages"] for run in observations),
+        "buffered_rows_high_water": max(run["buffered_rows_high_water"] for run in observations),
+        "raw_rows": rows,
+        "unique_rows": rows,
+        "overlap": rows,
+    }
+    if any(metrics[field] != value for field, value in exact_metrics.items()):
+        raise ContractError("benchmark PASS integer metrics do not match its stable observations")
+    float_metrics = {
+        "time_to_first_row_seconds": min(
+            run["time_to_first_row_seconds"]
+            for run in observations
+            if run["time_to_first_row_seconds"] is not None
+        ),
+        "wall_seconds": sum(run["wall_seconds"] for run in observations),
+        "server_operating_seconds": sum(run["operating_seconds"] for run in observations),
+    }
+    if any(
+        not math.isclose(float(metrics[field]), float(value), rel_tol=1e-12, abs_tol=1e-12)
+        for field, value in float_metrics.items()
+    ):
+        raise ContractError("benchmark PASS timing metrics do not match its stable observations")
+    offset = [run for run in observations if run["plan"] == "offset"]
+    keyset = [run for run in observations if run["plan"] == "keyset"]
+    offset_control = sum(run["operating_seconds"] for run in offset) / sum(run["requests"] for run in offset)
+    keyset_control = sum(run["operating_seconds"] for run in keyset) / sum(run["requests"] for run in keyset)
+    controls = derive_drift_controls(
+        rtt_before=offset_control,
+        rtt_after=keyset_control,
+        operating_before=offset_control,
+        operating_after=keyset_control,
+        max_rtt_ratio=1.20,
+        max_operating_ratio=1.20,
+    )
+    if content_sha256(artifact["controls"]) != content_sha256(controls):
+        raise ContractError("benchmark PASS drift controls do not match its stable observations")
 
 
 def _safe_message(message: str) -> None:
