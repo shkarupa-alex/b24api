@@ -675,6 +675,11 @@ def test_rollback_base_exception_does_not_mask_primary_bundle_failure(
             scan_bundle=True,
         )
 
+    assert not path.exists()
+    quarantined = tuple(tmp_path.glob(".benchmark-evidence.json.refused-*"))
+    assert len(quarantined) == 1
+    assert json.loads(quarantined[0].read_text())["outcome"] == "PASS"
+
 
 def test_bundle_scan_rechecks_candidate_cleanliness_after_reading(
     tmp_path: Path,

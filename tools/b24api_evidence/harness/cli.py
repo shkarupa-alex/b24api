@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import argparse
+import contextlib
 import hashlib
 import math
 import os
@@ -1227,13 +1228,19 @@ def _write_candidate_json(
 
 def _restore_candidate_json(path: Path, previous: Mapping[str, Any] | None) -> None:
     """Best-effort rollback without masking the candidate or bundle failure."""
+    quarantine: Path | None = None
     try:
-        if previous is None:
-            path.unlink(missing_ok=True)
-        else:
+        if path.exists():
+            quarantine = path.with_name(f".{path.name}.refused-{uuid.uuid4().hex}")
+            path.replace(quarantine)
+        if previous is not None:
             atomic_write_json(path, previous)
     except BaseException:  # noqa: BLE001, S110 - rollback must never mask the primary refusal
         pass
+    finally:
+        if quarantine is not None:
+            with contextlib.suppress(BaseException):
+                quarantine.unlink(missing_ok=True)
 
 
 def _write_validated_artifact(
