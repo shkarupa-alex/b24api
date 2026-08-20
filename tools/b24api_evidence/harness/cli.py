@@ -135,6 +135,8 @@ def _plan(args: argparse.Namespace) -> ExitCode:
     lineage_id = _uuid_or_new(args.lineage_id, "lineage_id")
     if not 0 <= args.count <= REVIEWED_MAX_ENTITIES_PER_CELL:
         raise ContractError(f"count must be between 0 and {REVIEWED_MAX_ENTITIES_PER_CELL}")
+    if args.live and args.count == 0:
+        raise ContractError("live dataset plans require at least one disposable entity")
     profile_set = validate_reviewed_profile_set(PROFILE_SET_PATH)
     profile = _profile(profile_set, args.entity_profile)
     if args.live:
@@ -1126,6 +1128,8 @@ def _require_approved_plan(plan: Mapping[str, Any]) -> None:
         raise ContractError("live writes require a human-reviewed approved_for_seed plan")
     if plan["portal"]["role"] == "model":
         raise ContractError("approved live-write plan cannot target the deterministic model portal")
+    if sum(int(cell["target_count"]) for cell in plan["cells"]) == 0:
+        raise ContractError("approved live-write plans require at least one disposable entity")
 
 
 def _require_portal_match(plan: Mapping[str, Any], portal: LivePortal) -> None:

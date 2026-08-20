@@ -662,6 +662,24 @@ def test_every_live_command_refuses_under_ordinary_pytest(tmp_path: Path) -> Non
     assert "forbidden under ordinary pytest" in result.stderr
 
 
+def test_live_empty_plan_refuses_before_credential_setup(tmp_path: Path) -> None:
+    environment = dict(os.environ)
+    environment.pop("PYTEST_CURRENT_TEST", None)
+    environment.pop("BITRIX24_API_WEBHOOK_URL", None)
+    environment.pop("BITRIX24_EVIDENCE_FINGERPRINT_KEY", None)
+    result = _run_cli(
+        "plan",
+        "--artifact-dir",
+        str(tmp_path),
+        "--live",
+        "--count",
+        "0",
+        environment=environment,
+    )
+    assert result.returncode == ExitCode.INVALID
+    assert "at least one disposable entity" in result.stderr
+
+
 def test_live_benchmark_and_live_resume_never_silently_run_offline(tmp_path: Path) -> None:
     environment = dict(os.environ)
     environment.pop("PYTEST_CURRENT_TEST", None)
