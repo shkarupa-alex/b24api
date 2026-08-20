@@ -660,9 +660,7 @@ def append_manifest_record(path: Path, record: Mapping[str, Any]) -> None:
         fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
         manifest_existed = path.exists()
         existing = (
-            _read_bounded_bytes(path, ceiling=MAX_MANIFEST_INPUT_BYTES, kind="manifest")
-            if manifest_existed
-            else b""
+            _read_bounded_bytes(path, ceiling=MAX_MANIFEST_INPUT_BYTES, kind="manifest") if manifest_existed else b""
         )
         previous_records = load_manifest(path) if manifest_existed else []
         previous = previous_records[-1] if previous_records else None
@@ -947,6 +945,7 @@ def scan_bytes_for_secrets(data: bytes, *, source: str) -> None:
         b"abcdef1234567890",
         b"zyxwvutsrqponmlk",
     )
+
     def decode_ascii_escape(match: re.Match[bytes]) -> bytes:
         value = int(match.group(1), 16)
         return bytes((value,)) if value <= MAX_ASCII_CODEPOINT else match.group(0)

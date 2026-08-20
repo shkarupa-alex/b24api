@@ -82,6 +82,7 @@ class PlanContract:
     invariants: tuple[str, ...] = ("bounded", "terminal_explicit")
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         object.__setattr__(self, "invariants", tuple(self.invariants))
         if not self.invariants or any(not invariant for invariant in self.invariants):
             raise ValueError("plans must declare non-empty local invariants")
@@ -117,6 +118,7 @@ class OffsetSequentialPlan(PlanContract):
     allow_create_controls: bool = True
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         super(OffsetSequentialPlan, self).__post_init__()
         if not isinstance(self.continuation, OffsetContinuation):
             raise TypeError("continuation must be an OffsetContinuation")
@@ -129,10 +131,10 @@ class OffsetSequentialPlan(PlanContract):
             raise ValueError("offset plan requires at least one terminal rule")
         if OffsetTerminalRule.PROFILE_SHORT_PAGE in self.terminal and self.requested_page_size is None:
             raise ValueError("short-page terminal requires a requested_page_size")
-        if (
-            OffsetTerminalRule.QUALIFIED_TOTAL in self.terminal
-            and self.total_semantics not in {TotalSemantics.FILTERED_EXACT, TotalSemantics.ADVISORY}
-        ):
+        if OffsetTerminalRule.QUALIFIED_TOTAL in self.terminal and self.total_semantics not in {
+            TotalSemantics.FILTERED_EXACT,
+            TotalSemantics.ADVISORY,
+        }:
             raise ValueError("qualified-total terminal requires exact or advisory total semantics")
 
 
@@ -149,6 +151,7 @@ class CountedOffsetPlan(PlanContract):
     allow_create_controls: bool = True
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         super(CountedOffsetPlan, self).__post_init__()
         if not isinstance(self.mode, CountedOffsetMode):
             raise TypeError("mode must be a CountedOffsetMode")
@@ -179,6 +182,7 @@ class KeysetPlan(PlanContract):
     allow_create_controls: bool = True
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         super(KeysetPlan, self).__post_init__()
         if self.direction not in {"asc", "desc"}:
             raise ValueError("keyset direction must be asc or desc")
@@ -222,6 +226,7 @@ class ItemCursorPlan(PlanContract):
     allow_create_controls: bool = True
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         super(ItemCursorPlan, self).__post_init__()
         object.__setattr__(self, "cursor_item_path", tuple(self.cursor_item_path))
         if not self.cursor_item_path:
@@ -256,6 +261,7 @@ class PartitionedKeysetPlan(PlanContract):
     merge_order: ReferenceOutputOrder = ReferenceOutputOrder.READY
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         super(PartitionedKeysetPlan, self).__post_init__()
         if self.direction not in {"asc", "desc"}:
             raise ValueError("partition direction must be asc or desc")
@@ -281,6 +287,7 @@ class BatchDispatch:
     fallback_failed: Literal["none", "direct"] = "none"
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not _is_plain_int(self.batch_size) or not 1 <= self.batch_size <= PORTAL_BATCH_CAP:
             raise ValueError("batch_size must be between 1 and 50")
         if not isinstance(self.output_order, ReferenceOutputOrder):
@@ -297,6 +304,7 @@ class DirectDispatch:
     output_order: ReferenceOutputOrder = ReferenceOutputOrder.READY
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not _is_plain_int(self.concurrency) or self.concurrency < 1:
             raise ValueError("direct concurrency must be positive")
         if not isinstance(self.output_order, ReferenceOutputOrder):

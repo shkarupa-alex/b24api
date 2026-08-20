@@ -42,11 +42,15 @@ NESTED_ROW_COUNT = 2
 
 
 class CallbackTransport:
+    """Provide a deterministic test helper."""
+
     def __init__(self, callback: Callable[[Request], WireResponse | Exception]) -> None:
+        """Initialize instance state."""
         self.callback = callback
         self.requests: list[Request] = []
 
     async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+        """Send one transport request attempt."""
         assert attempt_timeout > 0
         self.requests.append(request)
         outcome = self.callback(request)

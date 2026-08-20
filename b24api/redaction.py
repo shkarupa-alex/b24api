@@ -62,6 +62,7 @@ class Redactor:
     max_string: int = 500
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if self.max_depth < 1:
             raise ValueError("max_depth must be positive")
         if self.max_items < 1:
@@ -187,8 +188,7 @@ class Redactor:
     def _is_secret_path(self, path: tuple[PathPart, ...]) -> bool:
         normalized_path = tuple(item.casefold() if isinstance(item, str) else item for item in path)
         return any(
-            normalized_path
-            == tuple(item.casefold() if isinstance(item, str) else item for item in configured_path)
+            normalized_path == tuple(item.casefold() if isinstance(item, str) else item for item in configured_path)
             for configured_path in self.secret_paths
         )
 

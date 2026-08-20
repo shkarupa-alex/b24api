@@ -26,6 +26,11 @@ The committed mappings now preserve:
 - the empty-mapping `list_method=True` result;
 - settings-backed batch size, list page cap, retry timeout, and logger.
 
+`list_sequential` treats a qualified total as terminal only when no contradictory
+continuation remains. `list_batched` preserves the direct-head plus batched-tail
+counted execution and validates every returned range. Cursor compatibility uses
+empty-page confirmation by default rather than unprofiled short-page inference.
+
 Compatibility `list_size` is a caller-declared decoded page cap. Only the
 cursor wrapper sends the committed `LIMIT` control; other wrappers do not
 invent endpoint-specific parameter names.
@@ -42,6 +47,11 @@ The library packages the profile schema and an intentionally empty profile set.
 No endpoint profile or automatic strategy default is admitted before live
 evidence and a separate human decision. The facade refuses a raw profile when
 it lacks exact runtime build/scope context rather than guessing applicability.
+
+Facade resolution is explicit `plan` > exact applicable `profile` > deterministic
+wrapper default. An applicable profile supplies its plan, selector, identity,
+page cap, replay safety, and immutable report provenance; contradictory explicit
+values refuse before I/O.
 
 `OperationReport` records complete hash-only profile provenance. A
 `PROFILE_VERIFIED` report requires profile ID/version, applicability, source

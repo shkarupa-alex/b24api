@@ -3,8 +3,9 @@
 from __future__ import annotations
 import logging
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator, Mapping
-from dataclasses import replace
-from typing import TYPE_CHECKING, Literal, Self, cast, overload
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Literal, Never, Self, cast, overload
 
 from pydantic import BaseModel
 from pydantic_core import to_jsonable_python
@@ -14,11 +15,15 @@ from b24api.entity import LegacyRequest
 from b24api.error import CapabilityError, IncompleteTraversalError
 from b24api.execution import Executor, HttpxTransport
 from b24api.models import (
+    BatchFailure,
+    BatchSuccess,
+    CompletionAssurance,
     ExecutionPolicy,
     IdentityCoercion,
     IdentityRequirement,
     IdentitySpec,
     JsonValue,
+    OperationReport,
     OrderSemantics,
     ParameterPath,
     ReferenceBinding,
@@ -33,7 +38,7 @@ from b24api.models import (
     TerminalState,
     TotalSemantics,
 )
-from b24api.pagination import _LEGACY_RESULT_SELECTOR, ItemStream
+from b24api.pagination import _LEGACY_RESULT_SELECTOR, ItemStream, _coerce_identity, _extract_path
 from b24api.pagination import iter_list as iter_list_stream
 from b24api.plans import (
     PORTAL_BATCH_CAP,
@@ -50,14 +55,13 @@ from b24api.plans import (
     OffsetTerminalRule,
     ReferenceOutputOrder,
 )
+from b24api.profiles import EndpointProfile, choose_plan, query_shape_from_request
 from b24api.references import ReferenceStream, iter_references
 from b24api.references import fan_out as fan_out_stream
 from b24api.settings import Settings, api_settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    from b24api.profiles import EndpointProfile
 
 type RequestMapping = Mapping[str, object]
 type RequestLike = Request | LegacyRequest | RequestMapping
@@ -69,6 +73,19 @@ type UpdateSource = Iterable[Update | UpdateWithPayload] | AsyncIterable[Update 
 
 _ROOT_SELECTOR = ResultSelector.root()
 _PAIR_LENGTH = 2
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedTraversal:
+    plan: ListPlan
+    identity: IdentitySpec | None
+    selector: ResultSelector
+    assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED
+    profile_id: str | None = None
+    profile_version: int | None = None
+    profile_source_sha256: str | None = None
+    profile_evidence_sha256: tuple[str, ...] = ()
+    page_cap_hint: int | None = None
 
 
 class Bitrix24:
@@ -86,6 +103,8 @@ class Bitrix24:
         self._batch_executor = BatchExecutor(self._executor)
         self._default_policy = _policy_from_settings(resolved)
         self._logger = logging.getLogger(resolved.logger_name)
+        self._portal_build = resolved.portal_build
+        self._portal_scopes = resolved.scopes
         host = resolved.webhook_url.host
         if host is None:
             raise ValueError("webhook_url must have a host")
@@ -98,6 +117,8 @@ class Bitrix24:
         *,
         policy: ExecutionPolicy | None = None,
         host: str = "test.invalid",
+        portal_build: str | None = None,
+        scopes: Iterable[str] = (),
     ) -> Bitrix24:
         """Construct a facade over an injected executor for deterministic tests."""
         instance = cls.__new__(cls)
@@ -107,6 +128,8 @@ class Bitrix24:
         instance._batch_executor = BatchExecutor(executor)  # noqa: SLF001 - class-owned alternate constructor
         instance._default_policy = policy or ExecutionPolicy()  # noqa: SLF001 - class-owned alternate constructor
         instance._host = host  # noqa: SLF001 - class-owned alternate constructor
+        instance._portal_build = portal_build  # noqa: SLF001 - class-owned alternate constructor
+        instance._portal_scopes = frozenset(scopes)  # noqa: SLF001 - class-owned alternate constructor
         return instance
 
     async def aclose(self) -> None:
@@ -285,6 +308,51 @@ class Bitrix24:
             policy=policy or self._default_policy,
         )
 
+    def _resolve_traversal(  # noqa: PLR0913
+        self,
+        request: Request,
+        *,
+        plan: ListPlan | None,
+        profile: EndpointProfile | None,
+        default: ListPlan,
+        selector: ResultSelector,
+        identity: IdentitySpec | None,
+        policy: ExecutionPolicy,
+        page_cap_hint: int | None,
+    ) -> _ResolvedTraversal:
+        if plan is not None:
+            if profile is not None:
+                raise CapabilityError("plan and profile cannot both select wrapper traversal")
+            return _ResolvedTraversal(plan, identity, selector, page_cap_hint=page_cap_hint)
+        if profile is None:
+            return _ResolvedTraversal(default, identity, selector, page_cap_hint=page_cap_hint)
+        if profile.source_sha256 is None:
+            raise CapabilityError("endpoint profile requires immutable source provenance")
+        query = query_shape_from_request(
+            request,
+            selector=profile.query.selector,
+            scopes=self._portal_scopes,
+            portal_build=self._portal_build,
+            observed_at=datetime.now(UTC),
+        )
+        decision = choose_plan(profile, query, policy)
+        if not decision.accepted or decision.selected_plan is None:
+            codes = ",".join(reason.code.value for reason in decision.reasons)
+            raise CapabilityError(f"endpoint profile is not applicable: {codes}")
+        if identity is not None and identity != profile.identity:
+            raise CapabilityError("explicit identity contradicts endpoint profile identity")
+        return _ResolvedTraversal(
+            decision.selected_plan,
+            identity or profile.identity,
+            profile.query.selector,
+            assurance=decision.assurance,
+            profile_id=profile.profile_id,
+            profile_version=profile.version,
+            profile_source_sha256=profile.source_sha256,
+            profile_evidence_sha256=tuple(anchor.artifact_sha256 for anchor in profile.evidence),
+            page_cap_hint=profile.page_cap,
+        )
+
     async def list_sequential(  # noqa: PLR0913 - compatibility bridge signature
         self,
         request: RequestLike,
@@ -298,10 +366,13 @@ class Bitrix24:
         """Preserve sequential offset gathering through the shared driver."""
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
-        selected = _resolve_plan(
-            plan,
-            profile,
-            OffsetSequentialPlan(
+        base = _as_profiled_read_request(_canonical_request(request), profile, plan=plan)
+        effective_policy = policy or self._default_policy
+        selected = self._resolve_traversal(
+            base,
+            plan=plan,
+            profile=profile,
+            default=OffsetSequentialPlan(
                 continuation=OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT,
                 terminal=frozenset(
                     {
@@ -311,15 +382,24 @@ class Bitrix24:
                 ),
                 total_semantics=TotalSemantics.ADVISORY,
             ),
+            selector=_LEGACY_RESULT_SELECTOR,
+            identity=identity,
+            policy=effective_policy,
+            page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
         )
         stream = iter_list_stream(
             self._executor,
-            _as_read_request(_canonical_request(request)),
-            plan=selected,
-            selector=_LEGACY_RESULT_SELECTOR,
-            identity=identity,
-            policy=policy or self._default_policy,
-            _page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
+            base,
+            plan=selected.plan,
+            selector=selected.selector,
+            identity=selected.identity,
+            policy=effective_policy,
+            _page_cap_hint=selected.page_cap_hint,
+            _assurance=selected.assurance,
+            _profile_id=selected.profile_id,
+            _profile_version=selected.profile_version,
+            _profile_source_sha256=selected.profile_source_sha256,
+            _profile_evidence_sha256=selected.profile_evidence_sha256,
         )
         items = _completed_items(stream)
         try:
@@ -339,19 +419,49 @@ class Bitrix24:
         identity: IdentitySpec | None = None,
         policy: ExecutionPolicy | None = None,
     ) -> AsyncGenerator[JsonValue]:
-        """Preserve counted gathering with the admitted sequential fallback."""
+        """Preserve committed head-plus-batched-tail counted gathering."""
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
         _validate_batch_size(batch_size)
-        selected = _resolve_plan(plan, profile, CountedOffsetPlan())
-        stream = iter_list_stream(
-            self._executor,
-            _as_read_request(_canonical_request(request)),
-            plan=selected,
+        base = _as_profiled_read_request(_canonical_request(request), profile, plan=plan)
+        effective_policy = policy or self._default_policy
+        if plan is None and profile is None:
+            items = self._list_batched_default(
+                base,
+                page_size=page_size,
+                batch_size=self._configured_batch_size(batch_size) or self._batch_executor.portal_command_cap,
+                identity=identity,
+                policy=effective_policy,
+            )
+            try:
+                async for item in items:
+                    yield item
+            finally:
+                await items.aclose()
+            return
+        selected = self._resolve_traversal(
+            base,
+            plan=plan,
+            profile=profile,
+            default=CountedOffsetPlan(),
             selector=_LEGACY_RESULT_SELECTOR,
             identity=identity,
-            policy=policy or self._default_policy,
-            _page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
+            policy=effective_policy,
+            page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
+        )
+        stream = iter_list_stream(
+            self._executor,
+            base,
+            plan=selected.plan,
+            selector=selected.selector,
+            identity=selected.identity,
+            policy=effective_policy,
+            _page_cap_hint=selected.page_cap_hint,
+            _assurance=selected.assurance,
+            _profile_id=selected.profile_id,
+            _profile_version=selected.profile_version,
+            _profile_source_sha256=selected.profile_source_sha256,
+            _profile_evidence_sha256=selected.profile_evidence_sha256,
         )
         items = _completed_items(stream)
         try:
@@ -359,6 +469,93 @@ class Bitrix24:
                 yield item
         finally:
             await items.aclose()
+
+    async def _list_batched_default(  # noqa: C901, PLR0912, PLR0915
+        self,
+        base: Request,
+        *,
+        page_size: int,
+        batch_size: int,
+        identity: IdentitySpec | None,
+        policy: ExecutionPolicy,
+    ) -> AsyncGenerator[JsonValue]:
+        seen: set[str | int] = set()
+        emitted = 0
+        try:
+            head = await self._executor.execute(_merge_top_level(base, {"start": 0}), policy=policy)
+            head_items = head.list_result
+            total = head.total
+            if total is None or total < 0:
+                _raise_capability("parallel counted traversal requires a non-negative total")
+            if total < len(head_items):
+                _raise_capability("parallel counted traversal observed total below the head page")
+            if identity is not None and total > policy.max_tracked_identities:
+                _raise_capability("parallel counted traversal exceeds the exact identity budget")
+            stride = head.next if head.next is not None else page_size
+            if isinstance(stride, bool) or stride < 1:
+                _raise_capability("parallel counted traversal requires a positive in-band stride")
+            if total > len(head_items) and head.next is None:
+                _raise_capability("parallel counted traversal has no in-band tail stride")
+            if head.next is not None and head.next != len(head_items):
+                _raise_capability("parallel counted head continuation contradicts its row count")
+            for item in head_items:
+                _record_compatibility_identity(item, identity, seen)
+                emitted += 1
+                yield item
+            if total == emitted:
+                if head.next is not None:
+                    _raise_capability("parallel counted traversal completed while continuation remained")
+                return
+            starts = tuple(range(stride, total, stride))
+            requests = tuple(_merge_top_level(base, {"start": start}) for start in starts)
+            outcomes = self._batch_executor.batch_outcomes(
+                requests,
+                batch_size=batch_size,
+                policy=policy,
+            )
+            primary: BaseException | None = None
+            try:
+                async for outcome in outcomes:
+                    if isinstance(outcome, BatchFailure):
+                        if isinstance(outcome.error, BaseException):
+                            _raise_error(outcome.error)
+                        _raise_capability("parallel counted batch command failed")
+                    if not isinstance(outcome, BatchSuccess) or outcome.response is None:
+                        _raise_capability("parallel counted batch outcome lacks correlated response evidence")
+                    response = outcome.response
+                    start = starts[outcome.command_index]
+                    items = response.list_result
+                    expected_rows = min(stride, total - start)
+                    if len(items) != expected_rows:
+                        _raise_capability("parallel counted page length contradicts the planned exact range")
+                    if response.total is not None and response.total != total:
+                        _raise_capability("parallel counted page total contradicts the head total")
+                    expected_next = start + stride if start + stride < total else None
+                    if response.next is not None and response.next != expected_next:
+                        _raise_capability("parallel counted continuation contradicts the planned exact range")
+                    for item in items:
+                        _record_compatibility_identity(item, identity, seen)
+                        emitted += 1
+                        yield item
+            except BaseException as error:  # noqa: BLE001 - preserve the canonical stream report
+                primary = error
+            finally:
+                try:
+                    await outcomes.aclose()
+                except BaseException as cleanup_error:  # noqa: BLE001 - cleanup retains primary failure
+                    if primary is None:
+                        primary = cleanup_error
+            if outcomes.report.state is not TerminalState.COMPLETED:
+                _raise_incomplete(outcomes.report, primary)
+            if primary is not None:
+                _raise_error(primary)
+            if emitted != total:
+                _raise_capability("parallel counted traversal did not emit its exact total")
+        except IncompleteTraversalError:
+            raise
+        except BaseException as error:
+            report = OperationReport(state=TerminalState.FAILED, terminal_reason=type(error).__name__)
+            raise IncompleteTraversalError(report=report) from error
 
     async def list_batched_no_count(  # noqa: PLR0913 - compatibility bridge signature
         self,
@@ -376,19 +573,34 @@ class Bitrix24:
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
         _validate_batch_size(batch_size)
-        resolved_identity = identity or _legacy_identity(id_key)
-        selected = _resolve_plan(plan, profile, _keyset_default())
-        base = _as_read_request(_canonical_request(request))
-        if identity is None:
+        resolved_identity = identity if profile is not None else identity or _legacy_identity(id_key)
+        base = _as_profiled_read_request(_canonical_request(request), profile, plan=plan)
+        if identity is None and profile is None:
             base = _ensure_legacy_select_identity(base, id_key)
+        effective_policy = policy or self._default_policy
+        selected = self._resolve_traversal(
+            base,
+            plan=plan,
+            profile=profile,
+            default=_keyset_default(),
+            selector=_LEGACY_RESULT_SELECTOR,
+            identity=resolved_identity,
+            policy=effective_policy,
+            page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
+        )
         stream = iter_list_stream(
             self._executor,
             base,
-            plan=selected,
-            selector=_LEGACY_RESULT_SELECTOR,
-            identity=resolved_identity,
-            policy=policy or self._default_policy,
-            _page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
+            plan=selected.plan,
+            selector=selected.selector,
+            identity=selected.identity,
+            policy=effective_policy,
+            _page_cap_hint=selected.page_cap_hint,
+            _assurance=selected.assurance,
+            _profile_id=selected.profile_id,
+            _profile_version=selected.profile_version,
+            _profile_source_sha256=selected.profile_source_sha256,
+            _profile_evidence_sha256=selected.profile_evidence_sha256,
         )
         items = _completed_items(stream)
         try:
@@ -439,11 +651,21 @@ class Bitrix24:
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
         _validate_batch_size(batch_size)
-        base = _as_read_request(_canonical_request(request))
-        if identity is None:
+        base = _as_profiled_read_request(_canonical_request(request), profile, plan=plan)
+        if identity is None and profile is None:
             base = _ensure_legacy_select_identity(base, id_key)
-        selected = _resolve_plan(plan, profile, _keyset_default())
-        resolved_identity = identity or _legacy_identity(id_key)
+        resolved_identity = identity if profile is not None else identity or _legacy_identity(id_key)
+        effective_policy = policy or self._default_policy
+        selected = self._resolve_traversal(
+            base,
+            plan=plan,
+            profile=profile,
+            default=_keyset_default(),
+            selector=_LEGACY_RESULT_SELECTOR,
+            identity=resolved_identity,
+            policy=effective_policy,
+            page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
+        )
         output_order = ReferenceOutputOrder.READY
         dispatch = BatchDispatch(
             batch_size=self._configured_batch_size(batch_size) or self._batch_executor.portal_command_cap,
@@ -458,13 +680,18 @@ class Bitrix24:
         stream = iter_references(
             self._executor,
             sources,
-            plan=selected,
+            plan=selected.plan,
             dispatch=dispatch,
-            selector=_LEGACY_RESULT_SELECTOR,
-            identity=resolved_identity,
+            selector=selected.selector,
+            identity=selected.identity,
             output_order=output_order,
-            policy=policy or self._default_policy,
-            _page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
+            policy=effective_policy,
+            _page_cap_hint=selected.page_cap_hint,
+            _assurance=selected.assurance,
+            _profile_id=selected.profile_id,
+            _profile_version=selected.profile_version,
+            _profile_source_sha256=selected.profile_source_sha256,
+            _profile_evidence_sha256=selected.profile_evidence_sha256,
         )
         items = _legacy_reference_items(stream, with_payload=with_payload)
         try:
@@ -495,12 +722,17 @@ class Bitrix24:
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
         _validate_batch_size(batch_size)
-        base = _as_read_request(_canonical_request(request))
-        resolved_identity = identity or IdentitySpec(
-            item_path=(cursor_field,),
-            filter_key=cursor_field,
-            order_key=cursor_field,
-            coercion=IdentityCoercion.DECIMAL_STRING_INTEGER,
+        base = _as_profiled_read_request(_canonical_request(request), profile, plan=plan)
+        resolved_identity = (
+            identity
+            if profile is not None
+            else identity
+            or IdentitySpec(
+                item_path=(cursor_field,),
+                filter_key=cursor_field,
+                order_key=cursor_field,
+                coercion=IdentityCoercion.DECIMAL_STRING_INTEGER,
+            )
         )
         default = ItemCursorPlan(
             identity_requirement=IdentityRequirement.REQUIRED,
@@ -511,10 +743,20 @@ class Bitrix24:
             cursor_take=cursor_take,
             limit_path=ParameterPath((list_size_param,)),
             requested_page_size=page_size,
-            terminal=CursorTerminalRule.PROFILE_SHORT_PAGE,
+            terminal=CursorTerminalRule.EMPTY_CONFIRMATION,
         )
-        selected = _resolve_plan(plan, profile, default)
         selector = ResultSelector((result_key,)) if result_key is not None else ResultSelector.root()
+        effective_policy = policy or self._default_policy
+        selected = self._resolve_traversal(
+            base,
+            plan=plan,
+            profile=profile,
+            default=default,
+            selector=selector if result_key is not None else _LEGACY_RESULT_SELECTOR,
+            identity=resolved_identity,
+            policy=effective_policy,
+            page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
+        )
         output_order = ReferenceOutputOrder.READY
         dispatch = BatchDispatch(
             batch_size=self._configured_batch_size(batch_size) or self._batch_executor.portal_command_cap,
@@ -529,13 +771,18 @@ class Bitrix24:
         stream = iter_references(
             self._executor,
             sources,
-            plan=selected,
+            plan=selected.plan,
             dispatch=dispatch,
-            selector=selector if result_key is not None else _LEGACY_RESULT_SELECTOR,
-            identity=resolved_identity,
+            selector=selected.selector,
+            identity=selected.identity,
             output_order=output_order,
-            policy=policy or self._default_policy,
-            _page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
+            policy=effective_policy,
+            _page_cap_hint=selected.page_cap_hint,
+            _assurance=selected.assurance,
+            _profile_id=selected.profile_id,
+            _profile_version=selected.profile_version,
+            _profile_source_sha256=selected.profile_source_sha256,
+            _profile_evidence_sha256=selected.profile_evidence_sha256,
         )
         items = _legacy_reference_items(stream, with_payload=with_payload)
         try:
@@ -611,14 +858,21 @@ def _as_read_request(request: Request) -> Request:
     return Request(request.method, request.copy_parameters(), ReplaySafety.SAFE)
 
 
-def _resolve_plan(plan: ListPlan | None, profile: EndpointProfile | None, default: ListPlan) -> ListPlan:
-    if plan is not None:
-        if profile is not None:
-            raise CapabilityError("plan and profile cannot both select wrapper traversal")
-        return plan
-    if profile is not None:
-        raise CapabilityError("endpoint profiles are unavailable until W8")
-    return default
+def _as_profiled_read_request(
+    request: Request,
+    profile: EndpointProfile | None,
+    *,
+    plan: ListPlan | None,
+) -> Request:
+    if plan is not None and profile is not None:
+        raise CapabilityError("plan and profile cannot both select wrapper traversal")
+    if profile is None:
+        return _as_read_request(request)
+    if not isinstance(profile, EndpointProfile):
+        raise TypeError("profile must be an EndpointProfile")
+    if request.replay_safety is not None and request.replay_safety is not profile.replay_safety:
+        raise CapabilityError("request replay safety contradicts the endpoint profile")
+    return Request(request.method, request.copy_parameters(), profile.replay_safety)
 
 
 def _legacy_identity(id_key: str) -> IdentitySpec:
@@ -630,6 +884,34 @@ def _legacy_identity(id_key: str) -> IdentitySpec:
         order_key=id_key,
         coercion=IdentityCoercion.DECIMAL_STRING_INTEGER,
     )
+
+
+def _record_compatibility_identity(
+    item: JsonValue,
+    identity: IdentitySpec | None,
+    seen: set[str | int],
+) -> None:
+    if identity is None:
+        return
+    try:
+        value = _coerce_identity(_extract_path(item, identity.item_path), identity.coercion)
+    except (KeyError, TypeError, ValueError) as error:
+        raise CapabilityError("parallel counted result does not satisfy its identity contract") from error
+    if value in seen:
+        raise CapabilityError("parallel counted traversal observed a duplicate identity")
+    seen.add(value)
+
+
+def _raise_capability(message: str) -> Never:
+    raise CapabilityError(message)
+
+
+def _raise_error(error: BaseException) -> Never:
+    raise error
+
+
+def _raise_incomplete(report: OperationReport, cause: BaseException | None) -> Never:
+    raise IncompleteTraversalError(report=report) from cause
 
 
 def _keyset_default() -> KeysetPlan:

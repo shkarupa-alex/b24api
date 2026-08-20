@@ -563,11 +563,7 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
     controls_config = benchmark_plan["controls"]
 
     run_exact_matrix_sync()  # one declared warmup; its observations are intentionally discarded
-    runs = tuple(
-        run
-        for _ in range(int(controls_config["advisory_runs"]))
-        for run in run_exact_matrix_sync()
-    )
+    runs = tuple(run for _ in range(int(controls_config["advisory_runs"])) for run in run_exact_matrix_sync())
     return _benchmark_runs_and_artifact(args, plan=plan, benchmark_plan=benchmark_plan, runs=runs)
 
 
@@ -1584,9 +1580,7 @@ def _validate_benchmark_pass_dependencies(  # noqa: C901
         raise ContractError("benchmark PASS requires exactly one stable model-matrix dependency")
     matrix_hash = next(iter(matrix_hashes))
     matrix_candidates = [
-        document
-        for path, document in json_documents.get(matrix_hash, [])
-        if path.name == "model-matrix.json"
+        document for path, document in json_documents.get(matrix_hash, []) if path.name == "model-matrix.json"
     ]
     if len(matrix_candidates) != 1:
         raise ContractError("benchmark PASS matrix hash does not resolve to model-matrix.json")
@@ -1641,11 +1635,7 @@ def _validate_model_observations(
 ) -> None:
     """Enforce the exact deterministic stable-run set and recompute parent metrics."""
     cases = {case.case_id: case for case in exact_model_cases() if not case.mutation}
-    reference_runs = {
-        (run.case_id, run.plan): run
-        for run in run_exact_matrix_sync()
-        if run.outcome == "PASS"
-    }
+    reference_runs = {(run.case_id, run.plan): run for run in run_exact_matrix_sync() if run.outcome == "PASS"}
     expected_keys = {
         (iteration, case_id, plan)
         for iteration in range(1, _MODEL_ADVISORY_RUNS + 1)
@@ -1791,9 +1781,7 @@ def _validate_benchmark_metric_algebra(observations: list[dict[str, Any]], artif
         raise ContractError("benchmark PASS integer metrics do not match its stable observations")
     float_metrics = {
         "time_to_first_row_seconds": min(
-            run["time_to_first_row_seconds"]
-            for run in observations
-            if run["time_to_first_row_seconds"] is not None
+            run["time_to_first_row_seconds"] for run in observations if run["time_to_first_row_seconds"] is not None
         ),
         "wall_seconds": sum(run["wall_seconds"] for run in observations),
         "server_operating_seconds": sum(run["operating_seconds"] for run in observations),

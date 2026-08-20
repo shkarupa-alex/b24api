@@ -1,3 +1,5 @@
+"""Support settings."""
+
 from typing import Annotated, Any
 
 from fast_depends import Depends
@@ -7,6 +9,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    """Environment-backed client settings and optional verified portal context."""
+
     webhook_url: HttpUrl
 
     logger_name: str = "b24api"
@@ -30,6 +34,8 @@ class Settings(BaseSettings):
 
     list_size: int = 50
     batch_size: int = 50
+    portal_build: str | None = None
+    scopes: frozenset[str] = frozenset()
 
     model_config = SettingsConfigDict(
         env_prefix="bitrix24_api_",
@@ -39,6 +45,7 @@ class Settings(BaseSettings):
 
 
 def api_settings(**kwargs: Any) -> Settings:  # noqa: ANN401
+    """Return validated API settings."""
     return Settings(**kwargs)
 
 

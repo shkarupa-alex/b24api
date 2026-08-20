@@ -5,8 +5,10 @@ import base64
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
 import uuid
 import zipfile
 from argparse import Namespace
@@ -468,6 +470,61 @@ def test_bundle_scan_rechecks_candidate_cleanliness_after_reading(
         cli_module._scan_bundle(tmp_path)  # noqa: SLF001
 
 
+def test_real_mid_benchmark_tracked_mutation_cannot_emit_pass(tmp_path: Path) -> None:
+    worktree = tmp_path / "candidate"
+    artifact_dir = tmp_path / "artifacts"
+    git = shutil.which("git")
+    assert git is not None
+    add = subprocess.run(  # noqa: S603 - fixed git operation in an isolated test directory
+        [git, "worktree", "add", "--detach", "--quiet", str(worktree), "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert add.returncode == 0
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(  # noqa: S603 - fixed interpreter and detached entrypoint
+            [
+                sys.executable,
+                str(worktree / "tools/b24api_evidence.py"),
+                "benchmark",
+                "--artifact-dir",
+                str(artifact_dir),
+            ],
+            cwd=worktree,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 10
+        plan_path = artifact_dir / "dataset-plan.json"
+        while not plan_path.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert plan_path.exists(), "benchmark finished before its immutable plan became observable"
+        assert process.poll() is None, "benchmark completed before the mid-run mutation window"
+        readme = worktree / "README.md"
+        readme.write_text(readme.read_text() + "\nmid-benchmark dirty-tree regression\n")
+
+        stdout, stderr = process.communicate(timeout=30)
+
+        assert process.returncode == ExitCode.INVALID, (stdout, stderr)
+        assert "clean tracked tree" in stderr
+        assert not (artifact_dir / "benchmark-evidence.json").exists()
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate()
+        subprocess.run(  # noqa: S603 - exact disposable worktree cleanup
+            [git, "worktree", "remove", "--force", str(worktree)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+
 def test_manifest_hash_chain_marker_and_resume_lineage(tmp_path: Path) -> None:
     plan = _plan()
     first = build_manifest_record(_manifest_base(plan))
@@ -498,7 +555,7 @@ def test_manifest_hash_chain_marker_and_resume_lineage(tmp_path: Path) -> None:
     with pytest.raises(ContractError, match="run_id"):
         load_manifest(
             path,
-                expected=replace(lineage, run_id=str(uuid.uuid4())),
+            expected=replace(lineage, run_id=str(uuid.uuid4())),
         )
 
 
@@ -905,8 +962,7 @@ def test_benchmark_rejects_per_observation_timing_redistribution(tmp_path: Path)
     second["wall_seconds"] += shift
     new_hash = content_sha256(matrix)
     artifact["evidence_refs"] = [
-        f"sha256:{new_hash}" if value == f"sha256:{old_hash}" else value
-        for value in artifact["evidence_refs"]
+        f"sha256:{new_hash}" if value == f"sha256:{old_hash}" else value for value in artifact["evidence_refs"]
     ]
     matrix_path.write_text(json.dumps(matrix))
     artifact_path.write_text(json.dumps(artifact))
@@ -926,8 +982,7 @@ def test_benchmark_observation_counters_reject_boolean_integer_aliases(tmp_path:
     observation["requests"] = True
     new_hash = content_sha256(matrix)
     artifact["evidence_refs"] = [
-        f"sha256:{new_hash}" if value == f"sha256:{old_hash}" else value
-        for value in artifact["evidence_refs"]
+        f"sha256:{new_hash}" if value == f"sha256:{old_hash}" else value for value in artifact["evidence_refs"]
     ]
     matrix_path.write_text(json.dumps(matrix))
     artifact_path.write_text(json.dumps(artifact))
@@ -1357,6 +1412,7 @@ def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) 
     assert any(name.startswith("b24api/") for name in names)
     assert not any("b24api_evidence" in name or name.startswith("tools/") for name in names)
     assert not any(name.endswith(("live.py", "cli.py")) for name in names)
+    assert not any(name.startswith("b24api/") and name.endswith("_test.py") for name in names)
 
 
 def _run_cli(*arguments: str, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

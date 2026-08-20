@@ -38,6 +38,7 @@ from b24api.error import (
 from b24api.execution import Executor, WireResponse
 from b24api.facade import Bitrix24
 from b24api.models import (
+    CompletionAssurance,
     ConsistencyPolicy,
     ExecutionPolicy,
     IdentityCoercion,
@@ -62,6 +63,7 @@ from b24api.plans import (
     OffsetSequentialPlan,
     SingleResponsePlan,
 )
+from b24api.profiles import load_profile_document
 from b24api.query import build_query
 from b24api.type import ApiTypes
 
@@ -78,10 +80,12 @@ class FunctionTransport:
     """Record canonical requests and return JSON envelopes from a handler."""
 
     def __init__(self, handler: Callable[[Request], object]) -> None:
+        """Initialize instance state."""
         self.handler = handler
         self.requests: list[Request] = []
 
     async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+        """Send one transport request attempt."""
         del attempt_timeout
         self.requests.append(request)
         body = json.dumps(self.handler(request), separators=(",", ":")).encode()
@@ -91,6 +95,59 @@ class FunctionTransport:
 def _client(handler: Callable[[Request], object]) -> tuple[Bitrix24, FunctionTransport]:
     transport = FunctionTransport(handler)
     return Bitrix24._from_executor(Executor(transport)), transport  # noqa: SLF001
+
+
+def _single_profile() -> EndpointProfile:
+    return load_profile_document(
+        {
+            "schema_version": "1.0",
+            "profile_id": "tasks-single-v1",
+            "version": 1,
+            "endpoint": "tasks-list",
+            "method": "tasks.task.list",
+            "verified_at": "2026-01-01T00:00:00+00:00",
+            "expires_at": "2027-01-01T00:00:00+00:00",
+            "applicable_builds": ["build-1"],
+            "required_scopes": ["task"],
+            "query": {
+                "parameter_paths": [],
+                "filter_keys": [],
+                "filter_operators": [],
+                "order": [],
+                "selector": [],
+            },
+            "plan": {
+                "kind": "single_response",
+                "identity_requirement": "optional",
+                "order_semantics": "unordered",
+                "duplicate_policy": "report",
+                "total_semantics": "advisory",
+                "reject_continuation": True,
+                "reject_positive_total_over_result": True,
+            },
+            "identity": None,
+            "page_cap": 50,
+            "replay_safety": "safe",
+            "capabilities": {
+                "offset_honored": False,
+                "stable_order": False,
+                "filter_honored": False,
+                "cursor_honored": False,
+                "batch_supported": False,
+                "fixed_page_cap": True,
+            },
+            "evidence": [
+                {
+                    "artifact_sha256": "b" * 64,
+                    "candidate_sha": "a" * 40,
+                    "reviewed_at": "2025-12-20T00:00:00+00:00",
+                    "expires_at": "2027-06-01T00:00:00+00:00",
+                    "review_status": "accepted",
+                },
+            ],
+            "required_probes": [],
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -199,10 +256,27 @@ async def test_public_batch_early_close_closes_owned_async_source() -> None:
 @pytest.mark.asyncio
 async def test_sequential_and_counted_wrappers_delegate_to_shared_driver() -> None:
     def handler(request: Request) -> object:
-        start = request.copy_parameters().get("start", 0)
-        assert isinstance(start, int)
-        rows = [{"ID": start + 1}] if start < EXPECTED_PAGE_ROWS else []
-        return {"result": rows, "total": EXPECTED_PAGE_ROWS} | ({"next": 1} if start == 0 else {})
+        if request.method == "batch":
+            commands = request.copy_parameters()["cmd"]
+            assert isinstance(commands, dict)
+            results: dict[str, object] = {}
+            totals: dict[str, int] = {}
+            for key, command in commands.items():
+                assert isinstance(command, str)
+                start = int(parse_qs(urlsplit(command).query)["start"][0])
+                results[key] = [{"ID": start + 1}] if start < EXPECTED_PAGE_ROWS else []
+                totals[key] = EXPECTED_PAGE_ROWS
+            return {
+                "result": {
+                    "result": results,
+                    "result_error": [],
+                    "result_total": totals,
+                },
+            }
+        direct_start = request.copy_parameters().get("start", 0)
+        assert isinstance(direct_start, int)
+        rows = [{"ID": direct_start + 1}] if direct_start < EXPECTED_PAGE_ROWS else []
+        return {"result": rows, "total": EXPECTED_PAGE_ROWS} | ({"next": 1} if direct_start == 0 else {})
 
     sequential, sequential_transport = _client(handler)
     counted, counted_transport = _client(handler)
@@ -216,7 +290,7 @@ async def test_sequential_and_counted_wrappers_delegate_to_shared_driver() -> No
         {"ID": 2},
     ]
     assert [request.copy_parameters()["start"] for request in sequential_transport.requests] == [0, 1]
-    assert [request.copy_parameters()["start"] for request in counted_transport.requests] == [0, 1]
+    assert [request.method for request in counted_transport.requests] == ["crm.item.list", "batch"]
     assert all(request.replay_safety is ReplaySafety.SAFE for request in sequential_transport.requests)
 
 
@@ -231,6 +305,72 @@ async def test_sequential_wrapper_accepts_server_next_without_total() -> None:
     client, transport = _client(handler)
     assert [item async for item in client.list_sequential({"method": "department.get"})] == [{"ID": 1}]
     assert [request.copy_parameters()["start"] for request in transport.requests] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_sequential_wrapper_does_not_trust_total_while_next_remains() -> None:
+    def handler(request: Request) -> object:
+        start = request.copy_parameters().get("start", 0)
+        if start == 0:
+            return {"result": [{"ID": 1}], "total": 1, "next": 1}
+        if start == 1:
+            return {"result": [{"ID": 2}], "total": 2}
+        raise AssertionError("unexpected offset")
+
+    client, transport = _client(handler)
+
+    assert [item async for item in client.list_sequential({"method": "crm.item.list"})] == [
+        {"ID": 1},
+        {"ID": 2},
+    ]
+    assert [request.copy_parameters()["start"] for request in transport.requests] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_facade_applies_exact_profile_and_preserves_report_provenance() -> None:
+    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    client = Bitrix24._from_executor(  # noqa: SLF001
+        Executor(transport),
+        portal_build="build-1",
+        scopes={"task"},
+    )
+    policy = ExecutionPolicy(consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST))
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        _ = [
+            item
+            async for item in client.list_sequential(
+                {"method": "tasks.task.list"},
+                profile=_single_profile(),
+                policy=policy,
+            )
+        ]
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.assurance is CompletionAssurance.PROFILE_VERIFIED
+    assert report.profile_id == "tasks-single-v1"
+    assert report.profile_version == 1
+    assert report.profile_applicable is True
+    assert report.profile_source_sha256 is not None
+    assert report.profile_evidence_sha256 == ("b" * 64,)
+    assert len(transport.requests) == 1
+    assert transport.requests[0].replay_safety is ReplaySafety.SAFE
+
+
+@pytest.mark.asyncio
+async def test_facade_refuses_profile_replay_safety_conflict_before_io() -> None:
+    client, transport = _client(lambda _request: {"result": []})
+
+    with pytest.raises(CapabilityError, match="replay safety contradicts"):
+        _ = [
+            item
+            async for item in client.list_sequential(
+                {"method": "tasks.task.list", "replay_safety": "unsafe"},
+                profile=_single_profile(),
+            )
+        ]
+
+    assert transport.requests == []
 
 
 @pytest.mark.asyncio
@@ -367,9 +507,7 @@ async def test_reference_keyset_wrapper_preserves_committed_page_round_order() -
             owner = query["filter[OWNER_ID]"][0]
             cursor = int(query.get("filter[>ID]", ["0"])[0])
             group.append((owner, cursor))
-            results[key] = (
-                [{"ID": cursor + 1, "OWNER_ID": owner}] if cursor < EXPECTED_PAGE_ROWS else []
-            )
+            results[key] = [{"ID": cursor + 1, "OWNER_ID": owner}] if cursor < EXPECTED_PAGE_ROWS else []
         command_groups.append(group)
         return {"result": {"result": results, "result_error": []}}
 
@@ -469,13 +607,18 @@ async def test_public_reference_early_close_closes_owned_async_source() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reference_cursor_wrapper_selects_result_and_short_page_terminal() -> None:
+async def test_reference_cursor_wrapper_uses_empty_confirmation_not_short_page() -> None:
     def handler(request: Request) -> object:
         commands = request.copy_parameters()["cmd"]
         assert isinstance(commands, dict)
+        results: dict[str, object] = {}
+        for key, command in commands.items():
+            assert isinstance(command, str)
+            query = parse_qs(urlsplit(command).query)
+            results[key] = {"items": [] if "LAST_ID" in query else [{"id": 10}]}
         return {
             "result": {
-                "result": {key: {"items": [{"id": 10}]} for key in commands},
+                "result": results,
                 "result_error": [],
             },
         }
@@ -494,7 +637,7 @@ async def test_reference_cursor_wrapper_selects_result_and_short_page_terminal()
     ]
 
     assert items == [({"id": 10}, "chat")]
-    assert len(transport.requests) == 1
+    assert len(transport.requests) == EXPECTED_PAGE_ROWS
 
 
 @pytest.mark.asyncio
@@ -502,9 +645,14 @@ async def test_reference_cursor_min_preserves_committed_descending_direction() -
     def handler(request: Request) -> object:
         commands = request.copy_parameters()["cmd"]
         assert isinstance(commands, dict)
+        results: dict[str, object] = {}
+        for key, command in commands.items():
+            assert isinstance(command, str)
+            query = parse_qs(urlsplit(command).query)
+            results[key] = [] if "LAST_ID" in query else [{"id": 3}, {"id": 2}]
         return {
             "result": {
-                "result": {key: [{"id": 3}, {"id": 2}] for key in commands},
+                "result": results,
                 "result_error": [],
             },
         }
@@ -719,10 +867,7 @@ def test_facade_signature_snapshot_preserves_committed_and_keyword_bridges() -> 
         ),
     }
 
-    assert {
-        name: tuple(inspect.signature(getattr(Bitrix24, name)).parameters)
-        for name in expected
-    } == expected
+    assert {name: tuple(inspect.signature(getattr(Bitrix24, name)).parameters) for name in expected} == expected
 
     constructor = inspect.signature(Bitrix24)
     settings = constructor.parameters["settings"]

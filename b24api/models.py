@@ -102,6 +102,7 @@ class RequestSummary:
     parameter_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         object.__setattr__(self, "method", DEFAULT_REDACTOR.redact_text(self.method))
         object.__setattr__(
             self,
@@ -110,6 +111,7 @@ class RequestSummary:
         )
 
     def to_dict(self) -> dict[str, object]:
+        """Return the to dict representation."""
         return {"method": self.method, "parameter_keys": list(self.parameter_keys)}
 
 
@@ -123,6 +125,7 @@ class ResponseEvidence:
     body_preview: str | None = None
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         redacted_headers = DEFAULT_REDACTOR.redact(dict(self.headers))
         object.__setattr__(
             self,
@@ -135,6 +138,7 @@ class ResponseEvidence:
             object.__setattr__(self, "body_preview", DEFAULT_REDACTOR.redact_text(self.body_preview))
 
     def to_dict(self) -> dict[str, object]:
+        """Return the to dict representation."""
         return {
             "http_status": self.http_status,
             "request_id": self.request_id,
@@ -153,12 +157,14 @@ class BatchCommandEvidence:
     normalized_code: str | None = None
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not _is_plain_int(self.command_index) or self.command_index < 0:
             raise ValueError("command_index cannot be negative")
         if not self.stable_key or len(self.stable_key) > STABLE_KEY_MAXIMUM:
             raise ValueError("stable_key must be 1..100 characters")
 
     def to_dict(self) -> dict[str, object]:
+        """Return the to dict representation."""
         return {
             "command_index": self.command_index,
             "stable_key": self.stable_key,
@@ -321,6 +327,7 @@ class ParameterPath:
     path: tuple[PathPart, ...]
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         object.__setattr__(self, "path", tuple(self.path))
         _validate_path(self.path, allow_empty=False)
 
@@ -332,11 +339,13 @@ class ResultSelector:
     path: tuple[PathPart, ...] = ()
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         object.__setattr__(self, "path", tuple(self.path))
         _validate_path(self.path, allow_empty=True)
 
     @classmethod
     def root(cls) -> ResultSelector:
+        """Return a selector for the response root."""
         return cls(())
 
 
@@ -350,6 +359,7 @@ class IdentitySpec:
     coercion: IdentityCoercion = IdentityCoercion.EXACT_STRING
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         object.__setattr__(self, "item_path", tuple(self.item_path))
         _validate_path(self.item_path, allow_empty=False)
         if not self.filter_key or not self.order_key:
@@ -384,6 +394,7 @@ class Request:
         parameters: Mapping[str, object] | None = None,
         replay_safety: ReplaySafety | None = None,
     ) -> None:
+        """Initialize instance state."""
         if not _METHOD_RE.fullmatch(method):
             raise ValueError("method must contain only letters, digits, dots, and underscores")
         if replay_safety is not None and not isinstance(replay_safety, ReplaySafety):
@@ -397,12 +408,15 @@ class Request:
 
     @property
     def parameters(self) -> Mapping[str, JsonValue]:
+        """Return the parameters."""
         return MappingProxyType(self.copy_parameters())
 
     def copy_parameters(self) -> dict[str, JsonValue]:
+        """Return a mutable copy of the immutable request parameters."""
         return cast("dict[str, JsonValue]", _thaw_json(self._parameters))
 
     def to_wire_parameters(self) -> dict[str, JsonValue]:
+        """Return the to wire parameters representation."""
         return self.copy_parameters()
 
     @property
@@ -414,9 +428,11 @@ class Request:
 
     @property
     def summary(self) -> RequestSummary:
+        """Return the summary."""
         return summarize_request(self.method, self._parameters)
 
     def __repr__(self) -> str:
+        """Return a safe representation."""
         return f"Request(summary={self.summary!r}, replay_safety={self.replay_safety!r})"
 
 
@@ -434,6 +450,7 @@ class ResponseTime:
     operating: float | None = None
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         for value in (self.start, self.finish, self.duration, self.processing, self.operating_reset_at, self.operating):
             if value is not None and not math.isfinite(value):
                 raise ValueError("response time values must be finite")
@@ -460,6 +477,7 @@ class Response:
         next: int | None = None,  # noqa: A002
         evidence: ResponseEvidence | None = None,
     ) -> None:
+        """Initialize instance state."""
         if total is not None and (not _is_plain_int(total) or total < -1):
             raise ValueError("total must be -1 or non-negative")
         if next is not None and (not _is_plain_int(next) or next < 0):
@@ -474,10 +492,12 @@ class Response:
 
     @property
     def result(self) -> JsonValue:
+        """Return the result."""
         return _thaw_json(self._result)
 
     @property
     def list_result(self) -> list[JsonValue]:
+        """Return the list result."""
         result = self.result
         if isinstance(result, list):
             return result
@@ -493,6 +513,7 @@ class Response:
         return value
 
     def list_items(self, selector: ResultSelector | None = None) -> list[JsonValue]:
+        """Return list items selected from the response result."""
         selector = selector or ResultSelector.root()
         selected: JsonValue = self.result
         for part in selector.path:
@@ -509,6 +530,7 @@ class Response:
         return selected
 
     def __repr__(self) -> str:
+        """Return a safe representation."""
         result = self.result
         size = len(result) if isinstance(result, list | dict) else None
         return (
@@ -597,6 +619,7 @@ class RetryPolicy:
     jitter: float = 0.1
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         object.__setattr__(self, "transient_http_statuses", frozenset(self.transient_http_statuses))
         object.__setattr__(
             self,
@@ -631,6 +654,7 @@ class ConsistencyPolicy:
     confirmation_policy: ConfirmationPolicy = ConfirmationPolicy.NONE
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         expected = (
             (self.duplicate_policy, DuplicatePolicy),
             (self.total_semantics, TotalSemantics),
@@ -644,6 +668,7 @@ class ConsistencyPolicy:
 
     @classmethod
     def traversal(cls) -> ConsistencyPolicy:
+        """Return the default traversal-only consistency policy."""
         return cls()
 
 
@@ -667,6 +692,7 @@ class ExecutionPolicy:
     debug_evidence: bool = False
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not isinstance(self.identity_tracker, IdentityTracker):
             raise TypeError("identity_tracker must be an IdentityTracker")
         if not isinstance(self.retry, RetryPolicy) or not isinstance(self.consistency, ConsistencyPolicy):
@@ -700,6 +726,7 @@ class BudgetCounters:
     buffered_rows_high_water: int = 0
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         object.__setattr__(self, "pages_per_reference", tuple(sorted(self.pages_per_reference)))
         if any(
             not _is_plain_int(value) or value < 0
@@ -722,6 +749,7 @@ class BudgetCounters:
         retry_elapsed: float,
         total_elapsed: float,
     ) -> BudgetCounters:
+        """Reserve the attempt budget."""
         if self.physical_requests >= policy.max_requests:
             _raise_budget("physical request budget exhausted")
         if attempts_for_request >= policy.max_attempts_per_request:
@@ -739,6 +767,7 @@ class BudgetCounters:
         )
 
     def reserve_page(self, policy: ExecutionPolicy, *, reference: str | None = None) -> BudgetCounters:
+        """Reserve the page budget."""
         if self.logical_pages >= policy.max_pages:
             _raise_budget("logical page budget exhausted")
         per_reference = dict(self.pages_per_reference)
@@ -756,6 +785,7 @@ class BudgetCounters:
         )
 
     def with_buffered_rows(self, policy: ExecutionPolicy, rows: int) -> BudgetCounters:
+        """Return counters with buffered rows."""
         if rows < 0:
             raise ValueError("buffered row count cannot be negative")
         if rows > policy.max_buffered_rows:
@@ -785,6 +815,7 @@ class Violation:
     field: str | None = None
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not isinstance(self.severity, ViolationSeverity):
             raise TypeError("severity must be a ViolationSeverity")
         object.__setattr__(self, "code", DEFAULT_REDACTOR.redact_text(self.code))
@@ -825,6 +856,7 @@ class OperationReport:
     evidence: tuple[ResponseEvidence, ...] = ()
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not isinstance(self.state, TerminalState):
             raise TypeError("state must be a TerminalState")
         if not isinstance(self.assurance, CompletionAssurance):
@@ -856,19 +888,23 @@ class OperationReport:
 
     @property
     def completed(self) -> bool:
+        """Return the completed."""
         return self.state is TerminalState.COMPLETED
 
 
 def _validate_report_profile(report: OperationReport) -> None:
     if report.profile_id is None:
-        if any(
-            value is not None
-            for value in (
-                report.profile_version,
-                report.profile_applicable,
-                report.profile_source_sha256,
+        if (
+            any(
+                value is not None
+                for value in (
+                    report.profile_version,
+                    report.profile_applicable,
+                    report.profile_source_sha256,
+                )
             )
-        ) or report.profile_evidence_sha256:
+            or report.profile_evidence_sha256
+        ):
             raise ValueError("profile metadata requires profile_id")
     else:
         if not report.profile_id or len(report.profile_id) > STABLE_KEY_MAXIMUM:
@@ -879,9 +915,7 @@ def _validate_report_profile(report: OperationReport) -> None:
             raise TypeError("profile_applicable must be a boolean")
         if report.profile_source_sha256 is None or not _is_sha256(report.profile_source_sha256):
             raise ValueError("profile_source_sha256 must be a lowercase SHA-256")
-        if not report.profile_evidence_sha256 or any(
-            not _is_sha256(value) for value in report.profile_evidence_sha256
-        ):
+        if not report.profile_evidence_sha256 or any(not _is_sha256(value) for value in report.profile_evidence_sha256):
             raise ValueError("profile evidence must contain lowercase SHA-256 values")
     if report.assurance is CompletionAssurance.PROFILE_VERIFIED and (
         report.profile_id is None or report.profile_applicable is not True
@@ -914,6 +948,7 @@ class BatchSuccess:
         replay_disposition: ReplayDisposition | None = None,
         response: Response | None = None,
     ) -> None:
+        """Initialize instance state."""
         _validate_batch_correlation(command_index, stable_key, request, evidence)
         if replay_disposition is not None and not isinstance(replay_disposition, ReplayDisposition):
             raise TypeError("replay_disposition must be a ReplayDisposition or None")
@@ -934,6 +969,7 @@ class BatchSuccess:
 
     @property
     def result(self) -> JsonValue:
+        """Return the result."""
         return _thaw_json(self._result)
 
     @property
@@ -956,6 +992,7 @@ class BatchFailure:
     evidence: BatchCommandEvidence | None = None
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         _validate_batch_correlation(self.command_index, self.stable_key, self.request, self.evidence)
         if not isinstance(self.replay_safety, ReplaySafety):
             raise TypeError("replay_safety must be a ReplaySafety")
@@ -991,6 +1028,7 @@ class ReferenceRequest:
     payload: object = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not isinstance(self.request, Request):
             raise TypeError("reference request must contain a canonical Request")
         if not self.reference_key or len(self.reference_key) > STABLE_KEY_MAXIMUM:
@@ -1013,6 +1051,7 @@ class ReferenceBinding:
         updates: Mapping[str, object] | None = None,
         payload: object = None,
     ) -> None:
+        """Initialize instance state."""
         frozen = _freeze_json(updates or {})
         if not isinstance(frozen, FrozenMapping):
             raise TypeError("reference updates must be a mapping")
@@ -1023,6 +1062,7 @@ class ReferenceBinding:
         self.__post_init__()
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not self.reference_summary or len(self.reference_summary) > VIOLATION_MESSAGE_MAXIMUM:
             raise ValueError("reference_summary must be 1..500 characters")
         if not self.payload_key or len(self.payload_key) > STABLE_KEY_MAXIMUM:
@@ -1047,6 +1087,7 @@ class ReferenceItem:
     payload: object = field(default=None, repr=False)
 
     def __init__(self, reference_key: str, item: object, payload: object = None) -> None:
+        """Initialize instance state."""
         if not reference_key or len(reference_key) > STABLE_KEY_MAXIMUM:
             raise ValueError("reference_key must be 1..100 characters")
         object.__setattr__(self, "reference_key", reference_key)
@@ -1055,6 +1096,7 @@ class ReferenceItem:
 
     @property
     def item(self) -> JsonValue:
+        """Return the item."""
         return _thaw_json(self._item)
 
 
@@ -1084,6 +1126,7 @@ class ReferenceFailure:
         replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE,
         payload: object = None,
     ) -> None:
+        """Initialize instance state."""
         if not reference_key or len(reference_key) > STABLE_KEY_MAXIMUM:
             raise ValueError("reference_key must be 1..100 characters")
         if not isinstance(request, Request):
@@ -1108,6 +1151,7 @@ class ReferenceFailure:
 
     @property
     def cursor(self) -> JsonValue:
+        """Return the cursor."""
         return _thaw_json(self._cursor)
 
 

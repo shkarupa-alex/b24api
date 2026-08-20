@@ -202,6 +202,7 @@ class PaginationDriver:
         single_result_as_item: bool = False,
         page_cap_hint: int | None = None,
     ) -> None:
+        """Initialize instance state."""
         self.executor = executor
         self.request = request
         self.plan = plan
@@ -234,6 +235,7 @@ class PaginationDriver:
         self._advisory_total_mismatch_reported = False
 
     async def pages(self) -> AsyncGenerator[_Page]:  # noqa: C901
+        """Yield validated traversal pages."""
         self._validate_capabilities()
         self._identity_store = _identity_store(self.context.policy, self.plan, self.identity)
         try:
@@ -267,9 +269,7 @@ class PaginationDriver:
         response = await self._fetch(self.request)
         qualified_count = (
             len(response.result)
-            if self._single_result_as_item
-            and self.selector.path == ()
-            and isinstance(response.result, list)
+            if self._single_result_as_item and self.selector.path == () and isinstance(response.result, list)
             else None
         )
         items = (
@@ -696,6 +696,7 @@ class PaginationDriver:
 
     @property
     def unique_rows(self) -> int:
+        """Return the unique rows."""
         if self.identity is None:
             return self.validated_rows
         if self._unique_rows_final is not None:
@@ -706,6 +707,7 @@ class PaginationDriver:
 
     @property
     def last_page_unique_mask(self) -> tuple[bool, ...]:
+        """Return the last page unique mask."""
         return self._last_page_unique_mask
 
     @property
@@ -728,7 +730,13 @@ class ItemStream(AsyncIterator[JsonValue]):
         identity: IdentitySpec | None = None,
         policy: ExecutionPolicy | None = None,
         page_cap_hint: int | None = None,
+        assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
+        profile_id: str | None = None,
+        profile_version: int | None = None,
+        profile_source_sha256: str | None = None,
+        profile_evidence_sha256: tuple[str, ...] = (),
     ) -> None:
+        """Initialize instance state."""
         PaginationDriver.validate_plan(plan)
         self._context = executor.context(policy)
         self._driver = PaginationDriver(
@@ -740,18 +748,31 @@ class ItemStream(AsyncIterator[JsonValue]):
             context=self._context,
             page_cap_hint=page_cap_hint,
         )
-        self._assurance = CompletionAssurance.CALLER_ASSERTED
+        self._assurance = assurance
+        self._profile_id = profile_id
+        self._profile_version = profile_version
+        self._profile_source_sha256 = profile_source_sha256
+        self._profile_evidence_sha256 = profile_evidence_sha256
         self._runner: AsyncGenerator[tuple[JsonValue, bool]] | None = None
         self._prefetched: tuple[JsonValue, bool] | object = _MISSING
         self._closed = False
         self._emitted = 0
         self._unique_emitted = 0
-        self.report = OperationReport()
+        self.report = OperationReport(
+            assurance=assurance,
+            profile_id=profile_id,
+            profile_version=profile_version,
+            profile_applicable=True if profile_id is not None else None,
+            profile_source_sha256=profile_source_sha256,
+            profile_evidence_sha256=profile_evidence_sha256,
+        )
 
     def __aiter__(self) -> Self:
+        """Return this asynchronous iterator."""
         return self
 
     async def __anext__(self) -> JsonValue:
+        """Return the next asynchronous item."""
         if self._closed:
             raise StopAsyncIteration
         if self._prefetched is not _MISSING:
@@ -771,6 +792,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             self._unique_emitted += 1
 
     async def __aenter__(self) -> Self:
+        """Enter the asynchronous context."""
         if self._closed:
             raise RuntimeError("stream is closed")
         if self._runner is None:
@@ -780,9 +802,11 @@ class ItemStream(AsyncIterator[JsonValue]):
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
+        """Exit the asynchronous context."""
         await self.aclose()
 
     async def aclose(self) -> None:
+        """Close owned asynchronous resources."""
         if self._closed:
             return
         self._closed = True
@@ -898,6 +922,11 @@ class ItemStream(AsyncIterator[JsonValue]):
             snapshot=snapshot_state,
             plan_id=type(self._driver.plan).__name__,
             dispatch_id="sequential_direct",
+            profile_id=self._profile_id,
+            profile_version=self._profile_version,
+            profile_applicable=True if self._profile_id is not None else None,
+            profile_source_sha256=self._profile_source_sha256,
+            profile_evidence_sha256=self._profile_evidence_sha256,
             emitted_rows=self._emitted,
             unique_rows=self._unique_emitted,
             physical_requests=snapshot.counters.physical_requests,
@@ -919,6 +948,11 @@ def iter_list(  # noqa: PLR0913
     identity: IdentitySpec | None = None,
     policy: ExecutionPolicy | None = None,
     _page_cap_hint: int | None = None,
+    _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
+    _profile_id: str | None = None,
+    _profile_version: int | None = None,
+    _profile_source_sha256: str | None = None,
+    _profile_evidence_sha256: tuple[str, ...] = (),
 ) -> ItemStream:
     """Construct a lazy canonical item stream without performing I/O."""
     return ItemStream(
@@ -929,6 +963,11 @@ def iter_list(  # noqa: PLR0913
         identity=identity,
         policy=policy,
         page_cap_hint=_page_cap_hint,
+        assurance=_assurance,
+        profile_id=_profile_id,
+        profile_version=_profile_version,
+        profile_source_sha256=_profile_source_sha256,
+        profile_evidence_sha256=_profile_evidence_sha256,
     )
 
 
@@ -1115,6 +1154,7 @@ def _offset_terminal(
         and response.total is not None
         and response.total >= 0
         and accepted == response.total
+        and response.next is None
     ):
         return "qualified total reached"
     if OffsetTerminalRule.PROFILE_ABSENT_NEXT in plan.terminal and response.next is None:

@@ -94,6 +94,7 @@ class EvidenceAnchor:
     review_status: str = "accepted"
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not _SHA256_RE.fullmatch(self.artifact_sha256):
             raise ValueError("artifact_sha256 must be a lowercase SHA-256")
         if not re.fullmatch(r"[0-9a-f]{40}", self.candidate_sha):
@@ -117,6 +118,7 @@ class QueryPredicate:
     selector: ResultSelector = field(default_factory=ResultSelector.root)
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         paths = frozenset(tuple(path) for path in self.parameter_paths)
         for path in paths:
             ParameterPath(path)
@@ -146,6 +148,7 @@ class CapabilitySet:
     fixed_page_cap: bool = False
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if any(type(getattr(self, field_name)) is not bool for field_name in self.__dataclass_fields__):
             raise TypeError("capability controls must be booleans")
 
@@ -162,6 +165,7 @@ class ProbeSpec:
     within_caller_filter: bool = True
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not _ID_RE.fullmatch(self.probe_id):
             raise ValueError("probe_id is invalid")
         if not _METHOD_RE.fullmatch(self.method):
@@ -201,6 +205,7 @@ class EndpointProfile:
     source_sha256: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:  # noqa: C901, PLR0912, PLR0915 - strict immutable boundary
+        """Validate and normalize instance state."""
         if self.schema_version != PROFILE_SCHEMA_VERSION:
             raise ValueError("unsupported endpoint profile schema version")
         if not _ID_RE.fullmatch(self.profile_id):
@@ -279,6 +284,7 @@ class QueryShape:
     observed_at: datetime
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not _METHOD_RE.fullmatch(self.method):
             raise ValueError("query method is invalid")
         predicate = QueryPredicate(
@@ -319,6 +325,7 @@ class DecisionReason:
     message: str
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not isinstance(self.code, ProfileReasonCode):
             raise TypeError("decision reason code must be a ProfileReasonCode")
         object.__setattr__(self, "message", DEFAULT_REDACTOR.redact_text(self.message))
@@ -337,6 +344,7 @@ class PlanDecision:
     reasons: tuple[DecisionReason, ...] = ()
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not isinstance(self.assurance, CompletionAssurance):
             raise TypeError("decision assurance must be a CompletionAssurance")
         object.__setattr__(self, "rejected_alternatives", tuple(self.rejected_alternatives))
@@ -391,6 +399,7 @@ class ProbeObservation:
     note_code: str | None = None
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not _ID_RE.fullmatch(self.probe_id):
             raise ValueError("probe observation ID is invalid")
         if not isinstance(self.status, ProbeStatus):
@@ -641,9 +650,7 @@ def _validate_plan_capabilities(profile: EndpointProfile) -> None:
         and not profile.capabilities.stable_order
     ):
         raise ValueError("ordered plans require the stable-order capability")
-    if _uses_profile_short_page(profile.plan) and (
-        profile.page_cap is None or not profile.capabilities.fixed_page_cap
-    ):
+    if _uses_profile_short_page(profile.plan) and (profile.page_cap is None or not profile.capabilities.fixed_page_cap):
         raise ValueError("short-page terminal requires a fixed profile page cap")
 
 

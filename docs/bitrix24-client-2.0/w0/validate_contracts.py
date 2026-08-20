@@ -113,8 +113,7 @@ def _profile_map() -> dict[str, dict[str, Any]]:
 def _disposable_profile_errors(document: dict[str, Any]) -> list[str]:
     ids = [profile["id"] for profile in document["profiles"]]
     triples = [
-        (profile["create_method"], profile["read_method"], profile["delete_method"])
-        for profile in document["profiles"]
+        (profile["create_method"], profile["read_method"], profile["delete_method"]) for profile in document["profiles"]
     ]
     errors = []
     if len(ids) != len(set(ids)):
@@ -837,6 +836,7 @@ def self_test() -> None:  # noqa: PLR0915
 
 
 def main() -> int:
+    """Run the contract validation command."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--schema", choices=sorted(SCHEMAS))
     parser.add_argument("path", nargs="?", type=Path)

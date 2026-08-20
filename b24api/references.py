@@ -437,6 +437,7 @@ class ReferenceScheduler:
         whole_result: bool = False,
         page_cap_hint: int | None = None,
     ) -> None:
+        """Initialize instance state."""
         self.executor = executor
         self.plan = plan
         self.dispatch = dispatch
@@ -466,6 +467,7 @@ class ReferenceScheduler:
         self._source_controller: AsyncIteratorController[ReferenceRequest] | None = None
 
     async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:
+        """Yield correlated operation outcomes."""
         PaginationDriver.validate_contract(
             self.plan,
             self.identity,
@@ -767,10 +769,12 @@ class ReferenceScheduler:
         )
 
     def record_delivery(self, item: ReferenceItem) -> bool:
+        """Record one delivered reference item."""
         stored = self._delivery_uniqueness.pop(id(item), None)
         return stored is not None and stored[0] is item and stored[1]
 
     async def observe_source_cleanup(self) -> None:
+        """Observe completion of source cleanup."""
         controller = self._source_controller
         if controller is None:
             return
@@ -782,7 +786,18 @@ class ReferenceScheduler:
 class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     """Lazy reference stream with one frozen report and deterministic cleanup."""
 
-    def __init__(self, scheduler: ReferenceScheduler, source: ReferenceSource) -> None:
+    def __init__(  # noqa: PLR0913
+        self,
+        scheduler: ReferenceScheduler,
+        source: ReferenceSource,
+        *,
+        assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
+        profile_id: str | None = None,
+        profile_version: int | None = None,
+        profile_source_sha256: str | None = None,
+        profile_evidence_sha256: tuple[str, ...] = (),
+    ) -> None:
+        """Initialize instance state."""
         self._scheduler = scheduler
         self._source = source
         self._runner: AsyncGenerator[ReferenceStreamItem] | None = None
@@ -790,12 +805,26 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         self._closed = False
         self._emitted = 0
         self._unique_emitted = 0
-        self.report = OperationReport()
+        self._assurance = assurance
+        self._profile_id = profile_id
+        self._profile_version = profile_version
+        self._profile_source_sha256 = profile_source_sha256
+        self._profile_evidence_sha256 = profile_evidence_sha256
+        self.report = OperationReport(
+            assurance=assurance,
+            profile_id=profile_id,
+            profile_version=profile_version,
+            profile_applicable=True if profile_id is not None else None,
+            profile_source_sha256=profile_source_sha256,
+            profile_evidence_sha256=profile_evidence_sha256,
+        )
 
     def __aiter__(self) -> Self:
+        """Return this asynchronous iterator."""
         return self
 
     async def __anext__(self) -> ReferenceStreamItem:
+        """Return the next asynchronous item."""
         if self._closed:
             raise StopAsyncIteration
         if self._prefetched is not _MISSING:
@@ -816,6 +845,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
                 self._unique_emitted += 1
 
     async def __aenter__(self) -> Self:
+        """Enter the asynchronous context."""
         if self._closed:
             raise RuntimeError("stream is closed")
         if self._runner is None:
@@ -825,9 +855,11 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
+        """Exit the asynchronous context."""
         await self.aclose()
 
     async def aclose(self) -> None:
+        """Close owned asynchronous resources."""
         if self._closed:
             await self._observe_source_cleanup()
             return
@@ -945,10 +977,15 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             )
         self.report = OperationReport(
             state=state,
-            assurance=CompletionAssurance.CALLER_ASSERTED,
+            assurance=self._assurance,
             snapshot=snapshot_state,
             plan_id=type(self._scheduler.plan).__name__,
             dispatch_id=type(self._scheduler.dispatch).__name__,
+            profile_id=self._profile_id,
+            profile_version=self._profile_version,
+            profile_applicable=True if self._profile_id is not None else None,
+            profile_source_sha256=self._profile_source_sha256,
+            profile_evidence_sha256=self._profile_evidence_sha256,
             emitted_rows=self._emitted,
             unique_rows=self._unique_emitted,
             physical_requests=snapshot.counters.physical_requests,
@@ -998,6 +1035,11 @@ def iter_references(  # noqa: PLR0913
     policy: ExecutionPolicy | None = None,
     _whole_result: bool = False,
     _page_cap_hint: int | None = None,
+    _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
+    _profile_id: str | None = None,
+    _profile_version: int | None = None,
+    _profile_source_sha256: str | None = None,
+    _profile_evidence_sha256: tuple[str, ...] = (),
 ) -> ReferenceStream:
     """Construct a lazy bounded reference traversal stream without I/O."""
     PaginationDriver.validate_plan(plan)
@@ -1023,7 +1065,15 @@ def iter_references(  # noqa: PLR0913
         whole_result=_whole_result,
         page_cap_hint=_page_cap_hint,
     )
-    return ReferenceStream(scheduler, requests)
+    return ReferenceStream(
+        scheduler,
+        requests,
+        assurance=_assurance,
+        profile_id=_profile_id,
+        profile_version=_profile_version,
+        profile_source_sha256=_profile_source_sha256,
+        profile_evidence_sha256=_profile_evidence_sha256,
+    )
 
 
 async def _iterate_references(source: ReferenceSource) -> AsyncGenerator[ReferenceRequest]:

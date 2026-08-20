@@ -1,3 +1,5 @@
+"""Support helper."""
+
 from collections.abc import AsyncGenerator, AsyncIterable, Generator, Iterable
 from itertools import repeat
 from typing import Any, Literal

@@ -73,6 +73,7 @@ class WireResponse:
     body: bytes
 
     def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
         if not _HTTP_STATUS_MINIMUM <= self.status_code <= _HTTP_STATUS_MAXIMUM:
             raise ValueError("HTTP status must be between 100 and 599")
         object.__setattr__(self, "headers", tuple(self.headers))
@@ -80,6 +81,7 @@ class WireResponse:
 
     @property
     def header_map(self) -> dict[str, str]:
+        """Return the header map."""
         return {name.casefold(): value for name, value in self.headers}
 
 
@@ -91,7 +93,9 @@ class Transport(Protocol):
     cooperates with cancellation or returns within ``attempt_timeout``.
     """
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse: ...
+    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+        """Send one transport request attempt."""
+        ...
 
 
 class _PhaseTracker:
@@ -115,6 +119,7 @@ class HttpxTransport:
     """HTTPX transport with conservative failure-phase classification."""
 
     def __init__(self, webhook_url: str, *, client: httpx.AsyncClient | None = None) -> None:
+        """Initialize instance state."""
         if not webhook_url.endswith("/"):
             webhook_url += "/"
         self._webhook_url = webhook_url
@@ -123,6 +128,7 @@ class HttpxTransport:
         self._closed = False
 
     async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+        """Send one transport request attempt."""
         if self._closed:
             raise RuntimeError("transport is closed")
         tracker = _PhaseTracker()
@@ -172,6 +178,7 @@ class HttpxTransport:
         )
 
     async def aclose(self) -> None:
+        """Close owned asynchronous resources."""
         if self._closed:
             return
         self._closed = True
@@ -221,6 +228,7 @@ class RateCoordinator:
     )
 
     def __init__(self, *, max_concurrency: int = 10, clock: Clock = time.monotonic) -> None:
+        """Initialize instance state."""
         if isinstance(max_concurrency, bool) or max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
         self._max_concurrency = max_concurrency
@@ -235,6 +243,7 @@ class RateCoordinator:
         self._wake_task: asyncio.Task[None] | None = None
 
     async def acquire(self, work_class: WorkClass) -> _Permit:
+        """Acquire one coordinator permit for the requested work class."""
         if not isinstance(work_class, WorkClass):
             raise TypeError("work_class must be a WorkClass")
         loop = asyncio.get_running_loop()
@@ -276,6 +285,7 @@ class RateCoordinator:
             return max(0.0, self._cooldown_until - self._clock())
 
     async def close(self) -> None:
+        """Close owned resources."""
         async with self._condition:
             if self._state is CoordinatorState.CLOSED:
                 return
@@ -290,6 +300,7 @@ class RateCoordinator:
                         future.set_exception(RuntimeError("rate coordinator is closed"))
 
     async def snapshot(self) -> CoordinatorSnapshot:
+        """Return the current immutable snapshot."""
         async with self._condition:
             self._refresh_cooldown_locked()
             return CoordinatorSnapshot(
@@ -385,6 +396,7 @@ class ExecutionContext:
         *,
         clock: Clock = time.monotonic,
     ) -> None:
+        """Initialize instance state."""
         self.policy = policy
         self.coordinator = coordinator
         self._clock = clock
@@ -399,6 +411,7 @@ class ExecutionContext:
 
     @property
     def elapsed(self) -> float:
+        """Return the elapsed."""
         if self._start is None:
             return 0.0
         return max(0.0, self._clock() - self._start)
@@ -410,6 +423,7 @@ class ExecutionContext:
                 self._start = self._clock()
 
     async def reserve_attempt(self, *, attempts_for_request: int, retry_started: float) -> None:
+        """Reserve the attempt budget."""
         async with self._lock:
             self._counters = self._counters.reserve_attempt(
                 self.policy,
@@ -419,10 +433,12 @@ class ExecutionContext:
             )
 
     async def record_retry(self) -> None:
+        """Record the retry."""
         async with self._lock:
             self._retries += 1
 
     async def record_cooldown(self, seconds: float) -> None:
+        """Record the cooldown."""
         async with self._lock:
             self._cooldown_seconds += max(0.0, seconds)
 
@@ -485,12 +501,14 @@ class ExecutionContext:
             self._counters = self._counters.with_buffered_rows(self.policy, target)
 
     def remaining_time(self, *, retry_started: float) -> float:
+        """Return the tighter operation or retry time remaining."""
         return min(
             self.policy.max_elapsed - self.elapsed,
             self.policy.max_retry_elapsed_per_request - max(0.0, self._clock() - retry_started),
         )
 
     async def snapshot(self) -> ExecutionSnapshot:
+        """Return the current immutable snapshot."""
         async with self._lock:
             return ExecutionSnapshot(
                 counters=self._counters,
@@ -629,6 +647,7 @@ class Executor:
         sleep: Sleeper = asyncio.sleep,
         random_source: Callable[[], float] = random.random,
     ) -> None:
+        """Initialize instance state."""
         self.transport = transport
         self.coordinator = coordinator or RateCoordinator(clock=clock)
         self.codec = codec or ProtocolCodec()
@@ -637,6 +656,7 @@ class Executor:
         self._random = random_source
 
     def context(self, policy: ExecutionPolicy | None = None) -> ExecutionContext:
+        """Create an operation execution context."""
         return ExecutionContext(policy or ExecutionPolicy(), self.coordinator, clock=self._clock)
 
     async def execute(  # noqa: C901
@@ -647,6 +667,7 @@ class Executor:
         policy: ExecutionPolicy | None = None,
         work_class: WorkClass = WorkClass.INTERACTIVE_DIRECT,
     ) -> Response:
+        """Execute one canonical request."""
         if context is not None and policy is not None:
             raise ValueError("pass context or policy, not both")
         if not isinstance(request, Request):

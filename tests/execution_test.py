@@ -29,12 +29,16 @@ HTTP_OK = 200
 
 
 class SequenceTransport:
+    """Provide a deterministic test helper."""
+
     def __init__(self, outcomes: tuple[WireResponse | Exception, ...] | list[WireResponse | Exception]) -> None:
+        """Initialize instance state."""
         self.outcomes = list(outcomes)
         self.calls = 0
         self.timeouts: list[float] = []
 
     async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+        """Send one transport request attempt."""
         del request
         self.timeouts.append(attempt_timeout)
         outcome = self.outcomes[self.calls]

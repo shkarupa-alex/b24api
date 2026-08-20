@@ -33,6 +33,7 @@ class ProtocolCodec:
     """Decode bounded HTTP error evidence without retaining raw bodies."""
 
     def __init__(self, *, redactor: Redactor = DEFAULT_REDACTOR) -> None:
+        """Initialize instance state."""
         self._redactor = redactor
 
     def error_from_http(

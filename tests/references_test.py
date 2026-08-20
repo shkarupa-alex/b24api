@@ -64,11 +64,15 @@ PULL_TEST_TIMEOUT = 0.15
 
 
 class AsyncFunctionTransport:
+    """Provide a deterministic test helper."""
+
     def __init__(self, handler: Callable[[Request], object]) -> None:
+        """Initialize instance state."""
         self.handler = handler
         self.requests: list[Request] = []
 
     async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+        """Send one transport request attempt."""
         del attempt_timeout
         self.requests.append(request)
         outcome = self.handler(request)
@@ -79,11 +83,15 @@ class AsyncFunctionTransport:
 
 
 class BlockingTransport:
+    """Provide a deterministic test helper."""
+
     def __init__(self) -> None:
+        """Initialize instance state."""
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
 
     async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+        """Send one transport request attempt."""
         del request, attempt_timeout
         self.started.set()
         try:

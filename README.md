@@ -127,8 +127,9 @@ ReferenceItem or ReferenceFailure instead of losing correlation.
 The committed wrappers remain callable and delegate to the same engine:
 
 - list_sequential uses OffsetSequentialPlan.
-- list_batched uses correctness-first counted traversal; the zero-profile
-  fallback is sequential.
+- list_batched preserves the committed direct-head plus batched-tail counted
+  traversal and verifies every in-band range, continuation, total, and supplied
+  identity before normal completion.
 - list_batched_no_count uses exact sequential KeysetPlan.
 - reference_batched_no_count uses per-reference keyset traversal with
   BatchDispatch.
@@ -154,7 +155,9 @@ all cursor values are missing or null; mixed present and missing cursor values
 fail before any row from that page is emitted.
 
 Read wrappers set SAFE only when replay_safety was not supplied. An explicitly
-UNSAFE request is never upgraded.
+UNSAFE request is never upgraded. When a reviewed profile is selected, its
+replay-safety value is applied exactly and any explicit conflict refuses before
+I/O.
 
 Legacy wrappers retain the historical one-key result fallback. Canonical
 iter_list remains exact: ResultSelector.root() means the root itself must be a

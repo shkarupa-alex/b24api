@@ -47,6 +47,7 @@ class ModelCase:
 
     @property
     def expected_hash(self) -> str:
+        """Return the expected hash."""
         return content_sha256(list(self.identities))
 
 
@@ -97,6 +98,7 @@ class DeterministicPortal(Transport):
     """A finite in-memory Bitrix-shaped endpoint with exact accounting."""
 
     def __init__(self, case: ModelCase) -> None:
+        """Initialize instance state."""
         self.case = case
         self.requests = 0
         self.operating_seconds = 0.0
@@ -111,6 +113,7 @@ class DeterministicPortal(Transport):
         return content_sha256(self._identities)
 
     async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+        """Send one transport request attempt."""
         if request.method != MODEL_METHOD:
             raise AssertionError(f"unexpected model method: {request.method}")
         if attempt_timeout <= 0:

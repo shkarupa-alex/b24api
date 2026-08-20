@@ -29,6 +29,7 @@ class LiveApiError(LiveCorrectnessError):
     """A typed API error whose safe code is available without rendering portal text."""
 
     def __init__(self, *, method: str, code: str) -> None:
+        """Initialize instance state."""
         self.code = code
         super().__init__(f"live API returned an unexpected error for {method}")
 
@@ -66,6 +67,7 @@ class LivePortal:
     """Minimal synchronous webhook session whose URL never enters artifacts or errors."""
 
     def __init__(self, *, role: str, timeout: float = 30.0) -> None:
+        """Initialize instance state."""
         encoded_key = os.environ.get("BITRIX24_EVIDENCE_FINGERPRINT_KEY")
         if encoded_key is None:
             raise ContractError("BITRIX24_EVIDENCE_FINGERPRINT_KEY is required for --live")
@@ -80,12 +82,15 @@ class LivePortal:
         self.attempts = 0
 
     def close(self) -> None:
+        """Close owned resources."""
         self._client.close()
 
     def __enter__(self) -> Self:
+        """Enter the context."""
         return self
 
     def __exit__(self, *_args: object) -> None:
+        """Exit the context."""
         self.close()
 
     def call_envelope(self, method: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -159,6 +164,7 @@ class DisposableAdapter:
     not_found_codes: frozenset[str] = frozenset({"error_not_found"})
 
     def create(self, portal: LivePortal, marker: str) -> str:
+        """Create one disposable portal entity."""
         result = portal.call(self.create_method, {"fields": {self.marker_field: marker}})
         if self.result_container is not None:
             if not isinstance(result, dict) or not isinstance(result.get(self.result_container), dict):
@@ -172,6 +178,7 @@ class DisposableAdapter:
         return str(entity_id)
 
     def read(self, portal: LivePortal, entity_id: str) -> dict[str, Any] | None:
+        """Read one portal entity by identifier."""
         try:
             result = portal.call(self.read_method, {self.id_parameter: entity_id})
         except LiveApiError as error:
@@ -189,9 +196,11 @@ class DisposableAdapter:
         return result
 
     def delete(self, portal: LivePortal, entity_id: str) -> None:
+        """Delete one owned portal entity."""
         portal.call(self.delete_method, {self.id_parameter: entity_id})
 
     def find_exact_marker(self, portal: LivePortal, marker: str) -> list[str]:  # noqa: C901
+        """Find entities matching the exact ownership marker."""
         matches: set[str] = set()
         start: int | None = None
         seen_starts: set[int | None] = set()

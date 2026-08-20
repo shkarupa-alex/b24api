@@ -92,6 +92,7 @@ class BatchExecutor:
         portal_command_cap: int = PORTAL_BATCH_CAP,
         fallback_eligible_codes: frozenset[str] = frozenset(),
     ) -> None:
+        """Initialize instance state."""
         if isinstance(portal_command_cap, bool) or not 1 <= portal_command_cap <= PORTAL_BATCH_CAP:
             raise ValueError("portal command cap must be between 1 and 50")
         self.executor = executor
@@ -346,6 +347,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         fallback_failed: Literal["none", "direct"],
         policy: ExecutionPolicy,
     ) -> None:
+        """Initialize instance state."""
         self._executor = batch_executor
         self._source = source
         self._batch_size = batch_size
@@ -363,9 +365,11 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         self.report = OperationReport()
 
     def __aiter__(self) -> Self:
+        """Return this asynchronous iterator."""
         return self
 
     async def __anext__(self) -> BatchStreamItem:
+        """Return the next asynchronous item."""
         if self._closed:
             raise StopAsyncIteration
         if self._prefetched is not _MISSING:
@@ -380,6 +384,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         return item
 
     async def __aenter__(self) -> Self:
+        """Enter the asynchronous context."""
         if self._closed:
             raise RuntimeError("stream is closed")
         if self._runner is None:
@@ -389,9 +394,11 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
+        """Exit the asynchronous context."""
         await self.aclose()
 
     async def aclose(self) -> None:
+        """Close owned asynchronous resources."""
         if self._closed:
             await self._observe_source_cleanup()
             return

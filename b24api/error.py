@@ -54,6 +54,7 @@ class B24ApiError(Exception):
         retryable: bool = False,
         redactor: Redactor = DEFAULT_REDACTOR,
     ) -> None:
+        """Initialize instance state."""
         resolved_origin = origin or self.default_origin
         if resolved_origin is None:
             raise TypeError("origin is required for B24ApiError")
@@ -68,6 +69,7 @@ class B24ApiError(Exception):
 
     @property
     def http_status(self) -> int | None:
+        """Return the http status."""
         return self.evidence.http_status
 
     def to_safe_dict(self) -> dict[str, object]:
@@ -83,6 +85,7 @@ class B24ApiError(Exception):
         }
 
     def __repr__(self) -> str:
+        """Return a safe representation."""
         return f"{type(self).__name__}({self.to_safe_dict()!r})"
 
 
@@ -101,6 +104,7 @@ class TransportError(B24ApiError):
         retryable: bool = True,
         redactor: Redactor = DEFAULT_REDACTOR,
     ) -> None:
+        """Initialize instance state."""
         if not isinstance(phase, FailurePhase):
             raise TypeError("phase must be a FailurePhase")
         self.phase = phase
@@ -118,6 +122,7 @@ class TransportError(B24ApiError):
         return self.phase not in {FailurePhase.NOT_DISPATCHED, FailurePhase.CONNECTION_ESTABLISHED}
 
     def to_safe_dict(self) -> dict[str, object]:
+        """Return the to safe dict representation."""
         safe = super().to_safe_dict()
         safe.update({"phase": self.phase.value, "possible_acceptance": self.possible_acceptance})
         return safe
@@ -152,6 +157,7 @@ class ApiResponseError(B24ApiError):
         retryable: bool = False,
         redactor: Redactor = DEFAULT_REDACTOR,
     ) -> None:
+        """Initialize instance state."""
         self.original_code = code
         self.code = str(code).lower()
         self.normalized_code = str(code).strip().casefold()
@@ -182,6 +188,7 @@ class ApiResponseError(B24ApiError):
         )
 
     def to_safe_dict(self) -> dict[str, object]:
+        """Return the to safe dict representation."""
         safe = super().to_safe_dict()
         safe.update(
             {
@@ -201,6 +208,7 @@ class RetryApiResponseError(ApiResponseError):
     """Structured API error classified as retryable by explicit policy."""
 
     def __init__(self, **kwargs: Any) -> None:  # noqa: ANN401
+        """Initialize instance state."""
         kwargs["retryable"] = True
         super().__init__(**kwargs)
 
@@ -209,6 +217,7 @@ class BatchCommandError(ApiResponseError):
     """Structured error correlated to one batch command."""
 
     def __init__(self, **kwargs: Any) -> None:  # noqa: ANN401
+        """Initialize instance state."""
         kwargs.setdefault("origin", ErrorOrigin.BATCH_COMMAND)
         super().__init__(**kwargs)
 
@@ -241,6 +250,7 @@ class IncompleteTraversalError(B24ApiError):
     """Compatibility traversal ended without a completed terminal report."""
 
     def __init__(self, *, report: object) -> None:
+        """Initialize instance state."""
         self.report = report
         super().__init__(
             "Traversal did not complete",
@@ -252,6 +262,7 @@ class RetryHTTPStatusError(HTTPGatewayError):
     """Import-compatible retryable HTTP status error with redacted presentation."""
 
     def __init__(self, message: str, *, request: httpx.Request, response: httpx.Response) -> None:
+        """Initialize instance state."""
         self.httpx_request = request
         self.httpx_response = response
         endpoint = request.url.path.rstrip("/").rsplit("/", maxsplit=1)[-1] or "unknown"

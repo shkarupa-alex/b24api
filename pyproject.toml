@@ -56,7 +56,7 @@ docstring-code-format = true
 
 [tool.ruff.lint]
 select = ["ALL"]
-ignore = ["EM", "TRY003", "D1", "FA"]
+ignore = ["EM", "TRY003"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
@@ -66,7 +66,12 @@ no-lines-before = ["standard-library"]
 known-third-party = []
 
 [tool.ruff.lint.extend-per-file-ignores]
-"*_test.py" = ["S101", "S311"]
+"*_test.py" = [
+    "D100",
+    "D103",
+    "S101",
+    "S311",
+]
 
 
 [tool.mypy]
@@ -82,7 +87,7 @@ module = [
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["b24api.api_test", "b24api.query_test"]
+module = ["tests.api_test", "tests.query_test"]
 disable_error_code = [
     "call-arg",       # @inject hides DI-resolved arguments from mypy
     "arg-type",       # test code operates on ApiTypes without narrowing
