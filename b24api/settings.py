@@ -48,6 +48,17 @@ class Settings(BaseSettings):
         hide_input_in_errors=True,
     )
 
+    def __init__(self, **data: Any) -> None:  # noqa: ANN401
+        """Validate without retaining credential-bearing framework traceback frames."""
+        failure: ValidationError | None = None
+        try:
+            super().__init__(**data)
+        except ValidationError as error:
+            failure = error.with_traceback(None)
+        data.clear()
+        if failure is not None:
+            raise failure
+
     @field_validator("webhook_url", mode="before")
     @classmethod
     def _sanitize_invalid_webhook_input(cls, value: Any) -> HttpUrl | str:  # noqa: ANN401
@@ -66,6 +77,14 @@ class Settings(BaseSettings):
         """Iterate with the credential-bearing field redacted."""
         for name, value in super().__iter__():
             yield name, _REDACTED if name == "webhook_url" else value
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Return pickle state without credential-bearing settings."""
+        state = super().__getstate__()
+        values = dict(state["__dict__"])
+        values["webhook_url"] = _REDACTED
+        state["__dict__"] = values
+        return state
 
 
 def api_settings(**kwargs: Any) -> Settings:  # noqa: ANN401

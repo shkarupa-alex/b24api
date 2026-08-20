@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 import json
+import pickle
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
@@ -52,6 +54,8 @@ def test_settings_redacts_webhook_from_representations_and_serialization() -> No
         repr(list(settings)),
         repr(settings.model_dump()),
         settings.model_dump_json(),
+        repr(settings.__getstate__()),
+        repr(pickle.dumps(settings)),
     )
 
     assert all(sensitive_fragment not in surface for surface in surfaces)
@@ -67,6 +71,54 @@ def test_settings_redacts_invalid_webhook_from_validation_error() -> None:
     error = captured.value
     surfaces = (str(error), repr(error), repr(error.errors()), error.json())
     assert all(sensitive_fragment not in surface for surface in surfaces)
+
+
+@pytest.mark.parametrize("webhook_case", ["valid", "invalid"])
+def test_settings_validation_error_drops_framework_credential_locals(webhook_case: str) -> None:
+    sensitive_fragment = "synthetic-traceback-private-token"
+    webhook = f"https://example.invalid/rest/1/{sensitive_fragment}/"
+    arguments: dict[str, object] = {"webhook_url": webhook, "batch_size": 51}
+    if webhook_case == "invalid":
+        arguments = {"webhook_url": f"https://example.invalid:bad/{sensitive_fragment}"}
+
+    with pytest.raises(ValidationError) as captured:
+        Settings(**arguments)
+
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        filename = Path(traceback.tb_frame.f_code.co_filename)
+        if filename.name != "api_test.py":
+            for value in traceback.tb_frame.f_locals.values():
+                assert sensitive_fragment not in repr(value)
+        traceback = traceback.tb_next
+
+
+@pytest.mark.parametrize("webhook_case", ["valid", "invalid"])
+def test_environment_settings_error_drops_framework_credential_locals(
+    monkeypatch: pytest.MonkeyPatch,
+    webhook_case: str,
+) -> None:
+    sensitive_fragment = "synthetic-env-traceback-private-token"
+    webhook = f"https://example.invalid/rest/1/{sensitive_fragment}/"
+    monkeypatch.setenv("BITRIX24_API_WEBHOOK_URL", webhook)
+    monkeypatch.setenv("BITRIX24_API_BATCH_SIZE", "51")
+    if webhook_case == "invalid":
+        monkeypatch.setenv(
+            "BITRIX24_API_WEBHOOK_URL",
+            f"https://example.invalid:bad/{sensitive_fragment}",
+        )
+        monkeypatch.delenv("BITRIX24_API_BATCH_SIZE")
+
+    with pytest.raises(ValidationError) as captured:
+        Settings()
+
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        filename = Path(traceback.tb_frame.f_code.co_filename)
+        if filename.name != "api_test.py":
+            for value in traceback.tb_frame.f_locals.values():
+                assert sensitive_fragment not in repr(value)
+        traceback = traceback.tb_next
 
 
 @pytest.mark.asyncio
