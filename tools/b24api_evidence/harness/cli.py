@@ -526,6 +526,16 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
         or benchmark_plan["dataset_plan_content_hash"] != content_sha256(plan)
     ):
         raise ContractError("benchmark plan lineage does not match the dataset plan and candidate")
+    if benchmark_plan["admission_state"] != "draft":
+        raise LiveUnavailableError("admission-ready benchmark plans require the unavailable reviewed live runner")
+    cases = benchmark_plan["cases"]
+    if (
+        not isinstance(cases, list)
+        or len(cases) != 1
+        or cases[0].get("id") != "MODEL-MATRIX"
+        or cases[0].get("compared_plans") != ["offset", "keyset"]
+    ):
+        raise ContractError("the deterministic runner accepts only its exact MODEL-MATRIX offset/keyset draft")
     started = time.monotonic()
     runs = run_exact_matrix_sync()
     rows = sum(len(run.identities) for run in runs if run.outcome == "PASS")

@@ -64,6 +64,16 @@ _ENV_SECRET_RE = re.compile(
     re.IGNORECASE,
 )
 _ASCII_UNICODE_ESCAPE_RE = re.compile(rb"\\u([0-9a-fA-F]{4})")
+_CONTRACT_TEST_SECRET_FIXTURE_LINE_SHA256 = frozenset(
+    {
+        "4d6ee1de7c64da4f49365980897cc01fff1240a0258091d1df92a5505ad4da6e",
+        "aabd00436576a28dca9ee75a578f722247109dce7bc7325188cc645a98610b8b",
+        "f1462274256a074c4c6c6e413856341013efb9f77e73d9bfcc5f822e63954181",
+        "4bfbd7e3a59ca085a2c11043553b98f2c008db2b879546c9be4301aefcbf568c",
+        "62812b3cdbc6519f96f61a3fbc05c97120bcf96b9dfe522b457d7163ca3f876e",
+        "8c87d639114081d310c484fc215f8cc3b1440bfa992b90127bcb732f3379ec12",
+    },
+)
 
 
 class ExitCode(IntEnum):
@@ -904,13 +914,11 @@ def scan_paths_for_secrets(paths: Iterable[Path]) -> None:
             if path.name in {"models_test.py", "protocol_test.py", "redaction_test.py"}:
                 data = b"\n".join(line for line in data.splitlines() if b"EXAMPLE_CREDENTIAL" not in line)
             if path.name == "contracts_test.py":
-                for fixture in (
-                    b'LEAK_FIXTURE = b"https://example.invalid' + b'/rest/1/realisticToken123/"',
-                    b'"https://portal.invalid' + b'/rest/13/not-a-real-token/",',
-                    b'"https://portal.invalid' + b'/rest/13/different-dummy-token/",',
-                    b'"https://user:password@portal.invalid' + b'/rest/13/not-a-real-token/",',
-                ):
-                    data = data.replace(fixture, b"")
+                data = b"\n".join(
+                    line
+                    for line in data.splitlines()
+                    if hashlib.sha256(line).hexdigest() not in _CONTRACT_TEST_SECRET_FIXTURE_LINE_SHA256
+                )
             scan_bytes_for_secrets(data, source=str(path))
 
 

@@ -713,6 +713,28 @@ def test_benchmark_parent_hashes_detect_oracle_tampering(tmp_path: Path) -> None
         cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - bundle-integrity regression
 
 
+def test_admission_ready_benchmark_never_runs_the_model_matrix_as_a_substitute(tmp_path: Path) -> None:
+    dataset_plan = _plan(count=0)
+    benchmark_plan = _benchmark_plan()
+    benchmark_plan["dataset_plan_content_hash"] = content_sha256(dataset_plan)
+    benchmark_plan["cases"][0]["id"] = "FAKE-UNEXECUTED-LIVE-CELL"
+    plan_path = tmp_path / "dataset-plan-input.json"
+    benchmark_path = tmp_path / "benchmark-plan-input.json"
+    plan_path.write_text(json.dumps(dataset_plan))
+    benchmark_path.write_text(json.dumps(benchmark_plan))
+    result = _run_cli(
+        "benchmark",
+        "--artifact-dir",
+        str(tmp_path / "artifacts"),
+        "--plan",
+        str(plan_path),
+        "--benchmark-plan",
+        str(benchmark_path),
+    )
+    assert result.returncode == ExitCode.UNAVAILABLE
+    assert "admission-ready" in result.stderr
+
+
 def test_resume_rejects_incompatible_run_lineage(tmp_path: Path) -> None:
     plan = _plan()
     plan_path = tmp_path / "plan.json"
