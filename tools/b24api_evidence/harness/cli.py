@@ -415,6 +415,7 @@ def _verify(args: argparse.Namespace) -> ExitCode:
         "schema_version": SCHEMA_VERSION,
         "run_id": plan["run_id"],
         "lineage_id": plan["lineage_id"],
+        "case_id": "MANIFEST",
         "candidate_sha": plan["candidate_sha"],
         "dataset_plan_content_hash": content_sha256(plan),
         "manifest_content_hash": manifest_hash,
