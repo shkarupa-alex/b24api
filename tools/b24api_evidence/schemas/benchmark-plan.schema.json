@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b24api.local/schemas/evidence/benchmark-plan-2.0.json",
+  "title": "Preregistered normalized benchmark plan",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "plan_id", "lineage_id", "admission_state", "thresholds_normative", "candidate_sha", "dataset_plan_content_hash", "controls", "cases"],
+  "properties": {
+    "schema_version": {"const": "2.0"}, "plan_id": {"$ref": "#/$defs/uuid"}, "lineage_id": {"$ref": "#/$defs/uuid"},
+    "admission_state": {"enum": ["draft", "admission_ready"]}, "thresholds_normative": {"type": "boolean"},
+    "candidate_sha": {"$ref": "#/$defs/sha"}, "dataset_plan_content_hash": {"$ref": "#/$defs/sha256"},
+    "controls": {"$ref": "#/$defs/controls"}, "cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}}
+  },
+  "allOf": [
+    {"if": {"properties": {"admission_state": {"const": "draft"}}, "required": ["admission_state"]}, "then": {"properties": {"thresholds_normative": {"const": false}}}},
+    {
+      "if": {"properties": {"admission_state": {"const": "admission_ready"}}, "required": ["admission_state"]},
+      "then": {
+        "properties": {
+          "thresholds_normative": {"const": true},
+          "controls": {
+            "properties": {
+              "drift": {
+                "properties": {
+                  "status": {"const": "preregistered"},
+                  "max_rtt_ratio": {"type": "number", "minimum": 1},
+                  "max_operating_ratio": {"type": "number", "minimum": 1}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "uuid": {"type": "string", "pattern": "^[0-9a-f-]{36}$"},
+    "controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["warmups", "advisory_runs", "blocking_pairs", "interleaving", "drift"],
+      "properties": {
+        "warmups": {"type": "integer", "minimum": 1},
+        "advisory_runs": {"type": "integer", "minimum": 5},
+        "blocking_pairs": {"type": "integer", "minimum": 9},
+        "interleaving": {"const": true},
+        "drift": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "max_rtt_ratio", "max_operating_ratio"],
+          "properties": {
+            "status": {"enum": ["preregistered", "tbd_live"]},
+            "max_rtt_ratio": {"oneOf": [{"type": "number", "minimum": 1}, {"const": "TBD-LIVE"}]},
+            "max_operating_ratio": {"oneOf": [{"type": "number", "minimum": 1}, {"const": "TBD-LIVE"}]}
+          }
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "compared_plans", "benefit_gate"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$"},
+        "compared_plans": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "benefit_gate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "blocking", "minimum_median_improvement", "paired_95_interval_excludes_parity",
+            "maximum_small_p95_ratio", "maximum_server_operating_ratio"
+          ],
+          "properties": {
+            "blocking": {"type": "boolean"},
+            "minimum_median_improvement": {"type": "number", "minimum": 0},
+            "paired_95_interval_excludes_parity": {"type": "boolean"},
+            "maximum_small_p95_ratio": {"type": "number", "minimum": 1},
+            "maximum_server_operating_ratio": {"type": "number", "minimum": 1}
+          },
+          "allOf": [{
+            "if": {"properties": {"blocking": {"const": true}}, "required": ["blocking"]},
+            "then": {"properties": {
+              "minimum_median_improvement": {"minimum": 0.15},
+              "paired_95_interval_excludes_parity": {"const": true},
+              "maximum_small_p95_ratio": {"maximum": 1.05},
+              "maximum_server_operating_ratio": {"maximum": 1.1}
+            }}
+          }]
+        }
+      }
+    }
+  },
+  "$comment": "Admission semantic validation additionally requires every case to have a blocking gate and at least two distinct compared plans."
+}

@@ -32,6 +32,7 @@ include = ["b24api*"]
 
 [dependency-groups]
 dev = [
+    "jsonschema>=4.25.1",
     "mypy>=1.15.0",
     "pytest-asyncio>=1.1.0",
     "pytest-env>=1.1.5",
@@ -40,6 +41,7 @@ dev = [
     "ruff>=0.15.5",
     "setuptools>=80.9.0",
     "setuptools-git-versioning>=2.1.0",
+    "types-jsonschema>=4.26.0.20260113",
     "wheel>=0.45.1",
 ]
 
