@@ -16,7 +16,14 @@ uv run python tools/b24api_evidence.py recover-manifest
 `plan`, model-plan `verify`, and the deterministic model benchmark do not need a
 webhook. A live dataset plan requires `verify --live`, which point-reads every manifest identity twice.
 `seed` and `cleanup` refuse unless both `--live` and `--allow-writes`
-are present and `--plan` names a human-approved `approved_for_seed` plan.
+are present and `--plan` names a human-approved `approved_for_seed` plan. The
+approval cannot be claimed by the plan alone: each write invocation must also
+repeat its exact external review commit and full plan hash through
+`--confirm-plan-review-sha <sha>` and
+`--confirm-plan-content-sha256 <sha256>`. Both confirmations must match the
+reviewed plan's exact canonical content. The review commit message must contain
+the trailer `Dataset-Plan-SHA256: <same-sha256>`; an arbitrary hex value in the
+plan is not authorization.
 `benchmark` is always read-only; `benchmark --live` explicitly refuses until a reviewed live benchmark
 cell exists rather than silently substituting model evidence. Recovery is a two-step read-only exact-marker
 scan: the first run writes a preview; only a second run with

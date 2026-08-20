@@ -126,13 +126,20 @@ class LivePortal:
         """Call one REST method and return its result without retaining raw bodies."""
         return self.call_envelope(method, parameters)["result"]
 
-    def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
+    def preflight(self, *, required_scopes: set[str]) -> LivePreflight:  # noqa: C901 - hostile wire union
         """Call scope/app.info and classify missing environment as unavailable."""
         scope_result = self.call("scope")
         if isinstance(scope_result, list):
-            scopes = frozenset(str(item) for item in scope_result)
+            if any(not isinstance(item, str) or not item for item in scope_result):
+                raise LiveCorrectnessError("scope result contains an invalid scope name")
+            scopes = frozenset(scope_result)
         elif isinstance(scope_result, dict):
-            scopes = frozenset(str(key) for key, enabled in scope_result.items() if enabled)
+            if any(
+                not isinstance(key, str) or not key or type(enabled) is not bool
+                for key, enabled in scope_result.items()
+            ):
+                raise LiveCorrectnessError("scope result contains invalid capability values")
+            scopes = frozenset(key for key, enabled in scope_result.items() if enabled)
         else:
             raise LiveCorrectnessError("scope result has an unsupported shape")
         missing = sorted(required_scopes - scopes)
@@ -142,10 +149,16 @@ class LivePortal:
         build: str | None = None
         if isinstance(app, dict):
             for key in ("VERSION", "version", "BUILD", "build"):
+                if key not in app:
+                    continue
                 value = app.get(key)
-                if isinstance(value, str | int):
+                if isinstance(value, str) and value:
                     build = str(value)[:100]
                     break
+                if isinstance(value, int) and not isinstance(value, bool):
+                    build = str(value)[:100]
+                    break
+                raise LiveCorrectnessError("app.info build has an invalid semantic type")
         return LivePreflight(identity=self.identity, build=build, scopes=scopes)
 
 

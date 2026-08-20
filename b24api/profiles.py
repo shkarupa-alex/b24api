@@ -262,6 +262,8 @@ class EndpointProfile:
             raise ValueError("profile verification cannot predate its evidence review")
         if any(anchor.expires_at < self.expires_at for anchor in self.evidence):
             raise ValueError("profile cannot outlive an evidence anchor")
+        if len({anchor.candidate_sha for anchor in self.evidence}) != 1:
+            raise ValueError("profile evidence anchors must share one exact candidate SHA")
         if len({probe.probe_id for probe in self.required_probes}) != len(self.required_probes):
             raise ValueError("profile probe IDs must be unique")
         if any(probe.method != self.method for probe in self.required_probes):

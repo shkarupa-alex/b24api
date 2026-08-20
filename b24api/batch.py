@@ -459,7 +459,9 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                 reservations = []
                 try:
                     if self._logical_page_per_command:
-                        reservations.extend([await self._context.reserve_page() for _ in chunk.commands])
+                        for _ in chunk.commands:
+                            reservation = await self._context.reserve_page()
+                            reservations.append(reservation)
                     outcomes = await self._executor._execute_chunk(  # noqa: SLF001
                         chunk.commands,
                         tolerant=self._tolerant,

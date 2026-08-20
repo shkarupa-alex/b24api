@@ -231,6 +231,7 @@ def test_profile_verified_report_requires_complete_hash_only_provenance() -> Non
         profile_applicable=True,
         profile_source_sha256=profile_hash,
         profile_evidence_sha256=(evidence_hash,),
+        profile_evidence_candidate_sha="c" * 40,
     )
 
     assert report.profile_source_sha256 == profile_hash

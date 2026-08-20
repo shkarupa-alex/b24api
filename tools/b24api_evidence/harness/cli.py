@@ -6,6 +6,8 @@ import hashlib
 import math
 import os
 import platform
+import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -119,6 +121,8 @@ def _parser() -> argparse.ArgumentParser:
         subparser.add_argument("--count", type=int, default=5)
         subparser.add_argument("--confirm-recovery", action="store_true")
         subparser.add_argument("--recovery-preview-sha256")
+        subparser.add_argument("--confirm-plan-review-sha")
+        subparser.add_argument("--confirm-plan-content-sha256")
     return parser
 
 
@@ -250,7 +254,7 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
     _require_live_write_flags(args, "seed")
     _required_path(args.plan, "--plan")
     plan = _load_plan(args)
-    _require_approved_plan(plan)
+    _require_approved_plan(plan, args=args)
     validate_reviewed_profile_set(PROFILE_SET_PATH)
     manifest_path = _manifest_path(args)
     artifact_dir = args.artifact_dir.resolve()
@@ -372,6 +376,7 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                 append_manifest_record(manifest_path, record)
                 previous = record
                 try:
+                    require_clean_tracked_tree(ROOT)
                     entity_id = adapter.create(portal, marker)
                     http_attempts += 1
                     event = "created"
@@ -765,7 +770,7 @@ def _resume(args: argparse.Namespace) -> ExitCode:
 def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0915
     _require_live_write_flags(args, "cleanup")
     plan = _load_plan(args)
-    _require_approved_plan(plan)
+    _require_approved_plan(plan, args=args)
     manifest_path = _manifest_path(args)
     records = load_manifest(manifest_path, expected=_lineage(plan))
     validate_manifest_against_plan(records, plan)
@@ -869,6 +874,7 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0915
             )
             append_manifest_record(manifest_path, dispatched)
             previous = dispatched
+            require_clean_tracked_tree(ROOT)
             adapter.delete(portal, entity_id)
             deleted = build_manifest_record(
                 {**base, "event": "deleted", "entity_id": entity_id, "request_fingerprint": request_fingerprint},
@@ -1321,14 +1327,40 @@ def _profile(profile_set: Mapping[str, Any], profile_id: str) -> dict[str, Any]:
     raise ContractError("requested disposable entity profile is not in the reviewed set")
 
 
-def _require_approved_plan(plan: Mapping[str, Any]) -> None:
+def _require_approved_plan(plan: Mapping[str, Any], *, args: argparse.Namespace) -> None:
     authorization = plan["authorization"]
     if not isinstance(authorization, dict) or authorization.get("state") != "approved_for_seed":
         raise ContractError("live writes require a human-reviewed approved_for_seed plan")
+    review_sha = authorization.get("plan_review_sha")
+    if getattr(args, "confirm_plan_review_sha", None) != review_sha:
+        raise ContractError("live writes require an external exact plan review SHA confirmation")
+    plan_content_sha256 = content_sha256(plan)
+    if getattr(args, "confirm_plan_content_sha256", None) != plan_content_sha256:
+        raise ContractError("live writes require an external exact plan content hash confirmation")
+    _require_review_commit(str(review_sha), plan_content_sha256=plan_content_sha256)
     if plan["portal"]["role"] == "model":
         raise ContractError("approved live-write plan cannot target the deterministic model portal")
     if sum(int(cell["target_count"]) for cell in plan["cells"]) == 0:
         raise ContractError("approved live-write plans require at least one disposable entity")
+
+
+def _require_review_commit(review_sha: str, *, plan_content_sha256: str) -> None:
+    git = shutil.which("git")
+    if git is None:
+        raise ContractError("git executable is unavailable")
+    try:
+        message = subprocess.run(  # noqa: S603 - fixed git and validated hash-only revision
+            [git, "show", "--no-patch", "--format=%B", review_sha],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ContractError("plan_review_sha must name an existing review commit") from error
+    expected = f"Dataset-Plan-SHA256: {plan_content_sha256}"
+    if expected not in {line.strip() for line in message.splitlines()}:
+        raise ContractError("plan review commit does not bind the exact dataset plan content hash")
 
 
 def _require_portal_match(plan: Mapping[str, Any], portal: LivePortal) -> None:
@@ -1344,6 +1376,8 @@ def _require_portal_match(plan: Mapping[str, Any], portal: LivePortal) -> None:
 def _require_preflight_match(plan: Mapping[str, Any], preflight: LivePreflight) -> None:
     """Reject reviewed-build or scope drift before any entity operation."""
     planned = plan["portal"]
+    if not isinstance(preflight.build, str) or not preflight.build:
+        raise LiveUnavailableError("live portal did not provide an exact build identifier")
     if planned.get("build") != preflight.build:
         raise LiveUnavailableError("live portal build differs from the reviewed plan")
     if planned.get("scope_hash") != content_sha256(sorted(preflight.scopes)):

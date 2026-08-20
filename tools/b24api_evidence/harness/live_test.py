@@ -83,6 +83,27 @@ def test_live_envelope_refuses_oversized_content_before_buffering(
         portal.call("scope")
 
 
+@pytest.mark.parametrize(
+    ("scope_result", "app_result"),
+    [
+        ({"task": "N"}, {"VERSION": "build-1"}),
+        (["task"], {"VERSION": True}),
+    ],
+)
+def test_live_preflight_rejects_hostile_scope_and_build_types(
+    monkeypatch: pytest.MonkeyPatch,
+    scope_result: object,
+    app_result: object,
+) -> None:
+    results = iter((scope_result, app_result))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"result": next(results)})
+
+    with _portal(monkeypatch, handler) as portal, pytest.raises(LiveCorrectnessError):
+        portal.preflight(required_scopes={"task"})
+
+
 def test_streamed_response_has_no_per_chunk_retention_amplification() -> None:
     chunk_count = 100_000
 

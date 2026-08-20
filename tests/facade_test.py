@@ -48,6 +48,8 @@ from b24api.models import (
     IdentitySpec,
     JsonValue,
     OperationReport,
+    OrderSemantics,
+    ParameterPath,
     ReferenceBinding,
     ReferenceItem,
     ReplaySafety,
@@ -62,10 +64,11 @@ from b24api.plans import (
     CursorTerminalRule,
     DirectDispatch,
     ItemCursorPlan,
+    KeysetPlan,
     OffsetSequentialPlan,
     SingleResponsePlan,
 )
-from b24api.profiles import load_profile_document
+from b24api.profiles import CapabilitySet, load_profile_document
 from b24api.query import build_query
 from b24api.settings import Settings
 from b24api.type import ApiTypes
@@ -311,6 +314,52 @@ async def test_counted_wrapper_refuses_operation_budget_before_tail_admission() 
     assert report.logical_pages == 1
     assert report.emitted_rows == 0
     assert [request.method for request in transport.requests] == ["crm.item.list"]
+
+
+@pytest.mark.asyncio
+async def test_counted_wrapper_accounts_head_retries_before_emission() -> None:
+    class RetryHeadTransport:
+        def __init__(self) -> None:
+            self.requests: list[Request] = []
+
+        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+            assert attempt_timeout > 0
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return WireResponse(
+                    503,
+                    (("content-type", "text/plain"),),
+                    b"temporary upstream failure",
+                )
+            return WireResponse(
+                200,
+                (("content-type", "application/json"),),
+                b'{"result":[{"ID":1}],"total":2,"next":1}',
+            )
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    transport = RetryHeadTransport()
+    client = Bitrix24._from_executor(Executor(transport, sleep=no_sleep))  # noqa: SLF001
+    delivered: list[JsonValue] = []
+
+    async def collect() -> None:
+        async for item in client.list_batched(
+            {"method": "crm.item.list"},
+            policy=ExecutionPolicy(max_requests=2),
+        ):
+            delivered.append(item)  # noqa: PERF401 - prove refusal precedes first emission
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        await collect()
+
+    report = cast("OperationReport", caught.value.report)
+    assert delivered == []
+    assert report.physical_requests == EXPECTED_PAGE_ROWS
+    assert report.logical_pages == 1
+    assert report.emitted_rows == 0
+    assert len(transport.requests) == EXPECTED_PAGE_ROWS
 
 
 @pytest.mark.asyncio
@@ -638,8 +687,34 @@ async def test_facade_applies_exact_profile_and_preserves_report_provenance() ->
     assert report.profile_applicable is True
     assert report.profile_source_sha256 is not None
     assert report.profile_evidence_sha256 == ("b" * 64,)
+    assert report.profile_evidence_candidate_sha == "a" * 40
     assert len(transport.requests) == 1
     assert transport.requests[0].replay_safety is ReplaySafety.SAFE
+
+
+@pytest.mark.asyncio
+async def test_profile_never_relaxes_explicit_compatibility_page_cap() -> None:
+    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
+    client = Bitrix24._from_executor(  # noqa: SLF001
+        Executor(transport),
+        portal_build="build-1",
+        scopes={"task"},
+    )
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        _ = [
+            item
+            async for item in client.list_sequential(
+                {"method": "tasks.task.list"},
+                list_size=1,
+                profile=_single_profile(),
+            )
+        ]
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.emitted_rows == 0
+    assert "declared page cap" in str(caught.value.__cause__)
+    assert len(transport.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -756,6 +831,123 @@ async def test_reference_wrapper_refuses_explicit_selector_outside_profile_befor
                 {"method": "tasks.task.list"},
                 [{"OWNER_ID": 1}],
                 result_key="items",
+                profile=_single_profile(),
+            )
+        ]
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_profile_refuses_ignored_nondefault_legacy_cursor_controls_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": []})
+    client = Bitrix24._from_executor(  # noqa: SLF001
+        Executor(transport),
+        portal_build="build-1",
+        scopes={"task"},
+    )
+
+    with pytest.raises(CapabilityError, match="cursor controls contradict"):
+        _ = [
+            item
+            async for item in client.reference_cursor_no_count(
+                {"method": "tasks.task.list"},
+                [{"OWNER_ID": 1}],
+                cursor_take="min",
+                profile=_single_profile(),
+            )
+        ]
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_profile_refuses_ignored_nondefault_legacy_identity_key_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": []})
+    client = Bitrix24._from_executor(  # noqa: SLF001
+        Executor(transport),
+        portal_build="build-1",
+        scopes={"task"},
+    )
+
+    with pytest.raises(CapabilityError, match="id_key contradicts"):
+        _ = [
+            item
+            async for item in client.list_batched_no_count(
+                {"method": "tasks.task.list"},
+                id_key="custom_id",
+                profile=_single_profile(),
+            )
+        ]
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_profile_refuses_explicit_default_identity_key_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": []})
+    client = Bitrix24._from_executor(  # noqa: SLF001
+        Executor(transport),
+        portal_build="build-1",
+        scopes={"task"},
+    )
+
+    with pytest.raises(CapabilityError, match="id_key contradicts"):
+        _ = [
+            item
+            async for item in client.list_batched_no_count(
+                {"method": "tasks.task.list"},
+                id_key="ID",
+                profile=_single_profile(),
+            )
+        ]
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_identity_key_must_match_explicit_plan_identity_before_io() -> None:
+    client, transport = _client(lambda _request: {"result": []})
+    identity = IdentitySpec(
+        item_path=("id",),
+        filter_key="ID",
+        order_key="id",
+        coercion=IdentityCoercion.DECIMAL_STRING_INTEGER,
+    )
+
+    with pytest.raises(CapabilityError, match="id_key contradicts"):
+        _ = [
+            item
+            async for item in client.list_batched_no_count(
+                {"method": "tasks.task.list"},
+                id_key="CUSTOM",
+                plan=KeysetPlan(
+                    identity_requirement=IdentityRequirement.REQUIRED,
+                    order_semantics=OrderSemantics.ASCENDING,
+                ),
+                identity=identity,
+            )
+        ]
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_profile_refuses_explicit_default_cursor_controls_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": []})
+    client = Bitrix24._from_executor(  # noqa: SLF001
+        Executor(transport),
+        portal_build="build-1",
+        scopes={"task"},
+    )
+
+    with pytest.raises(CapabilityError, match="cursor controls contradict"):
+        _ = [
+            item
+            async for item in client.reference_cursor_no_count(
+                {"method": "tasks.task.list"},
+                [{"OWNER_ID": 1}],
+                cursor_param="LAST_ID",
                 profile=_single_profile(),
             )
         ]
@@ -1258,6 +1450,37 @@ def test_facade_signature_snapshot_preserves_committed_and_keyword_bridges() -> 
     }
 
     assert {name: tuple(inspect.signature(getattr(Bitrix24, name)).parameters) for name in expected} == expected
+    assert inspect.signature(Bitrix24.list_batched_no_count).parameters["id_key"].default == "ID"
+    cursor_signature = inspect.signature(Bitrix24.reference_cursor_no_count)
+    assert cursor_signature.parameters["cursor_param"].default == "LAST_ID"
+    assert cursor_signature.parameters["cursor_field"].default == "id"
+    assert cursor_signature.parameters["cursor_take"].default == "max"
+    assert cursor_signature.parameters["list_size_param"].default == "LIMIT"
+
+
+def test_facade_derives_profile_query_paths_from_nested_keyset_plan() -> None:
+    profile = replace(
+        _single_profile(),
+        plan=KeysetPlan(
+            selector=ResultSelector.root(),
+            filter_path=ParameterPath(("params", "filter")),
+            order_path=ParameterPath(("params", "order")),
+            identity_requirement=IdentityRequirement.REQUIRED,
+            order_semantics=OrderSemantics.ASCENDING,
+        ),
+        identity=IdentitySpec(
+            item_path=("ID",),
+            filter_key="ID",
+            order_key="ID",
+            coercion=IdentityCoercion.DECIMAL_STRING_INTEGER,
+        ),
+        capabilities=CapabilitySet(filter_honored=True, stable_order=True, fixed_page_cap=True),
+    )
+
+    assert facade_module._profile_query_paths(profile) == (  # noqa: SLF001
+        ParameterPath(("params", "filter")),
+        ParameterPath(("params", "order")),
+    )
 
 
 def test_settings_reject_batch_size_above_portal_cap() -> None:
@@ -1345,3 +1568,13 @@ def test_compatibility_wrappers_contain_no_pagination_engine() -> None:
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         }
         assert "execute" not in calls
+    counted_adapter = ast.parse(
+        textwrap.dedent(inspect.getsource(facade_module.Bitrix24._list_batched_default)),  # noqa: SLF001
+    )
+    counted_calls = {
+        node.func.attr
+        for node in ast.walk(counted_adapter)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "execute" not in counted_calls
+    assert "counted_batch_pages" in counted_calls

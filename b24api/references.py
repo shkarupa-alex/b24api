@@ -796,6 +796,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         profile_version: int | None = None,
         profile_source_sha256: str | None = None,
         profile_evidence_sha256: tuple[str, ...] = (),
+        profile_evidence_candidate_sha: str | None = None,
     ) -> None:
         """Initialize instance state."""
         self._scheduler = scheduler
@@ -810,6 +811,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         self._profile_version = profile_version
         self._profile_source_sha256 = profile_source_sha256
         self._profile_evidence_sha256 = profile_evidence_sha256
+        self._profile_evidence_candidate_sha = profile_evidence_candidate_sha
         self.report = OperationReport(
             assurance=assurance,
             profile_id=profile_id,
@@ -817,6 +819,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             profile_applicable=True if profile_id is not None else None,
             profile_source_sha256=profile_source_sha256,
             profile_evidence_sha256=profile_evidence_sha256,
+            profile_evidence_candidate_sha=profile_evidence_candidate_sha,
         )
 
     def __aiter__(self) -> Self:
@@ -986,6 +989,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             profile_applicable=True if self._profile_id is not None else None,
             profile_source_sha256=self._profile_source_sha256,
             profile_evidence_sha256=self._profile_evidence_sha256,
+            profile_evidence_candidate_sha=self._profile_evidence_candidate_sha,
             emitted_rows=self._emitted,
             unique_rows=self._unique_emitted,
             physical_requests=snapshot.counters.physical_requests,
@@ -1040,6 +1044,7 @@ def iter_references(  # noqa: PLR0913
     _profile_version: int | None = None,
     _profile_source_sha256: str | None = None,
     _profile_evidence_sha256: tuple[str, ...] = (),
+    _profile_evidence_candidate_sha: str | None = None,
 ) -> ReferenceStream:
     """Construct a lazy bounded reference traversal stream without I/O."""
     PaginationDriver.validate_plan(plan)
@@ -1073,6 +1078,7 @@ def iter_references(  # noqa: PLR0913
         profile_version=_profile_version,
         profile_source_sha256=_profile_source_sha256,
         profile_evidence_sha256=_profile_evidence_sha256,
+        profile_evidence_candidate_sha=_profile_evidence_candidate_sha,
     )
 
 

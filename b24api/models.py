@@ -842,6 +842,7 @@ class OperationReport:
     profile_applicable: bool | None = None
     profile_source_sha256: str | None = None
     profile_evidence_sha256: tuple[str, ...] = ()
+    profile_evidence_candidate_sha: str | None = None
     emitted_rows: int = 0
     unique_rows: int = 0
     physical_requests: int = 0
@@ -901,6 +902,7 @@ def _validate_report_profile(report: OperationReport) -> None:
                     report.profile_version,
                     report.profile_applicable,
                     report.profile_source_sha256,
+                    report.profile_evidence_candidate_sha,
                 )
             )
             or report.profile_evidence_sha256
@@ -917,6 +919,11 @@ def _validate_report_profile(report: OperationReport) -> None:
             raise ValueError("profile_source_sha256 must be a lowercase SHA-256")
         if not report.profile_evidence_sha256 or any(not _is_sha256(value) for value in report.profile_evidence_sha256):
             raise ValueError("profile evidence must contain lowercase SHA-256 values")
+        if report.profile_evidence_candidate_sha is None or not re.fullmatch(
+            r"[0-9a-f]{40}",
+            report.profile_evidence_candidate_sha,
+        ):
+            raise ValueError("profile evidence candidate must be a lowercase Git SHA-1")
     if report.assurance is CompletionAssurance.PROFILE_VERIFIED and (
         report.profile_id is None or report.profile_applicable is not True
     ):

@@ -173,6 +173,39 @@ def _approved_live_plan(*, count: int = 1) -> dict[str, Any]:
     return plan
 
 
+def _approval_arguments(plan: dict[str, Any]) -> dict[str, str]:
+    return {
+        "confirm_plan_review_sha": str(plan["authorization"]["plan_review_sha"]),
+        "confirm_plan_content_sha256": content_sha256(plan),
+    }
+
+
+def test_approved_plan_self_claims_do_not_authorize_live_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    plan = _approved_live_plan()
+    with pytest.raises(ContractError, match="external exact plan review"):
+        cli_module._require_approved_plan(plan, args=Namespace())  # noqa: SLF001
+    with pytest.raises(ContractError, match="content hash"):
+        cli_module._require_approved_plan(  # noqa: SLF001
+            plan,
+            args=Namespace(confirm_plan_review_sha=SHA, confirm_plan_content_sha256="f" * 64),
+        )
+    forged = copy.deepcopy(plan)
+    forged["authorization"]["plan_review_sha"] = "f" * 40
+    with pytest.raises(ContractError, match="existing review commit"):
+        cli_module._require_approved_plan(  # noqa: SLF001
+            forged,
+            args=Namespace(
+                confirm_plan_review_sha="f" * 40,
+                confirm_plan_content_sha256=content_sha256(forged),
+            ),
+        )
+    monkeypatch.setattr(cli_module, "_require_review_commit", lambda *_args, **_kwargs: None)
+    cli_module._require_approved_plan(  # noqa: SLF001
+        plan,
+        args=Namespace(**_approval_arguments(plan)),
+    )
+
+
 def _manifest_base(plan: dict[str, Any]) -> dict[str, Any]:
     correlation = content_sha256([RUN_ID, "CELL", 0])
     marker = marker_value(plan["namespace"], correlation)
@@ -1242,6 +1275,7 @@ def test_cleanup_reconciles_an_ambiguous_create_before_claiming_absence(
     monkeypatch.delenv("PYTEST_CURRENT_TEST")
     monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
     monkeypatch.setitem(ADAPTERS, "tasks-task-v1", adapter)
+    monkeypatch.setattr(cli_module, "_require_review_commit", lambda *_args, **_kwargs: None)
     result = cli_module._cleanup(  # noqa: SLF001 - direct offline orchestration regression
         Namespace(
             live=True,
@@ -1252,6 +1286,7 @@ def test_cleanup_reconciles_an_ambiguous_create_before_claiming_absence(
             run_id=None,
             lineage_id=None,
             credential_role="admin_full",
+            **_approval_arguments(plan),
         ),
     )
     assert result == ExitCode.COMPLETED
@@ -1310,6 +1345,7 @@ def test_cleanup_resumes_after_delete_dispatch_without_corrupting_manifest(
     monkeypatch.delenv("PYTEST_CURRENT_TEST")
     monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
     monkeypatch.setitem(ADAPTERS, "tasks-task-v1", FakeAdapter())
+    monkeypatch.setattr(cli_module, "_require_review_commit", lambda *_args, **_kwargs: None)
     result = cli_module._cleanup(  # noqa: SLF001 - direct crash-window regression
         Namespace(
             live=True,
@@ -1320,6 +1356,7 @@ def test_cleanup_resumes_after_delete_dispatch_without_corrupting_manifest(
             run_id=None,
             lineage_id=None,
             credential_role="admin_full",
+            **_approval_arguments(plan),
         ),
     )
     assert result == ExitCode.COMPLETED
@@ -1377,6 +1414,7 @@ def test_seed_never_redispatches_an_unresolved_create(
     monkeypatch.delenv("PYTEST_CURRENT_TEST")
     monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
     monkeypatch.setitem(ADAPTERS, "tasks-task-v1", adapter)
+    monkeypatch.setattr(cli_module, "_require_review_commit", lambda *_args, **_kwargs: None)
     result = cli_module._seed(  # noqa: SLF001 - direct no-network ambiguity regression
         Namespace(
             live=True,
@@ -1387,6 +1425,7 @@ def test_seed_never_redispatches_an_unresolved_create(
             run_id=None,
             lineage_id=None,
             credential_role="admin_full",
+            **_approval_arguments(plan),
         ),
     )
     assert result == ExitCode.INCOMPLETE
@@ -1394,6 +1433,151 @@ def test_seed_never_redispatches_an_unresolved_create(
     records = load_manifest(manifest_path)
     assert records[-1]["event"] == "create_dispatched"
     validate_manifest_against_plan(records, plan)
+
+
+def test_seed_rechecks_clean_candidate_immediately_before_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _approved_live_plan()
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    dirty = False
+
+    class FakeAdapter:
+        create_method = "tasks.task.add"
+        create_calls = 0
+
+        def create(self, _portal: object, _marker: str) -> str:
+            self.create_calls += 1
+            return "unexpected"
+
+    adapter = FakeAdapter()
+
+    class FakePortal:
+        identity = PortalIdentity("portal.invalid", "admin_full", "1", SHA256)
+        attempts = 0
+
+        def __init__(self, *, role: str) -> None:
+            assert role == "admin_full"
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
+            nonlocal dirty
+            assert required_scopes == {"task"}
+            dirty = True
+            return LivePreflight(self.identity, "build-1", frozenset({"task"}))
+
+    def reject_after_preflight(_root: Path) -> None:
+        if dirty:
+            raise ContractError("tracked repository changed before live mutation")
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+    monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", reject_after_preflight)
+    monkeypatch.setitem(ADAPTERS, "tasks-task-v1", adapter)
+    monkeypatch.setattr(cli_module, "_require_review_commit", lambda *_args, **_kwargs: None)
+    with pytest.raises(ContractError, match="before live mutation"):
+        cli_module._seed(  # noqa: SLF001 - exact pre-mutation race regression
+            Namespace(
+                live=True,
+                allow_writes=True,
+                plan=plan_path,
+                manifest=None,
+                artifact_dir=tmp_path / "artifacts",
+                run_id=None,
+                lineage_id=None,
+                credential_role="admin_full",
+                **_approval_arguments(plan),
+            ),
+        )
+    assert adapter.create_calls == 0
+
+
+def test_cleanup_rechecks_clean_candidate_immediately_before_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _approved_live_plan()
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    manifest_path = tmp_path / "manifest.jsonl"
+    previous = build_manifest_record(_manifest_base(plan))
+    append_manifest_record(manifest_path, previous)
+    for event, entity_id in (("create_dispatched", None), ("created", "42"), ("verified", "42")):
+        previous = build_manifest_record(
+            {
+                **_manifest_base(plan),
+                "event": event,
+                "entity_id": entity_id,
+                "request_fingerprint": SHA256,
+            },
+            previous=previous,
+        )
+        append_manifest_record(manifest_path, previous)
+    dirty = False
+
+    class FakeAdapter:
+        delete_method = "tasks.task.delete"
+        id_parameter = "taskId"
+        delete_calls = 0
+
+        def read(self, _portal: object, _entity_id: str) -> dict[str, str]:
+            return {"TITLE": str(previous["marker_value"])}
+
+        def delete(self, _portal: object, _entity_id: str) -> None:
+            self.delete_calls += 1
+
+    adapter = FakeAdapter()
+
+    class FakePortal:
+        identity = PortalIdentity("portal.invalid", "admin_full", "1", SHA256)
+        attempts = 0
+
+        def __init__(self, *, role: str) -> None:
+            assert role == "admin_full"
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
+            nonlocal dirty
+            assert required_scopes == {"task"}
+            dirty = True
+            return LivePreflight(self.identity, "build-1", frozenset({"task"}))
+
+    def reject_after_preflight(_root: Path) -> None:
+        if dirty:
+            raise ContractError("tracked repository changed before live mutation")
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+    monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", reject_after_preflight)
+    monkeypatch.setitem(ADAPTERS, "tasks-task-v1", adapter)
+    monkeypatch.setattr(cli_module, "_require_review_commit", lambda *_args, **_kwargs: None)
+    with pytest.raises(ContractError, match="before live mutation"):
+        cli_module._cleanup(  # noqa: SLF001 - exact pre-mutation race regression
+            Namespace(
+                live=True,
+                allow_writes=True,
+                plan=plan_path,
+                manifest=manifest_path,
+                artifact_dir=tmp_path / "artifacts",
+                run_id=None,
+                lineage_id=None,
+                credential_role="admin_full",
+                **_approval_arguments(plan),
+            ),
+        )
+    assert adapter.delete_calls == 0
 
 
 def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) -> None:

@@ -8,7 +8,7 @@ from typing import Any, cast
 
 import pytest
 
-from b24api.models import CompletionAssurance, ExecutionPolicy, ReplaySafety, Request, ResultSelector
+from b24api.models import CompletionAssurance, ExecutionPolicy, ParameterPath, ReplaySafety, Request, ResultSelector
 from b24api.profiles import (
     CapabilitySet,
     ProbeObservation,
@@ -317,3 +317,33 @@ def test_query_shape_records_structure_without_literal_values() -> None:
     assert first.filter_keys == frozenset({"ID", "STATUS"})
     assert first.filter_operators == frozenset({">", "="})
     assert "SECRET" not in repr(first)
+
+
+def test_query_shape_uses_declared_nested_filter_and_order_paths() -> None:
+    shape = query_shape_from_request(
+        Request(
+            "crm.item.list",
+            {"params": {"filter": {">ID": 1}, "order": {"ID": "asc"}}},
+        ),
+        selector=ResultSelector.root(),
+        filter_path=ParameterPath(("params", "filter")),
+        order_path=ParameterPath(("params", "order")),
+        scopes={"crm"},
+        portal_build="build-1",
+        observed_at=_OBSERVED_AT,
+    )
+
+    assert shape.filter_keys == frozenset({"ID"})
+    assert shape.filter_operators == frozenset({">"})
+    assert shape.order == (("ID", "ASC"),)
+
+
+def test_profile_rejects_mixed_evidence_candidate_provenance() -> None:
+    document = deepcopy(_document())
+    evidence = cast("list[dict[str, object]]", document["evidence"])
+    second = deepcopy(evidence[0])
+    second["candidate_sha"] = "c" * 40
+    evidence.append(second)
+
+    with pytest.raises(ValueError, match="one exact candidate SHA"):
+        load_profile_document(document)

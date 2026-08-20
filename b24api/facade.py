@@ -14,10 +14,8 @@ from pydantic_core import to_jsonable_python
 from b24api.batch import BatchExecutor, BatchInput, BatchOutcomeStream, BatchStream
 from b24api.entity import LegacyRequest
 from b24api.error import CapabilityError, IncompleteTraversalError
-from b24api.execution import ExecutionContext, Executor, HttpxTransport, await_cancellation_resistant
+from b24api.execution import ExecutionContext, Executor, HttpxTransport
 from b24api.models import (
-    BatchFailure,
-    BatchSuccess,
     CompletionAssurance,
     ExecutionPolicy,
     IdentityCoercion,
@@ -60,6 +58,7 @@ from b24api.plans import (
     OffsetContinuation,
     OffsetSequentialPlan,
     OffsetTerminalRule,
+    PartitionedKeysetPlan,
     ReferenceOutputOrder,
 )
 from b24api.profiles import EndpointProfile, apply_probe_observations, choose_plan, query_shape_from_request
@@ -82,6 +81,19 @@ _ROOT_SELECTOR = ResultSelector.root()
 _PAIR_LENGTH = 2
 
 
+class _ImplicitCompatibilityString(str):
+    """Distinguish an omitted legacy string default without changing its public value."""
+
+    __slots__ = ()
+
+
+_IMPLICIT_ID_KEY = _ImplicitCompatibilityString("ID")
+_IMPLICIT_CURSOR_PARAM = _ImplicitCompatibilityString("LAST_ID")
+_IMPLICIT_CURSOR_FIELD = _ImplicitCompatibilityString("id")
+_IMPLICIT_CURSOR_TAKE = cast('Literal["max", "min"]', _ImplicitCompatibilityString("max"))
+_IMPLICIT_LIST_SIZE_PARAM = _ImplicitCompatibilityString("LIMIT")
+
+
 @dataclass(frozen=True, slots=True)
 class _ResolvedTraversal:
     plan: ListPlan
@@ -92,6 +104,7 @@ class _ResolvedTraversal:
     profile_version: int | None = None
     profile_source_sha256: str | None = None
     profile_evidence_sha256: tuple[str, ...] = ()
+    profile_evidence_candidate_sha: str | None = None
     page_cap_hint: int | None = None
 
 
@@ -342,9 +355,12 @@ class Bitrix24:
             return _ResolvedTraversal(default, identity, selector, page_cap_hint=page_cap_hint)
         if profile.source_sha256 is None:
             raise CapabilityError("endpoint profile requires immutable source provenance")
+        filter_path, order_path = _profile_query_paths(profile)
         query = query_shape_from_request(
             request,
             selector=selector if selector_explicit else profile.query.selector,
+            filter_path=filter_path,
+            order_path=order_path,
             scopes=self._portal_scopes,
             portal_build=self._portal_build,
             observed_at=datetime.now(UTC),
@@ -364,7 +380,8 @@ class Bitrix24:
             profile_version=profile.version,
             profile_source_sha256=profile.source_sha256,
             profile_evidence_sha256=tuple(anchor.artifact_sha256 for anchor in profile.evidence),
-            page_cap_hint=profile.page_cap,
+            profile_evidence_candidate_sha=profile.evidence[0].candidate_sha,
+            page_cap_hint=_minimum_optional(page_cap_hint, profile.page_cap),
         )
 
     async def list_sequential(  # noqa: PLR0913 - compatibility bridge signature
@@ -414,6 +431,7 @@ class Bitrix24:
             _profile_version=selected.profile_version,
             _profile_source_sha256=selected.profile_source_sha256,
             _profile_evidence_sha256=selected.profile_evidence_sha256,
+            _profile_evidence_candidate_sha=selected.profile_evidence_candidate_sha,
         )
         items = _completed_items(stream)
         try:
@@ -476,6 +494,7 @@ class Bitrix24:
             _profile_version=selected.profile_version,
             _profile_source_sha256=selected.profile_source_sha256,
             _profile_evidence_sha256=selected.profile_evidence_sha256,
+            _profile_evidence_candidate_sha=selected.profile_evidence_candidate_sha,
         )
         items = _completed_items(stream)
         try:
@@ -484,7 +503,7 @@ class Bitrix24:
         finally:
             await items.aclose()
 
-    async def _list_batched_default(  # noqa: C901, PLR0912, PLR0915
+    async def _list_batched_default(  # noqa: C901 - compatibility report boundary
         self,
         base: Request,
         *,
@@ -495,8 +514,8 @@ class Bitrix24:
     ) -> AsyncGenerator[JsonValue]:
         evidence: list[ResponseEvidence] = []
         emitted = 0
+        unique = 0
         context = self._executor.context(policy)
-        outcomes: BatchStream | None = None
         validation_plan = CountedOffsetPlan()
         validator = PaginationDriver(
             self._executor,
@@ -507,134 +526,33 @@ class Bitrix24:
             context=context,
             page_cap_hint=page_size,
         )
-        validator.begin_external_validation()
         try:
-            head_reservation = await context.reserve_page()
-            try:
-                head = await self._executor.execute(
-                    _counted_offset_request(base, validation_plan, 0),
-                    context=context,
+            async for page in validator.counted_batch_pages(batch_size=batch_size, page_size=page_size):
+                evidence.append(page.response.evidence)
+                unique += sum(validator.last_page_unique_mask)
+                for item in page.items:
+                    emitted += 1
+                    yield item
+            if policy.consistency.snapshot_requirement is not SnapshotRequirement.TRAVERSAL_ONLY:
+                report = await _counted_report(
+                    context,
+                    TerminalState.COMPLETED,
+                    "parallel counted traversal completed",
+                    emitted=emitted,
+                    unique=unique,
+                    batch_report=validator.batch_report,
+                    violations=tuple(validator.violations),
+                    evidence=tuple(evidence),
                 )
-            except BaseException:
-                context.release_page(head_reservation)
-                raise
-            context.commit_page(head_reservation)
-            evidence.append(head.evidence)
-            head_items = head.list_result
-            await context.set_buffered_rows(len(head_items))
-            total = head.total
-            if total is None or total < 0:
-                _raise_capability("parallel counted traversal requires a non-negative total")
-            if total < len(head_items):
-                _raise_capability("parallel counted traversal observed total below the head page")
-            if identity is not None and total > policy.max_tracked_identities:
-                _raise_capability("parallel counted traversal exceeds the exact identity budget")
-            stride = head.next if head.next is not None else page_size
-            if isinstance(stride, bool) or stride < 1:
-                _raise_capability("parallel counted traversal requires a positive in-band stride")
-            if total > len(head_items) and head.next is None:
-                _raise_capability("parallel counted traversal has no in-band tail stride")
-            if head.next is not None and head.next != len(head_items):
-                _raise_capability("parallel counted head continuation contradicts its row count")
-            if total == len(head_items) and head.next is not None:
-                _raise_capability("parallel counted traversal completed while continuation remained")
-            tail_pages = (total - 1) // stride if total > len(head_items) else 0
-            if 1 + tail_pages > policy.max_pages:
-                _raise_capability("parallel counted traversal exceeds the logical page budget")
-            if tail_pages and stride > policy.max_buffered_rows:
-                _raise_capability("parallel counted page exceeds the decoded row buffer budget")
-            effective_batch_size = min(
-                batch_size,
-                max(1, policy.max_buffered_rows // stride),
-            )
-            minimum_requests = 1 + (tail_pages + effective_batch_size - 1) // effective_batch_size
-            if minimum_requests > policy.max_requests:
-                _raise_capability("parallel counted traversal exceeds the physical request budget")
-            validator.validate_external_page(head_items, head)
-            for item in head_items:
-                emitted += 1
-                yield item
-                await context.adjust_buffered_rows(-1)
-            if total == emitted:
-                validator.finish_external_validation()
-                if policy.consistency.snapshot_requirement is not SnapshotRequirement.TRAVERSAL_ONLY:
-                    report = await _counted_report(
-                        context,
-                        TerminalState.COMPLETED,
-                        "parallel counted traversal completed",
-                        emitted=emitted,
-                        unique=emitted,
-                        violations=tuple(validator.violations),
-                        evidence=tuple(evidence),
-                    )
-                    _raise_incomplete(report, None)
-                return
-            requests = (
-                _counted_offset_request(base, validation_plan, start)
-                for start in range(stride, total, stride)
-            )
-            outcomes = BatchStream(
-                self._batch_executor,
-                requests,
-                batch_size=effective_batch_size,
-                tolerant=True,
-                with_payload=False,
-                fallback_failed="none",
-                policy=policy,
-                context=context,
-                logical_page_per_command=True,
-            )
-            primary: BaseException | None = None
-            try:
-                async for outcome in outcomes:
-                    if isinstance(outcome, BatchFailure):
-                        if isinstance(outcome.error, BaseException):
-                            _raise_error(outcome.error)
-                        _raise_capability("parallel counted batch command failed")
-                    if not isinstance(outcome, BatchSuccess) or outcome.response is None:
-                        _raise_capability("parallel counted batch outcome lacks correlated response evidence")
-                    response = outcome.response
-                    evidence.append(response.evidence)
-                    start = stride * (outcome.command_index + 1)
-                    items = response.list_result
-                    expected_rows = min(stride, total - start)
-                    if len(items) != expected_rows:
-                        _raise_capability("parallel counted page length contradicts the planned exact range")
-                    if response.total is not None and response.total != total:
-                        _raise_capability("parallel counted page total contradicts the head total")
-                    expected_next = start + stride if start + stride < total else None
-                    if response.next != expected_next:
-                        _raise_capability("parallel counted continuation contradicts the planned exact range")
-                    validator.validate_external_page(items, response)
-                    for item in items:
-                        emitted += 1
-                        yield item
-            except BaseException as error:  # noqa: BLE001 - preserve the canonical stream report
-                primary = error
-            finally:
-                try:
-                    cleanup_cancellation = await await_cancellation_resistant(outcomes.aclose())
-                except BaseException as cleanup_error:  # noqa: BLE001 - cleanup retains primary failure
-                    if primary is None:
-                        primary = cleanup_error
-                else:
-                    if cleanup_cancellation is not None:
-                        primary = cleanup_cancellation
-            if primary is not None:
-                _raise_error(primary)
-            if outcomes.report.state is not TerminalState.COMPLETED:
-                _raise_incomplete(outcomes.report, None)
-            if emitted != total:
-                _raise_capability("parallel counted traversal did not emit its exact total")
-            validator.finish_external_validation()
+                _raise_incomplete(report, None)
         except asyncio.CancelledError as error:
             report, repeated = await _counted_report_resistant(
                 context,
                 TerminalState.CANCELLED,
                 "iteration cancelled",
                 emitted=emitted,
-                unique=emitted,
-                batch_report=outcomes.report if outcomes is not None else None,
+                unique=unique,
+                batch_report=validator.batch_report,
                 violations=tuple(validator.violations),
                 evidence=tuple(evidence),
             )
@@ -649,8 +567,8 @@ class Bitrix24:
                 TerminalState.CANCELLED,
                 "stream closed before exhaustion",
                 emitted=emitted,
-                unique=emitted,
-                batch_report=outcomes.report if outcomes is not None else None,
+                unique=unique,
+                batch_report=validator.batch_report,
                 violations=tuple(validator.violations),
                 evidence=tuple(evidence),
             )
@@ -659,6 +577,9 @@ class Bitrix24:
                 raise repeated from error
             raise IncompleteTraversalError(report=report) from error
         except BaseException as error:
+            preflight = await context.snapshot()
+            if isinstance(error, CapabilityError) and preflight.counters.physical_requests == 0:
+                raise
             cause_report = getattr(error, "report", None)
             state = cause_report.state if isinstance(cause_report, OperationReport) else TerminalState.FAILED
             if state is TerminalState.COMPLETED:
@@ -668,12 +589,9 @@ class Bitrix24:
                 state,
                 type(error).__name__,
                 emitted=emitted,
-                unique=emitted,
-                batch_report=(
-                    outcomes.report
-                    if outcomes is not None
-                    else cause_report if isinstance(cause_report, OperationReport) else None
-                ),
+                unique=unique,
+                batch_report=validator.batch_report
+                or (cause_report if isinstance(cause_report, OperationReport) else None),
                 violations=tuple(validator.violations),
                 evidence=tuple(evidence),
             )
@@ -681,14 +599,12 @@ class Bitrix24:
                 _attach_compatibility_report(repeated, report)
                 raise repeated from error
             raise IncompleteTraversalError(report=report) from error
-        finally:
-            validator.close_external_validation()
 
     async def list_batched_no_count(  # noqa: PLR0913 - compatibility bridge signature
         self,
         request: RequestLike,
         *,
-        id_key: str = "ID",
+        id_key: str = _IMPLICIT_ID_KEY,
         list_size: int | None = None,
         batch_size: int | None = None,
         plan: ListPlan | None = None,
@@ -697,13 +613,15 @@ class Bitrix24:
         policy: ExecutionPolicy | None = None,
     ) -> AsyncGenerator[JsonValue]:
         """Preserve no-count list gathering as exact sequential keyset traversal."""
+        id_key_explicit = id_key is not _IMPLICIT_ID_KEY
+        resolved_id_key = _compatibility_string(id_key, default="ID", field="id_key")
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
         self._effective_batch_size(batch_size)
-        resolved_identity = identity if profile is not None else identity or _legacy_identity(id_key)
+        resolved_identity = identity if profile is not None else identity or _legacy_identity(resolved_id_key)
         base = _as_profiled_read_request(_canonical_request(request), profile, plan=plan)
         if identity is None and profile is None:
-            base = _ensure_legacy_select_identity(base, id_key)
+            base = _ensure_legacy_select_identity(base, resolved_id_key)
         effective_policy = policy or self._default_policy
         selected = self._resolve_traversal(
             base,
@@ -715,6 +633,7 @@ class Bitrix24:
             policy=effective_policy,
             page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
         )
+        _require_identity_control(selected, id_key=resolved_id_key, explicit=id_key_explicit)
         stream = iter_list_stream(
             self._executor,
             base,
@@ -728,6 +647,7 @@ class Bitrix24:
             _profile_version=selected.profile_version,
             _profile_source_sha256=selected.profile_source_sha256,
             _profile_evidence_sha256=selected.profile_evidence_sha256,
+            _profile_evidence_candidate_sha=selected.profile_evidence_candidate_sha,
         )
         items = _completed_items(stream)
         try:
@@ -765,7 +685,7 @@ class Bitrix24:
         request: RequestLike,
         updates: UpdateSource,
         *,
-        id_key: str = "ID",
+        id_key: str = _IMPLICIT_ID_KEY,
         list_size: int | None = None,
         batch_size: int | None = None,
         with_payload: bool = False,
@@ -775,13 +695,15 @@ class Bitrix24:
         policy: ExecutionPolicy | None = None,
     ) -> AsyncGenerator[JsonValue | tuple[JsonValue, object]]:
         """Map legacy per-filter references to bounded keyset batch dispatch."""
+        id_key_explicit = id_key is not _IMPLICIT_ID_KEY
+        resolved_id_key = _compatibility_string(id_key, default="ID", field="id_key")
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
         effective_batch_size = self._effective_batch_size(batch_size)
         base = _as_profiled_read_request(_canonical_request(request), profile, plan=plan)
         if identity is None and profile is None:
-            base = _ensure_legacy_select_identity(base, id_key)
-        resolved_identity = identity if profile is not None else identity or _legacy_identity(id_key)
+            base = _ensure_legacy_select_identity(base, resolved_id_key)
+        resolved_identity = identity if profile is not None else identity or _legacy_identity(resolved_id_key)
         effective_policy = policy or self._default_policy
         selected = self._resolve_traversal(
             base,
@@ -793,6 +715,7 @@ class Bitrix24:
             policy=effective_policy,
             page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
         )
+        _require_identity_control(selected, id_key=resolved_id_key, explicit=id_key_explicit)
         _require_profile_batch_support(profile)
         output_order = ReferenceOutputOrder.READY
         dispatch = BatchDispatch(
@@ -820,6 +743,7 @@ class Bitrix24:
             _profile_version=selected.profile_version,
             _profile_source_sha256=selected.profile_source_sha256,
             _profile_evidence_sha256=selected.profile_evidence_sha256,
+            _profile_evidence_candidate_sha=selected.profile_evidence_candidate_sha,
         )
         items = _legacy_reference_items(stream, with_payload=with_payload)
         try:
@@ -833,11 +757,11 @@ class Bitrix24:
         request: RequestLike,
         updates: UpdateSource,
         *,
-        cursor_param: str = "LAST_ID",
-        cursor_field: str = "id",
-        cursor_take: Literal["max", "min"] = "max",
+        cursor_param: str = _IMPLICIT_CURSOR_PARAM,
+        cursor_field: str = _IMPLICIT_CURSOR_FIELD,
+        cursor_take: Literal["max", "min"] = _IMPLICIT_CURSOR_TAKE,
         list_size: int | None = None,
-        list_size_param: str = "LIMIT",
+        list_size_param: str = _IMPLICIT_LIST_SIZE_PARAM,
         batch_size: int | None = None,
         result_key: str | None = None,
         with_payload: bool = False,
@@ -847,6 +771,14 @@ class Bitrix24:
         policy: ExecutionPolicy | None = None,
     ) -> AsyncGenerator[JsonValue | tuple[JsonValue, object]]:
         """Map legacy cursor references to one bounded item-cursor scheduler."""
+        explicit_cursor_param = cursor_param is not _IMPLICIT_CURSOR_PARAM
+        explicit_cursor_field = cursor_field is not _IMPLICIT_CURSOR_FIELD
+        explicit_cursor_take = cursor_take is not _IMPLICIT_CURSOR_TAKE
+        explicit_list_size_param = list_size_param is not _IMPLICIT_LIST_SIZE_PARAM
+        resolved_cursor_param = _compatibility_string(cursor_param, default="LAST_ID", field="cursor_param")
+        resolved_cursor_field = _compatibility_string(cursor_field, default="id", field="cursor_field")
+        resolved_cursor_take = _cursor_take(cursor_take)
+        resolved_list_size_param = _compatibility_string(list_size_param, default="LIMIT", field="list_size_param")
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
         effective_batch_size = self._effective_batch_size(batch_size)
@@ -856,20 +788,20 @@ class Bitrix24:
             if profile is not None
             else identity
             or IdentitySpec(
-                item_path=(cursor_field,),
-                filter_key=cursor_field,
-                order_key=cursor_field,
+                item_path=(resolved_cursor_field,),
+                filter_key=resolved_cursor_field,
+                order_key=resolved_cursor_field,
                 coercion=IdentityCoercion.DECIMAL_STRING_INTEGER,
             )
         )
         default = ItemCursorPlan(
             identity_requirement=IdentityRequirement.REQUIRED,
-            cursor_request_path=ParameterPath((cursor_param,)),
-            cursor_item_path=(cursor_field,),
+            cursor_request_path=ParameterPath((resolved_cursor_param,)),
+            cursor_item_path=(resolved_cursor_field,),
             cursor_coercion=IdentityCoercion.DECIMAL_STRING_INTEGER,
-            direction="desc" if cursor_take == "min" else "asc",
-            cursor_take=cursor_take,
-            limit_path=ParameterPath((list_size_param,)),
+            direction="desc" if resolved_cursor_take == "min" else "asc",
+            cursor_take=resolved_cursor_take,
+            limit_path=ParameterPath((resolved_list_size_param,)),
             requested_page_size=page_size,
             terminal=CursorTerminalRule.EMPTY_CONFIRMATION,
         )
@@ -885,6 +817,13 @@ class Bitrix24:
             policy=effective_policy,
             page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
             selector_explicit=result_key is not None,
+        )
+        _require_cursor_controls(
+            selected.plan,
+            cursor_param=(resolved_cursor_param, explicit_cursor_param),
+            cursor_field=(resolved_cursor_field, explicit_cursor_field),
+            cursor_take=(resolved_cursor_take, explicit_cursor_take),
+            list_size_param=(resolved_list_size_param, explicit_list_size_param),
         )
         _require_profile_batch_support(profile)
         output_order = ReferenceOutputOrder.READY
@@ -913,6 +852,7 @@ class Bitrix24:
             _profile_version=selected.profile_version,
             _profile_source_sha256=selected.profile_source_sha256,
             _profile_evidence_sha256=selected.profile_evidence_sha256,
+            _profile_evidence_candidate_sha=selected.profile_evidence_candidate_sha,
         )
         items = _legacy_reference_items(stream, with_payload=with_payload)
         try:
@@ -1031,6 +971,65 @@ def _counted_offset_request(base: Request, plan: CountedOffsetPlan, start: int) 
 def _require_profile_batch_support(profile: EndpointProfile | None) -> None:
     if profile is not None and not profile.capabilities.batch_supported:
         raise CapabilityError("endpoint profile does not authorize batch dispatch")
+
+
+def _require_identity_control(selected: _ResolvedTraversal, *, id_key: str, explicit: bool) -> None:
+    if not explicit:
+        return
+    if selected.identity is None or selected.identity.item_path != (id_key,):
+        raise CapabilityError("explicit id_key contradicts the selected traversal identity")
+
+
+def _require_cursor_controls(
+    selected: ListPlan,
+    *,
+    cursor_param: tuple[str, bool],
+    cursor_field: tuple[str, bool],
+    cursor_take: tuple[Literal["max", "min"], bool],
+    list_size_param: tuple[str, bool],
+) -> None:
+    checks = (
+        (
+            cursor_param[1],
+            isinstance(selected, ItemCursorPlan) and selected.cursor_request_path.path == (cursor_param[0],),
+        ),
+        (cursor_field[1], isinstance(selected, ItemCursorPlan) and selected.cursor_item_path == (cursor_field[0],)),
+        (cursor_take[1], isinstance(selected, ItemCursorPlan) and selected.cursor_take == cursor_take[0]),
+        (
+            list_size_param[1],
+            isinstance(selected, ItemCursorPlan)
+            and selected.limit_path is not None
+            and selected.limit_path.path == (list_size_param[0],),
+        ),
+    )
+    if any(explicit and not matches for explicit, matches in checks):
+        raise CapabilityError("explicit cursor controls contradict the selected traversal plan")
+
+
+def _compatibility_string(value: object, *, default: str, field: str) -> str:
+    resolved = default if isinstance(value, _ImplicitCompatibilityString) else value
+    if not isinstance(resolved, str) or not resolved:
+        raise ValueError(f"{field} must be a non-empty string")
+    return resolved
+
+
+def _cursor_take(value: object) -> Literal["max", "min"]:
+    resolved = str(value) if isinstance(value, _ImplicitCompatibilityString) else value
+    if resolved not in {"max", "min"}:
+        raise ValueError("cursor_take must be max or min")
+    return cast('Literal["max", "min"]', resolved)
+
+
+def _minimum_optional(first: int | None, second: int | None) -> int | None:
+    values = tuple(value for value in (first, second) if value is not None)
+    return min(values) if values else None
+
+
+def _profile_query_paths(profile: EndpointProfile) -> tuple[ParameterPath, ParameterPath]:
+    selected = profile.plan
+    if isinstance(selected, KeysetPlan | PartitionedKeysetPlan):
+        return selected.filter_path, selected.order_path
+    return ParameterPath(("filter",)), ParameterPath(("order",))
 
 
 async def _counted_report_resistant(  # noqa: PLR0913

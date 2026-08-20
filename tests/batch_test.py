@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from b24api.batch import BatchExecutor
+from b24api.batch import BatchExecutor, BatchStream
 from b24api.error import BatchCommandError, BudgetExceededError, FailurePhase, ProtocolError, TransportError
 from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.models import (
@@ -536,6 +536,50 @@ async def test_batch_cancellation_carries_same_terminal_report() -> None:
 
     assert captured.value.__dict__["report"] is stream.report
     assert stream.report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_shared_batch_page_reservations_roll_back_when_admission_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    second_admission = asyncio.Event()
+    blocker = asyncio.Event()
+    calls = 0
+    original_reserve = ExecutionContext.reserve_page
+
+    async def gated_reserve(context: ExecutionContext, *, reference: str | None = None) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # noqa: PLR2004 - exact second-reservation cancellation window
+            second_admission.set()
+            await blocker.wait()
+        return await original_reserve(context, reference=reference)
+
+    monkeypatch.setattr(ExecutionContext, "reserve_page", gated_reserve)
+    executor = Executor(CallbackTransport(_echo_batch))
+    policy = ExecutionPolicy()
+    context = executor.context(policy)
+    stream = BatchStream(
+        BatchExecutor(executor),
+        [Request("one"), Request("two")],
+        batch_size=2,
+        tolerant=True,
+        with_payload=False,
+        fallback_failed="none",
+        policy=policy,
+        context=context,
+        logical_page_per_command=True,
+    )
+    task = asyncio.create_task(anext(stream))
+    await second_admission.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream.report.state is TerminalState.CANCELLED
+    assert context._page_reservations == {}  # noqa: SLF001 - exact rollback ledger assertion
 
 
 @pytest.mark.asyncio
