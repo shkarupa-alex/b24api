@@ -42,6 +42,7 @@ MINIMUM_WEBHOOK_TOKEN_LENGTH: Final = 6
 MINIMUM_COMPARED_PLANS: Final = 2
 MINIMUM_KEY_DISTINCT_BYTES: Final = 16
 MINIMUM_KEY_SHANNON_ENTROPY: Final = 3.5
+MAX_ASCII_CODEPOINT: Final = 0x7F
 SCHEMA_DIR: Final = Path(__file__).resolve().parents[1] / "schemas"
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -49,6 +50,10 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _NAMESPACE_RE = re.compile(r"^b24api-evidence-[0-9a-f-]{36}$")
 _BASE64URL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_DNS_HOST_RE = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$",
+    re.IGNORECASE,
+)
 _WEBHOOK_RE = re.compile(rb"https?://[^\s/'\"<>]+/rest/[0-9]+/[A-Za-z0-9_-]{6,}/?", re.IGNORECASE)
 _QUERY_SECRET_RE = re.compile(
     rb"(?:[?&](?:auth|access_token|refresh_token)=|\bBearer\s+)[A-Za-z0-9._~+/-]{8,}",
@@ -58,6 +63,7 @@ _ENV_SECRET_RE = re.compile(
     rb"\b(?:AUTH_ID|APPLICATION_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)=[A-Za-z0-9._~-]{8,}",
     re.IGNORECASE,
 )
+_ASCII_UNICODE_ESCAPE_RE = re.compile(rb"\\u([0-9a-fA-F]{4})")
 
 
 class ExitCode(IntEnum):
@@ -241,7 +247,12 @@ def portal_identity(webhook_url: str, *, role: str, fingerprint_key: str) -> Por
     token = path_parts[2]
     if not principal_id.isdigit() or len(token) < MINIMUM_WEBHOOK_TOKEN_LENGTH or parts.query or parts.fragment:
         raise ContractError("live webhook has an invalid principal or token shape")
-    host = parts.hostname.encode("idna").decode("ascii").lower()
+    try:
+        host = parts.hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError as error:
+        raise ContractError("live webhook host is not valid IDNA") from error
+    if not _DNS_HOST_RE.fullmatch(host):
+        raise ContractError("live webhook host is not a valid DNS name")
     message = canonical_json([host, role, principal_id])
     fingerprint = hmac.new(key, message, hashlib.sha256).hexdigest()
     return PortalIdentity(host=host, role=role, principal_id=principal_id, fingerprint=fingerprint)
@@ -874,7 +885,11 @@ def scan_bytes_for_secrets(data: bytes, *, source: str) -> None:
         b"abcdef1234567890",
         b"zyxwvutsrqponmlk",
     )
-    sanitized = data
+    def decode_ascii_escape(match: re.Match[bytes]) -> bytes:
+        value = int(match.group(1), 16)
+        return bytes((value,)) if value <= MAX_ASCII_CODEPOINT else match.group(0)
+
+    sanitized = _ASCII_UNICODE_ESCAPE_RE.sub(decode_ascii_escape, data).replace(b"\\/", b"/")
     for literal in allowlisted:
         sanitized = sanitized.replace(literal, b"")
     if _WEBHOOK_RE.search(sanitized) or _QUERY_SECRET_RE.search(sanitized) or _ENV_SECRET_RE.search(sanitized):

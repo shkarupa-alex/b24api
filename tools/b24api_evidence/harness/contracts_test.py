@@ -327,6 +327,13 @@ def test_fingerprint_requires_exact_random_key_shape_and_hides_principal() -> No
             role="employee_full",
             fingerprint_key=key,
         )
+    for invalid_host in (".bad.example", "bad_host", "-bad.example", "bad-.example", "[::1]"):
+        with pytest.raises(ContractError, match="host"):
+            portal_identity(
+                f"https://{invalid_host}/rest/13/abcdef",
+                role="employee_full",
+                fingerprint_key=key,
+            )
 
 
 def test_reviewed_profile_set_is_anchored_by_id_and_immutable_hash(tmp_path: Path) -> None:
@@ -621,6 +628,12 @@ def test_secret_scanner_rejects_realistic_forms_without_echoing_value() -> None:
     with pytest.raises(SecretLeakError) as captured:
         scan_bytes_for_secrets(LEAK_FIXTURE, source="artifact.json")
     assert "realisticToken123" not in str(captured.value)
+    for escaped in (
+        b'"https:\\/\\/example.invalid\\/rest\\/1\\/realisticToken123\\/"',
+        b'"https:\\u002f\\u002fexample.invalid\\u002frest\\u002f1\\u002frealisticToken123\\u002f"',
+    ):
+        with pytest.raises(SecretLeakError):
+            scan_bytes_for_secrets(escaped, source="artifact.json")
     scan_bytes_for_secrets(b"https://bitrix24.com/rest/0/test/", source="fixture")
 
 

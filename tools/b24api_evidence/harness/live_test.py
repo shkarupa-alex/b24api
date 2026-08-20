@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from .live import ADAPTERS, LiveCorrectnessError, LivePortal
+from .live import ADAPTERS, LiveApiError, LiveCorrectnessError, LivePortal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -70,3 +70,13 @@ def test_point_read_classifies_typed_not_found_without_rendering_portal_text(
     with _portal(monkeypatch, handler) as portal:
         assert ADAPTERS["crm-deal-v1"].read(portal, "42") is None
         assert portal.attempts == 1
+
+
+def test_point_read_never_treats_not_found_substrings_as_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"error": "permission_not_found_but_entity_still_exists"})
+
+    with _portal(monkeypatch, handler) as portal, pytest.raises(LiveApiError):
+        ADAPTERS["crm-deal-v1"].read(portal, "42")

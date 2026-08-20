@@ -132,6 +132,7 @@ class DisposableAdapter:
     id_parameter: str
     result_container: str | None
     marker_field: str = "TITLE"
+    not_found_codes: frozenset[str] = frozenset({"error_not_found"})
 
     def create(self, portal: LivePortal, marker: str) -> str:
         result = portal.call(self.create_method, {"fields": {self.marker_field: marker}})
@@ -150,7 +151,7 @@ class DisposableAdapter:
         try:
             result = portal.call(self.read_method, {self.id_parameter: entity_id})
         except LiveApiError as error:
-            if "not_found" in error.code:
+            if error.code in self.not_found_codes:
                 return None
             raise
         if self.result_container is not None:
