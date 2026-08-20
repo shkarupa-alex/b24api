@@ -616,8 +616,13 @@ async def test_unreviewed_parallel_and_partitioned_strategies_refuse_before_io()
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING,
     )
+    boundary = KeysetPlan(
+        identity_requirement=IdentityRequirement.REQUIRED,
+        order_semantics=OrderSemantics.ASCENDING,
+        terminal=KeysetTerminalRule.BOUNDARY_ID_SEEN,
+    )
 
-    for plan in (parallel, partitioned):
+    for plan in (parallel, partitioned, boundary):
         stream = iter_list(Executor(transport), Request("crm.item.list"), plan=plan, identity=_identity())
         with pytest.raises(CapabilityError):
             await _collect(stream)
