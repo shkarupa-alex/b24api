@@ -1215,8 +1215,8 @@ def _write_candidate_json(
     """Atomically write only while the clean executing HEAD stays the exact candidate."""
     _require_evidence_candidate(candidate_sha)
     previous = read_json_object(path) if path.exists() else None
-    atomic_write_json(path, value)
     try:
+        atomic_write_json(path, value)
         _require_evidence_candidate(candidate_sha)
         if scan_bundle:
             _scan_bundle(path.parent, expected_candidate_sha=candidate_sha)
@@ -1232,7 +1232,7 @@ def _restore_candidate_json(path: Path, previous: Mapping[str, Any] | None) -> N
             path.unlink(missing_ok=True)
         else:
             atomic_write_json(path, previous)
-    except Exception:  # noqa: BLE001, S110 - rollback must never mask the primary refusal
+    except BaseException:  # noqa: BLE001, S110 - rollback must never mask the primary refusal
         pass
 
 

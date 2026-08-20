@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Self
 import pytest
 
 from . import cli as cli_module
+from . import contracts as contracts_module
 from .contracts import (
     FINGERPRINT_ALGORITHM,
     FINGERPRINT_KEY_FORMAT,
@@ -623,6 +624,56 @@ def test_terminal_bundle_scan_failure_rolls_back_pass_artifact(
         )
 
     assert not path.exists()
+
+
+def test_directory_fsync_failure_after_replace_restores_previous_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = _benchmark_artifact()
+    candidate_sha = str(artifact["candidate_sha"])
+    path = tmp_path / "benchmark-evidence.json"
+    previous = {"previous": "accepted"}
+    atomic_write_json(path, previous)
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
+    monkeypatch.setattr(
+        contracts_module,
+        "_fsync_directory",
+        lambda _directory: (_ for _ in ()).throw(OSError("directory fsync failed after replace")),
+    )
+
+    with pytest.raises(OSError, match="directory fsync failed after replace"):
+        cli_module._write_validated_artifact(  # noqa: SLF001
+            path,
+            artifact,
+            candidate_sha=candidate_sha,
+        )
+
+    assert json.loads(path.read_text()) == previous
+
+
+def test_rollback_base_exception_does_not_mask_primary_bundle_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = _benchmark_artifact()
+    candidate_sha = str(artifact["candidate_sha"])
+    path = tmp_path / "benchmark-evidence.json"
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
+    monkeypatch.setattr(
+        cli_module,
+        "_scan_bundle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ContractError("primary final scan failure")),
+    )
+    monkeypatch.setattr(Path, "unlink", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+    with pytest.raises(ContractError, match="primary final scan failure"):
+        cli_module._write_validated_artifact(  # noqa: SLF001
+            path,
+            artifact,
+            candidate_sha=candidate_sha,
+            scan_bundle=True,
+        )
 
 
 def test_bundle_scan_rechecks_candidate_cleanliness_after_reading(
