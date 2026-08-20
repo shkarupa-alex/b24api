@@ -4,18 +4,25 @@
 from __future__ import annotations
 import os
 from dataclasses import dataclass
-from typing import Any, Self
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Self, cast
 from urllib.parse import urljoin
 
 import httpx
 
 from .contracts import ContractError, PortalIdentity, parse_fingerprint_key, portal_identity, strict_json_loads
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 HTTP_OK = 200
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_MARKER_SCAN_PAGES = 1_000
 MAX_EXACT_MARKER_MATCHES = 2
 MAX_BUILD_LENGTH = 100
+UNAVAILABLE_API_CODES = frozenset({"error_method_not_found", "insufficient_scope", "access_denied"})
+CLASSIFIED_API_CODES = frozenset({"error_not_found"})
+UNKNOWN_API_CODE = "unexpected_api_error"
 
 
 class LiveUnavailableError(RuntimeError):
@@ -29,10 +36,31 @@ class LiveCorrectnessError(RuntimeError):
 class LiveApiError(LiveCorrectnessError):
     """A typed API error whose safe code is available without rendering portal text."""
 
-    def __init__(self, *, method: str, code: str) -> None:
+    def __init__(self, *, method: str, code: str = UNKNOWN_API_CODE) -> None:
         """Initialize instance state."""
-        self.code = code
+        self.code = code if code in CLASSIFIED_API_CODES else UNKNOWN_API_CODE
         super().__init__(f"live API returned an unexpected error for {method}")
+
+
+def _redacted_live_errors[**P, T](function: Callable[P, T]) -> Callable[P, T]:
+    """Discard hostile inner frames before an error crosses a live boundary."""
+
+    @wraps(function)
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> T:
+        failure: LiveCorrectnessError | LiveUnavailableError | None = None
+        try:
+            return function(*args, **kwargs)
+        except LiveApiError as error:
+            failure = LiveApiError(method="redacted live operation", code=error.code)
+        except LiveUnavailableError as error:
+            failure = LiveUnavailableError(str(error))
+        except LiveCorrectnessError as error:
+            failure = LiveCorrectnessError(str(error))
+        if failure is not None:
+            raise failure
+        raise RuntimeError("unreachable live error boundary")
+
+    return wrapped
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,18 +75,28 @@ class LivePreflight:
 def _bounded_response_payload(response: httpx.Response, *, method: str) -> bytes:
     """Consume a streamed response without crossing the reviewed memory ceiling."""
     content_length = response.headers.get("content-length")
+    invalid_content_length = False
+    declared: int | None = None
     if content_length is not None:
         try:
             declared = int(content_length)
-        except ValueError as error:
-            raise LiveCorrectnessError(f"live response has invalid content length for {method}") from error
-        if declared > MAX_RESPONSE_BYTES:
-            raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
+        except ValueError:
+            invalid_content_length = True
+    content_length = None
+    if invalid_content_length:
+        response = None  # type: ignore[assignment]
+        raise LiveCorrectnessError(f"live response has invalid content length for {method}")
+    if declared is not None and declared > MAX_RESPONSE_BYTES:
+        response = None  # type: ignore[assignment]
+        raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
     payload = bytearray()
     received = 0
     for chunk in response.iter_bytes():
         received += len(chunk)
         if received > MAX_RESPONSE_BYTES:
+            del chunk
+            payload.clear()
+            response = None  # type: ignore[assignment]
             raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
         payload.extend(chunk)
     return bytes(payload)
@@ -73,12 +111,31 @@ class LivePortal:
         if encoded_key is None:
             raise ContractError("BITRIX24_EVIDENCE_FINGERPRINT_KEY is required for --live")
         # Key strength is rejected before the credential is even read.
-        parse_fingerprint_key(encoded_key)
+        invalid_fingerprint_key = False
+        try:
+            parse_fingerprint_key(encoded_key)
+        except ContractError:
+            invalid_fingerprint_key = True
+        if invalid_fingerprint_key:
+            encoded_key = None
+            raise ContractError("BITRIX24_EVIDENCE_FINGERPRINT_KEY is invalid")
         webhook_url = os.environ.get("BITRIX24_API_WEBHOOK_URL")
         if webhook_url is None:
             raise ContractError("BITRIX24_API_WEBHOOK_URL is required for --live")
-        self.identity = portal_identity(webhook_url, role=role, fingerprint_key=encoded_key)
-        self._webhook_url = webhook_url.rstrip("/") + "/"
+        identity: PortalIdentity | None = None
+        normalized_webhook: str | None = None
+        invalid_configuration = False
+        try:
+            identity = portal_identity(webhook_url, role=role, fingerprint_key=encoded_key)
+            normalized_webhook = webhook_url.rstrip("/") + "/"
+        except (ContractError, TypeError, ValueError):
+            invalid_configuration = True
+        encoded_key = None
+        webhook_url = None
+        if invalid_configuration:
+            raise ContractError("live credential configuration is invalid")
+        self.identity = cast("PortalIdentity", identity)
+        self._webhook_url = cast("str", normalized_webhook)
         self._client = httpx.Client(timeout=timeout, follow_redirects=False)
         self.attempts = 0
 
@@ -94,32 +151,78 @@ class LivePortal:
         """Exit the context."""
         self.close()
 
-    def call_envelope(self, method: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+    def call_envelope(  # noqa: C901, PLR0912 - one boundary owns all raw response state
+        self,
+        method: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Call one REST method and return a strictly decoded, bounded envelope."""
         self.attempts += 1
+        payload: bytes | None = None
+        status_code: int | None = None
+        transport_failed = False
+        bounded_failure: str | None = None
+        response: httpx.Response | None = None
         try:
             with self._client.stream(
                 "POST",
                 urljoin(self._webhook_url, method),
                 json=parameters or {},
             ) as response:
-                if response.status_code != HTTP_OK:
-                    raise LiveUnavailableError(f"live HTTP status {response.status_code} for {method}")
-                payload = _bounded_response_payload(response, method=method)
-        except httpx.HTTPError as error:
-            raise LiveUnavailableError(f"live transport unavailable for {method}") from error
+                status_code = response.status_code
+                if status_code == HTTP_OK:
+                    try:
+                        payload = _bounded_response_payload(response, method=method)
+                    except LiveCorrectnessError as error:
+                        bounded_failure = str(error)
+        except httpx.HTTPError:
+            transport_failed = True
+        response = None
+        if transport_failed:
+            raise LiveUnavailableError(f"live transport unavailable for {method}")
+        if status_code != HTTP_OK:
+            raise LiveUnavailableError(f"live HTTP status {status_code} for {method}")
+        if bounded_failure is not None:
+            raise LiveCorrectnessError(bounded_failure)
+        if payload is None:
+            raise LiveCorrectnessError(f"live response payload is unavailable for {method}")
+        parse_failed = False
         try:
             envelope = strict_json_loads(payload)
-        except ContractError as error:
-            raise LiveCorrectnessError(f"live response is not JSON for {method}") from error
+        except ContractError:
+            parse_failed = True
+            envelope = None
+        payload = None
+        if parse_failed:
+            raise LiveCorrectnessError(f"live response is not JSON for {method}")
         if not isinstance(envelope, dict):
+            envelope = None
             raise LiveCorrectnessError(f"live response envelope is not an object for {method}")
         if "error" in envelope:
-            code = str(envelope.get("error", "unknown"))[:100].casefold()
-            if code in {"error_method_not_found", "insufficient_scope", "access_denied"}:
-                raise LiveUnavailableError(f"live method unavailable for {method}: {code}")
-            raise LiveApiError(method=method, code=code)
+            raw_code = envelope.get("error")
+            unavailable_code = next(
+                (
+                    candidate
+                    for candidate in UNAVAILABLE_API_CODES
+                    if isinstance(raw_code, str) and raw_code.casefold() == candidate
+                ),
+                None,
+            )
+            classified_code = next(
+                (
+                    candidate
+                    for candidate in CLASSIFIED_API_CODES
+                    if isinstance(raw_code, str) and raw_code.casefold() == candidate
+                ),
+                UNKNOWN_API_CODE,
+            )
+            raw_code = None
+            envelope = None
+            if unavailable_code is not None:
+                raise LiveUnavailableError(f"live method unavailable for {method}: {unavailable_code}")
+            raise LiveApiError(method=method, code=classified_code)
         if "result" not in envelope:
+            envelope = None
             raise LiveCorrectnessError(f"live response has no result for {method}")
         return envelope
 
@@ -127,6 +230,7 @@ class LivePortal:
         """Call one REST method and return its result without retaining raw bodies."""
         return self.call_envelope(method, parameters)["result"]
 
+    @_redacted_live_errors
     def preflight(self, *, required_scopes: set[str]) -> LivePreflight:  # noqa: C901 - hostile wire union
         """Call scope/app.info and classify missing environment as unavailable."""
         scope_result = self.call("scope")
@@ -180,6 +284,7 @@ class DisposableAdapter:
     marker_field: str = "TITLE"
     not_found_codes: frozenset[str] = frozenset({"error_not_found"})
 
+    @_redacted_live_errors
     def create(self, portal: LivePortal, marker: str) -> str:
         """Create one disposable portal entity."""
         result = portal.call(self.create_method, {"fields": {self.marker_field: marker}})
@@ -194,6 +299,7 @@ class DisposableAdapter:
             raise LiveCorrectnessError("create result lacks a scalar entity id")
         return str(entity_id)
 
+    @_redacted_live_errors
     def read(self, portal: LivePortal, entity_id: str) -> dict[str, Any] | None:
         """Read one portal entity by identifier."""
         try:
@@ -212,10 +318,12 @@ class DisposableAdapter:
             raise LiveCorrectnessError("read result is not an entity object")
         return result
 
+    @_redacted_live_errors
     def delete(self, portal: LivePortal, entity_id: str) -> None:
         """Delete one owned portal entity."""
         portal.call(self.delete_method, {self.id_parameter: entity_id})
 
+    @_redacted_live_errors
     def find_exact_marker(self, portal: LivePortal, marker: str) -> list[str]:  # noqa: C901
         """Find entities matching the exact ownership marker."""
         matches: set[str] = set()
