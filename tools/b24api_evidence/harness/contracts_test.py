@@ -39,6 +39,7 @@ from .contracts import (
     parse_fingerprint_key,
     portal_identity,
     scan_bytes_for_secrets,
+    scan_paths_for_secrets,
     strict_json_loads,
     validate_benchmark_plan,
     validate_dataset_plan,
@@ -359,6 +360,12 @@ def test_reviewed_profile_set_is_anchored_by_id_and_immutable_hash(tmp_path: Pat
         lambda plan: plan["cleanup"].update(dependency_order=[]),
         lambda plan: plan["estimated"].update(requests=0),
         lambda plan: plan["estimated"].update(batch_commands=1),
+        lambda plan: plan["estimated"].update(
+            create_strategy="batch",
+            delete_strategy="batch",
+            requests=1,
+            batch_commands=10,
+        ),
         lambda plan: plan["estimated"].update(duration_seconds=0),
         lambda plan: plan["estimated"].update(quota_impact=0),
     ],
@@ -636,6 +643,14 @@ def test_secret_scanner_rejects_realistic_forms_without_echoing_value() -> None:
         with pytest.raises(SecretLeakError):
             scan_bytes_for_secrets(escaped, source="artifact.json")
     scan_bytes_for_secrets(b"https://bitrix24.com/rest/0/test/", source="fixture")
+
+
+@pytest.mark.parametrize("filename", ["models_test.py", "protocol_test.py", "redaction_test.py"])
+def test_secret_scanner_never_grants_allowance_by_basename(tmp_path: Path, filename: str) -> None:
+    path = tmp_path / filename
+    path.write_text("EXAMPLE_CREDENTIAL " + "https://real.example" + "/rest/13/realisticToken123/")
+    with pytest.raises(SecretLeakError):
+        scan_paths_for_secrets([path])
 
 
 def test_cli_plan_and_benchmark_are_offline_and_live_writes_are_flag_gated(tmp_path: Path) -> None:

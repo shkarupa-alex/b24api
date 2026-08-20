@@ -360,11 +360,8 @@ def validate_dataset_plan(plan: Mapping[str, Any]) -> None:  # noqa: C901, PLR09
             raise ContractError("direct lifecycle strategy cannot claim batch commands")
         if total_entities and requests < total_entities * 5 + 4:
             raise ContractError("direct lifecycle request estimate is not conservative")
-    elif create_strategy == delete_strategy == "batch":
-        if batch_commands < total_entities * 2 or requests * 50 < batch_commands:
-            raise ContractError("batch lifecycle estimates cannot carry the declared entity count")
     else:
-        raise ContractError("mixed create/delete strategies require a separately reviewed estimate model")
+        raise ContractError("only the reviewed direct/direct lifecycle strategy is implemented")
     if quota < requests:
         raise ContractError("quota estimate cannot be lower than physical requests")
     cleanup = _mapping(plan["cleanup"], "cleanup")
@@ -911,8 +908,6 @@ def scan_paths_for_secrets(paths: Iterable[Path]) -> None:
     for path in paths:
         if path.is_file():
             data = path.read_bytes()
-            if path.name in {"models_test.py", "protocol_test.py", "redaction_test.py"}:
-                data = b"\n".join(line for line in data.splitlines() if b"EXAMPLE_CREDENTIAL" not in line)
             if path.name == "contracts_test.py":
                 data = b"\n".join(
                     line
