@@ -623,6 +623,13 @@ def test_cli_plan_and_benchmark_are_offline_and_live_writes_are_flag_gated(tmp_p
     assert "requires both --live and --allow-writes" in seed.stderr
 
 
+def test_every_live_command_refuses_under_ordinary_pytest(tmp_path: Path) -> None:
+    environment = {**os.environ, "PYTEST_CURRENT_TEST": "ordinary::test"}
+    result = _run_cli("plan", "--artifact-dir", str(tmp_path), "--live", environment=environment)
+    assert result.returncode == ExitCode.INVALID
+    assert "forbidden under ordinary pytest" in result.stderr
+
+
 def test_live_benchmark_and_live_resume_never_silently_run_offline(tmp_path: Path) -> None:
     benchmark = _run_cli("benchmark", "--artifact-dir", str(tmp_path), "--live")
     resume = _run_cli("resume", "--artifact-dir", str(tmp_path), "--live")
@@ -789,6 +796,7 @@ def test_cleanup_reconciles_an_ambiguous_create_before_claiming_absence(
     assert adapter.deleted
     latest = load_manifest(manifest_path)[-1]
     assert latest["event"] == "absence_verified"
+    validate_manifest_against_plan(load_manifest(manifest_path), plan)
 
 
 def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) -> None:

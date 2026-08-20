@@ -114,6 +114,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def _dispatch(args: argparse.Namespace) -> ExitCode:
     require_clean_tracked_tree(ROOT)
+    if args.live and os.environ.get("PYTEST_CURRENT_TEST"):
+        raise ContractError("live evidence commands are forbidden under ordinary pytest")
     handlers: dict[str, Callable[[argparse.Namespace], ExitCode]] = {
         "plan": _plan,
         "seed": _seed,
