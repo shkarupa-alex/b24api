@@ -346,6 +346,8 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         with_payload: bool,
         fallback_failed: Literal["none", "direct"],
         policy: ExecutionPolicy,
+        context: ExecutionContext | None = None,
+        logical_page_per_command: bool = False,
     ) -> None:
         """Initialize instance state."""
         self._executor = batch_executor
@@ -354,7 +356,10 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         self._tolerant = tolerant
         self._with_payload = with_payload
         self._fallback_failed = fallback_failed
-        self._context = batch_executor.executor.context(policy)
+        if context is not None and context.policy != policy:
+            raise ValueError("shared batch context must use the exact stream policy")
+        self._context = context or batch_executor.executor.context(policy)
+        self._logical_page_per_command = logical_page_per_command
         self._runner: AsyncGenerator[BatchStreamItem] | None = None
         self._source_controller: AsyncIteratorController[BatchInput] | None = None
         self._prefetched: BatchStreamItem | object = _MISSING
@@ -451,12 +456,26 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                     _raise_source_error(chunk.source_error)
                 self._batch_requests += 1
                 self._batch_commands += len(chunk.commands)
-                outcomes = await self._executor._execute_chunk(  # noqa: SLF001
-                    chunk.commands,
-                    tolerant=self._tolerant,
-                    fallback_failed=self._fallback_failed,
-                    context=self._context,
-                )
+                reservations = []
+                try:
+                    if self._logical_page_per_command:
+                        reservations.extend([await self._context.reserve_page() for _ in chunk.commands])
+                    outcomes = await self._executor._execute_chunk(  # noqa: SLF001
+                        chunk.commands,
+                        tolerant=self._tolerant,
+                        fallback_failed=self._fallback_failed,
+                        context=self._context,
+                    )
+                except BaseException:
+                    for reservation in reservations:
+                        self._context.release_page(reservation)
+                    raise
+                if reservations:
+                    for reservation, outcome in zip(reservations, outcomes, strict=True):
+                        if isinstance(outcome, BatchSuccess):
+                            self._context.commit_page(reservation)
+                        else:
+                            self._context.release_page(reservation)
                 buffered_rows = sum(_batch_outcome_row_weight(outcome) for outcome in outcomes)
                 await self._context.set_buffered_rows(buffered_rows)
                 for outcome in outcomes:
@@ -588,6 +607,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             emitted_rows=self._emitted,
             unique_rows=self._emitted,
             physical_requests=snapshot.counters.physical_requests,
+            logical_pages=snapshot.counters.logical_pages,
             batch_requests=self._batch_requests,
             batch_commands=self._batch_commands,
             retries=snapshot.retries,

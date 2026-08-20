@@ -73,6 +73,7 @@ class ProfileReasonCode(StrEnum):
     PROBE_MISSING = "probe_missing"
     PROBE_INCONCLUSIVE = "probe_inconclusive"
     PROBE_CONTRADICTION = "probe_contradiction"
+    PROVENANCE_MISMATCH = "provenance_mismatch"
 
 
 class ProbeStatus(StrEnum):
@@ -203,6 +204,7 @@ class EndpointProfile:
     evidence: tuple[EvidenceAnchor, ...]
     required_probes: tuple[ProbeSpec, ...] = ()
     source_sha256: str | None = field(default=None, repr=False, compare=False)
+    _source_document: str | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:  # noqa: C901, PLR0912, PLR0915 - strict immutable boundary
         """Validate and normalize instance state."""
@@ -423,6 +425,8 @@ def choose_plan(  # noqa: C901, PLR0912 - typed applicability checks stay explic
     if not isinstance(policy, ExecutionPolicy):
         raise TypeError("policy must be an ExecutionPolicy")
     reasons: list[DecisionReason] = []
+    if not _profile_source_matches(profile):
+        reasons.append(_reason(ProfileReasonCode.PROVENANCE_MISMATCH, "profile content does not match its source"))
     if query.observed_at < profile.verified_at:
         reasons.append(_reason(ProfileReasonCode.NOT_YET_VALID, "profile evidence post-dates the observation"))
     if query.observed_at >= profile.expires_at:
@@ -571,7 +575,7 @@ def load_profile_document(raw: Mapping[str, object]) -> EndpointProfile:
         _parse_probe(_strict_mapping(value, _PROBE_KEYS, "probe"))
         for value in _sequence(document["required_probes"], "required_probes")
     )
-    return EndpointProfile(
+    profile = EndpointProfile(
         schema_version=_string(document["schema_version"], "schema_version"),
         profile_id=_string(document["profile_id"], "profile_id"),
         version=_integer(document["version"], "version"),
@@ -591,6 +595,24 @@ def load_profile_document(raw: Mapping[str, object]) -> EndpointProfile:
         required_probes=probes,
         source_sha256=source_sha256,
     )
+    object.__setattr__(profile, "_source_document", canonical)
+    return profile
+
+
+def _profile_source_matches(profile: EndpointProfile) -> bool:
+    document = profile._source_document  # noqa: SLF001 - class-owned provenance capsule
+    if document is None or profile.source_sha256 is None:
+        return False
+    if hashlib.sha256(document.encode()).hexdigest() != profile.source_sha256:
+        return False
+    try:
+        raw = json.loads(document, parse_constant=_reject_json_constant)
+        if not isinstance(raw, Mapping):
+            return False
+        loaded = load_profile_document(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return loaded.source_sha256 == profile.source_sha256 and loaded == profile
 
 
 def load_packaged_profiles() -> tuple[EndpointProfile, ...]:

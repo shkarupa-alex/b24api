@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import textwrap
+from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs, urlsplit
 
@@ -13,6 +14,7 @@ import pytest
 
 import b24api
 import b24api.facade as facade_module
+from b24api.batch import BatchStream
 from b24api.entity import (
     BatchResult,
     ErrorResponse,
@@ -65,6 +67,7 @@ from b24api.plans import (
 )
 from b24api.profiles import load_profile_document
 from b24api.query import build_query
+from b24api.settings import Settings
 from b24api.type import ApiTypes
 
 if TYPE_CHECKING:
@@ -97,7 +100,7 @@ def _client(handler: Callable[[Request], object]) -> tuple[Bitrix24, FunctionTra
     return Bitrix24._from_executor(Executor(transport)), transport  # noqa: SLF001
 
 
-def _single_profile() -> EndpointProfile:
+def _single_profile(*, required_probes: list[dict[str, object]] | None = None) -> EndpointProfile:
     return load_profile_document(
         {
             "schema_version": "1.0",
@@ -145,7 +148,7 @@ def _single_profile() -> EndpointProfile:
                     "review_status": "accepted",
                 },
             ],
-            "required_probes": [],
+            "required_probes": required_probes or [],
         },
     )
 
@@ -295,6 +298,288 @@ async def test_sequential_and_counted_wrappers_delegate_to_shared_driver() -> No
 
 
 @pytest.mark.asyncio
+async def test_counted_wrapper_refuses_operation_budget_before_tail_admission() -> None:
+    client, transport = _client(lambda _request: {"result": [{"ID": 1}], "total": 1_000_000, "next": 1})
+    policy = ExecutionPolicy(max_requests=1, max_pages=1, max_buffered_rows=1)
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        _ = [item async for item in client.list_batched({"method": "crm.item.list"}, policy=policy)]
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.state is TerminalState.FAILED
+    assert report.physical_requests == 1
+    assert report.logical_pages == 1
+    assert report.emitted_rows == 0
+    assert [request.method for request in transport.requests] == ["crm.item.list"]
+
+
+@pytest.mark.asyncio
+async def test_counted_wrapper_accounts_head_buffer_before_emission() -> None:
+    client, transport = _client(lambda _request: {"result": [{"ID": 1}, {"ID": 2}], "total": 2})
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        _ = [
+            item
+            async for item in client.list_batched(
+                {"method": "crm.item.list"},
+                policy=ExecutionPolicy(max_buffered_rows=1),
+            )
+        ]
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.emitted_rows == 0
+    assert report.physical_requests == 1
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_counted_wrapper_validates_head_before_first_emission() -> None:
+    client, transport = _client(lambda _request: {"result": [{"ID": 1}], "total": 1, "next": 1})
+    stream = client.list_batched({"method": "crm.item.list"})
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        await anext(stream)
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.emitted_rows == 0
+    assert report.logical_pages == 1
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_counted_wrapper_validates_whole_tail_page_before_emission() -> None:
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {"result": [{"ID": 1}, {"ID": 2}], "total": 4, "next": 2}
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: [{"ID": 3}, {"ID": 1}] for key in commands},
+                "result_error": [],
+                "result_total": dict.fromkeys(commands, 4),
+            },
+        }
+
+    client, _transport = _client(handler)
+    delivered: list[JsonValue] = []
+    identity = IdentitySpec(
+        item_path=("ID",),
+        filter_key="ID",
+        order_key="ID",
+        coercion=IdentityCoercion.EXACT_INTEGER,
+    )
+
+    async def collect() -> None:
+        async for item in client.list_batched(
+            {"method": "crm.item.list"},
+            batch_size=1,
+            identity=identity,
+        ):
+            delivered.append(item)  # noqa: PERF401 - retain the delivered prefix on failure
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        await collect()
+
+    report = cast("OperationReport", caught.value.report)
+    assert delivered == [{"ID": 1}, {"ID": 2}]
+    assert report.state is TerminalState.FAILED
+    assert report.emitted_rows == EXPECTED_PAGE_ROWS
+    assert report.physical_requests == EXPECTED_PAGE_ROWS
+    assert report.logical_pages == EXPECTED_PAGE_ROWS
+
+
+@pytest.mark.asyncio
+async def test_counted_wrapper_requires_intermediate_tail_continuation() -> None:
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {"result": [{"ID": 1}], "total": 3, "next": 1}
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        results: dict[str, object] = {}
+        for key, command in commands.items():
+            assert isinstance(command, str)
+            start = int(parse_qs(urlsplit(command).query)["start"][0])
+            results[key] = [{"ID": start + 1}]
+        return {
+            "result": {
+                "result": results,
+                "result_error": [],
+                "result_total": dict.fromkeys(commands, 3),
+            },
+        }
+
+    client, _transport = _client(handler)
+    delivered: list[JsonValue] = []
+
+    async def collect() -> None:
+        async for item in client.list_batched({"method": "crm.item.list"}, batch_size=2):
+            delivered.append(item)  # noqa: PERF401 - retain the delivered prefix on failure
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        await collect()
+
+    assert delivered == [{"ID": 1}]
+    assert "continuation contradicts" in str(caught.value.__cause__)
+
+
+@pytest.mark.asyncio
+async def test_counted_wrapper_early_close_has_shared_cancelled_report() -> None:
+    client, _transport = _client(lambda _request: {"result": [{"ID": 1}], "total": 2, "next": 1})
+    stream = client.list_batched({"method": "crm.item.list"}, batch_size=1)
+    assert await anext(stream) == {"ID": 1}
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        await stream.aclose()
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.state is TerminalState.CANCELLED
+    assert report.physical_requests == 1
+    assert report.logical_pages == 1
+    assert report.emitted_rows == 1
+
+
+@pytest.mark.asyncio
+async def test_counted_wrapper_tail_cleanup_resists_concurrent_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_aclose = BatchStream.aclose
+
+    async def gated_aclose(stream: BatchStream) -> None:
+        entered.set()
+        await release.wait()
+        await original_aclose(stream)
+
+    monkeypatch.setattr(BatchStream, "aclose", gated_aclose)
+
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {"result": [{"ID": 1}], "total": 2, "next": 1}
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {"result": {"result": {key: [{"ID": 1}] for key in commands}, "result_error": []}}
+
+    client, _transport = _client(handler)
+    identity = IdentitySpec(
+        item_path=("ID",),
+        filter_key="ID",
+        order_key="ID",
+        coercion=IdentityCoercion.EXACT_INTEGER,
+    )
+
+    async def consume() -> list[JsonValue]:
+        return [
+            item
+            async for item in client.list_batched(
+                {"method": "crm.item.list"},
+                batch_size=1,
+                identity=identity,
+            )
+        ]
+
+    task = asyncio.create_task(consume())
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+
+    report = cast("OperationReport", cast("IncompleteTraversalError", caught.value).report)
+    assert report.state is TerminalState.CANCELLED
+    assert report.physical_requests == EXPECTED_PAGE_ROWS
+    assert report.logical_pages == EXPECTED_PAGE_ROWS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parameters", [{"start": 99}, {"START": 99}])
+async def test_counted_wrapper_refuses_caller_offset_controls_before_io(
+    parameters: dict[str, int],
+) -> None:
+    client, transport = _client(lambda _request: {"result": []})
+
+    with pytest.raises(CapabilityError, match="conflict"):
+        _ = [
+            item
+            async for item in client.list_batched(
+                {"method": "crm.item.list", "parameters": parameters},
+            )
+        ]
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_counted_wrapper_refuses_required_identity_before_io() -> None:
+    client, transport = _client(lambda _request: {"result": []})
+    policy = ExecutionPolicy(consistency=ConsistencyPolicy(identity_requirement=IdentityRequirement.REQUIRED))
+
+    with pytest.raises(CapabilityError, match="requires IdentitySpec"):
+        _ = [item async for item in client.list_batched({"method": "crm.item.list"}, policy=policy)]
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_counted_wrapper_required_snapshot_is_incomplete() -> None:
+    client, transport = _client(lambda _request: {"result": [], "total": 0})
+    policy = ExecutionPolicy(
+        consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST),
+    )
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        _ = [item async for item in client.list_batched({"method": "crm.item.list"}, policy=policy)]
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.state is TerminalState.INCOMPLETE
+    assert report.logical_pages == 1
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_counted_wrapper_required_snapshot_report_counts_head_and_tail_rows() -> None:
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {"result": [{"ID": 1}], "total": 2, "next": 1}
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: [{"ID": 2}] for key in commands},
+                "result_error": [],
+                "result_total": dict.fromkeys(commands, 2),
+            },
+        }
+
+    client, transport = _client(handler)
+    policy = ExecutionPolicy(
+        consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST),
+    )
+    delivered: list[JsonValue] = []
+
+    async def collect() -> None:
+        async for item in client.list_batched({"method": "crm.item.list"}, batch_size=1, policy=policy):
+            delivered.append(item)  # noqa: PERF401 - retain rows delivered before terminal assurance
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        await collect()
+
+    report = cast("OperationReport", caught.value.report)
+    assert delivered == [{"ID": 1}, {"ID": 2}]
+    assert report.state is TerminalState.INCOMPLETE
+    assert report.emitted_rows == EXPECTED_PAGE_ROWS
+    assert report.unique_rows == EXPECTED_PAGE_ROWS
+    assert report.physical_requests == EXPECTED_PAGE_ROWS
+    assert report.logical_pages == EXPECTED_PAGE_ROWS
+    assert report.batch_requests == 1
+    assert len(transport.requests) == EXPECTED_PAGE_ROWS
+
+
+@pytest.mark.asyncio
 async def test_sequential_wrapper_accepts_server_next_without_total() -> None:
     def handler(request: Request) -> object:
         start = request.copy_parameters().get("start", 0)
@@ -366,6 +651,111 @@ async def test_facade_refuses_profile_replay_safety_conflict_before_io() -> None
             item
             async for item in client.list_sequential(
                 {"method": "tasks.task.list", "replay_safety": "unsafe"},
+                profile=_single_profile(),
+            )
+        ]
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_facade_refuses_profile_with_unobserved_required_probe_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": []})
+    client = Bitrix24._from_executor(  # noqa: SLF001
+        Executor(transport),
+        portal_build="build-1",
+        scopes={"task"},
+    )
+    profile = _single_profile(
+        required_probes=[
+            {
+                "probe_id": "must-run",
+                "method": "tasks.task.list",
+                "max_rows": 1,
+                "selector": [],
+                "minimal_select": ["ID"],
+                "within_caller_filter": True,
+            },
+        ],
+    )
+
+    with pytest.raises(CapabilityError, match="probe_missing"):
+        _ = [
+            item
+            async for item in client.list_sequential(
+                {"method": "tasks.task.list"},
+                profile=profile,
+            )
+        ]
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_facade_refuses_profile_whose_semantics_no_longer_match_source() -> None:
+    client, transport = _client(lambda _request: {"result": [{"ID": 1}], "next": 1})
+    original = _single_profile()
+    assert isinstance(original.plan, SingleResponsePlan)
+    forged = replace(original, plan=replace(original.plan, reject_continuation=False))
+
+    with pytest.raises(CapabilityError, match="provenance_mismatch"):
+        _ = [
+            item
+            async for item in client.list_sequential(
+                {"method": "tasks.task.list"},
+                profile=forged,
+            )
+        ]
+
+    assert forged.source_sha256 == original.source_sha256
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_reference_wrapper_refuses_profile_without_batch_capability_before_source_pull() -> None:
+    transport = FunctionTransport(lambda _request: {"result": []})
+    client = Bitrix24._from_executor(  # noqa: SLF001
+        Executor(transport),
+        portal_build="build-1",
+        scopes={"task"},
+    )
+    pulled = False
+
+    async def updates() -> AsyncGenerator[dict[str, object]]:
+        nonlocal pulled
+        pulled = True
+        yield {"OWNER_ID": 1}
+
+    with pytest.raises(CapabilityError, match="does not authorize batch"):
+        _ = [
+            item
+            async for item in client.reference_batched_no_count(
+                {"method": "tasks.task.list"},
+                updates(),
+                profile=_single_profile(),
+            )
+        ]
+
+    assert not pulled
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_reference_wrapper_refuses_explicit_selector_outside_profile_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": {"items": []}})
+    client = Bitrix24._from_executor(  # noqa: SLF001
+        Executor(transport),
+        portal_build="build-1",
+        scopes={"task"},
+    )
+
+    with pytest.raises(CapabilityError, match="query_shape_mismatch"):
+        _ = [
+            item
+            async for item in client.reference_cursor_no_count(
+                {"method": "tasks.task.list"},
+                [{"OWNER_ID": 1}],
+                result_key="items",
                 profile=_single_profile(),
             )
         ]
@@ -868,6 +1258,13 @@ def test_facade_signature_snapshot_preserves_committed_and_keyword_bridges() -> 
     }
 
     assert {name: tuple(inspect.signature(getattr(Bitrix24, name)).parameters) for name in expected} == expected
+
+
+def test_settings_reject_batch_size_above_portal_cap() -> None:
+    with pytest.raises(ValueError, match="less than or equal to 50"):
+        Settings.model_validate(
+            {"webhook_url": "https://bitrix24.com/rest/0/test/", "batch_size": 51},
+        )
 
     constructor = inspect.signature(Bitrix24)
     settings = constructor.parameters["settings"]

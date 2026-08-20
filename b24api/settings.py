@@ -4,7 +4,7 @@ from typing import Annotated, Any
 
 from fast_depends import Depends
 from httpx import codes
-from pydantic import HttpUrl
+from pydantic import Field, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     retry_backoff: float = 2
 
     list_size: int = 50
-    batch_size: int = 50
+    batch_size: int = Field(default=50, ge=1, le=50)
     portal_build: str | None = None
     scopes: frozenset[str] = frozenset()
 

@@ -236,8 +236,7 @@ class PaginationDriver:
 
     async def pages(self) -> AsyncGenerator[_Page]:  # noqa: C901
         """Yield validated traversal pages."""
-        self._validate_capabilities()
-        self._identity_store = _identity_store(self.context.policy, self.plan, self.identity)
+        self.begin_external_validation()
         try:
             if isinstance(self.plan, SingleResponsePlan):
                 async for page in self._single(self.plan):
@@ -261,9 +260,34 @@ class PaginationDriver:
                 return
             raise AssertionError("validated list plan was not dispatched")
         finally:
-            if self._identity_store is not None:
-                self._unique_rows_final = self._identity_store.count
-                self._identity_store.close()
+            self.close_external_validation()
+
+    def begin_external_validation(self) -> None:
+        """Start canonical contract and identity validation for an external page dispatcher."""
+        if self._identity_store is not None:
+            raise RuntimeError("page validation is already active")
+        self._validate_capabilities()
+        self._identity_store = _identity_store(self.context.policy, self.plan, self.identity)
+
+    def validate_external_page(self, items: list[JsonValue], response: Response) -> None:
+        """Validate one externally dispatched page with the canonical traversal state machine."""
+        if self._identity_store is None:
+            raise RuntimeError("page validation is not active")
+        self._validate_page(items, response=response)
+
+    def finish_external_validation(self) -> None:
+        """Validate the canonical terminal-total contract for externally dispatched pages."""
+        if self._identity_store is None:
+            raise RuntimeError("page validation is not active")
+        self._validate_terminal_total()
+
+    def close_external_validation(self) -> None:
+        """Release the canonical identity store retained by external page validation."""
+        if self._identity_store is None:
+            return
+        self._unique_rows_final = self._identity_store.count
+        self._identity_store.close()
+        self._identity_store = None
 
     async def _single(self, plan: SingleResponsePlan) -> AsyncGenerator[_Page]:
         response = await self._fetch(self.request)

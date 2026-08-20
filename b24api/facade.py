@@ -1,6 +1,7 @@
 """Canonical Bitrix24 facade and plan-driven compatibility wrappers."""
 
 from __future__ import annotations
+import asyncio
 import logging
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
@@ -13,7 +14,7 @@ from pydantic_core import to_jsonable_python
 from b24api.batch import BatchExecutor, BatchInput, BatchOutcomeStream, BatchStream
 from b24api.entity import LegacyRequest
 from b24api.error import CapabilityError, IncompleteTraversalError
-from b24api.execution import Executor, HttpxTransport
+from b24api.execution import ExecutionContext, Executor, HttpxTransport, await_cancellation_resistant
 from b24api.models import (
     BatchFailure,
     BatchSuccess,
@@ -33,12 +34,18 @@ from b24api.models import (
     ReplaySafety,
     Request,
     Response,
+    ResponseEvidence,
     ResultSelector,
     RetryPolicy,
+    SnapshotRequirement,
+    SnapshotState,
     TerminalState,
     TotalSemantics,
+    Violation,
+    ViolationSeverity,
+    inject_controls,
 )
-from b24api.pagination import _LEGACY_RESULT_SELECTOR, ItemStream, _coerce_identity, _extract_path
+from b24api.pagination import _LEGACY_RESULT_SELECTOR, ItemStream, PaginationDriver
 from b24api.pagination import iter_list as iter_list_stream
 from b24api.plans import (
     PORTAL_BATCH_CAP,
@@ -55,7 +62,7 @@ from b24api.plans import (
     OffsetTerminalRule,
     ReferenceOutputOrder,
 )
-from b24api.profiles import EndpointProfile, choose_plan, query_shape_from_request
+from b24api.profiles import EndpointProfile, apply_probe_observations, choose_plan, query_shape_from_request
 from b24api.references import ReferenceStream, iter_references
 from b24api.references import fan_out as fan_out_stream
 from b24api.settings import Settings, api_settings
@@ -197,7 +204,7 @@ class Bitrix24:
         """Return a lazy fail-fast compatibility batch stream."""
         stream = self._batch_executor.batch(
             _adapt_batch_source(requests, with_payload=with_payload),
-            batch_size=self._configured_batch_size(batch_size),
+            batch_size=self._effective_batch_size(batch_size),
             with_payload=with_payload,
             policy=policy or self._default_policy,
         )
@@ -217,7 +224,7 @@ class Bitrix24:
         """Return one typed tolerant outcome for every input command."""
         return self._batch_executor.batch_outcomes(
             _adapt_batch_source(requests, with_payload=None),
-            batch_size=self._configured_batch_size(batch_size),
+            batch_size=self._effective_batch_size(batch_size),
             policy=policy or self._default_policy,
             fallback_failed=fallback_failed,
         )
@@ -226,6 +233,12 @@ class Bitrix24:
         if requested is not None:
             return requested
         return self._settings.batch_size if self._settings is not None else None
+
+    def _effective_batch_size(self, requested: int | None) -> int:
+        configured = self._configured_batch_size(requested)
+        value = self._batch_executor.portal_command_cap if configured is None else configured
+        _validate_batch_size(value)
+        return value
 
     def _configured_list_size(self, requested: int | None) -> int:
         if requested is not None:
@@ -319,6 +332,7 @@ class Bitrix24:
         identity: IdentitySpec | None,
         policy: ExecutionPolicy,
         page_cap_hint: int | None,
+        selector_explicit: bool = False,
     ) -> _ResolvedTraversal:
         if plan is not None:
             if profile is not None:
@@ -330,12 +344,12 @@ class Bitrix24:
             raise CapabilityError("endpoint profile requires immutable source provenance")
         query = query_shape_from_request(
             request,
-            selector=profile.query.selector,
+            selector=selector if selector_explicit else profile.query.selector,
             scopes=self._portal_scopes,
             portal_build=self._portal_build,
             observed_at=datetime.now(UTC),
         )
-        decision = choose_plan(profile, query, policy)
+        decision = apply_probe_observations(choose_plan(profile, query, policy), ())
         if not decision.accepted or decision.selected_plan is None:
             codes = ",".join(reason.code.value for reason in decision.reasons)
             raise CapabilityError(f"endpoint profile is not applicable: {codes}")
@@ -422,14 +436,14 @@ class Bitrix24:
         """Preserve committed head-plus-batched-tail counted gathering."""
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
-        _validate_batch_size(batch_size)
+        effective_batch_size = self._effective_batch_size(batch_size)
         base = _as_profiled_read_request(_canonical_request(request), profile, plan=plan)
         effective_policy = policy or self._default_policy
         if plan is None and profile is None:
             items = self._list_batched_default(
                 base,
                 page_size=page_size,
-                batch_size=self._configured_batch_size(batch_size) or self._batch_executor.portal_command_cap,
+                batch_size=effective_batch_size,
                 identity=identity,
                 policy=effective_policy,
             )
@@ -479,11 +493,35 @@ class Bitrix24:
         identity: IdentitySpec | None,
         policy: ExecutionPolicy,
     ) -> AsyncGenerator[JsonValue]:
-        seen: set[str | int] = set()
+        evidence: list[ResponseEvidence] = []
         emitted = 0
+        context = self._executor.context(policy)
+        outcomes: BatchStream | None = None
+        validation_plan = CountedOffsetPlan()
+        validator = PaginationDriver(
+            self._executor,
+            base,
+            validation_plan,
+            selector=_LEGACY_RESULT_SELECTOR,
+            identity=identity,
+            context=context,
+            page_cap_hint=page_size,
+        )
+        validator.begin_external_validation()
         try:
-            head = await self._executor.execute(_merge_top_level(base, {"start": 0}), policy=policy)
+            head_reservation = await context.reserve_page()
+            try:
+                head = await self._executor.execute(
+                    _counted_offset_request(base, validation_plan, 0),
+                    context=context,
+                )
+            except BaseException:
+                context.release_page(head_reservation)
+                raise
+            context.commit_page(head_reservation)
+            evidence.append(head.evidence)
             head_items = head.list_result
+            await context.set_buffered_rows(len(head_items))
             total = head.total
             if total is None or total < 0:
                 _raise_capability("parallel counted traversal requires a non-negative total")
@@ -498,20 +536,53 @@ class Bitrix24:
                 _raise_capability("parallel counted traversal has no in-band tail stride")
             if head.next is not None and head.next != len(head_items):
                 _raise_capability("parallel counted head continuation contradicts its row count")
+            if total == len(head_items) and head.next is not None:
+                _raise_capability("parallel counted traversal completed while continuation remained")
+            tail_pages = (total - 1) // stride if total > len(head_items) else 0
+            if 1 + tail_pages > policy.max_pages:
+                _raise_capability("parallel counted traversal exceeds the logical page budget")
+            if tail_pages and stride > policy.max_buffered_rows:
+                _raise_capability("parallel counted page exceeds the decoded row buffer budget")
+            effective_batch_size = min(
+                batch_size,
+                max(1, policy.max_buffered_rows // stride),
+            )
+            minimum_requests = 1 + (tail_pages + effective_batch_size - 1) // effective_batch_size
+            if minimum_requests > policy.max_requests:
+                _raise_capability("parallel counted traversal exceeds the physical request budget")
+            validator.validate_external_page(head_items, head)
             for item in head_items:
-                _record_compatibility_identity(item, identity, seen)
                 emitted += 1
                 yield item
+                await context.adjust_buffered_rows(-1)
             if total == emitted:
-                if head.next is not None:
-                    _raise_capability("parallel counted traversal completed while continuation remained")
+                validator.finish_external_validation()
+                if policy.consistency.snapshot_requirement is not SnapshotRequirement.TRAVERSAL_ONLY:
+                    report = await _counted_report(
+                        context,
+                        TerminalState.COMPLETED,
+                        "parallel counted traversal completed",
+                        emitted=emitted,
+                        unique=emitted,
+                        violations=tuple(validator.violations),
+                        evidence=tuple(evidence),
+                    )
+                    _raise_incomplete(report, None)
                 return
-            starts = tuple(range(stride, total, stride))
-            requests = tuple(_merge_top_level(base, {"start": start}) for start in starts)
-            outcomes = self._batch_executor.batch_outcomes(
+            requests = (
+                _counted_offset_request(base, validation_plan, start)
+                for start in range(stride, total, stride)
+            )
+            outcomes = BatchStream(
+                self._batch_executor,
                 requests,
-                batch_size=batch_size,
+                batch_size=effective_batch_size,
+                tolerant=True,
+                with_payload=False,
+                fallback_failed="none",
                 policy=policy,
+                context=context,
+                logical_page_per_command=True,
             )
             primary: BaseException | None = None
             try:
@@ -523,7 +594,8 @@ class Bitrix24:
                     if not isinstance(outcome, BatchSuccess) or outcome.response is None:
                         _raise_capability("parallel counted batch outcome lacks correlated response evidence")
                     response = outcome.response
-                    start = starts[outcome.command_index]
+                    evidence.append(response.evidence)
+                    start = stride * (outcome.command_index + 1)
                     items = response.list_result
                     expected_rows = min(stride, total - start)
                     if len(items) != expected_rows:
@@ -531,31 +603,86 @@ class Bitrix24:
                     if response.total is not None and response.total != total:
                         _raise_capability("parallel counted page total contradicts the head total")
                     expected_next = start + stride if start + stride < total else None
-                    if response.next is not None and response.next != expected_next:
+                    if response.next != expected_next:
                         _raise_capability("parallel counted continuation contradicts the planned exact range")
+                    validator.validate_external_page(items, response)
                     for item in items:
-                        _record_compatibility_identity(item, identity, seen)
                         emitted += 1
                         yield item
             except BaseException as error:  # noqa: BLE001 - preserve the canonical stream report
                 primary = error
             finally:
                 try:
-                    await outcomes.aclose()
+                    cleanup_cancellation = await await_cancellation_resistant(outcomes.aclose())
                 except BaseException as cleanup_error:  # noqa: BLE001 - cleanup retains primary failure
                     if primary is None:
                         primary = cleanup_error
-            if outcomes.report.state is not TerminalState.COMPLETED:
-                _raise_incomplete(outcomes.report, primary)
+                else:
+                    if cleanup_cancellation is not None:
+                        primary = cleanup_cancellation
             if primary is not None:
                 _raise_error(primary)
+            if outcomes.report.state is not TerminalState.COMPLETED:
+                _raise_incomplete(outcomes.report, None)
             if emitted != total:
                 _raise_capability("parallel counted traversal did not emit its exact total")
-        except IncompleteTraversalError:
+            validator.finish_external_validation()
+        except asyncio.CancelledError as error:
+            report, repeated = await _counted_report_resistant(
+                context,
+                TerminalState.CANCELLED,
+                "iteration cancelled",
+                emitted=emitted,
+                unique=emitted,
+                batch_report=outcomes.report if outcomes is not None else None,
+                violations=tuple(validator.violations),
+                evidence=tuple(evidence),
+            )
+            propagated = repeated or error
+            _attach_compatibility_report(propagated, report)
+            if repeated is not None:
+                raise repeated from error
             raise
-        except BaseException as error:
-            report = OperationReport(state=TerminalState.FAILED, terminal_reason=type(error).__name__)
+        except GeneratorExit as error:
+            report, repeated = await _counted_report_resistant(
+                context,
+                TerminalState.CANCELLED,
+                "stream closed before exhaustion",
+                emitted=emitted,
+                unique=emitted,
+                batch_report=outcomes.report if outcomes is not None else None,
+                violations=tuple(validator.violations),
+                evidence=tuple(evidence),
+            )
+            if repeated is not None:
+                _attach_compatibility_report(repeated, report)
+                raise repeated from error
             raise IncompleteTraversalError(report=report) from error
+        except BaseException as error:
+            cause_report = getattr(error, "report", None)
+            state = cause_report.state if isinstance(cause_report, OperationReport) else TerminalState.FAILED
+            if state is TerminalState.COMPLETED:
+                state = TerminalState.FAILED
+            report, repeated = await _counted_report_resistant(
+                context,
+                state,
+                type(error).__name__,
+                emitted=emitted,
+                unique=emitted,
+                batch_report=(
+                    outcomes.report
+                    if outcomes is not None
+                    else cause_report if isinstance(cause_report, OperationReport) else None
+                ),
+                violations=tuple(validator.violations),
+                evidence=tuple(evidence),
+            )
+            if repeated is not None:
+                _attach_compatibility_report(repeated, report)
+                raise repeated from error
+            raise IncompleteTraversalError(report=report) from error
+        finally:
+            validator.close_external_validation()
 
     async def list_batched_no_count(  # noqa: PLR0913 - compatibility bridge signature
         self,
@@ -572,7 +699,7 @@ class Bitrix24:
         """Preserve no-count list gathering as exact sequential keyset traversal."""
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
-        _validate_batch_size(batch_size)
+        self._effective_batch_size(batch_size)
         resolved_identity = identity if profile is not None else identity or _legacy_identity(id_key)
         base = _as_profiled_read_request(_canonical_request(request), profile, plan=plan)
         if identity is None and profile is None:
@@ -650,7 +777,7 @@ class Bitrix24:
         """Map legacy per-filter references to bounded keyset batch dispatch."""
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
-        _validate_batch_size(batch_size)
+        effective_batch_size = self._effective_batch_size(batch_size)
         base = _as_profiled_read_request(_canonical_request(request), profile, plan=plan)
         if identity is None and profile is None:
             base = _ensure_legacy_select_identity(base, id_key)
@@ -666,9 +793,10 @@ class Bitrix24:
             policy=effective_policy,
             page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
         )
+        _require_profile_batch_support(profile)
         output_order = ReferenceOutputOrder.READY
         dispatch = BatchDispatch(
-            batch_size=self._configured_batch_size(batch_size) or self._batch_executor.portal_command_cap,
+            batch_size=effective_batch_size,
             output_order=output_order,
         )
         sources = _legacy_reference_requests(
@@ -721,7 +849,7 @@ class Bitrix24:
         """Map legacy cursor references to one bounded item-cursor scheduler."""
         page_size = self._configured_list_size(list_size)
         _validate_positive_optional(page_size, "list_size")
-        _validate_batch_size(batch_size)
+        effective_batch_size = self._effective_batch_size(batch_size)
         base = _as_profiled_read_request(_canonical_request(request), profile, plan=plan)
         resolved_identity = (
             identity
@@ -756,10 +884,12 @@ class Bitrix24:
             identity=resolved_identity,
             policy=effective_policy,
             page_cap_hint=self._wrapper_page_cap(list_size, plan, profile),
+            selector_explicit=result_key is not None,
         )
+        _require_profile_batch_support(profile)
         output_order = ReferenceOutputOrder.READY
         dispatch = BatchDispatch(
-            batch_size=self._configured_batch_size(batch_size) or self._batch_executor.portal_command_cap,
+            batch_size=effective_batch_size,
             output_order=output_order,
         )
         sources = _legacy_reference_requests(
@@ -886,20 +1016,110 @@ def _legacy_identity(id_key: str) -> IdentitySpec:
     )
 
 
-def _record_compatibility_identity(
-    item: JsonValue,
-    identity: IdentitySpec | None,
-    seen: set[str | int],
-) -> None:
-    if identity is None:
-        return
+def _counted_offset_request(base: Request, plan: CountedOffsetPlan, start: int) -> Request:
     try:
-        value = _coerce_identity(_extract_path(item, identity.item_path), identity.coercion)
+        parameters = inject_controls(
+            base.copy_parameters(),
+            {plan.offset_path: start},
+            allow_create=plan.allow_create_controls,
+        )
     except (KeyError, TypeError, ValueError) as error:
-        raise CapabilityError("parallel counted result does not satisfy its identity contract") from error
-    if value in seen:
-        raise CapabilityError("parallel counted traversal observed a duplicate identity")
-    seen.add(value)
+        raise CapabilityError("request parameters conflict with counted traversal controls") from error
+    return Request(base.method, parameters, base.replay_safety)
+
+
+def _require_profile_batch_support(profile: EndpointProfile | None) -> None:
+    if profile is not None and not profile.capabilities.batch_supported:
+        raise CapabilityError("endpoint profile does not authorize batch dispatch")
+
+
+async def _counted_report_resistant(  # noqa: PLR0913
+    context: ExecutionContext,
+    state: TerminalState,
+    reason: str,
+    *,
+    emitted: int,
+    unique: int,
+    batch_report: OperationReport | None = None,
+    violations: tuple[Violation, ...] = (),
+    evidence: tuple[ResponseEvidence, ...] = (),
+) -> tuple[OperationReport, asyncio.CancelledError | None]:
+    task = asyncio.create_task(
+        _counted_report(
+            context,
+            state,
+            reason,
+            emitted=emitted,
+            unique=unique,
+            batch_report=batch_report,
+            violations=violations,
+            evidence=evidence,
+        ),
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    return await task, cancellation
+
+
+async def _counted_report(  # noqa: PLR0913
+    context: ExecutionContext,
+    state: TerminalState,
+    reason: str,
+    *,
+    emitted: int,
+    unique: int,
+    batch_report: OperationReport | None = None,
+    violations: tuple[Violation, ...] = (),
+    evidence: tuple[ResponseEvidence, ...] = (),
+) -> OperationReport:
+    snapshot = await context.snapshot()
+    snapshot_state = (
+        SnapshotState.NOT_REQUESTED
+        if context.policy.consistency.snapshot_requirement is SnapshotRequirement.TRAVERSAL_ONLY
+        else SnapshotState.UNVERIFIED
+    )
+    report_violations = (*violations, *(batch_report.violations if batch_report is not None else ()))
+    if state is TerminalState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
+        state = TerminalState.INCOMPLETE
+        reason = "required snapshot was not verified"
+        report_violations = (
+            *report_violations,
+            Violation(
+                severity=ViolationSeverity.BLOCKING,
+                code="snapshot_unverified",
+                message="the requested stable snapshot was not verified",
+            ),
+        )
+    return OperationReport(
+        state=state,
+        assurance=CompletionAssurance.CALLER_ASSERTED,
+        snapshot=snapshot_state,
+        plan_id="CountedOffsetPlan",
+        dispatch_id="batch",
+        emitted_rows=emitted,
+        unique_rows=unique,
+        physical_requests=snapshot.counters.physical_requests,
+        logical_pages=snapshot.counters.logical_pages,
+        batch_requests=batch_report.batch_requests if batch_report is not None else 0,
+        batch_commands=batch_report.batch_commands if batch_report is not None else 0,
+        retries=snapshot.retries,
+        cooldown_seconds=snapshot.cooldown_seconds,
+        buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
+        violations=report_violations,
+        terminal_reason=reason,
+        evidence=evidence,
+    )
+
+
+def _attach_compatibility_report(error: BaseException, report: OperationReport) -> None:
+    try:
+        error.report = report  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        return
 
 
 def _raise_capability(message: str) -> Never:
