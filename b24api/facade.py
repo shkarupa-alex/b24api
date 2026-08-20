@@ -14,7 +14,7 @@ from pydantic_core import to_jsonable_python
 from b24api.batch import BatchExecutor, BatchInput, BatchOutcomeStream, BatchStream
 from b24api.entity import LegacyRequest
 from b24api.error import CapabilityError, IncompleteTraversalError
-from b24api.execution import ExecutionContext, Executor, HttpxTransport
+from b24api.execution import ExecutionContext, ExecutionSnapshot, Executor, HttpxTransport
 from b24api.models import (
     CompletionAssurance,
     ExecutionPolicy,
@@ -583,7 +583,7 @@ class Bitrix24:
                 raise repeated from error
             raise IncompleteTraversalError(report=report) from error
         except BaseException as error:
-            preflight = await context.snapshot()
+            preflight, _snapshot_cancellation = await _snapshot_resistant(context)
             if isinstance(error, CapabilityError) and preflight.counters.physical_requests == 0:
                 raise
             cause_report = getattr(error, "report", None)
@@ -1073,6 +1073,19 @@ async def _counted_report_resistant(  # noqa: PLR0913
             evidence=evidence,
         ),
     )
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    return await task, cancellation
+
+
+async def _snapshot_resistant(
+    context: ExecutionContext,
+) -> tuple[ExecutionSnapshot, asyncio.CancelledError | None]:
+    task = asyncio.create_task(context.snapshot(), name="b24api-counted-failure-snapshot")
     cancellation: asyncio.CancelledError | None = None
     while not task.done():
         try:

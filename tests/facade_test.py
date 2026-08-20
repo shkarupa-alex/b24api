@@ -37,7 +37,7 @@ from b24api.error import (
     RetryApiResponseError,
     RetryHTTPStatusError,
 )
-from b24api.execution import Executor, WireResponse
+from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.facade import Bitrix24
 from b24api.models import (
     CompletionAssurance,
@@ -557,6 +557,54 @@ async def test_counted_report_cancellation_preserves_detected_failure(
     await report_started.wait()
     task.cancel()
     release_report.set()
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        await task
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.state is TerminalState.FAILED
+    assert "total contradicts" in str(caught.value.__cause__)
+
+
+@pytest.mark.asyncio
+async def test_counted_pre_report_snapshot_cancellation_preserves_detected_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot_started = asyncio.Event()
+    release_snapshot = asyncio.Event()
+    original_snapshot = ExecutionContext.snapshot
+
+    async def controlled_snapshot(context: ExecutionContext) -> object:
+        task = asyncio.current_task()
+        if task is not None and task.get_name() == "b24api-counted-failure-snapshot":
+            snapshot_started.set()
+            await release_snapshot.wait()
+        return await original_snapshot(context)
+
+    monkeypatch.setattr(ExecutionContext, "snapshot", controlled_snapshot)
+
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {"result": [{"ID": 1}], "total": 2, "next": 1}
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: [{"ID": 2}] for key in commands},
+                "result_error": [],
+                "result_total": dict.fromkeys(commands, 3),
+            },
+        }
+
+    client, _transport = _client(handler)
+
+    async def collect() -> list[JsonValue]:
+        return [item async for item in client.list_batched({"method": "crm.item.list"}, batch_size=1)]
+
+    task = asyncio.create_task(collect())
+    await snapshot_started.wait()
+    task.cancel()
+    release_snapshot.set()
 
     with pytest.raises(IncompleteTraversalError) as caught:
         await task
