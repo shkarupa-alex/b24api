@@ -696,6 +696,42 @@ async def test_item_cursor_advances_from_items_until_empty_confirmation() -> Non
 
 
 @pytest.mark.asyncio
+async def test_item_cursor_orders_cursor_values_independently_from_row_identity() -> None:
+    responses = [
+        {"result": [{"ID": 20, "cursor": 1}, {"ID": 10, "cursor": 2}]},
+        {"result": [{"ID": 10, "cursor": 3}]},
+        {"result": []},
+    ]
+    transport = FunctionTransport(lambda _request: responses.pop(0))
+    plan = ItemCursorPlan(
+        identity_requirement=IdentityRequirement.REQUIRED,
+        cursor_item_path=("cursor",),
+        direction="asc",
+        cursor_take="max",
+        duplicate_policy=DuplicatePolicy.REPORT,
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        identity=_identity(),
+        policy=ExecutionPolicy(
+            consistency=ConsistencyPolicy(duplicate_policy=DuplicatePolicy.REPORT),
+        ),
+    )
+
+    assert await _collect(stream) == [
+        {"ID": 20, "cursor": 1},
+        {"ID": 10, "cursor": 2},
+        {"ID": 10, "cursor": 3},
+    ]
+    assert [request.copy_parameters().get("LAST_ID") for request in transport.requests] == [None, 2, 3]
+    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.unique_rows == PAGE_SIZE
+    assert [violation.code for violation in stream.report.violations] == ["duplicate_identity"]
+
+
+@pytest.mark.asyncio
 async def test_item_cursor_rejects_wrong_order_within_first_page() -> None:
     transport = FunctionTransport(lambda _request: {"result": [{"ID": 2}, {"ID": 1}]})
     plan = ItemCursorPlan(

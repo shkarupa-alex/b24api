@@ -15,6 +15,7 @@ from b24api.error import (
     BudgetExceededError,
     CapabilityError,
     FailurePhase,
+    HTTPGatewayError,
     ProtocolError,
     TransportError,
 )
@@ -31,6 +32,7 @@ from b24api.models import (
     ReferenceItem,
     ReferenceRequest,
     Request,
+    RetryPolicy,
     SnapshotRequirement,
     SnapshotState,
     TerminalState,
@@ -419,6 +421,42 @@ async def test_fan_out_accepts_list_result_whose_total_matches_list_length() -> 
     assert isinstance(outcomes[0], ReferenceItem)
     assert outcomes[0].item == [{"ID": 1}, {"ID": 2}]
     assert stream.report.state is TerminalState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
+    class TransientThenSuccessTransport:
+        def __init__(self) -> None:
+            self.requests: list[Request] = []
+
+        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+            del attempt_timeout
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return WireResponse(503, (), b"gateway")
+            return WireResponse(200, (), b'{"result":{"ID":1}}')
+
+    transport = TransientThenSuccessTransport()
+    request = Request("tasks.task.add")
+    stream = fan_out(
+        Executor(transport),
+        [ReferenceRequest(request, "write")],
+        dispatch=DirectDispatch(concurrency=1),
+        policy=ExecutionPolicy(
+            max_attempts_per_request=TWO_REFERENCES,
+            retry=RetryPolicy(initial_delay=0, maximum_delay=0, jitter=0),
+        ),
+    )
+
+    with pytest.raises(HTTPGatewayError) as captured:
+        await anext(stream)
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert request.replay_safety is None
+    assert len(transport.requests) == 1
+    assert transport.requests[0].replay_safety is None
+    assert stream.report.retries == 0
+    assert stream.report.state is TerminalState.FAILED
 
 
 @pytest.mark.asyncio

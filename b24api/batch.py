@@ -450,9 +450,10 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                     fallback_failed=self._fallback_failed,
                     context=self._context,
                 )
-                buffered_outcomes = len(outcomes)
-                await self._context.set_buffered_rows(buffered_outcomes)
+                buffered_rows = sum(_batch_outcome_row_weight(outcome) for outcome in outcomes)
+                await self._context.set_buffered_rows(buffered_rows)
                 for outcome in outcomes:
+                    outcome_rows = _batch_outcome_row_weight(outcome)
                     if self._tolerant:
                         yield outcome
                     else:
@@ -461,8 +462,8 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                             yield success.result, success.payload
                         else:
                             yield success.result
-                    buffered_outcomes -= 1
-                    await self._context.set_buffered_rows(buffered_outcomes)
+                    buffered_rows -= outcome_rows
+                    await self._context.set_buffered_rows(buffered_rows)
             naturally_exhausted = True
             await self._finalize(TerminalState.COMPLETED, "input exhausted")
         except asyncio.CancelledError as error:
@@ -820,6 +821,10 @@ def _fallback_eligible(outcome: BatchFailure) -> bool:
         and isinstance(outcome.error, B24ApiError)
         and outcome.error.retryable
     )
+
+
+def _batch_outcome_row_weight(outcome: BatchOutcome) -> int:
+    return outcome.decoded_rows if isinstance(outcome, BatchSuccess) else 1
 
 
 __all__ = [

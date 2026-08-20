@@ -27,7 +27,6 @@ from b24api.models import (
     OperationReport,
     OrderSemantics,
     ParameterPath,
-    ReplaySafety,
     Request,
     Response,
     ResultSelector,
@@ -203,7 +202,7 @@ class PaginationDriver:
         single_result_as_item: bool = False,
     ) -> None:
         self.executor = executor
-        self.request = _traversal_request(request)
+        self.request = request
         self.plan = plan
         self.selector = plan.selector or selector or ResultSelector.root()
         self.identity = identity
@@ -920,12 +919,6 @@ def iter_list(  # noqa: PLR0913
         identity=identity,
         policy=policy,
     )
-
-
-def _traversal_request(request: Request) -> Request:
-    if request.replay_safety is not None:
-        return request
-    return Request(request.method, request.copy_parameters(), ReplaySafety.SAFE)
 
 
 def _attach_report(error: BaseException, report: OperationReport) -> None:

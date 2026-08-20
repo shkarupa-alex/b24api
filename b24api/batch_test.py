@@ -38,6 +38,7 @@ HTTP_OK = 200
 EXPECTED_TOTAL = 3
 PULL_TEST_TIMEOUT = 0.15
 PARTIAL_COMMAND_COUNT = 2
+NESTED_ROW_COUNT = 2
 
 
 class CallbackTransport:
@@ -170,6 +171,47 @@ async def test_batch_outcomes_obey_decoded_row_buffer_ceiling() -> None:
     assert len(transport.requests) == MIXED_COMMAND_COUNT
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.buffered_rows_high_water == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_list_result_uses_nested_decoded_row_weight() -> None:
+    def list_result(request: Request) -> WireResponse:
+        keys = _batch_keys(request)
+        rows = [{"ID": index} for index in range(NESTED_ROW_COUNT)]
+        body = json.dumps(
+            {
+                "result": {
+                    "result": dict.fromkeys(keys, rows),
+                    "result_error": [],
+                },
+            },
+        ).encode()
+        return WireResponse(200, (("content-type", "application/json"),), body)
+
+    rejected = BatchExecutor(Executor(CallbackTransport(list_result))).batch_outcomes(
+        [Request("profile")],
+        batch_size=1,
+        policy=ExecutionPolicy(max_buffered_rows=1),
+    )
+    with pytest.raises(BudgetExceededError, match="buffer") as captured:
+        await anext(rejected)
+    assert captured.value.__dict__["report"] is rejected.report
+    assert rejected.report.state is TerminalState.FAILED
+    assert rejected.report.emitted_rows == 0
+    assert rejected.report.buffered_rows_high_water == 0
+
+    admitted = BatchExecutor(Executor(CallbackTransport(list_result))).batch_outcomes(
+        [Request("profile")],
+        batch_size=1,
+        policy=ExecutionPolicy(max_buffered_rows=NESTED_ROW_COUNT),
+    )
+    outcome = await anext(admitted)
+    snapshot = await admitted._context.snapshot()  # noqa: SLF001 - live weighted buffer evidence
+    assert isinstance(outcome, BatchSuccess)
+    assert outcome.decoded_rows == NESTED_ROW_COUNT
+    assert snapshot.counters.buffered_rows == NESTED_ROW_COUNT
+    assert [item async for item in admitted] == []
+    assert admitted.report.buffered_rows_high_water == NESTED_ROW_COUNT
 
 
 @pytest.mark.asyncio

@@ -203,7 +203,7 @@ class KeysetPlan(PlanContract):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ItemCursorPlan(PlanContract):
-    """Sequential cursor derived from an item in the preceding page."""
+    """Sequential item-derived cursor with independent row-order semantics."""
 
     cursor_request_path: ParameterPath = _LAST_ID_PATH
     cursor_item_path: tuple[str | int, ...] = ("id",)
@@ -232,9 +232,6 @@ class ItemCursorPlan(PlanContract):
             raise ValueError("short-page terminal requires a requested_page_size")
         if self.identity_requirement is not IdentityRequirement.REQUIRED:
             raise ValueError("item cursor plan requires identity")
-        expected = OrderSemantics.ASCENDING if self.direction == "asc" else OrderSemantics.DESCENDING
-        if self.order_semantics is not expected:
-            raise ValueError("cursor direction contradicts order_semantics")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

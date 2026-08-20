@@ -847,6 +847,7 @@ class BatchSuccess:
     stable_key: str
     request: Request = field(repr=False)
     _result: FrozenJson = field(repr=False)
+    _decoded_rows: int = field(repr=False)
     payload: object = field(default=None, repr=False)
     evidence: BatchCommandEvidence | None = None
     replay_disposition: ReplayDisposition | None = None
@@ -875,6 +876,7 @@ class BatchSuccess:
         object.__setattr__(self, "stable_key", stable_key)
         object.__setattr__(self, "request", request)
         object.__setattr__(self, "_result", frozen_result)
+        object.__setattr__(self, "_decoded_rows", len(frozen_result) if isinstance(frozen_result, tuple) else 1)
         object.__setattr__(self, "payload", payload)
         object.__setattr__(self, "evidence", evidence)
         object.__setattr__(self, "replay_disposition", replay_disposition)
@@ -883,6 +885,11 @@ class BatchSuccess:
     @property
     def result(self) -> JsonValue:
         return _thaw_json(self._result)
+
+    @property
+    def decoded_rows(self) -> int:
+        """Top-level decoded row weight retained by this command outcome."""
+        return self._decoded_rows
 
 
 @dataclass(frozen=True, slots=True)
