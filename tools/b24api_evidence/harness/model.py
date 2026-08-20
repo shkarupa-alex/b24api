@@ -58,6 +58,8 @@ class ModelRun:
     identities: tuple[int, ...]
     expected_hash: str
     actual_hash: str
+    pre_hash: str
+    post_hash: str
     requests: int
     logical_pages: int
     operating_seconds: float
@@ -195,7 +197,9 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
     report = stream.report
     identities = tuple(int(row["ID"]) for row in rows)
     actual_hash = content_sha256(list(identities))
-    snapshot_state = "changed" if case.mutation else "verified"
+    pre_hash = case.expected_hash
+    post_hash = content_sha256([*case.identities, max(case.identities, default=0) + 1]) if case.mutation else pre_hash
+    snapshot_state = "changed" if pre_hash != post_hash else "verified"
     outcome = "INCONCLUSIVE" if case.mutation else "PASS"
     return ModelRun(
         case_id=case.case_id,
@@ -203,6 +207,8 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
         identities=identities,
         expected_hash=case.expected_hash,
         actual_hash=actual_hash,
+        pre_hash=pre_hash,
+        post_hash=post_hash,
         requests=report.physical_requests,
         logical_pages=report.logical_pages,
         operating_seconds=portal.operating_seconds,

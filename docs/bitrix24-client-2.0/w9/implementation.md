@@ -18,7 +18,7 @@ includes only `b24api*`. The normative entry point remains
 | Correctness metric algebra. | `duplicates == raw_rows - unique_rows`; PASS also requires zero shortfall, overfetch, and reference failures plus oracle assurance. |
 | Draft thresholds are non-normative. | Draft plans require `thresholds_normative: false`; admission-ready plans require preregistered drift and the 15% / 1.05 / 1.10 blocking gates with at least two distinct plans. |
 | PHP-aware probe shape. | `result_error` must be present and is recorded as `empty_array` or `associative_object`; missing/non-empty arrays/other shapes refuse. Exact success is `dependent_ids == [who_id]`. |
-| Strong fingerprint key. | The only accepted format is 43-character unpadded base64url decoding to exactly 32 bytes. It is validated before the webhook environment variable is read. |
+| Strong fingerprint key. | The only accepted format is 43-character unpadded base64url decoding to exactly 32 bytes, with minimum byte diversity and Shannon entropy. It is validated before the webhook environment variable is read. |
 
 ## Artifact and recovery guarantees
 
@@ -31,6 +31,8 @@ Normal artifacts use file and directory `fsync` plus same-directory atomic
 replace. Manifest JSONL appends one canonical record at a time with contiguous
 sequence, genesis iff sequence zero, immutable run/lineage/plan/portal/candidate
 fields, previous-record SHA-256, and current-record SHA-256.
+An adjacent exclusive lock covers chain reload, validation, append, and fsync,
+so a stale concurrent writer cannot append a second genesis or sequence.
 
 Resume validates the complete chain and exact run, lineage, plan content,
 portal fingerprint, candidate SHA, and namespace. An ambiguous create never
@@ -41,7 +43,9 @@ an orphan and is never deleted.
 
 Lost-manifest recovery derives the finite expected marker set from the reviewed
 plan. The first invocation writes only a preview. A second explicit
-`--confirm-recovery` writes a candidate manifest; recovery itself never deletes.
+`--confirm-recovery` must bind the exact preview file SHA-256 and writes a
+candidate manifest only when a fresh exact-marker scan has the same candidate
+set; recovery itself never deletes.
 
 ## Offline evidence and live boundary
 
@@ -49,7 +53,8 @@ The deterministic portal drives the production executor and traversal engine
 over empty, 1, 19, 500, dense/sparse/clustered/skewed/deleted 10,000-row, and
 persistent-mutation states with offset and keyset plans. The sparse case has
 10,000 matches over more than 100,000 base identities. Mutation produces
-`INCONCLUSIVE` after three attempts.
+distinct independent pre/post hashes and `INCONCLUSIVE` after three attempts;
+every stable model oracle has equal hashes and PASS.
 
 Ordinary pytest has no path that supplies both live/write flags. `seed` and
 `cleanup` require both flags, a plan with explicit human approval, exact

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 import base64
+import fcntl
 import hashlib
 import hmac
 import json
@@ -12,6 +13,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,6 +39,8 @@ FINGERPRINT_KEY_BYTES: Final = 32
 WEBHOOK_PATH_PARTS: Final = 3
 MINIMUM_WEBHOOK_TOKEN_LENGTH: Final = 6
 MINIMUM_COMPARED_PLANS: Final = 2
+MINIMUM_KEY_DISTINCT_BYTES: Final = 16
+MINIMUM_KEY_SHANNON_ENTROPY: Final = 3.5
 SCHEMA_DIR: Final = Path(__file__).resolve().parents[1] / "schemas"
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -136,9 +140,12 @@ def content_sha256(value: Any) -> str:
 def file_sha256(path: Path) -> str:
     """Hash a file without interpreting its contents."""
     digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
+    try:
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as error:
+        raise ContractError(f"cannot hash required file: {path.name}") from error
     return digest.hexdigest()
 
 
@@ -193,6 +200,10 @@ def parse_fingerprint_key(encoded: str) -> bytes:
         raise ContractError("invalid BITRIX24_EVIDENCE_FINGERPRINT_KEY encoding") from error
     if len(key) != FINGERPRINT_KEY_BYTES:
         raise ContractError("BITRIX24_EVIDENCE_FINGERPRINT_KEY must decode to exactly 32 bytes")
+    counts = Counter(key)
+    entropy = -sum((count / len(key)) * math.log2(count / len(key)) for count in counts.values())
+    if len(counts) < MINIMUM_KEY_DISTINCT_BYTES or entropy < MINIMUM_KEY_SHANNON_ENTROPY:
+        raise ContractError("BITRIX24_EVIDENCE_FINGERPRINT_KEY does not satisfy the random-key strength check")
     return key
 
 
@@ -200,10 +211,17 @@ def portal_identity(webhook_url: str, *, role: str, fingerprint_key: str) -> Por
     """Validate a webhook and derive a non-reversible host/role/principal fingerprint."""
     key = parse_fingerprint_key(fingerprint_key)
     parts = urlsplit(webhook_url)
+    try:
+        port = parts.port
+    except ValueError as error:
+        raise ContractError("live webhook has an invalid port") from error
     path_parts = [part for part in parts.path.split("/") if part]
     if (
         parts.scheme != "https"
         or parts.hostname is None
+        or parts.username is not None
+        or parts.password is not None
+        or port not in {None, 443}
         or len(path_parts) != WEBHOOK_PATH_PARTS
         or path_parts[0] != "rest"
     ):
@@ -332,8 +350,22 @@ def _validate_cell(cell: Mapping[str, Any], *, index: int) -> None:
     if max(target, base) > REVIEWED_MAX_ENTITIES_PER_CELL:
         raise ContractError(f"cells[{index}] exceeds reviewed hard scale ceiling")
     expected = {
-        "tasks-task-v1": ("task", "tasks.task.add", "tasks.task.get", "tasks.task.delete", "TITLE"),
-        "crm-deal-v1": ("crm_deal", "crm.deal.add", "crm.deal.get", "crm.deal.delete", "TITLE"),
+        "tasks-task-v1": (
+            "task",
+            "tasks.task.add",
+            "tasks.task.get",
+            "tasks.task.delete",
+            "TITLE",
+            frozenset({"task"}),
+        ),
+        "crm-deal-v1": (
+            "crm_deal",
+            "crm.deal.add",
+            "crm.deal.get",
+            "crm.deal.delete",
+            "TITLE",
+            frozenset({"crm"}),
+        ),
     }
     profile_id = cell.get("disposable_profile_id")
     actual = (
@@ -342,6 +374,7 @@ def _validate_cell(cell: Mapping[str, Any], *, index: int) -> None:
         cell.get("read_method"),
         cell.get("delete_method"),
         cell.get("marker_field"),
+        frozenset(cell.get("required_scopes", [])),
     )
     if profile_id not in expected or actual != expected[profile_id]:
         raise ContractError(f"cells[{index}] does not exactly match a reviewed disposable profile")
@@ -483,20 +516,27 @@ def load_manifest(path: Path, *, expected: ManifestLineage | None = None) -> lis
 
 def append_manifest_record(path: Path, record: Mapping[str, Any]) -> None:
     """Append one validated record with one O_APPEND write and fsync."""
-    previous_records = load_manifest(path) if path.exists() else []
-    previous = previous_records[-1] if previous_records else None
-    validate_manifest_record(record, previous=previous)
-    payload = canonical_json(record) + b"\n"
-    scan_bytes_for_secrets(payload, source=str(path))
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    lock_path = path.with_suffix(f"{path.suffix}.lock")
+    lock_descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
-        written = os.write(descriptor, payload)
-        if written != len(payload):
-            raise OSError("short manifest append")
-        os.fsync(descriptor)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        previous_records = load_manifest(path) if path.exists() else []
+        previous = previous_records[-1] if previous_records else None
+        validate_manifest_record(record, previous=previous)
+        payload = canonical_json(record) + b"\n"
+        scan_bytes_for_secrets(payload, source=str(path))
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            written = os.write(descriptor, payload)
+            if written != len(payload):
+                raise OSError("short manifest append")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
     finally:
-        os.close(descriptor)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
 
 
 def build_manifest_record(base: Mapping[str, Any], *, previous: Mapping[str, Any] | None = None) -> dict[str, Any]:

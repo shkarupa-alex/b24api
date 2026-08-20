@@ -18,7 +18,9 @@ webhook. `seed` and `cleanup` refuse unless both `--live` and `--allow-writes`
 are present and `--plan` names a human-approved `approved_for_seed` plan.
 `benchmark` is always read-only. Recovery is a two-step read-only exact-marker
 scan: the first run writes a preview; only a second run with
-`--confirm-recovery` writes a candidate manifest. Recovery never deletes.
+`--confirm-recovery --recovery-preview-sha256 <exact-file-hash>` writes a
+candidate manifest, and only if a fresh exact-marker scan matches that reviewed
+preview byte-for-byte. Recovery never deletes.
 
 ## Credential boundary
 
@@ -28,7 +30,8 @@ The webhook is read only by `harness/live.py`, from
 encoding of exactly 32 random bytes. Evidence stores only the host, role,
 portal build, scope hash, key-format assertion, and HMAC-SHA256 over the
 canonical `(host, role, principal_id)` tuple. The principal ID and key are not
-persisted.
+persisted. Low-diversity or low-entropy 32-byte values are rejected rather than
+passing on length alone.
 
 The reviewed disposable entity set is pinned by both
 `w0-disposable-entities-v1` and SHA-256
@@ -44,7 +47,9 @@ Dataset plans and evidence documents are strict Draft 2020-12 JSON Schema
 objects plus semantic validation. Non-finite numbers, including `1e400`, are
 rejected. Manifest records are append-only JSON Lines with contiguous sequence,
 genesis iff `sequence == 0`, immutable lineage, previous-record links, and a
-canonical SHA-256 record hash. Each marker is exactly
+canonical SHA-256 record hash. An adjacent exclusive lock serializes chain
+reload, validation, append, and `fsync`, so stale writers cannot add a second
+genesis or sequence. Each marker is exactly
 `<namespace>:<correlation-key>` and its hash is SHA-256 of UTF-8 marker bytes.
 
 Non-manifest artifacts use same-directory temporary files, file `fsync`, atomic
@@ -57,7 +62,8 @@ The deterministic model matrix exercises the production executor and traversal
 stack over empty, 1, 19, 500, dense 10,000, sparse 10,000 below 10% selectivity,
 clustered, skewed, deleted-ID, and persistent-mutation cases with both offset
 and keyset plans. Persistent mutation is expected to be `INCONCLUSIVE` after
-three attempts. Draft timing thresholds are explicitly non-normative; live
+three attempts and records distinct independent pre/post hashes. Draft timing
+thresholds are explicitly non-normative; live
 admission must use preregistered interleaved controls and derived drift ratios.
 
 No live command is part of ordinary pytest, and the wheel-content regression

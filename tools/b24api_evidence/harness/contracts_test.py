@@ -1,6 +1,7 @@
 """Regression gates for W9 evidence contracts and offline execution."""
 
 from __future__ import annotations
+import base64
 import copy
 import json
 import os
@@ -58,7 +59,7 @@ FINGERPRINT_KEY_BYTES = 32
 LARGE_CASE_ROWS = 10_000
 SPARSE_BASE_MINIMUM = 100_000
 EXPECTED_MUTATION_RETRIES = 3
-EXPECTED_SCHEMA_COUNT = 5
+EXPECTED_SCHEMA_COUNT = 6
 LEAK_FIXTURE = b"https://example.invalid/rest/1/realisticToken123/"
 
 
@@ -248,7 +249,7 @@ def test_strict_json_rejects_every_nonfinite_form(literal: str) -> None:
 
 
 def test_fingerprint_requires_exact_random_key_shape_and_hides_principal() -> None:
-    key = "A" * 43
+    key = base64.urlsafe_b64encode(bytes(range(FINGERPRINT_KEY_BYTES))).decode().rstrip("=")
     assert len(parse_fingerprint_key(key)) == FINGERPRINT_KEY_BYTES
     identity = portal_identity(
         "https://portal.invalid/rest/13/not-a-real-token/",
@@ -268,6 +269,14 @@ def test_fingerprint_requires_exact_random_key_shape_and_hides_principal() -> No
     assert "13" not in identity.fingerprint
     with pytest.raises(ContractError, match="43-character"):
         parse_fingerprint_key("A")
+    with pytest.raises(ContractError, match="random-key strength"):
+        parse_fingerprint_key("A" * 43)
+    with pytest.raises(ContractError, match="HTTPS"):
+        portal_identity(
+            "https://user:password@portal.invalid/rest/13/not-a-real-token/",
+            role="employee_full",
+            fingerprint_key=key,
+        )
 
 
 def test_reviewed_profile_set_is_anchored_by_id_and_immutable_hash(tmp_path: Path) -> None:
@@ -286,6 +295,7 @@ def test_reviewed_profile_set_is_anchored_by_id_and_immutable_hash(tmp_path: Pat
         lambda plan: plan["cells"][0].update(target_count=501),
         lambda plan: plan["authorization"].update(max_entities_per_cell=10**9),
         lambda plan: plan["cells"][0].update(create_method="user.add"),
+        lambda plan: plan["cells"][0].update(required_scopes=["crm"]),
         lambda plan: plan["estimated"].update(requests=0),
         lambda plan: plan["estimated"].update(batch_commands=1),
         lambda plan: plan["estimated"].update(duration_seconds=0),
@@ -331,12 +341,32 @@ def test_manifest_hash_chain_marker_and_resume_lineage(tmp_path: Path) -> None:
         )
 
 
+def test_manifest_rejects_a_stale_concurrent_genesis_writer(tmp_path: Path) -> None:
+    plan = _plan()
+    first = build_manifest_record(_manifest_base(plan))
+    stale_marker = marker_value(plan["namespace"], "4" * 64)
+    stale = build_manifest_record(
+        {
+            **_manifest_base(plan),
+            "correlation_key": "4" * 64,
+            "marker_value": stale_marker,
+            "marker_hash": marker_sha256(stale_marker),
+        },
+    )
+    path = tmp_path / "manifest.jsonl"
+    append_manifest_record(path, first)
+    with pytest.raises(ContractError, match="sequence"):
+        append_manifest_record(path, stale)
+    assert load_manifest(path) == [first]
+
+
 @pytest.mark.parametrize("requirement", ["frozen_manifest", "independent_pre_post_oracle"])
 def test_oracle_snapshot_pass_requires_equal_nonnull_hashes(requirement: str) -> None:
     oracle = {
         "schema_version": SCHEMA_VERSION,
         "run_id": RUN_ID,
         "lineage_id": LINEAGE_ID,
+        "case_id": "MODEL-offset",
         "candidate_sha": SHA,
         "dataset_plan_content_hash": SHA256,
         "manifest_content_hash": SHA256,
@@ -482,6 +512,8 @@ def test_exact_model_matrix_covers_all_scales_and_expected_mutation() -> None:
     assert len(runs) == len(cases) * 2
     assert all(run.actual_hash == run.expected_hash for run in runs)
     assert {run.outcome for run in runs if run.case_id == "mutation"} == {"INCONCLUSIVE"}
+    assert all(run.pre_hash != run.post_hash for run in runs if run.case_id == "mutation")
+    assert all(run.pre_hash == run.post_hash for run in runs if run.case_id != "mutation")
     assert all(run.mutation_retries == EXPECTED_MUTATION_RETRIES for run in runs if run.case_id == "mutation")
 
 

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b24api.local/schemas/evidence/recovery-preview-2.0.json",
+  "title": "Read-only exact-marker recovery preview",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "run_id", "lineage_id", "dataset_plan_content_hash",
+    "candidate_sha", "portal_fingerprint", "namespace", "exact_marker_candidates",
+    "confirmation_required"
+  ],
+  "properties": {
+    "schema_version": {"const": "2.0"},
+    "run_id": {"$ref": "#/$defs/uuid"},
+    "lineage_id": {"$ref": "#/$defs/uuid"},
+    "dataset_plan_content_hash": {"$ref": "#/$defs/sha256"},
+    "candidate_sha": {"$ref": "#/$defs/sha"},
+    "portal_fingerprint": {"$ref": "#/$defs/sha256"},
+    "namespace": {"type": "string", "pattern": "^b24api-evidence-[0-9a-f-]{36}$"},
+    "exact_marker_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cell_id", "correlation_key", "entity_id"],
+        "properties": {
+          "cell_id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "maxLength": 100},
+          "correlation_key": {"$ref": "#/$defs/sha256"},
+          "entity_id": {"type": "string", "minLength": 1, "maxLength": 100}
+        }
+      }
+    },
+    "confirmation_required": {"const": true}
+  },
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "uuid": {"type": "string", "pattern": "^[0-9a-f-]{36}$"}
+  }
+}

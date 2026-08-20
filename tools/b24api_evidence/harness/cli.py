@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import httpx
 
+from b24api.redaction import DEFAULT_REDACTOR
+
 from .contracts import (
     FINGERPRINT_ALGORITHM,
     FINGERPRINT_KEY_FORMAT,
@@ -33,6 +35,7 @@ from .contracts import (
     build_manifest_record,
     content_sha256,
     derive_drift_controls,
+    file_sha256,
     git_sha,
     load_manifest,
     manifest_content_hash,
@@ -47,6 +50,7 @@ from .contracts import (
     validate_evidence_artifact,
     validate_oracle_record,
     validate_reviewed_profile_set,
+    validate_schema,
 )
 from .live import ADAPTERS, LiveCorrectnessError, LivePortal, LiveUnavailableError
 from .model import run_exact_matrix_sync
@@ -100,6 +104,7 @@ def _parser() -> argparse.ArgumentParser:
         subparser.add_argument("--entity-profile", choices=tuple(ADAPTERS), default="tasks-task-v1")
         subparser.add_argument("--count", type=int, default=5)
         subparser.add_argument("--confirm-recovery", action="store_true")
+        subparser.add_argument("--recovery-preview-sha256")
     return parser
 
 
@@ -493,9 +498,32 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
             "benchmark_plan_content_hash": content_sha256(benchmark_plan),
             "controls": controls,
             "case_id": "MODEL-MATRIX",
+            "evidence_refs": [f"model-oracles/{run.case_id}-{run.plan}.json" for run in runs],
         },
     )
     artifact_dir = args.artifact_dir.resolve()
+    oracle_dir = artifact_dir / "model-oracles"
+    for run in runs:
+        oracle = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": plan["run_id"],
+            "lineage_id": plan["lineage_id"],
+            "case_id": f"{run.case_id}-{run.plan}",
+            "candidate_sha": plan["candidate_sha"],
+            "dataset_plan_content_hash": content_sha256(plan),
+            "manifest_content_hash": run.expected_hash,
+            "qualification": "independent_cross_method",
+            "snapshot_requirement": "independent_pre_post_oracle",
+            "snapshot_state": run.snapshot_state,
+            "pre_hash": run.pre_hash,
+            "post_hash": run.post_hash,
+            "mutation_retries": run.mutation_retries,
+            "raw_count": len(run.identities),
+            "unique_count": len(set(run.identities)),
+            "outcome": run.outcome,
+        }
+        validate_oracle_record(oracle)
+        atomic_write_json(oracle_dir / f"{run.case_id}-{run.plan}.json", oracle)
     atomic_write_json(
         artifact_dir / "model-matrix.json",
         {"schema_version": SCHEMA_VERSION, "runs": [asdict(run) for run in runs]},
@@ -640,7 +668,7 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: PLR0915
     return ExitCode.COMPLETED
 
 
-def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901
+def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
     if not args.live:
         raise ContractError("recover-manifest requires --live")
     if args.allow_writes:
@@ -648,9 +676,34 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901
     plan = _load_plan(args)
     if args.run_id is not None and args.run_id != plan["run_id"]:
         raise ContractError("recovery run_id does not match the reviewed plan")
+    artifact_dir = args.artifact_dir.resolve()
+    preview_path = artifact_dir / "recovery-preview.json"
+    prior_preview: dict[str, Any] | None = None
+    if args.confirm_recovery:
+        if args.recovery_preview_sha256 is None or not preview_path.exists():
+            raise ContractError("confirmed recovery requires the prior preview and --recovery-preview-sha256")
+        if file_sha256(preview_path) != args.recovery_preview_sha256:
+            raise ContractError("recovery preview content hash does not match the explicit confirmation")
+        prior_preview = read_json_object(preview_path)
+        validate_schema(prior_preview, "recovery-preview")
+        for field in (
+            "run_id",
+            "lineage_id",
+            "dataset_plan_content_hash",
+            "candidate_sha",
+            "portal_fingerprint",
+            "namespace",
+        ):
+            expected = content_sha256(plan) if field == "dataset_plan_content_hash" else plan.get(field)
+            if field == "portal_fingerprint":
+                expected = plan["portal"]["fingerprint"]
+            if prior_preview.get(field) != expected:
+                raise ContractError(f"recovery preview {field} does not match the reviewed plan")
     candidates: list[dict[str, Any]] = []
     with LivePortal(role=args.credential_role) as portal:
         _require_portal_match(plan, portal)
+        required_scopes = {scope for cell in plan["cells"] for scope in cell.get("required_scopes", [])}
+        portal.preflight(required_scopes=required_scopes)
         for cell in plan["cells"]:
             adapter = ADAPTERS[str(cell["disposable_profile_id"])]
             for index in range(int(cell["target_count"])):
@@ -670,14 +723,25 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901
         "portal_fingerprint": plan["portal"]["fingerprint"],
         "namespace": plan["namespace"],
         "exact_marker_candidates": candidates,
-        "confirmation_required": not args.confirm_recovery,
+        "confirmation_required": True,
     }
-    artifact_dir = args.artifact_dir.resolve()
-    atomic_write_json(artifact_dir / "recovery-preview.json", preview)
+    validate_schema(preview, "recovery-preview")
     if not args.confirm_recovery:
+        atomic_write_json(preview_path, preview)
+        preview_hash = file_sha256(preview_path)
         _safe_message(
-            f"recovery preview completed; rerun with --confirm-recovery: {artifact_dir / 'recovery-preview.json'}",
+            "recovery preview completed; rerun with --confirm-recovery "
+            f"--recovery-preview-sha256 {preview_hash}: {preview_path}",
         )
+        return ExitCode.INCOMPLETE
+    if prior_preview is None or prior_preview["exact_marker_candidates"] != candidates:
+        atomic_write_json(preview_path, preview)
+        _safe_message(
+            f"recovery candidates changed; review the new preview SHA-256 {file_sha256(preview_path)}",
+        )
+        return ExitCode.INCOMPLETE
+    if not candidates:
+        _safe_message("recovery found no exact-marker entities; no candidate manifest was written")
         return ExitCode.INCOMPLETE
     manifest_path = _manifest_path(args)
     if manifest_path.exists():
@@ -699,6 +763,21 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901
         )
         append_manifest_record(manifest_path, record)
         previous = record
+    artifact = _operation_artifact(
+        command="recover-manifest",
+        dataset_plan=plan,
+        manifest_hash=manifest_content_hash(manifest_path),
+        metrics={
+            "kind": "operation",
+            "http_attempts": sum(int(cell["target_count"]) for cell in plan["cells"]) + 2,
+            "wall_seconds": 0.0,
+            "records": len(candidates),
+        },
+        outcome="INCONCLUSIVE",
+        terminal_state="incomplete",
+    )
+    _write_validated_artifact(artifact_dir / "recovery-evidence.json", artifact)
+    _scan_bundle(artifact_dir)
     _safe_message(f"confirmed candidate manifest written: {manifest_path}")
     return ExitCode.COMPLETED
 
@@ -985,11 +1064,12 @@ def _scan_bundle(artifact_dir: Path) -> None:
 
 
 def _safe_message(message: str) -> None:
-    sys.stdout.write(f"{message}\n")
+    sys.stdout.write(f"{DEFAULT_REDACTOR.redact_text(message)}\n")
 
 
 def _safe_error(error: BaseException) -> None:
-    sys.stderr.write(f"error: {type(error).__name__}: {error}\n")
+    rendered = DEFAULT_REDACTOR.redact_text(str(error))
+    sys.stderr.write(f"error: {type(error).__name__}: {rendered}\n")
 
 
 def _abort(message: str) -> NoReturn:

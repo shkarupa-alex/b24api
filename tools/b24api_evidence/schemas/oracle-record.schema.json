@@ -3,9 +3,10 @@
   "$id": "https://b24api.local/schemas/evidence/oracle-record-2.0.json",
   "title": "Qualified evidence oracle",
   "type": "object", "additionalProperties": false,
-  "required": ["schema_version", "run_id", "lineage_id", "candidate_sha", "dataset_plan_content_hash", "manifest_content_hash", "qualification", "snapshot_requirement", "snapshot_state", "pre_hash", "post_hash", "mutation_retries", "raw_count", "unique_count", "outcome"],
+  "required": ["schema_version", "run_id", "lineage_id", "case_id", "candidate_sha", "dataset_plan_content_hash", "manifest_content_hash", "qualification", "snapshot_requirement", "snapshot_state", "pre_hash", "post_hash", "mutation_retries", "raw_count", "unique_count", "outcome"],
   "properties": {
     "schema_version": {"const": "2.0"}, "run_id": {"$ref": "#/$defs/uuid"}, "lineage_id": {"$ref": "#/$defs/uuid"},
+    "case_id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "maxLength": 150},
     "candidate_sha": {"$ref": "#/$defs/sha"}, "dataset_plan_content_hash": {"$ref": "#/$defs/sha256"}, "manifest_content_hash": {"$ref": "#/$defs/sha256"},
     "qualification": {"enum": ["immutable_manifest", "bounded_point_read", "independent_cross_method", "independent_serial_reference", "diagnostic_shared_assumption"]},
     "snapshot_requirement": {"enum": ["traversal_only", "frozen_manifest", "independent_pre_post_oracle"]},
