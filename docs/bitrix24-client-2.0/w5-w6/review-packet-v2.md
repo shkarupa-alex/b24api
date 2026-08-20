@@ -1,3 +1,6 @@
+> **Superseded.** Human review rejected code subject `2d4ea6c...` and returned
+> five packet findings. Use `review-packet-v3.md`.
+
 # W5/W6 review packet v2 — bounded traversal foundation
 
 ## Decision requested
