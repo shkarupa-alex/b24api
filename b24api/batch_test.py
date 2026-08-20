@@ -149,6 +149,30 @@ async def test_async_unlimited_input_pulls_only_one_bounded_chunk_before_first_y
 
 
 @pytest.mark.asyncio
+async def test_batch_outcomes_obey_decoded_row_buffer_ceiling() -> None:
+    transport = CallbackTransport(_echo_batch)
+    stream = BatchExecutor(Executor(transport)).batch_outcomes(
+        [Request("profile") for _index in range(MIXED_COMMAND_COUNT)],
+        batch_size=MIXED_COMMAND_COUNT,
+        policy=ExecutionPolicy(max_buffered_rows=1),
+    )
+
+    first = await anext(stream)
+    snapshot = await stream._context.snapshot()  # noqa: SLF001 - assert live buffer accounting
+
+    assert isinstance(first, BatchSuccess)
+    assert snapshot.counters.buffered_rows == 1
+    assert snapshot.counters.buffered_rows_high_water == 1
+    assert len(transport.requests) == 1
+
+    remaining = [item async for item in stream]
+    assert len(remaining) == MIXED_COMMAND_COUNT - 1
+    assert len(transport.requests) == MIXED_COMMAND_COUNT
+    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.buffered_rows_high_water == 1
+
+
+@pytest.mark.asyncio
 async def test_context_entry_starts_batch_execution_without_counting_prefetch_as_emitted() -> None:
     transport = CallbackTransport(_echo_batch)
     stream = BatchExecutor(Executor(transport)).batch_outcomes([Request("profile")], batch_size=1)

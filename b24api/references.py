@@ -85,6 +85,7 @@ class _Reservation:
 class _PageEvent:
     work: _Work
     items: tuple[JsonValue, ...]
+    item_weights: tuple[int, ...]
     unique_mask: tuple[bool, ...]
     violations: tuple[Violation, ...]
     reservation: _Reservation
@@ -444,7 +445,12 @@ class ReferenceScheduler:
         self.tolerant = tolerant
         self.whole_result = whole_result
         self.context = executor.context(policy)
-        self.page_cap = _page_cap(plan, policy, whole_result=whole_result)
+        self.page_cap = _page_cap(
+            plan,
+            dispatch,
+            policy,
+            whole_result=whole_result,
+        )
         self.active_limit = _active_limit(output_order, policy, self.page_cap)
         self.dispatcher: _PageDispatcher
         if isinstance(dispatch, DirectDispatch):
@@ -458,6 +464,11 @@ class ReferenceScheduler:
         self._source_controller: AsyncIteratorController[ReferenceRequest] | None = None
 
     async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:
+        PaginationDriver.validate_contract(
+            self.plan,
+            self.identity,
+            self.context.policy,
+        )
         await self.context.start()
         iterator = AsyncIteratorController(
             _iterate_references(source),
@@ -600,7 +611,7 @@ class ReferenceScheduler:
             async for page in driver.pages():
                 if reservation is None:
                     raise RuntimeError("page completed without a buffer reservation")  # noqa: TRY301
-                await self.buffer.accept(reservation, len(page.items))
+                await self.buffer.accept(reservation, page.retained_rows)
                 acknowledged = asyncio.get_running_loop().create_future()
                 page_violations = tuple(driver.violations[violation_offset:])
                 violation_offset = len(driver.violations)
@@ -608,6 +619,7 @@ class ReferenceScheduler:
                     _PageEvent(
                         work,
                         page.items,
+                        page.item_weights,
                         driver.last_page_unique_mask,
                         page_violations,
                         reservation,
@@ -708,11 +720,16 @@ class ReferenceScheduler:
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
         if isinstance(event, _PageEvent):
             try:
-                for item, is_unique in zip(event.items, event.unique_mask, strict=True):
+                for item, weight, is_unique in zip(
+                    event.items,
+                    event.item_weights,
+                    event.unique_mask,
+                    strict=True,
+                ):
                     outcome = ReferenceItem(event.work.reference.reference_key, item)
                     self._delivery_uniqueness[id(outcome)] = (outcome, is_unique)
                     yield outcome
-                    await self.buffer.release(event.reservation, 1)
+                    await self.buffer.release(event.reservation, weight)
             finally:
                 if not event.acknowledged.done():
                     event.acknowledged.set_result(None)
@@ -1105,9 +1122,23 @@ async def _finish_task(tasks: dict[int, asyncio.Task[None]], index: int) -> None
     await task
 
 
-def _page_cap(plan: ListPlan, policy: ExecutionPolicy, *, whole_result: bool) -> int:
+def _page_cap(
+    plan: ListPlan,
+    dispatch: DispatchPlan,
+    policy: ExecutionPolicy,
+    *,
+    whole_result: bool,
+) -> int:
     if whole_result:
-        return 1
+        if isinstance(dispatch, DirectDispatch):
+            concurrent_results = min(
+                dispatch.concurrency,
+                policy.max_direct_concurrency,
+                policy.max_active_references,
+            )
+        else:
+            concurrent_results = min(dispatch.batch_size, policy.max_active_references)
+        return max(1, policy.max_buffered_rows // concurrent_results)
     requested = (
         plan.requested_page_size
         if isinstance(plan, OffsetSequentialPlan | CountedOffsetPlan | KeysetPlan | ItemCursorPlan)

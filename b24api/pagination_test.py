@@ -526,6 +526,25 @@ async def test_empty_boundary_policy_requires_the_empty_offset_confirmation() ->
 
 
 @pytest.mark.asyncio
+async def test_advisory_total_mismatch_is_reported_without_blocking_completion() -> None:
+    transport = FunctionTransport(
+        lambda _request: {"result": [{"ID": 1}, {"ID": 2}], "total": 99},
+    )
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=SingleResponsePlan(reject_positive_total_over_result=False),
+        policy=ExecutionPolicy(
+            consistency=ConsistencyPolicy(total_semantics=TotalSemantics.ADVISORY),
+        ),
+    )
+
+    assert await _collect(stream) == [{"ID": 1}, {"ID": 2}]
+    assert stream.report.state is TerminalState.COMPLETED
+    assert [violation.code for violation in stream.report.violations] == ["advisory_total_mismatch"]
+
+
+@pytest.mark.asyncio
 async def test_conflicting_policy_and_plan_semantics_refuse_before_io() -> None:
     transport = FunctionTransport(lambda _request: {"result": []})
     plan = CountedOffsetPlan(order_semantics=OrderSemantics.ASCENDING)

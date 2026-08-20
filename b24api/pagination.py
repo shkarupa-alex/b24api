@@ -172,6 +172,19 @@ class _MonotonicIdentityStore:
 class _Page:
     items: tuple[JsonValue, ...]
     response: Response
+    item_weights: tuple[int, ...]
+
+    @property
+    def retained_rows(self) -> int:
+        return sum(self.item_weights)
+
+
+@dataclass(frozen=True, slots=True)
+class _EffectiveConsistency:
+    duplicate_policy: DuplicatePolicy
+    total_semantics: TotalSemantics
+    order_direction: str | None
+    confirmation_policy: ConfirmationPolicy
 
 
 class PaginationDriver:
@@ -211,6 +224,9 @@ class PaginationDriver:
         self._order_direction: str | None = None
         self._confirmation_policy = ConfirmationPolicy.NONE
         self._expected_total: int | None = None
+        self._advisory_totals: set[int] = set()
+        self._advisory_total_drift_reported = False
+        self._advisory_total_mismatch_reported = False
 
     async def pages(self) -> AsyncGenerator[_Page]:  # noqa: C901
         self._validate_capabilities()
@@ -263,7 +279,8 @@ class PaginationDriver:
         self._validate_page(items, response=response, qualified_count=qualified_count)
         self._validate_terminal_total()
         self.terminal_reason = "single response complete"
-        yield _Page(tuple(items), response)
+        item_weights = (qualified_count,) if self._single_result_as_item else (1,) * len(items)
+        yield _Page(tuple(items), response, item_weights)
 
     async def _offset(self, plan: OffsetSequentialPlan) -> AsyncGenerator[_Page]:
         offset = 0
@@ -295,7 +312,7 @@ class PaginationDriver:
             if terminal is not None:
                 self._validate_terminal_total()
             if items:
-                yield _Page(tuple(items), response)
+                yield _Page(tuple(items), response, (1,) * len(items))
             if terminal is not None:
                 self.terminal_reason = terminal
                 return
@@ -326,7 +343,7 @@ class PaginationDriver:
             items = _response_items(response, self.selector)
             self._validate_page(items, response=response)
             if items:
-                yield _Page(tuple(items), response)
+                yield _Page(tuple(items), response, (1,) * len(items))
             if self._expected_total is not None and self.validated_rows == self._expected_total:
                 self._validate_terminal_total()
                 self.terminal_reason = "qualified total reached"
@@ -371,7 +388,7 @@ class PaginationDriver:
             if terminal is not None:
                 self._validate_terminal_total()
             if items:
-                yield _Page(tuple(items), response)
+                yield _Page(tuple(items), response, (1,) * len(items))
             if terminal is not None:
                 self.terminal_reason = terminal
                 return
@@ -418,7 +435,7 @@ class PaginationDriver:
             if terminal is not None:
                 self._validate_terminal_total()
             if items:
-                yield _Page(tuple(items), response)
+                yield _Page(tuple(items), response, (1,) * len(items))
             if terminal is not None:
                 self.terminal_reason = terminal
                 return
@@ -451,51 +468,73 @@ class PaginationDriver:
             raise
         return response
 
+    @staticmethod
+    def validate_contract(
+        plan: ListPlan,
+        identity: IdentitySpec | None,
+        policy: ExecutionPolicy,
+    ) -> _EffectiveConsistency:
+        """Validate request-independent plan/policy capabilities before input or I/O."""
+        consistency = policy.consistency
+        if (
+            plan.identity_requirement is IdentityRequirement.COMPOSITE
+            or consistency.identity_requirement is IdentityRequirement.COMPOSITE
+        ):
+            raise CapabilityError("composite identity requires a separately reviewed identity contract")
+        if (
+            plan.identity_requirement is IdentityRequirement.REQUIRED
+            or consistency.identity_requirement is IdentityRequirement.REQUIRED
+        ) and identity is None:
+            raise CapabilityError("plan requires IdentitySpec")
+        duplicate_policy = _effective_duplicate_policy(
+            plan.duplicate_policy,
+            consistency.duplicate_policy,
+        )
+        total_semantics = _effective_total_semantics(
+            plan.total_semantics,
+            consistency.total_semantics,
+        )
+        order_direction = _effective_order_direction(
+            plan.order_semantics,
+            consistency.order_semantics,
+        )
+        if order_direction is not None and identity is None:
+            raise CapabilityError("ordered traversal requires IdentitySpec")
+        _validate_confirmation_policy(
+            plan,
+            consistency.confirmation_policy,
+            total_semantics,
+        )
+        if isinstance(plan, CountedOffsetPlan) and plan.mode is CountedOffsetMode.PARALLEL_FIXED_STRIDE:
+            raise CapabilityError("parallel fixed-stride counted traversal requires separate reviewed authorization")
+        if isinstance(plan, PartitionedKeysetPlan):
+            raise CapabilityError("partitioned keyset requires separate reviewed authorization")
+        if isinstance(plan, KeysetPlan) and plan.terminal is KeysetTerminalRule.BOUNDARY_ID_SEEN:
+            raise CapabilityError("boundary-id keyset requires an externally reviewed boundary contract")
+        if policy.identity_tracker is IdentityTracker.MONOTONIC and not isinstance(plan, KeysetPlan):
+            raise CapabilityError("monotonic identity tracking requires identity-ordered keyset traversal")
+        return _EffectiveConsistency(
+            duplicate_policy,
+            total_semantics,
+            order_direction,
+            consistency.confirmation_policy,
+        )
+
     def _require_identity(self, plan_name: str) -> IdentitySpec:
         if self.identity is None:
             raise CapabilityError(f"{plan_name} traversal requires IdentitySpec")
         return self.identity
 
     def _validate_capabilities(self) -> None:
-        consistency = self.context.policy.consistency
-        if (
-            self.plan.identity_requirement is IdentityRequirement.COMPOSITE
-            or consistency.identity_requirement is IdentityRequirement.COMPOSITE
-        ):
-            raise CapabilityError("composite identity requires a separately reviewed identity contract")
-        if (
-            self.plan.identity_requirement is IdentityRequirement.REQUIRED
-            or consistency.identity_requirement is IdentityRequirement.REQUIRED
-        ) and self.identity is None:
-            raise CapabilityError("plan requires IdentitySpec")
-        self._duplicate_policy = _effective_duplicate_policy(
-            self.plan.duplicate_policy,
-            consistency.duplicate_policy,
-        )
-        self._total_semantics = _effective_total_semantics(
-            self.plan.total_semantics,
-            consistency.total_semantics,
-        )
-        self._order_direction = _effective_order_direction(
-            self.plan.order_semantics,
-            consistency.order_semantics,
-        )
-        self._confirmation_policy = consistency.confirmation_policy
-        if self._order_direction is not None and self.identity is None:
-            raise CapabilityError("ordered traversal requires IdentitySpec")
-        _validate_confirmation_policy(
+        effective = self.validate_contract(
             self.plan,
-            consistency.confirmation_policy,
-            self._total_semantics,
+            self.identity,
+            self.context.policy,
         )
-        if isinstance(self.plan, CountedOffsetPlan) and self.plan.mode is CountedOffsetMode.PARALLEL_FIXED_STRIDE:
-            raise CapabilityError("parallel fixed-stride counted traversal requires separate reviewed authorization")
-        if isinstance(self.plan, PartitionedKeysetPlan):
-            raise CapabilityError("partitioned keyset requires separate reviewed authorization")
-        if isinstance(self.plan, KeysetPlan) and self.plan.terminal is KeysetTerminalRule.BOUNDARY_ID_SEEN:
-            raise CapabilityError("boundary-id keyset requires an externally reviewed boundary contract")
-        if self.context.policy.identity_tracker is IdentityTracker.MONOTONIC and not isinstance(self.plan, KeysetPlan):
-            raise CapabilityError("monotonic identity tracking requires identity-ordered keyset traversal")
+        self._duplicate_policy = effective.duplicate_policy
+        self._total_semantics = effective.total_semantics
+        self._order_direction = effective.order_direction
+        self._confirmation_policy = effective.confirmation_policy
         self._preflight_controls()
 
     def _preflight_controls(self) -> None:
@@ -599,6 +638,17 @@ class PaginationDriver:
                 self._expected_total = response.total
             elif response.total != self._expected_total:
                 raise PaginationError("traversal exact total drifted")
+        elif self._total_semantics is TotalSemantics.ADVISORY and response.total is not None and response.total >= 0:
+            self._advisory_totals.add(response.total)
+            if len(self._advisory_totals) > 1 and not self._advisory_total_drift_reported:
+                self.violations.append(
+                    Violation(
+                        severity=ViolationSeverity.WARNING,
+                        code="advisory_total_drift",
+                        message="advisory totals changed during traversal",
+                    ),
+                )
+                self._advisory_total_drift_reported = True
         elif self._total_semantics is TotalSemantics.GLOBAL and (response.total is None or response.total < 0):
             raise CapabilityError("global total semantics require a non-negative total")
         if accepted_count < 0:
@@ -609,6 +659,21 @@ class PaginationDriver:
             raise PaginationError("traversal exceeded its exact total")
 
     def _validate_terminal_total(self) -> None:
+        if self._total_semantics is TotalSemantics.ADVISORY:
+            if (
+                self._advisory_totals
+                and self.validated_rows not in self._advisory_totals
+                and not self._advisory_total_mismatch_reported
+            ):
+                self.violations.append(
+                    Violation(
+                        severity=ViolationSeverity.WARNING,
+                        code="advisory_total_mismatch",
+                        message="delivered rows differ from the observed advisory total",
+                    ),
+                )
+                self._advisory_total_mismatch_reported = True
+            return
         if self._total_semantics is not TotalSemantics.FILTERED_EXACT:
             return
         if self._expected_total is None:

@@ -10,13 +10,21 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from b24api.error import ApiResponseError, BudgetExceededError, FailurePhase, ProtocolError, TransportError
+from b24api.error import (
+    ApiResponseError,
+    BudgetExceededError,
+    CapabilityError,
+    FailurePhase,
+    ProtocolError,
+    TransportError,
+)
 from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.models import (
     ConsistencyPolicy,
     DuplicatePolicy,
     ExecutionPolicy,
     IdentityCoercion,
+    IdentityRequirement,
     IdentitySpec,
     ParameterPath,
     ReferenceFailure,
@@ -26,12 +34,16 @@ from b24api.models import (
     SnapshotRequirement,
     SnapshotState,
     TerminalState,
+    TotalSemantics,
     ViolationSeverity,
 )
 from b24api.plans import (
     BatchDispatch,
+    CountedOffsetMode,
     CountedOffsetPlan,
     DirectDispatch,
+    DispatchPlan,
+    ListPlan,
     OffsetContinuation,
     OffsetSequentialPlan,
     OffsetTerminalRule,
@@ -228,6 +240,81 @@ async def test_per_reference_pagination_is_sequential_while_references_are_concu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("plan", "policy"),
+    [
+        (
+            OffsetSequentialPlan(identity_requirement=IdentityRequirement.REQUIRED),
+            ExecutionPolicy(),
+        ),
+        (
+            OffsetSequentialPlan(),
+            ExecutionPolicy(
+                consistency=ConsistencyPolicy(identity_requirement=IdentityRequirement.REQUIRED),
+            ),
+        ),
+        (
+            CountedOffsetPlan(),
+            ExecutionPolicy(
+                consistency=ConsistencyPolicy(total_semantics=TotalSemantics.GLOBAL),
+            ),
+        ),
+        (
+            CountedOffsetPlan(
+                mode=CountedOffsetMode.PARALLEL_FIXED_STRIDE,
+                fixed_stride=1,
+            ),
+            ExecutionPolicy(),
+        ),
+    ],
+)
+async def test_invalid_reference_contract_refuses_even_empty_input(
+    plan: ListPlan,
+    policy: ExecutionPolicy,
+) -> None:
+    transport = AsyncFunctionTransport(lambda _request: {"result": []})
+    stream = iter_references(
+        Executor(transport),
+        [],
+        plan=plan,
+        dispatch=DirectDispatch(),
+        policy=policy,
+    )
+
+    with pytest.raises(CapabilityError) as captured:
+        await anext(stream)
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream.report.state is TerminalState.FAILED
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_reference_contract_refuses_before_blocking_source_pull() -> None:
+    pulled = asyncio.Event()
+
+    async def source() -> AsyncGenerator[ReferenceRequest]:
+        pulled.set()
+        await asyncio.Future[None]()
+        yield _reference("unreachable")
+
+    transport = AsyncFunctionTransport(lambda _request: {"result": []})
+    stream = iter_references(
+        Executor(transport),
+        source(),
+        plan=OffsetSequentialPlan(identity_requirement=IdentityRequirement.REQUIRED),
+        dispatch=DirectDispatch(),
+        policy=ExecutionPolicy(max_elapsed=0.03),
+    )
+
+    with pytest.raises(CapabilityError, match="IdentitySpec"):
+        await anext(stream)
+
+    assert not pulled.is_set()
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
 async def test_batch_dispatch_coalesces_pages_and_preserves_total_metadata() -> None:
     def handler(request: Request) -> object:
         assert request.method == "batch"
@@ -340,6 +427,85 @@ async def test_batch_fan_out_accepts_list_result_whose_total_matches_list_length
     assert isinstance(outcomes[0], ReferenceItem)
     assert outcomes[0].item == [{"ID": 1}, {"ID": 2}]
     assert stream.report.state is TerminalState.COMPLETED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch", [DirectDispatch(concurrency=1), BatchDispatch(batch_size=1)])
+async def test_fan_out_list_result_obeys_decoded_row_buffer(dispatch: DispatchPlan) -> None:
+    def handler(request: Request) -> object:
+        rows = [{"ID": 1}, {"ID": 2}, {"ID": 3}]
+        if request.method != "batch":
+            return {"result": rows, "total": len(rows)}
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": dict.fromkeys(commands, rows),
+                "result_error": [],
+                "result_total": dict.fromkeys(commands, len(rows)),
+            },
+        }
+
+    transport = AsyncFunctionTransport(handler)
+    stream = fan_out(
+        Executor(transport),
+        [_reference("a")],
+        dispatch=dispatch,
+        policy=ExecutionPolicy(max_buffered_rows=TWO_REFERENCES),
+    )
+
+    with pytest.raises(BudgetExceededError, match="decoded page") as captured:
+        await anext(stream)
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.emitted_rows == 0
+    assert stream.report.buffered_rows_high_water == 0
+
+
+@pytest.mark.asyncio
+async def test_input_order_rejects_oversized_whole_result_behind_blocked_head() -> None:
+    head_started = asyncio.Event()
+    release_head = asyncio.Event()
+    later_started = asyncio.Event()
+
+    async def handler(request: Request) -> object:
+        if request.copy_parameters()["ref"] == "head":
+            head_started.set()
+            await release_head.wait()
+            return {"result": {"head": True}}
+        later_started.set()
+        rows = [{"ID": index} for index in range(10)]
+        return {"result": rows, "total": len(rows)}
+
+    order = ReferenceOutputOrder.INPUT
+    stream = fan_out(
+        Executor(AsyncFunctionTransport(handler)),
+        [_reference("head"), _reference("later")],
+        dispatch=DirectDispatch(concurrency=TWO_REFERENCES, output_order=order),
+        output_order=order,
+        policy=ExecutionPolicy(
+            max_active_references=TWO_REFERENCES,
+            max_buffered_rows=TWO_REFERENCES,
+        ),
+    )
+    first = asyncio.create_task(anext(stream))
+    await head_started.wait()
+    await later_started.wait()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    snapshot = await stream._scheduler.context.snapshot()  # noqa: SLF001 - bounded retention regression
+    assert snapshot.counters.buffered_rows == 0
+    assert snapshot.counters.buffered_rows_high_water == 0
+
+    release_head.set()
+    head = await first
+    assert isinstance(head, ReferenceItem)
+    assert head.reference_key == "head"
+
+    with pytest.raises(BudgetExceededError, match="decoded page"):
+        await anext(stream)
+    assert stream.report.buffered_rows_high_water == 1
 
 
 @pytest.mark.asyncio

@@ -430,7 +430,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             while True:
                 chunk = await _next_chunk(
                     source,
-                    self._batch_size,
+                    min(self._batch_size, self._context.policy.max_buffered_rows),
                     start_index=next_index,
                     context=self._context,
                 )
@@ -450,6 +450,8 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                     fallback_failed=self._fallback_failed,
                     context=self._context,
                 )
+                buffered_outcomes = len(outcomes)
+                await self._context.set_buffered_rows(buffered_outcomes)
                 for outcome in outcomes:
                     if self._tolerant:
                         yield outcome
@@ -459,6 +461,8 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                             yield success.result, success.payload
                         else:
                             yield success.result
+                    buffered_outcomes -= 1
+                    await self._context.set_buffered_rows(buffered_outcomes)
             naturally_exhausted = True
             await self._finalize(TerminalState.COMPLETED, "input exhausted")
         except asyncio.CancelledError as error:
@@ -516,6 +520,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
 
     async def _cleanup_source(self, source: AsyncIteratorController[BatchInput]) -> None:
         try:
+            await self._context.set_buffered_rows(0)
             await source.aclose(
                 remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed),
             )
@@ -579,6 +584,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             batch_commands=self._batch_commands,
             retries=snapshot.retries,
             cooldown_seconds=snapshot.cooldown_seconds,
+            buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
             violations=violations,
             terminal_reason=reason,
         )
