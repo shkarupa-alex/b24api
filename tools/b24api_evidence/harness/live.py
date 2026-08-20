@@ -9,9 +9,11 @@ from urllib.parse import urljoin
 
 import httpx
 
-from .contracts import ContractError, PortalIdentity, parse_fingerprint_key, portal_identity
+from .contracts import ContractError, PortalIdentity, parse_fingerprint_key, portal_identity, strict_json_loads
 
 HTTP_OK = 200
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_MARKER_SCAN_PAGES = 1_000
 
 
 class LiveUnavailableError(RuntimeError):
@@ -46,6 +48,7 @@ class LivePortal:
         self.identity = portal_identity(webhook_url, role=role, fingerprint_key=encoded_key)
         self._webhook_url = webhook_url.rstrip("/") + "/"
         self._client = httpx.Client(timeout=timeout, follow_redirects=False)
+        self.attempts = 0
 
     def close(self) -> None:
         self._client.close()
@@ -56,28 +59,35 @@ class LivePortal:
     def __exit__(self, *_args: object) -> None:
         self.close()
 
-    def call(self, method: str, parameters: dict[str, Any] | None = None) -> Any:
-        """Call one REST method and return its result without retaining raw bodies."""
+    def call_envelope(self, method: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Call one REST method and return a strictly decoded, bounded envelope."""
+        self.attempts += 1
         try:
             response = self._client.post(urljoin(self._webhook_url, method), json=parameters or {})
         except httpx.HTTPError as error:
             raise LiveUnavailableError(f"live transport unavailable for {method}") from error
         if response.status_code != HTTP_OK:
             raise LiveUnavailableError(f"live HTTP status {response.status_code} for {method}")
+        if len(response.content) > MAX_RESPONSE_BYTES:
+            raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
         try:
-            envelope = response.json()
-        except ValueError as error:
+            envelope = strict_json_loads(response.content)
+        except ContractError as error:
             raise LiveCorrectnessError(f"live response is not JSON for {method}") from error
         if not isinstance(envelope, dict):
             raise LiveCorrectnessError(f"live response envelope is not an object for {method}")
         if "error" in envelope:
-            code = str(envelope.get("error", "unknown"))[:100]
-            if code.casefold() in {"error_method_not_found", "insufficient_scope", "access_denied"}:
+            code = str(envelope.get("error", "unknown"))[:100].casefold()
+            if code in {"error_method_not_found", "insufficient_scope", "access_denied"}:
                 raise LiveUnavailableError(f"live method unavailable for {method}: {code}")
-            raise LiveCorrectnessError(f"live API error for {method}: {code}")
+            raise LiveCorrectnessError(f"live API returned an unexpected error for {method}")
         if "result" not in envelope:
             raise LiveCorrectnessError(f"live response has no result for {method}")
-        return envelope["result"]
+        return envelope
+
+    def call(self, method: str, parameters: dict[str, Any] | None = None) -> Any:
+        """Call one REST method and return its result without retaining raw bodies."""
+        return self.call_envelope(method, parameters)["result"]
 
     def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
         """Call scope/app.info and classify missing environment as unavailable."""
@@ -148,24 +158,40 @@ class DisposableAdapter:
     def delete(self, portal: LivePortal, entity_id: str) -> None:
         portal.call(self.delete_method, {self.id_parameter: entity_id})
 
-    def find_exact_marker(self, portal: LivePortal, marker: str) -> list[str]:
-        result = portal.call(
-            self.list_method,
-            {"filter": {self.marker_field: marker}, "select": ["ID", self.marker_field]},
-        )
-        if isinstance(result, dict) and len(result) == 1:
-            result = next(iter(result.values()))
-        if not isinstance(result, list):
-            raise LiveCorrectnessError("exact-marker search did not return a list")
+    def find_exact_marker(self, portal: LivePortal, marker: str) -> list[str]:  # noqa: C901
         matches: list[str] = []
-        for row in result:
-            if not isinstance(row, dict):
-                raise LiveCorrectnessError("exact-marker search returned a malformed row")
-            value = row.get(self.marker_field) or row.get(self.marker_field.casefold())
-            entity_id = row.get("ID") or row.get("id")
-            if value == marker and isinstance(entity_id, str | int) and not isinstance(entity_id, bool):
-                matches.append(str(entity_id))
-        return matches
+        start: int | None = None
+        seen_starts: set[int | None] = set()
+        for _page in range(MAX_MARKER_SCAN_PAGES):
+            if start in seen_starts:
+                raise LiveCorrectnessError("exact-marker search continuation did not advance")
+            seen_starts.add(start)
+            parameters: dict[str, Any] = {
+                "filter": {self.marker_field: marker},
+                "select": ["ID", self.marker_field],
+            }
+            if start is not None:
+                parameters["start"] = start
+            envelope = portal.call_envelope(self.list_method, parameters)
+            result = envelope["result"]
+            if isinstance(result, dict) and len(result) == 1:
+                result = next(iter(result.values()))
+            if not isinstance(result, list):
+                raise LiveCorrectnessError("exact-marker search did not return a list")
+            for row in result:
+                if not isinstance(row, dict):
+                    raise LiveCorrectnessError("exact-marker search returned a malformed row")
+                value = row.get(self.marker_field) or row.get(self.marker_field.casefold())
+                entity_id = row.get("ID") or row.get("id")
+                if value == marker and isinstance(entity_id, str | int) and not isinstance(entity_id, bool):
+                    matches.append(str(entity_id))
+            continuation = envelope.get("next")
+            if continuation is None:
+                return matches
+            if isinstance(continuation, bool) or not isinstance(continuation, int) or continuation < 0:
+                raise LiveCorrectnessError("exact-marker search continuation is malformed")
+            start = continuation
+        raise LiveCorrectnessError("exact-marker search exceeded the reviewed page ceiling")
 
 
 ADAPTERS = {

@@ -13,8 +13,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import uuid
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import IntEnum
@@ -107,8 +108,16 @@ def strict_json_loads(raw: str | bytes) -> Any:
     def reject_constant(value: str) -> None:
         raise ContractError(f"non-finite JSON constant is forbidden: {value}")
 
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ContractError("duplicate JSON object keys are forbidden")
+            result[key] = value
+        return result
+
     try:
-        value = json.loads(raw, parse_constant=reject_constant)
+        value = json.loads(raw, parse_constant=reject_constant, object_pairs_hook=reject_duplicate_keys)
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ContractError(f"invalid JSON: {error}") from error
     _require_finite(value)
@@ -203,15 +212,15 @@ def parse_fingerprint_key(encoded: str) -> bytes:
     counts = Counter(key)
     entropy = -sum((count / len(key)) * math.log2(count / len(key)) for count in counts.values())
     if len(counts) < MINIMUM_KEY_DISTINCT_BYTES or entropy < MINIMUM_KEY_SHANNON_ENTROPY:
-        raise ContractError("BITRIX24_EVIDENCE_FINGERPRINT_KEY does not satisfy the random-key strength check")
+        raise ContractError("BITRIX24_EVIDENCE_FINGERPRINT_KEY does not satisfy the diversity safety check")
     return key
 
 
 def portal_identity(webhook_url: str, *, role: str, fingerprint_key: str) -> PortalIdentity:
     """Validate a webhook and derive a non-reversible host/role/principal fingerprint."""
     key = parse_fingerprint_key(fingerprint_key)
-    parts = urlsplit(webhook_url)
     try:
+        parts = urlsplit(webhook_url)
         port = parts.port
     except ValueError as error:
         raise ContractError("live webhook has an invalid port") from error
@@ -338,6 +347,11 @@ def validate_dataset_plan(plan: Mapping[str, Any]) -> None:  # noqa: C901, PLR09
     cleanup = _mapping(plan["cleanup"], "cleanup")
     if cleanup.get("feasible") is not True or cleanup.get("absence_verification") != "exact_id_point_read":
         raise ContractError("cleanup must be feasible with exact-id point-read absence verification")
+    dependency_order = cleanup.get("dependency_order")
+    if not isinstance(dependency_order, list) or len(dependency_order) != len(seen_cells):
+        raise ContractError("cleanup dependency_order must list every dataset cell exactly once")
+    if len(set(dependency_order)) != len(dependency_order) or set(dependency_order) != seen_cells:
+        raise ContractError("cleanup dependency_order must be an exact permutation of dataset cell ids")
     authorization = _mapping(plan["authorization"], "authorization")
     _validate_authorization(authorization, cells=cells)
     if authorization["state"] == "approved_for_seed" and portal["role"] == "model":
@@ -349,6 +363,10 @@ def _validate_cell(cell: Mapping[str, Any], *, index: int) -> None:
     base = _nonnegative_int(cell.get("base_count", 0), f"cells[{index}].base_count")
     if max(target, base) > REVIEWED_MAX_ENTITIES_PER_CELL:
         raise ContractError(f"cells[{index}] exceeds reviewed hard scale ceiling")
+    relationships = _nonnegative_int(cell.get("relationship_count", 0), f"cells[{index}].relationship_count")
+    expected_distribution = "boundary" if target else "empty"
+    if base != 0 or relationships != 0 or cell.get("distribution") != expected_distribution:
+        raise ContractError(f"cells[{index}] requests an unimplemented seed distribution or relationship shape")
     expected = {
         "tasks-task-v1": (
             "task",
@@ -461,6 +479,11 @@ def validate_manifest_record(  # noqa: C901
     _require_exact_keys(record, required, "manifest record", optional=optional)
     if record["schema_version"] != SCHEMA_VERSION:
         raise ContractError("unsupported manifest schema_version")
+    _require_uuid(record["run_id"], "run_id")
+    _require_uuid(record["lineage_id"], "lineage_id")
+    _require_sha(record["candidate_sha"], "candidate_sha")
+    _require_sha256(record["dataset_plan_content_hash"], "dataset_plan_content_hash")
+    _require_sha256(record["portal_fingerprint"], "portal_fingerprint")
     sequence = _nonnegative_int(record["sequence"], "sequence")
     expected_sequence = 0 if previous is None else int(previous["sequence"]) + 1
     if sequence != expected_sequence:
@@ -514,6 +537,46 @@ def load_manifest(path: Path, *, expected: ManifestLineage | None = None) -> lis
     return records
 
 
+def validate_manifest_against_plan(records: Sequence[Mapping[str, Any]], plan: Mapping[str, Any]) -> None:
+    """Bind every manifest entity and lifecycle transition to the reviewed dataset plan."""
+    expected: dict[str, Mapping[str, Any]] = {}
+    for cell in cast("list[Mapping[str, Any]]", plan["cells"]):
+        for index in range(int(cell["target_count"])):
+            correlation = content_sha256([plan["run_id"], cell["id"], index])
+            expected[correlation] = cell
+    current_events: dict[str, str] = {}
+    allowed: dict[str | None, frozenset[str]] = {
+        None: frozenset({"planned"}),
+        "planned": frozenset({"create_dispatched"}),
+        "create_dispatched": frozenset({"created", "ambiguous", "reconciled", "absence_verified"}),
+        "ambiguous": frozenset({"reconciled", "absence_verified"}),
+        "created": frozenset({"reconciled", "verified"}),
+        "reconciled": frozenset({"verified"}),
+        "verified": frozenset({"delete_dispatched"}),
+        "delete_dispatched": frozenset({"deleted", "orphan"}),
+        "deleted": frozenset({"absence_verified", "orphan"}),
+        "orphan": frozenset({"delete_dispatched", "absence_verified"}),
+        "absence_verified": frozenset(),
+    }
+    for record in records:
+        correlation = str(record["correlation_key"])
+        matched_cell = expected.get(correlation)
+        if matched_cell is None:
+            raise ContractError("manifest correlation_key is not a member of the reviewed dataset plan")
+        if record["cell_id"] != matched_cell["id"] or record["entity_family"] != matched_cell["entity_family"]:
+            raise ContractError("manifest entity metadata does not match its reviewed dataset cell")
+        event = str(record["event"])
+        previous_event = current_events.get(correlation)
+        recovered_genesis = (
+            previous_event is None
+            and event == "reconciled"
+            and record.get("request_fingerprint") == content_sha256(["recover-manifest", correlation])
+        )
+        if not recovered_genesis and event not in allowed.get(previous_event, frozenset()):
+            raise ContractError(f"manifest lifecycle transition {previous_event!r} -> {event!r} is invalid")
+        current_events[correlation] = event
+
+
 def append_manifest_record(path: Path, record: Mapping[str, Any]) -> None:
     """Append one validated record with one O_APPEND write and fsync."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -521,7 +584,8 @@ def append_manifest_record(path: Path, record: Mapping[str, Any]) -> None:
     lock_descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-        previous_records = load_manifest(path) if path.exists() else []
+        manifest_existed = path.exists()
+        previous_records = load_manifest(path) if manifest_existed else []
         previous = previous_records[-1] if previous_records else None
         validate_manifest_record(record, previous=previous)
         payload = canonical_json(record) + b"\n"
@@ -534,6 +598,8 @@ def append_manifest_record(path: Path, record: Mapping[str, Any]) -> None:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        if not manifest_existed:
+            _fsync_directory(path.parent)
     finally:
         fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
         os.close(lock_descriptor)
@@ -553,15 +619,31 @@ def build_manifest_record(base: Mapping[str, Any], *, previous: Mapping[str, Any
 def validate_oracle_record(record: Mapping[str, Any]) -> None:
     """Enforce qualification and mutation invariants for oracle PASS."""
     validate_schema(record, "oracle-record")
+    _require_uuid(record.get("run_id"), "run_id")
+    _require_uuid(record.get("lineage_id"), "lineage_id")
+    _require_sha(record.get("candidate_sha"), "candidate_sha")
+    for field in (
+        "dataset_plan_content_hash",
+        "manifest_content_hash",
+        "expected_result_hash",
+        "actual_result_hash",
+    ):
+        _require_sha256(record.get(field), field)
     outcome = record.get("outcome")
     requirement = record.get("snapshot_requirement")
     state = record.get("snapshot_state")
     pre_hash = record.get("pre_hash")
     post_hash = record.get("post_hash")
     retries = _nonnegative_int(record.get("mutation_retries", 0), "mutation_retries")
+    raw_count = _nonnegative_int(record.get("raw_count"), "raw_count")
+    unique_count = _nonnegative_int(record.get("unique_count"), "unique_count")
+    if unique_count > raw_count:
+        raise ContractError("oracle unique_count cannot exceed raw_count")
     if retries > MAX_MUTATION_RETRIES:
         raise ContractError("oracle mutation retries exceed the reviewed maximum")
     if outcome == "PASS":
+        if record.get("expected_result_hash") != record.get("actual_result_hash"):
+            raise ContractError("oracle PASS requires exact candidate/oracle result hash equality")
         if record.get("qualification") not in {
             "immutable_manifest",
             "bounded_point_read",
@@ -742,9 +824,16 @@ def validate_probe_envelope(envelope: Mapping[str, Any], *, who_id: str) -> dict
     dependent = result_map.get("dependent")
     if not isinstance(dependent, list):
         raise ContractError("probe dependent result must be an array")
+    unexpected_result_keys = sorted(str(key) for key in result_map if key not in {"who", "dependent"})
     dependent_ids = [str(row.get("ID")) for row in dependent if isinstance(row, dict) and "ID" in row]
     unexpected_error_keys = sorted(str(key) for key in errors if key not in {"who", "dependent"})
-    matched = dependent_ids == [who_id] and not errors and not unexpected_error_keys
+    matched = (
+        len(dependent) == 1
+        and dependent_ids == [who_id]
+        and not errors
+        and not unexpected_error_keys
+        and not unexpected_result_keys
+    )
     return {
         "result_error_shape": shape,
         "dependent_ids": dependent_ids,
@@ -798,11 +887,13 @@ def scan_paths_for_secrets(paths: Iterable[Path]) -> None:
             if path.name in {"models_test.py", "protocol_test.py", "redaction_test.py"}:
                 data = b"\n".join(line for line in data.splitlines() if b"EXAMPLE_CREDENTIAL" not in line)
             if path.name == "contracts_test.py":
-                data = b"\n".join(
-                    line
-                    for line in data.splitlines()
-                    if b"LEAK_FIXTURE" not in line and b"portal.invalid/rest/13/" not in line
-                )
+                for fixture in (
+                    b'LEAK_FIXTURE = b"https://example.invalid' + b'/rest/1/realisticToken123/"',
+                    b'"https://portal.invalid' + b'/rest/13/not-a-real-token/",',
+                    b'"https://portal.invalid' + b'/rest/13/different-dummy-token/",',
+                    b'"https://user:password@portal.invalid' + b'/rest/13/not-a-real-token/",',
+                ):
+                    data = data.replace(fixture, b"")
             scan_bytes_for_secrets(data, source=str(path))
 
 
@@ -908,6 +999,12 @@ def _ratio_threshold(value: Any, field: str) -> float:
 def _require_uuid(value: Any, field: str) -> None:
     if not isinstance(value, str) or not _UUID_RE.fullmatch(value):
         raise ContractError(f"{field} must be a lowercase UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as error:
+        raise ContractError(f"{field} must be a lowercase UUID") from error
+    if str(parsed) != value:
+        raise ContractError(f"{field} must be a lowercase canonical UUID")
 
 
 def _require_sha(value: Any, field: str) -> None:

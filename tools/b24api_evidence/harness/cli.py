@@ -3,12 +3,13 @@
 from __future__ import annotations
 import argparse
 import hashlib
+import os
 import platform
 import sys
 import time
 import uuid
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
@@ -19,6 +20,7 @@ from b24api.redaction import DEFAULT_REDACTOR
 from .contracts import (
     FINGERPRINT_ALGORITHM,
     FINGERPRINT_KEY_FORMAT,
+    MAX_MUTATION_RETRIES,
     NORMATIVE_MAXIMUM_OPERATING_RATIO,
     NORMATIVE_MAXIMUM_SMALL_P95_RATIO,
     NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT,
@@ -48,11 +50,12 @@ from .contracts import (
     validate_benchmark_plan,
     validate_dataset_plan,
     validate_evidence_artifact,
+    validate_manifest_against_plan,
     validate_oracle_record,
     validate_reviewed_profile_set,
     validate_schema,
 )
-from .live import ADAPTERS, LiveCorrectnessError, LivePortal, LiveUnavailableError
+from .live import ADAPTERS, LiveCorrectnessError, LivePortal, LivePreflight, LiveUnavailableError
 from .model import run_exact_matrix_sync
 
 if TYPE_CHECKING:
@@ -217,9 +220,8 @@ def _plan(args: argparse.Namespace) -> ExitCode:
 
 def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
     _require_live_write_flags(args, "seed")
-    plan_path = _required_path(args.plan, "--plan")
-    plan = read_json_object(plan_path)
-    validate_dataset_plan(plan)
+    _required_path(args.plan, "--plan")
+    plan = _load_plan(args)
     _require_approved_plan(plan)
     validate_reviewed_profile_set(PROFILE_SET_PATH)
     manifest_path = _manifest_path(args)
@@ -228,6 +230,7 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
     existing: list[dict[str, Any]] = []
     if manifest_path.exists():
         existing = load_manifest(manifest_path, expected=_lineage(plan))
+        validate_manifest_against_plan(existing, plan)
         previous = existing[-1]
     terminal_by_key = {record["correlation_key"]: record for record in existing}
     http_attempts = 0
@@ -235,20 +238,23 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
     with LivePortal(role=args.credential_role) as portal:
         _require_portal_match(plan, portal)
         required_scopes = {scope for cell in plan["cells"] for scope in cell.get("required_scopes", [])}
-        portal.preflight(required_scopes=required_scopes)
+        preflight = portal.preflight(required_scopes=required_scopes)
+        _require_preflight_match(plan, preflight)
         http_attempts += 2
         for cell in plan["cells"]:
             adapter = ADAPTERS[str(cell["disposable_profile_id"])]
             for index in range(int(cell["target_count"])):
                 correlation = content_sha256([plan["run_id"], cell["id"], index])
                 current = terminal_by_key.get(correlation)
+                if current is not None and current["event"] == "verified":
+                    continue
                 if current is not None and current["event"] in {
-                    "verified",
                     "delete_dispatched",
                     "deleted",
                     "absence_verified",
+                    "orphan",
                 }:
-                    continue
+                    raise ContractError("seed cannot resume a correlation after cleanup has started")
                 marker = marker_value(str(plan["namespace"]), correlation)
                 base = _manifest_base(plan, cell=cell, correlation=correlation, marker=marker)
                 recovered_id: str | None = None
@@ -267,7 +273,7 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                                 artifact_dir=artifact_dir,
                                 plan=plan,
                                 manifest_path=manifest_path,
-                                http_attempts=http_attempts,
+                                http_attempts=portal.attempts,
                                 started=started,
                             )
                 elif current is not None and current["event"] in {"planned", "create_dispatched", "ambiguous"}:
@@ -342,7 +348,7 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                             artifact_dir=artifact_dir,
                             plan=plan,
                             manifest_path=manifest_path,
-                            http_attempts=http_attempts,
+                            http_attempts=portal.attempts,
                             started=started,
                         )
                     entity_id = matches[0]
@@ -364,6 +370,7 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                 append_manifest_record(manifest_path, verified)
                 previous = verified
                 terminal_by_key[correlation] = verified
+        http_attempts = portal.attempts
     artifact = _operation_artifact(
         command="seed",
         dataset_plan=plan,
@@ -401,16 +408,47 @@ def _seed_inconclusive(
 
 
 def _verify(args: argparse.Namespace) -> ExitCode:
+    if args.allow_writes:
+        raise ContractError("verify is read-only; --allow-writes is invalid")
     plan = _load_plan(args)
     manifest_path = _manifest_path(args)
     records = load_manifest(manifest_path, expected=_lineage(plan))
+    validate_manifest_against_plan(records, plan)
     manifest_hash = manifest_content_hash(manifest_path)
-    identities = sorted(
-        str(record["entity_id"])
-        for record in _latest_records(records).values()
-        if record["event"] in {"created", "reconciled", "verified"} and record["entity_id"] is not None
-    )
-    snapshot_hash = content_sha256(identities)
+    latest = _latest_records(records)
+    expected_count = sum(int(cell["target_count"]) for cell in plan["cells"])
+    if len(latest) != expected_count or any(record["event"] != "verified" for record in latest.values()):
+        raise ContractError("verify requires exactly one verified terminal entity for every planned correlation")
+    started = time.monotonic()
+    retries = 0
+    attempts = 0
+    snapshot_state = "verified"
+    if args.live:
+        if plan["portal"]["role"] == "model":
+            raise ContractError("model dataset plans cannot be verified with --live")
+        with LivePortal(role=args.credential_role) as portal:
+            _require_portal_match(plan, portal)
+            required_scopes = {scope for cell in plan["cells"] for scope in cell.get("required_scopes", [])}
+            preflight = portal.preflight(required_scopes=required_scopes)
+            _require_preflight_match(plan, preflight)
+            pre_hash = _live_manifest_snapshot(portal, plan=plan, latest=latest)
+            post_hash = _live_manifest_snapshot(portal, plan=plan, latest=latest)
+            while pre_hash != post_hash and retries < MAX_MUTATION_RETRIES:
+                retries += 1
+                pre_hash = post_hash
+                post_hash = _live_manifest_snapshot(portal, plan=plan, latest=latest)
+            attempts = portal.attempts
+        if pre_hash != post_hash:
+            snapshot_state = "changed"
+    elif plan["portal"]["role"] != "model":
+        raise ContractError("a live dataset plan requires --live independent verification")
+    else:
+        identities = sorted(
+            [str(record["correlation_key"]), str(record["entity_id"]), str(record["marker_hash"])]
+            for record in latest.values()
+        )
+        pre_hash = post_hash = content_sha256(identities)
+    outcome = "PASS" if snapshot_state == "verified" else "INCONCLUSIVE"
     oracle = {
         "schema_version": SCHEMA_VERSION,
         "run_id": plan["run_id"],
@@ -419,15 +457,17 @@ def _verify(args: argparse.Namespace) -> ExitCode:
         "candidate_sha": plan["candidate_sha"],
         "dataset_plan_content_hash": content_sha256(plan),
         "manifest_content_hash": manifest_hash,
+        "expected_result_hash": pre_hash,
+        "actual_result_hash": post_hash,
         "qualification": "immutable_manifest",
         "snapshot_requirement": "frozen_manifest",
-        "snapshot_state": "verified",
-        "pre_hash": snapshot_hash,
-        "post_hash": snapshot_hash,
-        "mutation_retries": 0,
-        "raw_count": len(identities),
-        "unique_count": len(set(identities)),
-        "outcome": "PASS",
+        "snapshot_state": snapshot_state,
+        "pre_hash": pre_hash,
+        "post_hash": post_hash,
+        "mutation_retries": retries,
+        "raw_count": len(latest),
+        "unique_count": len({str(record["entity_id"]) for record in latest.values()}),
+        "outcome": outcome,
     }
     validate_oracle_record(oracle)
     artifact_dir = args.artifact_dir.resolve()
@@ -436,35 +476,52 @@ def _verify(args: argparse.Namespace) -> ExitCode:
         command="verify",
         dataset_plan=plan,
         manifest_hash=manifest_hash,
-        metrics={"kind": "operation", "http_attempts": 0, "wall_seconds": 0.0},
+        metrics={"kind": "operation", "http_attempts": attempts, "wall_seconds": time.monotonic() - started},
         snapshot_requirement="frozen_manifest",
-        snapshot_state="verified",
+        snapshot_state=snapshot_state,
         assurance="oracle_verified",
+        outcome=outcome,
+        terminal_state="completed" if outcome == "PASS" else "incomplete",
+        extra={"evidence_refs": [f"sha256:{content_sha256(oracle)}"]},
     )
     _write_validated_artifact(artifact_dir / "verify-evidence.json", artifact)
     _scan_bundle(artifact_dir)
     _safe_message(f"verify completed: {artifact_dir / 'oracle.json'}")
-    return ExitCode.COMPLETED
+    return ExitCode.COMPLETED if outcome == "PASS" else ExitCode.INCOMPLETE
 
 
 def _benchmark(args: argparse.Namespace) -> ExitCode:
     if args.allow_writes:
         raise ContractError("benchmark is read-only; --allow-writes is invalid")
+    if args.live:
+        raise LiveUnavailableError(
+            "live benchmark execution is not admitted until a reviewed live benchmark cell exists",
+        )
     plan = _load_plan(args, allow_generated=True)
     benchmark_plan = (
         read_json_object(args.benchmark_plan) if args.benchmark_plan is not None else _default_benchmark_plan(plan)
     )
     validate_benchmark_plan(benchmark_plan)
+    if (
+        benchmark_plan["candidate_sha"] != plan["candidate_sha"]
+        or benchmark_plan["lineage_id"] != plan["lineage_id"]
+        or benchmark_plan["dataset_plan_content_hash"] != content_sha256(plan)
+    ):
+        raise ContractError("benchmark plan lineage does not match the dataset plan and candidate")
     started = time.monotonic()
     runs = run_exact_matrix_sync()
     rows = sum(len(run.identities) for run in runs if run.outcome == "PASS")
     requests = sum(run.requests for run in runs)
     logical_pages = sum(run.logical_pages for run in runs)
+    stable_offset = [run for run in runs if run.plan == "offset" and run.outcome == "PASS"]
+    stable_keyset = [run for run in runs if run.plan == "keyset" and run.outcome == "PASS"]
+    offset_control = sum(run.operating_seconds for run in stable_offset) / sum(run.requests for run in stable_offset)
+    keyset_control = sum(run.operating_seconds for run in stable_keyset) / sum(run.requests for run in stable_keyset)
     controls = derive_drift_controls(
-        rtt_before=0.010,
-        rtt_after=0.010,
-        operating_before=0.002,
-        operating_after=0.002,
+        rtt_before=offset_control,
+        rtt_after=keyset_control,
+        operating_before=offset_control,
+        operating_after=keyset_control,
         max_rtt_ratio=1.20,
         max_operating_ratio=1.20,
     )
@@ -474,12 +531,14 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
         "logical_pages": logical_pages,
         "batch_requests": 0,
         "batch_commands": 0,
-        "time_to_first_row_seconds": 0.001,
+        "time_to_first_row_seconds": min(
+            run.time_to_first_row_seconds for run in runs if run.time_to_first_row_seconds is not None
+        ),
         "wall_seconds": max(time.monotonic() - started, 0.000001),
         "server_operating_seconds": sum(run.operating_seconds for run in runs),
         "retries": 0,
         "cooldown_seconds": 0.0,
-        "buffered_rows_high_water": 50,
+        "buffered_rows_high_water": max(run.buffered_rows_high_water for run in runs),
         "rss_delta_bytes": None,
         "raw_rows": rows,
         "unique_rows": rows,
@@ -489,21 +548,9 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
         "overfetch": 0,
         "reference_failures": 0,
     }
-    artifact = _operation_artifact(
-        command="benchmark",
-        dataset_plan=plan,
-        manifest_hash=None,
-        metrics=metrics,
-        assurance="oracle_verified",
-        extra={
-            "benchmark_plan_content_hash": content_sha256(benchmark_plan),
-            "controls": controls,
-            "case_id": "MODEL-MATRIX",
-            "evidence_refs": [f"model-oracles/{run.case_id}-{run.plan}.json" for run in runs],
-        },
-    )
     artifact_dir = args.artifact_dir.resolve()
     oracle_dir = artifact_dir / "model-oracles"
+    oracle_refs: list[str] = []
     for run in runs:
         oracle = {
             "schema_version": SCHEMA_VERSION,
@@ -513,6 +560,8 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
             "candidate_sha": plan["candidate_sha"],
             "dataset_plan_content_hash": content_sha256(plan),
             "manifest_content_hash": run.expected_hash,
+            "expected_result_hash": run.expected_hash,
+            "actual_result_hash": run.actual_hash,
             "qualification": "independent_cross_method",
             "snapshot_requirement": "independent_pre_post_oracle",
             "snapshot_state": run.snapshot_state,
@@ -525,11 +574,26 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
         }
         validate_oracle_record(oracle)
         atomic_write_json(oracle_dir / f"{run.case_id}-{run.plan}.json", oracle)
-    atomic_write_json(
-        artifact_dir / "model-matrix.json",
-        {"schema_version": SCHEMA_VERSION, "runs": [asdict(run) for run in runs]},
+        if run.outcome == "PASS":
+            oracle_refs.append(f"sha256:{content_sha256(oracle)}")
+    model_matrix = {"schema_version": SCHEMA_VERSION, "runs": [asdict(run) for run in runs]}
+    atomic_write_json(artifact_dir / "model-matrix.json", model_matrix)
+    oracle_refs.append(f"sha256:{content_sha256(model_matrix)}")
+    artifact = _operation_artifact(
+        command="benchmark",
+        dataset_plan=plan,
+        manifest_hash=None,
+        metrics=metrics,
+        assurance="oracle_verified",
+        extra={
+            "benchmark_plan_content_hash": content_sha256(benchmark_plan),
+            "controls": controls,
+            "case_id": "MODEL-MATRIX",
+            "evidence_refs": oracle_refs,
+        },
     )
     atomic_write_json(artifact_dir / "benchmark-plan.json", benchmark_plan)
+    atomic_write_json(artifact_dir / "dataset-plan.json", plan)
     _write_validated_artifact(artifact_dir / "benchmark-evidence.json", artifact)
     _scan_bundle(artifact_dir)
     _safe_message(f"benchmark completed: {artifact_dir / 'benchmark-evidence.json'}")
@@ -537,8 +601,13 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
 
 
 def _resume(args: argparse.Namespace) -> ExitCode:
+    if args.live or args.allow_writes:
+        raise ContractError(
+            "resume is read-only validation; continue writes with the idempotent seed or cleanup command",
+        )
     plan = _load_plan(args)
     records = load_manifest(_manifest_path(args), expected=_lineage(plan))
+    validate_manifest_against_plan(records, plan)
     artifact = _operation_artifact(
         command="resume",
         dataset_plan=plan,
@@ -547,30 +616,38 @@ def _resume(args: argparse.Namespace) -> ExitCode:
     )
     artifact_path = args.artifact_dir.resolve() / "resume-evidence.json"
     _write_validated_artifact(artifact_path, artifact)
+    _scan_bundle(args.artifact_dir.resolve())
     _safe_message(f"resume validation completed: {artifact_path}")
     return ExitCode.COMPLETED
 
 
-def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: PLR0915
+def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0915
     _require_live_write_flags(args, "cleanup")
     plan = _load_plan(args)
     _require_approved_plan(plan)
     manifest_path = _manifest_path(args)
     records = load_manifest(manifest_path, expected=_lineage(plan))
+    validate_manifest_against_plan(records, plan)
     previous = records[-1]
     latest = _latest_records(records)
     cell_by_id = {str(cell["id"]): cell for cell in plan["cells"]}
-    ordered = sorted(latest.values(), key=lambda record: list(cell_by_id).index(str(record["cell_id"])), reverse=True)
+    dependency_order = [str(cell_id) for cell_id in plan["cleanup"]["dependency_order"]]
+    ordered = sorted(
+        latest.values(),
+        key=lambda record: dependency_order.index(str(record["cell_id"])),
+        reverse=True,
+    )
     orphans: list[str] = []
-    attempts = 0
+    portal_attempts = 0
     started = time.monotonic()
     with LivePortal(role=args.credential_role) as portal:
         _require_portal_match(plan, portal)
         required_scopes = {scope for cell in plan["cells"] for scope in cell.get("required_scopes", [])}
-        portal.preflight(required_scopes=required_scopes)
-        attempts += 2
+        preflight = portal.preflight(required_scopes=required_scopes)
+        _require_preflight_match(plan, preflight)
         for current in ordered:
-            if current["event"] == "absence_verified" or current["entity_id"] is None:
+            active_record = current
+            if current["event"] == "absence_verified":
                 continue
             cell = cell_by_id[str(current["cell_id"])]
             adapter = ADAPTERS[str(cell["disposable_profile_id"])]
@@ -580,12 +657,36 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: PLR0915
                 correlation=str(current["correlation_key"]),
                 marker=str(current["marker_value"]),
             )
-            entity_id = str(current["entity_id"])
+            if current["entity_id"] is None:
+                if current["event"] == "planned":
+                    continue
+                if current["event"] not in {"create_dispatched", "ambiguous"}:
+                    raise ContractError("cleanup found an entity-less manifest state that cannot be reconciled")
+                matches = adapter.find_exact_marker(portal, str(current["marker_value"]))
+                if len(matches) > 1:
+                    raise LiveCorrectnessError("cleanup found multiple exact-marker entities")
+                recovery_fingerprint = content_sha256(
+                    ["cleanup-exact-marker", current["correlation_key"]],
+                )
+                recovered = build_manifest_record(
+                    {
+                        **base,
+                        "event": "reconciled" if matches else "absence_verified",
+                        "entity_id": matches[0] if matches else None,
+                        "request_fingerprint": recovery_fingerprint,
+                    },
+                    previous=previous,
+                )
+                append_manifest_record(manifest_path, recovered)
+                previous = recovered
+                active_record = recovered
+                if not matches:
+                    continue
+            entity_id = str(active_record["entity_id"])
             request_fingerprint = content_sha256(
-                [adapter.delete_method, [adapter.id_parameter], current["correlation_key"]],
+                [adapter.delete_method, [adapter.id_parameter], active_record["correlation_key"]],
             )
             owned = adapter.read(portal, entity_id)
-            attempts += 1
             if owned is None:
                 checked = build_manifest_record(
                     {
@@ -599,7 +700,7 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: PLR0915
                 append_manifest_record(manifest_path, checked)
                 previous = checked
                 continue
-            if _entity_marker(owned, str(cell["marker_field"])) != current["marker_value"]:
+            if _entity_marker(owned, str(cell["marker_field"])) != active_record["marker_value"]:
                 checked = build_manifest_record(
                     {
                         **base,
@@ -611,7 +712,7 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: PLR0915
                 )
                 append_manifest_record(manifest_path, checked)
                 previous = checked
-                orphans.append(str(current["correlation_key"]))
+                orphans.append(str(active_record["correlation_key"]))
                 continue
             dispatched = build_manifest_record(
                 {
@@ -625,7 +726,6 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: PLR0915
             append_manifest_record(manifest_path, dispatched)
             previous = dispatched
             adapter.delete(portal, entity_id)
-            attempts += 1
             deleted = build_manifest_record(
                 {**base, "event": "deleted", "entity_id": entity_id, "request_fingerprint": request_fingerprint},
                 previous=previous,
@@ -633,7 +733,6 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: PLR0915
             append_manifest_record(manifest_path, deleted)
             previous = deleted
             absent = adapter.read(portal, entity_id) is None
-            attempts += 1
             event = "absence_verified" if absent else "orphan"
             checked = build_manifest_record(
                 {**base, "event": event, "entity_id": entity_id, "request_fingerprint": request_fingerprint},
@@ -642,7 +741,8 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: PLR0915
             append_manifest_record(manifest_path, checked)
             previous = checked
             if not absent:
-                orphans.append(str(current["correlation_key"]))
+                orphans.append(str(active_record["correlation_key"]))
+        portal_attempts = portal.attempts
     outcome = "PASS" if not orphans else "FAIL"
     artifact = _operation_artifact(
         command="cleanup",
@@ -650,7 +750,7 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: PLR0915
         manifest_hash=manifest_content_hash(manifest_path),
         metrics={
             "kind": "operation",
-            "http_attempts": attempts,
+            "http_attempts": portal_attempts,
             "wall_seconds": time.monotonic() - started,
             "orphan_count": len(orphans),
             "absence_verified": not orphans,
@@ -704,7 +804,8 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0
     with LivePortal(role=args.credential_role) as portal:
         _require_portal_match(plan, portal)
         required_scopes = {scope for cell in plan["cells"] for scope in cell.get("required_scopes", [])}
-        portal.preflight(required_scopes=required_scopes)
+        preflight = portal.preflight(required_scopes=required_scopes)
+        _require_preflight_match(plan, preflight)
         for cell in plan["cells"]:
             adapter = ADAPTERS[str(cell["disposable_profile_id"])]
             for index in range(int(cell["target_count"])):
@@ -715,6 +816,7 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0
                     raise LiveCorrectnessError("exact-marker recovery found multiple owned entities")
                 if matches:
                     candidates.append({"cell_id": cell["id"], "correlation_key": correlation, "entity_id": matches[0]})
+        portal_attempts = portal.attempts
     preview = {
         "schema_version": SCHEMA_VERSION,
         "run_id": plan["run_id"],
@@ -731,8 +833,7 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0
         atomic_write_json(preview_path, preview)
         preview_hash = file_sha256(preview_path)
         _safe_message(
-            "recovery preview completed; rerun with --confirm-recovery "
-            f"--recovery-preview-sha256 {preview_hash}: {preview_path}",
+            f"recovery preview completed: {preview_path}; explicit confirmation digest: {preview_hash}",
         )
         return ExitCode.INCOMPLETE
     if prior_preview is None or prior_preview["exact_marker_candidates"] != candidates:
@@ -770,7 +871,7 @@ def _recover_manifest(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0
         manifest_hash=manifest_content_hash(manifest_path),
         metrics={
             "kind": "operation",
-            "http_attempts": sum(int(cell["target_count"]) for cell in plan["cells"]) + 2,
+            "http_attempts": portal_attempts,
             "wall_seconds": 0.0,
             "records": len(candidates),
         },
@@ -796,7 +897,10 @@ def _operation_artifact(  # noqa: PLR0913
     snapshot_state: str = "not_requested",
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    now = _timestamp()
+    finished = datetime.now(UTC)
+    wall_seconds = metrics.get("wall_seconds", 0.0)
+    duration = float(wall_seconds) if isinstance(wall_seconds, int | float) else 0.0
+    started = finished - timedelta(seconds=max(duration, 0.0))
     artifact = {
         "schema_version": SCHEMA_VERSION,
         "run_id": dataset_plan["run_id"],
@@ -816,8 +920,8 @@ def _operation_artifact(  # noqa: PLR0913
             "b24api": "working-tree-candidate",
             "httpx": httpx.__version__,
         },
-        "started_at": now,
-        "finished_at": now,
+        "started_at": started.isoformat().replace("+00:00", "Z"),
+        "finished_at": finished.isoformat().replace("+00:00", "Z"),
         "outcome": outcome,
         "terminal_state": terminal_state,
         "assurance": assurance,
@@ -1018,9 +1122,20 @@ def _require_portal_match(plan: Mapping[str, Any], portal: LivePortal) -> None:
         raise ContractError("live portal identity does not match the reviewed plan")
 
 
+def _require_preflight_match(plan: Mapping[str, Any], preflight: LivePreflight) -> None:
+    """Reject reviewed-build or scope drift before any entity operation."""
+    planned = plan["portal"]
+    if planned.get("build") != preflight.build:
+        raise LiveUnavailableError("live portal build differs from the reviewed plan")
+    if planned.get("scope_hash") != content_sha256(sorted(preflight.scopes)):
+        raise LiveUnavailableError("live portal scope set differs from the reviewed plan")
+
+
 def _require_live_write_flags(args: argparse.Namespace, command: str) -> None:
     if not args.live or not args.allow_writes:
         raise ContractError(f"{command} requires both --live and --allow-writes")
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        raise ContractError(f"{command} live writes are forbidden under ordinary pytest")
 
 
 def _manifest_path(args: argparse.Namespace) -> Path:
@@ -1053,6 +1168,27 @@ def _timestamp() -> str:
 
 def _latest_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
     return {str(record["correlation_key"]): record for record in records}
+
+
+def _live_manifest_snapshot(
+    portal: LivePortal,
+    *,
+    plan: Mapping[str, Any],
+    latest: Mapping[str, Mapping[str, Any]],
+) -> str:
+    """Point-read every manifest identity and hash its exact ownership relation."""
+    cells = {str(cell["id"]): cell for cell in plan["cells"]}
+    qualified: list[list[str]] = []
+    for correlation, record in sorted(latest.items()):
+        cell = cells[str(record["cell_id"])]
+        adapter = ADAPTERS[str(cell["disposable_profile_id"])]
+        entity_id = str(record["entity_id"])
+        entity = adapter.read(portal, entity_id)
+        marker = str(record["marker_value"])
+        if entity is None or _entity_marker(entity, str(cell["marker_field"])) != marker:
+            raise LiveCorrectnessError("manifest identity failed independent exact-marker point-read")
+        qualified.append([correlation, entity_id, marker_sha256(marker)])
+    return content_sha256(qualified)
 
 
 def _entity_marker(entity: Mapping[str, Any], marker_field: str) -> object:

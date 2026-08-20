@@ -16,6 +16,7 @@ includes only `b24api*`. The normative entry point remains
 | Every PASS rejects blocking violations; cleanup proves absence. | Artifact schema and semantic validator apply the blocking rule to every command. Cleanup metrics are closed and require `orphan_count == 0` plus `absence_verified == true`. |
 | Benchmark lineage and drift. | Every benchmark artifact requires `benchmark_plan_content_hash`, four positive finite controls, preregistered maximum ratios, derived observed ratios, and derived quarantine. |
 | Correctness metric algebra. | `duplicates == raw_rows - unique_rows`; PASS also requires zero shortfall, overfetch, and reference failures plus oracle assurance. |
+| Immutable oracle/result binding. | Oracle records carry separate expected and actual result hashes; PASS requires equality. Parent evidence references stable oracle contents by SHA-256 rather than mutable paths. |
 | Draft thresholds are non-normative. | Draft plans require `thresholds_normative: false`; admission-ready plans require preregistered drift and the 15% / 1.05 / 1.10 blocking gates with at least two distinct plans. |
 | PHP-aware probe shape. | `result_error` must be present and is recorded as `empty_array` or `associative_object`; missing/non-empty arrays/other shapes refuse. Exact success is `dependent_ids == [who_id]`. |
 | Strong fingerprint key. | The only accepted format is 43-character unpadded base64url decoding to exactly 32 bytes, with minimum byte diversity and Shannon entropy. It is validated before the webhook environment variable is read. |
@@ -34,9 +35,11 @@ fields, previous-record SHA-256, and current-record SHA-256.
 An adjacent exclusive lock covers chain reload, validation, append, and fsync,
 so a stale concurrent writer cannot append a second genesis or sequence.
 
-Resume validates the complete chain and exact run, lineage, plan content,
+Resume validates the complete chain, its per-correlation lifecycle state machine,
+planned cell membership/cardinality, and exact run, lineage, plan content,
 portal fingerprint, candidate SHA, and namespace. An ambiguous create never
-causes a blind retry: resume first performs exact-marker read-back. Cleanup
+causes a blind retry: resume first performs paginated exact-marker read-back. Cleanup
+also reconciles ambiguous/dispatched creates by exact marker before it can claim absence. It
 first point-reads the exact manifest-owned ID and verifies its marker, then
 deletes only that ID and verifies absence. A reused/mismatched ID is recorded as
 an orphan and is never deleted.
@@ -53,13 +56,15 @@ The deterministic portal drives the production executor and traversal engine
 over empty, 1, 19, 500, dense/sparse/clustered/skewed/deleted 10,000-row, and
 persistent-mutation states with offset and keyset plans. The sparse case has
 10,000 matches over more than 100,000 base identities. Mutation produces
-distinct independent pre/post hashes and `INCONCLUSIVE` after three attempts;
+distinct independent pre/post hashes through actual model mutation and three retries, ending `INCONCLUSIVE`;
 every stable model oracle has equal hashes and PASS.
 
 Ordinary pytest has no path that supplies both live/write flags. `seed` and
-`cleanup` require both flags, a plan with explicit human approval, exact
+`cleanup` require both flags, reject ordinary pytest, and require a plan with explicit human approval, exact
 candidate SHA, exact HMAC portal identity, reviewed profile tuple, scope and
-`app.info` preflight. `benchmark` is read-only. No live command has been run in
+`app.info` preflight. Live verify performs two independent full point-read snapshots and
+quarantines persistent change. Live benchmark currently refuses as unavailable until a reviewed
+live benchmark cell exists; it never falls back to model evidence. No live command has been run in
 the pre-live candidate.
 
 The leak scanner covers every tracked repository file and every artifact while

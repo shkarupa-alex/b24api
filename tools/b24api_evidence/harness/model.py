@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +29,7 @@ from b24api.plans import (
     OffsetTerminalRule,
 )
 
-from .contracts import content_sha256
+from .contracts import MAX_MUTATION_RETRIES, content_sha256
 
 MODEL_METHOD = "model.entity.list"
 PAGE_SIZE = 50
@@ -63,6 +64,9 @@ class ModelRun:
     requests: int
     logical_pages: int
     operating_seconds: float
+    time_to_first_row_seconds: float | None
+    wall_seconds: float
+    buffered_rows_high_water: int
     outcome: str
     snapshot_state: str
     mutation_retries: int
@@ -96,6 +100,15 @@ class DeterministicPortal(Transport):
         self.case = case
         self.requests = 0
         self.operating_seconds = 0.0
+        self._identities = list(case.identities)
+        self._oracle_reads = 0
+
+    def oracle_snapshot(self) -> str:
+        """Read an independent model snapshot, with real persistent churn when requested."""
+        if self.case.mutation and self._oracle_reads:
+            self._identities.append(max(self._identities, default=0) + 1)
+        self._oracle_reads += 1
+        return content_sha256(self._identities)
 
     async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
         if request.method != MODEL_METHOD:
@@ -105,7 +118,7 @@ class DeterministicPortal(Transport):
         self.requests += 1
         parameters = request.copy_parameters()
         limit = _positive_integer(parameters.get("LIMIT", PAGE_SIZE), "LIMIT")
-        identities = self.case.identities
+        identities = tuple(self._identities)
         filter_value = parameters.get("filter", {})
         if not isinstance(filter_value, dict):
             raise TypeError("model filter must be an object")
@@ -188,17 +201,27 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
         policy=policy,
         _page_cap_hint=PAGE_SIZE,
     )
+    pre_hash = portal.oracle_snapshot()
     rows: list[dict[str, Any]] = []
+    started = time.monotonic()
+    time_to_first_row_seconds: float | None = None
     async with stream:
         async for item in stream:
             if not isinstance(item, dict) or not isinstance(item.get("ID"), int):
                 raise TypeError("model traversal emitted malformed row")
+            if time_to_first_row_seconds is None:
+                time_to_first_row_seconds = time.monotonic() - started
             rows.append(item)
+    wall_seconds = time.monotonic() - started
     report = stream.report
     identities = tuple(int(row["ID"]) for row in rows)
     actual_hash = content_sha256(list(identities))
-    pre_hash = case.expected_hash
-    post_hash = content_sha256([*case.identities, max(case.identities, default=0) + 1]) if case.mutation else pre_hash
+    post_hash = portal.oracle_snapshot()
+    mutation_retries = 0
+    while pre_hash != post_hash and mutation_retries < MAX_MUTATION_RETRIES:
+        mutation_retries += 1
+        pre_hash = post_hash
+        post_hash = portal.oracle_snapshot()
     snapshot_state = "changed" if pre_hash != post_hash else "verified"
     outcome = "INCONCLUSIVE" if case.mutation else "PASS"
     return ModelRun(
@@ -212,9 +235,12 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
         requests=report.physical_requests,
         logical_pages=report.logical_pages,
         operating_seconds=portal.operating_seconds,
+        time_to_first_row_seconds=time_to_first_row_seconds,
+        wall_seconds=wall_seconds,
+        buffered_rows_high_water=report.buffered_rows_high_water,
         outcome=outcome,
         snapshot_state=snapshot_state,
-        mutation_retries=3 if case.mutation else 0,
+        mutation_retries=mutation_retries,
     )
 
 

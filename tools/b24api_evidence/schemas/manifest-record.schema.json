@@ -33,7 +33,7 @@
   "allOf": [
     {"if": {"properties": {"sequence": {"const": 0}}, "required": ["sequence"]}, "then": {"properties": {"previous_record_hash": {"type": "null"}}}, "else": {"properties": {"previous_record_hash": {"$ref": "#/$defs/sha256"}}}},
     {"if": {"properties": {"event": {"enum": ["create_dispatched", "ambiguous", "delete_dispatched"]}}, "required": ["event"]}, "then": {"properties": {"request_fingerprint": {"$ref": "#/$defs/sha256"}}}},
-    {"if": {"properties": {"event": {"enum": ["created", "reconciled", "verified", "delete_dispatched", "deleted", "absence_verified", "orphan"]}}, "required": ["event"]}, "then": {"properties": {"entity_id": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "integer"}]}}}}
+    {"if": {"properties": {"event": {"enum": ["created", "reconciled", "verified", "delete_dispatched", "deleted", "orphan"]}}, "required": ["event"]}, "then": {"properties": {"entity_id": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "integer"}]}}}}
   ],
   "$defs": {
     "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
