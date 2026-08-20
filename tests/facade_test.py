@@ -7,7 +7,7 @@ import inspect
 import json
 import textwrap
 from dataclasses import replace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -473,6 +473,52 @@ async def test_counted_wrapper_requires_intermediate_tail_continuation() -> None
 
 
 @pytest.mark.asyncio
+async def test_counted_cleanup_cancellation_preserves_detected_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_aclose = BatchStream.aclose
+
+    async def controlled_aclose(stream: BatchStream) -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+        await original_aclose(stream)
+
+    monkeypatch.setattr(BatchStream, "aclose", controlled_aclose)
+
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {"result": [{"ID": 1}], "total": 2, "next": 1}
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: [{"ID": 2}] for key in commands},
+                "result_error": [],
+                "result_total": dict.fromkeys(commands, 3),
+            },
+        }
+
+    client, _transport = _client(handler)
+
+    async def collect() -> list[JsonValue]:
+        return [item async for item in client.list_batched({"method": "crm.item.list"}, batch_size=1)]
+
+    task = asyncio.create_task(collect())
+    await cleanup_started.wait()
+    task.cancel()
+    release_cleanup.set()
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        await task
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.state is TerminalState.FAILED
+    assert "total contradicts" in str(caught.value.__cause__)
+
+
+@pytest.mark.asyncio
 async def test_counted_wrapper_early_close_has_shared_cancelled_report() -> None:
     client, _transport = _client(lambda _request: {"result": [{"ID": 1}, {"ID": 2}], "total": 2})
     stream = client.list_batched({"method": "crm.item.list"}, batch_size=1)
@@ -509,7 +555,13 @@ async def test_counted_wrapper_tail_cleanup_resists_concurrent_cancellation(
             return {"result": [{"ID": 1}], "total": 2, "next": 1}
         commands = request.copy_parameters()["cmd"]
         assert isinstance(commands, dict)
-        return {"result": {"result": {key: [{"ID": 1}] for key in commands}, "result_error": []}}
+        return {
+            "result": {
+                "result": {key: [{"ID": 2}] for key in commands},
+                "result_error": [],
+                "result_total": dict.fromkeys(commands, 2),
+            },
+        }
 
     client, _transport = _client(handler)
     identity = IdentitySpec(
@@ -716,6 +768,57 @@ async def test_profile_never_relaxes_explicit_compatibility_page_cap() -> None:
     assert report.emitted_rows == 0
     assert "declared page cap" in str(caught.value.__cause__)
     assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_list_size_narrows_the_profile_plan_request_before_io() -> None:
+    expected_rows = 20
+    base_profile = _single_profile()
+    document = cast(
+        "dict[str, Any]",
+        json.loads(cast("str", base_profile._source_document)),  # noqa: SLF001 - immutable profile fixture
+    )
+    document["plan"] = {
+        "kind": "offset_sequential",
+        "identity_requirement": "optional",
+        "order_semantics": "unordered",
+        "duplicate_policy": "report",
+        "total_semantics": "advisory",
+        "offset_path": ["start"],
+        "limit_path": ["LIMIT"],
+        "requested_page_size": 50,
+        "continuation": "server_next_or_observed_count",
+        "terminal": ["empty_page"],
+        "allow_create_controls": True,
+    }
+    cast("dict[str, object]", document["capabilities"])["offset_honored"] = True
+    profile = load_profile_document(document)
+
+    def handler(request: Request) -> object:
+        parameters = request.copy_parameters()
+        start = cast("int", parameters.get("start", 0))
+        limit = cast("int", parameters["LIMIT"])
+        rows = [{"ID": value} for value in range(start + 1, min(start + limit, expected_rows) + 1)]
+        return {"result": rows}
+
+    transport = FunctionTransport(handler)
+    client = Bitrix24._from_executor(  # noqa: SLF001
+        Executor(transport),
+        portal_build="build-1",
+        scopes={"task"},
+    )
+
+    rows = [
+        item
+        async for item in client.list_sequential(
+            {"method": "tasks.task.list"},
+            list_size=10,
+            profile=profile,
+        )
+    ]
+
+    assert len(rows) == expected_rows
+    assert [request.copy_parameters()["LIMIT"] for request in transport.requests] == [10, 10, 10]
 
 
 @pytest.mark.asyncio

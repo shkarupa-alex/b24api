@@ -408,7 +408,9 @@ class ProbeObservation:
             raise ValueError("probe observation ID is invalid")
         if not isinstance(self.status, ProbeStatus):
             raise TypeError("probe status must be a ProbeStatus")
-        if isinstance(self.observed_rows, bool) or self.observed_rows < 0:
+        if type(self.observed_rows) is not int:
+            raise TypeError("observed_rows must be an integer")
+        if self.observed_rows < 0:
             raise ValueError("observed_rows cannot be negative")
         if self.note_code is not None and not _ID_RE.fullmatch(self.note_code):
             raise ValueError("probe note_code is invalid")

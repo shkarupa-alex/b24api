@@ -291,6 +291,16 @@ def test_probe_observations_only_preserve_or_downgrade_decision() -> None:
     assert ProfileReasonCode.UNKNOWN_BUILD in {reason.code for reason in still_refused.reasons}
 
 
+@pytest.mark.parametrize("observed_rows", [True, 0.5, "1", None])
+def test_probe_observation_requires_a_plain_integer_row_count(observed_rows: object) -> None:
+    with pytest.raises(TypeError, match="integer"):
+        ProbeObservation(
+            "bounded-keyset-check",
+            ProbeStatus.PASS,
+            observed_rows=cast("Any", observed_rows),
+        )
+
+
 def test_query_shape_records_structure_without_literal_values() -> None:
     first = query_shape_from_request(
         Request(

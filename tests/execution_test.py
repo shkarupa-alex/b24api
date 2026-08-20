@@ -339,6 +339,34 @@ async def test_no_trace_post_dispatch_error_classes_have_conservative_minimum_ph
 
 
 @pytest.mark.asyncio
+async def test_transport_error_drops_credentialed_httpx_exception_and_request_locals() -> None:
+    sensitive_fragment = "synthetic-private-fragment-9f4a"
+
+    class RefusingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("refused", request=request)
+
+    client = httpx.AsyncClient(transport=RefusingTransport())
+    transport = HttpxTransport(f"https://example.invalid/rest/1/{sensitive_fragment}/", client=client)
+    try:
+        with pytest.raises(TransportError) as captured:
+            await transport.send(Request("profile"), attempt_timeout=1)
+
+        error = captured.value
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        traceback = error.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code.co_name == "send":
+                for value in traceback.tb_frame.f_locals.values():
+                    assert sensitive_fragment not in repr(value)
+            traceback = traceback.tb_next
+    finally:
+        await transport.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_socket_partial_body_failure_is_classified_after_headers() -> None:
     async def partial_body(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         await reader.readuntil(b"\r\n\r\n")

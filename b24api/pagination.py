@@ -378,29 +378,49 @@ class PaginationDriver:
                 context=self.context,
                 logical_page_per_command=True,
             )
+
+            def validated_outcome(outcome: object) -> tuple[Response, list[JsonValue]]:
+                if isinstance(outcome, BatchFailure):
+                    if isinstance(outcome.error, BaseException):
+                        raise outcome.error
+                    raise CapabilityError("parallel counted batch command failed")
+                if not isinstance(outcome, BatchSuccess) or outcome.response is None:
+                    raise CapabilityError("parallel counted batch outcome lacks correlated response evidence")
+                response = outcome.response
+                start = stride * (outcome.command_index + 1)
+                items = _response_items(response, self.selector)
+                expected_rows = min(stride, total - start)
+                if len(items) != expected_rows:
+                    raise CapabilityError("parallel counted page length contradicts the planned exact range")
+                if response.total is not None and response.total != total:
+                    raise CapabilityError("parallel counted page total contradicts the head total")
+                expected_next = start + stride if start + stride < total else None
+                if response.next != expected_next:
+                    raise CapabilityError("parallel counted continuation contradicts the planned exact range")
+                self.validate_external_page(items, response)
+                return response, items
+
+            primary_error: BaseException | None = None
             try:
                 async for outcome in outcomes:
-                    if isinstance(outcome, BatchFailure):
-                        if isinstance(outcome.error, BaseException):
-                            raise outcome.error
-                        raise CapabilityError("parallel counted batch command failed")
-                    if not isinstance(outcome, BatchSuccess) or outcome.response is None:
-                        raise CapabilityError("parallel counted batch outcome lacks correlated response evidence")
-                    response = outcome.response
-                    start = stride * (outcome.command_index + 1)
-                    items = _response_items(response, self.selector)
-                    expected_rows = min(stride, total - start)
-                    if len(items) != expected_rows:
-                        raise CapabilityError("parallel counted page length contradicts the planned exact range")
-                    if response.total is not None and response.total != total:
-                        raise CapabilityError("parallel counted page total contradicts the head total")
-                    expected_next = start + stride if start + stride < total else None
-                    if response.next != expected_next:
-                        raise CapabilityError("parallel counted continuation contradicts the planned exact range")
-                    self.validate_external_page(items, response)
+                    response, items = validated_outcome(outcome)
                     yield _Page(tuple(items), response, (1,) * len(items))
+            except BaseException as error:
+                primary_error = error
+                raise
             finally:
-                await outcomes.aclose()
+                preserve_primary = primary_error is not None and not isinstance(
+                    primary_error,
+                    asyncio.CancelledError | GeneratorExit,
+                )
+                try:
+                    cleanup_cancellation = await await_cancellation_resistant(outcomes.aclose())
+                except BaseException:
+                    if not preserve_primary:
+                        raise
+                else:
+                    if cleanup_cancellation is not None and not preserve_primary:
+                        raise cleanup_cancellation
                 self.batch_report = outcomes.report
             if outcomes.report.state is not TerminalState.COMPLETED:
                 raise IncompleteTraversalError(report=outcomes.report)

@@ -37,6 +37,7 @@ from .contracts import (
     PortalIdentity,
     SecretLeakError,
     append_manifest_record,
+    atomic_write_json,
     build_manifest_record,
     content_sha256,
     derive_drift_controls,
@@ -257,6 +258,38 @@ def test_approved_plan_self_claims_do_not_authorize_live_writes(
         plan,
         args=Namespace(**_approval_arguments(plan)),
     )
+
+
+@pytest.mark.parametrize("command_name", ["_seed", "_cleanup"])
+def test_live_write_refuses_unapproved_plan_before_writing_artifact_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command_name: str,
+) -> None:
+    external_plan = tmp_path / "external-plan.json"
+    plan = cli_module._model_dataset_plan(run_id=RUN_ID, lineage_id=LINEAGE_ID)  # noqa: SLF001
+    atomic_write_json(external_plan, plan)
+    artifact_dir = tmp_path / "empty-bundle"
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+    command = getattr(cli_module, command_name)
+
+    with pytest.raises(ContractError, match="human-reviewed"):
+        command(
+            Namespace(
+                live=True,
+                allow_writes=True,
+                plan=external_plan,
+                artifact_dir=artifact_dir,
+                run_id=None,
+                lineage_id=None,
+                manifest=None,
+                credential_role="admin_full",
+                confirm_plan_review_sha=None,
+                confirm_plan_content_sha256=None,
+            ),
+        )
+
+    assert not artifact_dir.exists()
 
 
 def _manifest_base(plan: dict[str, Any]) -> dict[str, Any]:
@@ -704,6 +737,25 @@ def test_manifest_append_failure_preserves_the_last_complete_chain(
         append_manifest_record(path, second)
     assert path.read_bytes() == original
     assert load_manifest(path) == [first]
+
+
+def test_atomic_write_cleanup_never_masks_the_primary_replace_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "artifact.json"
+
+    def fail_replace(_source: Path, _destination: Path) -> Path:
+        raise RuntimeError("primary replace failure")
+
+    def fail_unlink(_path: Path, *, missing_ok: bool = False) -> None:
+        del missing_ok
+        raise OSError("cleanup unlink failure")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    with pytest.raises(RuntimeError, match="primary replace failure"):
+        atomic_write_json(target, {"safe": "value"})
 
 
 @pytest.mark.parametrize("requirement", ["frozen_manifest", "independent_pre_post_oracle"])
@@ -1374,9 +1426,17 @@ def test_cleanup_resumes_after_delete_dispatch_without_corrupting_manifest(
     class FakeAdapter:
         delete_method = "tasks.task.delete"
         id_parameter = "taskId"
+        deleted = False
+        delete_calls = 0
 
-        def read(self, _portal: object, _entity_id: str) -> None:
-            return None
+        def read(self, _portal: object, _entity_id: str) -> dict[str, Any] | None:
+            return None if self.deleted else {"TITLE": previous["marker_value"]}
+
+        def delete(self, _portal: object, _entity_id: str) -> None:
+            self.delete_calls += 1
+            self.deleted = True
+
+    adapter = FakeAdapter()
 
     class FakePortal:
         identity = PortalIdentity("portal.invalid", "admin_full", "1", SHA256)
@@ -1397,8 +1457,11 @@ def test_cleanup_resumes_after_delete_dispatch_without_corrupting_manifest(
 
     monkeypatch.delenv("PYTEST_CURRENT_TEST")
     monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
-    monkeypatch.setitem(ADAPTERS, "tasks-task-v1", FakeAdapter())
+    monkeypatch.setitem(ADAPTERS, "tasks-task-v1", adapter)
     monkeypatch.setattr(cli_module, "_require_review_commit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_module, "_bind_plan_to_bundle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_module, "_require_exact_candidate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda *_args, **_kwargs: None)
     result = cli_module._cleanup(  # noqa: SLF001 - direct crash-window regression
         Namespace(
             live=True,
@@ -1415,6 +1478,13 @@ def test_cleanup_resumes_after_delete_dispatch_without_corrupting_manifest(
     assert result == ExitCode.COMPLETED
     records = load_manifest(manifest_path)
     assert records[-1]["event"] == "absence_verified"
+    assert [record["event"] for record in records][-4:] == [
+        "delete_dispatched",
+        "delete_dispatched",
+        "deleted",
+        "absence_verified",
+    ]
+    assert adapter.delete_calls == 1
     validate_manifest_against_plan(records, plan)
 
 

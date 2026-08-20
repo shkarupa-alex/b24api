@@ -132,6 +132,8 @@ class HttpxTransport:
         if self._closed:
             raise RuntimeError("transport is closed")
         tracker = _PhaseTracker()
+        failure: tuple[str, FailurePhase] | None = None
+        http_request: httpx.Request | None = None
         try:
             http_request = self._client.build_request(
                 "POST",
@@ -147,30 +149,29 @@ class HttpxTransport:
                 "pool": attempt_timeout,
             }
             response = await self._client.send(http_request)
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as error:
-            raise TransportError(
-                "Transport failed before dispatch",
-                phase=tracker.phase,
-                request_summary=request.summary,
-            ) from error
-        except (httpx.WriteError, httpx.WriteTimeout) as error:
-            raise TransportError(
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            failure = ("Transport failed before dispatch", tracker.phase)
+        except (httpx.WriteError, httpx.WriteTimeout):
+            failure = (
                 "Transport failed during or after possible request dispatch",
-                phase=_at_least_dispatch_started(tracker.phase),
-                request_summary=request.summary,
-            ) from error
-        except (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError) as error:
-            raise TransportError(
+                _at_least_dispatch_started(tracker.phase),
+            )
+        except (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError):
+            failure = (
                 "Transport failed after possible request dispatch",
-                phase=_at_least_dispatch_started(tracker.phase),
-                request_summary=request.summary,
-            ) from error
-        except httpx.TransportError as error:
-            raise TransportError(
+                _at_least_dispatch_started(tracker.phase),
+            )
+        except httpx.TransportError:
+            failure = (
                 "Unclassified transport failure after possible dispatch",
-                phase=_at_least_dispatch_started(tracker.phase),
-                request_summary=request.summary,
-            ) from error
+                _at_least_dispatch_started(tracker.phase),
+            )
+        if failure is not None:
+            # Do not retain httpx's credential-bearing request on an exception
+            # chain or in the outgoing traceback frame's local variables.
+            http_request = None
+            message, phase = failure
+            raise TransportError(message, phase=phase, request_summary=request.summary)
         return WireResponse(
             status_code=response.status_code,
             headers=tuple(response.headers.multi_items()),

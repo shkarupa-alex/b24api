@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 import base64
+import contextlib
 import fcntl
 import hashlib
 import hmac
@@ -246,7 +247,9 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
         temporary.replace(path)
         _fsync_directory(path.parent)
     except BaseException:
-        temporary.unlink(missing_ok=True)
+        # Cleanup diagnostics must never replace the atomic-write failure.
+        with contextlib.suppress(BaseException):
+            temporary.unlink(missing_ok=True)
         raise
 
 
@@ -636,7 +639,9 @@ def validate_manifest_against_plan(records: Sequence[Mapping[str, Any]], plan: M
         "created": frozenset({"reconciled", "verified", "delete_dispatched", "absence_verified", "orphan"}),
         "reconciled": frozenset({"verified", "delete_dispatched", "absence_verified", "orphan"}),
         "verified": frozenset({"delete_dispatched", "absence_verified", "orphan"}),
-        "delete_dispatched": frozenset({"delete_cancelled", "deleted", "absence_verified", "orphan"}),
+        "delete_dispatched": frozenset(
+            {"delete_dispatched", "delete_cancelled", "deleted", "absence_verified", "orphan"},
+        ),
         "delete_cancelled": frozenset({"delete_dispatched", "absence_verified", "orphan"}),
         "deleted": frozenset({"delete_dispatched", "absence_verified", "orphan"}),
         "orphan": frozenset({"delete_dispatched", "absence_verified"}),

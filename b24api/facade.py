@@ -350,7 +350,12 @@ class Bitrix24:
         if plan is not None:
             if profile is not None:
                 raise CapabilityError("plan and profile cannot both select wrapper traversal")
-            return _ResolvedTraversal(plan, identity, selector, page_cap_hint=page_cap_hint)
+            return _ResolvedTraversal(
+                _narrow_plan_page_size(plan, page_cap_hint),
+                identity,
+                selector,
+                page_cap_hint=page_cap_hint,
+            )
         if profile is None:
             return _ResolvedTraversal(default, identity, selector, page_cap_hint=page_cap_hint)
         if profile.source_sha256 is None:
@@ -371,8 +376,9 @@ class Bitrix24:
             raise CapabilityError(f"endpoint profile is not applicable: {codes}")
         if identity is not None and identity != profile.identity:
             raise CapabilityError("explicit identity contradicts endpoint profile identity")
+        effective_page_cap = _minimum_optional(page_cap_hint, profile.page_cap)
         return _ResolvedTraversal(
-            decision.selected_plan,
+            _narrow_plan_page_size(decision.selected_plan, effective_page_cap),
             identity or profile.identity,
             profile.query.selector,
             assurance=decision.assurance,
@@ -381,7 +387,7 @@ class Bitrix24:
             profile_source_sha256=profile.source_sha256,
             profile_evidence_sha256=tuple(anchor.artifact_sha256 for anchor in profile.evidence),
             profile_evidence_candidate_sha=profile.evidence[0].candidate_sha,
-            page_cap_hint=_minimum_optional(page_cap_hint, profile.page_cap),
+            page_cap_hint=effective_page_cap,
         )
 
     async def list_sequential(  # noqa: PLR0913 - compatibility bridge signature
@@ -1023,6 +1029,19 @@ def _cursor_take(value: object) -> Literal["max", "min"]:
 def _minimum_optional(first: int | None, second: int | None) -> int | None:
     values = tuple(value for value in (first, second) if value is not None)
     return min(values) if values else None
+
+
+def _narrow_plan_page_size(plan: ListPlan, page_cap: int | None) -> ListPlan:
+    """Keep the emitted request size consistent with a narrower wrapper cap."""
+    requested = getattr(plan, "requested_page_size", None)
+    if page_cap is None or requested is None or requested <= page_cap:
+        return plan
+    if isinstance(plan, CountedOffsetPlan):
+        fixed_stride = page_cap if plan.fixed_stride is not None else None
+        return replace(plan, requested_page_size=page_cap, fixed_stride=fixed_stride)
+    if isinstance(plan, OffsetSequentialPlan | KeysetPlan | ItemCursorPlan | PartitionedKeysetPlan):
+        return replace(plan, requested_page_size=page_cap)
+    return plan
 
 
 def _profile_query_paths(profile: EndpointProfile) -> tuple[ParameterPath, ParameterPath]:

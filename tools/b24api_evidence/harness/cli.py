@@ -254,8 +254,9 @@ def _plan(args: argparse.Namespace) -> ExitCode:
 def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
     _require_live_write_flags(args, "seed")
     _required_path(args.plan, "--plan")
-    plan = _load_plan(args)
+    plan = _read_plan(args)
     _require_approved_plan(plan, args=args)
+    _bind_plan_to_bundle(args, plan)
     validate_reviewed_profile_set(PROFILE_SET_PATH)
     manifest_path = _manifest_path(args)
     artifact_dir = args.artifact_dir.resolve()
@@ -790,8 +791,9 @@ def _resume(args: argparse.Namespace) -> ExitCode:
 
 def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
     _require_live_write_flags(args, "cleanup")
-    plan = _load_plan(args)
+    plan = _read_plan(args)
     _require_approved_plan(plan, args=args)
+    _bind_plan_to_bundle(args, plan)
     manifest_path = _manifest_path(args)
     records = load_manifest(manifest_path, expected=_lineage(plan))
     validate_manifest_against_plan(records, plan)
@@ -1255,6 +1257,13 @@ def _lineage(plan: Mapping[str, Any]) -> ManifestLineage:
 
 
 def _load_plan(args: argparse.Namespace, *, allow_generated: bool = False) -> dict[str, Any]:
+    plan = _read_plan(args, allow_generated=allow_generated)
+    _bind_plan_to_bundle(args, plan)
+    return plan
+
+
+def _read_plan(args: argparse.Namespace, *, allow_generated: bool = False) -> dict[str, Any]:
+    """Load and validate a plan without mutating its artifact bundle."""
     if args.plan is None:
         default = args.artifact_dir.resolve() / "dataset-plan.json"
         if not default.exists() and allow_generated:
@@ -1273,6 +1282,11 @@ def _load_plan(args: argparse.Namespace, *, allow_generated: bool = False) -> di
         raise ContractError("requested run_id does not match dataset plan")
     if args.lineage_id is not None and args.lineage_id != plan["lineage_id"]:
         raise ContractError("requested lineage_id does not match dataset plan")
+    return plan
+
+
+def _bind_plan_to_bundle(args: argparse.Namespace, plan: Mapping[str, Any]) -> None:
+    """Persist an admitted plan into its immutable artifact bundle."""
     artifact_dir = args.artifact_dir.resolve()
     bundled_plan_path = artifact_dir / "dataset-plan.json"
     _scan_bundle(artifact_dir)
@@ -1284,7 +1298,6 @@ def _load_plan(args: argparse.Namespace, *, allow_generated: bool = False) -> di
     else:
         atomic_write_json(bundled_plan_path, plan)
     _scan_bundle(artifact_dir)
-    return plan
 
 
 def _model_dataset_plan(*, run_id: str, lineage_id: str) -> dict[str, Any]:
