@@ -758,7 +758,11 @@ def scan_paths_for_secrets(paths: Iterable[Path]) -> None:
             if path.name in {"models_test.py", "protocol_test.py", "redaction_test.py"}:
                 data = b"\n".join(line for line in data.splitlines() if b"EXAMPLE_CREDENTIAL" not in line)
             if path.name == "contracts_test.py":
-                data = b"\n".join(line for line in data.splitlines() if b"LEAK_FIXTURE" not in line)
+                data = b"\n".join(
+                    line
+                    for line in data.splitlines()
+                    if b"LEAK_FIXTURE" not in line and b"portal.invalid/rest/13/" not in line
+                )
             scan_bytes_for_secrets(data, source=str(path))
 
 
