@@ -798,6 +798,24 @@ def git_sha(root: Path) -> str:
     return value
 
 
+def require_clean_tracked_tree(root: Path) -> None:
+    """Reject evidence from staged or unstaged tracked content outside HEAD."""
+    git = shutil.which("git")
+    if git is None:
+        raise ContractError("git executable is unavailable")
+    for arguments in (("diff", "--quiet", "--"), ("diff", "--cached", "--quiet", "--")):
+        result = subprocess.run(  # noqa: S603 - fixed git executable and literal arguments
+            [git, *arguments],
+            cwd=root,
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode == 1:
+            raise ContractError("evidence requires a clean tracked tree at the exact candidate SHA")
+        if result.returncode != 0:
+            raise ContractError("cannot verify tracked-tree cleanliness")
+
+
 def manifest_content_hash(path: Path) -> str:
     """Hash exact manifest bytes after validating the full chain."""
     load_manifest(path)

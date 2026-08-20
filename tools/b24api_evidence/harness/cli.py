@@ -39,6 +39,7 @@ from .contracts import (
     marker_sha256,
     marker_value,
     read_json_object,
+    require_clean_tracked_tree,
     scan_paths_for_secrets,
     tracked_repository_paths,
     validate_benchmark_plan,
@@ -103,6 +104,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _dispatch(args: argparse.Namespace) -> ExitCode:
+    require_clean_tracked_tree(ROOT)
     handlers: dict[str, Callable[[argparse.Namespace], ExitCode]] = {
         "plan": _plan,
         "seed": _seed,
