@@ -134,9 +134,18 @@ class LivePortal:
         webhook_url = None
         if invalid_configuration:
             raise ContractError("live credential configuration is invalid")
+        resolved_client: httpx.Client | None = None
+        client_initialization_failed = False
+        try:
+            resolved_client = httpx.Client(timeout=timeout, follow_redirects=False)
+        except Exception:  # noqa: BLE001 - sanitize environment/proxy constructor failures
+            client_initialization_failed = True
+        if client_initialization_failed:
+            normalized_webhook = None
+            raise LiveUnavailableError("live HTTP client configuration is invalid")
         self.identity = cast("PortalIdentity", identity)
         self._webhook_url = cast("str", normalized_webhook)
-        self._client = httpx.Client(timeout=timeout, follow_redirects=False)
+        self._client = cast("httpx.Client", resolved_client)
         self.attempts = 0
 
     def close(self) -> None:
@@ -151,7 +160,7 @@ class LivePortal:
         """Exit the context."""
         self.close()
 
-    def call_envelope(  # noqa: C901, PLR0912 - one boundary owns all raw response state
+    def call_envelope(  # noqa: C901, PLR0912, PLR0915 - one boundary owns all raw response state
         self,
         method: str,
         parameters: dict[str, Any] | None = None,
@@ -161,6 +170,7 @@ class LivePortal:
         payload: bytes | None = None
         status_code: int | None = None
         transport_failed = False
+        decoding_failed = False
         bounded_failure: str | None = None
         response: httpx.Response | None = None
         try:
@@ -170,18 +180,19 @@ class LivePortal:
                 json=parameters or {},
             ) as response:
                 status_code = response.status_code
-                if status_code == HTTP_OK:
-                    try:
-                        payload = _bounded_response_payload(response, method=method)
-                    except LiveCorrectnessError as error:
-                        bounded_failure = str(error)
+                try:
+                    payload = _bounded_response_payload(response, method=method)
+                except LiveCorrectnessError as error:
+                    bounded_failure = str(error)
+        except httpx.DecodingError:
+            decoding_failed = True
         except httpx.HTTPError:
             transport_failed = True
         response = None
+        if decoding_failed:
+            raise LiveCorrectnessError(f"live response decoding failed for {method}")
         if transport_failed:
             raise LiveUnavailableError(f"live transport unavailable for {method}")
-        if status_code != HTTP_OK:
-            raise LiveUnavailableError(f"live HTTP status {status_code} for {method}")
         if bounded_failure is not None:
             raise LiveCorrectnessError(bounded_failure)
         if payload is None:
@@ -194,9 +205,13 @@ class LivePortal:
             envelope = None
         payload = None
         if parse_failed:
+            if status_code != HTTP_OK:
+                raise LiveUnavailableError(f"live HTTP status {status_code} for {method}")
             raise LiveCorrectnessError(f"live response is not JSON for {method}")
         if not isinstance(envelope, dict):
             envelope = None
+            if status_code != HTTP_OK:
+                raise LiveUnavailableError(f"live HTTP status {status_code} for {method}")
             raise LiveCorrectnessError(f"live response envelope is not an object for {method}")
         if "error" in envelope:
             raw_code = envelope.get("error")
@@ -221,6 +236,9 @@ class LivePortal:
             if unavailable_code is not None:
                 raise LiveUnavailableError(f"live method unavailable for {method}: {unavailable_code}")
             raise LiveApiError(method=method, code=classified_code)
+        if status_code != HTTP_OK:
+            envelope = None
+            raise LiveUnavailableError(f"live HTTP status {status_code} for {method}")
         if "result" not in envelope:
             envelope = None
             raise LiveCorrectnessError(f"live response has no result for {method}")
@@ -313,7 +331,7 @@ class DisposableAdapter:
                 raise LiveCorrectnessError("read result lacks reviewed entity container")
             result = result.get(self.result_container)
         if result is None:
-            return None
+            raise LiveCorrectnessError("successful point read returned no entity")
         if not isinstance(result, dict):
             raise LiveCorrectnessError("read result is not an entity object")
         return result

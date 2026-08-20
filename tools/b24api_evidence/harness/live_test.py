@@ -146,6 +146,25 @@ def test_live_portal_configuration_error_drops_credential_locals(
     _assert_live_error_redacted(captured.value, sensitive_fragment)
 
 
+def test_live_portal_drops_webhook_when_httpx_client_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sensitive_fragment = "synthetic-live-client-init-fragment"
+    key = base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
+    monkeypatch.setenv("BITRIX24_EVIDENCE_FINGERPRINT_KEY", key)
+    monkeypatch.setenv(
+        "BITRIX24_API_WEBHOOK_URL",
+        f"https://example.invalid/rest/1/{sensitive_fragment}/",
+    )
+    monkeypatch.setenv("HTTPS_PROXY", "http://example.invalid:bad")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+
+    with pytest.raises(LiveUnavailableError, match="client configuration") as captured:
+        LivePortal(role="admin_full")
+
+    _assert_live_error_redacted(captured.value, sensitive_fragment)
+
+
 @pytest.mark.parametrize("response_case", ["scope", "build", "create", "missing_result"])
 def test_live_semantic_errors_drop_hostile_response_locals(
     monkeypatch: pytest.MonkeyPatch,
@@ -285,6 +304,56 @@ def test_point_read_classifies_typed_not_found_without_rendering_portal_text(
     with _portal(monkeypatch, handler) as portal:
         assert ADAPTERS["crm-deal-v1"].read(portal, "42") is None
         assert portal.attempts == 1
+
+
+def test_non_ok_point_read_still_classifies_structured_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "ERROR_NOT_FOUND"})
+
+    with _portal(monkeypatch, handler) as portal:
+        assert ADAPTERS["crm-deal-v1"].read(portal, "42") is None
+
+
+@pytest.mark.parametrize("profile_id", ["crm-deal-v1", "tasks-task-v1"])
+def test_successful_null_point_read_never_proves_absence(
+    monkeypatch: pytest.MonkeyPatch,
+    profile_id: str,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        result = None if profile_id == "crm-deal-v1" else {"task": None}
+        return httpx.Response(200, json={"result": result})
+
+    with (
+        _portal(monkeypatch, handler) as portal,
+        pytest.raises(
+            LiveCorrectnessError,
+            match="returned no entity",
+        ),
+    ):
+        ADAPTERS[profile_id].read(portal, "42")
+
+
+def test_invalid_content_encoding_is_correctness_not_unavailability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip", "content-type": "application/json"},
+            content=b"not-a-gzip-stream",
+        )
+
+    with (
+        _portal(monkeypatch, handler) as portal,
+        pytest.raises(
+            LiveCorrectnessError,
+            match="decoding failed",
+        ) as captured,
+    ):
+        portal.call("scope")
+    assert not isinstance(captured.value, LiveUnavailableError)
 
 
 def test_point_read_never_treats_not_found_substrings_as_absence(

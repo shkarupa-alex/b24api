@@ -12,7 +12,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, Self
+from typing import Protocol, Self, cast
 
 import httpx
 
@@ -122,8 +122,20 @@ class HttpxTransport:
         """Initialize instance state."""
         if not webhook_url.endswith("/"):
             webhook_url += "/"
-        self._webhook_url = webhook_url
-        self._client = client or httpx.AsyncClient()
+        resolved_client = client
+        client_initialization_failed = False
+        if resolved_client is None:
+            try:
+                resolved_client = httpx.AsyncClient()
+            except Exception:  # noqa: BLE001 - sanitize environment/proxy constructor failures
+                client_initialization_failed = True
+        normalized_webhook = webhook_url
+        webhook_url = ""
+        if client_initialization_failed:
+            normalized_webhook = ""
+            raise RuntimeError("HTTP client initialization failed")
+        self._webhook_url = normalized_webhook
+        self._client = cast("httpx.AsyncClient", resolved_client)
         self._owns_client = client is None
         self._closed = False
 

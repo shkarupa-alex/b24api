@@ -63,6 +63,27 @@ class CancellationTransport(httpx.AsyncBaseTransport):
         raise AssertionError("unreachable")
 
 
+def test_transport_constructor_drops_webhook_when_httpx_client_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sensitive_fragment = "synthetic-constructor-private-fragment"
+    monkeypatch.setenv("HTTPS_PROXY", "http://example.invalid:bad")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+
+    with pytest.raises(RuntimeError, match="initialization failed") as captured:
+        HttpxTransport(f"https://example.invalid/rest/1/{sensitive_fragment}/")
+
+    error = captured.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = error.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_filename.endswith("b24api/execution.py"):
+            for value in traceback.tb_frame.f_locals.values():
+                assert sensitive_fragment not in repr(value)
+        traceback = traceback.tb_next
+
+
 def _success(body: bytes = b'{"result":{"ok":true},"total":1,"next":1}') -> WireResponse:
     return WireResponse(status_code=200, headers=(("content-type", "application/json"),), body=body)
 
