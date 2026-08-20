@@ -5,7 +5,7 @@ import asyncio
 import contextlib
 import json
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -52,7 +52,7 @@ from b24api.plans import (
 from b24api.references import fan_out, iter_references
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, Callable, Iterator
 
 PAGE_SIZE = 1
 TWO_REFERENCES = 2
@@ -312,6 +312,25 @@ async def test_invalid_reference_contract_refuses_before_blocking_source_pull() 
 
     assert not pulled.is_set()
     assert transport.requests == []
+
+
+def test_invalid_reference_plan_type_refuses_at_construction() -> None:
+    source_touched = False
+
+    def source() -> Iterator[ReferenceRequest]:
+        nonlocal source_touched
+        source_touched = True
+        yield _reference("unreachable")
+
+    with pytest.raises(TypeError, match="canonical ListPlan"):
+        iter_references(
+            Executor(AsyncFunctionTransport(lambda _request: {"result": []})),
+            source(),
+            plan=cast("ListPlan", object()),
+            dispatch=DirectDispatch(),
+        )
+
+    assert not source_touched
 
 
 @pytest.mark.asyncio

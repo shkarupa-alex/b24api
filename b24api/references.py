@@ -991,6 +991,7 @@ def iter_references(  # noqa: PLR0913
     _whole_result: bool = False,
 ) -> ReferenceStream:
     """Construct a lazy bounded reference traversal stream without I/O."""
+    PaginationDriver.validate_plan(plan)
     if not isinstance(dispatch, BatchDispatch | DirectDispatch):
         raise TypeError("dispatch must be a canonical DispatchPlan")
     if not isinstance(output_order, ReferenceOutputOrder):

@@ -469,12 +469,19 @@ class PaginationDriver:
         return response
 
     @staticmethod
+    def validate_plan(plan: object) -> None:
+        """Reject values outside the closed canonical plan union."""
+        if not isinstance(plan, _PLAN_TYPES):
+            raise TypeError("plan must be a canonical ListPlan")
+
+    @staticmethod
     def validate_contract(
         plan: ListPlan,
         identity: IdentitySpec | None,
         policy: ExecutionPolicy,
     ) -> _EffectiveConsistency:
         """Validate request-independent plan/policy capabilities before input or I/O."""
+        PaginationDriver.validate_plan(plan)
         consistency = policy.consistency
         if (
             plan.identity_requirement is IdentityRequirement.COMPOSITE
@@ -715,8 +722,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         identity: IdentitySpec | None = None,
         policy: ExecutionPolicy | None = None,
     ) -> None:
-        if not isinstance(plan, _PLAN_TYPES):
-            raise TypeError("plan must be a canonical ListPlan")
+        PaginationDriver.validate_plan(plan)
         self._context = executor.context(policy)
         self._driver = PaginationDriver(
             executor,
