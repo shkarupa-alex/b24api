@@ -10,6 +10,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, cast
 
+from b24api.query import build_query
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 type JsonScalar = None | bool | int | float | str
@@ -398,6 +399,13 @@ class Request:
 
     def to_wire_parameters(self) -> dict[str, JsonValue]:
         return self.copy_parameters()
+
+    @property
+    def query(self) -> str:
+        """Return the committed PHP-style method/query representation."""
+        parameters = self.to_wire_parameters()
+        query = build_query(cast("dict[Any, Any]", parameters))
+        return self.method if not query else f"{self.method}?{query}"
 
     @property
     def summary(self) -> RequestSummary:

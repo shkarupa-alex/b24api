@@ -1,151 +1,190 @@
 # API client for Bitrix24
 
-Low-level API client with multiple strategies for lists gathering.
-All methods support retries.
+A correctness-first asynchronous Bitrix24 REST client. Version 2.0 uses one
+replay-aware executor for direct calls, batches, pagination, and reference
+fan-out. Traversal strategies are immutable plans; incomplete traversal never
+looks like normal generator exhaustion.
 
-## Regular call (any method)
+## Configuration and lifecycle
 
-```python
-import asyncio
+Set BITRIX24_API_WEBHOOK_URL and keep one client open for related work:
 
+~~~python
 from b24api import Bitrix24
 
+async with Bitrix24() as b24:
+    profile = await b24.call({"method": "profile"})
+~~~
 
-async def main():
-    async with Bitrix24() as b24:
-        result = await b24.call({"method": "user.access", "parameters": {"ACCESS": ["G2", "AU"]}})
-        print(result)
+The webhook is never included in exception text or reports. The host property
+returns only the configured host. Calling aclose explicitly is also supported.
 
+## Requests and retries
 
-asyncio.run(main())
-```
+Mapping requests contain method and optional parameters and replay_safety.
+Unknown top-level keys are rejected. Canonical Request values make replay
+intent explicit:
 
-## Batch call (any method, no limit)
+~~~python
+from b24api import Request
+from b24api.models import ReplaySafety
 
-```python
-import asyncio
+read = Request("crm.item.get", {"id": 7}, ReplaySafety.SAFE)
+write = Request("crm.item.add", {"fields": {"TITLE": "Example"}}, ReplaySafety.UNSAFE)
+~~~
 
-from b24api import Bitrix24
+call returns the decoded result. With raw=True it returns an immutable Response
+including total, next, time, and redacted HTTP evidence.
 
+~~~python
+result = await b24.call(read)
+response = await b24.call(read, raw=True)
+~~~
 
-async def main():
-    async with Bitrix24() as b24:
-        requests = ({"method": "user.update", "parameters": {"ID": u, "UF_SKYPE": ""}} for u in range(1000))
-        async for result in b24.batch(requests):
-            print(result)
+retry=False limits the call to one attempt. retry=True enables only retries that
+are permitted by the request replay safety and the ExecutionPolicy. UNKNOWN and
+UNSAFE writes are not repeated after a failure that may have reached the server.
 
+## Batch execution
 
-asyncio.run(main())
-```
+batch is fail-fast, preserves input order, and accepts bounded or unlimited
+synchronous and asynchronous inputs:
 
-## Gathering full list (slow)
-Applicable to list methods with `start=<offset>` support. 
-Fetches list chunks one by one.
+~~~python
+async for result in b24.batch(requests, batch_size=25):
+    consume(result)
+~~~
 
-```python
-import asyncio
+Use with_payload=True for (request, payload) inputs. Use list_method=True only
+for the committed compatibility flattening of a list or one-key list envelope.
 
-from b24api import Bitrix24
+For independent commands that must each receive a correlated result, use the
+separate tolerant API:
 
+~~~python
+from b24api import BatchFailure, BatchSuccess
 
-async def main():
-    async with Bitrix24() as b24:
-        async for item in b24.list_sequential({"method": "user.get"}):
-            print(item)
+async for outcome in b24.batch_outcomes(requests):
+    if isinstance(outcome, BatchSuccess):
+        consume(outcome.result)
+    else:
+        handle(outcome.error)
+~~~
 
+There is no errors= mode on batch. The explicit split keeps fail-fast and
+tolerant return types unambiguous. The codec accepts the observed Bitrix/PHP
+batch polymorphism: an empty associative map may arrive as JSON [] while a
+non-empty map arrives as a JSON object.
 
-asyncio.run(main())
-```
+## Explicit traversal
 
-## Gathering full list (faster)
-Applicable to list methods with `start=<offset>` support. 
-Fetches first list chunk with regular call, then fetches other chunks with `batch`.
-Approximately 3 times faster then `list_sequential`.
+New multi-page code supplies a canonical plan:
 
-```python
-import asyncio
+~~~python
+from b24api import IdentitySpec, Request, ResultSelector
+from b24api.models import IdentityCoercion
+from b24api.plans import KeysetPlan
 
-from b24api import Bitrix24
+identity = IdentitySpec(
+    item_path=("id",),
+    filter_key="ID",
+    order_key="id",
+    coercion=IdentityCoercion.DECIMAL_STRING_INTEGER,
+)
 
+stream = b24.iter_list(
+    Request("tasks.task.list"),
+    plan=KeysetPlan(),
+    selector=ResultSelector(("tasks",)),
+    identity=identity,
+)
 
-async def main():
-    async with Bitrix24() as b24:
-        async for item in b24.list_batched({"method": "user.get"}):
-            print(item)
+async with stream:
+    async for item in stream:
+        consume(item)
 
+print(stream.report)
+~~~
 
-asyncio.run(main())
-```
+Plans are exported from b24api.plans. Policies and reports are exported from
+b24api.models. Every stream owns a deterministic final OperationReport. If a
+legacy list/reference wrapper reaches FAILED, INCOMPLETE, CANCELLED, or a budget
+ceiling, it raises IncompleteTraversalError with that same final report.
 
-## Gathering full list (fastest)
-Applicable to list methods with `filter={<parameters>}` support. 
-Fetches first and last list chunk with batch call, then fetches other chunks with `batch`. Doesn't use counting (`start=-1`).
-Approximately 2 times faster then `list_batched`.
+fan_out handles already independent ReferenceRequest values. iter_reference
+binds ReferenceBinding updates to a base request and applies one explicit list
+plan with DirectDispatch or BatchDispatch. Tolerant reference mode yields
+ReferenceItem or ReferenceFailure instead of losing correlation.
 
-```python
-import asyncio
+## Compatibility wrappers
 
-from b24api import Bitrix24
+The committed wrappers remain callable and delegate to the same engine:
 
+- list_sequential uses OffsetSequentialPlan.
+- list_batched uses correctness-first counted traversal; the zero-profile
+  fallback is sequential.
+- list_batched_no_count uses exact sequential KeysetPlan.
+- reference_batched_no_count uses per-reference keyset traversal with
+  BatchDispatch.
+- reference_cursor_no_count uses ItemCursorPlan with BatchDispatch.
+- list_keyset is a thin public KeysetPlan wrapper and is intentionally not a
+  root export.
 
-async def main():
-    async with Bitrix24() as b24:
-        async for item in b24.list_batched_no_count({"method": "user.get"}):
-            print(item)
+Each wrapper accepts only the committed arguments plus the keyword-only bridges
+plan, profile, identity, and policy. Resolution is explicit plan, then explicit
+profile, then the deterministic wrapper default. plan and profile together
+refuse before I/O. Until reviewed endpoint profiles are packaged, profile also
+refuses before I/O.
 
+Read wrappers set SAFE only when replay_safety was not supplied. An explicitly
+UNSAFE request is never upgraded.
 
-asyncio.run(main())
-```
+Legacy wrappers retain the historical one-key result fallback. Canonical
+iter_list remains exact: ResultSelector.root() means the root itself must be a
+list. Use an explicit selector for nested or multi-key envelopes.
 
-## Gathering full list with required reference
-Applicable to list methods with `select=[<fields>]` and `filter={<parameters>}` support and required filter parameters. 
-Fetches first and last list chunk with batch call, then fetches other chunks with `batch`. Doesn't use counting (`start=-1`).
+## Authorized 2.0 corrections
 
-```python
-import asyncio
+The compatibility suite snapshots these deliberate corrections:
 
-from b24api import Bitrix24
+- identity and parameter-casing validation;
+- counted-offset stride correction;
+- non-advancing continuation and ignored-offset detection;
+- contract-qualified short-page handling;
+- duplicate detection and classification;
+- structured normalized errors with redacted request summaries;
+- replay-safe retry behavior;
+- incomplete range detection and typed refusal instead of silent omission.
 
+The reviewed batch wire uses integer halt values and stable correlation keys.
+These are internal wire-shape changes inherited from the accepted execution
+foundation; yielded values and command order remain compatible.
 
-async def main():
-    async with Bitrix24() as b24:
-        deal_ids = [1, 2, 3]  # deals IDs (e.g. from "crm.deal.list" call)
-        filter_updates = ({"=ENTITY_ID": i} for i in deal_ids)
-        items = b24.reference_batched_no_count(
-            {"method": "crm.timeline.comment.list", "parameters": {"filter": {"ENTITY_TYPE": "deal"}}},
-            filter_updates,
-        )
-        async for item in items:
-            print(item)
+Dirty prototype features such as errors=, reference_batch, automatic OR
+splitting, hidden strategy selection, and Response.items() are not public 2.0
+contracts.
 
+## Public imports
 
-asyncio.run(main())
-```
+The root package exports exactly:
 
-## Gathering full list with cursor pagination per reference
-Applicable to list methods that paginate via a dedicated top-level cursor parameter (`LAST_ID`, `FIRST_ID`) per reference instead of the standard `>ID` filter — e.g. most `im.*` list methods. Pagination within a single reference is strictly sequential; each round-trip fires up to `batch_size` requests in parallel, mixing new first-page requests with in-flight continuations as the FIFO queue rotates (so continuations may be served before later-arriving first-pages).
+~~~python
+[
+    "ApiResponseError",
+    "BatchFailure",
+    "BatchSuccess",
+    "Bitrix24",
+    "ExecutionPolicy",
+    "IdentitySpec",
+    "ReferenceFailure",
+    "ReferenceItem",
+    "Request",
+    "Response",
+    "ResultSelector",
+]
+~~~
 
-```python
-import asyncio
-
-from b24api import Bitrix24
-
-
-async def main():
-    async with Bitrix24() as b24:
-        dialog_ids = ["chat1", "chat2", "chat3"]
-        references = ({"DIALOG_ID": d} for d in dialog_ids)
-        items = b24.reference_cursor_no_count(
-            {"method": "im.dialog.messages.get", "parameters": {}},
-            references,
-            cursor_param="LAST_ID",   # name of the cursor parameter the API accepts
-            cursor_field="id",         # field in each item that holds its id
-            cursor_take="min",         # "min" = older messages direction; "max" = newer
-            result_key="messages",     # required for multi-key responses
-        )
-        async for item in items:
-            print(item)
-
-
-asyncio.run(main())
-```
+For one major compatibility release, b24api.entity keeps ListRequest,
+ListRequestParameters, ErrorResponse, and BatchResult importable and aliases
+Request, Response, and ResponseTime to the canonical immutable models.
+b24api.type.ApiTypes and b24api.query.build_query also remain importable.

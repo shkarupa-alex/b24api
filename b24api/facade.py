@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from pydantic_core import to_jsonable_python
 
 from b24api.batch import BatchExecutor, BatchInput, BatchStream
-from b24api.entity import Request as LegacyRequest
+from b24api.entity import LegacyRequest
 from b24api.error import CapabilityError, IncompleteTraversalError
 from b24api.execution import Executor, HttpxTransport
 from b24api.models import (
@@ -33,7 +33,7 @@ from b24api.models import (
     TerminalState,
     TotalSemantics,
 )
-from b24api.pagination import ItemStream
+from b24api.pagination import _LEGACY_RESULT_SELECTOR, ItemStream
 from b24api.pagination import iter_list as iter_list_stream
 from b24api.plans import (
     PORTAL_BATCH_CAP,
@@ -286,11 +286,13 @@ class Bitrix24:
                 total_semantics=TotalSemantics.FILTERED_EXACT,
             ),
         )
-        stream = self.iter_list(
+        stream = iter_list_stream(
+            self._executor,
             _as_read_request(_canonical_request(request)),
             plan=selected,
+            selector=_LEGACY_RESULT_SELECTOR,
             identity=identity,
-            policy=policy,
+            policy=policy or self._default_policy,
         )
         async for item in _completed_items(stream):
             yield item
@@ -310,11 +312,13 @@ class Bitrix24:
         _validate_positive_optional(list_size, "list_size")
         _validate_batch_size(batch_size)
         selected = _resolve_plan(plan, profile, CountedOffsetPlan())
-        stream = self.iter_list(
+        stream = iter_list_stream(
+            self._executor,
             _as_read_request(_canonical_request(request)),
             plan=selected,
+            selector=_LEGACY_RESULT_SELECTOR,
             identity=identity,
-            policy=policy,
+            policy=policy or self._default_policy,
         )
         async for item in _completed_items(stream):
             yield item
@@ -336,11 +340,13 @@ class Bitrix24:
         _validate_batch_size(batch_size)
         resolved_identity = identity or _legacy_identity(id_key)
         selected = _resolve_plan(plan, profile, _keyset_default())
-        stream = self.iter_list(
+        stream = iter_list_stream(
+            self._executor,
             _as_read_request(_canonical_request(request)),
             plan=selected,
+            selector=_LEGACY_RESULT_SELECTOR,
             identity=resolved_identity,
-            policy=policy,
+            policy=policy or self._default_policy,
         )
         async for item in _completed_items(stream):
             yield item
@@ -401,6 +407,7 @@ class Bitrix24:
             sources,
             plan=selected,
             dispatch=dispatch,
+            selector=_LEGACY_RESULT_SELECTOR,
             identity=resolved_identity,
             output_order=output_order,
             policy=policy or self._default_policy,
@@ -465,7 +472,7 @@ class Bitrix24:
             sources,
             plan=selected,
             dispatch=dispatch,
-            selector=selector,
+            selector=selector if result_key is not None else _LEGACY_RESULT_SELECTOR,
             identity=resolved_identity,
             output_order=output_order,
             policy=policy or self._default_policy,
@@ -650,13 +657,22 @@ def _legacy_list_result(result: JsonValue) -> list[JsonValue]:
 
 
 async def _completed_items(stream: ItemStream) -> AsyncGenerator[JsonValue]:
+    primary: BaseException | None = None
     try:
         async for item in stream:
             yield item
+    except BaseException as error:  # noqa: BLE001 - cancellation also needs the final report
+        primary = error
     finally:
-        await stream.aclose()
+        try:
+            await stream.aclose()
+        except BaseException as cleanup_error:  # noqa: BLE001 - cleanup can fail with cancellation
+            if primary is None:
+                primary = cleanup_error
     if stream.report.state is not TerminalState.COMPLETED:
-        raise IncompleteTraversalError(report=stream.report)
+        raise IncompleteTraversalError(report=stream.report) from primary
+    if primary is not None:
+        raise primary
 
 
 def _binding_requests(
@@ -805,17 +821,36 @@ async def _legacy_reference_items(
     *,
     with_payload: bool,
 ) -> AsyncGenerator[JsonValue | tuple[JsonValue, object]]:
+    primary: BaseException | None = None
     try:
         async for outcome in stream:
-            if isinstance(outcome, ReferenceFailure):
-                raise cast("BaseException", outcome.error)
-            if not isinstance(outcome, ReferenceItem):
-                raise TypeError("reference stream yielded an unknown outcome")
-            yield (outcome.item, outcome.payload) if with_payload else outcome.item
+            yield _legacy_reference_value(outcome, with_payload=with_payload)
+    except BaseException as error:  # noqa: BLE001 - cancellation also needs the final report
+        primary = error
     finally:
-        await stream.aclose()
+        try:
+            await stream.aclose()
+        except BaseException as cleanup_error:  # noqa: BLE001 - cleanup can fail with cancellation
+            if primary is None:
+                primary = cleanup_error
     if stream.report.state is not TerminalState.COMPLETED:
-        raise IncompleteTraversalError(report=stream.report)
+        raise IncompleteTraversalError(report=stream.report) from primary
+    if primary is not None:
+        raise primary
+
+
+def _legacy_reference_value(
+    outcome: ReferenceItem | ReferenceFailure,
+    *,
+    with_payload: bool,
+) -> JsonValue | tuple[JsonValue, object]:
+    if isinstance(outcome, ReferenceFailure):
+        if not isinstance(outcome.error, BaseException):
+            raise TypeError("reference failure does not contain an exception")
+        raise outcome.error
+    if not isinstance(outcome, ReferenceItem):
+        raise TypeError("reference stream yielded an unknown outcome")
+    return (outcome.item, outcome.payload) if with_payload else outcome.item
 
 
 __all__ = ["Bitrix24"]

@@ -261,7 +261,9 @@ class PaginationDriver:
         response = await self._fetch(self.request)
         qualified_count = (
             len(response.result)
-            if self._single_result_as_item and self.selector.path == () and isinstance(response.result, list)
+            if self._single_result_as_item
+            and self.selector.path == ()
+            and isinstance(response.result, list)
             else None
         )
         items = (
@@ -941,7 +943,19 @@ def _child_path(parent: ParameterPath, child: str) -> ParameterPath:
     return ParameterPath((*parent.path, child))
 
 
+class _LegacyResultSelector(ResultSelector):
+    """Internal marker for the committed one-key result fallback."""
+
+
+_LEGACY_RESULT_SELECTOR = _LegacyResultSelector.root()
+
+
 def _response_items(response: Response, selector: ResultSelector, *, single: bool = False) -> list[JsonValue]:
+    if isinstance(selector, _LegacyResultSelector):
+        try:
+            return response.list_result
+        except TypeError as error:
+            raise CapabilityError("response result is not an unambiguous legacy list") from error
     if single and selector.path == () and not isinstance(response.result, list):
         return [response.result]
     try:
