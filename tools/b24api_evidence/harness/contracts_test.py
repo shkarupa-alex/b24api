@@ -914,6 +914,27 @@ def test_benchmark_rejects_per_observation_timing_redistribution(tmp_path: Path)
         cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - per-observation timing binding
 
 
+def test_benchmark_observation_counters_reject_boolean_integer_aliases(tmp_path: Path) -> None:
+    result = _run_cli("benchmark", "--artifact-dir", str(tmp_path))
+    assert result.returncode == ExitCode.COMPLETED, result.stderr
+    matrix_path = tmp_path / "model-matrix.json"
+    artifact_path = tmp_path / "benchmark-evidence.json"
+    matrix = json.loads(matrix_path.read_text())
+    artifact = json.loads(artifact_path.read_text())
+    old_hash = content_sha256(matrix)
+    observation = next(run for run in matrix["runs"] if run["requests"] == 1)
+    observation["requests"] = True
+    new_hash = content_sha256(matrix)
+    artifact["evidence_refs"] = [
+        f"sha256:{new_hash}" if value == f"sha256:{old_hash}" else value
+        for value in artifact["evidence_refs"]
+    ]
+    matrix_path.write_text(json.dumps(matrix))
+    artifact_path.write_text(json.dumps(artifact))
+    with pytest.raises(ContractError, match="exact non-negative integers"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - bool/int alias regression
+
+
 def test_bundle_rejects_evidence_from_two_runs_even_when_each_document_is_valid(tmp_path: Path) -> None:
     first = _run_cli(
         "plan",

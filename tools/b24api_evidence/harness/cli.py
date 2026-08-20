@@ -1687,6 +1687,7 @@ def _validate_model_observations(
             or not isinstance(plan_name, str)
         ):
             raise ContractError("benchmark model observation identity is malformed")
+        _validate_observation_value_types(observation)
         key = (iteration, case_id, plan_name)
         observed_keys.add(key)
         case = cases.get(case_id)
@@ -1756,6 +1757,23 @@ def _validate_observation_timing(observation: Mapping[str, Any]) -> None:
             raise ContractError("benchmark observation first-row time is invalid")
     elif first is not None:
         raise ContractError("empty benchmark observation cannot report a first-row time")
+
+
+def _validate_observation_value_types(observation: Mapping[str, Any]) -> None:
+    identities = observation["identities"]
+    if not isinstance(identities, list) or any(type(value) is not int or value < 0 for value in identities):
+        raise ContractError("benchmark observation identities must be exact non-negative integers")
+    integer_fields = ("requests", "logical_pages", "buffered_rows_high_water", "mutation_retries")
+    if any(type(observation[field]) is not int or observation[field] < 0 for field in integer_fields):
+        raise ContractError("benchmark observation counters must be exact non-negative integers")
+    operating = observation["operating_seconds"]
+    if (
+        isinstance(operating, bool)
+        or not isinstance(operating, int | float)
+        or not math.isfinite(operating)
+        or operating < 0
+    ):
+        raise ContractError("benchmark observation operating time must be finite and non-negative")
 
 
 def _validate_benchmark_metric_algebra(observations: list[dict[str, Any]], artifact: Mapping[str, Any]) -> None:
