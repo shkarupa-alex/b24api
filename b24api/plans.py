@@ -204,7 +204,12 @@ class KeysetPlan(PlanContract):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ItemCursorPlan(PlanContract):
-    """Sequential item-derived cursor with independent row-order semantics."""
+    """Sequential item cursor whose type and order are independent of row identity.
+
+    Continued pages require unique, strictly monotonic cursor values. Under
+    that admitted contract, ``min``/``max`` are compatibility aliases of
+    ``first``/``last`` rather than distinct traversal capabilities.
+    """
 
     cursor_request_path: ParameterPath = _LAST_ID_PATH
     cursor_item_path: tuple[str | int, ...] = ("id",)

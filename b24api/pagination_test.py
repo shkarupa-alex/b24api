@@ -36,6 +36,7 @@ from b24api.plans import (
     CursorTerminalRule,
     ItemCursorPlan,
     KeysetPlan,
+    KeysetTerminalRule,
     ListPlan,
     OffsetContinuation,
     OffsetSequentialPlan,
@@ -622,6 +623,109 @@ async def test_unreviewed_parallel_and_partitioned_strategies_refuse_before_io()
             await _collect(stream)
 
     assert transport.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("plan", "policy", "message"),
+    [
+        (
+            SingleResponsePlan(),
+            ExecutionPolicy(
+                consistency=ConsistencyPolicy(
+                    confirmation_policy=ConfirmationPolicy.INDEPENDENT_ORACLE,
+                ),
+            ),
+            "independent oracle",
+        ),
+        (
+            SingleResponsePlan(),
+            ExecutionPolicy(
+                consistency=ConsistencyPolicy(
+                    confirmation_policy=ConfirmationPolicy.BOUNDARY_ID_SEEN,
+                ),
+            ),
+            "boundary identity",
+        ),
+        (
+            SingleResponsePlan(order_semantics=OrderSemantics.INPUT),
+            ExecutionPolicy(),
+            "input order semantics",
+        ),
+        (
+            SingleResponsePlan(),
+            ExecutionPolicy(
+                consistency=ConsistencyPolicy(order_semantics=OrderSemantics.INPUT),
+            ),
+            "input order semantics",
+        ),
+    ],
+)
+async def test_unadmitted_consistency_controls_refuse_before_io(
+    plan: ListPlan,
+    policy: ExecutionPolicy,
+    message: str,
+) -> None:
+    transport = FunctionTransport(lambda _request: {"result": []})
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        policy=policy,
+    )
+
+    with pytest.raises(CapabilityError, match=message):
+        await anext(stream)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("plan", "row", "terminal_reason"),
+    [
+        (
+            KeysetPlan(
+                identity_requirement=IdentityRequirement.REQUIRED,
+                order_semantics=OrderSemantics.ASCENDING,
+                limit_path=ParameterPath(("limit",)),
+                requested_page_size=PAGE_SIZE,
+                terminal=KeysetTerminalRule.PROFILE_SHORT_PAGE,
+            ),
+            {"ID": 1},
+            "profile-authorized short keyset page",
+        ),
+        (
+            ItemCursorPlan(
+                identity_requirement=IdentityRequirement.REQUIRED,
+                cursor_item_path=("cursor",),
+                limit_path=ParameterPath(("limit",)),
+                requested_page_size=PAGE_SIZE,
+                terminal=CursorTerminalRule.PROFILE_SHORT_PAGE,
+            ),
+            {"ID": 1, "cursor": 10},
+            "profile-authorized short cursor page",
+        ),
+    ],
+)
+async def test_profile_short_page_terminates_keyset_and_cursor_traversal(
+    plan: ListPlan,
+    row: JsonValue,
+    terminal_reason: str,
+) -> None:
+    transport = FunctionTransport(lambda _request: {"result": [row]})
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list"),
+        plan=plan,
+        identity=_identity(),
+    )
+
+    assert await _collect(stream) == [row]
+    assert len(transport.requests) == 1
+    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.assurance is CompletionAssurance.CALLER_ASSERTED
+    assert stream.report.violations == ()
+    assert stream.report.terminal_reason == terminal_reason
 
 
 @pytest.mark.asyncio
