@@ -88,6 +88,9 @@ def test_live_envelope_refuses_oversized_content_before_buffering(
     [
         ({"task": "N"}, {"VERSION": "build-1"}),
         (["task"], {"VERSION": True}),
+        (["task"], {"VERSION": " "}),
+        (["task"], {"VERSION": "A" * 101}),
+        (["task"], {"VERSION": int("9" * 101)}),
     ],
 )
 def test_live_preflight_rejects_hostile_scope_and_build_types(
@@ -102,6 +105,17 @@ def test_live_preflight_rejects_hostile_scope_and_build_types(
 
     with _portal(monkeypatch, handler) as portal, pytest.raises(LiveCorrectnessError):
         portal.preflight(required_scopes={"task"})
+
+
+def test_live_preflight_preserves_exact_build_at_schema_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = "A" * 99 + "X"
+    results = iter((["task"], {"VERSION": expected}))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"result": next(results)})
+
+    with _portal(monkeypatch, handler) as portal:
+        assert portal.preflight(required_scopes={"task"}).build == expected
 
 
 def test_streamed_response_has_no_per_chunk_retention_amplification() -> None:

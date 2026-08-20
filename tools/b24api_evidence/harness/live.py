@@ -15,6 +15,7 @@ HTTP_OK = 200
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_MARKER_SCAN_PAGES = 1_000
 MAX_EXACT_MARKER_MATCHES = 2
+MAX_BUILD_LENGTH = 100
 
 
 class LiveUnavailableError(RuntimeError):
@@ -152,11 +153,14 @@ class LivePortal:
                 if key not in app:
                     continue
                 value = app.get(key)
-                if isinstance(value, str) and value:
-                    build = str(value)[:100]
+                if isinstance(value, str) and value.strip() and len(value) <= MAX_BUILD_LENGTH:
+                    build = value
                     break
                 if isinstance(value, int) and not isinstance(value, bool):
-                    build = str(value)[:100]
+                    rendered = str(value)
+                    if len(rendered) > MAX_BUILD_LENGTH:
+                        raise LiveCorrectnessError("app.info build exceeds the semantic length ceiling")
+                    build = rendered
                     break
                 raise LiveCorrectnessError("app.info build has an invalid semantic type")
         return LivePreflight(identity=self.identity, build=build, scopes=scopes)

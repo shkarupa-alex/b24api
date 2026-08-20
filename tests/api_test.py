@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 from pydantic import ValidationError
+from pydantic_settings import SettingsError
 
 if TYPE_CHECKING:
     from pytest_httpx import HTTPXMock
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
 from b24api.api import Bitrix24
 from b24api.error import ApiResponseError, HTTPGatewayError, IncompleteTraversalError
 from b24api.models import BatchSuccess, ReplaySafety, Request, Response
-from b24api.settings import Settings
+from b24api.settings import Settings, api_settings
 
 _WEBHOOK = "https://bitrix24.com/rest/0/test/"
 _NEXT_OFFSET = 50
@@ -113,6 +114,70 @@ def test_environment_settings_error_drops_framework_credential_locals(
         Settings()
 
     traceback = captured.value.__traceback__
+    while traceback is not None:
+        filename = Path(traceback.tb_frame.f_code.co_filename)
+        if filename.name != "api_test.py":
+            for value in traceback.tb_frame.f_locals.values():
+                assert sensitive_fragment not in repr(value)
+        traceback = traceback.tb_next
+
+
+@pytest.mark.parametrize("entrypoint", ["api", "mapping", "json", "malformed_json", "strings"])
+def test_alternative_settings_validation_drops_credential_surfaces(entrypoint: str) -> None:
+    sensitive_fragment = "synthetic-alternative-validation-token"
+    webhook = f"https://example.invalid/rest/1/{sensitive_fragment}/"
+
+    def validate() -> None:
+        if entrypoint == "api":
+            api_settings(webhook_url=webhook, batch_size=51)
+        elif entrypoint == "mapping":
+            Settings.model_validate({"webhook_url": webhook, "batch_size": 51})
+        elif entrypoint == "json":
+            Settings.model_validate_json(json.dumps({"webhook_url": webhook, "batch_size": 51}))
+        elif entrypoint == "malformed_json":
+            Settings.model_validate_json(f'{{"webhook_url":"{webhook}"')
+        else:
+            Settings.model_validate_strings({"webhook_url": webhook, "batch_size": "51"})
+
+    with pytest.raises(ValidationError) as captured:
+        validate()
+
+    error = captured.value
+    surfaces = (str(error), repr(error), repr(error.errors()), error.json())
+    assert all(sensitive_fragment not in surface for surface in surfaces)
+    traceback = error.__traceback__
+    while traceback is not None:
+        filename = Path(traceback.tb_frame.f_code.co_filename)
+        if filename.name != "api_test.py":
+            for value in traceback.tb_frame.f_locals.values():
+                assert sensitive_fragment not in repr(value)
+        traceback = traceback.tb_next
+
+
+def test_alternative_settings_validation_preserves_valid_compatibility() -> None:
+    webhook = "https://example.invalid/rest/1/synthetic-valid-token/"
+
+    assert str(Settings.model_validate({"webhook_url": webhook}).webhook_url) == webhook
+    assert str(Settings.model_validate_json(json.dumps({"webhook_url": webhook})).webhook_url) == webhook
+    assert str(Settings.model_validate_strings({"webhook_url": webhook}).webhook_url) == webhook
+
+
+def test_environment_settings_loading_error_drops_credential_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sensitive_fragment = "synthetic-settings-source-token"
+    monkeypatch.setenv(
+        "BITRIX24_API_WEBHOOK_URL",
+        f"https://example.invalid/rest/1/{sensitive_fragment}/",
+    )
+    monkeypatch.setenv("BITRIX24_API_SCOPES", "not-json")
+
+    with pytest.raises(SettingsError) as captured:
+        Settings()
+
+    error = captured.value
+    assert sensitive_fragment not in str(error)
+    traceback = error.__traceback__
     while traceback is not None:
         filename = Path(traceback.tb_frame.f_code.co_filename)
         if filename.name != "api_test.py":

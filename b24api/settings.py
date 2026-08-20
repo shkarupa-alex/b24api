@@ -1,15 +1,34 @@
 """Support settings."""
 
 from collections.abc import Generator
-from typing import Annotated, Any
+from typing import Annotated, Any, Self, cast
 
 from fast_depends import Depends
 from httpx import codes
 from pydantic import Field, HttpUrl, TypeAdapter, ValidationError, field_serializer, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic.config import ExtraValues
+from pydantic_core import PydanticCustomError
+from pydantic_settings import BaseSettings, SettingsConfigDict, SettingsError
 
 _WEBHOOK_ADAPTER = TypeAdapter(HttpUrl)
 _REDACTED = "[REDACTED]"
+
+
+def _settings_validation_error() -> ValidationError:
+    return ValidationError.from_exception_data(
+        "Settings",
+        [
+            {
+                "type": PydanticCustomError("settings_validation", "Settings validation failed"),
+                "loc": (),
+                "input": _REDACTED,
+            },
+        ],
+    )
+
+
+def _settings_loading_error() -> SettingsError:
+    return SettingsError("Settings loading failed")
 
 
 class Settings(BaseSettings):
@@ -50,14 +69,114 @@ class Settings(BaseSettings):
 
     def __init__(self, **data: Any) -> None:  # noqa: ANN401
         """Validate without retaining credential-bearing framework traceback frames."""
-        failure: ValidationError | None = None
+        validation_failed = False
+        loading_failed = False
         try:
             super().__init__(**data)
-        except ValidationError as error:
-            failure = error.with_traceback(None)
+        except ValidationError:
+            validation_failed = True
+        except SettingsError:
+            loading_failed = True
         data.clear()
-        if failure is not None:
-            raise failure
+        if validation_failed:
+            raise _settings_validation_error()
+        if loading_failed:
+            raise _settings_loading_error()
+
+    @classmethod
+    def model_validate(  # noqa: PLR0913
+        cls,
+        obj: Any,  # noqa: ANN401
+        *,
+        strict: bool | None = None,
+        extra: ExtraValues | None = None,
+        from_attributes: bool | None = None,
+        context: Any | None = None,  # noqa: ANN401
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        """Validate mappings without retaining credential-bearing inputs."""
+        result: Self | None = None
+        failed = False
+        try:
+            result = super().model_validate(
+                obj,
+                strict=strict,
+                extra=extra,
+                from_attributes=from_attributes,
+                context=context,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+        except ValidationError:
+            failed = True
+        obj = None
+        context = None
+        if failed:
+            raise _settings_validation_error()
+        return cast("Self", result)
+
+    @classmethod
+    def model_validate_json(  # noqa: PLR0913
+        cls,
+        json_data: str | bytes | bytearray,
+        *,
+        strict: bool | None = None,
+        extra: ExtraValues | None = None,
+        context: Any | None = None,  # noqa: ANN401
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        """Validate JSON without retaining credential-bearing inputs."""
+        result: Self | None = None
+        failed = False
+        try:
+            result = super().model_validate_json(
+                json_data,
+                strict=strict,
+                extra=extra,
+                context=context,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+        except ValidationError:
+            failed = True
+        json_data = b""
+        context = None
+        if failed:
+            raise _settings_validation_error()
+        return cast("Self", result)
+
+    @classmethod
+    def model_validate_strings(  # noqa: PLR0913
+        cls,
+        obj: Any,  # noqa: ANN401
+        *,
+        strict: bool | None = None,
+        extra: ExtraValues | None = None,
+        context: Any | None = None,  # noqa: ANN401
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        """Validate string mappings without retaining credential-bearing inputs."""
+        result: Self | None = None
+        failed = False
+        try:
+            result = super().model_validate_strings(
+                obj,
+                strict=strict,
+                extra=extra,
+                context=context,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+        except ValidationError:
+            failed = True
+        obj = None
+        context = None
+        if failed:
+            raise _settings_validation_error()
+        return cast("Self", result)
 
     @field_validator("webhook_url", mode="before")
     @classmethod
@@ -89,7 +208,21 @@ class Settings(BaseSettings):
 
 def api_settings(**kwargs: Any) -> Settings:  # noqa: ANN401
     """Return validated API settings."""
-    return Settings(**kwargs)
+    result: Settings | None = None
+    validation_failed = False
+    loading_failed = False
+    try:
+        result = Settings(**kwargs)
+    except ValidationError:
+        validation_failed = True
+    except SettingsError:
+        loading_failed = True
+    kwargs.clear()
+    if validation_failed:
+        raise _settings_validation_error()
+    if loading_failed:
+        raise _settings_loading_error()
+    return cast("Settings", result)
 
 
 ApiSettings = Annotated[Settings, Depends(api_settings)]
