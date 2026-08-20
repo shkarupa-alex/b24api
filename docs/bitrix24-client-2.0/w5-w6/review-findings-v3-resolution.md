@@ -1,5 +1,11 @@
 # W5/W6 v3 human findings resolution
 
+> **Evidence correction.** Packet v4 correctly listed COMPOSITE as refused,
+> but overstated its committed pre-source coverage: the committed test covered
+> `iter_list`, while `iter_references` existed only as a clean-room scratch
+> probe. Handoff review rejected that claim. The committed reference-source
+> regression is added by `a29b58f...`; see `review-findings-v4-resolution.md`.
+
 Rejected code subject:
 `8ba3c40ca85f5e7c7123a2aec332c2dfe11f27d5`.
 
@@ -25,7 +31,7 @@ contract matrix.
 
 | v3 packet finding | v4 disposition |
 |---|---|
-| The pre-I/O refusal list omitted `IdentityRequirement.COMPOSITE`, and no committed test protected it. | v4 lists it as the fifth constructible but unadmitted control. A parameterized regression proves plan-level and policy-level refusal before source pull or HTTP I/O. |
+| The pre-I/O refusal list omitted `IdentityRequirement.COMPOSITE`, and no committed test protected it. | v4 listed it as the fifth constructible but unadmitted control and committed plan/policy `iter_list` coverage. Its broader pre-source evidence claim was rejected because `iter_references` remained scratch-only; v5 adds the missing committed reference-source regression. |
 | The admitted ItemCursor surface did not explain that cursor values must be unique and strictly monotonic within each continued page. | v4 states this restriction and records a binding W7 obligation not to expose a nonunique cursor field without a separately reviewed tie-breaker/composite contract. |
 | `cursor_take=min/max` are observationally equivalent to `first/last` under the admitted strict ordering contract. | v4 and the W7 obligations identify these as aliases, not distinct public capabilities. |
 | Empty batch arrays weigh zero but the consequence was unstated. | v4 states that they consume no decoded-row budget while command/outcome count remains bounded by the hard portal batch limit of 50. |

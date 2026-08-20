@@ -1,41 +1,39 @@
-# W5/W6 review packet v4 — bounded traversal foundation
-
-> **Superseded.** Independent handoff review rejected this packet because its
-> claimed committed COMPOSITE pre-source evidence covered `iter_list` but not
-> `iter_references`. The production behavior was correct; the missing committed
-> regression and replacement decision request are recorded in
-> `review-findings-v4-resolution.md` and `review-packet-v5.md`.
+# W5/W6 review packet v5 — bounded traversal foundation
 
 ## Decision requested
 
-Review exact code SHA
-`fd1fb727c4a13d748539948188a8375e8bbf80aa` and either accept it as the
+Review exact code-and-test SHA
+`a29b58f3faba9a71202bbe1e9a4aab0f770b369b` and either accept it as the
 W5/W6 traversal foundation for W7 integration or return findings against that
 same SHA.
 
-The previous code subject `8ba3c40...` and packet v3 are superseded. Their
-findings and resolutions are recorded in `review-findings-v3-resolution.md`;
-the earlier history remains in the v1 and v2 resolution documents.
+The previous code subject `fd1fb727...` remains production-equivalent, but
+packet v4 is superseded because its immutable regression set did not prove one
+of its evidence claims. The exact handoff finding and replacement test are in
+`review-findings-v4-resolution.md`; earlier history remains in the v1–v3
+resolution documents.
 
 ## Immutable inputs, base, and lineage
 
-- final code SHA: `fd1fb727c4a13d748539948188a8375e8bbf80aa`;
+- final code-and-test SHA: `a29b58f3faba9a71202bbe1e9a4aab0f770b369b`;
+- production tree is identical to clean-room-admitted `fd1fb727...`;
 - exact W5/W6 branch point: `99c13fa3be0bbdbd8248829da7df5ed55c7d2dc9`;
 - accepted W3/W4 dependency: `521f0eb7cb107ec948c693496154f94e57dbf7c9`;
 - W5 initial code: `bc75c3357ed17715f8461e83b3449efed3e69ece`;
 - W6 initial code: `1f2ebe95b4539e736382ce359ed4b88f3878d77b`;
-- remediation **code commits only**: `5e2c8a1`, `91b918b`, `6a26c73`,
+- remediation **code/test commits only**: `5e2c8a1`, `91b918b`, `6a26c73`,
   `bf6adca`, `e8c9b7b`, `0b9dfe9`, `10b1509`, `67f9d2e`, `2d4ea6c`,
-  `8ba3c40`, `fd1fb727`;
+  `8ba3c40`, `fd1fb727`, `a29b58f`;
 - packet commits: v1 `9fab54f9c86ffa2eb7d39407d3c5c01aa7371668`,
   v2 `a7752ed8360561ecb8b13749dd9e74bfbd91cdd5`,
-  v3 `024af374a051bc877c5e514dc5e09672dafe4357`;
+  v3 `024af374a051bc877c5e514dc5e09672dafe4357`,
+  v4 `d09158760e0054716a87942015d2afe79e465f86`;
 - branch: `codex/bitrix24-client-benchmarks`.
 
-The exact code comparison is:
+The exact comparison is:
 
 ```bash
-git diff 99c13fa3be0bbdbd8248829da7df5ed55c7d2dc9..fd1fb727c4a13d748539948188a8375e8bbf80aa -- b24api
+git diff 99c13fa3be0bbdbd8248829da7df5ed55c7d2dc9..a29b58f3faba9a71202bbe1e9a4aab0f770b369b -- b24api
 ```
 
 The normative input referenced as sections 7.7 and 27.6 is the user-owned file
@@ -49,7 +47,8 @@ shasum -a 256 spec/2026-08-19-bitrix24-client-benchmarks/spec-review.md
 ```
 
 This packet is a later documentation commit. Clean gate claims refer only to a
-detached worktree at the code SHA; overlay claims are separately hash-bound.
+detached worktree at the code-and-test SHA; overlay claims are separately
+hash-bound.
 
 ## Authorized and refused boundary
 
@@ -94,6 +93,10 @@ before source pull or HTTP I/O because their proof/profile is not admitted:
 - `IdentityTracker.MONOTONIC` with any plan other than keyset;
 - `IdentityRequirement.COMPOSITE` at either plan or consistency-policy level.
 
+The fifth refusal now has committed plan/policy tests for both `iter_list` and
+`iter_references`; the reference form also proves that the input source is not
+pulled.
+
 No compatibility facade, default strategy, automatic dispatch, pipelined
 prefetch, partition profile, composite cursor profile, proactive rate profile,
 or benchmark admission is authorized. W7 owns compatibility/defaults; W9 owns
@@ -101,8 +104,10 @@ live evidence.
 
 ## Review history and closure
 
-All code findings from `bc75c33...` through `8ba3c40...` were replayed on the
-final subject. Detailed history is in the three resolution documents.
+All production-code findings from `bc75c33...` through `8ba3c40...` were
+replayed on `fd1fb727...`. The final subject changes no production file and adds
+only the handoff-requested committed regression. Detailed history is in the
+four resolution documents.
 
 | Candidate | Verdict | Final disposition |
 |---|---|---|
@@ -111,28 +116,30 @@ final subject. Detailed history is in the three resolution documents.
 | `67f9d2e` | Clean-room rejected: 1 P2 | Canonical plan validation closed. |
 | `2d4ea6c` | Human rejected: 2 P1, 1 P2 | Replay safety, nested batch weight, and cursor/row order separation closed. |
 | `8ba3c40` | Human rejected: 2 P2 | Independent cursor typing and cursor-exhaustion terminal semantics closed. |
-| `fd1fb727` | **Clean-room admitted** | Fresh audit P1/P2/P3 = 0/0/0. |
+| `fd1fb727` + packet v4 | Code admitted; handoff rejected: 1 P2 evidence | Missing committed reference-source COMPOSITE regression added. |
+| `a29b58f` | **Current candidate** | Production unchanged; immutable evidence completed. |
 
-Rejected subjects receive no authorization.
+Rejected subjects and packets receive no authorization.
 
 ## Exact clean-SHA gates
 
 Executed with CPython 3.12.10 in a detached clean worktree at exactly
-`fd1fb727c4a13d748539948188a8375e8bbf80aa`:
+`a29b58f3faba9a71202bbe1e9a4aab0f770b369b`:
 
 | Check | Exact result |
 |---|---|
-| Full clean pytest | 237/237 passed |
-| Stream-focused W4–W6: batch/pagination/references | 127/127 passed |
-| Affected common + stream: execution/models/plans/batch/pagination/references | 169/169 passed |
-| Consolidated committed remediation gate under asyncio debug and warnings-as-errors | 30/30 passed |
-| Six new human/packet-finding regressions under the same strict mode | 6/6 passed |
-| Focused W4–W6 with asyncio debug and `-W error::RuntimeWarning` | 127/127 passed |
+| Full clean pytest | 239/239 passed |
+| Stream-focused W4–W6: batch/pagination/references | 129/129 passed |
+| Affected common + stream: execution/models/plans/batch/pagination/references | 171/171 passed |
+| Consolidated committed remediation gate under asyncio debug and warnings-as-errors | 32/32 passed |
+| Eight newest human/packet-finding regressions under the same strict mode | 8/8 passed |
+| Focused W4–W6 with asyncio debug and `-W error::RuntimeWarning` | 129/129 passed |
 | Scoped Ruff `--no-fix`, six source files | Passed |
 | Scoped strict mypy, six source files | Passed |
+| New reference regression Ruff `--no-fix` and strict mypy | Passed |
 | `git diff --check`, `git diff --exit-code`, and status | Clean |
 
-The exact new-finding gate is:
+The exact newest-finding gate is:
 
 ```bash
 PYTHONASYNCIODEBUG=1 PYTHONWARNINGS=error \
@@ -141,10 +148,11 @@ uv run --python 3.12.10 pytest -q \
   b24api/pagination_test.py::test_item_cursor_uses_independent_cursor_coercion \
   b24api/pagination_test.py::test_profile_cursor_exhaustion_delivers_last_page_without_cursor \
   b24api/pagination_test.py::test_profile_cursor_exhaustion_rejects_mixed_cursor_presence \
-  b24api/pagination_test.py::test_composite_identity_refuses_before_io
+  b24api/pagination_test.py::test_composite_identity_refuses_before_io \
+  b24api/references_test.py::test_composite_reference_identity_refuses_before_source_pull_or_io
 ```
 
-Result: 6/6 passed after parameterization. The complete consolidated gate is:
+Result: 8/8 passed after parameterization. The complete consolidated gate is:
 
 ```bash
 PYTHONASYNCIODEBUG=1 PYTHONWARNINGS=error \
@@ -171,16 +179,18 @@ uv run --python 3.12.10 pytest -q \
   b24api/pagination_test.py::test_item_cursor_uses_independent_cursor_coercion \
   b24api/pagination_test.py::test_profile_cursor_exhaustion_delivers_last_page_without_cursor \
   b24api/pagination_test.py::test_profile_cursor_exhaustion_rejects_mixed_cursor_presence \
-  b24api/pagination_test.py::test_composite_identity_refuses_before_io
+  b24api/pagination_test.py::test_composite_identity_refuses_before_io \
+  b24api/references_test.py::test_composite_reference_identity_refuses_before_source_pull_or_io
 ```
 
-Result: 30/30 passed; parameterized functions expand to the exact case count.
+Result: 32/32 passed; parameterized functions expand to the exact case count.
 
 The clean full-tree static baseline remains the inherited W2 debt in untouched
 `b24api/api_test.py`: exactly three Ruff findings and 24 strict-mypy
 `union-attr` findings. The six scoped production files (`batch.py`,
-`execution.py`, `models.py`, `pagination.py`, `plans.py`, `references.py`) add
-none. Ruff always runs with `--no-fix`.
+`execution.py`, `models.py`, `pagination.py`, `plans.py`, `references.py`) and
+the new `references_test.py` regression add none. Ruff always runs with
+`--no-fix`.
 
 ## Protected overlay and `error.py` provenance
 
@@ -192,7 +202,7 @@ fields. Therefore `error.py` is no longer in the protected overlay; the seven
 remaining files still are.
 
 The main-tree overlay is supplemental and not attributed to the code SHA. It
-passes 256/256 full tests, 127/127 stream-focused tests, 169/169 affected tests,
+passes 258/258 full tests, 129/129 stream-focused tests, 171/171 affected tests,
 repository-wide Ruff `--no-fix`, and strict mypy for 27 source files.
 
 Reproduce the seven protected hashes with:
