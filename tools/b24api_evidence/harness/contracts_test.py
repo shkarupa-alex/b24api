@@ -631,8 +631,10 @@ def test_every_live_command_refuses_under_ordinary_pytest(tmp_path: Path) -> Non
 
 
 def test_live_benchmark_and_live_resume_never_silently_run_offline(tmp_path: Path) -> None:
-    benchmark = _run_cli("benchmark", "--artifact-dir", str(tmp_path), "--live")
-    resume = _run_cli("resume", "--artifact-dir", str(tmp_path), "--live")
+    environment = dict(os.environ)
+    environment.pop("PYTEST_CURRENT_TEST", None)
+    benchmark = _run_cli("benchmark", "--artifact-dir", str(tmp_path), "--live", environment=environment)
+    resume = _run_cli("resume", "--artifact-dir", str(tmp_path), "--live", environment=environment)
     assert benchmark.returncode == ExitCode.UNAVAILABLE
     assert "not admitted" in benchmark.stderr
     assert resume.returncode == ExitCode.INVALID
