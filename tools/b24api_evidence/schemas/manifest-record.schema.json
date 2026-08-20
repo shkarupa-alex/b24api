@@ -22,7 +22,7 @@
     "dataset_plan_content_hash": {"$ref": "#/$defs/sha256"},
     "portal_fingerprint": {"$ref": "#/$defs/sha256"}, "candidate_sha": {"$ref": "#/$defs/sha"},
     "namespace": {"type": "string", "pattern": "^b24api-evidence-[0-9a-f-]{36}$"},
-    "event": {"enum": ["planned", "create_dispatched", "created", "ambiguous", "reconciled", "verified", "delete_dispatched", "deleted", "absence_verified", "orphan"]},
+    "event": {"enum": ["planned", "create_dispatched", "create_cancelled", "created", "ambiguous", "reconciled", "verified", "delete_dispatched", "delete_cancelled", "deleted", "absence_verified", "orphan"]},
     "cell_id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "maxLength": 100},
     "entity_family": {"enum": ["task", "crm_deal"]},
     "correlation_key": {"$ref": "#/$defs/sha256"},
@@ -37,8 +37,8 @@
   },
   "allOf": [
     {"if": {"properties": {"sequence": {"const": 0}}, "required": ["sequence"]}, "then": {"properties": {"previous_record_hash": {"type": "null"}}}, "else": {"properties": {"previous_record_hash": {"$ref": "#/$defs/sha256"}}}},
-    {"if": {"properties": {"event": {"enum": ["create_dispatched", "ambiguous", "delete_dispatched"]}}, "required": ["event"]}, "then": {"properties": {"request_fingerprint": {"$ref": "#/$defs/sha256"}}}},
-    {"if": {"properties": {"event": {"enum": ["created", "reconciled", "verified", "delete_dispatched", "deleted", "orphan"]}}, "required": ["event"]}, "then": {"properties": {"entity_id": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "integer"}]}}}}
+    {"if": {"properties": {"event": {"enum": ["create_dispatched", "create_cancelled", "ambiguous", "delete_dispatched", "delete_cancelled"]}}, "required": ["event"]}, "then": {"properties": {"request_fingerprint": {"$ref": "#/$defs/sha256"}}}},
+    {"if": {"properties": {"event": {"enum": ["created", "reconciled", "verified", "delete_dispatched", "delete_cancelled", "deleted", "orphan"]}}, "required": ["event"]}, "then": {"properties": {"entity_id": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "integer"}]}}}}
   ],
   "$defs": {
     "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},

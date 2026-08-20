@@ -63,7 +63,7 @@ from .live import ADAPTERS, LivePreflight
 from .model import DeterministicPortal, exact_model_cases, run_exact_matrix_sync
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 ROOT = Path(__file__).resolve().parents[3]
 ENTRYPOINT = ROOT / "tools/b24api_evidence.py"
@@ -213,6 +213,21 @@ def test_approved_plan_self_claims_do_not_authorize_live_writes(
         check=True,
     )
     trailer_hash = reviewed_dataset_plan_sha256(plan)
+    review_blob = subprocess.run(  # noqa: S603 - isolated non-commit regression fixture
+        [git, "hash-object", "-w", "--stdin"],
+        cwd=review_root,
+        check=True,
+        capture_output=True,
+        input=f"Dataset-Plan-SHA256: {trailer_hash}\n",
+        text=True,
+    ).stdout.strip()
+    plan["authorization"]["plan_review_sha"] = review_blob
+    monkeypatch.setattr(cli_module, "ROOT", review_root)
+    with pytest.raises(ContractError, match="commit object"):
+        cli_module._require_approved_plan(  # noqa: SLF001
+            plan,
+            args=Namespace(**_approval_arguments(plan)),
+        )
     subprocess.run(  # noqa: S603 - isolated exact review-commit integration fixture
         [
             git,
@@ -238,7 +253,6 @@ def test_approved_plan_self_claims_do_not_authorize_live_writes(
     ).stdout.strip()
     plan["authorization"]["plan_review_sha"] = review_sha
     assert reviewed_dataset_plan_sha256(plan) == trailer_hash
-    monkeypatch.setattr(cli_module, "ROOT", review_root)
     cli_module._require_approved_plan(  # noqa: SLF001
         plan,
         args=Namespace(**_approval_arguments(plan)),
@@ -1475,10 +1489,12 @@ def test_seed_never_redispatches_an_unresolved_create(
 
 
 @pytest.mark.parametrize("drift_kind", ["dirty", "clean_head"])
+@pytest.mark.parametrize("drift_timing", ["preflight", "journal"])
 def test_seed_rechecks_exact_candidate_and_remains_resumable_before_create(  # noqa: C901
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     drift_kind: str,
+    drift_timing: str,
 ) -> None:
     plan = _approved_live_plan()
     plan_path = tmp_path / "plan.json"
@@ -1521,7 +1537,7 @@ def test_seed_rechecks_exact_candidate_and_remains_resumable_before_create(  # n
         def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
             nonlocal dirty, head_changed
             assert required_scopes == {"task"}
-            if induce_drift:
+            if induce_drift and drift_timing == "preflight":
                 dirty = drift_kind == "dirty"
                 head_changed = drift_kind == "clean_head"
             return LivePreflight(self.identity, "build-1", frozenset({"task"}))
@@ -1530,10 +1546,20 @@ def test_seed_rechecks_exact_candidate_and_remains_resumable_before_create(  # n
         if dirty:
             raise ContractError("tracked repository changed before live mutation")
 
+    real_append = append_manifest_record
+
+    def append_with_optional_drift(path: Path, record: Mapping[str, Any]) -> None:
+        nonlocal dirty, head_changed
+        real_append(path, record)
+        if induce_drift and drift_timing == "journal" and record["event"] == "create_dispatched":
+            dirty = drift_kind == "dirty"
+            head_changed = drift_kind == "clean_head"
+
     monkeypatch.delenv("PYTEST_CURRENT_TEST")
     monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
     monkeypatch.setattr(cli_module, "require_clean_tracked_tree", reject_after_preflight)
     monkeypatch.setattr(cli_module, "git_sha", lambda _root: "f" * 40 if head_changed else SHA)
+    monkeypatch.setattr(cli_module, "append_manifest_record", append_with_optional_drift)
     monkeypatch.setitem(ADAPTERS, "tasks-task-v1", adapter)
     monkeypatch.setattr(cli_module, "_require_review_commit", lambda *_args, **_kwargs: None)
     arguments = Namespace(
@@ -1551,7 +1577,8 @@ def test_seed_rechecks_exact_candidate_and_remains_resumable_before_create(  # n
         cli_module._seed(arguments)  # noqa: SLF001 - exact pre-mutation race regression
     assert adapter.create_calls == 0
     records = load_manifest(tmp_path / "artifacts" / "manifest.jsonl")
-    assert records[-1]["event"] == "planned"
+    expected_event = "planned" if drift_timing == "preflight" else "create_cancelled"
+    assert records[-1]["event"] == expected_event
 
     induce_drift = False
     dirty = False
@@ -1560,9 +1587,11 @@ def test_seed_rechecks_exact_candidate_and_remains_resumable_before_create(  # n
     assert adapter.create_calls == 1
 
 
-def test_cleanup_rechecks_clean_candidate_immediately_before_delete(
+@pytest.mark.parametrize("drift_timing", ["preflight", "journal"])
+def test_cleanup_rechecks_clean_candidate_immediately_before_delete(  # noqa: C901
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    drift_timing: str,
 ) -> None:
     plan = _approved_live_plan()
     plan_path = tmp_path / "plan.json"
@@ -1582,17 +1611,20 @@ def test_cleanup_rechecks_clean_candidate_immediately_before_delete(
         )
         append_manifest_record(manifest_path, previous)
     dirty = False
+    induce_drift = True
 
     class FakeAdapter:
         delete_method = "tasks.task.delete"
         id_parameter = "taskId"
         delete_calls = 0
+        deleted = False
 
-        def read(self, _portal: object, _entity_id: str) -> dict[str, str]:
-            return {"TITLE": str(previous["marker_value"])}
+        def read(self, _portal: object, _entity_id: str) -> dict[str, str] | None:
+            return None if self.deleted else {"TITLE": str(previous["marker_value"])}
 
         def delete(self, _portal: object, _entity_id: str) -> None:
             self.delete_calls += 1
+            self.deleted = True
 
     adapter = FakeAdapter()
 
@@ -1612,16 +1644,26 @@ def test_cleanup_rechecks_clean_candidate_immediately_before_delete(
         def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
             nonlocal dirty
             assert required_scopes == {"task"}
-            dirty = True
+            if induce_drift and drift_timing == "preflight":
+                dirty = True
             return LivePreflight(self.identity, "build-1", frozenset({"task"}))
 
     def reject_after_preflight(_root: Path) -> None:
         if dirty:
             raise ContractError("tracked repository changed before live mutation")
 
+    real_append = append_manifest_record
+
+    def append_with_optional_drift(path: Path, record: Mapping[str, Any]) -> None:
+        nonlocal dirty
+        real_append(path, record)
+        if induce_drift and drift_timing == "journal" and record["event"] == "delete_dispatched":
+            dirty = True
+
     monkeypatch.delenv("PYTEST_CURRENT_TEST")
     monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
     monkeypatch.setattr(cli_module, "require_clean_tracked_tree", reject_after_preflight)
+    monkeypatch.setattr(cli_module, "append_manifest_record", append_with_optional_drift)
     monkeypatch.setitem(ADAPTERS, "tasks-task-v1", adapter)
     monkeypatch.setattr(cli_module, "_require_review_commit", lambda *_args, **_kwargs: None)
     with pytest.raises(ContractError, match="before live mutation"):
@@ -1639,6 +1681,29 @@ def test_cleanup_rechecks_clean_candidate_immediately_before_delete(
             ),
         )
     assert adapter.delete_calls == 0
+    records = load_manifest(manifest_path)
+    expected_event = "verified" if drift_timing == "preflight" else "delete_cancelled"
+    assert records[-1]["event"] == expected_event
+
+    induce_drift = False
+    dirty = False
+    assert (
+        cli_module._cleanup(  # noqa: SLF001
+            Namespace(
+                live=True,
+                allow_writes=True,
+                plan=plan_path,
+                manifest=manifest_path,
+                artifact_dir=tmp_path / "artifacts",
+                run_id=None,
+                lineage_id=None,
+                credential_role="admin_full",
+                **_approval_arguments(plan),
+            ),
+        )
+        == ExitCode.COMPLETED
+    )
+    assert adapter.delete_calls == 1
 
 
 def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) -> None:

@@ -283,6 +283,7 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                     continue
                 if current is not None and current["event"] in {
                     "delete_dispatched",
+                    "delete_cancelled",
                     "deleted",
                     "absence_verified",
                     "orphan",
@@ -326,6 +327,10 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                             http_attempts=portal.attempts,
                             started=started,
                         )
+                elif current is not None and current["event"] == "create_cancelled":
+                    # The post-journal guard refused before adapter.create(), so
+                    # no marker reconciliation is necessary on retry.
+                    pass
                 if recovered_id is not None:
                     request_fingerprint = content_sha256(["resume-exact-marker", correlation])
                     if write_reconciled_event:
@@ -377,6 +382,21 @@ def _seed(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
                 )
                 append_manifest_record(manifest_path, record)
                 previous = record
+                try:
+                    _require_exact_candidate(plan)
+                except ContractError:
+                    cancelled = build_manifest_record(
+                        {
+                            **base,
+                            "event": "create_cancelled",
+                            "entity_id": None,
+                            "request_fingerprint": request_fingerprint,
+                        },
+                        previous=previous,
+                    )
+                    append_manifest_record(manifest_path, cancelled)
+                    previous = cancelled
+                    raise
                 try:
                     entity_id = adapter.create(portal, marker)
                     http_attempts += 1
@@ -768,7 +788,7 @@ def _resume(args: argparse.Namespace) -> ExitCode:
     return ExitCode.COMPLETED
 
 
-def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0915
+def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0912, PLR0915
     _require_live_write_flags(args, "cleanup")
     plan = _load_plan(args)
     _require_approved_plan(plan, args=args)
@@ -805,7 +825,7 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0915
                 marker=str(current["marker_value"]),
             )
             if current["entity_id"] is None:
-                if current["event"] == "planned":
+                if current["event"] in {"planned", "create_cancelled"}:
                     continue
                 if current["event"] not in {"create_dispatched", "ambiguous"}:
                     raise ContractError("cleanup found an entity-less manifest state that cannot be reconciled")
@@ -876,6 +896,21 @@ def _cleanup(args: argparse.Namespace) -> ExitCode:  # noqa: C901, PLR0915
             )
             append_manifest_record(manifest_path, dispatched)
             previous = dispatched
+            try:
+                _require_exact_candidate(plan)
+            except ContractError:
+                cancelled = build_manifest_record(
+                    {
+                        **base,
+                        "event": "delete_cancelled",
+                        "entity_id": entity_id,
+                        "request_fingerprint": request_fingerprint,
+                    },
+                    previous=previous,
+                )
+                append_manifest_record(manifest_path, cancelled)
+                previous = cancelled
+                raise
             adapter.delete(portal, entity_id)
             deleted = build_manifest_record(
                 {**base, "event": "deleted", "entity_id": entity_id, "request_fingerprint": request_fingerprint},
@@ -1353,15 +1388,26 @@ def _require_review_commit(review_sha: str, *, reviewed_plan_sha256: str) -> Non
     if git is None:
         raise ContractError("git executable is unavailable")
     try:
+        object_type = subprocess.run(  # noqa: S603 - fixed git and validated hash-only revision
+            [git, "cat-file", "-t", review_sha],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
         message = subprocess.run(  # noqa: S603 - fixed git and validated hash-only revision
             [git, "show", "--no-patch", "--format=%B", review_sha],
             cwd=ROOT,
             check=True,
             capture_output=True,
             text=True,
+            timeout=5,
         ).stdout
-    except (OSError, subprocess.CalledProcessError) as error:
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         raise ContractError("plan_review_sha must name an existing review commit") from error
+    if object_type != "commit":
+        raise ContractError("plan_review_sha must name a commit object")
     expected = f"Dataset-Plan-SHA256: {reviewed_plan_sha256}"
     if expected not in {line.strip() for line in message.splitlines()}:
         raise ContractError("plan review commit does not bind the exact dataset plan content hash")
