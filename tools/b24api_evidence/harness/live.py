@@ -24,6 +24,14 @@ class LiveCorrectnessError(RuntimeError):
     """A live response contradicts the reviewed disposable-entity contract."""
 
 
+class LiveApiError(LiveCorrectnessError):
+    """A typed API error whose safe code is available without rendering portal text."""
+
+    def __init__(self, *, method: str, code: str) -> None:
+        self.code = code
+        super().__init__(f"live API returned an unexpected error for {method}")
+
+
 @dataclass(frozen=True, slots=True)
 class LivePreflight:
     """Redacted portal facts retained after scope/app preflight."""
@@ -80,7 +88,7 @@ class LivePortal:
             code = str(envelope.get("error", "unknown"))[:100].casefold()
             if code in {"error_method_not_found", "insufficient_scope", "access_denied"}:
                 raise LiveUnavailableError(f"live method unavailable for {method}: {code}")
-            raise LiveCorrectnessError(f"live API returned an unexpected error for {method}")
+            raise LiveApiError(method=method, code=code)
         if "result" not in envelope:
             raise LiveCorrectnessError(f"live response has no result for {method}")
         return envelope
@@ -141,8 +149,8 @@ class DisposableAdapter:
     def read(self, portal: LivePortal, entity_id: str) -> dict[str, Any] | None:
         try:
             result = portal.call(self.read_method, {self.id_parameter: entity_id})
-        except LiveCorrectnessError as error:
-            if "not_found" in str(error).casefold() or "not found" in str(error).casefold():
+        except LiveApiError as error:
+            if "not_found" in error.code:
                 return None
             raise
         if self.result_container is not None:

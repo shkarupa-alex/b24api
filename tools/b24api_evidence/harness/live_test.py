@@ -59,3 +59,14 @@ def test_live_envelope_rejects_overflow_json_and_hides_unknown_error(
         with pytest.raises(LiveCorrectnessError) as captured:
             portal.call("scope")
     assert "should-never-be-rendered" not in str(captured.value)
+
+
+def test_point_read_classifies_typed_not_found_without_rendering_portal_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"error": "ERROR_NOT_FOUND", "error_description": "secret-like text"})
+
+    with _portal(monkeypatch, handler) as portal:
+        assert ADAPTERS["crm-deal-v1"].read(portal, "42") is None
+        assert portal.attempts == 1
