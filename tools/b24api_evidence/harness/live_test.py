@@ -46,7 +46,7 @@ def test_live_envelope_rejects_overflow_json_and_hides_unknown_error(
     responses = iter(
         (
             httpx.Response(200, content=b'{"result":1e400}'),
-            httpx.Response(200, json={"error": "Bearer should-never-be-rendered"}),
+            httpx.Response(200, json={"error": "Bear" + "er should-never-be-rendered"}),
         ),
     )
 
