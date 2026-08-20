@@ -292,6 +292,50 @@ async def test_invalid_reference_contract_refuses_even_empty_input(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("plan", "policy"),
+    [
+        (
+            OffsetSequentialPlan(identity_requirement=IdentityRequirement.COMPOSITE),
+            ExecutionPolicy(),
+        ),
+        (
+            OffsetSequentialPlan(),
+            ExecutionPolicy(
+                consistency=ConsistencyPolicy(identity_requirement=IdentityRequirement.COMPOSITE),
+            ),
+        ),
+    ],
+)
+async def test_composite_reference_identity_refuses_before_source_pull_or_io(
+    plan: ListPlan,
+    policy: ExecutionPolicy,
+) -> None:
+    pulled = asyncio.Event()
+
+    async def source() -> AsyncGenerator[ReferenceRequest]:
+        pulled.set()
+        yield _reference("unreachable")
+
+    transport = AsyncFunctionTransport(lambda _request: {"result": []})
+    stream = iter_references(
+        Executor(transport),
+        source(),
+        plan=plan,
+        dispatch=DirectDispatch(),
+        policy=policy,
+    )
+
+    with pytest.raises(CapabilityError, match="composite identity") as captured:
+        await anext(stream)
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert stream.report.state is TerminalState.FAILED
+    assert not pulled.is_set()
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
 async def test_invalid_reference_contract_refuses_before_blocking_source_pull() -> None:
     pulled = asyncio.Event()
 
