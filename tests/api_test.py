@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 if TYPE_CHECKING:
     from pytest_httpx import HTTPXMock
@@ -47,12 +48,25 @@ def test_settings_redacts_webhook_from_representations_and_serialization() -> No
     surfaces = (
         repr(settings),
         str(settings),
+        repr(dict(settings)),
+        repr(list(settings)),
         repr(settings.model_dump()),
         settings.model_dump_json(),
     )
 
     assert all(sensitive_fragment not in surface for surface in surfaces)
     assert sensitive_fragment in str(settings.webhook_url)
+
+
+def test_settings_redacts_invalid_webhook_from_validation_error() -> None:
+    sensitive_fragment = "synthetic-invalid-private-token"
+
+    with pytest.raises(ValidationError) as captured:
+        Settings(webhook_url=f"https://example.invalid:bad/{sensitive_fragment}")
+
+    error = captured.value
+    surfaces = (str(error), repr(error), repr(error.errors()), error.json())
+    assert all(sensitive_fragment not in surface for surface in surfaces)
 
 
 @pytest.mark.asyncio

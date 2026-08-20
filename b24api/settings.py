@@ -1,11 +1,15 @@
 """Support settings."""
 
+from collections.abc import Generator
 from typing import Annotated, Any
 
 from fast_depends import Depends
 from httpx import codes
-from pydantic import Field, HttpUrl, field_serializer
+from pydantic import Field, HttpUrl, TypeAdapter, ValidationError, field_serializer, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_WEBHOOK_ADAPTER = TypeAdapter(HttpUrl)
+_REDACTED = "[REDACTED]"
 
 
 class Settings(BaseSettings):
@@ -41,12 +45,27 @@ class Settings(BaseSettings):
         env_prefix="bitrix24_api_",
         env_file=".env",
         extra="ignore",
+        hide_input_in_errors=True,
     )
+
+    @field_validator("webhook_url", mode="before")
+    @classmethod
+    def _sanitize_invalid_webhook_input(cls, value: Any) -> HttpUrl | str:  # noqa: ANN401
+        """Keep invalid credential-bearing input out of validation errors."""
+        try:
+            return _WEBHOOK_ADAPTER.validate_python(value)
+        except (TypeError, ValueError, ValidationError):
+            return _REDACTED
 
     @field_serializer("webhook_url")
     def _serialize_webhook_url(self, _value: HttpUrl) -> str:
         """Never expose webhook credentials through public serialization."""
-        return "[REDACTED]"
+        return _REDACTED
+
+    def __iter__(self) -> Generator[tuple[str, Any], None, None]:
+        """Iterate with the credential-bearing field redacted."""
+        for name, value in super().__iter__():
+            yield name, _REDACTED if name == "webhook_url" else value
 
 
 def api_settings(**kwargs: Any) -> Settings:  # noqa: ANN401
