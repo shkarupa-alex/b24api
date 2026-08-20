@@ -746,6 +746,20 @@ def test_benchmark_parent_hashes_detect_oracle_tampering(tmp_path: Path) -> None
     assert f"sha256:{content_sha256(json.loads((tmp_path / 'model-matrix.json').read_text()))}" not in artifact[
         "evidence_refs"
     ]
+    artifact_path = tmp_path / "benchmark-evidence.json"
+    original_artifact = artifact_path.read_text()
+    arbitrary = {"schema_version": SCHEMA_VERSION, "value": "not an oracle"}
+    arbitrary_path = tmp_path / "arbitrary.json"
+    arbitrary_path.write_text(json.dumps(arbitrary))
+    artifact["evidence_refs"] = [f"sha256:{content_sha256(arbitrary)}"]
+    artifact_path.write_text(json.dumps(artifact))
+    with pytest.raises(ContractError, match="qualified PASS oracle"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - dependency-type regression
+    artifact["evidence_refs"] = []
+    artifact_path.write_text(json.dumps(artifact))
+    with pytest.raises(ContractError, match="requires immutable"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - missing-dependency regression
+    artifact_path.write_text(original_artifact)
     oracle_path = tmp_path / "model-oracles/empty-offset-run-1.json"
     oracle_path.write_text("{}")
     with pytest.raises(ContractError, match="content hash"):

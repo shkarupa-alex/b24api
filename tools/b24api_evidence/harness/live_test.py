@@ -3,15 +3,23 @@
 from __future__ import annotations
 import base64
 import json
+import tracemalloc
 from typing import TYPE_CHECKING
 
 import httpx
 import pytest
 
-from .live import ADAPTERS, MAX_RESPONSE_BYTES, LiveApiError, LiveCorrectnessError, LivePortal
+from .live import (
+    ADAPTERS,
+    MAX_RESPONSE_BYTES,
+    LiveApiError,
+    LiveCorrectnessError,
+    LivePortal,
+    _bounded_response_payload,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 
 def _portal(monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]) -> LivePortal:
@@ -73,6 +81,26 @@ def test_live_envelope_refuses_oversized_content_before_buffering(
 
     with _portal(monkeypatch, handler) as portal, pytest.raises(LiveCorrectnessError, match="byte ceiling"):
         portal.call("scope")
+
+
+def test_streamed_response_has_no_per_chunk_retention_amplification() -> None:
+    chunk_count = 100_000
+
+    class OneByteStream(httpx.SyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            for _ in range(chunk_count):
+                yield b"x"
+
+    response = httpx.Response(200, stream=OneByteStream())
+    tracemalloc.start()
+    try:
+        payload = _bounded_response_payload(response, method="scope")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        response.close()
+        tracemalloc.stop()
+    assert len(payload) == chunk_count
+    assert peak < chunk_count * 10
 
 
 def test_point_read_classifies_typed_not_found_without_rendering_portal_text(

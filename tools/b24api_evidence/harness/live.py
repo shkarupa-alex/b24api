@@ -14,6 +14,7 @@ from .contracts import ContractError, PortalIdentity, parse_fingerprint_key, por
 HTTP_OK = 200
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_MARKER_SCAN_PAGES = 1_000
+MAX_EXACT_MARKER_MATCHES = 2
 
 
 class LiveUnavailableError(RuntimeError):
@@ -51,14 +52,14 @@ def _bounded_response_payload(response: httpx.Response, *, method: str) -> bytes
             raise LiveCorrectnessError(f"live response has invalid content length for {method}") from error
         if declared > MAX_RESPONSE_BYTES:
             raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
-    chunks: list[bytes] = []
+    payload = bytearray()
     received = 0
     for chunk in response.iter_bytes():
         received += len(chunk)
         if received > MAX_RESPONSE_BYTES:
             raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
-        chunks.append(chunk)
-    return b"".join(chunks)
+        payload.extend(chunk)
+    return bytes(payload)
 
 
 class LivePortal:
@@ -191,7 +192,7 @@ class DisposableAdapter:
         portal.call(self.delete_method, {self.id_parameter: entity_id})
 
     def find_exact_marker(self, portal: LivePortal, marker: str) -> list[str]:  # noqa: C901
-        matches: list[str] = []
+        matches: set[str] = set()
         start: int | None = None
         seen_starts: set[int | None] = set()
         for _page in range(MAX_MARKER_SCAN_PAGES):
@@ -216,10 +217,12 @@ class DisposableAdapter:
                 value = row.get(self.marker_field) or row.get(self.marker_field.casefold())
                 entity_id = row.get("ID") or row.get("id")
                 if value == marker and isinstance(entity_id, str | int) and not isinstance(entity_id, bool):
-                    matches.append(str(entity_id))
+                    matches.add(str(entity_id))
+                    if len(matches) >= MAX_EXACT_MARKER_MATCHES:
+                        return sorted(matches)
             continuation = envelope.get("next")
             if continuation is None:
-                return matches
+                return sorted(matches)
             if isinstance(continuation, bool) or not isinstance(continuation, int) or continuation < 0:
                 raise LiveCorrectnessError("exact-marker search continuation is malformed")
             start = continuation

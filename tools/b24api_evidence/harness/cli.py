@@ -1303,7 +1303,8 @@ def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912
         or dataset_plan["portal"]["fingerprint"] != expected["portal_fingerprint"]
     ):
         raise ContractError("evidence bundle lineage does not match its immutable dataset plan")
-    for documents in json_documents.values():
+    qualified_oracle_hashes: set[str] = set()
+    for document_hash, documents in json_documents.items():
         for path, document in documents:
             if path.name != "oracle.json" and path.parent.name != "model-oracles":
                 continue
@@ -1313,6 +1314,31 @@ def _scan_bundle(artifact_dir: Path) -> None:  # noqa: C901, PLR0912
                 for field in ("run_id", "lineage_id", "candidate_sha", "dataset_plan_content_hash")
             ):
                 raise ContractError("oracle lineage does not match the evidence bundle")
+            if document["outcome"] == "PASS":
+                qualified_oracle_hashes.add(document_hash)
+    for artifact in artifacts:
+        if artifact["outcome"] != "PASS" or artifact["assurance"] != "oracle_verified":
+            continue
+        references = artifact["evidence_refs"]
+        referenced_hashes = {
+            reference.removeprefix("sha256:")
+            for reference in references
+            if isinstance(reference, str) and reference.startswith("sha256:")
+        }
+        if not references or len(referenced_hashes) != len(references):
+            raise ContractError("oracle-verified PASS requires immutable SHA-256 oracle dependencies")
+        if not referenced_hashes <= qualified_oracle_hashes:
+            raise ContractError("oracle-verified PASS references a document that is not a qualified PASS oracle")
+        if artifact["command"] == "verify":
+            matching = [
+                document
+                for document_hash in referenced_hashes
+                for _path, document in json_documents[document_hash]
+                if document.get("case_id") == "MANIFEST"
+                and document.get("manifest_content_hash") == artifact["manifest_content_hash"]
+            ]
+            if len(matching) != 1:
+                raise ContractError("verify PASS requires exactly one matching MANIFEST oracle")
 
 
 def _safe_message(message: str) -> None:
