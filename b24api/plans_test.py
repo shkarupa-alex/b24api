@@ -68,8 +68,16 @@ def test_counted_offset_mode_and_stride_are_coherent() -> None:
 def test_evidence_based_terminal_rules_require_their_declared_contract() -> None:
     with pytest.raises(ValueError, match="requested_page_size"):
         OffsetSequentialPlan(terminal=frozenset({OffsetTerminalRule.PROFILE_SHORT_PAGE}))
-    with pytest.raises(ValueError, match="filtered exact"):
-        OffsetSequentialPlan(terminal=frozenset({OffsetTerminalRule.QUALIFIED_TOTAL}))
+    with pytest.raises(ValueError, match="exact or advisory"):
+        OffsetSequentialPlan(
+            terminal=frozenset({OffsetTerminalRule.QUALIFIED_TOTAL}),
+            total_semantics=TotalSemantics.IGNORE,
+        )
+    advisory = OffsetSequentialPlan(
+        terminal=frozenset({OffsetTerminalRule.QUALIFIED_TOTAL}),
+        total_semantics=TotalSemantics.ADVISORY,
+    )
+    assert advisory.total_semantics is TotalSemantics.ADVISORY
     with pytest.raises(ValueError, match="requested_page_size"):
         KeysetPlan(
             terminal=KeysetTerminalRule.PROFILE_SHORT_PAGE,

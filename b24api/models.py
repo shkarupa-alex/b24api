@@ -18,6 +18,7 @@ type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type FrozenJson = JsonScalar | tuple[FrozenJson, ...] | FrozenMapping
 
 _METHOD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 HTTP_STATUS_MINIMUM = 100
 HTTP_STATUS_MAXIMUM = 599
 VIOLATION_CODE_MAXIMUM = 100
@@ -87,6 +88,10 @@ def _thaw_json(value: FrozenJson) -> JsonValue:
 
 def _is_plain_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -801,6 +806,11 @@ class OperationReport:
     snapshot: SnapshotState = SnapshotState.NOT_REQUESTED
     plan_id: str | None = None
     dispatch_id: str | None = None
+    profile_id: str | None = None
+    profile_version: int | None = None
+    profile_applicable: bool | None = None
+    profile_source_sha256: str | None = None
+    profile_evidence_sha256: tuple[str, ...] = ()
     emitted_rows: int = 0
     unique_rows: int = 0
     physical_requests: int = 0
@@ -823,6 +833,7 @@ class OperationReport:
             raise TypeError("snapshot must be a SnapshotState")
         object.__setattr__(self, "violations", tuple(self.violations))
         object.__setattr__(self, "evidence", tuple(self.evidence))
+        object.__setattr__(self, "profile_evidence_sha256", tuple(self.profile_evidence_sha256))
         if self.terminal_reason is not None:
             object.__setattr__(self, "terminal_reason", DEFAULT_REDACTOR.redact_text(self.terminal_reason))
         counters = (
@@ -839,12 +850,43 @@ class OperationReport:
             raise ValueError("report counters must be non-negative")
         if self.unique_rows > self.emitted_rows:
             raise ValueError("unique_rows cannot exceed emitted_rows")
+        _validate_report_profile(self)
         if self.completed and any(item.severity is ViolationSeverity.BLOCKING for item in self.violations):
             raise ValueError("completed report cannot contain blocking violations")
 
     @property
     def completed(self) -> bool:
         return self.state is TerminalState.COMPLETED
+
+
+def _validate_report_profile(report: OperationReport) -> None:
+    if report.profile_id is None:
+        if any(
+            value is not None
+            for value in (
+                report.profile_version,
+                report.profile_applicable,
+                report.profile_source_sha256,
+            )
+        ) or report.profile_evidence_sha256:
+            raise ValueError("profile metadata requires profile_id")
+    else:
+        if not report.profile_id or len(report.profile_id) > STABLE_KEY_MAXIMUM:
+            raise ValueError("profile_id must be 1..100 characters")
+        if not _is_plain_int(report.profile_version) or cast("int", report.profile_version) < 1:
+            raise ValueError("profile_version must be positive")
+        if not isinstance(report.profile_applicable, bool):
+            raise TypeError("profile_applicable must be a boolean")
+        if report.profile_source_sha256 is None or not _is_sha256(report.profile_source_sha256):
+            raise ValueError("profile_source_sha256 must be a lowercase SHA-256")
+        if not report.profile_evidence_sha256 or any(
+            not _is_sha256(value) for value in report.profile_evidence_sha256
+        ):
+            raise ValueError("profile evidence must contain lowercase SHA-256 values")
+    if report.assurance is CompletionAssurance.PROFILE_VERIFIED and (
+        report.profile_id is None or report.profile_applicable is not True
+    ):
+        raise ValueError("profile-verified assurance requires applicable profile provenance")
 
 
 @dataclass(frozen=True, slots=True, init=False)

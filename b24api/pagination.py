@@ -200,6 +200,7 @@ class PaginationDriver:
         context: ExecutionContext,
         fetch: PageFetch | None = None,
         single_result_as_item: bool = False,
+        page_cap_hint: int | None = None,
     ) -> None:
         self.executor = executor
         self.request = request
@@ -209,6 +210,11 @@ class PaginationDriver:
         self.context = context
         self._fetch_override = fetch
         self._single_result_as_item = single_result_as_item
+        if page_cap_hint is not None and (
+            not isinstance(page_cap_hint, int) or isinstance(page_cap_hint, bool) or page_cap_hint < 1
+        ):
+            raise ValueError("page cap hint must be a positive integer")
+        self._page_cap_hint = page_cap_hint
         self.terminal_reason: str | None = None
         self.cursor_state: JsonValue = None
         self.violations: list[Violation] = []
@@ -585,8 +591,9 @@ class PaginationDriver:
         qualified_count: int | None = None,
     ) -> list[IdentityValue]:
         requested_page_size = getattr(self.plan, "requested_page_size", None)
-        if requested_page_size is not None and len(items) > requested_page_size:
-            raise PaginationError("response exceeded the requested page cap")
+        page_caps = tuple(value for value in (requested_page_size, self._page_cap_hint) if value is not None)
+        if page_caps and len(items) > min(page_caps):
+            raise PaginationError("response exceeded the declared page cap")
         fingerprint = _page_fingerprint(items)
         if fingerprint in self._fingerprints:
             raise PaginationError("repeated page fingerprint detected")
@@ -720,6 +727,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         selector: ResultSelector | None = None,
         identity: IdentitySpec | None = None,
         policy: ExecutionPolicy | None = None,
+        page_cap_hint: int | None = None,
     ) -> None:
         PaginationDriver.validate_plan(plan)
         self._context = executor.context(policy)
@@ -730,6 +738,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             selector=selector,
             identity=identity,
             context=self._context,
+            page_cap_hint=page_cap_hint,
         )
         self._assurance = CompletionAssurance.CALLER_ASSERTED
         self._runner: AsyncGenerator[tuple[JsonValue, bool]] | None = None
@@ -909,6 +918,7 @@ def iter_list(  # noqa: PLR0913
     selector: ResultSelector | None = None,
     identity: IdentitySpec | None = None,
     policy: ExecutionPolicy | None = None,
+    _page_cap_hint: int | None = None,
 ) -> ItemStream:
     """Construct a lazy canonical item stream without performing I/O."""
     return ItemStream(
@@ -918,6 +928,7 @@ def iter_list(  # noqa: PLR0913
         selector=selector,
         identity=identity,
         policy=policy,
+        page_cap_hint=_page_cap_hint,
     )
 
 

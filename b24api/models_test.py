@@ -220,6 +220,26 @@ def test_report_is_frozen_and_completion_rejects_blocking_violation() -> None:
         )
 
 
+def test_profile_verified_report_requires_complete_hash_only_provenance() -> None:
+    profile_hash = "a" * 64
+    evidence_hash = "b" * 64
+    report = OperationReport(
+        state=TerminalState.COMPLETED,
+        assurance=CompletionAssurance.PROFILE_VERIFIED,
+        profile_id="crm-item-v1",
+        profile_version=1,
+        profile_applicable=True,
+        profile_source_sha256=profile_hash,
+        profile_evidence_sha256=(evidence_hash,),
+    )
+
+    assert report.profile_source_sha256 == profile_hash
+    with pytest.raises(ValueError, match="provenance"):
+        OperationReport(assurance=CompletionAssurance.PROFILE_VERIFIED)
+    with pytest.raises(ValueError, match="profile metadata"):
+        OperationReport(profile_version=1)
+
+
 def test_failure_repr_excludes_request_error_and_payload_values() -> None:
     request = Request("profile", {"auth": EXAMPLE_CREDENTIAL})
     failure = BatchFailure(

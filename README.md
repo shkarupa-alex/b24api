@@ -57,6 +57,9 @@ async for result in b24.batch(requests, batch_size=25):
 
 Use with_payload=True for (request, payload) inputs. Use list_method=True only
 for the committed compatibility flattening of a list or one-key list envelope.
+The returned stream owns the supplied iterator: closing the stream early also
+closes that exact sync or async iterator and runs its cleanup. It cannot be
+resumed afterwards.
 
 For independent commands that must each receive a correlated result, use the
 separate tolerant API:
@@ -75,6 +78,9 @@ There is no errors= mode on batch. The explicit split keeps fail-fast and
 tolerant return types unambiguous. The codec accepts the observed Bitrix/PHP
 batch polymorphism: an empty associative map may arrive as JSON [] while a
 non-empty map arrives as a JSON object.
+Decoded array results are charged by their top-level length against the row
+buffer. An empty array has row weight zero, while command and outcome ceilings
+still apply and the portal batch limit remains 50 commands.
 
 ## Explicit traversal
 
@@ -133,8 +139,19 @@ The committed wrappers remain callable and delegate to the same engine:
 Each wrapper accepts only the committed arguments plus the keyword-only bridges
 plan, profile, identity, and policy. Resolution is explicit plan, then explicit
 profile, then the deterministic wrapper default. plan and profile together
-refuse before I/O. Until reviewed endpoint profiles are packaged, profile also
-refuses before I/O.
+refuse before I/O. A raw profile also refuses when the facade has no exact
+portal-build/scope applicability context; it never guesses those facts.
+
+The compatibility `list_size` value is enforced as a caller-declared decoded
+page cap. The cursor wrapper also sends it through its committed `LIMIT`
+control. Other wrappers do not invent an endpoint-specific limit parameter.
+
+ItemCursorPlan requires cursor values on continued pages to be unique and
+strictly monotonic in the declared direction. Under that contract, min/max are
+compatibility aliases of first/last, not additional traversal semantics. The
+profile-authorized cursor-exhausted terminal delivers a final page only when
+all cursor values are missing or null; mixed present and missing cursor values
+fail before any row from that page is emitted.
 
 Read wrappers set SAFE only when replay_safety was not supplied. An explicitly
 UNSAFE request is never upgraded.
@@ -142,6 +159,20 @@ UNSAFE request is never upgraded.
 Legacy wrappers retain the historical one-key result fallback. Canonical
 iter_list remains exact: ResultSelector.root() means the root itself must be a
 list. Use an explicit selector for nested or multi-key envelopes.
+
+## Endpoint profiles
+
+`b24api.profiles` loads immutable, versioned profile JSON, derives value-free
+`QueryShape` values, and exposes the pure `choose_plan` and `explain_plan`
+functions. Applicability requires an exact query shape, known portal build,
+required scopes, unexpired reviewed evidence, and a compatible execution
+policy. Unknown build, expired evidence, or a mismatched shape refuses the
+profile; callers may still choose an explicit plan at caller-asserted assurance.
+
+Runtime probes are contradiction checks only. Missing, inconclusive, oversized,
+or contradictory observations can downgrade a decision but can never promote
+one to profile-verified assurance. The core package intentionally ships with an
+empty default profile set until a live evidence package passes review.
 
 ## Authorized 2.0 corrections
 

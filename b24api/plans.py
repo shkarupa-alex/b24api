@@ -131,9 +131,9 @@ class OffsetSequentialPlan(PlanContract):
             raise ValueError("short-page terminal requires a requested_page_size")
         if (
             OffsetTerminalRule.QUALIFIED_TOTAL in self.terminal
-            and self.total_semantics is not TotalSemantics.FILTERED_EXACT
+            and self.total_semantics not in {TotalSemantics.FILTERED_EXACT, TotalSemantics.ADVISORY}
         ):
-            raise ValueError("qualified-total terminal requires filtered exact total semantics")
+            raise ValueError("qualified-total terminal requires exact or advisory total semantics")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

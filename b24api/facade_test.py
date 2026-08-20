@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import ast
+import asyncio
 import inspect
 import json
 import textwrap
@@ -39,6 +40,10 @@ from b24api.facade import Bitrix24
 from b24api.models import (
     ConsistencyPolicy,
     ExecutionPolicy,
+    IdentityCoercion,
+    IdentityRequirement,
+    IdentitySpec,
+    JsonValue,
     OperationReport,
     ReferenceBinding,
     ReferenceItem,
@@ -50,14 +55,23 @@ from b24api.models import (
     SnapshotRequirement,
     TerminalState,
 )
-from b24api.plans import DirectDispatch, OffsetSequentialPlan, SingleResponsePlan
+from b24api.plans import (
+    CursorTerminalRule,
+    DirectDispatch,
+    ItemCursorPlan,
+    OffsetSequentialPlan,
+    SingleResponsePlan,
+)
 from b24api.query import build_query
 from b24api.type import ApiTypes
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncGenerator, Callable, Iterator
+
+    from b24api.profiles import EndpointProfile
 
 MINIMUM_BATCH_CALLS = 2
+EXPECTED_PAGE_ROWS = 2
 
 
 class FunctionTransport:
@@ -117,12 +131,78 @@ async def test_batch_preserves_payload_and_legacy_list_selection() -> None:
 
 
 @pytest.mark.asyncio
+async def test_batch_list_method_preserves_empty_mapping_as_empty_list() -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {"result": {"result": {key: {} for key in commands}, "result_error": []}}
+
+    client, _transport = _client(handler)
+
+    assert [item async for item in client.batch([{"method": "empty"}], list_method=True)] == [[]]
+
+
+@pytest.mark.asyncio
+async def test_public_batch_early_close_closes_owned_sync_source() -> None:
+    closed = False
+
+    def source() -> Iterator[dict[str, object]]:
+        nonlocal closed
+        try:
+            yield {"method": "one"}
+            yield {"method": "two"}
+        finally:
+            closed = True
+
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {"result": {"result": {key: {"ok": True} for key in commands}, "result_error": []}}
+
+    client, _transport = _client(handler)
+    stream = cast("AsyncGenerator[JsonValue, None]", client.batch(source(), batch_size=1))
+    assert await anext(stream) == {"ok": True}
+
+    await stream.aclose()
+
+    assert closed
+
+
+@pytest.mark.asyncio
+async def test_public_batch_early_close_closes_owned_async_source() -> None:
+    closed = False
+    blocker = asyncio.Event()
+
+    async def source() -> AsyncGenerator[dict[str, object]]:
+        nonlocal closed
+        try:
+            yield {"method": "one"}
+            await blocker.wait()
+            yield {"method": "two"}
+        finally:
+            closed = True
+
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {"result": {"result": {key: {"ok": True} for key in commands}, "result_error": []}}
+
+    client, _transport = _client(handler)
+    stream = cast("AsyncGenerator[JsonValue, None]", client.batch(source(), batch_size=1))
+    assert await anext(stream) == {"ok": True}
+
+    await stream.aclose()
+
+    assert closed
+
+
+@pytest.mark.asyncio
 async def test_sequential_and_counted_wrappers_delegate_to_shared_driver() -> None:
     def handler(request: Request) -> object:
         start = request.copy_parameters().get("start", 0)
         assert isinstance(start, int)
-        rows = [{"ID": start + 1}]
-        return {"result": rows, "total": 2} | ({"next": 1} if start == 0 else {})
+        rows = [{"ID": start + 1}] if start < EXPECTED_PAGE_ROWS else []
+        return {"result": rows, "total": EXPECTED_PAGE_ROWS} | ({"next": 1} if start == 0 else {})
 
     sequential, sequential_transport = _client(handler)
     counted, counted_transport = _client(handler)
@@ -141,6 +221,53 @@ async def test_sequential_and_counted_wrappers_delegate_to_shared_driver() -> No
 
 
 @pytest.mark.asyncio
+async def test_sequential_wrapper_accepts_server_next_without_total() -> None:
+    def handler(request: Request) -> object:
+        start = request.copy_parameters().get("start", 0)
+        if start == 0:
+            return {"result": [{"ID": 1}], "next": 1}
+        return {"result": []}
+
+    client, transport = _client(handler)
+    assert [item async for item in client.list_sequential({"method": "department.get"})] == [{"ID": 1}]
+    assert [request.copy_parameters()["start"] for request in transport.requests] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_list_size_override_is_enforced_as_compatibility_page_cap() -> None:
+    client, _transport = _client(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        _ = [
+            item
+            async for item in client.list_sequential(
+                {"method": "department.get"},
+                list_size=1,
+            )
+        ]
+
+    assert "declared page cap" in str(caught.value.__cause__)
+
+
+@pytest.mark.asyncio
+async def test_public_list_early_close_propagates_final_incomplete_report() -> None:
+    def handler(request: Request) -> object:
+        start = request.copy_parameters().get("start", 0)
+        assert isinstance(start, int)
+        return {"result": [{"ID": start + 1}], "next": start + 1}
+
+    client, _transport = _client(handler)
+    stream = client.list_sequential({"method": "department.get"})
+    assert await anext(stream) == {"ID": 1}
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        await stream.aclose()
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
 async def test_no_count_wrapper_maps_legacy_id_key_to_exact_keyset() -> None:
     def handler(request: Request) -> object:
         parameters = request.copy_parameters()
@@ -153,7 +280,11 @@ async def test_no_count_wrapper_maps_legacy_id_key_to_exact_keyset() -> None:
     client, transport = _client(handler)
     assert [item async for item in client.list_batched_no_count({"method": "crm.item.list"})] == [{"ID": "1"}]
 
-    assert transport.requests[0].copy_parameters() == {"order": {"ID": "ASC"}, "start": -1}
+    assert transport.requests[0].copy_parameters() == {
+        "order": {"ID": "ASC"},
+        "select": ["ID"],
+        "start": -1,
+    }
     assert transport.requests[1].copy_parameters()["filter"] == {">ID": 1}
 
 
@@ -222,6 +353,122 @@ async def test_reference_keyset_wrapper_preserves_input_order_and_payload() -> N
 
 
 @pytest.mark.asyncio
+async def test_reference_keyset_wrapper_preserves_committed_page_round_order() -> None:
+    command_groups: list[list[tuple[str, int]]] = []
+
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        group: list[tuple[str, int]] = []
+        results: dict[str, object] = {}
+        for key, command in commands.items():
+            assert isinstance(command, str)
+            query = parse_qs(urlsplit(command).query)
+            owner = query["filter[OWNER_ID]"][0]
+            cursor = int(query.get("filter[>ID]", ["0"])[0])
+            group.append((owner, cursor))
+            results[key] = (
+                [{"ID": cursor + 1, "OWNER_ID": owner}] if cursor < EXPECTED_PAGE_ROWS else []
+            )
+        command_groups.append(group)
+        return {"result": {"result": results, "result_error": []}}
+
+    client, _transport = _client(handler)
+    items = [
+        item
+        async for item in client.reference_batched_no_count(
+            {"method": "crm.timeline.list"},
+            [({"OWNER_ID": "A"}, "a"), ({"OWNER_ID": "B"}, "b")],
+            with_payload=True,
+            batch_size=2,
+        )
+    ]
+
+    assert items == [
+        ({"ID": 1, "OWNER_ID": "A"}, "a"),
+        ({"ID": 1, "OWNER_ID": "B"}, "b"),
+        ({"ID": 2, "OWNER_ID": "A"}, "a"),
+        ({"ID": 2, "OWNER_ID": "B"}, "b"),
+    ]
+    assert command_groups == [
+        [("A", 0), ("B", 0)],
+        [("A", 1), ("B", 1)],
+        [("A", 2), ("B", 2)],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reference_keyset_wrapper_appends_identity_to_legacy_select() -> None:
+    seen_select: list[list[str]] = []
+
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        results: dict[str, object] = {}
+        for key, command in commands.items():
+            assert isinstance(command, str)
+            query = parse_qs(urlsplit(command).query)
+            selected = [values[0] for name, values in query.items() if name.startswith("select[")]
+            seen_select.append(selected)
+            results[key] = [] if "filter[>ID]" in query else [{"ID": 1, "STATUS_ID": "NEW"}]
+        return {"result": {"result": results, "result_error": []}}
+
+    client, _transport = _client(handler)
+    items = [
+        item
+        async for item in client.reference_batched_no_count(
+            {
+                "method": "crm.timeline.list",
+                "parameters": {"select": ["STATUS_ID"]},
+            },
+            [{"OWNER_ID": "A"}],
+            batch_size=1,
+        )
+    ]
+
+    assert items == [{"ID": 1, "STATUS_ID": "NEW"}]
+    assert seen_select
+    assert all(selected == ["STATUS_ID", "ID"] for selected in seen_select)
+
+
+@pytest.mark.asyncio
+async def test_public_reference_early_close_closes_owned_async_source() -> None:
+    closed = False
+    blocker = asyncio.Event()
+
+    async def updates() -> AsyncGenerator[dict[str, object]]:
+        nonlocal closed
+        try:
+            yield {"OWNER_ID": 1}
+            await blocker.wait()
+            yield {"OWNER_ID": 2}
+        finally:
+            closed = True
+
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        results: dict[str, object] = {}
+        for key, command in commands.items():
+            assert isinstance(command, str)
+            results[key] = [] if "%3EID" in command or ">ID" in command else [{"ID": 1}]
+        return {"result": {"result": results, "result_error": []}}
+
+    client, _transport = _client(handler)
+    stream = client.reference_batched_no_count(
+        {"method": "crm.timeline.list"},
+        updates(),
+        batch_size=1,
+    )
+    assert await anext(stream) == {"ID": 1}
+
+    with pytest.raises(IncompleteTraversalError):
+        await stream.aclose()
+
+    assert closed
+
+
+@pytest.mark.asyncio
 async def test_reference_cursor_wrapper_selects_result_and_short_page_terminal() -> None:
     def handler(request: Request) -> object:
         commands = request.copy_parameters()["cmd"]
@@ -248,6 +495,110 @@ async def test_reference_cursor_wrapper_selects_result_and_short_page_terminal()
 
     assert items == [({"id": 10}, "chat")]
     assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_reference_cursor_min_preserves_committed_descending_direction() -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: [{"id": 3}, {"id": 2}] for key in commands},
+                "result_error": [],
+            },
+        }
+
+    client, _transport = _client(handler)
+    result = [
+        item
+        async for item in client.reference_cursor_no_count(
+            {"method": "im.dialog.messages.get"},
+            [{"DIALOG_ID": "chat1"}],
+            cursor_take="min",
+            list_size=3,
+            batch_size=1,
+        )
+    ]
+
+    assert result == [{"id": 3}, {"id": 2}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row", [{"ID": 1}, {"ID": 1, "cursor": None}])
+async def test_reference_cursor_profile_exhaustion_delivers_missing_or_null_terminal_row(
+    row: dict[str, JsonValue],
+) -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {"result": {"result": {key: [row] for key in commands}, "result_error": []}}
+
+    client, _transport = _client(handler)
+    plan = ItemCursorPlan(
+        identity_requirement=IdentityRequirement.REQUIRED,
+        cursor_item_path=("cursor",),
+        cursor_coercion=IdentityCoercion.EXACT_INTEGER,
+        terminal=CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED,
+    )
+    identity = IdentitySpec(
+        item_path=("ID",),
+        filter_key="ID",
+        order_key="ID",
+        coercion=IdentityCoercion.EXACT_INTEGER,
+    )
+
+    result = [
+        item
+        async for item in client.reference_cursor_no_count(
+            {"method": "im.dialog.messages.get"},
+            [{"DIALOG_ID": "chat1"}],
+            plan=plan,
+            identity=identity,
+            batch_size=1,
+        )
+    ]
+
+    assert result == [row]
+
+
+@pytest.mark.asyncio
+async def test_reference_cursor_profile_exhaustion_rejects_mixed_cursor_presence() -> None:
+    rows = [{"ID": 1, "cursor": 1}, {"ID": 2}]
+
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {"result": {"result": dict.fromkeys(commands, rows), "result_error": []}}
+
+    client, _transport = _client(handler)
+    plan = ItemCursorPlan(
+        identity_requirement=IdentityRequirement.REQUIRED,
+        cursor_item_path=("cursor",),
+        cursor_coercion=IdentityCoercion.EXACT_INTEGER,
+        terminal=CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED,
+    )
+    identity = IdentitySpec(
+        item_path=("ID",),
+        filter_key="ID",
+        order_key="ID",
+        coercion=IdentityCoercion.EXACT_INTEGER,
+    )
+
+    with pytest.raises(IncompleteTraversalError) as caught:
+        _ = [
+            item
+            async for item in client.reference_cursor_no_count(
+                {"method": "im.dialog.messages.get"},
+                [{"DIALOG_ID": "chat1"}],
+                plan=plan,
+                identity=identity,
+                batch_size=1,
+            )
+        ]
+
+    report = cast("OperationReport", caught.value.report)
+    assert report.emitted_rows == 0
 
 
 @pytest.mark.asyncio
@@ -312,7 +663,7 @@ async def test_plan_profile_conflict_refuses_before_transport() -> None:
             async for item in client.list_sequential(
                 {"method": "crm.item.list"},
                 plan=SingleResponsePlan(),
-                profile=object(),
+                profile=cast("EndpointProfile", object()),
             )
         ]
 
@@ -372,6 +723,31 @@ def test_facade_signature_snapshot_preserves_committed_and_keyword_bridges() -> 
         name: tuple(inspect.signature(getattr(Bitrix24, name)).parameters)
         for name in expected
     } == expected
+
+    constructor = inspect.signature(Bitrix24)
+    settings = constructor.parameters["settings"]
+    assert settings.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert settings.default is None
+    assert settings.annotation == "Settings | None"
+
+    outcomes = inspect.signature(Bitrix24.batch_outcomes)
+    assert outcomes.return_annotation == "BatchOutcomeStream"
+    assert outcomes.parameters["batch_size"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert outcomes.parameters["fallback_failed"].default == "none"
+
+    for name in (
+        "list_sequential",
+        "list_batched",
+        "list_batched_no_count",
+        "reference_batched_no_count",
+        "reference_cursor_no_count",
+    ):
+        signature = inspect.signature(getattr(Bitrix24, name))
+        assert signature.parameters["profile"].annotation == "EndpointProfile | None"
+        for parameter in tuple(signature.parameters.values())[2:]:
+            if name.startswith("reference_") and parameter.name == "updates":
+                continue
+            assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_root_export_snapshot_and_legacy_import_paths() -> None:

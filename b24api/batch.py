@@ -827,9 +827,13 @@ def _batch_outcome_row_weight(outcome: BatchOutcome) -> int:
     return outcome.decoded_rows if isinstance(outcome, BatchSuccess) else 1
 
 
+BatchOutcomeStream = BatchStream
+
+
 __all__ = [
     "BatchExecutor",
     "BatchInput",
+    "BatchOutcomeStream",
     "BatchSource",
     "BatchStream",
     "BatchStreamItem",

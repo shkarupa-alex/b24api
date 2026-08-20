@@ -435,6 +435,7 @@ class ReferenceScheduler:
         tolerant: bool,
         policy: ExecutionPolicy,
         whole_result: bool = False,
+        page_cap_hint: int | None = None,
     ) -> None:
         self.executor = executor
         self.plan = plan
@@ -450,6 +451,7 @@ class ReferenceScheduler:
             dispatch,
             policy,
             whole_result=whole_result,
+            page_cap_hint=page_cap_hint,
         )
         self.active_limit = _active_limit(output_order, policy, self.page_cap)
         self.dispatcher: _PageDispatcher
@@ -606,6 +608,7 @@ class ReferenceScheduler:
             context=self.context,
             fetch=fetch,
             single_result_as_item=self.whole_result,
+            page_cap_hint=self.page_cap,
         )
         try:
             async for page in driver.pages():
@@ -994,6 +997,7 @@ def iter_references(  # noqa: PLR0913
     tolerant: bool = False,
     policy: ExecutionPolicy | None = None,
     _whole_result: bool = False,
+    _page_cap_hint: int | None = None,
 ) -> ReferenceStream:
     """Construct a lazy bounded reference traversal stream without I/O."""
     PaginationDriver.validate_plan(plan)
@@ -1003,6 +1007,10 @@ def iter_references(  # noqa: PLR0913
         raise TypeError("output_order must be ReferenceOutputOrder")
     if dispatch.output_order is not output_order:
         raise ValueError("dispatch and stream output order must agree")
+    if _page_cap_hint is not None and (
+        not isinstance(_page_cap_hint, int) or isinstance(_page_cap_hint, bool) or _page_cap_hint < 1
+    ):
+        raise ValueError("page cap hint must be a positive integer")
     scheduler = ReferenceScheduler(
         executor,
         plan=plan,
@@ -1013,6 +1021,7 @@ def iter_references(  # noqa: PLR0913
         tolerant=tolerant,
         policy=policy or ExecutionPolicy(),
         whole_result=_whole_result,
+        page_cap_hint=_page_cap_hint,
     )
     return ReferenceStream(scheduler, requests)
 
@@ -1134,6 +1143,7 @@ def _page_cap(
     policy: ExecutionPolicy,
     *,
     whole_result: bool,
+    page_cap_hint: int | None,
 ) -> int:
     if whole_result:
         if isinstance(dispatch, DirectDispatch):
@@ -1145,6 +1155,8 @@ def _page_cap(
         else:
             concurrent_results = min(dispatch.batch_size, policy.max_active_references)
         return max(1, policy.max_buffered_rows // concurrent_results)
+    if page_cap_hint is not None:
+        return min(page_cap_hint, policy.max_buffered_rows)
     requested = (
         plan.requested_page_size
         if isinstance(plan, OffsetSequentialPlan | CountedOffsetPlan | KeysetPlan | ItemCursorPlan)

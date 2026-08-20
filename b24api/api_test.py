@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 from b24api.api import Bitrix24
 from b24api.error import ApiResponseError, HTTPGatewayError, IncompleteTraversalError
-from b24api.models import ReplaySafety, Request, Response
+from b24api.models import BatchSuccess, ReplaySafety, Request, Response
 from b24api.settings import Settings
 
 _WEBHOOK = "https://bitrix24.com/rest/0/test/"
@@ -45,6 +45,46 @@ async def test_zero_explicit_argument_construction_remains_valid() -> None:
     client = Bitrix24()
     try:
         assert client.host == "bitrix24.com"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_positional_explicit_settings_override_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BITRIX24_API_WEBHOOK_URL", "https://environment.invalid/rest/1/redacted/")
+    explicit = Settings(webhook_url="https://explicit.invalid/rest/1/redacted/")
+
+    client = Bitrix24(explicit)
+    try:
+        assert client.host == "explicit.invalid"
+        assert client._settings is explicit  # noqa: SLF001 - compatibility regression
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_environment_backed_settings_map_to_facade_defaults() -> None:
+    timeout = 17
+    attempts = 3
+    list_size = 23
+    batch_size = 7
+    settings = Settings(
+        webhook_url=_WEBHOOK,
+        logger_name="b24api.compatibility-test",
+        http_timeout=timeout,
+        retry_attempts=attempts,
+        list_size=list_size,
+        batch_size=batch_size,
+    )
+
+    client = Bitrix24(settings)
+    try:
+        assert client._settings is not None  # noqa: SLF001
+        assert client._default_policy.max_retry_elapsed_per_request == timeout  # noqa: SLF001
+        assert client._default_policy.max_attempts_per_request == attempts  # noqa: SLF001
+        assert client._settings.list_size == list_size  # noqa: SLF001
+        assert client._settings.batch_size == batch_size  # noqa: SLF001
+        assert client._logger.name == "b24api.compatibility-test"  # noqa: SLF001
     finally:
         await client.aclose()
 
@@ -180,6 +220,75 @@ async def test_batch_wire_snapshot_uses_reviewed_php_shape_and_preserves_order(h
 
     assert result == [{"ID": "1"}, [{"ID": "2"}]]
     assert json.loads(httpx_mock.get_requests()[0].content) == {"halt": 1, "cmd": expected_cmd}
+
+
+@pytest.mark.asyncio
+async def test_configured_default_batch_size_is_applied(httpx_mock: HTTPXMock) -> None:
+    command_counts: list[int] = []
+
+    def callback(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        commands = body["cmd"]
+        command_counts.append(len(commands))
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "result": {key: {"ok": True} for key in commands},
+                    "result_error": [],
+                },
+            },
+        )
+
+    httpx_mock.add_callback(
+        callback,
+        method="POST",
+        url=f"{_WEBHOOK}batch",
+        is_reusable=True,
+    )
+    settings = Settings(
+        webhook_url=_WEBHOOK,
+        batch_size=2,
+        retry_attempts=1,
+        retry_delay=0,
+        retry_backoff=1,
+    )
+
+    async with Bitrix24(settings) as client:
+        result = [item async for item in client.batch([{"method": f"method.{index}"} for index in range(3)])]
+
+    assert result == [{"ok": True}, {"ok": True}, {"ok": True}]
+    assert command_counts == [2, 1]
+
+
+@pytest.mark.asyncio
+async def test_batch_outcomes_preserves_normative_payload_tuple(httpx_mock: HTTPXMock) -> None:
+    def callback(request: httpx.Request) -> httpx.Response:
+        commands = json.loads(request.content)["cmd"]
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "result": {key: {"ok": True} for key in commands},
+                    "result_error": [],
+                },
+            },
+        )
+
+    httpx_mock.add_callback(callback, method="POST", url=f"{_WEBHOOK}batch")
+    payload = {"correlation": 9}
+
+    async with Bitrix24(Settings(webhook_url=_WEBHOOK)) as client:
+        outcomes = [
+            outcome
+            async for outcome in client.batch_outcomes(
+                [({"method": "profile"}, payload)],
+            )
+        ]
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], BatchSuccess)
+    assert outcomes[0].payload is payload
 
 
 @pytest.mark.asyncio
