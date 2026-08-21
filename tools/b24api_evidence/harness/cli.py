@@ -81,6 +81,7 @@ _ROLE_CHOICES = ("admin_full", "admin_limited", "employee_full", "employee_limit
 _MODEL_WARMUPS = 1
 _MODEL_ADVISORY_RUNS = 5
 _MODEL_BLOCKING_PAIRS = 9
+_MAX_PORTAL_BUILD_LENGTH = 100
 _MAX_BUNDLE_FILES = 512
 _MAX_BUNDLE_BYTES = 128 * 1024 * 1024
 _TRANSACTION_MARKER_PREFIX = ".b24api-transaction-"
@@ -2039,9 +2040,12 @@ def _optional_preflight_build(preflight: LivePreflight) -> str | None:
     build = preflight.build
     if build is None:
         return None
-    if not isinstance(build, str) or not build.strip():
+    if not isinstance(build, str):
         raise LiveCorrectnessError("live portal returned an invalid build identifier")
-    return build.strip()
+    normalized = build.strip()
+    if not normalized or len(normalized) > _MAX_PORTAL_BUILD_LENGTH:
+        raise LiveCorrectnessError("live portal returned an invalid build identifier")
+    return normalized
 
 
 def _require_live_write_flags(args: argparse.Namespace, command: str) -> None:

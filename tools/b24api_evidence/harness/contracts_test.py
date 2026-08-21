@@ -1821,7 +1821,7 @@ def test_live_empty_plan_refuses_before_credential_setup(tmp_path: Path) -> None
     assert "at least one disposable entity" in result.stderr
 
 
-@pytest.mark.parametrize("build", ["", "   ", 24100, True])
+@pytest.mark.parametrize("build", ["", "   ", "x" * 101, 24100, True])
 def test_live_plan_refuses_invalid_build_before_artifact_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1863,6 +1863,52 @@ def test_live_plan_refuses_invalid_build_before_artifact_write(
         cli_module._plan(args)  # noqa: SLF001 - direct refusal-before-write regression
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_public_main_maps_overlength_optional_build_to_correctness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakePortal:
+        identity = PortalIdentity("portal.invalid", "admin_full", "1", SHA256)
+
+        def __init__(self, *, role: str) -> None:
+            assert role == "admin_full"
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
+            assert required_scopes == {"task"}
+            return LivePreflight(self.identity, "x" * 101, frozenset({"task"}))
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+    monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda _root: None)
+    artifact_dir = tmp_path / "artifacts"
+
+    result = cli_module.main(
+        [
+            "plan",
+            "--artifact-dir",
+            str(artifact_dir),
+            "--live",
+            "--credential-role",
+            "admin_full",
+            "--entity-profile",
+            "tasks-task-v1",
+            "--count",
+            "5",
+        ],
+    )
+
+    assert result == ExitCode.CORRECTNESS
+    assert "invalid build identifier" in capsys.readouterr().err
+    assert not artifact_dir.exists()
 
 
 @pytest.mark.parametrize(("build", "expected_build"), [(None, None), (" 26.500.0 ", "26.500.0")])
