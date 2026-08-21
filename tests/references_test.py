@@ -1467,6 +1467,7 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
     )
     assert isinstance(await anext(stream), ReferenceItem)
     observed: list[tuple[str, object]] = []
+    independent_transport = AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})
 
     async def consume() -> None:
         current = asyncio.current_task()
@@ -1476,7 +1477,7 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
         except RuntimeError as error:
             observed.append((str(error), current.cancelling()))
         try:
-            await asyncio.sleep(0)
+            await Executor(independent_transport).execute(Request("independent"))
         except asyncio.CancelledError as cancellation:
             observed.append((str(cancellation), current.cancelling()))
         while current.cancelling():
@@ -1488,6 +1489,7 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
 
     await task
     assert observed == [("reference close boom", 1), ("external-caller", 1)]
+    assert independent_transport.requests == []
     assert stream.report.state is TerminalState.FAILED
     assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
 

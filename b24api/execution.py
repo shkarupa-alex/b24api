@@ -739,6 +739,14 @@ def _raise_for_pending_cancellation() -> None:
         raise asyncio.CancelledError
 
 
+async def _checkpoint_pending_cancellation() -> None:
+    task = asyncio.current_task()
+    if task is None or not task.cancelling():
+        return
+    await asyncio.sleep(0)
+    _raise_for_pending_cancellation()
+
+
 class Executor:
     """Execute canonical requests with conservative replay and budget semantics."""
 
@@ -777,6 +785,7 @@ class Executor:
             raise ValueError("pass context or policy, not both")
         if not isinstance(request, Request):
             raise TypeError("request must be canonical Request")
+        await _checkpoint_pending_cancellation()
         context = context or self.context(policy)
         await context.start()
         retry_started = self._clock()
