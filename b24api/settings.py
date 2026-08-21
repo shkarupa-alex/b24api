@@ -24,7 +24,12 @@ def _settings_validation_error(error: ValidationError | None = None) -> Validati
             },
         ]
     else:
-        details = [cast("InitErrorDetails", dict(item, input=_REDACTED)) for item in error.errors(include_url=False)]
+        details = []
+        for item in error.errors(include_url=False):
+            safe_item = dict(item, input=_REDACTED)
+            if item["type"] == "webhook_url":
+                safe_item["type"] = PydanticCustomError("webhook_url", "Webhook URL is invalid")
+            details.append(cast("InitErrorDetails", safe_item))
     return ValidationError.from_exception_data("Settings", details)
 
 
@@ -186,7 +191,7 @@ class Settings(BaseSettings):
         try:
             return _WEBHOOK_ADAPTER.validate_python(value)
         except (TypeError, ValueError, ValidationError):
-            return _REDACTED
+            raise PydanticCustomError("webhook_url", "Webhook URL is invalid") from None
 
     @field_serializer("webhook_url")
     def _serialize_webhook_url(self, _value: HttpUrl) -> str:

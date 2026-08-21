@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 import base64
+import gc
 import json
 import tracemalloc
+import weakref
 from typing import TYPE_CHECKING
 
 import httpx
 import pytest
 
+from . import live as live_module
 from .contracts import ContractError
 from .live import (
     ADAPTERS,
@@ -170,6 +173,23 @@ def test_live_portal_drops_webhook_when_httpx_client_initialization_fails(
         LivePortal(role="admin_full")
 
     _assert_live_error_redacted(captured.value, sensitive_fragment)
+
+
+def test_live_portal_webhook_vault_is_opaque_and_gc_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    sensitive_fragment = "not-a-secret"
+    portal = _portal(monkeypatch, lambda _request: httpx.Response(200, json={"result": []}))
+    client = portal._client  # noqa: SLF001 - lifecycle regression
+    handle = portal._webhook_handle  # noqa: SLF001 - lifecycle regression
+    reference = weakref.ref(portal)
+
+    assert sensitive_fragment not in repr(live_module.__dict__)
+    del portal
+    gc.collect()
+
+    assert reference() is None
+    with pytest.raises(LiveUnavailableError, match="credential is unavailable"):
+        live_module._webhook_for(handle)  # noqa: SLF001 - lifecycle regression
+    client.close()
 
 
 @pytest.mark.parametrize("response_case", ["scope", "build", "create", "missing_result"])

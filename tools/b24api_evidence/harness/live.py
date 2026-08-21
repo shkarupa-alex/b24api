@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 import os
+import secrets
 import uuid
+import weakref
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Self, cast
@@ -26,20 +28,6 @@ MAX_BUILD_LENGTH = 100
 UNAVAILABLE_API_CODES = frozenset({"error_method_not_found", "insufficient_scope", "access_denied"})
 CLASSIFIED_API_CODES = frozenset({"error_not_found"})
 UNKNOWN_API_CODE = "unexpected_api_error"
-_WEBHOOK_VAULT: dict[str, str] = {}
-
-
-def _store_webhook(webhook_url: str) -> str:
-    handle = uuid.uuid4().hex
-    _WEBHOOK_VAULT[handle] = webhook_url
-    return handle
-
-
-def _webhook_for(handle: str) -> str:
-    try:
-        return _WEBHOOK_VAULT[handle]
-    except KeyError as error:
-        raise LiveUnavailableError("live credential is unavailable") from error
 
 
 class LiveUnavailableError(RuntimeError):
@@ -48,6 +36,32 @@ class LiveUnavailableError(RuntimeError):
 
 class LiveCorrectnessError(RuntimeError):
     """A live response contradicts the reviewed disposable-entity contract."""
+
+
+def _webhook_vault() -> tuple[Callable[[str], str], Callable[[str], str], Callable[[str], None]]:
+    entries: dict[str, tuple[bytes, bytes]] = {}
+
+    def store(webhook_url: str) -> str:
+        handle = uuid.uuid4().hex
+        plaintext = webhook_url.encode()
+        key = secrets.token_bytes(len(plaintext))
+        entries[handle] = (bytes(left ^ right for left, right in zip(plaintext, key, strict=True)), key)
+        return handle
+
+    def fetch(handle: str) -> str:
+        try:
+            ciphertext, key = entries[handle]
+        except KeyError as error:
+            raise LiveUnavailableError("live credential is unavailable") from error
+        return bytes(left ^ right for left, right in zip(ciphertext, key, strict=True)).decode()
+
+    def drop(handle: str) -> None:
+        entries.pop(handle, None)
+
+    return store, fetch, drop
+
+
+_store_webhook, _webhook_for, _drop_webhook = _webhook_vault()
 
 
 class LiveApiError(LiveCorrectnessError):
@@ -162,6 +176,7 @@ class LivePortal:
             raise LiveUnavailableError("live HTTP client configuration is invalid")
         self.identity = cast("PortalIdentity", identity)
         self._webhook_handle = _store_webhook(cast("str", normalized_webhook))
+        self._webhook_finalizer = weakref.finalize(self, _drop_webhook, self._webhook_handle)
         self._client = cast("httpx.Client", resolved_client)
         self.attempts = 0
 
@@ -170,7 +185,7 @@ class LivePortal:
         try:
             self._client.close()
         finally:
-            _WEBHOOK_VAULT.pop(self._webhook_handle, None)
+            self._webhook_finalizer()
 
     def __enter__(self) -> Self:
         """Enter the context."""

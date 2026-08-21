@@ -72,6 +72,7 @@ def test_settings_redacts_invalid_webhook_from_validation_error() -> None:
     error = captured.value
     surfaces = (str(error), repr(error), repr(error.errors()), error.json())
     assert all(sensitive_fragment not in surface for surface in surfaces)
+    assert "Webhook URL is invalid" in str(error)
 
 
 @pytest.mark.parametrize("webhook_case", ["valid", "invalid"])

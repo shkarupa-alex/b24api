@@ -556,11 +556,6 @@ def _verify(args: argparse.Namespace) -> ExitCode:
     }
     validate_oracle_record(oracle)
     artifact_dir = args.artifact_dir.resolve()
-    _write_candidate_json(
-        artifact_dir / "oracle.json",
-        oracle,
-        candidate_sha=str(plan["candidate_sha"]),
-    )
     artifact = _operation_artifact(
         command="verify",
         dataset_plan=plan,
@@ -573,11 +568,11 @@ def _verify(args: argparse.Namespace) -> ExitCode:
         terminal_state="completed" if outcome == "PASS" else "incomplete",
         extra={"evidence_refs": [f"sha256:{content_sha256(oracle)}"]},
     )
-    _write_validated_artifact(
-        artifact_dir / "verify-evidence.json",
-        artifact,
+    _persist_verify_bundle(
+        artifact_dir=artifact_dir,
+        oracle=oracle,
+        artifact=artifact,
         candidate_sha=str(plan["candidate_sha"]),
-        scan_bundle=True,
     )
     _safe_message(f"verify completed: {artifact_dir / 'oracle.json'}")
     return ExitCode.COMPLETED if outcome == "PASS" else ExitCode.INCOMPLETE
@@ -1266,7 +1261,8 @@ def _restore_candidate_json(path: Path, previous: Mapping[str, Any] | None) -> N
     quarantine: Path | None = None
     try:
         if path.exists():
-            quarantine = path.with_name(f".{path.name}.refused-{uuid.uuid4().hex}")
+            bundle_root = path.parent.parent if path.parent.name == "model-oracles" else path.parent
+            quarantine = bundle_root.parent / (f".{bundle_root.name}.{path.name}.refused-{uuid.uuid4().hex}")
             path.replace(quarantine)
         if previous is not None:
             atomic_write_json(path, previous)
@@ -1281,6 +1277,33 @@ def _restore_candidate_json(path: Path, previous: Mapping[str, Any] | None) -> N
 def _rollback_candidate_json_log(log: list[tuple[Path, Mapping[str, Any] | None]]) -> None:
     for path, previous in reversed(log):
         _restore_candidate_json(path, previous)
+
+
+def _persist_verify_bundle(
+    *,
+    artifact_dir: Path,
+    oracle: Mapping[str, Any],
+    artifact: Mapping[str, Any],
+    candidate_sha: str,
+) -> None:
+    """Publish one verify dependency and terminal artifact as a transaction."""
+    rollback_log: list[tuple[Path, Mapping[str, Any] | None]] = []
+    try:
+        _write_candidate_json(
+            artifact_dir / "oracle.json",
+            oracle,
+            candidate_sha=candidate_sha,
+            rollback_log=rollback_log,
+        )
+        _write_validated_artifact(
+            artifact_dir / "verify-evidence.json",
+            artifact,
+            candidate_sha=candidate_sha,
+            scan_bundle=True,
+        )
+    except BaseException:
+        _rollback_candidate_json_log(rollback_log)
+        raise
 
 
 def _persist_plan_bundle(
@@ -1725,13 +1748,6 @@ def _scan_bundle(  # noqa: C901, PLR0912, PLR0915
         _require_evidence_candidate(expected_candidate_sha)
     else:
         require_clean_tracked_tree(ROOT)
-    for refused in artifact_dir.glob(".*.refused-*"):
-        if not refused.is_file():
-            continue
-        try:
-            refused.unlink()
-        except OSError as error:
-            raise ContractError("cannot clean a refused evidence quarantine") from error
     scan_paths_for_secrets(tracked_repository_paths(ROOT))
     artifact_paths: list[Path] = []
     total_bytes = 0

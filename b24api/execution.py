@@ -7,8 +7,10 @@ import email.utils
 import json
 import math
 import random
+import secrets
 import time
 import uuid
+import weakref
 from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -46,20 +48,32 @@ type Sleeper = Callable[[float], Awaitable[None]]
 _HTTP_STATUS_MINIMUM = 100
 _HTTP_STATUS_MAXIMUM = 599
 _RETRY_AFTER_CAP_SECONDS = 3_600.0
-_WEBHOOK_VAULT: dict[str, str] = {}
 
 
-def _store_webhook(webhook_url: str) -> str:
-    handle = uuid.uuid4().hex
-    _WEBHOOK_VAULT[handle] = webhook_url
-    return handle
+def _webhook_vault() -> tuple[Callable[[str], str], Callable[[str], str], Callable[[str], None]]:
+    entries: dict[str, tuple[bytes, bytes]] = {}
+
+    def store(webhook_url: str) -> str:
+        handle = uuid.uuid4().hex
+        plaintext = webhook_url.encode()
+        key = secrets.token_bytes(len(plaintext))
+        entries[handle] = (bytes(left ^ right for left, right in zip(plaintext, key, strict=True)), key)
+        return handle
+
+    def fetch(handle: str) -> str:
+        try:
+            ciphertext, key = entries[handle]
+        except KeyError as error:
+            raise RuntimeError("transport credential is unavailable") from error
+        return bytes(left ^ right for left, right in zip(ciphertext, key, strict=True)).decode()
+
+    def drop(handle: str) -> None:
+        entries.pop(handle, None)
+
+    return store, fetch, drop
 
 
-def _webhook_for(handle: str) -> str:
-    try:
-        return _WEBHOOK_VAULT[handle]
-    except KeyError as error:
-        raise RuntimeError("transport credential is unavailable") from error
+_store_webhook, _webhook_for, _drop_webhook = _webhook_vault()
 
 
 class WorkClass(StrEnum):
@@ -150,6 +164,7 @@ class HttpxTransport:
             normalized_webhook = ""
             raise RuntimeError("HTTP client initialization failed")
         self._webhook_handle = _store_webhook(normalized_webhook)
+        self._webhook_finalizer = weakref.finalize(self, _drop_webhook, self._webhook_handle)
         self._client = cast("httpx.AsyncClient", resolved_client)
         self._owns_client = client is None
         self._closed = False
@@ -232,7 +247,7 @@ class HttpxTransport:
             if self._owns_client:
                 await self._client.aclose()
         finally:
-            _WEBHOOK_VAULT.pop(self._webhook_handle, None)
+            self._webhook_finalizer()
 
 
 @dataclass(frozen=True, slots=True)
@@ -680,10 +695,9 @@ async def await_cancellation_resistant(awaitable: Awaitable[None]) -> asyncio.Ca
 def rearm_cancellation(cancellation: asyncio.CancelledError | None) -> None:
     """Replay a cancellation after a primary failure has crossed its atomic cleanup."""
     task = asyncio.current_task()
-    if task is None or (cancellation is None and not task.cancelling()):
+    if task is None or not task.cancelling():
         return
-    while task.cancelling():
-        task.uncancel()
+    task.uncancel()
     message = cancellation.args[0] if cancellation is not None and cancellation.args else None
     task.cancel(message)
 

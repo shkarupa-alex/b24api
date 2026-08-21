@@ -660,39 +660,99 @@ def test_rollback_base_exception_does_not_mask_primary_bundle_failure(
     artifact = _benchmark_artifact()
     candidate_sha = str(artifact["candidate_sha"])
     path = tmp_path / "benchmark-evidence.json"
-    monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
-    monkeypatch.setattr(
-        cli_module,
-        "_scan_bundle",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(ContractError("primary final scan failure")),
-    )
-    monkeypatch.setattr(Path, "unlink", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()))
-
-    with pytest.raises(ContractError, match="primary final scan failure"):
-        cli_module._write_validated_artifact(  # noqa: SLF001
-            path,
-            artifact,
-            candidate_sha=candidate_sha,
-            scan_bundle=True,
+    with monkeypatch.context() as patch:
+        patch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
+        patch.setattr(
+            cli_module,
+            "_scan_bundle",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ContractError("primary final scan failure")),
         )
+        patch.setattr(Path, "unlink", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+        with pytest.raises(ContractError, match="primary final scan failure"):
+            cli_module._write_validated_artifact(  # noqa: SLF001
+                path,
+                artifact,
+                candidate_sha=candidate_sha,
+                scan_bundle=True,
+            )
 
     assert not path.exists()
-    quarantined = tuple(tmp_path.glob(".benchmark-evidence.json.refused-*"))
+    quarantined = tuple(tmp_path.parent.glob(f".{tmp_path.name}.benchmark-evidence.json.refused-*"))
     assert len(quarantined) == 1
     assert json.loads(quarantined[0].read_text())["outcome"] == "PASS"
+    quarantined[0].unlink()
 
 
-def test_next_bundle_scan_cleans_refused_quarantine(
+def test_bundle_scan_never_deletes_caller_owned_refused_lookalikes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    quarantine = tmp_path / ".benchmark-evidence.json.refused-synthetic"
-    quarantine.write_text('{"outcome":"PASS"}')
+    root_lookalike = tmp_path / ".caller-owned.refused-backup"
+    nested_dir = tmp_path / "model-oracles"
+    nested_dir.mkdir()
+    nested_lookalike = nested_dir / ".caller-owned.json.refused-backup"
+    root_lookalike.write_text("caller owned")
+    nested_lookalike.write_text("caller owned")
     monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda _root: None)
 
     cli_module._scan_bundle(tmp_path)  # noqa: SLF001
 
-    assert not quarantine.exists()
+    assert root_lookalike.read_text() == "caller owned"
+    assert nested_lookalike.read_text() == "caller owned"
+
+
+def test_failed_nested_quarantine_never_remains_inside_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    oracle_dir = tmp_path / "model-oracles"
+    oracle_dir.mkdir()
+    path = oracle_dir / "case.json"
+    atomic_write_json(path, {"outcome": "PASS"})
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()))
+        cli_module._restore_candidate_json(path, None)  # noqa: SLF001
+
+    assert not path.exists()
+    assert not tuple(tmp_path.rglob("*.refused-*"))
+    quarantined = tuple(tmp_path.parent.glob(f".{tmp_path.name}.case.json.refused-*"))
+    assert len(quarantined) == 1
+    quarantined[0].unlink()
+
+
+@pytest.mark.parametrize("with_previous", [False, True])
+def test_verify_bundle_failure_rolls_back_oracle_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    with_previous: bool,
+) -> None:
+    candidate_sha = "d9cd6969415f571ce64ae16d7aab160b8a3a7d42"
+    oracle_path = tmp_path / "oracle.json"
+    previous = {"case_id": "old"}
+    if with_previous:
+        atomic_write_json(oracle_path, previous)
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
+    monkeypatch.setattr(
+        cli_module,
+        "_write_validated_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ContractError("terminal publication refused")),
+    )
+
+    with pytest.raises(ContractError, match="terminal publication refused"):
+        cli_module._persist_verify_bundle(  # noqa: SLF001
+            artifact_dir=tmp_path,
+            oracle={"case_id": "new"},
+            artifact=_benchmark_artifact(),
+            candidate_sha=candidate_sha,
+        )
+
+    if with_previous:
+        assert json.loads(oracle_path.read_text()) == previous
+    else:
+        assert not oracle_path.exists()
 
 
 def test_plan_bundle_failure_rolls_back_every_new_dependency(

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 import asyncio
+import gc
+import weakref
 
 import httpx
 import pytest
 
+from b24api import execution as execution_module
 from b24api.error import (
     AmbiguousExecutionError,
     BudgetExceededError,
@@ -21,11 +24,72 @@ from b24api.execution import (
     RateCoordinator,
     WireResponse,
     WorkClass,
+    rearm_cancellation,
 )
 from b24api.models import ExecutionPolicy, ReplaySafety, Request, RetryPolicy
 
 EXPECTED_RETRIED_CALLS = 2
 HTTP_OK = 200
+
+
+@pytest.mark.asyncio
+async def test_internal_cancelled_error_never_cancels_the_caller() -> None:
+    assert asyncio.current_task() is not None
+    assert asyncio.current_task().cancelling() == 0
+
+    rearm_cancellation(asyncio.CancelledError("internal cleanup signal"))
+    await asyncio.sleep(0)
+
+    assert asyncio.current_task().cancelling() == 0
+
+
+@pytest.mark.asyncio
+async def test_rearmed_cancellation_preserves_nested_cancellation_count() -> None:
+    observations: list[int] = []
+
+    async def worker() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel("outer")
+        current.cancel("inner")
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError as cancellation:
+            observations.append(current.cancelling())
+            rearm_cancellation(cancellation)
+            observations.append(current.cancelling())
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            observations.append(current.cancelling())
+        while current.cancelling():
+            current.uncancel()
+
+    task = asyncio.create_task(worker())
+    await task
+
+    assert observations == [2, 2, 2]
+
+
+@pytest.mark.asyncio
+async def test_transport_webhook_vault_is_opaque_and_gc_bounded() -> None:
+    sensitive_fragment = "synthetic-vault-private-fragment"
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(200)))
+    transport = HttpxTransport(
+        f"https://example.invalid/rest/1/{sensitive_fragment}/",
+        client=client,
+    )
+    handle = transport._webhook_handle  # noqa: SLF001 - lifecycle regression
+    reference = weakref.ref(transport)
+
+    assert sensitive_fragment not in repr(execution_module.__dict__)
+    del transport
+    gc.collect()
+
+    assert reference() is None
+    with pytest.raises(RuntimeError, match="credential is unavailable"):
+        execution_module._webhook_for(handle)  # noqa: SLF001 - lifecycle regression
+    await client.aclose()
 
 
 class SequenceTransport:
