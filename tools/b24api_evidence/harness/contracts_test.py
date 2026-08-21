@@ -991,6 +991,42 @@ def test_stale_transaction_never_overwrites_foreign_canonical_content(tmp_path: 
     assert marker.exists()
 
 
+def test_standalone_rollback_reads_predecessor_only_after_lock_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "plan-evidence.json"
+    old = {"tag": "old"}
+    committed = {"tag": "intervening-commit"}
+    candidate = {"tag": "refused-candidate"}
+    atomic_write_json(path, old)
+    real_begin = cli_module._begin_candidate_transaction  # noqa: SLF001
+    candidate_checks = 0
+
+    def commit_before_lock(target: Path) -> Path:
+        atomic_write_json(path, committed)
+        return real_begin(target)
+
+    def refuse_after_write(_candidate_sha: str) -> None:
+        nonlocal candidate_checks
+        candidate_checks += 1
+        if candidate_checks == SECOND_CALL:
+            raise ContractError("post-write refusal")
+
+    monkeypatch.setattr(cli_module, "_begin_candidate_transaction", commit_before_lock)
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", refuse_after_write)
+
+    with pytest.raises(ContractError, match="post-write refusal"):
+        cli_module._write_candidate_json(  # noqa: SLF001
+            path,
+            candidate,
+            candidate_sha="a" * 40,
+        )
+
+    assert json.loads(path.read_text()) == committed
+    assert not tuple(tmp_path.glob(".b24api-transaction-*.pending"))
+
+
 def test_transaction_refuses_a_symlinked_canonical_path_before_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

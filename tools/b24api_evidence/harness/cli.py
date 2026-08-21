@@ -1260,7 +1260,7 @@ def _operation_artifact(  # noqa: PLR0913
     return artifact
 
 
-def _write_candidate_json(  # noqa: PLR0913 - explicit transaction dependencies
+def _write_candidate_json(  # noqa: C901, PLR0913 - explicit transaction dependencies
     path: Path,
     value: Mapping[str, Any],
     *,
@@ -1271,7 +1271,6 @@ def _write_candidate_json(  # noqa: PLR0913 - explicit transaction dependencies
 ) -> None:
     """Atomically write only while the clean executing HEAD stays the exact candidate."""
     _require_evidence_candidate(candidate_sha)
-    previous = read_json_object(path) if path.exists() else None
     owns_transaction = transaction is None
     marker = transaction if transaction is not None else _begin_candidate_transaction(path)
     post_commit_error: BaseException | None = None
@@ -1280,8 +1279,11 @@ def _write_candidate_json(  # noqa: PLR0913 - explicit transaction dependencies
             raise ContractError("shared evidence transaction marker is unavailable")
         if rollback_log is None:
             raise ContractError("a shared evidence transaction requires a rollback log")
-        rollback_log.append((path, previous))
     try:
+        path, _relative_path = _lexical_transaction_path(marker.parent, path)
+        previous = read_json_object(path) if path.exists() else None
+        if not owns_transaction and rollback_log is not None:
+            rollback_log.append((path, previous))
         _register_transaction_write(marker, path, previous, value)
         atomic_write_json(path, value)
         _require_evidence_candidate(candidate_sha)
