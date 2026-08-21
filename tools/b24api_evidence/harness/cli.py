@@ -173,6 +173,8 @@ def _plan(args: argparse.Namespace) -> ExitCode:
     if args.live:
         with LivePortal(role=args.credential_role) as portal:
             preflight = portal.preflight(required_scopes=set(profile["required_scopes"]))
+        if not isinstance(preflight.build, str) or not preflight.build:
+            raise LiveUnavailableError("live portal did not provide an exact build identifier")
         portal_data = {
             "host": preflight.identity.host,
             "role": preflight.identity.role,

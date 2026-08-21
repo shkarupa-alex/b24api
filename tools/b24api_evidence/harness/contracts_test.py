@@ -63,7 +63,7 @@ from .contracts import (
     validate_probe_envelope,
     validate_reviewed_profile_set,
 )
-from .live import ADAPTERS, LivePreflight
+from .live import ADAPTERS, LivePreflight, LiveUnavailableError
 from .model import DeterministicPortal, exact_model_cases, run_exact_matrix_sync
 
 if TYPE_CHECKING:
@@ -1814,6 +1814,48 @@ def test_live_empty_plan_refuses_before_credential_setup(tmp_path: Path) -> None
     )
     assert result.returncode == ExitCode.INVALID
     assert "at least one disposable entity" in result.stderr
+
+
+def test_live_plan_refuses_missing_build_before_artifact_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePortal:
+        identity = PortalIdentity("portal.invalid", "admin_full", "1", SHA256)
+
+        def __init__(self, *, role: str) -> None:
+            assert role == "admin_full"
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
+            assert required_scopes == {"task"}
+            return LivePreflight(self.identity, None, frozenset({"task"}))
+
+    monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
+    args = cli_module._parser().parse_args(  # noqa: SLF001 - direct refusal-before-write regression
+        [
+            "plan",
+            "--artifact-dir",
+            str(tmp_path),
+            "--live",
+            "--credential-role",
+            "admin_full",
+            "--entity-profile",
+            "tasks-task-v1",
+            "--count",
+            "5",
+        ],
+    )
+
+    with pytest.raises(LiveUnavailableError, match="exact build identifier"):
+        cli_module._plan(args)  # noqa: SLF001 - direct refusal-before-write regression
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_live_benchmark_and_live_resume_never_silently_run_offline(tmp_path: Path) -> None:
