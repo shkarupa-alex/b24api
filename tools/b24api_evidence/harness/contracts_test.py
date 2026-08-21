@@ -532,6 +532,10 @@ def test_reviewed_profile_set_is_anchored_by_id_and_immutable_hash(tmp_path: Pat
         ),
         lambda plan: plan["estimated"].update(duration_seconds=0),
         lambda plan: plan["estimated"].update(quota_impact=0),
+        lambda plan: plan["portal"].update(build=None),
+        lambda plan: plan["portal"].update(build=""),
+        lambda plan: plan["portal"].update(build="   "),
+        lambda plan: plan["portal"].update(build=" build-1 "),
     ],
 )
 def test_dataset_plan_rejects_self_authorized_or_underestimated_writes(
@@ -1816,9 +1820,11 @@ def test_live_empty_plan_refuses_before_credential_setup(tmp_path: Path) -> None
     assert "at least one disposable entity" in result.stderr
 
 
-def test_live_plan_refuses_missing_build_before_artifact_write(
+@pytest.mark.parametrize("build", [None, "", "   ", 24100, True])
+def test_live_plan_refuses_missing_or_non_string_build_before_artifact_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    build: object,
 ) -> None:
     class FakePortal:
         identity = PortalIdentity("portal.invalid", "admin_full", "1", SHA256)
@@ -1834,7 +1840,7 @@ def test_live_plan_refuses_missing_build_before_artifact_write(
 
         def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
             assert required_scopes == {"task"}
-            return LivePreflight(self.identity, None, frozenset({"task"}))
+            return LivePreflight(self.identity, cast("Any", build), frozenset({"task"}))
 
     monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
     args = cli_module._parser().parse_args(  # noqa: SLF001 - direct refusal-before-write regression
@@ -1856,6 +1862,56 @@ def test_live_plan_refuses_missing_build_before_artifact_write(
         cli_module._plan(args)  # noqa: SLF001 - direct refusal-before-write regression
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_live_plan_normalizes_a_valid_explicit_portal_build_and_publishes_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePortal:
+        identity = PortalIdentity("portal.invalid", "admin_full", "1", SHA256)
+
+        def __init__(self, *, role: str) -> None:
+            assert role == "admin_full"
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
+            assert required_scopes == {"task"}
+            return LivePreflight(self.identity, " 26.500.0 ", frozenset({"task"}))
+
+    monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda *_args, **_kwargs: None)
+    args = cli_module._parser().parse_args(  # noqa: SLF001 - direct positive plan regression
+        [
+            "plan",
+            "--artifact-dir",
+            str(tmp_path),
+            "--live",
+            "--credential-role",
+            "admin_full",
+            "--entity-profile",
+            "tasks-task-v1",
+            "--count",
+            "5",
+        ],
+    )
+
+    assert cli_module._plan(args) == ExitCode.COMPLETED  # noqa: SLF001 - direct positive plan regression
+    plan = json.loads((tmp_path / "dataset-plan.json").read_text())
+
+    assert plan["portal"]["build"] == "26.500.0"
+    assert {path.name for path in tmp_path.iterdir()} == {
+        ".b24api-transaction-bundle.lock",
+        "benchmark-plan.json",
+        "dataset-plan.json",
+        "model-fixture-manifest.json",
+        "plan-evidence.json",
+    }
 
 
 def test_live_benchmark_and_live_resume_never_silently_run_offline(tmp_path: Path) -> None:

@@ -24,7 +24,6 @@ HTTP_STATUS_MAXIMUM = 599
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_MARKER_SCAN_PAGES = 1_000
 MAX_EXACT_MARKER_MATCHES = 2
-MAX_BUILD_LENGTH = 100
 UNAVAILABLE_API_CODES = frozenset({"error_method_not_found", "insufficient_scope", "access_denied"})
 CLASSIFIED_API_CODES = frozenset({"error_not_found"})
 UNKNOWN_API_CODE = "unexpected_api_error"
@@ -287,7 +286,7 @@ class LivePortal:
         return self.call_envelope(method, parameters)["result"]
 
     @_redacted_live_errors
-    def preflight(self, *, required_scopes: set[str]) -> LivePreflight:  # noqa: C901, PLR0912 - wire union
+    def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
         """Call scope/app.info and classify missing environment as unavailable."""
         scope_result = self.call("scope")
         scopes: frozenset[str]
@@ -310,24 +309,11 @@ class LivePortal:
         missing = sorted(required_scopes - scopes)
         if missing:
             raise LiveUnavailableError(f"required scope unavailable: {','.join(missing)}")
-        app = self.call("app.info")
-        build: str | None = None
-        if isinstance(app, dict):
-            for key in ("VERSION", "version", "BUILD", "build"):
-                if key not in app:
-                    continue
-                value = app.get(key)
-                if isinstance(value, str) and value.strip() and len(value) <= MAX_BUILD_LENGTH:
-                    build = value
-                    break
-                if isinstance(value, int) and not isinstance(value, bool):
-                    rendered = str(value)
-                    if len(rendered) > MAX_BUILD_LENGTH:
-                        raise LiveCorrectnessError("app.info build exceeds the semantic length ceiling")
-                    build = rendered
-                    break
-                raise LiveCorrectnessError("app.info build has an invalid semantic type")
-        return LivePreflight(identity=self.identity, build=build, scopes=scopes)
+        self.call("app.info")
+        # The documented app.info VERSION is the installed application version,
+        # not a portal build. No app.info field is admitted as portal-build
+        # evidence until Bitrix24 documents that exact contract.
+        return LivePreflight(identity=self.identity, build=None, scopes=scopes)
 
 
 @dataclass(frozen=True, slots=True)

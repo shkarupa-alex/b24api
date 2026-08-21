@@ -11,8 +11,9 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
+from . import cli as cli_module
 from . import live as live_module
-from .contracts import ContractError
+from .contracts import ContractError, ExitCode
 from .live import (
     ADAPTERS,
     MAX_RESPONSE_BYTES,
@@ -25,6 +26,7 @@ from .live import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from pathlib import Path
 
 
 def _portal(monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]) -> LivePortal:
@@ -192,19 +194,16 @@ def test_live_portal_webhook_vault_is_opaque_and_gc_bounded(monkeypatch: pytest.
     client.close()
 
 
-@pytest.mark.parametrize("response_case", ["scope", "build", "create", "missing_result"])
+@pytest.mark.parametrize("response_case", ["scope", "create", "missing_result"])
 def test_live_semantic_errors_drop_hostile_response_locals(
     monkeypatch: pytest.MonkeyPatch,
     response_case: str,
 ) -> None:
     sensitive_fragment = "synthetic-live-semantic-fragment"
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(_request: httpx.Request) -> httpx.Response:
         if response_case == "scope":
             return httpx.Response(200, json={"result": {sensitive_fragment: "N"}})
-        if response_case == "build":
-            result = ["task"] if request.url.path.endswith("scope") else {"VERSION": sensitive_fragment * 5}
-            return httpx.Response(200, json={"result": result})
         if response_case == "create":
             return httpx.Response(200, json={"result": {"hostile": sensitive_fragment}})
         return httpx.Response(200, json={"hostile": sensitive_fragment})
@@ -212,7 +211,7 @@ def test_live_semantic_errors_drop_hostile_response_locals(
     with _portal(monkeypatch, handler) as portal:
 
         def invoke() -> None:
-            if response_case in {"scope", "build"}:
+            if response_case == "scope":
                 portal.preflight(required_scopes={"task"})
             elif response_case == "create":
                 ADAPTERS["crm-deal-v1"].create(portal, "owned-marker")
@@ -268,39 +267,94 @@ def test_live_http_status_error_drops_credentialed_response_local(
 
 
 @pytest.mark.parametrize(
-    ("scope_result", "app_result"),
+    "scope_result",
     [
-        ({"task": "N"}, {"VERSION": "build-1"}),
-        (["", "task"], {"VERSION": "build-1"}),
-        (["task"], {"VERSION": True}),
-        (["task"], {"VERSION": " "}),
-        (["task"], {"VERSION": "A" * 101}),
-        (["task"], {"VERSION": int("9" * 101)}),
+        {"task": "N"},
+        ["", "task"],
     ],
 )
-def test_live_preflight_rejects_hostile_scope_and_build_types(
+def test_live_preflight_rejects_hostile_scope_types(
     monkeypatch: pytest.MonkeyPatch,
     scope_result: object,
-    app_result: object,
 ) -> None:
-    results = iter((scope_result, app_result))
-
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"result": next(results)})
+        return httpx.Response(200, json={"result": scope_result})
 
     with _portal(monkeypatch, handler) as portal, pytest.raises(LiveCorrectnessError):
         portal.preflight(required_scopes={"task"})
 
 
-def test_live_preflight_preserves_exact_build_at_schema_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
-    expected = "A" * 99 + "X"
-    results = iter((["task"], {"VERSION": expected}))
+@pytest.mark.parametrize(
+    "app_result",
+    [
+        {"VERSION": 4},
+        {"version": "4"},
+        {"VERSION": 4, "BUILD": "26.500.0"},
+        {"BUILD": "26.500.0"},
+        {"build": "26.500.0"},
+    ],
+)
+def test_live_preflight_never_treats_app_info_fields_as_portal_build(
+    monkeypatch: pytest.MonkeyPatch,
+    app_result: object,
+) -> None:
+    results = iter((["task"], app_result))
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"result": next(results)})
 
     with _portal(monkeypatch, handler) as portal:
-        assert portal.preflight(required_scopes={"task"}).build == expected
+        assert portal.preflight(required_scopes={"task"}).build is None
+
+
+@pytest.mark.parametrize(
+    "app_result",
+    [
+        {"VERSION": 4},
+        {"VERSION": 4, "BUILD": "26.500.0"},
+        {"BUILD": "26.500.0"},
+    ],
+)
+def test_public_main_maps_wire_app_info_without_portal_build_to_unavailable_before_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    app_result: object,
+) -> None:
+    results = iter((["task"], app_result))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"result": next(results)})
+
+    portal = _portal(monkeypatch, handler)
+
+    def portal_factory(*, role: str) -> LivePortal:
+        assert role == "admin_full"
+        return portal
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+    monkeypatch.setattr(cli_module, "LivePortal", portal_factory)
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda _root: None)
+    artifact_dir = tmp_path / "artifacts"
+
+    result = cli_module.main(
+        [
+            "plan",
+            "--artifact-dir",
+            str(artifact_dir),
+            "--live",
+            "--credential-role",
+            "admin_full",
+            "--entity-profile",
+            "tasks-task-v1",
+            "--count",
+            "5",
+        ],
+    )
+
+    assert result == ExitCode.UNAVAILABLE
+    assert "exact build identifier" in capsys.readouterr().err
+    assert not artifact_dir.exists()
 
 
 def test_live_preflight_maps_the_portal_empty_scope_sentinel_to_unavailable(

@@ -173,15 +173,14 @@ def _plan(args: argparse.Namespace) -> ExitCode:
     if args.live:
         with LivePortal(role=args.credential_role) as portal:
             preflight = portal.preflight(required_scopes=set(profile["required_scopes"]))
-        if not isinstance(preflight.build, str) or not preflight.build:
-            raise LiveUnavailableError("live portal did not provide an exact build identifier")
+        portal_build = _exact_preflight_build(preflight)
         portal_data = {
             "host": preflight.identity.host,
             "role": preflight.identity.role,
             "fingerprint": preflight.identity.fingerprint,
             "fingerprint_algorithm": FINGERPRINT_ALGORITHM,
             "fingerprint_key_format": FINGERPRINT_KEY_FORMAT,
-            "build": preflight.build,
+            "build": portal_build,
             "scope_hash": content_sha256(sorted(preflight.scopes)),
         }
     else:
@@ -2028,12 +2027,19 @@ def _require_portal_match(plan: Mapping[str, Any], portal: LivePortal) -> None:
 def _require_preflight_match(plan: Mapping[str, Any], preflight: LivePreflight) -> None:
     """Reject reviewed-build or scope drift before any entity operation."""
     planned = plan["portal"]
-    if not isinstance(preflight.build, str) or not preflight.build:
-        raise LiveUnavailableError("live portal did not provide an exact build identifier")
-    if planned.get("build") != preflight.build:
+    portal_build = _exact_preflight_build(preflight)
+    if planned.get("build") != portal_build:
         raise LiveUnavailableError("live portal build differs from the reviewed plan")
     if planned.get("scope_hash") != content_sha256(sorted(preflight.scopes)):
         raise LiveUnavailableError("live portal scope set differs from the reviewed plan")
+
+
+def _exact_preflight_build(preflight: LivePreflight) -> str:
+    """Return one normalized, explicitly sourced portal build or refuse."""
+    build = preflight.build
+    if not isinstance(build, str) or not build.strip():
+        raise LiveUnavailableError("live portal did not provide an exact build identifier")
+    return build.strip()
 
 
 def _require_live_write_flags(args: argparse.Namespace, command: str) -> None:
