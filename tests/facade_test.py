@@ -60,6 +60,7 @@ from b24api.models import (
     SnapshotRequirement,
     TerminalState,
 )
+from b24api.pagination import PaginationDriver
 from b24api.plans import (
     CursorTerminalRule,
     DirectDispatch,
@@ -574,6 +575,53 @@ async def test_counted_report_cancellation_preserves_detected_failure(
     report = cast("OperationReport", caught.value.report)
     assert report.state is TerminalState.FAILED
     assert "total contradicts" in str(caught.value.__cause__)
+
+
+@pytest.mark.asyncio
+async def test_counted_cleanup_failure_publishes_the_batch_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drivers: list[PaginationDriver] = []
+    original_pages = PaginationDriver.counted_batch_pages
+    original_aclose = BatchStream.aclose
+
+    async def tracked_pages(
+        driver: PaginationDriver,
+        *,
+        batch_size: int,
+        page_size: int,
+    ) -> AsyncGenerator[Any]:
+        drivers.append(driver)
+        async for page in original_pages(driver, batch_size=batch_size, page_size=page_size):
+            yield page
+
+    async def failing_aclose(stream: BatchStream) -> None:
+        await original_aclose(stream)
+        raise RuntimeError("owned counted cleanup failed")
+
+    monkeypatch.setattr(PaginationDriver, "counted_batch_pages", tracked_pages)
+    monkeypatch.setattr(BatchStream, "aclose", failing_aclose)
+
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {"result": [{"ID": 1}], "total": 2, "next": 1}
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: [{"ID": 2}] for key in commands},
+                "result_error": [],
+                "result_total": dict.fromkeys(commands, 2),
+            },
+        }
+
+    client, _transport = _client(handler)
+    with pytest.raises(IncompleteTraversalError) as caught:
+        _ = [item async for item in client.list_batched({"method": "crm.item.list"}, batch_size=1)]
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert drivers[0].batch_report is not None
+    assert drivers[0].batch_report.state is TerminalState.COMPLETED
 
 
 @pytest.mark.asyncio

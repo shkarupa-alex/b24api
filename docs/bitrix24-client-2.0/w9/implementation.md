@@ -45,8 +45,11 @@ journaled write or the already-restored predecessor. Any foreign content or
 failed restore retains the marker and keeps bundle scanning fail-closed. A
 successful terminal scan removes the marker as the commit point; an exception
 delivered after that unlink reports an operational error without rolling back
-the already committed bundle. The persistent lock file is included in bundle
-secret and size accounting.
+the already committed bundle. Journal paths retain their lexical atomic-replace
+identity; symlinks in a canonical path are rejected before mutation and during
+recovery. The persistent lock is created with mode `0600`, is included in bundle
+secret and size accounting, and is the sole permitted residue when retrying
+`plan` after a complete rollback or pre-publication refusal.
 
 Resume validates the complete chain, its per-correlation lifecycle state machine,
 planned cell membership/cardinality, and exact run, lineage, plan content,

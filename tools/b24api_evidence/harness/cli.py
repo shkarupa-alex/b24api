@@ -158,7 +158,7 @@ def _plan(args: argparse.Namespace) -> ExitCode:
     if args.allow_writes:
         raise ContractError("plan is read-only; --allow-writes is invalid")
     artifact_dir = args.artifact_dir.resolve()
-    if artifact_dir.exists() and next(artifact_dir.iterdir(), None) is not None:
+    if artifact_dir.exists() and any(path.name != _TRANSACTION_LOCK_NAME for path in artifact_dir.iterdir()):
         raise ContractError("plan requires an empty artifact directory and never overwrites an evidence bundle")
     run_id = _uuid_or_new(args.run_id, "run_id")
     lineage_id = _uuid_or_new(args.lineage_id, "lineage_id")
@@ -1329,7 +1329,17 @@ def _begin_candidate_transaction(path: Path) -> Path:
 
 def _acquire_transaction_lock(artifact_dir: Path) -> BinaryIO:
     lock_path = artifact_dir / _TRANSACTION_LOCK_NAME
-    lock = lock_path.open("a+b")
+    descriptor = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        lock = cast("BinaryIO", os.fdopen(descriptor, "a+b"))
+    except BaseException:
+        os.close(descriptor)
+        raise
     try:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as error:
@@ -1363,11 +1373,8 @@ def _register_transaction_write(
     entries = payload.get("entries")
     if payload.get("kind") != _TRANSACTION_KIND or not isinstance(entries, list):
         raise ContractError("evidence transaction journal is invalid")
-    artifact_dir = marker.parent.resolve()
-    resolved = path.resolve()
-    if not resolved.is_relative_to(artifact_dir):
-        raise ContractError("evidence transaction target escapes its artifact bundle")
-    relative = resolved.relative_to(artifact_dir).as_posix()
+    path, relative_path = _lexical_transaction_path(marker.parent, path)
+    relative = relative_path.as_posix()
     if any(isinstance(entry, dict) and entry.get("path") == relative for entry in entries):
         raise ContractError("evidence transaction cannot mutate one path twice")
     entries.append(
@@ -1378,6 +1385,21 @@ def _register_transaction_write(
         },
     )
     atomic_write_json(marker, payload)
+
+
+def _lexical_transaction_path(artifact_dir: Path, path: Path) -> tuple[Path, Path]:
+    """Bind a journal entry to its lexical atomic-replace path, rejecting symlinks."""
+    artifact_dir = artifact_dir.resolve()
+    lexical = Path(os.path.abspath(path))  # noqa: PTH100 - resolve() would change journal identity
+    if not lexical.is_relative_to(artifact_dir):
+        raise ContractError("evidence transaction target escapes its artifact bundle")
+    relative = lexical.relative_to(artifact_dir)
+    current = artifact_dir
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ContractError("evidence transaction target cannot contain a symlink")
+    return lexical, relative
 
 
 def _recover_transaction_marker(  # noqa: C901, PLR0911, PLR0912 - explicit fail-closed replay
@@ -1401,8 +1423,9 @@ def _recover_transaction_marker(  # noqa: C901, PLR0911, PLR0912 - explicit fail
                 or (previous is not None and not isinstance(previous, dict))
             ):
                 return False
-            path = (artifact_dir / relative).resolve()
-            if not path.is_relative_to(artifact_dir):
+            try:
+                path, _relative_path = _lexical_transaction_path(artifact_dir, artifact_dir / relative)
+            except ContractError:
                 return False
             if not path.exists():
                 if previous is None:

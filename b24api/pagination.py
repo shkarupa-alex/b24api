@@ -422,6 +422,7 @@ class PaginationDriver:
                     asyncio.CancelledError | GeneratorExit,
                 )
                 cleanup = await await_cleanup_resistant(outcomes.aclose())
+                self.batch_report = outcomes.report
                 if cleanup.error is not None:
                     cleanup_error = cleanup.error
                     if not preserve_primary:
@@ -435,7 +436,6 @@ class PaginationDriver:
                     raise cleanup.cancellation
                 elif preserve_primary:
                     pending_cancellation = cleanup.cancellation
-                self.batch_report = outcomes.report
                 rearm_cancellation(pending_cancellation)
             if outcomes.report.state is not TerminalState.COMPLETED:
                 raise IncompleteTraversalError(report=outcomes.report)

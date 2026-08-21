@@ -835,6 +835,33 @@ def test_plan_bundle_failure_rolls_back_every_new_dependency(
     assert {path.name for path in tmp_path.iterdir()} == {".b24api-transaction-bundle.lock"}
 
 
+def test_plan_reuses_a_directory_containing_only_its_persistent_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = cli_module._begin_candidate_transaction(tmp_path / "bundle")  # noqa: SLF001
+    assert cli_module._rollback_candidate_json_log([], transaction=marker)  # noqa: SLF001
+    assert {path.name for path in tmp_path.iterdir()} == {".b24api-transaction-bundle.lock"}
+    monkeypatch.setattr(cli_module, "_persist_plan_bundle", lambda **_kwargs: None)
+    monkeypatch.setattr(cli_module, "_safe_message", lambda _message: None)
+    args = cli_module._parser().parse_args(  # noqa: SLF001
+        ["plan", "--artifact-dir", str(tmp_path), "--count", "0"],
+    )
+
+    result = cli_module._plan(args)  # noqa: SLF001
+
+    assert result == ExitCode.COMPLETED
+
+
+def test_bundle_transaction_lock_is_owner_only(tmp_path: Path) -> None:
+    marker = cli_module._begin_candidate_transaction(tmp_path / "bundle")  # noqa: SLF001
+    lock_path = tmp_path / ".b24api-transaction-bundle.lock"
+    owner_only_mode = 0o600
+
+    assert lock_path.stat().st_mode & 0o777 == owner_only_mode
+    assert cli_module._rollback_candidate_json_log([], transaction=marker)  # noqa: SLF001
+
+
 def test_plan_bundle_uses_one_marker_created_before_all_dependency_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -917,6 +944,62 @@ def test_stale_transaction_never_overwrites_foreign_canonical_content(tmp_path: 
         cli_module._recover_stale_candidate_transaction(tmp_path)  # noqa: SLF001
 
     assert json.loads(path.read_text()) == foreign
+    assert marker.exists()
+
+
+def test_transaction_refuses_a_symlinked_canonical_path_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predecessor = tmp_path / "caller-owned-predecessor.json"
+    canonical = tmp_path / "dataset-plan.json"
+    accepted = {"tag": "accepted"}
+    refused = {"tag": "refused"}
+    atomic_write_json(predecessor, accepted)
+    canonical.symlink_to(predecessor.name)
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
+
+    with pytest.raises(ContractError, match="cannot contain a symlink"):
+        cli_module._write_candidate_json(  # noqa: SLF001
+            canonical,
+            refused,
+            candidate_sha="a" * 40,
+        )
+
+    assert canonical.is_symlink()
+    assert json.loads(predecessor.read_text()) == accepted
+    assert not tuple(tmp_path.glob(".b24api-transaction-*.pending"))
+
+
+def test_stale_transaction_refuses_a_symlinked_journal_path(tmp_path: Path) -> None:
+    predecessor = tmp_path / "caller-owned-predecessor.json"
+    canonical = tmp_path / "dataset-plan.json"
+    accepted = {"tag": "accepted"}
+    refused = {"tag": "refused"}
+    atomic_write_json(predecessor, accepted)
+    canonical.symlink_to(predecessor.name)
+    marker = cli_module._begin_candidate_transaction(tmp_path / "bundle")  # noqa: SLF001
+    atomic_write_json(
+        marker,
+        {
+            "kind": "b24api-evidence-transaction-v2",
+            "target": "bundle",
+            "entries": [
+                {
+                    "path": canonical.name,
+                    "previous": accepted,
+                    "written_sha256": content_sha256(refused),
+                },
+            ],
+        },
+    )
+    cli_module._finish_transaction_lock(marker)  # noqa: SLF001 - simulate process death
+
+    with pytest.raises(ContractError, match="could not be recovered safely"):
+        cli_module._recover_stale_candidate_transaction(tmp_path)  # noqa: SLF001
+
+    assert canonical.is_symlink()
+    assert json.loads(predecessor.read_text()) == accepted
     assert marker.exists()
 
 
