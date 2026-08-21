@@ -83,6 +83,7 @@ EXPECTED_MUTATION_RETRIES = 3
 EXPECTED_STABLE_MODEL_RUNS = 90
 EXPECTED_BENCHMARK_REFS = EXPECTED_STABLE_MODEL_RUNS + 1
 EXPECTED_SCHEMA_COUNT = 6
+SECOND_CALL = 2
 BUNDLE_OVERFLOW_FILES = 513
 LEAK_FIXTURE = b"https://example.invalid/rest/1/realisticToken123/"
 
@@ -637,11 +638,15 @@ def test_directory_fsync_failure_after_replace_restores_previous_artifact(
     previous = {"previous": "accepted"}
     atomic_write_json(path, previous)
     monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
-    monkeypatch.setattr(
-        contracts_module,
-        "_fsync_directory",
-        lambda _directory: (_ for _ in ()).throw(OSError("directory fsync failed after replace")),
-    )
+    fsync_calls = 0
+
+    def fail_artifact_fsync(_directory: Path) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == SECOND_CALL:
+            raise OSError("directory fsync failed after replace")
+
+    monkeypatch.setattr(contracts_module, "_fsync_directory", fail_artifact_fsync)
 
     with pytest.raises(OSError, match="directory fsync failed after replace"):
         cli_module._write_validated_artifact(  # noqa: SLF001
@@ -651,6 +656,48 @@ def test_directory_fsync_failure_after_replace_restores_previous_artifact(
         )
 
     assert json.loads(path.read_text()) == previous
+
+
+def test_failed_quarantine_move_leaves_bundle_transaction_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "plan-evidence.json"
+    accepted = {"outcome": "PASS", "metrics": {"http_attempts": 11}}
+    refused = {"outcome": "PASS", "metrics": {"http_attempts": 22}}
+    atomic_write_json(path, accepted)
+    candidate_checks = 0
+
+    def refuse_after_write(_candidate_sha: str) -> None:
+        nonlocal candidate_checks
+        candidate_checks += 1
+        if candidate_checks == SECOND_CALL:
+            raise ContractError("candidate SHA differs")
+
+    original_replace = Path.replace
+
+    def fail_quarantine_move(source: Path, target: Path) -> Path:
+        if source == path and ".refused-" in target.name:
+            raise OSError("cross-device quarantine move")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", refuse_after_write)
+    monkeypatch.setattr(Path, "replace", fail_quarantine_move)
+
+    with pytest.raises(ContractError, match="candidate SHA differs") as captured:
+        cli_module._write_candidate_json(  # noqa: SLF001
+            path,
+            refused,
+            candidate_sha="a" * 40,
+        )
+
+    assert json.loads(path.read_text()) == refused
+    assert any("bundle fail-closed" in note for note in captured.value.__notes__)
+    markers = tuple(tmp_path.glob(".b24api-transaction-*.pending"))
+    assert len(markers) == 1
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda _root: None)
+    with pytest.raises(ContractError, match="incomplete publication transaction"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001
 
 
 def test_rollback_base_exception_does_not_mask_primary_bundle_failure(
@@ -678,10 +725,16 @@ def test_rollback_base_exception_does_not_mask_primary_bundle_failure(
             )
 
     assert not path.exists()
-    quarantined = tuple(tmp_path.parent.glob(f".{tmp_path.name}.benchmark-evidence.json.refused-*"))
+    quarantined = tuple(tmp_path.glob(".benchmark-evidence.json.refused-*"))
     assert len(quarantined) == 1
     assert json.loads(quarantined[0].read_text())["outcome"] == "PASS"
+    markers = tuple(tmp_path.glob(".b24api-transaction-*.pending"))
+    assert len(markers) == 1
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda _root: None)
+    with pytest.raises(ContractError, match="incomplete publication transaction"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001
     quarantined[0].unlink()
+    markers[0].unlink()
 
 
 def test_bundle_scan_never_deletes_caller_owned_refused_lookalikes(
@@ -702,7 +755,7 @@ def test_bundle_scan_never_deletes_caller_owned_refused_lookalikes(
     assert nested_lookalike.read_text() == "caller owned"
 
 
-def test_failed_nested_quarantine_never_remains_inside_bundle(
+def test_interrupted_nested_quarantine_is_visible_and_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -716,10 +769,15 @@ def test_failed_nested_quarantine_never_remains_inside_bundle(
         cli_module._restore_candidate_json(path, None)  # noqa: SLF001
 
     assert not path.exists()
-    assert not tuple(tmp_path.rglob("*.refused-*"))
-    quarantined = tuple(tmp_path.parent.glob(f".{tmp_path.name}.case.json.refused-*"))
+    quarantined = tuple(tmp_path.rglob(".case.json.refused-*"))
     assert len(quarantined) == 1
+    markers = tuple(tmp_path.rglob(".b24api-transaction-*.pending"))
+    assert len(markers) == 1
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda _root: None)
+    with pytest.raises(ContractError, match="incomplete publication transaction"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001
     quarantined[0].unlink()
+    markers[0].unlink()
 
 
 @pytest.mark.parametrize("with_previous", [False, True])

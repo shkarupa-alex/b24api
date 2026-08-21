@@ -72,6 +72,37 @@ async def test_rearmed_cancellation_preserves_nested_cancellation_count() -> Non
 
 
 @pytest.mark.asyncio
+async def test_external_cancellation_wins_over_owned_task_cancellation() -> None:
+    observed: list[tuple[object, ...]] = []
+
+    async def owned() -> None:
+        await asyncio.Event().wait()
+
+    async def worker() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        child = asyncio.create_task(owned())
+        loop = asyncio.get_running_loop()
+        loop.call_soon(current.cancel, "external-caller")
+        loop.call_soon(child.cancel, "internal-owned")
+
+        cancellation = await execution_module.await_cancellation_resistant(child)
+        assert cancellation is not None
+        observed.append(cancellation.args)
+        rearm_cancellation(cancellation)
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError as replayed:
+            observed.append(replayed.args)
+        while current.cancelling():
+            current.uncancel()
+
+    await asyncio.create_task(worker())
+
+    assert observed == [("external-caller",), ("external-caller",)]
+
+
+@pytest.mark.asyncio
 async def test_transport_webhook_vault_is_opaque_and_gc_bounded() -> None:
     sensitive_fragment = "synthetic-vault-private-fragment"
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(200)))

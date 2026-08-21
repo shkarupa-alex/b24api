@@ -80,6 +80,8 @@ _MODEL_ADVISORY_RUNS = 5
 _MODEL_BLOCKING_PAIRS = 9
 _MAX_BUNDLE_FILES = 512
 _MAX_BUNDLE_BYTES = 128 * 1024 * 1024
+_TRANSACTION_MARKER_PREFIX = ".b24api-transaction-"
+_TRANSACTION_MARKER_SUFFIX = ".pending"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -648,8 +650,9 @@ def _benchmark_runs_and_artifact(
             runs=runs,
             rollback_log=rollback_log,
         )
-    except BaseException:
-        _rollback_candidate_json_log(rollback_log)
+    except BaseException as error:
+        if not _rollback_candidate_json_log(rollback_log):
+            error.add_note("one or more evidence dependencies could not be rolled back; the bundle is fail-closed")
         raise
     artifact_path = args.artifact_dir.resolve() / "benchmark-evidence.json"
     _safe_message(f"benchmark completed: {artifact_path}")
@@ -1244,39 +1247,75 @@ def _write_candidate_json(
     """Atomically write only while the clean executing HEAD stays the exact candidate."""
     _require_evidence_candidate(candidate_sha)
     previous = read_json_object(path) if path.exists() else None
+    transaction = _begin_candidate_transaction(path)
     try:
         atomic_write_json(path, value)
         _require_evidence_candidate(candidate_sha)
         if scan_bundle:
-            _scan_bundle(path.parent, expected_candidate_sha=candidate_sha)
+            _scan_bundle(
+                path.parent,
+                expected_candidate_sha=candidate_sha,
+                active_transaction=transaction,
+            )
+        transaction.unlink()
         if rollback_log is not None:
             rollback_log.append((path, previous))
-    except BaseException:
-        _restore_candidate_json(path, previous)
+    except BaseException as error:
+        if not _restore_candidate_json(path, previous, transaction=transaction):
+            error.add_note("evidence rollback failed; an incomplete transaction marker keeps the bundle fail-closed")
         raise
 
 
-def _restore_candidate_json(path: Path, previous: Mapping[str, Any] | None) -> None:
-    """Best-effort rollback without masking the candidate or bundle failure."""
-    quarantine: Path | None = None
+def _begin_candidate_transaction(path: Path) -> Path:
+    """Claim one exact same-directory transaction marker before publication."""
+    for _attempt in range(10):
+        marker = path.with_name(
+            f"{_TRANSACTION_MARKER_PREFIX}{uuid.uuid4().hex}{_TRANSACTION_MARKER_SUFFIX}",
+        )
+        try:
+            marker.touch(mode=0o600, exist_ok=False)
+        except FileExistsError:
+            continue
+        try:
+            atomic_write_json(marker, {"kind": "b24api-evidence-transaction-v1", "target": path.name})
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                marker.unlink(missing_ok=True)
+            raise
+        return marker
+    raise ContractError("cannot allocate a unique evidence transaction marker")
+
+
+def _restore_candidate_json(
+    path: Path,
+    previous: Mapping[str, Any] | None,
+    *,
+    transaction: Path | None = None,
+) -> bool:
+    """Rollback one artifact, leaving an exact fail-closed marker on any failure."""
+    marker = transaction
     try:
+        if marker is None or not marker.exists():
+            marker = _begin_candidate_transaction(path)
+        quarantine: Path | None = None
         if path.exists():
-            bundle_root = path.parent.parent if path.parent.name == "model-oracles" else path.parent
-            quarantine = bundle_root.parent / (f".{bundle_root.name}.{path.name}.refused-{uuid.uuid4().hex}")
+            quarantine = path.with_name(f".{path.name}.refused-{uuid.uuid4().hex}")
             path.replace(quarantine)
         if previous is not None:
             atomic_write_json(path, previous)
-    except BaseException:  # noqa: BLE001, S110 - rollback must never mask the primary refusal
-        pass
-    finally:
         if quarantine is not None:
-            with contextlib.suppress(BaseException):
-                quarantine.unlink(missing_ok=True)
+            quarantine.unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
+    except BaseException:  # noqa: BLE001 - the primary refusal remains authoritative
+        return False
+    return True
 
 
-def _rollback_candidate_json_log(log: list[tuple[Path, Mapping[str, Any] | None]]) -> None:
+def _rollback_candidate_json_log(log: list[tuple[Path, Mapping[str, Any] | None]]) -> bool:
+    complete = True
     for path, previous in reversed(log):
-        _restore_candidate_json(path, previous)
+        complete = _restore_candidate_json(path, previous) and complete
+    return complete
 
 
 def _persist_verify_bundle(
@@ -1301,8 +1340,9 @@ def _persist_verify_bundle(
             candidate_sha=candidate_sha,
             scan_bundle=True,
         )
-    except BaseException:
-        _rollback_candidate_json_log(rollback_log)
+    except BaseException as error:
+        if not _rollback_candidate_json_log(rollback_log):
+            error.add_note("one or more verify dependencies could not be rolled back; the bundle is fail-closed")
         raise
 
 
@@ -1340,8 +1380,9 @@ def _persist_plan_bundle(
             candidate_sha=candidate_sha,
             scan_bundle=True,
         )
-    except BaseException:
-        _rollback_candidate_json_log(rollback_log)
+    except BaseException as error:
+        if not _rollback_candidate_json_log(rollback_log):
+            error.add_note("one or more plan dependencies could not be rolled back; the bundle is fail-closed")
         raise
 
 
@@ -1743,6 +1784,7 @@ def _scan_bundle(  # noqa: C901, PLR0912, PLR0915
     artifact_dir: Path,
     *,
     expected_candidate_sha: str | None = None,
+    active_transaction: Path | None = None,
 ) -> None:
     if expected_candidate_sha is not None:
         _require_evidence_candidate(expected_candidate_sha)
@@ -1754,6 +1796,10 @@ def _scan_bundle(  # noqa: C901, PLR0912, PLR0915
     for path in artifact_dir.rglob("*"):
         if not path.is_file():
             continue
+        if active_transaction is not None and path == active_transaction:
+            continue
+        if path.name.startswith(_TRANSACTION_MARKER_PREFIX) and path.name.endswith(_TRANSACTION_MARKER_SUFFIX):
+            raise ContractError("evidence bundle contains an incomplete publication transaction")
         artifact_paths.append(path)
         if len(artifact_paths) > _MAX_BUNDLE_FILES:
             raise ContractError("evidence bundle exceeds the reviewed file-count ceiling")
