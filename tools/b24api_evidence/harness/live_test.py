@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
 
+EXPECTED_PREFLIGHT_CALLS = 2
+
 
 def _portal(monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]) -> LivePortal:
     key = base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
@@ -300,12 +302,16 @@ def test_live_preflight_never_treats_app_info_fields_as_portal_build(
     app_result: object,
 ) -> None:
     results = iter((["task"], app_result))
+    calls = 0
 
     def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         return httpx.Response(200, json={"result": next(results)})
 
     with _portal(monkeypatch, handler) as portal:
         assert portal.preflight(required_scopes={"task"}).build is None
+    assert calls == EXPECTED_PREFLIGHT_CALLS
 
 
 @pytest.mark.parametrize(
@@ -326,8 +332,11 @@ def test_public_main_maps_wire_app_info_without_portal_build_to_unavailable_befo
     app_result: object,
 ) -> None:
     results = iter((["task"], app_result))
+    calls = 0
 
     def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         return httpx.Response(200, json={"result": next(results)})
 
     portal = _portal(monkeypatch, handler)
@@ -359,6 +368,7 @@ def test_public_main_maps_wire_app_info_without_portal_build_to_unavailable_befo
     assert result == ExitCode.UNAVAILABLE
     assert "exact build identifier" in capsys.readouterr().err
     assert not artifact_dir.exists()
+    assert calls == EXPECTED_PREFLIGHT_CALLS
 
 
 def test_live_preflight_maps_the_portal_empty_scope_sentinel_to_unavailable(

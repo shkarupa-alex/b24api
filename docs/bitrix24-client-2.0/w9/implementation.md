@@ -83,6 +83,11 @@ substituting `LICENSE`, a response header, an inferred release, or a synthetic
 value. This is a conservative implementation of the frozen specification's
 exact-build requirement, not a new normative relaxation.
 
+The required non-empty `portal.build` in the dataset plan is a harness-level
+provenance strengthening. It is not presented as an item from the artifact
+field list in specification section 16.3; the exact-build refusal follows the
+broader live-evidence identity and reproducibility requirements.
+
 The deterministic portal drives the production executor and traversal engine
 over empty, 1, 19, 500, dense/sparse/clustered/skewed/deleted 10,000-row, and
 persistent-mutation states with offset and keyset plans. The sparse case has
