@@ -10,6 +10,9 @@ The previously accepted implementation SHA was
 `3947ac5dcd0b41aca234a14d0bdc2bb61bb4d3a5`. This packet covers the single
 material code change discovered by the first read-only live preflight. The
 packet itself is a later docs-only commit and is not the review subject.
+The Git range from the predecessor contains two commits: docs-only packet v9
+and the one material code/test commit. The path-filtered diff below intentionally
+shows only that code/test change.
 
 Acceptance does not authorize `seed`, `cleanup`, live benchmark, W10, release,
 or any other portal write.
@@ -36,32 +39,52 @@ git diff 3947ac5dcd0b41aca234a14d0bdc2bb61bb4d3a5..8e03127621fa1892e629721d4b166
 
 ## Live observation and remediation
 
-Bitrix24 webhooks without application scopes returned the successful scope
+The two deliberately limited Bitrix24 webhooks returned the successful scope
 envelope `{"result":[""]}`. The accepted predecessor classified that exact
-portal sentinel as malformed data and exited with correctness code `4`.
+portal sentinel as malformed data and exited with correctness code `4`. This
+does not close the live path: both full-rights webhooks separately completed
+read-only `plan` for both Tasks and CRM before this fix. The next trusted plan
+checkpoint therefore uses a full-rights webhook after this review.
 
 Section 16.5 requires missing scope to be classified as unavailable rather than
-strategy failure. The subject therefore maps only the exact list `[""]` to an
-empty scope set. A required `task` or `crm` scope then produces
+strategy failure; section 16.2 assigns exit `3` to an unavailable or scope-gated
+environment. The subject therefore maps only the exact list `[""]` to an empty
+scope set. A required `task` or `crm` scope then produces
 `LiveUnavailableError` and normative exit `3` before `app.info` and before any
-artifact write.
+artifact write. No SKIP artifact is written by `plan`; the named missing scope
+is carried in the safe diagnostic and exit classification.
 
 The change is deliberately narrow:
 
 - `[""]` means no granted scopes;
 - an empty string mixed with another scope remains malformed and exits `4`;
+- `["", ""]` remains malformed through the same general list rule;
+- capability dictionaries remain asymmetric by contract: empty keys such as
+  `{"": true}` and `{"": false}` are malformed rather than an empty-scope
+  sentinel;
 - non-string values, non-boolean capability maps, and invalid build values keep
-  the existing correctness classification.
+  the existing correctness classification;
+- the added `PLR0912` suppression is local to the explicit wire-shape union and
+  is required by the configured Ruff threshold.
 
 ## Reproduced results
 
 Local exact-SHA gates:
 
+```bash
+.venv/bin/pytest -q -p no:cacheprovider
+.venv/bin/ruff check . --no-fix
+.venv/bin/ruff format --check .
+.venv/bin/mypy --strict b24api tools/b24api_evidence
+git diff --check
+git status --short --branch
+```
+
 ```text
 pytest: 469 passed in 195.23s
 ruff check: PASS
 ruff format --check: 41 files
-mypy --strict: PASS, 25 source files
+mypy --strict b24api tools/b24api_evidence: PASS, 25 source files
 git diff --check: PASS
 tracked status: clean
 ```
@@ -80,7 +103,9 @@ The diagnostic read-only portal replay used both limited roles against the
 Tasks and CRM profiles. All four cases returned exit `3` with the exact missing
 scope name and created zero files. This replay validates the observed wire
 shape but is not yet admission evidence because the code change still requires
-this human checkpoint.
+this human checkpoint. Before the fix, both full-rights roles also completed
+read-only plans for both profiles, proving that the available credential model
+does not deterministically block the live path.
 
 ## Required functional checklist
 
@@ -88,12 +113,17 @@ this human checkpoint.
    tests.
 2. Confirm `[""]` becomes an empty scope set and a required scope produces
    `LiveUnavailableError` before `app.info`.
-3. Confirm the public CLI maps that result to exit `3` and leaves the artifact
-   directory empty.
+3. Confirm by code reading that the public CLI maps that result to exit `3` and
+   reaches preflight before artifact persistence. The four real read-only CLI
+   diagnostics additionally observed empty artifact directories; the committed
+   unit test covers the harness boundary rather than spawning the public CLI.
 4. Confirm `["", "task"]` and other malformed scope/build shapes still produce
    correctness exit `4` before artifact writes.
-5. Run the complete static gates, not only the two new tests.
-6. Keep the review functional. Existing offline credential/error-boundary tests
+5. Confirm the list/dict asymmetry, `["", ""]` fallback, and local `PLR0912`
+   suppression are intentional and bounded.
+6. Run the exact complete gate commands above, not `mypy --strict .` and not
+   only the two new tests.
+7. Keep the review functional. Existing offline credential/error-boundary tests
    may be replayed, but no expanded cybersecurity investigation is requested.
 
 ## Copy-paste review prompt
@@ -113,16 +143,28 @@ git show codex/bitrix24-client-benchmarks:docs/bitrix24-client-2.0/w7-w9/review-
 Не используй live Bitrix24, сеть, webhook/credentials, W10 или release actions;
 ничего не меняй и не читай user-owned untracked spec/session files.
 
-Запусти полный pytest, Ruff check, Ruff format --check, strict mypy,
-git diff --check и проверь clean detached status. Затем проверь diff
+Запусти точные команды:
+.venv/bin/pytest -q -p no:cacheprovider
+.venv/bin/ruff check . --no-fix
+.venv/bin/ruff format --check .
+.venv/bin/mypy --strict b24api tools/b24api_evidence
+git diff --check
+git status --short --branch
+
+Затем проверь diff
 3947ac5dcd0b41aca234a14d0bdc2bb61bb4d3a5..8e03127621fa1892e629721d4b166b30846e755b:
 
 1. Exact scope result [""] означает empty scope set.
-2. Required task/crm даёт LiveUnavailableError и CLI exit 3 до app.info и без
-   artifact writes.
+2. Required task/crm даёт LiveUnavailableError и CLI exit 3 до app.info. Связь
+   с public CLI и отсутствие persistence подтвердить чтением call path; unit
+   test находится на harness boundary, а zero files дополнительно наблюдались в
+   четырёх read-only live diagnostics.
 3. Mixed ["", "task"] и остальные malformed scope/build fixtures остаются
    LiveCorrectnessError / exit 4.
-4. Existing live/api/contracts regression tests не регрессировали.
+4. ["", ""] и dict с пустым ключом остаются malformed; это намеренная
+   асимметрия exact list sentinel и capability map.
+5. Existing live/api/contracts regression tests не регрессировали, локальный
+   PLR0912 suppression обоснован.
 
 Не углубляйся в cybersecurity; это функциональное ревью классификации portal
 scope response. Верни P1/P2/P3 и exact file/line для любого finding.
