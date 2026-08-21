@@ -50,7 +50,7 @@
         "fingerprint": {"$ref": "#/$defs/sha256"},
         "fingerprint_algorithm": {"type": "string", "minLength": 1, "maxLength": 100},
         "fingerprint_key_format": {"type": "string", "minLength": 1, "maxLength": 100},
-        "build": {"type": "string", "minLength": 1, "maxLength": 100},
+        "build": {"type": ["string", "null"], "minLength": 1, "maxLength": 100},
         "scope_hash": {"$ref": "#/$defs/sha256"}
       }
     },

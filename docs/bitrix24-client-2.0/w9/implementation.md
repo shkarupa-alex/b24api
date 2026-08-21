@@ -73,20 +73,24 @@ set; recovery itself never deletes.
 
 ## Offline evidence and live boundary
 
-The exact portal build is a mandatory provenance field, but the documented
-`app.info.VERSION` value is the installed application version rather than the
-portal build. No `app.info` field is admitted as portal-build evidence until a
-Bitrix24 contract explicitly documents that meaning. In particular,
-`VERSION`, `version`, `BUILD`, and `build` are ignored for this purpose; the
-harness refuses live plan generation before artifact publication instead of
-substituting `LICENSE`, a response header, an inferred release, or a synthetic
-value. This is a conservative implementation of the frozen specification's
-exact-build requirement, not a new normative relaxation.
+Live dataset identity is bound to the normalized portal host plus the existing
+HMAC fingerprint over `(host, credential_role, principal_id)`. The host is the
+stable portal name; the fingerprint distinguishes the reviewed role/principal
+without persisting either the principal ID or a credential.
 
-The required non-empty `portal.build` in the dataset plan is a harness-level
-provenance strengthening. It is not presented as an item from the artifact
-field list in specification section 16.3; the exact-build refusal follows the
-broader live-evidence identity and reproducibility requirements.
+The documented `app.info.VERSION` value is the installed application version,
+not the portal build. No `app.info` field is admitted as portal-build evidence
+until Bitrix24 documents that meaning. In particular, `VERSION`, `version`,
+`BUILD`, and `build` are ignored for this purpose. Dataset plans preserve the
+unknown state as `portal.build: null` instead of substituting `LICENSE`, a
+response header, an inferred release, or a synthetic value. A null build does
+not block correctness plan/seed/verify work, but it keeps every build-scoped
+endpoint profile inapplicable and cannot authorize `PROFILE_VERIFIED` claims.
+
+This nullable field matches the preregistered W0 dataset-plan contract. Portal
+identity and cleanup ownership do not depend on build; they remain bound to the
+host, HMAC fingerprint, scope hash, candidate, run, lineage, and exact manifest
+identities.
 
 The deterministic portal drives the production executor and traversal engine
 over empty, 1, 19, 500, dense/sparse/clustered/skewed/deleted 10,000-row, and

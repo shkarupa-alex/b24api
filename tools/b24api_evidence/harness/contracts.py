@@ -369,8 +369,10 @@ def validate_dataset_plan(plan: Mapping[str, Any]) -> None:  # noqa: C901, PLR09
         raise ContractError("dataset plan namespace is invalid")
     portal = _mapping(plan["portal"], "portal")
     portal_build = portal.get("build")
-    if not isinstance(portal_build, str) or not portal_build.strip() or portal_build != portal_build.strip():
-        raise ContractError("dataset plan portal.build must be a normalized non-empty string")
+    if portal_build is not None and (
+        not isinstance(portal_build, str) or not portal_build.strip() or portal_build != portal_build.strip()
+    ):
+        raise ContractError("dataset plan portal.build must be null or a normalized non-empty string")
     if plan["credential_role"] != portal["role"]:
         raise ContractError("dataset plan credential_role must equal portal.role")
     if portal["role"] == "model":

@@ -63,7 +63,7 @@ from .contracts import (
     validate_probe_envelope,
     validate_reviewed_profile_set,
 )
-from .live import ADAPTERS, LivePreflight, LiveUnavailableError
+from .live import ADAPTERS, LiveCorrectnessError, LivePreflight, LiveUnavailableError
 from .model import DeterministicPortal, exact_model_cases, run_exact_matrix_sync
 
 if TYPE_CHECKING:
@@ -532,10 +532,11 @@ def test_reviewed_profile_set_is_anchored_by_id_and_immutable_hash(tmp_path: Pat
         ),
         lambda plan: plan["estimated"].update(duration_seconds=0),
         lambda plan: plan["estimated"].update(quota_impact=0),
-        lambda plan: plan["portal"].update(build=None),
         lambda plan: plan["portal"].update(build=""),
         lambda plan: plan["portal"].update(build="   "),
         lambda plan: plan["portal"].update(build=" build-1 "),
+        lambda plan: plan["portal"].update(build=24100),
+        lambda plan: plan["portal"].update(build=True),
     ],
 )
 def test_dataset_plan_rejects_self_authorized_or_underestimated_writes(
@@ -1820,8 +1821,8 @@ def test_live_empty_plan_refuses_before_credential_setup(tmp_path: Path) -> None
     assert "at least one disposable entity" in result.stderr
 
 
-@pytest.mark.parametrize("build", [None, "", "   ", 24100, True])
-def test_live_plan_refuses_missing_or_non_string_build_before_artifact_write(
+@pytest.mark.parametrize("build", ["", "   ", 24100, True])
+def test_live_plan_refuses_invalid_build_before_artifact_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     build: object,
@@ -1858,15 +1859,18 @@ def test_live_plan_refuses_missing_or_non_string_build_before_artifact_write(
         ],
     )
 
-    with pytest.raises(LiveUnavailableError, match="exact build identifier"):
+    with pytest.raises(LiveCorrectnessError, match="invalid build identifier"):
         cli_module._plan(args)  # noqa: SLF001 - direct refusal-before-write regression
 
     assert list(tmp_path.iterdir()) == []
 
 
-def test_live_plan_normalizes_a_valid_explicit_portal_build_and_publishes_bundle(
+@pytest.mark.parametrize(("build", "expected_build"), [(None, None), (" 26.500.0 ", "26.500.0")])
+def test_live_plan_persists_optional_portal_build_and_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    build: str | None,
+    expected_build: str | None,
 ) -> None:
     class FakePortal:
         identity = PortalIdentity("portal.invalid", "admin_full", "1", SHA256)
@@ -1882,7 +1886,7 @@ def test_live_plan_normalizes_a_valid_explicit_portal_build_and_publishes_bundle
 
         def preflight(self, *, required_scopes: set[str]) -> LivePreflight:
             assert required_scopes == {"task"}
-            return LivePreflight(self.identity, " 26.500.0 ", frozenset({"task"}))
+            return LivePreflight(self.identity, build, frozenset({"task"}))
 
     monkeypatch.setattr(cli_module, "LivePortal", FakePortal)
     monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda *_args, **_kwargs: None)
@@ -1904,7 +1908,9 @@ def test_live_plan_normalizes_a_valid_explicit_portal_build_and_publishes_bundle
     assert cli_module._plan(args) == ExitCode.COMPLETED  # noqa: SLF001 - direct positive plan regression
     plan = json.loads((tmp_path / "dataset-plan.json").read_text())
 
-    assert plan["portal"]["build"] == "26.500.0"
+    assert plan["portal"]["host"] == "portal.invalid"
+    assert plan["portal"]["fingerprint"] == SHA256
+    assert plan["portal"]["build"] == expected_build
     assert {path.name for path in tmp_path.iterdir()} == {
         ".b24api-transaction-bundle.lock",
         "benchmark-plan.json",
@@ -1912,6 +1918,35 @@ def test_live_plan_normalizes_a_valid_explicit_portal_build_and_publishes_bundle
         "model-fixture-manifest.json",
         "plan-evidence.json",
     }
+
+
+def test_unknown_build_plan_binds_portal_name_fingerprint_and_scope() -> None:
+    plan = _approved_live_plan()
+    plan["portal"]["build"] = None
+    validate_dataset_plan(plan)
+    matching = LivePreflight(
+        PortalIdentity("portal.invalid", "admin_full", "1", SHA256),
+        None,
+        frozenset({"task"}),
+    )
+
+    cli_module._require_preflight_match(plan, matching)  # noqa: SLF001 - live identity boundary regression
+
+    class MatchingPortal:
+        identity = matching.identity
+
+    cli_module._require_portal_match(plan, cast("Any", MatchingPortal()))  # noqa: SLF001
+
+    class WrongPortal:
+        identity = PortalIdentity("other.invalid", "admin_full", "1", SHA256)
+
+    with pytest.raises(ContractError, match="portal identity"):
+        cli_module._require_portal_match(plan, cast("Any", WrongPortal()))  # noqa: SLF001
+    with pytest.raises(LiveUnavailableError, match="build differs"):
+        cli_module._require_preflight_match(  # noqa: SLF001 - future documented-build drift regression
+            plan,
+            LivePreflight(matching.identity, "26.500.0", matching.scopes),
+        )
 
 
 def test_live_benchmark_and_live_resume_never_silently_run_offline(tmp_path: Path) -> None:

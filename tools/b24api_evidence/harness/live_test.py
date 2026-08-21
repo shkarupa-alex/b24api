@@ -325,7 +325,7 @@ def test_live_preflight_never_treats_app_info_fields_as_portal_build(
         {"build": "26.500.0"},
     ],
 )
-def test_public_main_maps_wire_app_info_without_portal_build_to_unavailable_before_artifacts(
+def test_public_main_publishes_portal_identity_without_claiming_unknown_build(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -365,9 +365,18 @@ def test_public_main_maps_wire_app_info_without_portal_build_to_unavailable_befo
         ],
     )
 
-    assert result == ExitCode.UNAVAILABLE
-    assert "exact build identifier" in capsys.readouterr().err
-    assert not artifact_dir.exists()
+    assert result == ExitCode.COMPLETED
+    assert capsys.readouterr().err == ""
+    plan = json.loads((artifact_dir / "dataset-plan.json").read_text())
+    assert plan["portal"]["host"] == "example.invalid"
+    assert plan["portal"]["build"] is None
+    assert {path.name for path in artifact_dir.iterdir()} == {
+        ".b24api-transaction-bundle.lock",
+        "benchmark-plan.json",
+        "dataset-plan.json",
+        "model-fixture-manifest.json",
+        "plan-evidence.json",
+    }
     assert calls == EXPECTED_PREFLIGHT_CALLS
 
 

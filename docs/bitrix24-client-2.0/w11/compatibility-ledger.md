@@ -110,12 +110,12 @@ The packaged endpoint profile set is the empty JSON array. No profile-derived
 plan, optional optimization, or live performance claim is a default. Explicit
 plans remain available at caller-asserted assurance.
 
-The live evidence harness is repository-only and excluded from wheels. Current
-webhook preflight cannot obtain a documented exact portal build, so live plan
-generation is `UNAVAILABLE`, no dataset was seeded, and no live profile or
-performance result is admitted. The definition of done explicitly permits the
-correctness core to ship while unavailable live-dependent claims remain
-unclaimed.
+The live evidence harness is repository-only and excluded from wheels. Portal
+identity uses the normalized host plus the HMAC role/principal fingerprint.
+The current preflight has no documented exact portal build, so plans preserve
+`portal.build: null`; this does not block correctness evidence, but it keeps all
+build-scoped profiles inapplicable. No dataset has yet been seeded because the
+first concrete plan remains behind its separate human approval checkpoint.
 
 No performance regression is accepted by this ledger. Deterministic model
 coverage is a correctness gate, not a live latency claim. W10 supplied no

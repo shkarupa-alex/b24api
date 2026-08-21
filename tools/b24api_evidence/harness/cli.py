@@ -173,7 +173,7 @@ def _plan(args: argparse.Namespace) -> ExitCode:
     if args.live:
         with LivePortal(role=args.credential_role) as portal:
             preflight = portal.preflight(required_scopes=set(profile["required_scopes"]))
-        portal_build = _exact_preflight_build(preflight)
+        portal_build = _optional_preflight_build(preflight)
         portal_data = {
             "host": preflight.identity.host,
             "role": preflight.identity.role,
@@ -2027,18 +2027,20 @@ def _require_portal_match(plan: Mapping[str, Any], portal: LivePortal) -> None:
 def _require_preflight_match(plan: Mapping[str, Any], preflight: LivePreflight) -> None:
     """Reject reviewed-build or scope drift before any entity operation."""
     planned = plan["portal"]
-    portal_build = _exact_preflight_build(preflight)
+    portal_build = _optional_preflight_build(preflight)
     if planned.get("build") != portal_build:
         raise LiveUnavailableError("live portal build differs from the reviewed plan")
     if planned.get("scope_hash") != content_sha256(sorted(preflight.scopes)):
         raise LiveUnavailableError("live portal scope set differs from the reviewed plan")
 
 
-def _exact_preflight_build(preflight: LivePreflight) -> str:
-    """Return one normalized, explicitly sourced portal build or refuse."""
+def _optional_preflight_build(preflight: LivePreflight) -> str | None:
+    """Normalize a documented portal build while preserving unknown build state."""
     build = preflight.build
+    if build is None:
+        return None
     if not isinstance(build, str) or not build.strip():
-        raise LiveUnavailableError("live portal did not provide an exact build identifier")
+        raise LiveCorrectnessError("live portal returned an invalid build identifier")
     return build.strip()
 
 

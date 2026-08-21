@@ -59,9 +59,12 @@ legacy imports, and deliberate corrections.
 - The packaged default profile set is empty.
 - No W10 optimization is admitted.
 - No live performance claim or live endpoint profile is included.
-- The supplied portal currently exposes no documented exact portal build
-  through the required read-only preflight. Live plan generation therefore
-  refuses before artifact publication; no live seed/write was performed.
+- The supplied portal currently exposes no documented exact portal build.
+  Live plans record the unknown build as null and bind portal identity to the
+  normalized host plus HMAC role/principal fingerprint. Unknown build cannot
+  authorize a build-scoped endpoint profile.
+- No live seed/write has yet been performed; the first concrete dataset plan
+  remains behind its separate human approval checkpoint.
 - Large live stress data is not required for the correctness core, and all
   claims depending on unavailable live evidence remain unclaimed.
 - Evidence/seed/cleanup tooling is excluded from the wheel.
