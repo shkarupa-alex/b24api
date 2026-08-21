@@ -13,9 +13,10 @@ import time
 import uuid
 import zipfile
 from argparse import Namespace
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import pytest
 
@@ -719,6 +720,42 @@ def test_plan_bundle_failure_rolls_back_every_new_dependency(
         )
 
     assert tuple(tmp_path.iterdir()) == ()
+
+
+def test_stdout_failure_after_benchmark_commit_never_rolls_back_dependencies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dependency = tmp_path / "model-matrix.json"
+    terminal = tmp_path / "benchmark-evidence.json"
+
+    def publish(
+        _args: Namespace,
+        **kwargs: object,
+    ) -> ExitCode:
+        rollback_log = cast("list[tuple[Path, Mapping[str, Any] | None]]", kwargs["rollback_log"])
+        atomic_write_json(dependency, {"dependency": "committed"})
+        rollback_log.append((dependency, None))
+        atomic_write_json(terminal, {"outcome": "PASS"})
+        return ExitCode.COMPLETED
+
+    monkeypatch.setattr(cli_module, "_benchmark_runs_and_artifact_inner", publish)
+    monkeypatch.setattr(
+        cli_module,
+        "_safe_message",
+        lambda _message: (_ for _ in ()).throw(BrokenPipeError("stdout closed")),
+    )
+
+    with pytest.raises(BrokenPipeError, match="stdout closed"):
+        cli_module._benchmark_runs_and_artifact(  # noqa: SLF001
+            Namespace(artifact_dir=tmp_path),
+            plan={},
+            benchmark_plan={},
+            runs=(),
+        )
+
+    assert json.loads(dependency.read_text()) == {"dependency": "committed"}
+    assert json.loads(terminal.read_text()) == {"outcome": "PASS"}
 
 
 def test_bundle_scan_rechecks_candidate_cleanliness_after_reading(

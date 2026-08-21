@@ -646,7 +646,7 @@ def _benchmark_runs_and_artifact(
 ) -> ExitCode:
     rollback_log: list[tuple[Path, Mapping[str, Any] | None]] = []
     try:
-        return _benchmark_runs_and_artifact_inner(
+        result = _benchmark_runs_and_artifact_inner(
             args,
             plan=plan,
             benchmark_plan=benchmark_plan,
@@ -656,6 +656,9 @@ def _benchmark_runs_and_artifact(
     except BaseException:
         _rollback_candidate_json_log(rollback_log)
         raise
+    artifact_path = args.artifact_dir.resolve() / "benchmark-evidence.json"
+    _safe_message(f"benchmark completed: {artifact_path}")
+    return result
 
 
 def _benchmark_runs_and_artifact_inner(
@@ -834,7 +837,6 @@ def _benchmark_runs_and_artifact_inner(
         candidate_sha=candidate_sha,
         scan_bundle=True,
     )
-    _safe_message(f"benchmark completed: {artifact_dir / 'benchmark-evidence.json'}")
     return ExitCode.COMPLETED
 
 
