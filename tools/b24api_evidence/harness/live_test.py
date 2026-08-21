@@ -271,6 +271,7 @@ def test_live_http_status_error_drops_credentialed_response_local(
     ("scope_result", "app_result"),
     [
         ({"task": "N"}, {"VERSION": "build-1"}),
+        (["", "task"], {"VERSION": "build-1"}),
         (["task"], {"VERSION": True}),
         (["task"], {"VERSION": " "}),
         (["task"], {"VERSION": "A" * 101}),
@@ -300,6 +301,28 @@ def test_live_preflight_preserves_exact_build_at_schema_ceiling(monkeypatch: pyt
 
     with _portal(monkeypatch, handler) as portal:
         assert portal.preflight(required_scopes={"task"}).build == expected
+
+
+def test_live_preflight_maps_the_portal_empty_scope_sentinel_to_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"result": [""]})
+
+    with (
+        _portal(monkeypatch, handler) as portal,
+        pytest.raises(
+            LiveUnavailableError,
+            match="required scope unavailable: task",
+        ),
+    ):
+        portal.preflight(required_scopes={"task"})
+
+    assert calls == 1
 
 
 def test_streamed_response_has_no_per_chunk_retention_amplification() -> None:

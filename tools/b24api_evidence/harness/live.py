@@ -287,13 +287,17 @@ class LivePortal:
         return self.call_envelope(method, parameters)["result"]
 
     @_redacted_live_errors
-    def preflight(self, *, required_scopes: set[str]) -> LivePreflight:  # noqa: C901 - hostile wire union
+    def preflight(self, *, required_scopes: set[str]) -> LivePreflight:  # noqa: C901, PLR0912 - wire union
         """Call scope/app.info and classify missing environment as unavailable."""
         scope_result = self.call("scope")
+        scopes: frozenset[str]
         if isinstance(scope_result, list):
-            if any(not isinstance(item, str) or not item for item in scope_result):
+            if scope_result == [""]:
+                scopes = frozenset()
+            elif any(not isinstance(item, str) or not item for item in scope_result):
                 raise LiveCorrectnessError("scope result contains an invalid scope name")
-            scopes = frozenset(scope_result)
+            else:
+                scopes = frozenset(scope_result)
         elif isinstance(scope_result, dict):
             if any(
                 not isinstance(key, str) or not key or type(enabled) is not bool
