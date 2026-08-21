@@ -31,13 +31,14 @@ or any other portal write.
 git worktree add --detach /tmp/b24api-human-review \
   8e03127621fa1892e629721d4b166b30846e755b
 cd /tmp/b24api-human-review
+uv sync --frozen --group dev
 git status --short --branch
 git diff 3947ac5dcd0b41aca234a14d0bdc2bb61bb4d3a5..8e03127621fa1892e629721d4b166b30846e755b -- \
   tools/b24api_evidence/harness/live.py \
   tools/b24api_evidence/harness/live_test.py
 ```
 
-## Live observation and remediation
+## Live classification observation and fix
 
 The two deliberately limited Bitrix24 webhooks returned the successful scope
 envelope `{"result":[""]}`. The accepted predecessor classified that exact
@@ -45,6 +46,14 @@ portal sentinel as malformed data and exited with correctness code `4`. This
 does not close the live path: both full-rights webhooks separately completed
 read-only `plan` for both Tasks and CRM before this fix. The next trusted plan
 checkpoint therefore uses a full-rights webhook after this review.
+
+Those four full-rights runs were operator diagnostics on exact predecessor
+`3947ac5`: `admin_full/tasks-task-v1`, `employee_full/tasks-task-v1`,
+`admin_full/crm-deal-v1`, and `employee_full/crm-deal-v1` each returned exit
+`0`. Their temporary bundles were deliberately discarded after the code change,
+so this statement is not repository-attested evidence and does not authorize
+admission or writes. The change under review is a classification fix for the
+limited-role diagnostic, not the mechanism that opens the full-rights path.
 
 Section 16.5 requires missing scope to be classified as unavailable rather than
 strategy failure; section 16.2 assigns exit `3` to an unavailable or scope-gated
@@ -72,20 +81,21 @@ The change is deliberately narrow:
 Local exact-SHA gates:
 
 ```bash
+uv sync --frozen --group dev
 .venv/bin/pytest -q -p no:cacheprovider
 .venv/bin/ruff check . --no-fix
 .venv/bin/ruff format --check .
 .venv/bin/mypy --strict b24api tools/b24api_evidence
-git diff --check
+git diff --check 3947ac5dcd0b41aca234a14d0bdc2bb61bb4d3a5..8e03127621fa1892e629721d4b166b30846e755b
 git status --short --branch
 ```
 
 ```text
-pytest: 469 passed in 195.23s
+pytest: 469 passed in 195.49s
 ruff check: PASS
 ruff format --check: 41 files
 mypy --strict b24api tools/b24api_evidence: PASS, 25 source files
-git diff --check: PASS
+git diff --check predecessor..subject: PASS
 tracked status: clean
 ```
 
@@ -122,7 +132,9 @@ does not deterministically block the live path.
 5. Confirm the list/dict asymmetry, `["", ""]` fallback, and local `PLR0912`
    suppression are intentional and bounded.
 6. Run the exact complete gate commands above, not `mypy --strict .` and not
-   only the two new tests.
+   only the two new tests. A fresh detached worktree must run the pinned
+   `uv sync --frozen --group dev` first because `.venv` is intentionally not
+   stored in Git.
 7. Keep the review functional. Existing offline credential/error-boundary tests
    may be replayed, but no expanded cybersecurity investigation is requested.
 
@@ -144,11 +156,12 @@ git show codex/bitrix24-client-benchmarks:docs/bitrix24-client-2.0/w7-w9/review-
 ничего не меняй и не читай user-owned untracked spec/session files.
 
 Запусти точные команды:
+uv sync --frozen --group dev
 .venv/bin/pytest -q -p no:cacheprovider
 .venv/bin/ruff check . --no-fix
 .venv/bin/ruff format --check .
 .venv/bin/mypy --strict b24api tools/b24api_evidence
-git diff --check
+git diff --check 3947ac5dcd0b41aca234a14d0bdc2bb61bb4d3a5..8e03127621fa1892e629721d4b166b30846e755b
 git status --short --branch
 
 Затем проверь diff
