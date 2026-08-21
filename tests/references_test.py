@@ -1154,6 +1154,10 @@ async def test_reference_task_cancellation_closes_transport_and_buffer_state() -
 @pytest.mark.asyncio
 async def test_reference_cancellation_during_failed_finalization_preserves_failure_report() -> None:
     locked = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop_contexts: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
 
     class FailingSource:
         def __init__(self) -> None:
@@ -1192,21 +1196,26 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
         post_failure_executed = True
 
     task = asyncio.create_task(observe_replayed_cancellation())
-    await locked.wait()
-    for _ in range(50):
-        await asyncio.sleep(0)
-    task.cancel()
-    assert source.context is not None
-    source.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
+    try:
+        await locked.wait()
+        for _ in range(50):
+            await asyncio.sleep(0)
+        task.cancel()
+        assert source.context is not None
+        source.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
 
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
 
     assert "reference source failed" in str(primary[0])
     assert primary[0].__dict__["report"] is stream.report
     assert cancelling_seen == [1]
     assert post_failure_executed is False
     assert stream.report.state is TerminalState.FAILED
+    assert loop_contexts == []
 
 
 @pytest.mark.asyncio

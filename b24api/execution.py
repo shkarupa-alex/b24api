@@ -670,7 +670,7 @@ async def await_cancellation_resistant(awaitable: Awaitable[None]) -> asyncio.Ca
     cancellation: asyncio.CancelledError | None = None
     while not task.done():
         try:
-            await asyncio.shield(task)
+            await asyncio.wait((task,), return_when=asyncio.ALL_COMPLETED)
         except asyncio.CancelledError as error:
             cancellation = error
     await task
