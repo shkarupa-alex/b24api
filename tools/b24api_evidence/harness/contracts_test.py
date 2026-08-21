@@ -840,6 +840,56 @@ def test_plan_bundle_failure_rolls_back_every_new_dependency(
     assert tuple(tmp_path.iterdir()) == ()
 
 
+def test_plan_bundle_uses_one_marker_created_before_all_dependency_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(count=0)
+    benchmark_plan = _benchmark_plan()
+    artifact = _benchmark_artifact()
+    candidate_sha = str(plan["candidate_sha"])
+    real_begin = cli_module._begin_candidate_transaction  # noqa: SLF001
+    begin_calls = 0
+
+    def refuse_any_late_marker(path: Path) -> Path:
+        nonlocal begin_calls
+        begin_calls += 1
+        if begin_calls > 1:
+            raise PermissionError("late marker creation refused")
+        return real_begin(path)
+
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
+    monkeypatch.setattr(cli_module, "_begin_candidate_transaction", refuse_any_late_marker)
+    monkeypatch.setattr(
+        cli_module,
+        "_scan_bundle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ContractError("terminal publication refused")),
+    )
+
+    with pytest.raises(ContractError, match="terminal publication refused"):
+        cli_module._persist_plan_bundle(  # noqa: SLF001
+            artifact_dir=tmp_path,
+            dataset_plan=plan,
+            benchmark_plan=benchmark_plan,
+            artifact=artifact,
+            candidate_sha=candidate_sha,
+        )
+
+    assert begin_calls == 1
+    assert tuple(tmp_path.iterdir()) == ()
+
+
+def test_safe_error_renders_redacted_rollback_notes(capsys: pytest.CaptureFixture[str]) -> None:
+    error = ContractError("candidate publication refused")
+    error.add_note("rollback failed; bundle is fail-closed")
+
+    cli_module._safe_error(error)  # noqa: SLF001
+
+    assert capsys.readouterr().err == (
+        "error: ContractError: candidate publication refused\nnote: rollback failed; bundle is fail-closed\n"
+    )
+
+
 def test_stdout_failure_after_benchmark_commit_never_rolls_back_dependencies(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
