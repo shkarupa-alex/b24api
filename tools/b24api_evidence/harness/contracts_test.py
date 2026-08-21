@@ -879,6 +879,48 @@ def test_plan_bundle_uses_one_marker_created_before_all_dependency_writes(
     assert tuple(tmp_path.iterdir()) == ()
 
 
+def test_post_unlink_error_is_reported_after_bundle_commit_without_false_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(count=0)
+    benchmark_plan = _benchmark_plan()
+    artifact = _benchmark_artifact()
+    candidate_sha = str(plan["candidate_sha"])
+    real_unlink = Path.unlink
+    marker_removed = False
+
+    def remove_then_interrupt(path: Path, *, missing_ok: bool = False) -> None:
+        nonlocal marker_removed
+        real_unlink(path, missing_ok=missing_ok)
+        if path.name.startswith(".b24api-transaction-") and not marker_removed:
+            marker_removed = True
+            raise OSError("interrupted after marker unlink")
+
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
+    monkeypatch.setattr(cli_module, "_scan_bundle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(Path, "unlink", remove_then_interrupt)
+
+    with pytest.raises(OSError, match="after marker unlink") as captured:
+        cli_module._persist_plan_bundle(  # noqa: SLF001
+            artifact_dir=tmp_path,
+            dataset_plan=plan,
+            benchmark_plan=benchmark_plan,
+            artifact=artifact,
+            candidate_sha=candidate_sha,
+        )
+
+    assert marker_removed is True
+    assert not tuple(tmp_path.glob(".b24api-transaction-*.pending"))
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "benchmark-plan.json",
+        "dataset-plan.json",
+        "model-fixture-manifest.json",
+        "plan-evidence.json",
+    }
+    assert getattr(captured.value, "__notes__", ()) == ()
+
+
 def test_safe_error_renders_redacted_rollback_notes(capsys: pytest.CaptureFixture[str]) -> None:
     error = ContractError("candidate publication refused")
     error.add_note("rollback failed; bundle is fail-closed")

@@ -644,6 +644,7 @@ def _benchmark_runs_and_artifact(
 ) -> ExitCode:
     rollback_log: list[tuple[Path, Mapping[str, Any] | None]] = []
     transaction = _begin_candidate_transaction(args.artifact_dir.resolve() / "bundle")
+    post_commit_error: BaseException | None = None
     try:
         result = _benchmark_runs_and_artifact_inner(
             args,
@@ -653,11 +654,13 @@ def _benchmark_runs_and_artifact(
             rollback_log=rollback_log,
             transaction=transaction,
         )
-        transaction.unlink()
+        post_commit_error = _unlink_with_outcome(transaction)
     except BaseException as error:
         if not _rollback_candidate_json_log(rollback_log, transaction=transaction):
             error.add_note("one or more evidence dependencies could not be rolled back; the bundle is fail-closed")
         raise
+    if post_commit_error is not None:
+        raise post_commit_error
     artifact_path = args.artifact_dir.resolve() / "benchmark-evidence.json"
     _safe_message(f"benchmark completed: {artifact_path}")
     return result
@@ -1263,6 +1266,7 @@ def _write_candidate_json(  # noqa: PLR0913 - explicit transaction dependencies
     previous = read_json_object(path) if path.exists() else None
     owns_transaction = transaction is None
     marker = transaction if transaction is not None else _begin_candidate_transaction(path)
+    post_commit_error: BaseException | None = None
     if not owns_transaction:
         if not marker.exists():
             raise ContractError("shared evidence transaction marker is unavailable")
@@ -1279,13 +1283,15 @@ def _write_candidate_json(  # noqa: PLR0913 - explicit transaction dependencies
                 active_transaction=marker,
             )
         if owns_transaction:
-            marker.unlink()
+            post_commit_error = _unlink_with_outcome(marker)
         if owns_transaction and rollback_log is not None:
             rollback_log.append((path, previous))
     except BaseException as error:
         if owns_transaction and not _restore_candidate_json(path, previous, transaction=marker):
             error.add_note("evidence rollback failed; an incomplete transaction marker keeps the bundle fail-closed")
         raise
+    if post_commit_error is not None:
+        raise post_commit_error
 
 
 def _begin_candidate_transaction(path: Path) -> Path:
@@ -1309,6 +1315,17 @@ def _begin_candidate_transaction(path: Path) -> Path:
     raise ContractError("cannot allocate a unique evidence transaction marker")
 
 
+def _unlink_with_outcome(path: Path) -> BaseException | None:
+    """Return a post-unlink exception, but raise when the path still exists."""
+    try:
+        path.unlink()
+    except BaseException as error:
+        if path.exists():
+            raise
+        return error
+    return None
+
+
 def _restore_candidate_json(
     path: Path,
     previous: Mapping[str, Any] | None,
@@ -1330,9 +1347,9 @@ def _restore_candidate_json(
         if previous is not None:
             atomic_write_json(path, previous)
         if quarantine is not None:
-            quarantine.unlink(missing_ok=True)
+            _unlink_with_outcome(quarantine)
         if not retain_transaction:
-            marker.unlink(missing_ok=True)
+            _unlink_with_outcome(marker)
     except BaseException:  # noqa: BLE001 - the primary refusal remains authoritative
         return False
     return True
@@ -1356,7 +1373,7 @@ def _rollback_candidate_json_log(
         )
     if transaction is not None and complete:
         try:
-            transaction.unlink(missing_ok=True)
+            _unlink_with_outcome(transaction)
         except BaseException:  # noqa: BLE001 - caller keeps the primary refusal
             complete = False
     return complete
@@ -1372,6 +1389,7 @@ def _persist_verify_bundle(
     """Publish one verify dependency and terminal artifact as a transaction."""
     rollback_log: list[tuple[Path, Mapping[str, Any] | None]] = []
     transaction = _begin_candidate_transaction(artifact_dir / "bundle")
+    post_commit_error: BaseException | None = None
     try:
         _write_candidate_json(
             artifact_dir / "oracle.json",
@@ -1388,11 +1406,13 @@ def _persist_verify_bundle(
             rollback_log=rollback_log,
             transaction=transaction,
         )
-        transaction.unlink()
+        post_commit_error = _unlink_with_outcome(transaction)
     except BaseException as error:
         if not _rollback_candidate_json_log(rollback_log, transaction=transaction):
             error.add_note("one or more verify dependencies could not be rolled back; the bundle is fail-closed")
         raise
+    if post_commit_error is not None:
+        raise post_commit_error
 
 
 def _persist_plan_bundle(
@@ -1405,6 +1425,7 @@ def _persist_plan_bundle(
 ) -> None:
     rollback_log: list[tuple[Path, Mapping[str, Any] | None]] = []
     transaction = _begin_candidate_transaction(artifact_dir / "bundle")
+    post_commit_error: BaseException | None = None
     try:
         _write_candidate_json(
             artifact_dir / "dataset-plan.json",
@@ -1435,11 +1456,13 @@ def _persist_plan_bundle(
             rollback_log=rollback_log,
             transaction=transaction,
         )
-        transaction.unlink()
+        post_commit_error = _unlink_with_outcome(transaction)
     except BaseException as error:
         if not _rollback_candidate_json_log(rollback_log, transaction=transaction):
             error.add_note("one or more plan dependencies could not be rolled back; the bundle is fail-closed")
         raise
+    if post_commit_error is not None:
+        raise post_commit_error
 
 
 def _write_validated_artifact(  # noqa: PLR0913 - validation and transaction boundary
