@@ -9,6 +9,7 @@ import math
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -87,6 +88,7 @@ _TRANSACTION_MARKER_SUFFIX = ".pending"
 _TRANSACTION_MARKER_NAME = f"{_TRANSACTION_MARKER_PREFIX}bundle{_TRANSACTION_MARKER_SUFFIX}"
 _TRANSACTION_LOCK_NAME = ".b24api-transaction-bundle.lock"
 _TRANSACTION_KIND = "b24api-evidence-transaction-v2"
+_OWNER_ONLY_MODE = 0o600
 _TRANSACTION_LOCKS: dict[Path, BinaryIO] = {}
 
 
@@ -158,7 +160,7 @@ def _plan(args: argparse.Namespace) -> ExitCode:
     if args.allow_writes:
         raise ContractError("plan is read-only; --allow-writes is invalid")
     artifact_dir = args.artifact_dir.resolve()
-    if artifact_dir.exists() and any(path.name != _TRANSACTION_LOCK_NAME for path in artifact_dir.iterdir()):
+    if artifact_dir.exists() and any(not _is_secure_transaction_lock(path) for path in artifact_dir.iterdir()):
         raise ContractError("plan requires an empty artifact directory and never overwrites an evidence bundle")
     run_id = _uuid_or_new(args.run_id, "run_id")
     lineage_id = _uuid_or_new(args.lineage_id, "lineage_id")
@@ -1303,8 +1305,9 @@ def _write_candidate_json(  # noqa: PLR0913 - explicit transaction dependencies
 
 def _begin_candidate_transaction(path: Path) -> Path:
     """Exclusively claim a bundle and durably recover any stale owned transaction."""
-    artifact_dir = path.parent.resolve()
+    artifact_dir = _lexical_artifact_directory(path.parent)
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = _lexical_artifact_directory(artifact_dir)
     marker = artifact_dir / _TRANSACTION_MARKER_NAME
     lock = _acquire_transaction_lock(artifact_dir)
     try:
@@ -1329,13 +1332,24 @@ def _begin_candidate_transaction(path: Path) -> Path:
 
 def _acquire_transaction_lock(artifact_dir: Path) -> BinaryIO:
     lock_path = artifact_dir / _TRANSACTION_LOCK_NAME
-    descriptor = os.open(
-        lock_path,
-        os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
-        0o600,
-    )
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    created = False
     try:
-        os.fchmod(descriptor, 0o600)
+        descriptor = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, _OWNER_ONLY_MODE)
+        created = True
+    except FileExistsError:
+        if not _is_secure_transaction_lock(lock_path):
+            raise ContractError("evidence transaction lock is not a secure regular file") from None
+        try:
+            descriptor = os.open(lock_path, flags)
+        except OSError as error:
+            raise ContractError("evidence transaction lock cannot be opened safely") from error
+    try:
+        if created:
+            os.fchmod(descriptor, _OWNER_ONLY_MODE)
+        opened = os.fstat(descriptor)
+        current = lock_path.lstat()
+        _validate_open_transaction_lock(opened, current)
         lock = cast("BinaryIO", os.fdopen(descriptor, "a+b"))
     except BaseException:
         os.close(descriptor)
@@ -1389,7 +1403,7 @@ def _register_transaction_write(
 
 def _lexical_transaction_path(artifact_dir: Path, path: Path) -> tuple[Path, Path]:
     """Bind a journal entry to its lexical atomic-replace path, rejecting symlinks."""
-    artifact_dir = artifact_dir.resolve()
+    artifact_dir = _lexical_artifact_directory(artifact_dir)
     lexical = Path(os.path.abspath(path))  # noqa: PTH100 - resolve() would change journal identity
     if not lexical.is_relative_to(artifact_dir):
         raise ContractError("evidence transaction target escapes its artifact bundle")
@@ -1402,15 +1416,48 @@ def _lexical_transaction_path(artifact_dir: Path, path: Path) -> tuple[Path, Pat
     return lexical, relative
 
 
+def _lexical_artifact_directory(path: Path) -> Path:
+    """Return an absolute artifact directory only when no component is a symlink."""
+    lexical = Path(os.path.abspath(path))  # noqa: PTH100 - resolve() is used only for comparison
+    if lexical.resolve() != lexical:
+        raise ContractError("evidence artifact directory cannot contain a symlink")
+    return lexical
+
+
+def _is_secure_transaction_lock(path: Path) -> bool:
+    """Recognize only the exact owner-only regular bundle lock residue."""
+    if path.name != _TRANSACTION_LOCK_NAME:
+        return False
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1 and stat.S_IMODE(metadata.st_mode) == _OWNER_ONLY_MODE
+    )
+
+
+def _validate_open_transaction_lock(opened: os.stat_result, current: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) != _OWNER_ONLY_MODE
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise ContractError("evidence transaction lock identity is unsafe")
+
+
 def _recover_transaction_marker(  # noqa: C901, PLR0911, PLR0912 - explicit fail-closed replay
     marker: Path,
 ) -> bool:
     try:
+        if marker.is_symlink():
+            return False
         payload = read_json_object(marker)
         entries = payload.get("entries")
         if payload.get("kind") != _TRANSACTION_KIND or not isinstance(entries, list):
             return False
-        artifact_dir = marker.parent.resolve()
+        artifact_dir = _lexical_artifact_directory(marker.parent)
         for raw_entry in reversed(entries):
             if not isinstance(raw_entry, dict):
                 return False
@@ -1451,8 +1498,9 @@ def _recover_transaction_marker(  # noqa: C901, PLR0911, PLR0912 - explicit fail
 
 
 def _recover_stale_candidate_transaction(artifact_dir: Path) -> None:
-    artifact_dir = artifact_dir.resolve()
+    artifact_dir = _lexical_artifact_directory(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = _lexical_artifact_directory(artifact_dir)
     lock = _acquire_transaction_lock(artifact_dir)
     marker = artifact_dir / _TRANSACTION_MARKER_NAME
     try:

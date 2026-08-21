@@ -862,6 +862,50 @@ def test_bundle_transaction_lock_is_owner_only(tmp_path: Path) -> None:
     assert cli_module._rollback_candidate_json_log([], transaction=marker)  # noqa: SLF001
 
 
+def test_plan_never_exempts_or_follows_a_symlinked_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller_mode = 0o644
+    outside = tmp_path / "caller-owned"
+    artifact_dir = tmp_path / "bundle"
+    artifact_dir.mkdir()
+    outside.write_text("caller owned")
+    outside.chmod(caller_mode)
+    (artifact_dir / ".b24api-transaction-bundle.lock").symlink_to(outside)
+    monkeypatch.setattr(cli_module, "_persist_plan_bundle", lambda **_kwargs: None)
+    args = cli_module._parser().parse_args(  # noqa: SLF001
+        ["plan", "--artifact-dir", str(artifact_dir), "--count", "0"],
+    )
+
+    with pytest.raises(ContractError, match="requires an empty artifact directory"):
+        cli_module._plan(args)  # noqa: SLF001
+
+    assert outside.read_text() == "caller owned"
+    assert outside.stat().st_mode & 0o777 == caller_mode
+
+
+def test_transaction_lock_rejects_symlink_and_hardlink_aliases(tmp_path: Path) -> None:
+    owner_only_mode = 0o600
+    outside = tmp_path / "caller-owned"
+    outside.write_text("caller owned")
+    outside.chmod(owner_only_mode)
+    symlink_dir = tmp_path / "symlink-bundle"
+    hardlink_dir = tmp_path / "hardlink-bundle"
+    symlink_dir.mkdir()
+    hardlink_dir.mkdir()
+    (symlink_dir / ".b24api-transaction-bundle.lock").symlink_to(outside)
+    os.link(outside, hardlink_dir / ".b24api-transaction-bundle.lock")
+
+    with pytest.raises(ContractError, match="not a secure regular file"):
+        cli_module._begin_candidate_transaction(symlink_dir / "bundle")  # noqa: SLF001
+    with pytest.raises(ContractError, match="not a secure regular file"):
+        cli_module._begin_candidate_transaction(hardlink_dir / "bundle")  # noqa: SLF001
+
+    assert outside.read_text() == "caller owned"
+    assert outside.stat().st_mode & 0o777 == owner_only_mode
+
+
 def test_plan_bundle_uses_one_marker_created_before_all_dependency_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -969,6 +1013,28 @@ def test_transaction_refuses_a_symlinked_canonical_path_before_mutation(
     assert canonical.is_symlink()
     assert json.loads(predecessor.read_text()) == accepted
     assert not tuple(tmp_path.glob(".b24api-transaction-*.pending"))
+
+
+def test_transaction_refuses_a_symlinked_parent_before_creating_a_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_dir = tmp_path / "bundle"
+    outside = tmp_path / "caller-owned"
+    artifact_dir.mkdir()
+    outside.mkdir()
+    (artifact_dir / "nested").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
+
+    with pytest.raises(ContractError, match="artifact directory cannot contain a symlink"):
+        cli_module._write_candidate_json(  # noqa: SLF001
+            artifact_dir / "nested" / "case-evidence.json",
+            {"outcome": "PASS"},
+            candidate_sha="a" * 40,
+        )
+
+    assert tuple(outside.iterdir()) == ()
+    assert not (artifact_dir / ".b24api-transaction-bundle.lock").exists()
 
 
 def test_stale_transaction_refuses_a_symlinked_journal_path(tmp_path: Path) -> None:
