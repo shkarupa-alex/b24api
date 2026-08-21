@@ -14,6 +14,7 @@ from b24api.execution import (
     Executor,
     WorkClass,
     await_cancellation_resistant,
+    rearm_cancellation,
 )
 from b24api.models import (
     BatchCommandEvidence,
@@ -438,6 +439,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         next_index = 0
         naturally_exhausted = False
         primary_error: BaseException | None = None
+        pending_cancellation: asyncio.CancelledError | None = None
         try:
             while True:
                 chunk = await _next_chunk(
@@ -523,6 +525,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             )
             if cancellation is not None:
                 _attach_report(cancellation, self.report)
+                pending_cancellation = cancellation
             _attach_report(error, self.report)
             raise
         finally:
@@ -532,6 +535,8 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                 if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
                     raise
                 self._record_cleanup_failure(cleanup_error, primary_error)
+                if isinstance(cleanup_error, asyncio.CancelledError):
+                    pending_cancellation = cleanup_error
             else:
                 if cleanup_cancellation is not None and (
                     primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit)
@@ -540,10 +545,13 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                     raise cleanup_cancellation
                 if cleanup_cancellation is not None and primary_error is not None:
                     self._record_cleanup_failure(cleanup_cancellation, primary_error)
+                    pending_cancellation = cleanup_cancellation
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
                 await self._finalize(TerminalState.CANCELLED, "stream abandoned")
             if self.report.state is not TerminalState.NOT_STARTED:
                 self._closed = True
+            if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
+                rearm_cancellation(pending_cancellation)
 
     async def _cleanup_source(self, source: AsyncIteratorController[BatchInput]) -> None:
         try:

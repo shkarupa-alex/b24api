@@ -231,15 +231,8 @@ def _plan(args: argparse.Namespace) -> ExitCode:
     }
     validate_dataset_plan(dataset_plan)
     plan_path = artifact_dir / "dataset-plan.json"
-    _write_candidate_json(plan_path, dataset_plan, candidate_sha=candidate_sha)
     benchmark_plan = _default_benchmark_plan(dataset_plan)
     validate_benchmark_plan(benchmark_plan)
-    _write_candidate_json(artifact_dir / "benchmark-plan.json", benchmark_plan, candidate_sha=candidate_sha)
-    _write_candidate_json(
-        artifact_dir / "model-fixture-manifest.json",
-        _model_fixture_manifest(),
-        candidate_sha=candidate_sha,
-    )
     artifact = _operation_artifact(
         command="plan",
         dataset_plan=dataset_plan,
@@ -250,11 +243,12 @@ def _plan(args: argparse.Namespace) -> ExitCode:
             "wall_seconds": max(time.monotonic() - started, 0.000001),
         },
     )
-    _write_validated_artifact(
-        artifact_dir / "plan-evidence.json",
-        artifact,
+    _persist_plan_bundle(
+        artifact_dir=artifact_dir,
+        dataset_plan=dataset_plan,
+        benchmark_plan=benchmark_plan,
+        artifact=artifact,
         candidate_sha=candidate_sha,
-        scan_bundle=True,
     )
     _safe_message(f"plan completed: {plan_path}")
     return ExitCode.COMPLETED
@@ -650,6 +644,28 @@ def _benchmark_runs_and_artifact(
     benchmark_plan: Mapping[str, Any],
     runs: tuple[ModelRun, ...],
 ) -> ExitCode:
+    rollback_log: list[tuple[Path, Mapping[str, Any] | None]] = []
+    try:
+        return _benchmark_runs_and_artifact_inner(
+            args,
+            plan=plan,
+            benchmark_plan=benchmark_plan,
+            runs=runs,
+            rollback_log=rollback_log,
+        )
+    except BaseException:
+        _rollback_candidate_json_log(rollback_log)
+        raise
+
+
+def _benchmark_runs_and_artifact_inner(
+    args: argparse.Namespace,
+    *,
+    plan: Mapping[str, Any],
+    benchmark_plan: Mapping[str, Any],
+    runs: tuple[ModelRun, ...],
+    rollback_log: list[tuple[Path, Mapping[str, Any] | None]],
+) -> ExitCode:
     """Persist the already executed exact model matrix and its qualified evidence."""
     controls_config = benchmark_plan["controls"]
     stable_runs = [run for run in runs if run.outcome == "PASS"]
@@ -727,6 +743,7 @@ def _benchmark_runs_and_artifact(
             oracle_dir / f"{oracle_case_id}.json",
             oracle,
             candidate_sha=str(plan["candidate_sha"]),
+            rollback_log=rollback_log,
         )
         if run.outcome == "PASS":
             oracle_refs.append(f"sha256:{content_sha256(oracle)}")
@@ -752,6 +769,7 @@ def _benchmark_runs_and_artifact(
         artifact_dir / "model-matrix.json",
         model_matrix,
         candidate_sha=str(plan["candidate_sha"]),
+        rollback_log=rollback_log,
     )
     model_diagnostics = {
         "schema_version": SCHEMA_VERSION,
@@ -761,6 +779,7 @@ def _benchmark_runs_and_artifact(
         artifact_dir / "model-diagnostics.json",
         model_diagnostics,
         candidate_sha=str(plan["candidate_sha"]),
+        rollback_log=rollback_log,
     )
     matrix_ref = f"sha256:{content_sha256(model_matrix)}"
     artifact = _operation_artifact(
@@ -791,12 +810,23 @@ def _benchmark_runs_and_artifact(
         },
     )
     candidate_sha = str(plan["candidate_sha"])
-    _write_candidate_json(artifact_dir / "benchmark-plan.json", benchmark_plan, candidate_sha=candidate_sha)
-    _write_candidate_json(artifact_dir / "dataset-plan.json", plan, candidate_sha=candidate_sha)
+    _write_candidate_json(
+        artifact_dir / "benchmark-plan.json",
+        benchmark_plan,
+        candidate_sha=candidate_sha,
+        rollback_log=rollback_log,
+    )
+    _write_candidate_json(
+        artifact_dir / "dataset-plan.json",
+        plan,
+        candidate_sha=candidate_sha,
+        rollback_log=rollback_log,
+    )
     _write_candidate_json(
         artifact_dir / "model-fixture-manifest.json",
         _model_fixture_manifest(),
         candidate_sha=candidate_sha,
+        rollback_log=rollback_log,
     )
     _write_validated_artifact(
         artifact_dir / "benchmark-evidence.json",
@@ -1212,6 +1242,7 @@ def _write_candidate_json(
     *,
     candidate_sha: str,
     scan_bundle: bool = False,
+    rollback_log: list[tuple[Path, Mapping[str, Any] | None]] | None = None,
 ) -> None:
     """Atomically write only while the clean executing HEAD stays the exact candidate."""
     _require_evidence_candidate(candidate_sha)
@@ -1221,6 +1252,8 @@ def _write_candidate_json(
         _require_evidence_candidate(candidate_sha)
         if scan_bundle:
             _scan_bundle(path.parent, expected_candidate_sha=candidate_sha)
+        if rollback_log is not None:
+            rollback_log.append((path, previous))
     except BaseException:
         _restore_candidate_json(path, previous)
         raise
@@ -1241,6 +1274,50 @@ def _restore_candidate_json(path: Path, previous: Mapping[str, Any] | None) -> N
         if quarantine is not None:
             with contextlib.suppress(BaseException):
                 quarantine.unlink(missing_ok=True)
+
+
+def _rollback_candidate_json_log(log: list[tuple[Path, Mapping[str, Any] | None]]) -> None:
+    for path, previous in reversed(log):
+        _restore_candidate_json(path, previous)
+
+
+def _persist_plan_bundle(
+    *,
+    artifact_dir: Path,
+    dataset_plan: Mapping[str, Any],
+    benchmark_plan: Mapping[str, Any],
+    artifact: Mapping[str, Any],
+    candidate_sha: str,
+) -> None:
+    rollback_log: list[tuple[Path, Mapping[str, Any] | None]] = []
+    try:
+        _write_candidate_json(
+            artifact_dir / "dataset-plan.json",
+            dataset_plan,
+            candidate_sha=candidate_sha,
+            rollback_log=rollback_log,
+        )
+        _write_candidate_json(
+            artifact_dir / "benchmark-plan.json",
+            benchmark_plan,
+            candidate_sha=candidate_sha,
+            rollback_log=rollback_log,
+        )
+        _write_candidate_json(
+            artifact_dir / "model-fixture-manifest.json",
+            _model_fixture_manifest(),
+            candidate_sha=candidate_sha,
+            rollback_log=rollback_log,
+        )
+        _write_validated_artifact(
+            artifact_dir / "plan-evidence.json",
+            artifact,
+            candidate_sha=candidate_sha,
+            scan_bundle=True,
+        )
+    except BaseException:
+        _rollback_candidate_json_log(rollback_log)
+        raise
 
 
 def _write_validated_artifact(
@@ -1646,6 +1723,13 @@ def _scan_bundle(  # noqa: C901, PLR0912, PLR0915
         _require_evidence_candidate(expected_candidate_sha)
     else:
         require_clean_tracked_tree(ROOT)
+    for refused in artifact_dir.glob(".*.refused-*"):
+        if not refused.is_file():
+            continue
+        try:
+            refused.unlink()
+        except OSError as error:
+            raise ContractError("cannot clean a refused evidence quarantine") from error
     scan_paths_for_secrets(tracked_repository_paths(ROOT))
     artifact_paths: list[Path] = []
     total_bytes = 0

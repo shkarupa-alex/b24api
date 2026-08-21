@@ -44,6 +44,10 @@ def _assert_live_error_redacted(error: BaseException, sensitive_fragment: str) -
         if traceback.tb_frame.f_code.co_filename.endswith("harness/live.py"):
             for value in traceback.tb_frame.f_locals.values():
                 assert sensitive_fragment not in repr(value)
+                assert sensitive_fragment not in getattr(value, "_webhook_url", "")
+                if isinstance(value, tuple):
+                    for item in value:
+                        assert sensitive_fragment not in getattr(item, "_webhook_url", "")
         traceback = traceback.tb_next
 
 
@@ -156,8 +160,11 @@ def test_live_portal_drops_webhook_when_httpx_client_initialization_fails(
         "BITRIX24_API_WEBHOOK_URL",
         f"https://example.invalid/rest/1/{sensitive_fragment}/",
     )
-    monkeypatch.setenv("HTTPS_PROXY", "http://example.invalid:bad")
-    monkeypatch.delenv("NO_PROXY", raising=False)
+
+    def fail_client(*_args: object, **_kwargs: object) -> httpx.Client:
+        raise httpx.InvalidURL("synthetic client initialization failure")
+
+    monkeypatch.setattr(httpx, "Client", fail_client)
 
     with pytest.raises(LiveUnavailableError, match="client configuration") as captured:
         LivePortal(role="admin_full")
@@ -314,6 +321,24 @@ def test_non_ok_point_read_still_classifies_structured_not_found(
 
     with _portal(monkeypatch, handler) as portal:
         assert ADAPTERS["crm-deal-v1"].read(portal, "42") is None
+
+
+@pytest.mark.parametrize("status_code", [600, 999])
+def test_malformed_http_status_never_proves_point_read_absence(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"error": "ERROR_NOT_FOUND"})
+
+    with (
+        _portal(monkeypatch, handler) as portal,
+        pytest.raises(
+            LiveCorrectnessError,
+            match="invalid HTTP status",
+        ),
+    ):
+        ADAPTERS["crm-deal-v1"].read(portal, "42")
 
 
 @pytest.mark.parametrize("profile_id", ["crm-deal-v1", "tasks-task-v1"])

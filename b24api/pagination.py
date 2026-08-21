@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Protocol, Self, cast
 
 from b24api.error import CapabilityError, IncompleteTraversalError, PaginationError
-from b24api.execution import ExecutionContext, Executor, WorkClass, await_cancellation_resistant
+from b24api.execution import ExecutionContext, Executor, WorkClass, await_cancellation_resistant, rearm_cancellation
 from b24api.models import (
     CompletionAssurance,
     ConfirmationPolicy,
@@ -401,6 +401,7 @@ class PaginationDriver:
                 return response, items
 
             primary_error: BaseException | None = None
+            pending_cancellation: asyncio.CancelledError | None = None
             try:
                 async for outcome in outcomes:
                     response, items = validated_outcome(outcome)
@@ -415,13 +416,18 @@ class PaginationDriver:
                 )
                 try:
                     cleanup_cancellation = await await_cancellation_resistant(outcomes.aclose())
-                except BaseException:
+                except BaseException as cleanup_error:
                     if not preserve_primary:
                         raise
+                    if isinstance(cleanup_error, asyncio.CancelledError):
+                        pending_cancellation = cleanup_error
                 else:
                     if cleanup_cancellation is not None and not preserve_primary:
                         raise cleanup_cancellation
+                    if preserve_primary:
+                        pending_cancellation = cleanup_cancellation
                 self.batch_report = outcomes.report
+                rearm_cancellation(pending_cancellation)
             if outcomes.report.state is not TerminalState.COMPLETED:
                 raise IncompleteTraversalError(report=outcomes.report)
             if self.validated_rows != total:
@@ -1001,6 +1007,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         pages = self._driver.pages()
         naturally_exhausted = False
         primary_error: BaseException | None = None
+        pending_cancellation: asyncio.CancelledError | None = None
         try:
             async for page in pages:
                 buffered = deque(zip(page.items, self._driver.last_page_unique_mask, strict=True))
@@ -1041,6 +1048,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             )
             if cancellation is not None:
                 _attach_report(cancellation, self.report)
+                pending_cancellation = cancellation
             _attach_report(error, self.report)
             raise
         finally:
@@ -1053,6 +1061,8 @@ class ItemStream(AsyncIterator[JsonValue]):
             except BaseException as cleanup_error:
                 if preserve_primary:
                     _attach_report(cleanup_error, self.report)
+                    if isinstance(cleanup_error, asyncio.CancelledError):
+                        pending_cancellation = cleanup_error
                     cleanup_cancellation = None
                 elif self.report.state is TerminalState.NOT_STARTED:
                     cancellation = await await_cancellation_resistant(
@@ -1069,10 +1079,14 @@ class ItemStream(AsyncIterator[JsonValue]):
             if cleanup_cancellation is not None and not preserve_primary:
                 _attach_report(cleanup_cancellation, self.report)
                 raise cleanup_cancellation
+            if cleanup_cancellation is not None and preserve_primary:
+                pending_cancellation = cleanup_cancellation
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
                 await self._finalize(TerminalState.CANCELLED, "stream abandoned")
             if self.report.state is not TerminalState.NOT_STARTED:
                 self._closed = True
+            if preserve_primary:
+                rearm_cancellation(pending_cancellation)
 
     async def _cleanup_pages(self, pages: AsyncGenerator[_Page]) -> None:
         await pages.aclose()

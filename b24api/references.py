@@ -15,6 +15,7 @@ from b24api.execution import (
     Executor,
     WorkClass,
     await_cancellation_resistant,
+    rearm_cancellation,
 )
 from b24api.models import (
     BatchFailure,
@@ -466,7 +467,7 @@ class ReferenceScheduler:
         self._delivery_uniqueness: dict[int, tuple[ReferenceItem, bool]] = {}
         self._source_controller: AsyncIteratorController[ReferenceRequest] | None = None
 
-    async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:
+    async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912
         """Yield correlated operation outcomes."""
         PaginationDriver.validate_contract(
             self.plan,
@@ -489,6 +490,7 @@ class ReferenceScheduler:
         )
         producer = asyncio.create_task(self._produce(iterator, admission))
         primary_error: BaseException | None = None
+        pending_cancellation: asyncio.CancelledError | None = None
 
         try:
             if self.output_order is ReferenceOutputOrder.READY:
@@ -509,6 +511,8 @@ class ReferenceScheduler:
                 if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
                     raise
                 self._record_cleanup_failure(cleanup_error)
+                if isinstance(cleanup_error, asyncio.CancelledError):
+                    pending_cancellation = cleanup_error
             else:
                 if cleanup_cancellation is not None and primary_error is None:
                     raise cleanup_cancellation
@@ -517,6 +521,9 @@ class ReferenceScheduler:
                     asyncio.CancelledError | GeneratorExit,
                 ):
                     self._record_cleanup_failure(cleanup_cancellation)
+                    pending_cancellation = cleanup_cancellation
+            if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
+                rearm_cancellation(pending_cancellation)
 
     async def _cleanup(
         self,
@@ -904,6 +911,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         outcomes = self._scheduler.outcomes(self._source)
         naturally_exhausted = False
         primary_error: BaseException | None = None
+        pending_cancellation: asyncio.CancelledError | None = None
         try:
             async for outcome in outcomes:
                 yield outcome
@@ -938,6 +946,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             )
             if cancellation is not None:
                 _attach_report(cancellation, self.report)
+                pending_cancellation = cancellation
             _attach_report(error, self.report)
             raise
         finally:
@@ -950,6 +959,8 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             except BaseException as cleanup_error:
                 if preserve_primary:
                     _attach_report(cleanup_error, self.report)
+                    if isinstance(cleanup_error, asyncio.CancelledError):
+                        pending_cancellation = cleanup_error
                     cleanup_cancellation = None
                 elif self.report.state is TerminalState.NOT_STARTED:
                     cancellation = await await_cancellation_resistant(
@@ -966,10 +977,14 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             if cleanup_cancellation is not None and not preserve_primary:
                 _attach_report(cleanup_cancellation, self.report)
                 raise cleanup_cancellation
+            if cleanup_cancellation is not None and preserve_primary:
+                pending_cancellation = cleanup_cancellation
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
                 await self._finalize(TerminalState.CANCELLED, "stream abandoned")
             if self.report.state is not TerminalState.NOT_STARTED:
                 self._closed = True
+            if preserve_primary:
+                rearm_cancellation(pending_cancellation)
 
     async def _finalize(self, state: TerminalState, reason: str) -> None:
         if self.report.state is not TerminalState.NOT_STARTED:

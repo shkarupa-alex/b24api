@@ -67,8 +67,11 @@ def test_transport_constructor_drops_webhook_when_httpx_client_initialization_fa
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sensitive_fragment = "synthetic-constructor-private-fragment"
-    monkeypatch.setenv("HTTPS_PROXY", "http://example.invalid:bad")
-    monkeypatch.delenv("NO_PROXY", raising=False)
+
+    def fail_client() -> httpx.AsyncClient:
+        raise httpx.InvalidURL("synthetic client initialization failure")
+
+    monkeypatch.setattr(httpx, "AsyncClient", fail_client)
 
     with pytest.raises(RuntimeError, match="initialization failed") as captured:
         HttpxTransport(f"https://example.invalid/rest/1/{sensitive_fragment}/")
@@ -402,6 +405,10 @@ async def test_transport_error_drops_credentialed_httpx_exception_and_request_lo
             if traceback.tb_frame.f_code.co_name == "send":
                 for value in traceback.tb_frame.f_locals.values():
                     assert sensitive_fragment not in repr(value)
+                    assert sensitive_fragment not in getattr(value, "_webhook_url", "")
+                    if isinstance(value, tuple):
+                        for item in value:
+                            assert sensitive_fragment not in getattr(item, "_webhook_url", "")
             traceback = traceback.tb_next
     finally:
         await transport.aclose()

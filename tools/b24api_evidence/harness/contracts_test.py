@@ -681,6 +681,46 @@ def test_rollback_base_exception_does_not_mask_primary_bundle_failure(
     assert json.loads(quarantined[0].read_text())["outcome"] == "PASS"
 
 
+def test_next_bundle_scan_cleans_refused_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = tmp_path / ".benchmark-evidence.json.refused-synthetic"
+    quarantine.write_text('{"outcome":"PASS"}')
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda _root: None)
+
+    cli_module._scan_bundle(tmp_path)  # noqa: SLF001
+
+    assert not quarantine.exists()
+
+
+def test_plan_bundle_failure_rolls_back_every_new_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(count=0)
+    benchmark_plan = _benchmark_plan()
+    artifact = _benchmark_artifact()
+    candidate_sha = str(plan["candidate_sha"])
+    monkeypatch.setattr(cli_module, "_require_evidence_candidate", lambda _candidate: None)
+    monkeypatch.setattr(
+        cli_module,
+        "_write_validated_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ContractError("terminal publication refused")),
+    )
+
+    with pytest.raises(ContractError, match="terminal publication refused"):
+        cli_module._persist_plan_bundle(  # noqa: SLF001
+            artifact_dir=tmp_path,
+            dataset_plan=plan,
+            benchmark_plan=benchmark_plan,
+            artifact=artifact,
+            candidate_sha=candidate_sha,
+        )
+
+    assert tuple(tmp_path.iterdir()) == ()
+
+
 def test_bundle_scan_rechecks_candidate_cleanliness_after_reading(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

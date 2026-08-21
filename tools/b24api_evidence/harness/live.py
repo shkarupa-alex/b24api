@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 import os
+import uuid
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Self, cast
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 HTTP_OK = 200
+HTTP_STATUS_MINIMUM = 100
+HTTP_STATUS_MAXIMUM = 599
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_MARKER_SCAN_PAGES = 1_000
 MAX_EXACT_MARKER_MATCHES = 2
@@ -23,6 +26,20 @@ MAX_BUILD_LENGTH = 100
 UNAVAILABLE_API_CODES = frozenset({"error_method_not_found", "insufficient_scope", "access_denied"})
 CLASSIFIED_API_CODES = frozenset({"error_not_found"})
 UNKNOWN_API_CODE = "unexpected_api_error"
+_WEBHOOK_VAULT: dict[str, str] = {}
+
+
+def _store_webhook(webhook_url: str) -> str:
+    handle = uuid.uuid4().hex
+    _WEBHOOK_VAULT[handle] = webhook_url
+    return handle
+
+
+def _webhook_for(handle: str) -> str:
+    try:
+        return _WEBHOOK_VAULT[handle]
+    except KeyError as error:
+        raise LiveUnavailableError("live credential is unavailable") from error
 
 
 class LiveUnavailableError(RuntimeError):
@@ -144,13 +161,16 @@ class LivePortal:
             normalized_webhook = None
             raise LiveUnavailableError("live HTTP client configuration is invalid")
         self.identity = cast("PortalIdentity", identity)
-        self._webhook_url = cast("str", normalized_webhook)
+        self._webhook_handle = _store_webhook(cast("str", normalized_webhook))
         self._client = cast("httpx.Client", resolved_client)
         self.attempts = 0
 
     def close(self) -> None:
         """Close owned resources."""
-        self._client.close()
+        try:
+            self._client.close()
+        finally:
+            _WEBHOOK_VAULT.pop(self._webhook_handle, None)
 
     def __enter__(self) -> Self:
         """Enter the context."""
@@ -176,7 +196,7 @@ class LivePortal:
         try:
             with self._client.stream(
                 "POST",
-                urljoin(self._webhook_url, method),
+                urljoin(_webhook_for(self._webhook_handle), method),
                 json=parameters or {},
             ) as response:
                 status_code = response.status_code
@@ -189,6 +209,9 @@ class LivePortal:
         except httpx.HTTPError:
             transport_failed = True
         response = None
+        if status_code is not None and not HTTP_STATUS_MINIMUM <= status_code <= HTTP_STATUS_MAXIMUM:
+            payload = None
+            raise LiveCorrectnessError(f"live response has an invalid HTTP status for {method}")
         if decoding_failed:
             raise LiveCorrectnessError(f"live response decoding failed for {method}")
         if transport_failed:

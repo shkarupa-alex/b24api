@@ -1175,7 +1175,23 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
         dispatch=DirectDispatch(),
     )
     source.context = stream._scheduler.context  # noqa: SLF001 - deterministic finalize-race regression
-    task = asyncio.create_task(anext(stream))
+    primary: list[RuntimeError] = []
+    cancelling_seen: list[int] = []
+    post_failure_executed = False
+
+    async def observe_replayed_cancellation() -> None:
+        nonlocal post_failure_executed
+        try:
+            await anext(stream)
+        except RuntimeError as error:
+            primary.append(error)
+            current = asyncio.current_task()
+            assert current is not None
+            cancelling_seen.append(current.cancelling())
+        await asyncio.sleep(0)
+        post_failure_executed = True
+
+    task = asyncio.create_task(observe_replayed_cancellation())
     await locked.wait()
     for _ in range(50):
         await asyncio.sleep(0)
@@ -1183,10 +1199,13 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
     assert source.context is not None
     source.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
 
-    with pytest.raises(RuntimeError, match="reference source failed") as captured:
+    with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert "reference source failed" in str(primary[0])
+    assert primary[0].__dict__["report"] is stream.report
+    assert cancelling_seen == [1]
+    assert post_failure_executed is False
     assert stream.report.state is TerminalState.FAILED
 
 

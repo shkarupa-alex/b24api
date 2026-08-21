@@ -8,6 +8,7 @@ import json
 import math
 import random
 import time
+import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -45,6 +46,20 @@ type Sleeper = Callable[[float], Awaitable[None]]
 _HTTP_STATUS_MINIMUM = 100
 _HTTP_STATUS_MAXIMUM = 599
 _RETRY_AFTER_CAP_SECONDS = 3_600.0
+_WEBHOOK_VAULT: dict[str, str] = {}
+
+
+def _store_webhook(webhook_url: str) -> str:
+    handle = uuid.uuid4().hex
+    _WEBHOOK_VAULT[handle] = webhook_url
+    return handle
+
+
+def _webhook_for(handle: str) -> str:
+    try:
+        return _WEBHOOK_VAULT[handle]
+    except KeyError as error:
+        raise RuntimeError("transport credential is unavailable") from error
 
 
 class WorkClass(StrEnum):
@@ -134,7 +149,7 @@ class HttpxTransport:
         if client_initialization_failed:
             normalized_webhook = ""
             raise RuntimeError("HTTP client initialization failed")
-        self._webhook_url = normalized_webhook
+        self._webhook_handle = _store_webhook(normalized_webhook)
         self._client = cast("httpx.AsyncClient", resolved_client)
         self._owns_client = client is None
         self._closed = False
@@ -150,7 +165,7 @@ class HttpxTransport:
         try:
             http_request = self._client.build_request(
                 "POST",
-                f"{self._webhook_url}{request.method}",
+                f"{_webhook_for(self._webhook_handle)}{request.method}",
                 headers={"Content-Type": "application/json"},
                 json=request.to_wire_parameters(),
             )
@@ -213,8 +228,11 @@ class HttpxTransport:
         if self._closed:
             return
         self._closed = True
-        if self._owns_client:
-            await self._client.aclose()
+        try:
+            if self._owns_client:
+                await self._client.aclose()
+        finally:
+            _WEBHOOK_VAULT.pop(self._webhook_handle, None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -657,6 +675,17 @@ async def await_cancellation_resistant(awaitable: Awaitable[None]) -> asyncio.Ca
             cancellation = error
     await task
     return cancellation
+
+
+def rearm_cancellation(cancellation: asyncio.CancelledError | None) -> None:
+    """Replay a cancellation after a primary failure has crossed its atomic cleanup."""
+    task = asyncio.current_task()
+    if task is None or (cancellation is None and not task.cancelling()):
+        return
+    while task.cancelling():
+        task.uncancel()
+    message = cancellation.args[0] if cancellation is not None and cancellation.args else None
+    task.cancel(message)
 
 
 def _raise_for_pending_cancellation() -> None:

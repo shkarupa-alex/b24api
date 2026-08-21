@@ -502,20 +502,30 @@ async def test_counted_cleanup_cancellation_preserves_detected_failure(
 
     client, _transport = _client(handler)
 
-    async def collect() -> list[JsonValue]:
-        return [item async for item in client.list_batched({"method": "crm.item.list"}, batch_size=1)]
+    primary: list[IncompleteTraversalError] = []
+    post_failure_executed = False
+
+    async def collect() -> None:
+        nonlocal post_failure_executed
+        try:
+            _ = [item async for item in client.list_batched({"method": "crm.item.list"}, batch_size=1)]
+        except IncompleteTraversalError as error:
+            primary.append(error)
+        await asyncio.sleep(0)
+        post_failure_executed = True
 
     task = asyncio.create_task(collect())
     await cleanup_started.wait()
     task.cancel()
     release_cleanup.set()
 
-    with pytest.raises(IncompleteTraversalError) as caught:
+    with pytest.raises(asyncio.CancelledError):
         await task
 
-    report = cast("OperationReport", caught.value.report)
+    report = cast("OperationReport", primary[0].report)
     assert report.state is TerminalState.FAILED
-    assert "total contradicts" in str(caught.value.__cause__)
+    assert "total contradicts" in str(primary[0].__cause__)
+    assert post_failure_executed is False
 
 
 @pytest.mark.asyncio

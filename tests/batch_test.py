@@ -628,7 +628,19 @@ async def test_batch_cancellation_during_failed_finalization_preserves_failure_r
     source = FailingSource()
     stream = BatchExecutor(Executor(CallbackTransport(_echo_batch))).batch_outcomes(source)
     source.context = stream._context  # noqa: SLF001 - deterministic finalize-race regression
-    task = asyncio.create_task(anext(stream))
+    primary: list[RuntimeError] = []
+    post_failure_executed = False
+
+    async def observe_replayed_cancellation() -> None:
+        nonlocal post_failure_executed
+        try:
+            await anext(stream)
+        except RuntimeError as error:
+            primary.append(error)
+        await asyncio.sleep(0)
+        post_failure_executed = True
+
+    task = asyncio.create_task(observe_replayed_cancellation())
     await locked.wait()
     for _ in range(10):
         await asyncio.sleep(0)
@@ -636,10 +648,12 @@ async def test_batch_cancellation_during_failed_finalization_preserves_failure_r
     assert source.context is not None
     source.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
 
-    with pytest.raises(RuntimeError, match="batch source failed") as captured:
+    with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert "batch source failed" in str(primary[0])
+    assert primary[0].__dict__["report"] is stream.report
+    assert post_failure_executed is False
     assert stream.report.state is TerminalState.FAILED
 
 

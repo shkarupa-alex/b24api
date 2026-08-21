@@ -14,7 +14,7 @@ from pydantic_core import to_jsonable_python
 from b24api.batch import BatchExecutor, BatchInput, BatchOutcomeStream, BatchStream
 from b24api.entity import LegacyRequest
 from b24api.error import CapabilityError, IncompleteTraversalError
-from b24api.execution import ExecutionContext, ExecutionSnapshot, Executor, HttpxTransport
+from b24api.execution import ExecutionContext, ExecutionSnapshot, Executor, HttpxTransport, rearm_cancellation
 from b24api.models import (
     CompletionAssurance,
     ExecutionPolicy,
@@ -603,6 +603,7 @@ class Bitrix24:
             )
             if repeated is not None:
                 _attach_compatibility_report(repeated, report)
+            rearm_cancellation(repeated or _snapshot_cancellation)
             raise IncompleteTraversalError(report=report) from error
 
     async def list_batched_no_count(  # noqa: PLR0913 - compatibility bridge signature
