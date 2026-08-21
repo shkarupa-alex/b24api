@@ -35,6 +35,19 @@ fields, previous-record SHA-256, and current-record SHA-256.
 An adjacent exclusive lock covers chain reload, validation, append, and fsync,
 so a stale concurrent writer cannot append a second genesis or sequence.
 
+Multi-file evidence publication holds one non-blocking OS lock for the whole
+artifact directory. Its fixed pending marker is a durable ownership journal:
+before each canonical write it records the relative path, predecessor JSON, and
+the exact SHA-256 of the value being written. A concurrent publisher therefore
+refuses before mutation. After a crash, the next bundle-bound command acquires
+the released OS lock and rolls back only paths whose current hash is either the
+journaled write or the already-restored predecessor. Any foreign content or
+failed restore retains the marker and keeps bundle scanning fail-closed. A
+successful terminal scan removes the marker as the commit point; an exception
+delivered after that unlink reports an operational error without rolling back
+the already committed bundle. The persistent lock file is included in bundle
+secret and size accounting.
+
 Resume validates the complete chain, its per-correlation lifecycle state machine,
 planned cell membership/cardinality, and exact run, lineage, plan content,
 portal fingerprint, candidate SHA, and namespace. An ambiguous create never

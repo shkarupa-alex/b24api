@@ -246,7 +246,8 @@ async def test_batch_source_cleanup_error_carries_same_report() -> None:
         await stream.aclose()
 
     assert captured.value.__dict__["report"] is stream.report
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is TerminalState.FAILED
+    assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
 
 
 @pytest.mark.asyncio
@@ -487,13 +488,30 @@ async def test_batch_iteration_cancellation_propagates_source_cleanup_error() ->
         batch_size=1,
     )
     assert isinstance(await anext(stream), BatchSuccess)
-    task = asyncio.create_task(anext(stream))
-    await pulling.wait()
-    task.cancel()
+    observed: list[tuple[str, object]] = []
 
-    with pytest.raises(RuntimeError, match="batch close boom") as captured:
-        await task
-    assert captured.value.__dict__["report"] is stream.report
+    async def consume() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        try:
+            await anext(stream)
+        except RuntimeError as error:
+            observed.append((str(error), current.cancelling()))
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError as cancellation:
+            observed.append((str(cancellation), current.cancelling()))
+        while current.cancelling():
+            current.uncancel()
+
+    task = asyncio.create_task(consume())
+    await pulling.wait()
+    task.cancel("external-caller")
+
+    await task
+    assert observed == [("batch close boom", 1), ("external-caller", 1)]
+    assert stream.report.state is TerminalState.FAILED
+    assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
 
 
 @pytest.mark.asyncio

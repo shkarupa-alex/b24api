@@ -14,6 +14,7 @@ from b24api.execution import (
     Executor,
     WorkClass,
     await_cancellation_resistant,
+    await_cleanup_resistant,
     rearm_cancellation,
 )
 from b24api.models import (
@@ -529,23 +530,28 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             _attach_report(error, self.report)
             raise
         finally:
-            try:
-                cleanup_cancellation = await await_cancellation_resistant(self._cleanup_source(source))
-            except BaseException as cleanup_error:
+            cleanup = await await_cleanup_resistant(self._cleanup_source(source))
+            if cleanup.error is not None:
+                cleanup_error = cleanup.error
                 if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                    raise
+                    await self._record_terminal_cleanup_failure(cleanup_error)
+                    pending = cleanup.cancellation
+                    if pending is None and isinstance(primary_error, asyncio.CancelledError):
+                        pending = primary_error
+                    rearm_cancellation(pending)
+                    raise cleanup_error
                 self._record_cleanup_failure(cleanup_error, primary_error)
-                if isinstance(cleanup_error, asyncio.CancelledError):
+                pending_cancellation = cleanup.cancellation
+                if pending_cancellation is None and isinstance(cleanup_error, asyncio.CancelledError):
                     pending_cancellation = cleanup_error
-            else:
-                if cleanup_cancellation is not None and (
-                    primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit)
-                ):
-                    _attach_report(cleanup_cancellation, self.report)
-                    raise cleanup_cancellation
-                if cleanup_cancellation is not None and primary_error is not None:
-                    self._record_cleanup_failure(cleanup_cancellation, primary_error)
-                    pending_cancellation = cleanup_cancellation
+            elif cleanup.cancellation is not None and (
+                primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit)
+            ):
+                _attach_report(cleanup.cancellation, self.report)
+                raise cleanup.cancellation
+            elif cleanup.cancellation is not None and primary_error is not None:
+                self._record_cleanup_failure(cleanup.cancellation, primary_error)
+                pending_cancellation = cleanup.cancellation
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
                 await self._finalize(TerminalState.CANCELLED, "stream abandoned")
             if self.report.state is not TerminalState.NOT_STARTED:
@@ -554,27 +560,23 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                 rearm_cancellation(pending_cancellation)
 
     async def _cleanup_source(self, source: AsyncIteratorController[BatchInput]) -> None:
-        try:
-            await self._context.set_buffered_rows(0)
-            await source.aclose(
-                remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed),
-            )
-        except BaseException as cleanup_error:
-            if self.report.state is TerminalState.NOT_STARTED:
-                cancellation = await await_cancellation_resistant(
-                    self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
-                )
-                if cancellation is not None:
-                    _attach_report(cancellation, self.report)
-                    raise cancellation from cleanup_error
-            _attach_report(cleanup_error, self.report)
-            raise
+        await self._context.set_buffered_rows(0)
+        await source.aclose(
+            remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed),
+        )
 
     async def _observe_source_cleanup(self) -> None:
         controller = self._source_controller
         if controller is None:
             return
-        await self._cleanup_source(controller)
+        try:
+            await self._cleanup_source(controller)
+        except BaseException as error:
+            if self.report.state is not TerminalState.FAILED:
+                await self._record_terminal_cleanup_failure(error)
+            else:
+                _attach_report(error, self.report)
+            raise
 
     def _record_cleanup_failure(self, error: BaseException, primary_error: BaseException) -> None:
         violation = Violation(
@@ -584,6 +586,27 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         )
         self.report = replace(self.report, violations=(*self.report.violations, violation))
         _attach_report(primary_error, self.report)
+
+    async def _record_terminal_cleanup_failure(self, error: BaseException) -> None:
+        if self.report.state is TerminalState.NOT_STARTED:
+            await self._finalize(TerminalState.FAILED, "stream cleanup failed")
+        violations = self.report.violations
+        if not any(violation.code == "cleanup_failure" for violation in violations):
+            violations = (
+                *violations,
+                Violation(
+                    severity=ViolationSeverity.BLOCKING,
+                    code="cleanup_failure",
+                    message=f"batch cleanup failed ({type(error).__name__})",
+                ),
+            )
+        self.report = replace(
+            self.report,
+            state=TerminalState.FAILED,
+            terminal_reason="stream cleanup failed",
+            violations=violations,
+        )
+        _attach_report(error, self.report)
 
     async def _finalize(self, state: TerminalState, reason: str) -> None:
         if self.report.state is not TerminalState.NOT_STARTED:

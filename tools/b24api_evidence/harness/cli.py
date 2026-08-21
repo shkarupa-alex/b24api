@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import math
 import os
@@ -70,6 +71,7 @@ from .model import MODEL_REQUEST_SECONDS, ModelRun, exact_model_cases, run_exact
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from typing import BinaryIO
 
 ROOT = Path(__file__).resolve().parents[3]
 PROFILE_SET_PATH = ROOT / "docs/bitrix24-client-2.0/w0/disposable-entity-profiles.json"
@@ -82,6 +84,10 @@ _MAX_BUNDLE_FILES = 512
 _MAX_BUNDLE_BYTES = 128 * 1024 * 1024
 _TRANSACTION_MARKER_PREFIX = ".b24api-transaction-"
 _TRANSACTION_MARKER_SUFFIX = ".pending"
+_TRANSACTION_MARKER_NAME = f"{_TRANSACTION_MARKER_PREFIX}bundle{_TRANSACTION_MARKER_SUFFIX}"
+_TRANSACTION_LOCK_NAME = ".b24api-transaction-bundle.lock"
+_TRANSACTION_KIND = "b24api-evidence-transaction-v2"
+_TRANSACTION_LOCKS: dict[Path, BinaryIO] = {}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -654,7 +660,7 @@ def _benchmark_runs_and_artifact(
             rollback_log=rollback_log,
             transaction=transaction,
         )
-        post_commit_error = _unlink_with_outcome(transaction)
+        post_commit_error = _commit_candidate_transaction(transaction)
     except BaseException as error:
         if not _rollback_candidate_json_log(rollback_log, transaction=transaction):
             error.add_note("one or more evidence dependencies could not be rolled back; the bundle is fail-closed")
@@ -1268,12 +1274,13 @@ def _write_candidate_json(  # noqa: PLR0913 - explicit transaction dependencies
     marker = transaction if transaction is not None else _begin_candidate_transaction(path)
     post_commit_error: BaseException | None = None
     if not owns_transaction:
-        if not marker.exists():
+        if marker not in _TRANSACTION_LOCKS or not marker.exists():
             raise ContractError("shared evidence transaction marker is unavailable")
         if rollback_log is None:
             raise ContractError("a shared evidence transaction requires a rollback log")
         rollback_log.append((path, previous))
     try:
+        _register_transaction_write(marker, path, previous, value)
         atomic_write_json(path, value)
         _require_evidence_candidate(candidate_sha)
         if scan_bundle:
@@ -1283,11 +1290,11 @@ def _write_candidate_json(  # noqa: PLR0913 - explicit transaction dependencies
                 active_transaction=marker,
             )
         if owns_transaction:
-            post_commit_error = _unlink_with_outcome(marker)
+            post_commit_error = _commit_candidate_transaction(marker)
         if owns_transaction and rollback_log is not None:
             rollback_log.append((path, previous))
     except BaseException as error:
-        if owns_transaction and not _restore_candidate_json(path, previous, transaction=marker):
+        if owns_transaction and not _rollback_candidate_json_log([], transaction=marker):
             error.add_note("evidence rollback failed; an incomplete transaction marker keeps the bundle fail-closed")
         raise
     if post_commit_error is not None:
@@ -1295,24 +1302,141 @@ def _write_candidate_json(  # noqa: PLR0913 - explicit transaction dependencies
 
 
 def _begin_candidate_transaction(path: Path) -> Path:
-    """Claim one exact same-directory transaction marker before publication."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    for _attempt in range(10):
-        marker = path.with_name(
-            f"{_TRANSACTION_MARKER_PREFIX}{uuid.uuid4().hex}{_TRANSACTION_MARKER_SUFFIX}",
+    """Exclusively claim a bundle and durably recover any stale owned transaction."""
+    artifact_dir = path.parent.resolve()
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    marker = artifact_dir / _TRANSACTION_MARKER_NAME
+    lock = _acquire_transaction_lock(artifact_dir)
+    try:
+        if marker.exists() and not _recover_transaction_marker(marker):
+            raise ContractError(  # noqa: TRY301 - lock cleanup owns this boundary
+                "incomplete evidence transaction could not be recovered safely",
+            )
+        atomic_write_json(
+            marker,
+            {
+                "kind": _TRANSACTION_KIND,
+                "target": path.name,
+                "entries": [],
+            },
         )
-        try:
-            marker.touch(mode=0o600, exist_ok=False)
-        except FileExistsError:
-            continue
-        try:
-            atomic_write_json(marker, {"kind": "b24api-evidence-transaction-v1", "target": path.name})
-        except BaseException:
-            with contextlib.suppress(BaseException):
-                marker.unlink(missing_ok=True)
-            raise
-        return marker
-    raise ContractError("cannot allocate a unique evidence transaction marker")
+    except BaseException:
+        _release_transaction_lock(lock)
+        raise
+    _TRANSACTION_LOCKS[marker] = lock
+    return marker
+
+
+def _acquire_transaction_lock(artifact_dir: Path) -> BinaryIO:
+    lock_path = artifact_dir / _TRANSACTION_LOCK_NAME
+    lock = lock_path.open("a+b")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        lock.close()
+        raise ContractError("evidence bundle is owned by another active publication") from error
+    return lock
+
+
+def _release_transaction_lock(lock: BinaryIO) -> None:
+    with contextlib.suppress(BaseException):
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with contextlib.suppress(BaseException):
+        lock.close()
+
+
+def _finish_transaction_lock(marker: Path) -> None:
+    lock = _TRANSACTION_LOCKS.pop(marker, None)
+    if lock is not None:
+        _release_transaction_lock(lock)
+
+
+def _register_transaction_write(
+    marker: Path,
+    path: Path,
+    previous: Mapping[str, Any] | None,
+    value: Mapping[str, Any],
+) -> None:
+    if marker not in _TRANSACTION_LOCKS or not marker.exists():
+        raise ContractError("shared evidence transaction ownership is unavailable")
+    payload = read_json_object(marker)
+    entries = payload.get("entries")
+    if payload.get("kind") != _TRANSACTION_KIND or not isinstance(entries, list):
+        raise ContractError("evidence transaction journal is invalid")
+    artifact_dir = marker.parent.resolve()
+    resolved = path.resolve()
+    if not resolved.is_relative_to(artifact_dir):
+        raise ContractError("evidence transaction target escapes its artifact bundle")
+    relative = resolved.relative_to(artifact_dir).as_posix()
+    if any(isinstance(entry, dict) and entry.get("path") == relative for entry in entries):
+        raise ContractError("evidence transaction cannot mutate one path twice")
+    entries.append(
+        {
+            "path": relative,
+            "previous": dict(previous) if previous is not None else None,
+            "written_sha256": content_sha256(value),
+        },
+    )
+    atomic_write_json(marker, payload)
+
+
+def _recover_transaction_marker(  # noqa: C901, PLR0911, PLR0912 - explicit fail-closed replay
+    marker: Path,
+) -> bool:
+    try:
+        payload = read_json_object(marker)
+        entries = payload.get("entries")
+        if payload.get("kind") != _TRANSACTION_KIND or not isinstance(entries, list):
+            return False
+        artifact_dir = marker.parent.resolve()
+        for raw_entry in reversed(entries):
+            if not isinstance(raw_entry, dict):
+                return False
+            relative = raw_entry.get("path")
+            previous = raw_entry.get("previous")
+            written_sha256 = raw_entry.get("written_sha256")
+            if (
+                not isinstance(relative, str)
+                or not isinstance(written_sha256, str)
+                or (previous is not None and not isinstance(previous, dict))
+            ):
+                return False
+            path = (artifact_dir / relative).resolve()
+            if not path.is_relative_to(artifact_dir):
+                return False
+            if not path.exists():
+                if previous is None:
+                    continue
+                return False
+            current = read_json_object(path)
+            current_hash = content_sha256(current)
+            previous_hash = content_sha256(previous) if previous is not None else None
+            if previous_hash is not None and current_hash == previous_hash:
+                continue
+            if current_hash != written_sha256:
+                return False
+            if previous is None:
+                _unlink_with_outcome(path)
+            else:
+                atomic_write_json(path, previous)
+                if content_sha256(read_json_object(path)) != previous_hash:
+                    return False
+        _unlink_with_outcome(marker)
+    except BaseException:  # noqa: BLE001 - caller retains the fail-closed marker
+        return False
+    return True
+
+
+def _recover_stale_candidate_transaction(artifact_dir: Path) -> None:
+    artifact_dir = artifact_dir.resolve()
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    lock = _acquire_transaction_lock(artifact_dir)
+    marker = artifact_dir / _TRANSACTION_MARKER_NAME
+    try:
+        if marker.exists() and not _recover_transaction_marker(marker):
+            raise ContractError("incomplete evidence transaction could not be recovered safely")
+    finally:
+        _release_transaction_lock(lock)
 
 
 def _unlink_with_outcome(path: Path) -> BaseException | None:
@@ -1326,6 +1450,12 @@ def _unlink_with_outcome(path: Path) -> BaseException | None:
     return None
 
 
+def _commit_candidate_transaction(marker: Path) -> BaseException | None:
+    error = _unlink_with_outcome(marker)
+    _finish_transaction_lock(marker)
+    return error
+
+
 def _restore_candidate_json(
     path: Path,
     previous: Mapping[str, Any] | None,
@@ -1333,26 +1463,20 @@ def _restore_candidate_json(
     transaction: Path | None = None,
     retain_transaction: bool = False,
 ) -> bool:
-    """Rollback one artifact, leaving an exact fail-closed marker on any failure."""
+    """Compatibility wrapper for one journaled, ownership-checked rollback."""
     marker = transaction
+    owns_transaction = marker is None
     try:
-        if marker is not None and retain_transaction and not marker.exists():
-            return False
-        if marker is None or not marker.exists():
+        if marker is None:
             marker = _begin_candidate_transaction(path)
-        quarantine: Path | None = None
-        if path.exists():
-            quarantine = path.with_name(f".{path.name}.refused-{uuid.uuid4().hex}")
-            path.replace(quarantine)
-        if previous is not None:
-            atomic_write_json(path, previous)
-        if quarantine is not None:
-            _unlink_with_outcome(quarantine)
-        if not retain_transaction:
-            _unlink_with_outcome(marker)
+            current = read_json_object(path) if path.exists() else {}
+            _register_transaction_write(marker, path, previous, current)
+        complete = _recover_transaction_marker(marker)
     except BaseException:  # noqa: BLE001 - the primary refusal remains authoritative
-        return False
-    return True
+        complete = False
+    if marker is not None and (owns_transaction or not retain_transaction):
+        _finish_transaction_lock(marker)
+    return complete
 
 
 def _rollback_candidate_json_log(
@@ -1360,23 +1484,11 @@ def _rollback_candidate_json_log(
     *,
     transaction: Path | None = None,
 ) -> bool:
-    complete = True
-    for path, previous in reversed(log):
-        complete = (
-            _restore_candidate_json(
-                path,
-                previous,
-                transaction=transaction,
-                retain_transaction=transaction is not None,
-            )
-            and complete
-        )
-    if transaction is not None and complete:
-        try:
-            _unlink_with_outcome(transaction)
-        except BaseException:  # noqa: BLE001 - caller keeps the primary refusal
-            complete = False
-    return complete
+    if transaction is not None:
+        complete = _recover_transaction_marker(transaction)
+        _finish_transaction_lock(transaction)
+        return complete
+    return all(_restore_candidate_json(path, previous) for path, previous in reversed(log))
 
 
 def _persist_verify_bundle(
@@ -1406,7 +1518,7 @@ def _persist_verify_bundle(
             rollback_log=rollback_log,
             transaction=transaction,
         )
-        post_commit_error = _unlink_with_outcome(transaction)
+        post_commit_error = _commit_candidate_transaction(transaction)
     except BaseException as error:
         if not _rollback_candidate_json_log(rollback_log, transaction=transaction):
             error.add_note("one or more verify dependencies could not be rolled back; the bundle is fail-closed")
@@ -1427,6 +1539,18 @@ def _persist_plan_bundle(
     transaction = _begin_candidate_transaction(artifact_dir / "bundle")
     post_commit_error: BaseException | None = None
     try:
+        _scan_bundle(
+            artifact_dir,
+            expected_candidate_sha=candidate_sha,
+            active_transaction=transaction,
+        )
+        existing_plan_path = artifact_dir / "dataset-plan.json"
+        if existing_plan_path.exists() and content_sha256(read_json_object(existing_plan_path)) != content_sha256(
+            dataset_plan,
+        ):
+            raise ContractError(  # noqa: TRY301 - transaction rollback owns this boundary
+                "plan publication conflicts with the existing immutable evidence bundle",
+            )
         _write_candidate_json(
             artifact_dir / "dataset-plan.json",
             dataset_plan,
@@ -1456,7 +1580,7 @@ def _persist_plan_bundle(
             rollback_log=rollback_log,
             transaction=transaction,
         )
-        post_commit_error = _unlink_with_outcome(transaction)
+        post_commit_error = _commit_candidate_transaction(transaction)
     except BaseException as error:
         if not _rollback_candidate_json_log(rollback_log, transaction=transaction):
             error.add_note("one or more plan dependencies could not be rolled back; the bundle is fail-closed")
@@ -1629,6 +1753,7 @@ def _bind_plan_to_bundle(args: argparse.Namespace, plan: Mapping[str, Any]) -> N
     artifact_dir = args.artifact_dir.resolve()
     bundled_plan_path = artifact_dir / "dataset-plan.json"
     candidate_sha = str(plan["candidate_sha"])
+    _recover_stale_candidate_transaction(artifact_dir)
     _scan_bundle(artifact_dir, expected_candidate_sha=candidate_sha)
     if bundled_plan_path.exists():
         bundled_plan = read_json_object(bundled_plan_path)

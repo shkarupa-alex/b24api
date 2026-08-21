@@ -697,6 +697,32 @@ async def await_cancellation_resistant(awaitable: Awaitable[None]) -> asyncio.Ca
     return cancellation
 
 
+@dataclass(frozen=True, slots=True)
+class _CleanupOutcome:
+    cancellation: asyncio.CancelledError | None
+    error: BaseException | None
+
+
+async def await_cleanup_resistant(awaitable: Awaitable[None]) -> _CleanupOutcome:
+    """Finish owned cleanup without losing a concurrent caller cancellation."""
+    task: asyncio.Future[None] = asyncio.ensure_future(awaitable)
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.wait((task,), return_when=asyncio.ALL_COMPLETED)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    try:
+        await task
+    except asyncio.CancelledError as error:
+        if cancellation is not None:
+            return _CleanupOutcome(cancellation, None)
+        return _CleanupOutcome(None, error)
+    except BaseException as error:  # noqa: BLE001 - cleanup failure is returned with cancellation
+        return _CleanupOutcome(cancellation, error)
+    return _CleanupOutcome(cancellation, None)
+
+
 def rearm_cancellation(cancellation: asyncio.CancelledError | None) -> None:
     """Replay a cancellation after a primary failure has crossed its atomic cleanup."""
     task = asyncio.current_task()

@@ -658,7 +658,7 @@ def test_directory_fsync_failure_after_replace_restores_previous_artifact(
     assert json.loads(path.read_text()) == previous
 
 
-def test_failed_quarantine_move_leaves_bundle_transaction_fail_closed(
+def test_failed_owned_restore_leaves_bundle_transaction_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -674,15 +674,15 @@ def test_failed_quarantine_move_leaves_bundle_transaction_fail_closed(
         if candidate_checks == SECOND_CALL:
             raise ContractError("candidate SHA differs")
 
-    original_replace = Path.replace
+    real_atomic_write_json = contracts_module.atomic_write_json
 
-    def fail_quarantine_move(source: Path, target: Path) -> Path:
-        if source == path and ".refused-" in target.name:
-            raise OSError("cross-device quarantine move")
-        return original_replace(source, target)
+    def fail_predecessor_restore(target: Path, value: Mapping[str, Any]) -> None:
+        if target == path and value == accepted:
+            raise OSError("predecessor restore refused")
+        real_atomic_write_json(target, value)
 
     monkeypatch.setattr(cli_module, "_require_evidence_candidate", refuse_after_write)
-    monkeypatch.setattr(Path, "replace", fail_quarantine_move)
+    monkeypatch.setattr(cli_module, "atomic_write_json", fail_predecessor_restore)
 
     with pytest.raises(ContractError, match="candidate SHA differs") as captured:
         cli_module._write_candidate_json(  # noqa: SLF001
@@ -724,16 +724,13 @@ def test_rollback_base_exception_does_not_mask_primary_bundle_failure(
                 scan_bundle=True,
             )
 
-    assert not path.exists()
-    quarantined = tuple(tmp_path.glob(".benchmark-evidence.json.refused-*"))
-    assert len(quarantined) == 1
-    assert json.loads(quarantined[0].read_text())["outcome"] == "PASS"
+    assert json.loads(path.read_text())["outcome"] == "PASS"
     markers = tuple(tmp_path.glob(".b24api-transaction-*.pending"))
     assert len(markers) == 1
     monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda _root: None)
     with pytest.raises(ContractError, match="incomplete publication transaction"):
         cli_module._scan_bundle(tmp_path)  # noqa: SLF001
-    quarantined[0].unlink()
+    path.unlink()
     markers[0].unlink()
 
 
@@ -755,7 +752,7 @@ def test_bundle_scan_never_deletes_caller_owned_refused_lookalikes(
     assert nested_lookalike.read_text() == "caller owned"
 
 
-def test_interrupted_nested_quarantine_is_visible_and_fail_closed(
+def test_interrupted_nested_owned_restore_is_visible_and_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -768,15 +765,13 @@ def test_interrupted_nested_quarantine_is_visible_and_fail_closed(
         patch.setattr(Path, "unlink", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()))
         cli_module._restore_candidate_json(path, None)  # noqa: SLF001
 
-    assert not path.exists()
-    quarantined = tuple(tmp_path.rglob(".case.json.refused-*"))
-    assert len(quarantined) == 1
+    assert json.loads(path.read_text()) == {"outcome": "PASS"}
     markers = tuple(tmp_path.rglob(".b24api-transaction-*.pending"))
     assert len(markers) == 1
     monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda _root: None)
     with pytest.raises(ContractError, match="incomplete publication transaction"):
         cli_module._scan_bundle(tmp_path)  # noqa: SLF001
-    quarantined[0].unlink()
+    path.unlink()
     markers[0].unlink()
 
 
@@ -837,7 +832,7 @@ def test_plan_bundle_failure_rolls_back_every_new_dependency(
             candidate_sha=candidate_sha,
         )
 
-    assert tuple(tmp_path.iterdir()) == ()
+    assert {path.name for path in tmp_path.iterdir()} == {".b24api-transaction-bundle.lock"}
 
 
 def test_plan_bundle_uses_one_marker_created_before_all_dependency_writes(
@@ -876,7 +871,53 @@ def test_plan_bundle_uses_one_marker_created_before_all_dependency_writes(
         )
 
     assert begin_calls == 1
-    assert tuple(tmp_path.iterdir()) == ()
+    assert {path.name for path in tmp_path.iterdir()} == {".b24api-transaction-bundle.lock"}
+
+
+def test_bundle_transaction_excludes_a_concurrent_publisher(tmp_path: Path) -> None:
+    first = cli_module._begin_candidate_transaction(tmp_path / "bundle")  # noqa: SLF001
+
+    with pytest.raises(ContractError, match="owned by another active publication"):
+        cli_module._begin_candidate_transaction(tmp_path / "bundle")  # noqa: SLF001
+
+    assert cli_module._rollback_candidate_json_log([], transaction=first)  # noqa: SLF001
+    second = cli_module._begin_candidate_transaction(tmp_path / "bundle")  # noqa: SLF001
+    assert cli_module._rollback_candidate_json_log([], transaction=second)  # noqa: SLF001
+
+
+def test_stale_transaction_journal_restores_only_its_owned_content(tmp_path: Path) -> None:
+    path = tmp_path / "dataset-plan.json"
+    previous = {"tag": "accepted"}
+    refused = {"tag": "refused"}
+    atomic_write_json(path, previous)
+    marker = cli_module._begin_candidate_transaction(tmp_path / "bundle")  # noqa: SLF001
+    cli_module._register_transaction_write(marker, path, previous, refused)  # noqa: SLF001
+    atomic_write_json(path, refused)
+    cli_module._finish_transaction_lock(marker)  # noqa: SLF001 - simulate process death
+
+    cli_module._recover_stale_candidate_transaction(tmp_path)  # noqa: SLF001
+
+    assert json.loads(path.read_text()) == previous
+    assert not marker.exists()
+
+
+def test_stale_transaction_never_overwrites_foreign_canonical_content(tmp_path: Path) -> None:
+    path = tmp_path / "dataset-plan.json"
+    previous = {"tag": "accepted"}
+    refused = {"tag": "refused"}
+    foreign = {"tag": "foreign"}
+    atomic_write_json(path, previous)
+    marker = cli_module._begin_candidate_transaction(tmp_path / "bundle")  # noqa: SLF001
+    cli_module._register_transaction_write(marker, path, previous, refused)  # noqa: SLF001
+    atomic_write_json(path, refused)
+    cli_module._finish_transaction_lock(marker)  # noqa: SLF001 - simulate process death
+    atomic_write_json(path, foreign)
+
+    with pytest.raises(ContractError, match="could not be recovered safely"):
+        cli_module._recover_stale_candidate_transaction(tmp_path)  # noqa: SLF001
+
+    assert json.loads(path.read_text()) == foreign
+    assert marker.exists()
 
 
 def test_post_unlink_error_is_reported_after_bundle_commit_without_false_rollback(
@@ -917,6 +958,7 @@ def test_post_unlink_error_is_reported_after_bundle_commit_without_false_rollbac
         "dataset-plan.json",
         "model-fixture-manifest.json",
         "plan-evidence.json",
+        ".b24api-transaction-bundle.lock",
     }
     assert getattr(captured.value, "__notes__", ()) == ()
 
@@ -1458,6 +1500,44 @@ def test_cli_plan_and_benchmark_are_offline_and_live_writes_are_flag_gated(tmp_p
     cleanup = _run_cli("cleanup", "--artifact-dir", str(artifact_dir), environment=environment)
     assert seed.returncode == cleanup.returncode == ExitCode.INVALID
     assert "requires both --live and --allow-writes" in seed.stderr
+
+
+def test_concurrent_plan_publishers_cannot_rollback_the_committed_bundle(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    commands = [
+        [
+            sys.executable,
+            str(ENTRYPOINT),
+            "plan",
+            "--artifact-dir",
+            str(artifact_dir),
+            "--count",
+            "0",
+            "--run-id",
+            str(uuid.uuid4()),
+            "--lineage-id",
+            str(uuid.uuid4()),
+        ]
+        for _index in range(2)
+    ]
+    processes = [
+        subprocess.Popen(  # noqa: S603 - fixed interpreter and entrypoint
+            command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for command in commands
+    ]
+    results = [process.communicate(timeout=30) for process in processes]
+
+    assert sorted(process.returncode for process in processes) == [ExitCode.COMPLETED, ExitCode.INVALID]
+    assert sum("plan completed" in stdout for stdout, _stderr in results) == 1
+    assert (artifact_dir / "dataset-plan.json").exists()
+    assert (artifact_dir / "plan-evidence.json").exists()
+    assert not tuple(artifact_dir.glob(".b24api-transaction-*.pending"))
+    cli_module._scan_bundle(artifact_dir, expected_candidate_sha=SHA)  # noqa: SLF001
 
 
 def test_every_live_command_refuses_under_ordinary_pytest(tmp_path: Path) -> None:

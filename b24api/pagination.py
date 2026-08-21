@@ -9,11 +9,18 @@ import json
 import sqlite3
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, Self, cast
 
 from b24api.error import CapabilityError, IncompleteTraversalError, PaginationError
-from b24api.execution import ExecutionContext, Executor, WorkClass, await_cancellation_resistant, rearm_cancellation
+from b24api.execution import (
+    ExecutionContext,
+    Executor,
+    WorkClass,
+    await_cancellation_resistant,
+    await_cleanup_resistant,
+    rearm_cancellation,
+)
 from b24api.models import (
     CompletionAssurance,
     ConfirmationPolicy,
@@ -414,18 +421,20 @@ class PaginationDriver:
                     primary_error,
                     asyncio.CancelledError | GeneratorExit,
                 )
-                try:
-                    cleanup_cancellation = await await_cancellation_resistant(outcomes.aclose())
-                except BaseException as cleanup_error:
+                cleanup = await await_cleanup_resistant(outcomes.aclose())
+                if cleanup.error is not None:
+                    cleanup_error = cleanup.error
                     if not preserve_primary:
-                        raise
+                        rearm_cancellation(cleanup.cancellation)
+                        raise cleanup_error
                     if isinstance(cleanup_error, asyncio.CancelledError):
                         pending_cancellation = cleanup_error
-                else:
-                    if cleanup_cancellation is not None and not preserve_primary:
-                        raise cleanup_cancellation
-                    if preserve_primary:
-                        pending_cancellation = cleanup_cancellation
+                    if cleanup.cancellation is not None:
+                        pending_cancellation = cleanup.cancellation
+                elif cleanup.cancellation is not None and not preserve_primary:
+                    raise cleanup.cancellation
+                elif preserve_primary:
+                    pending_cancellation = cleanup.cancellation
                 self.batch_report = outcomes.report
                 rearm_cancellation(pending_cancellation)
             if outcomes.report.state is not TerminalState.COMPLETED:
@@ -1056,37 +1065,51 @@ class ItemStream(AsyncIterator[JsonValue]):
                 primary_error,
                 asyncio.CancelledError | GeneratorExit,
             )
-            try:
-                cleanup_cancellation = await await_cancellation_resistant(self._cleanup_pages(pages))
-            except BaseException as cleanup_error:
+            cleanup = await await_cleanup_resistant(self._cleanup_pages(pages))
+            if cleanup.error is not None:
+                cleanup_error = cleanup.error
                 if preserve_primary:
                     _attach_report(cleanup_error, self.report)
                     if isinstance(cleanup_error, asyncio.CancelledError):
                         pending_cancellation = cleanup_error
-                    cleanup_cancellation = None
-                elif self.report.state is TerminalState.NOT_STARTED:
-                    cancellation = await await_cancellation_resistant(
-                        self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
-                    )
-                    if cancellation is not None:
-                        _attach_report(cancellation, self.report)
-                        raise cancellation from cleanup_error
-                    _attach_report(cleanup_error, self.report)
-                    raise
+                    if cleanup.cancellation is not None:
+                        pending_cancellation = cleanup.cancellation
                 else:
-                    _attach_report(cleanup_error, self.report)
-                    raise
-            if cleanup_cancellation is not None and not preserve_primary:
-                _attach_report(cleanup_cancellation, self.report)
-                raise cleanup_cancellation
-            if cleanup_cancellation is not None and preserve_primary:
-                pending_cancellation = cleanup_cancellation
+                    await self._record_terminal_cleanup_failure(cleanup_error)
+                    rearm_cancellation(cleanup.cancellation)
+                    raise cleanup_error
+            if cleanup.cancellation is not None and not preserve_primary and cleanup.error is None:
+                _attach_report(cleanup.cancellation, self.report)
+                raise cleanup.cancellation
+            if cleanup.cancellation is not None and preserve_primary:
+                pending_cancellation = cleanup.cancellation
             if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
                 await self._finalize(TerminalState.CANCELLED, "stream abandoned")
             if self.report.state is not TerminalState.NOT_STARTED:
                 self._closed = True
             if preserve_primary:
                 rearm_cancellation(pending_cancellation)
+
+    async def _record_terminal_cleanup_failure(self, error: BaseException) -> None:
+        if self.report.state is TerminalState.NOT_STARTED:
+            await self._finalize(TerminalState.FAILED, "stream cleanup failed")
+        violations = self.report.violations
+        if not any(violation.code == "cleanup_failure" for violation in violations):
+            violations = (
+                *violations,
+                Violation(
+                    severity=ViolationSeverity.BLOCKING,
+                    code="cleanup_failure",
+                    message=f"pagination cleanup failed ({type(error).__name__})",
+                ),
+            )
+        self.report = replace(
+            self.report,
+            state=TerminalState.FAILED,
+            terminal_reason="stream cleanup failed",
+            violations=violations,
+        )
+        _attach_report(error, self.report)
 
     async def _cleanup_pages(self, pages: AsyncGenerator[_Page]) -> None:
         await pages.aclose()
