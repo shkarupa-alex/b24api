@@ -287,6 +287,7 @@ def test_live_preflight_rejects_hostile_scope_types(
 @pytest.mark.parametrize(
     "app_result",
     [
+        {"SCOPE": ["task"], "LICENSE": "nfr"},
         {"VERSION": 4},
         {"version": "4"},
         {"VERSION": 4, "BUILD": "26.500.0"},
@@ -310,9 +311,12 @@ def test_live_preflight_never_treats_app_info_fields_as_portal_build(
 @pytest.mark.parametrize(
     "app_result",
     [
+        {"SCOPE": ["task"], "LICENSE": "nfr"},
         {"VERSION": 4},
+        {"version": "4"},
         {"VERSION": 4, "BUILD": "26.500.0"},
         {"BUILD": "26.500.0"},
+        {"build": "26.500.0"},
     ],
 )
 def test_public_main_maps_wire_app_info_without_portal_build_to_unavailable_before_artifacts(
