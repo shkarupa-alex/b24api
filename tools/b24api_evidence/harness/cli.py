@@ -1276,7 +1276,7 @@ def _write_candidate_json(  # noqa: PLR0913 - explicit transaction dependencies
     marker = transaction if transaction is not None else _begin_candidate_transaction(path)
     post_commit_error: BaseException | None = None
     if not owns_transaction:
-        if marker not in _TRANSACTION_LOCKS or not marker.exists():
+        if marker not in _TRANSACTION_LOCKS or not _is_secure_transaction_marker(marker):
             raise ContractError("shared evidence transaction marker is unavailable")
         if rollback_log is None:
             raise ContractError("a shared evidence transaction requires a rollback log")
@@ -1311,7 +1311,7 @@ def _begin_candidate_transaction(path: Path) -> Path:
     marker = artifact_dir / _TRANSACTION_MARKER_NAME
     lock = _acquire_transaction_lock(artifact_dir)
     try:
-        if marker.exists() and not _recover_transaction_marker(marker):
+        if _lexically_exists(marker) and not _recover_transaction_marker(marker):
             raise ContractError(  # noqa: TRY301 - lock cleanup owns this boundary
                 "incomplete evidence transaction could not be recovered safely",
             )
@@ -1323,6 +1323,7 @@ def _begin_candidate_transaction(path: Path) -> Path:
                 "entries": [],
             },
         )
+        _require_secure_transaction_marker(marker)
     except BaseException:
         _release_transaction_lock(lock)
         raise
@@ -1381,7 +1382,7 @@ def _register_transaction_write(
     previous: Mapping[str, Any] | None,
     value: Mapping[str, Any],
 ) -> None:
-    if marker not in _TRANSACTION_LOCKS or not marker.exists():
+    if marker not in _TRANSACTION_LOCKS or not _is_secure_transaction_marker(marker):
         raise ContractError("shared evidence transaction ownership is unavailable")
     payload = read_json_object(marker)
     entries = payload.get("entries")
@@ -1437,6 +1438,35 @@ def _is_secure_transaction_lock(path: Path) -> bool:
     )
 
 
+def _is_secure_transaction_marker(path: Path) -> bool:
+    """Accept only the exact regular, private, single-link transaction journal."""
+    if path.name != _TRANSACTION_MARKER_NAME:
+        return False
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1 and stat.S_IMODE(metadata.st_mode) == _OWNER_ONLY_MODE
+    )
+
+
+def _lexically_exists(path: Path) -> bool:
+    """Test directory-entry presence without following a final symlink."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ContractError(f"cannot inspect evidence transaction path: {path.name}") from error
+    return True
+
+
+def _require_secure_transaction_marker(path: Path) -> None:
+    if not _is_secure_transaction_marker(path):
+        raise ContractError("evidence transaction marker identity is unsafe")
+
+
 def _validate_open_transaction_lock(opened: os.stat_result, current: os.stat_result) -> None:
     if (
         not stat.S_ISREG(opened.st_mode)
@@ -1451,7 +1481,7 @@ def _recover_transaction_marker(  # noqa: C901, PLR0911, PLR0912 - explicit fail
     marker: Path,
 ) -> bool:
     try:
-        if marker.is_symlink():
+        if not _is_secure_transaction_marker(marker):
             return False
         payload = read_json_object(marker)
         entries = payload.get("entries")
@@ -1504,7 +1534,7 @@ def _recover_stale_candidate_transaction(artifact_dir: Path) -> None:
     lock = _acquire_transaction_lock(artifact_dir)
     marker = artifact_dir / _TRANSACTION_MARKER_NAME
     try:
-        if marker.exists() and not _recover_transaction_marker(marker):
+        if _lexically_exists(marker) and not _recover_transaction_marker(marker):
             raise ContractError("incomplete evidence transaction could not be recovered safely")
     finally:
         _release_transaction_lock(lock)
@@ -1515,13 +1545,20 @@ def _unlink_with_outcome(path: Path) -> BaseException | None:
     try:
         path.unlink()
     except BaseException as error:
-        if path.exists():
-            raise
-        return error
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return error
+        except OSError:
+            raise error from None
+        raise
     return None
 
 
 def _commit_candidate_transaction(marker: Path) -> BaseException | None:
+    if marker not in _TRANSACTION_LOCKS or not _is_secure_transaction_marker(marker):
+        _finish_transaction_lock(marker)
+        raise ContractError("evidence transaction marker identity is unsafe")
     error = _unlink_with_outcome(marker)
     _finish_transaction_lock(marker)
     return error
@@ -2073,12 +2110,12 @@ def _scan_bundle(  # noqa: C901, PLR0912, PLR0915
     artifact_paths: list[Path] = []
     total_bytes = 0
     for path in artifact_dir.rglob("*"):
+        if path.name.startswith(_TRANSACTION_MARKER_PREFIX) and path.name.endswith(_TRANSACTION_MARKER_SUFFIX):
+            if active_transaction is not None and path == active_transaction and _is_secure_transaction_marker(path):
+                continue
+            raise ContractError("evidence bundle contains an incomplete publication transaction")
         if not path.is_file():
             continue
-        if active_transaction is not None and path == active_transaction:
-            continue
-        if path.name.startswith(_TRANSACTION_MARKER_PREFIX) and path.name.endswith(_TRANSACTION_MARKER_SUFFIX):
-            raise ContractError("evidence bundle contains an incomplete publication transaction")
         artifact_paths.append(path)
         if len(artifact_paths) > _MAX_BUNDLE_FILES:
             raise ContractError("evidence bundle exceeds the reviewed file-count ceiling")

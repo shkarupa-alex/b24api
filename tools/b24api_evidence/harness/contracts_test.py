@@ -1069,6 +1069,41 @@ def test_stale_transaction_refuses_a_symlinked_journal_path(tmp_path: Path) -> N
     assert marker.exists()
 
 
+@pytest.mark.parametrize("target_is_directory", [False, True])
+def test_dangling_or_directory_marker_symlink_is_always_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    target_is_directory: bool,
+) -> None:
+    marker = tmp_path / ".b24api-transaction-bundle.pending"
+    target = tmp_path / "caller-target"
+    if target_is_directory:
+        target.mkdir()
+    else:
+        target = tmp_path / "missing-caller-target"
+    marker.symlink_to(target, target_is_directory=target_is_directory)
+
+    with pytest.raises(ContractError, match="could not be recovered safely"):
+        cli_module._recover_stale_candidate_transaction(tmp_path)  # noqa: SLF001
+
+    assert marker.is_symlink()
+    monkeypatch.setattr(cli_module, "require_clean_tracked_tree", lambda _root: None)
+    with pytest.raises(ContractError, match="incomplete publication transaction"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001
+    assert marker.is_symlink()
+
+
+def test_begin_never_replaces_a_dangling_marker_symlink(tmp_path: Path) -> None:
+    marker = tmp_path / ".b24api-transaction-bundle.pending"
+    marker.symlink_to("missing-caller-target")
+
+    with pytest.raises(ContractError, match="could not be recovered safely"):
+        cli_module._begin_candidate_transaction(tmp_path / "bundle")  # noqa: SLF001
+
+    assert marker.is_symlink()
+
+
 def test_post_unlink_error_is_reported_after_bundle_commit_without_false_rollback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1687,6 +1722,37 @@ def test_concurrent_plan_publishers_cannot_rollback_the_committed_bundle(tmp_pat
     assert (artifact_dir / "plan-evidence.json").exists()
     assert not tuple(artifact_dir.glob(".b24api-transaction-*.pending"))
     cli_module._scan_bundle(artifact_dir, expected_candidate_sha=SHA)  # noqa: SLF001
+
+
+def test_cli_benchmark_refuses_and_preserves_a_dangling_transaction_marker(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    plan = _run_cli(
+        "plan",
+        "--artifact-dir",
+        str(artifact_dir),
+        "--count",
+        "0",
+        "--run-id",
+        RUN_ID,
+        "--lineage-id",
+        LINEAGE_ID,
+    )
+    assert plan.returncode == ExitCode.COMPLETED
+    marker = artifact_dir / ".b24api-transaction-bundle.pending"
+    marker.symlink_to("missing-caller-target")
+
+    benchmark = _run_cli(
+        "benchmark",
+        "--artifact-dir",
+        str(artifact_dir),
+        "--plan",
+        str(artifact_dir / "dataset-plan.json"),
+    )
+
+    assert benchmark.returncode == ExitCode.INVALID
+    assert "could not be recovered safely" in benchmark.stderr
+    assert marker.is_symlink()
+    assert not (artifact_dir / "benchmark-evidence.json").exists()
 
 
 def test_every_live_command_refuses_under_ordinary_pytest(tmp_path: Path) -> None:
