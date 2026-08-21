@@ -1268,6 +1268,7 @@ def _write_candidate_json(
 
 def _begin_candidate_transaction(path: Path) -> Path:
     """Claim one exact same-directory transaction marker before publication."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     for _attempt in range(10):
         marker = path.with_name(
             f"{_TRANSACTION_MARKER_PREFIX}{uuid.uuid4().hex}{_TRANSACTION_MARKER_SUFFIX}",
