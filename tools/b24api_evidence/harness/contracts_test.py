@@ -27,6 +27,7 @@ from .contracts import (
     FINGERPRINT_KEY_FORMAT,
     FIXED_1X_SHA,
     INSTRUMENTATION_REVIEW_SHA,
+    NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT,
     ORIGINAL_HEAD_SHA,
     REVIEWED_MAX_ENTITIES_PER_CELL,
     REVIEWED_PROFILE_SET_ID,
@@ -1692,6 +1693,29 @@ def test_exact_model_matrix_covers_all_scales_and_expected_mutation() -> None:
     portal = DeterministicPortal(mutation)
     snapshots = [portal.oracle_snapshot() for _ in range(EXPECTED_MUTATION_RETRIES + 1)]
     assert len(set(snapshots)) == EXPECTED_MUTATION_RETRIES + 1
+
+
+def test_deterministic_admission_proves_small_parity_and_large_benefit() -> None:
+    plan = _plan(count=0)
+    benchmark_plan = cli_module._admission_model_benchmark_plan(plan)  # noqa: SLF001
+    validate_benchmark_plan(benchmark_plan)
+    runs = tuple(
+        run for _pair in range(benchmark_plan["controls"]["blocking_pairs"]) for run in run_exact_matrix_sync()
+    )
+
+    summary = cli_module._deterministic_performance_summary(  # noqa: SLF001
+        runs,
+        benchmark_plan=benchmark_plan,
+    )
+
+    assert benchmark_plan["admission_state"] == "admission_ready"
+    assert summary["admission_passed"] is True
+    assert all(summary["gates"].values())
+    by_case = {case["case_id"]: case for case in summary["cases"]}
+    assert by_case["nineteen"]["median_wall_ratio"] == 1.0
+    assert by_case["dense-10k"]["median_improvement"] >= NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT
+    assert by_case["uniform-sparse-10k"]["median_improvement"] >= NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT
+    assert by_case["clustered-sparse-10k"]["median_improvement"] >= NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT
 
 
 def test_schema_documents_are_finite_draft_2020_12_objects() -> None:
