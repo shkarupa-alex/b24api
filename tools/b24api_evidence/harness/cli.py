@@ -2401,7 +2401,7 @@ def _scan_bundle(  # noqa: C901, PLR0912, PLR0915
         require_clean_tracked_tree(ROOT)
 
 
-def _validate_benchmark_pass_dependencies(  # noqa: C901
+def _validate_benchmark_pass_dependencies(  # noqa: C901, PLR0912
     artifact: Mapping[str, Any],
     *,
     json_documents: Mapping[str, list[tuple[Path, dict[str, Any]]]],
@@ -2414,8 +2414,6 @@ def _validate_benchmark_pass_dependencies(  # noqa: C901
         raise ContractError("benchmark PASS has no immutable benchmark plan")
     benchmark_plan = plan_documents[0][1]
     validate_benchmark_plan(benchmark_plan)
-    if benchmark_plan["admission_state"] != "draft":
-        raise ContractError("model benchmark PASS requires its exact draft benchmark plan")
     _require_exact_model_benchmark_plan(benchmark_plan)
     if (
         benchmark_plan["candidate_sha"] != artifact["candidate_sha"]
@@ -2433,10 +2431,23 @@ def _validate_benchmark_pass_dependencies(  # noqa: C901
         raise ContractError("benchmark PASS has no exact immutable model fixture manifest")
 
     referenced_hashes = {reference.removeprefix("sha256:") for reference in artifact["evidence_refs"]}
-    matrix_hashes = referenced_hashes - qualified_oracles.keys()
-    if len(matrix_hashes) != 1:
-        raise ContractError("benchmark PASS requires exactly one stable model-matrix dependency")
+    non_oracle_hashes = referenced_hashes - qualified_oracles.keys()
+    matrix_hashes = {
+        value
+        for value in non_oracle_hashes
+        if any(path.name == "model-matrix.json" for path, _document in json_documents.get(value, []))
+    }
+    performance_hashes = {
+        value
+        for value in non_oracle_hashes
+        if any(path.name == "performance-summary.json" for path, _document in json_documents.get(value, []))
+    }
+    if len(matrix_hashes) != 1 or len(performance_hashes) != 1:
+        raise ContractError("benchmark PASS requires exact model-matrix and performance-summary dependencies")
     matrix_hash = next(iter(matrix_hashes))
+    performance_hash = next(iter(performance_hashes))
+    if non_oracle_hashes != {matrix_hash, performance_hash}:
+        raise ContractError("benchmark PASS contains an unsupported non-oracle dependency")
     matrix_candidates = [
         document for path, document in json_documents.get(matrix_hash, []) if path.name == "model-matrix.json"
     ]
@@ -2471,6 +2482,22 @@ def _validate_benchmark_pass_dependencies(  # noqa: C901
             raise ContractError("benchmark model matrix lineage does not match its PASS artifact")
     if matrix["benchmark_plan_content_hash"] != benchmark_plan_hash:
         raise ContractError("benchmark model matrix does not match its benchmark plan")
+    performance_candidates = [
+        document
+        for path, document in json_documents.get(performance_hash, [])
+        if path.name == "performance-summary.json"
+    ]
+    if len(performance_candidates) != 1:
+        raise ContractError("benchmark PASS performance hash does not resolve to performance-summary.json")
+    run_count = (
+        int(benchmark_plan["controls"]["blocking_pairs"])
+        if benchmark_plan["admission_state"] == "admission_ready"
+        else int(benchmark_plan["controls"]["advisory_runs"])
+    )
+    reference_runs = tuple(run for _ in range(run_count) for run in run_exact_matrix_sync())
+    expected_performance = _deterministic_performance_summary(reference_runs, benchmark_plan=benchmark_plan)
+    if performance_candidates[0] != expected_performance or expected_performance["admission_passed"] is not True:
+        raise ContractError("benchmark PASS performance summary does not satisfy its exact deterministic gate")
     observations = matrix["runs"]
     if not isinstance(observations, list):
         raise ContractError("benchmark model matrix runs must be a list")
@@ -2479,26 +2506,35 @@ def _validate_benchmark_pass_dependencies(  # noqa: C901
         artifact=artifact,
         referenced_hashes=referenced_hashes,
         matrix_hash=matrix_hash,
+        performance_hash=performance_hash,
         qualified_oracles=qualified_oracles,
+        benchmark_plan=benchmark_plan,
     )
 
 
-def _validate_model_observations(
+def _validate_model_observations(  # noqa: PLR0913
     observations: list[Any],
     *,
     artifact: Mapping[str, Any],
     referenced_hashes: set[str],
     matrix_hash: str,
+    performance_hash: str,
     qualified_oracles: Mapping[str, dict[str, Any]],
+    benchmark_plan: Mapping[str, Any],
 ) -> None:
     """Enforce the exact deterministic stable-run set and recompute parent metrics."""
     cases = {case.case_id: case for case in exact_model_cases() if not case.mutation}
     reference_runs = {(run.case_id, run.plan): run for run in run_exact_matrix_sync() if run.outcome == "PASS"}
+    run_count = (
+        int(benchmark_plan["controls"]["blocking_pairs"])
+        if benchmark_plan["admission_state"] == "admission_ready"
+        else int(benchmark_plan["controls"]["advisory_runs"])
+    )
     expected_keys = {
         (iteration, case_id, plan)
-        for iteration in range(1, _MODEL_ADVISORY_RUNS + 1)
+        for iteration in range(1, run_count + 1)
         for case_id in cases
-        for plan in ("offset", "keyset")
+        for plan in ("offset", "keyset", "counted_batch")
     }
     run_fields = {
         "iteration",
@@ -2511,6 +2547,8 @@ def _validate_model_observations(
         "post_hash",
         "requests",
         "logical_pages",
+        "batch_requests",
+        "batch_commands",
         "operating_seconds",
         "time_to_first_row_seconds",
         "wall_seconds",
@@ -2565,6 +2603,8 @@ def _validate_model_observations(
         if (
             observation["requests"] != reference_run.requests
             or observation["logical_pages"] != reference_run.logical_pages
+            or observation["batch_requests"] != reference_run.batch_requests
+            or observation["batch_commands"] != reference_run.batch_commands
             or observation["buffered_rows_high_water"] != reference_run.buffered_rows_high_water
             or not math.isclose(
                 float(observation["operating_seconds"]),
@@ -2585,8 +2625,10 @@ def _validate_model_observations(
         required_oracle_hashes.add(oracle_hash)
     if len(observations) != len(expected_keys) or observed_keys != expected_keys:
         raise ContractError("benchmark PASS does not contain the exact stable model run set")
-    if referenced_hashes != required_oracle_hashes | {matrix_hash}:
-        raise ContractError("benchmark PASS references do not equal its exact matrix and oracle set")
+    if referenced_hashes != required_oracle_hashes | {matrix_hash, performance_hash}:
+        raise ContractError(
+            "benchmark PASS references do not equal its exact matrix, performance summary, and oracle set",
+        )
     _validate_benchmark_metric_algebra(observations, artifact)
 
 
