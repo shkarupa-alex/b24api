@@ -181,10 +181,14 @@ def content_sha256(value: Any) -> str:
 
 
 def reviewed_dataset_plan_sha256(plan: Mapping[str, Any]) -> str:
-    """Hash a plan review subject without its circular review-commit pointer."""
+    """Hash a plan review subject without post-decision approval metadata."""
     projected = dict(plan)
     authorization = _mapping(projected.get("authorization"), "authorization")
-    projected["authorization"] = {**authorization, "plan_review_sha": None}
+    projected["authorization"] = {
+        **authorization,
+        "approved_at": None,
+        "plan_review_sha": None,
+    }
     return content_sha256(projected)
 
 

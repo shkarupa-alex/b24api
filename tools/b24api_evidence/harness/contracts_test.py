@@ -186,6 +186,24 @@ def _approval_arguments(plan: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def test_reviewed_plan_hash_excludes_only_post_decision_approval_metadata() -> None:
+    plan = _approved_live_plan()
+    reviewed_hash = reviewed_dataset_plan_sha256(plan)
+    full_hash = content_sha256(plan)
+
+    recorded_later = copy.deepcopy(plan)
+    recorded_later["authorization"].update(
+        approved_at="2026-08-21T00:00:00+00:00",
+        plan_review_sha="f" * 40,
+    )
+    assert reviewed_dataset_plan_sha256(recorded_later) == reviewed_hash
+    assert content_sha256(recorded_later) != full_hash
+
+    expanded = copy.deepcopy(recorded_later)
+    expanded["authorization"]["max_entities_per_cell"] = 2
+    assert reviewed_dataset_plan_sha256(expanded) != reviewed_hash
+
+
 def test_approved_plan_self_claims_do_not_authorize_live_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -257,6 +275,8 @@ def test_approved_plan_self_claims_do_not_authorize_live_writes(
         text=True,
     ).stdout.strip()
     plan["authorization"]["plan_review_sha"] = review_sha
+    assert reviewed_dataset_plan_sha256(plan) == trailer_hash
+    plan["authorization"]["approved_at"] = "2026-08-21T00:00:00+00:00"
     assert reviewed_dataset_plan_sha256(plan) == trailer_hash
     cli_module._require_approved_plan(  # noqa: SLF001
         plan,
@@ -1957,6 +1977,16 @@ def test_live_plan_persists_optional_portal_build_and_identity(
     assert plan["portal"]["host"] == "portal.invalid"
     assert plan["portal"]["fingerprint"] == SHA256
     assert plan["portal"]["build"] == expected_build
+    assert plan["estimated"] == {
+        "entities": 5,
+        "relationships": 0,
+        "create_strategy": "direct",
+        "delete_strategy": "direct",
+        "requests": 41,
+        "batch_commands": 0,
+        "duration_seconds": 4.1000000000000005,
+        "quota_impact": 41.0,
+    }
     assert {path.name for path in tmp_path.iterdir()} == {
         ".b24api-transaction-bundle.lock",
         "benchmark-plan.json",

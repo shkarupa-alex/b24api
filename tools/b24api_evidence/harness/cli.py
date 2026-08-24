@@ -202,7 +202,10 @@ def _plan(args: argparse.Namespace) -> ExitCode:
         "delete_method": profile["delete_method"],
         "required_scopes": profile["required_scopes"],
     }
-    requests = args.count * 5 + 4 if args.count else 0
+    # Nominal full lifecycle: seed (2 + 2N), independent verify (2 + 2N),
+    # and manifest-owned cleanup (2 + 3N). Retry/ambiguity paths can only
+    # increase the recorded actual count.
+    requests = args.count * 7 + 6 if args.count else 0
     dataset_plan = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,

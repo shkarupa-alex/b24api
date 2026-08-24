@@ -10,7 +10,7 @@ includes only `b24api*`. The normative entry point remains
 |---|---|
 | Pin disposable entity allowlist by ID and reviewed content hash. | Runtime and dataset schema require `w0-disposable-entities-v1` plus `425cdca3...b754`; edited allowlists fail before plan/live setup. |
 | Prevent plan-self-raised scale. | Reviewed constants cap the whole plan at 500 entities, each cell at 500, and the plan at two unique disposable profiles/cells; schema and semantic validation enforce every ceiling plus any lower plan ceiling. |
-| Conservative non-empty estimates. | The direct lifecycle model requires positive finite duration/quota, zero batch commands, and at least `5 * entities + 4` requests for preflight, create/read-back, pre-delete ownership read, delete, and absence verification. |
+| Conservative non-empty estimates. | Generated direct plans report the complete nominal seed/verify/cleanup lifecycle as `7 * entities + 6` requests: two preflight calls per command, create/read-back, two independent verification reads, and ownership-read/delete/absence-read. Retry and ambiguity paths can only increase recorded actuals. Validation retains `5 * entities + 4` as the minimum acceptable legacy-plan floor. |
 | Bind marker hash/value/correlation. | Marker is exactly `<namespace>:<sha256(run, cell, index)>`; `marker_hash` is SHA-256 over UTF-8 marker bytes. Both are verified on every manifest read/append. |
 | Frozen and independent PASS snapshot hashes. | Oracle schema/validator require verified state and equal non-null pre/post SHA-256 values. Persistent changed state after three tries is only `INCONCLUSIVE`. |
 | Every PASS rejects blocking violations; cleanup proves absence. | Artifact schema and semantic validator apply the blocking rule to every command. Cleanup metrics are closed and require `orphan_count == 0` plus `absence_verified == true`. |
@@ -70,6 +70,16 @@ plan. The first invocation writes only a preview. A second explicit
 `--confirm-recovery` must bind the exact preview file SHA-256 and writes a
 candidate manifest only when a fresh exact-marker scan has the same candidate
 set; recovery itself never deletes.
+
+Human plan review hashes the complete proposed authorization while projecting
+both post-decision fields, `approved_at` and the circular `plan_review_sha`, to
+null. The review commit therefore binds run, lineage, portal identity, cells,
+the lower operational entity ceiling, and every other executable field without
+claiming that approval has already occurred. After the explicit human response,
+the harness operator records that response time and review commit in the final
+schema-valid plan. Its full-content SHA-256 is then supplied separately to the
+write command as an execution confirmation; it is not represented as a value
+the reviewer saw before deciding.
 
 ## Offline evidence and live boundary
 
