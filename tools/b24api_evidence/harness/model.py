@@ -5,6 +5,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl
 
 from b24api.execution import Executor, Transport, WireResponse
 from b24api.models import (
@@ -19,8 +20,9 @@ from b24api.models import (
     ResultSelector,
     TotalSemantics,
 )
-from b24api.pagination import iter_list
+from b24api.pagination import PaginationDriver, iter_list
 from b24api.plans import (
+    CountedOffsetPlan,
     KeysetPlan,
     KeysetTerminalRule,
     OffsetContinuation,
@@ -64,6 +66,8 @@ class ModelRun:
     post_hash: str
     requests: int
     logical_pages: int
+    batch_requests: int
+    batch_commands: int
     operating_seconds: float
     time_to_first_row_seconds: float | None
     wall_seconds: float
@@ -101,6 +105,7 @@ class DeterministicPortal(Transport):
         """Initialize instance state."""
         self.case = case
         self.requests = 0
+        self.logical_pages = 0
         self.operating_seconds = 0.0
         self._identities = list(case.identities)
         self._oracle_reads = 0
@@ -114,12 +119,25 @@ class DeterministicPortal(Transport):
 
     async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
         """Send one transport request attempt."""
-        if request.method != MODEL_METHOD:
-            raise AssertionError(f"unexpected model method: {request.method}")
         if attempt_timeout <= 0:
             raise AssertionError("model received an invalid attempt timeout")
         self.requests += 1
-        parameters = request.copy_parameters()
+        if request.method == MODEL_METHOD:
+            envelope = self._page_envelope(request.copy_parameters())
+            self.logical_pages += 1
+            self.operating_seconds += MODEL_REQUEST_SECONDS
+        elif request.method == "batch":
+            envelope = self._batch_envelope(request.copy_parameters())
+        else:
+            raise AssertionError(f"unexpected model method: {request.method}")
+        return WireResponse(
+            status_code=200,
+            headers=(("content-type", "application/json"), ("x-request-id", f"model-{self.requests}")),
+            body=json.dumps(envelope, separators=(",", ":")).encode(),
+        )
+
+    def _page_envelope(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        """Return one deterministic list response without charging a physical request."""
         limit = _positive_integer(parameters.get("LIMIT", PAGE_SIZE), "LIMIT")
         identities = tuple(self._identities)
         filter_value = parameters.get("filter", {})
@@ -138,19 +156,53 @@ class DeterministicPortal(Transport):
             offset = 0 if start == -1 else _nonnegative_integer(start, "start")
         page_ids = selected[offset : offset + limit]
         next_offset = offset + len(page_ids)
-        result: dict[str, Any] = {
+        envelope: dict[str, Any] = {
             "result": [{"ID": value} for value in page_ids],
             "total": len(identities),
             "time": {"duration": MODEL_REQUEST_SECONDS * 2, "operating": MODEL_REQUEST_SECONDS},
         }
         if after is None and next_offset < len(selected):
-            result["next"] = next_offset
-        self.operating_seconds += MODEL_REQUEST_SECONDS
-        return WireResponse(
-            status_code=200,
-            headers=(("content-type", "application/json"), ("x-request-id", f"model-{self.requests}")),
-            body=json.dumps(result, separators=(",", ":")).encode(),
-        )
+            envelope["next"] = next_offset
+        return envelope
+
+    def _batch_envelope(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        """Execute the exact Bitrix batch shape used by counted traversal."""
+        commands = parameters.get("cmd")
+        if not isinstance(commands, dict) or not commands:
+            raise AssertionError("model batch requires a non-empty command map")
+        results: dict[str, Any] = {}
+        totals: dict[str, int] = {}
+        continuations: dict[str, int] = {}
+        result_times: dict[str, dict[str, float]] = {}
+        for key, encoded in commands.items():
+            if not isinstance(key, str) or not isinstance(encoded, str):
+                raise TypeError("model batch command is malformed")
+            method, separator, query = encoded.partition("?")
+            if method != MODEL_METHOD:
+                raise AssertionError(f"unexpected model batch method: {method}")
+            command_parameters = _flat_command_parameters(query if separator else "")
+            command = self._page_envelope(command_parameters)
+            results[key] = command["result"]
+            totals[key] = int(command["total"])
+            if "next" in command:
+                continuations[key] = int(command["next"])
+            result_times[key] = {"duration": MODEL_REQUEST_SECONDS * 2, "operating": MODEL_REQUEST_SECONDS}
+        command_count = len(commands)
+        self.logical_pages += command_count
+        self.operating_seconds += MODEL_REQUEST_SECONDS * command_count
+        return {
+            "result": {
+                "result": results,
+                "result_error": {},
+                "result_total": totals,
+                "result_next": continuations,
+                "result_time": result_times,
+            },
+            "time": {
+                "duration": MODEL_REQUEST_SECONDS * command_count * 2,
+                "operating": MODEL_REQUEST_SECONDS * command_count,
+            },
+        }
 
 
 async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
@@ -164,6 +216,8 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
         coercion=IdentityCoercion.EXACT_INTEGER,
     )
     plan: OffsetSequentialPlan | KeysetPlan
+    if plan_name == "counted_batch":
+        return await _run_counted_batch_case(case, portal=portal, executor=executor, identity=identity)
     if plan_name == "offset":
         plan = OffsetSequentialPlan(
             limit_path=None,
@@ -232,6 +286,8 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
         post_hash=post_hash,
         requests=report.physical_requests,
         logical_pages=report.logical_pages,
+        batch_requests=report.batch_requests,
+        batch_commands=report.batch_commands,
         operating_seconds=portal.operating_seconds,
         time_to_first_row_seconds=MODEL_REQUEST_SECONDS if identities else None,
         wall_seconds=portal.operating_seconds,
@@ -246,7 +302,7 @@ async def run_exact_matrix() -> tuple[ModelRun, ...]:
     """Run both admitted baseline plans over the full deterministic matrix."""
     runs: list[ModelRun] = []
     for case in exact_model_cases():
-        for plan_name in ("offset", "keyset"):
+        for plan_name in ("offset", "keyset", "counted_batch"):
             run = await run_model_case(case, plan_name=plan_name)
             if not case.mutation and (run.identities != case.identities or run.actual_hash != run.expected_hash):
                 raise AssertionError(f"model correctness failure in {case.case_id}/{plan_name}")
@@ -257,6 +313,87 @@ async def run_exact_matrix() -> tuple[ModelRun, ...]:
 def run_exact_matrix_sync() -> tuple[ModelRun, ...]:
     """Synchronous CLI bridge for the deterministic matrix."""
     return asyncio.run(run_exact_matrix())
+
+
+async def _run_counted_batch_case(
+    case: ModelCase,
+    *,
+    portal: DeterministicPortal,
+    executor: Executor,
+    identity: IdentitySpec,
+) -> ModelRun:
+    """Exercise the production validated head-plus-batched-tail driver."""
+    plan = CountedOffsetPlan(
+        identity_requirement=IdentityRequirement.REQUIRED,
+        order_semantics=OrderSemantics.ASCENDING,
+        duplicate_policy=DuplicatePolicy.ERROR,
+        total_semantics=TotalSemantics.FILTERED_EXACT,
+    )
+    policy = ExecutionPolicy(
+        max_requests=1_000,
+        max_pages=1_000,
+        max_elapsed=120,
+        max_buffered_rows=2_500,
+        max_tracked_identities=20_000,
+    )
+    context = executor.context(policy)
+    driver = PaginationDriver(
+        executor,
+        Request(MODEL_METHOD, replay_safety=ReplaySafety.SAFE),
+        plan,
+        selector=ResultSelector.root(),
+        identity=identity,
+        context=context,
+        page_cap_hint=PAGE_SIZE,
+    )
+    pre_hash = portal.oracle_snapshot()
+    rows: list[dict[str, Any]] = []
+    async for page in driver.counted_batch_pages(batch_size=50, page_size=PAGE_SIZE):
+        for item in page.items:
+            if not isinstance(item, dict) or not isinstance(item.get("ID"), int):
+                raise TypeError("model counted traversal emitted malformed row")
+            rows.append(item)
+    snapshot = await context.snapshot()
+    identities = tuple(int(row["ID"]) for row in rows)
+    actual_hash = content_sha256(list(identities))
+    post_hash = portal.oracle_snapshot()
+    mutation_retries = 0
+    while pre_hash != post_hash and mutation_retries < MAX_MUTATION_RETRIES:
+        mutation_retries += 1
+        pre_hash = post_hash
+        post_hash = portal.oracle_snapshot()
+    snapshot_state = "changed" if pre_hash != post_hash else "verified"
+    outcome = "INCONCLUSIVE" if case.mutation else "PASS"
+    return ModelRun(
+        case_id=case.case_id,
+        plan="counted_batch",
+        identities=identities,
+        expected_hash=case.expected_hash,
+        actual_hash=actual_hash,
+        pre_hash=pre_hash,
+        post_hash=post_hash,
+        mutation_retries=mutation_retries,
+        requests=portal.requests,
+        logical_pages=portal.logical_pages,
+        batch_requests=driver.batch_report.batch_requests if driver.batch_report is not None else 0,
+        batch_commands=driver.batch_report.batch_commands if driver.batch_report is not None else 0,
+        operating_seconds=portal.operating_seconds,
+        time_to_first_row_seconds=MODEL_REQUEST_SECONDS if identities else None,
+        wall_seconds=portal.requests * MODEL_REQUEST_SECONDS,
+        buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
+        outcome=outcome,
+        snapshot_state=snapshot_state,
+    )
+
+
+def _flat_command_parameters(query: str) -> dict[str, Any]:
+    """Decode the scalar controls emitted by the counted model batch."""
+    parameters: dict[str, Any] = {}
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        if key not in {"start", "LIMIT"}:
+            raise AssertionError(f"unexpected counted model control: {key}")
+        parameters[key] = int(value)
+    return parameters
 
 
 def _positive_integer(value: object, field: str) -> int:

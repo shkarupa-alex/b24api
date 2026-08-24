@@ -80,6 +80,9 @@ FINGERPRINT_KEY_BYTES = 32
 LARGE_CASE_ROWS = 10_000
 SPARSE_BASE_MINIMUM = 100_000
 EXPECTED_MUTATION_RETRIES = 3
+EXPECTED_DENSE_BATCH_PHYSICAL_REQUESTS = 5
+EXPECTED_DENSE_BATCH_REQUESTS = 4
+EXPECTED_DENSE_BATCH_COMMANDS = 199
 EXPECTED_STABLE_MODEL_RUNS = 90
 EXPECTED_BENCHMARK_REFS = EXPECTED_STABLE_MODEL_RUNS + 1
 EXPECTED_SCHEMA_COUNT = 6
@@ -1672,12 +1675,19 @@ def test_exact_model_matrix_covers_all_scales_and_expected_mutation() -> None:
     }
     assert any(len(case.identities) == LARGE_CASE_ROWS and case.base_count > SPARSE_BASE_MINIMUM for case in cases)
     runs = run_exact_matrix_sync()
-    assert len(runs) == len(cases) * 2
+    assert len(runs) == len(cases) * 3
     assert all(run.actual_hash == run.expected_hash for run in runs)
     assert {run.outcome for run in runs if run.case_id == "mutation"} == {"INCONCLUSIVE"}
     assert all(run.pre_hash != run.post_hash for run in runs if run.case_id == "mutation")
     assert all(run.pre_hash == run.post_hash for run in runs if run.case_id != "mutation")
     assert all(run.mutation_retries == EXPECTED_MUTATION_RETRIES for run in runs if run.case_id == "mutation")
+    large = [run for run in runs if run.case_id == "dense-10k"]
+    counted = next(run for run in large if run.plan == "counted_batch")
+    offset = next(run for run in large if run.plan == "offset")
+    assert counted.requests == EXPECTED_DENSE_BATCH_PHYSICAL_REQUESTS
+    assert counted.batch_requests == EXPECTED_DENSE_BATCH_REQUESTS
+    assert counted.batch_commands == EXPECTED_DENSE_BATCH_COMMANDS
+    assert counted.requests < offset.requests
     mutation = next(case for case in cases if case.mutation)
     portal = DeterministicPortal(mutation)
     snapshots = [portal.oracle_snapshot() for _ in range(EXPECTED_MUTATION_RETRIES + 1)]

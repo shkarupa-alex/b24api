@@ -631,9 +631,9 @@ def _require_exact_model_benchmark_plan(benchmark_plan: Mapping[str, Any]) -> No
         not isinstance(cases, list)
         or len(cases) != 1
         or cases[0].get("id") != "MODEL-MATRIX"
-        or cases[0].get("compared_plans") != ["offset", "keyset"]
+        or cases[0].get("compared_plans") != ["offset", "keyset", "counted_batch"]
     ):
-        raise ContractError("the deterministic runner accepts only its exact MODEL-MATRIX offset/keyset draft")
+        raise ContractError("the deterministic runner accepts only its exact MODEL-MATRIX traversal draft")
     controls_config = benchmark_plan["controls"]
     if (
         controls_config["warmups"] != _MODEL_WARMUPS
@@ -694,6 +694,8 @@ def _benchmark_runs_and_artifact_inner(  # noqa: PLR0913 - explicit transaction 
     rows = sum(len(run.identities) for run in stable_runs)
     requests = sum(run.requests for run in stable_runs)
     logical_pages = sum(run.logical_pages for run in stable_runs)
+    batch_requests = sum(run.batch_requests for run in stable_runs)
+    batch_commands = sum(run.batch_commands for run in stable_runs)
     stable_offset = [run for run in stable_runs if run.plan == "offset"]
     stable_keyset = [run for run in stable_runs if run.plan == "keyset"]
     matrix_width = len(runs) // int(controls_config["advisory_runs"])
@@ -711,8 +713,8 @@ def _benchmark_runs_and_artifact_inner(  # noqa: PLR0913 - explicit transaction 
         "kind": "benchmark",
         "http_attempts": requests,
         "logical_pages": logical_pages,
-        "batch_requests": 0,
-        "batch_commands": 0,
+        "batch_requests": batch_requests,
+        "batch_commands": batch_commands,
         "time_to_first_row_seconds": min(
             run.time_to_first_row_seconds for run in stable_runs if run.time_to_first_row_seconds is not None
         ),
@@ -1758,7 +1760,7 @@ def _default_benchmark_plan(dataset_plan: Mapping[str, Any]) -> dict[str, Any]:
         "cases": [
             {
                 "id": "MODEL-MATRIX",
-                "compared_plans": ["offset", "keyset"],
+                "compared_plans": ["offset", "keyset", "counted_batch"],
                 "benefit_gate": {
                     "blocking": False,
                     "minimum_median_improvement": NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT,
