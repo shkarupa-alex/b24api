@@ -84,8 +84,10 @@ EXPECTED_MUTATION_RETRIES = 3
 EXPECTED_DENSE_BATCH_PHYSICAL_REQUESTS = 5
 EXPECTED_DENSE_BATCH_REQUESTS = 4
 EXPECTED_DENSE_BATCH_COMMANDS = 199
-EXPECTED_STABLE_MODEL_RUNS = 150
+EXPECTED_STABLE_MODEL_RUNS = 135
 EXPECTED_BENCHMARK_REFS = EXPECTED_STABLE_MODEL_RUNS + 2
+EXPECTED_ADMISSION_ORACLES = 270
+EXPECTED_ADMISSION_REFS = 245
 EXPECTED_SCHEMA_COUNT = 6
 SECOND_CALL = 2
 BUNDLE_OVERFLOW_FILES = 513
@@ -1718,6 +1720,19 @@ def test_deterministic_admission_proves_small_parity_and_large_benefit() -> None
     assert by_case["clustered-sparse-10k"]["median_improvement"] >= NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT
 
 
+def test_public_admission_ready_benchmark_publishes_a_scannable_blocking_result(tmp_path: Path) -> None:
+    result = _run_cli("benchmark", "--admission-ready", "--artifact-dir", str(tmp_path))
+    assert result.returncode == ExitCode.COMPLETED, result.stderr
+    artifact = json.loads((tmp_path / "benchmark-evidence.json").read_text())
+    summary = json.loads((tmp_path / "performance-summary.json").read_text())
+    assert artifact["outcome"] == "PASS"
+    assert len(artifact["evidence_refs"]) == EXPECTED_ADMISSION_REFS
+    assert len(list((tmp_path / "model-oracles").glob("*.json"))) == EXPECTED_ADMISSION_ORACLES
+    assert summary["admission_passed"] is True
+    assert all(summary["gates"].values())
+    cli_module._scan_bundle(tmp_path, expected_candidate_sha=SHA)  # noqa: SLF001 - public artifact regression
+
+
 def test_schema_documents_are_finite_draft_2020_12_objects() -> None:
     schema_dir = ROOT / "tools/b24api_evidence/schemas"
     schemas = sorted(schema_dir.glob("*.schema.json"))
@@ -2274,8 +2289,8 @@ def test_admission_ready_benchmark_never_runs_the_model_matrix_as_a_substitute(t
         "--benchmark-plan",
         str(benchmark_path),
     )
-    assert result.returncode == ExitCode.UNAVAILABLE
-    assert "admission-ready" in result.stderr
+    assert result.returncode == ExitCode.INVALID
+    assert "exact MODEL-MATRIX" in result.stderr
 
 
 def test_model_benchmark_rejects_run_controls_it_cannot_execute_exactly(tmp_path: Path) -> None:
