@@ -131,7 +131,9 @@ candidate SHA, exact HMAC portal identity, reviewed profile tuple, scope and
 `app.info` preflight. Live verify performs two independent full point-read snapshots and
 quarantines persistent change. Live benchmark currently refuses as unavailable until a reviewed
 live benchmark cell exists; it never falls back to model evidence. No live command has been run in
-the pre-live candidate.
+the pre-live candidate. The subsequently approved small lifecycle and its
+cleanup recovery are recorded without overclaim in
+`live-dataset-execution-8d76a07.md`.
 
 The leak scanner covers every tracked repository file and every artifact while
 reporting paths only. It narrowly recognizes committed dummy redaction fixtures.

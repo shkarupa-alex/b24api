@@ -51,6 +51,10 @@ legacy imports, and deliberate corrections.
 - Structured Bitrix errors take precedence over generic HTTP status handling;
   impossible status values and malformed response encoding remain correctness
   failures.
+- The observed CRM post-delete absence tuple is admitted only for
+  `crm.deal.get` with HTTP 400, an empty error code, and exact `Not found`
+  description; neighboring methods, statuses, and descriptions remain
+  correctness failures.
 - Stream cleanup preserves the first detected failure and replays genuine
   external cancellation before unrelated subsequent I/O.
 
@@ -63,8 +67,13 @@ legacy imports, and deliberate corrections.
   Live plans record the unknown build as null and bind portal identity to the
   normalized host plus HMAC role/principal fingerprint. Unknown build cannot
   authorize a build-scoped endpoint profile.
-- No live seed/write has yet been performed; the first concrete dataset plan
-  remains behind its separate human approval checkpoint.
+- Two five-entity live plans passed their separate human approval checkpoint.
+  Tasks stopped inconclusive and cleanup proved absence. CRM seed and
+  independent verify passed; its first cleanup exposed a previously unknown
+  absence envelope, after which exact-manifest recovery removed all five deals
+  with zero marker mismatches. The failed cleanup is not reported as an
+  evidence PASS; the complete sanitized record is in
+  `../w9/live-dataset-execution-8d76a07.md`.
 - Large live stress data is not required for the correctness core, and all
   claims depending on unavailable live evidence remain unclaimed.
 - Evidence/seed/cleanup tooling is excluded from the wheel.

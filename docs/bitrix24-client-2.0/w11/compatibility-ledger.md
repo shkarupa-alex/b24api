@@ -114,8 +114,17 @@ The live evidence harness is repository-only and excluded from wheels. Portal
 identity uses the normalized host plus the HMAC role/principal fingerprint.
 The current preflight has no documented exact portal build, so plans preserve
 `portal.build: null`; this does not block correctness evidence, but it keeps all
-build-scoped profiles inapplicable. No dataset has yet been seeded because the
-first concrete plan remains behind its separate human approval checkpoint.
+build-scoped profiles inapplicable.
+
+The first two small live plans passed their separate human approval checkpoint.
+Tasks stopped `INCONCLUSIVE` on one ambiguous create and its harness cleanup
+proved absence with zero orphans. CRM seeded and independently verified five
+exact-marker deals; cleanup exposed the portal's actual post-delete absence
+tuple. An exact-manifest operator recovery removed the remaining four deals
+with zero marker mismatches, and the fixed adapter subsequently classified all
+five IDs absent in read-only live replay. The original CRM run is deliberately
+not represented as a harness cleanup PASS. Full sanitized accounting is in
+`../w9/live-dataset-execution-8d76a07.md`.
 
 No performance regression is accepted by this ledger. Deterministic model
 coverage is a correctness gate, not a live latency claim. W10 supplied no
