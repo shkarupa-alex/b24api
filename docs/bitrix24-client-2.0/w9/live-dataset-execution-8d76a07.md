@@ -82,9 +82,11 @@ remained on the portal.
 
 ## Closure of the observed contract gap
 
-Fix candidate `4d68a266ee1a98b431ce6b32b1a4a58d257533af` recognizes only the exact
-observed empty-code/`Not found` pair as typed absence. Four nearby descriptions
-remain correctness failures. Its full Python 3.14 suite reports 495 passed;
+Fix candidate `10e91a217fd85e597809d3d91146d4a5db5a548c` recognizes only the complete
+observed tuple — `crm.deal.get`, HTTP 400, empty code, and `Not found` — as
+typed absence. Other descriptions, CRM HTTP 200/500, and the same envelope from
+the Tasks method remain correctness failures. Its full Python 3.14 suite
+reports 498 passed;
 Ruff check/format, strict mypy, cumulative diff-check, detached status, and the
 normative spec hash pass.
 
