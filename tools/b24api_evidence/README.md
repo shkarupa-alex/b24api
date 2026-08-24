@@ -20,13 +20,15 @@ are present and `--plan` names a human-approved `approved_for_seed` plan. The
 approval cannot be claimed by the plan alone: each write invocation must also
 repeat its exact external review commit and full plan hash through
 `--confirm-plan-review-sha <sha>` and
-`--confirm-plan-content-sha256 <sha256>`. Both confirmations must match the
-reviewed plan's exact canonical content. The review commit message must contain
+`--confirm-plan-content-sha256 <sha256>`. The first confirmation must match the
+review commit recorded after the human decision; the second must match the
+exact canonical final plan, including that commit and the actual approval
+timestamp. The review commit message must contain
 the trailer `Dataset-Plan-SHA256: <review-subject-sha256>`. The review subject
-is the canonical plan with only its circular `plan_review_sha` pointer replaced
-by `null`; all execution semantics and approval fields remain covered. The
-separate CLI content hash still binds the final executable plan including the
-actual review commit SHA.
+is the canonical proposed plan with the two necessarily post-decision values,
+`approved_at` and the circular `plan_review_sha`, replaced by `null`; all other
+execution semantics and authorization fields remain covered. The separate CLI
+content hash binds the final executable plan including both actual values.
 `benchmark` is always read-only; `benchmark --live` explicitly refuses until a reviewed live benchmark
 cell exists rather than silently substituting model evidence. Recovery is a two-step read-only exact-marker
 scan: the first run writes a preview; only a second run with
@@ -54,8 +56,12 @@ The reviewed disposable entity set is pinned by both
 `425cdca3d9f0682974c50afc9af4d4d3fa90dc6233ee785290ba7632bd30b754`.
 The hard write ceiling is 500 entities per cell; a plan may lower it but cannot
 raise it. The current lifecycle strategy is direct, and its request/quota
-estimate includes preflight, create, create read-back, pre-delete ownership
-read, exact-ID delete, and point-read absence verification.
+estimate covers the complete nominal lifecycle as `7 * entities + 6`: two
+preflight calls for each of seed, independent verify, and cleanup; create plus
+read-back; two verification point reads; and ownership read, exact-ID delete,
+and point-read absence verification. Retries can only increase recorded actuals.
+Semantic validation retains `5 * entities + 4` as the minimum legacy-plan
+floor rather than silently rewriting older reviewed plans.
 
 ## Recovery and artifacts
 
