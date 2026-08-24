@@ -27,6 +27,7 @@ MAX_EXACT_MARKER_MATCHES = 2
 UNAVAILABLE_API_CODES = frozenset({"error_method_not_found", "insufficient_scope", "access_denied"})
 CLASSIFIED_API_CODES = frozenset({"error_not_found"})
 UNKNOWN_API_CODE = "unexpected_api_error"
+CRM_EMPTY_CODE_NOT_FOUND_DESCRIPTION = "Not found"
 
 
 class LiveUnavailableError(RuntimeError):
@@ -252,6 +253,7 @@ class LivePortal:
             raise LiveCorrectnessError(f"live response envelope is not an object for {method}")
         if "error" in envelope:
             raw_code = envelope.get("error")
+            raw_description = envelope.get("error_description")
             unavailable_code = next(
                 (
                     candidate
@@ -268,7 +270,10 @@ class LivePortal:
                 ),
                 UNKNOWN_API_CODE,
             )
+            if raw_code == "" and raw_description == CRM_EMPTY_CODE_NOT_FOUND_DESCRIPTION:
+                classified_code = "error_not_found"
             raw_code = None
+            raw_description = None
             envelope = None
             if unavailable_code is not None:
                 raise LiveUnavailableError(f"live method unavailable for {method}: {unavailable_code}")

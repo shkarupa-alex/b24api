@@ -443,6 +443,28 @@ def test_non_ok_point_read_still_classifies_structured_not_found(
         assert ADAPTERS["crm-deal-v1"].read(portal, "42") is None
 
 
+def test_crm_empty_error_code_with_exact_not_found_description_proves_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "", "error_description": "Not found"})
+
+    with _portal(monkeypatch, handler) as portal:
+        assert ADAPTERS["crm-deal-v1"].read(portal, "42") is None
+
+
+@pytest.mark.parametrize("description", ["", "not found", "Access denied", None])
+def test_crm_empty_error_code_with_any_other_description_remains_correctness_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    description: str | None,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "", "error_description": description})
+
+    with _portal(monkeypatch, handler) as portal, pytest.raises(LiveApiError):
+        ADAPTERS["crm-deal-v1"].read(portal, "42")
+
+
 @pytest.mark.parametrize("status_code", [600, 999])
 def test_malformed_http_status_never_proves_point_read_absence(
     monkeypatch: pytest.MonkeyPatch,
