@@ -1,38 +1,44 @@
+"""Compatibility values and aliases for the canonical immutable models."""
+
+from __future__ import annotations
 import logging
-from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from b24api.error import ApiResponseError, RetryApiResponseError
+from b24api.models import Request, Response, ResponseTime
 from b24api.query import build_query
-from b24api.settings import Settings
-from b24api.type import ApiTypes
+from b24api.type import ApiTypes  # noqa: TC001 - Pydantic resolves this field type at runtime
+
+if TYPE_CHECKING:
+    from b24api.settings import Settings
 
 
-class Request(BaseModel):
-    """API request."""
+class LegacyRequest(BaseModel):
+    """Pydantic input retained only for ListRequest compatibility."""
 
     method: str
     parameters: dict[str, ApiTypes] = {}
 
     @property
     def query(self) -> str:
+        """Serialize this compatibility request using the committed PHP shape."""
         if not self.parameters:
             return self.method
-
-        parameters = self.parameters
-        if isinstance(self.parameters, BaseModel):
-            parameters = self.parameters.model_dump()
+        parameters: object = self.parameters
+        if isinstance(parameters, BaseModel):
+            parameters = parameters.model_dump(exclude_defaults=True)
+        if not isinstance(parameters, dict):
+            raise TypeError("legacy request parameters must serialize to a mapping")
         query = build_query(parameters)
-
-        return f"{self.method}?{query}"
+        return self.method if not query else f"{self.method}?{query}"
 
 
 class ListRequestParameters(BaseModel):
-    """Parameters of `*.list` requests."""
+    """Parameters of legacy list request inputs."""
 
-    model_config = ConfigDict(extra="allow")  # some methods (notably `crm.item.*`) accept additional parameters
+    model_config = ConfigDict(extra="allow")
 
     select: list[str] = []
     filter: dict[str, ApiTypes] = {}
@@ -40,14 +46,14 @@ class ListRequestParameters(BaseModel):
     start: int | None = None
 
 
-class ListRequest(Request):
-    """API `*.list` request."""
+class ListRequest(LegacyRequest):
+    """Import-compatible validated input translated by the W7 facade."""
 
     parameters: ListRequestParameters = Field(default_factory=ListRequestParameters)  # type: ignore[assignment]
 
 
 class ErrorResponse(BaseModel):
-    """API error response."""
+    """Import-compatible structured REST error value."""
 
     error: str
     error_description: str
@@ -55,80 +61,28 @@ class ErrorResponse(BaseModel):
     @field_validator("error", mode="before")
     @classmethod
     def error_to_lower_str(cls, value: int | str) -> str:
+        """Preserve the committed lowercase string comparison form."""
         return str(value).lower()
 
-    def raise_error(self, request: Request, settings: Settings) -> None:
+    def raise_error(self, request: Request | LegacyRequest, settings: Settings) -> None:
+        """Raise the compatibility error alias without exposing parameters."""
         logger = logging.getLogger(settings.logger_name)
-
         error_cls: type[ApiResponseError]
         if self.error in settings.retry_errors:
-            logger.debug("Request: %s", request)
+            logger.debug("Request method: %s", request.method)
             error_cls = RetryApiResponseError
         else:
-            logger.warning("Request: %s", request)
+            logger.warning("Request method: %s", request.method)
             error_cls = ApiResponseError
-
         raise error_cls(
             code=self.error,
             description=self.error_description,
+            request=request,
         )
 
 
-class ResponseTime(BaseModel):
-    """API Response `time` structure."""
-
-    start: float
-    finish: float
-    duration: float
-    processing: float
-    date_start: datetime
-    date_finish: datetime
-    operating_reset_at: float | None = None
-    operating: float | None = None
-
-
-class Response(BaseModel):
-    """API response."""
-
-    result: ApiTypes
-    time: ResponseTime
-    total: int | None = None
-    next: int | None = None
-
-    @property
-    def list_result(self) -> list[ApiTypes]:
-        """Fix `list` methods result to `list of items` structure.
-
-        There are two kinds of what `list` method `result` may contain:
-        - a list of items (e.g. `department-get` and `disk.folder.getchildren`),
-        - a dictionary with single item that contains the desired list of items
-            (e.g. `tasks` in `tasks.task.list`).
-        """
-        if not isinstance(self.result, list | dict):
-            raise TypeError(f"Expecting `result` to be a `list` or a `dict`. Got: {self.result}")
-
-        if not self.result:
-            return []
-
-        if isinstance(self.result, list):
-            return self.result
-
-        if len(self.result) != 1:
-            raise TypeError(
-                f"If `result` is a `dict`, expecting single item. Got: {self.result}",
-            )
-
-        key = next(iter(self.result))
-        value = self.result[key]
-
-        if not isinstance(value, list):
-            raise TypeError(f"If `result` is a `dict`, expecting single item to be a `list`. Got: {self.result}")
-
-        return value
-
-
 class BatchResult(BaseModel):
-    """API response `result` structure for `batch` method."""
+    """Import-compatible decoded legacy batch envelope."""
 
     result: dict[str, ApiTypes]
     result_time: dict[str, ResponseTime]
@@ -139,6 +93,19 @@ class BatchResult(BaseModel):
     @field_validator("result", "result_time", "result_error", "result_total", "result_next", mode="before")
     @classmethod
     def php_dict(cls, value: Any) -> Any:  # noqa: ANN401
+        """Accept the observed Bitrix/PHP empty-array map representation."""
         if isinstance(value, list) and not value:
             return {}
         return value
+
+
+__all__ = [
+    "BatchResult",
+    "ErrorResponse",
+    "LegacyRequest",
+    "ListRequest",
+    "ListRequestParameters",
+    "Request",
+    "Response",
+    "ResponseTime",
+]

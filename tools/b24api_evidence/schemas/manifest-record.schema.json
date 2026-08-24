@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b24api.local/schemas/evidence/manifest-record-2.0.json",
+  "title": "Append-only evidence manifest record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "sequence", "run_id", "lineage_id", "original_head_sha", "fixed_1x_sha",
+    "skills_corpus_sha", "skills_recipe_tree_sha256", "dataset_plan_content_hash",
+    "portal_fingerprint", "candidate_sha", "namespace", "event", "cell_id", "entity_family",
+    "correlation_key", "entity_id", "marker_hash", "marker_value", "request_fingerprint",
+    "previous_record_hash", "record_hash", "recorded_at", "safe_error"
+  ],
+  "properties": {
+    "schema_version": {"const": "2.0"},
+    "sequence": {"type": "integer", "minimum": 0},
+    "run_id": {"$ref": "#/$defs/uuid"}, "lineage_id": {"$ref": "#/$defs/uuid"},
+    "original_head_sha": {"const": "08277c4d921b83b9252177b3e72a21a4c0c86109"},
+    "fixed_1x_sha": {"const": "82f2d9ddafa50e5229c4191b66b0ad6db4ad4600"},
+    "skills_corpus_sha": {"const": "a353a58fb1de7abf2c81dd86fc7d8ad1caea8f2f"},
+    "skills_recipe_tree_sha256": {"const": "7c6c83487df9913076f16f1cab8630b065df2250f026c4679871957e51343b66"},
+    "dataset_plan_content_hash": {"$ref": "#/$defs/sha256"},
+    "portal_fingerprint": {"$ref": "#/$defs/sha256"}, "candidate_sha": {"$ref": "#/$defs/sha"},
+    "namespace": {"type": "string", "pattern": "^b24api-evidence-[0-9a-f-]{36}$"},
+    "event": {"enum": ["planned", "create_dispatched", "create_cancelled", "created", "ambiguous", "reconciled", "verified", "delete_dispatched", "delete_cancelled", "deleted", "absence_verified", "orphan"]},
+    "cell_id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "maxLength": 100},
+    "entity_family": {"enum": ["task", "crm_deal"]},
+    "correlation_key": {"$ref": "#/$defs/sha256"},
+    "entity_id": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 100}, {"type": "integer"}, {"type": "null"}]},
+    "parent_correlation_keys": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
+    "marker_hash": {"$ref": "#/$defs/sha256"},
+    "marker_value": {"type": "string", "pattern": "^b24api-evidence-[0-9a-f-]{36}:[0-9a-f]{64}$", "maxLength": 153},
+    "request_fingerprint": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+    "previous_record_hash": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+    "record_hash": {"$ref": "#/$defs/sha256"}, "recorded_at": {"type": "string", "format": "date-time"},
+    "safe_error": {"oneOf": [{"$ref": "#/$defs/safeError"}, {"type": "null"}]}
+  },
+  "allOf": [
+    {"if": {"properties": {"sequence": {"const": 0}}, "required": ["sequence"]}, "then": {"properties": {"previous_record_hash": {"type": "null"}}}, "else": {"properties": {"previous_record_hash": {"$ref": "#/$defs/sha256"}}}},
+    {"if": {"properties": {"event": {"enum": ["create_dispatched", "create_cancelled", "ambiguous", "delete_dispatched", "delete_cancelled"]}}, "required": ["event"]}, "then": {"properties": {"request_fingerprint": {"$ref": "#/$defs/sha256"}}}},
+    {"if": {"properties": {"event": {"enum": ["created", "reconciled", "verified", "delete_dispatched", "delete_cancelled", "deleted", "orphan"]}}, "required": ["event"]}, "then": {"properties": {"entity_id": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "integer"}]}}}}
+  ],
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "uuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "safeError": {"type": "object", "additionalProperties": false, "required": ["origin", "code", "retryable"], "properties": {"origin": {"enum": ["transport", "http", "api", "protocol", "recovery"]}, "code": {"type": ["string", "null"], "maxLength": 100}, "retryable": {"type": "boolean"}}}
+  },
+  "$comment": "The semantic validator checks contiguous sequence, both sides of genesis iff, exact lineage, marker_hash=sha256(marker_value UTF-8), marker/correlation binding, and canonical record_hash."
+}

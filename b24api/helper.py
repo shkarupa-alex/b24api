@@ -1,8 +1,11 @@
+"""Support helper."""
+
 from collections.abc import AsyncGenerator, AsyncIterable, Generator, Iterable
 from itertools import repeat
 from typing import Any, Literal
 
-from b24api.entity import ListRequest, Request, Response
+from b24api.entity import LegacyRequest as Request
+from b24api.entity import ListRequest, Response
 from b24api.type import ApiTypes
 
 

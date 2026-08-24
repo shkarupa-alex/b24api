@@ -1,0 +1,41 @@
+{
+  "authorization_effect": "none",
+  "command_keys": [
+    "who",
+    "dependent"
+  ],
+  "conclusion": "supported_for_observed_query_shape_only",
+  "credential_role": "admin_full",
+  "host": "bxtest851.bitrix24.ru",
+  "observed_at": "2026-08-19T20:06:59Z",
+  "outcome": "PASS",
+  "portal_fingerprint": "7b308c4d1fc6ebbee4b648296435406dfc7269f5dba109160f53460dea709c54",
+  "portal_fingerprint_algorithm": "hmac-sha256-portal-role-principal-v1",
+  "read_only": true,
+  "request_count": 1,
+  "request_shape": {
+    "cmd": {
+      "dependent": "user.get?ID=$result[who][ID]",
+      "who": "profile"
+    },
+    "halt": 0
+  },
+  "response_summary": {
+    "command_error_keys": [],
+    "dependent_identity_matched": true,
+    "dependent_row_count": 1,
+    "envelope_shape_valid": true,
+    "http_status": 200,
+    "profile_identity_present": true,
+    "structured_error": false,
+    "unexpected_command_error_count": 0
+  },
+  "runner": {
+    "httpx": "0.28.1",
+    "kind": "committed_python_httpx",
+    "python": "3.12.10",
+    "repository_head_sha": "cf153551640934a215a465959831a401a83358ff",
+    "source_sha256": "8bda6eae912a956871c9106e1ed209751823a1db4e09b4a6e3cdb92c9f8bab75"
+  },
+  "schema_version": "1.2"
+}
