@@ -326,6 +326,7 @@ async def _run_fixed_1x_batch_case(case: ModelCase, *, portal: DeterministicPort
     )
     head = json.loads(head_wire.body)
     rows = list(head["result"])
+    buffered_rows_high_water = len(rows)
     total = int(head["total"])
     tail_starts = tuple(range(PAGE_SIZE, total, PAGE_SIZE))
     batch_requests = 0
@@ -338,6 +339,7 @@ async def _run_fixed_1x_batch_case(case: ModelCase, *, portal: DeterministicPort
         )
         batch_requests += 1
         batch = json.loads(batch_wire.body)["result"]["result"]
+        buffered_rows_high_water = max(buffered_rows_high_water, sum(len(batch[key]) for key in commands))
         for key in commands:
             rows.extend(batch[key])
     identities = tuple(int(row["ID"]) for row in rows)
@@ -364,7 +366,7 @@ async def _run_fixed_1x_batch_case(case: ModelCase, *, portal: DeterministicPort
         operating_seconds=portal.operating_seconds,
         time_to_first_row_seconds=MODEL_REQUEST_SECONDS if identities else None,
         wall_seconds=portal.requests * MODEL_REQUEST_SECONDS,
-        buffered_rows_high_water=min(2_500, max(0, total - PAGE_SIZE)),
+        buffered_rows_high_water=buffered_rows_high_water,
         outcome="INCONCLUSIVE" if case.mutation else "PASS",
         snapshot_state=snapshot_state,
         mutation_retries=mutation_retries,

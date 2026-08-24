@@ -1694,6 +1694,12 @@ def test_exact_model_matrix_covers_all_scales_and_expected_mutation() -> None:
     assert fixed.batch_requests == counted.batch_requests
     assert fixed.batch_commands == counted.batch_commands
     assert fixed.identities == counted.identities
+    by_case_plan = {(run.case_id, run.plan): run for run in runs}
+    assert all(
+        by_case_plan[(case.case_id, "fixed_1x_batch")].buffered_rows_high_water
+        == by_case_plan[(case.case_id, "counted_batch")].buffered_rows_high_water
+        for case in cases
+    )
     assert counted.requests < offset.requests
     mutation = next(case for case in cases if case.mutation)
     portal = DeterministicPortal(mutation)
