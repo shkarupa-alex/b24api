@@ -84,10 +84,9 @@ EXPECTED_MUTATION_RETRIES = 3
 EXPECTED_DENSE_BATCH_PHYSICAL_REQUESTS = 5
 EXPECTED_DENSE_BATCH_REQUESTS = 4
 EXPECTED_DENSE_BATCH_COMMANDS = 199
-EXPECTED_STABLE_MODEL_RUNS = 135
+EXPECTED_STABLE_MODEL_RUNS = 180
 EXPECTED_BENCHMARK_REFS = EXPECTED_STABLE_MODEL_RUNS + 2
-EXPECTED_ADMISSION_ORACLES = 270
-EXPECTED_ADMISSION_REFS = 245
+EXPECTED_MODEL_ORACLES = 200
 EXPECTED_SCHEMA_COUNT = 6
 SECOND_CALL = 2
 BUNDLE_OVERFLOW_FILES = 513
@@ -1678,7 +1677,7 @@ def test_exact_model_matrix_covers_all_scales_and_expected_mutation() -> None:
     }
     assert any(len(case.identities) == LARGE_CASE_ROWS and case.base_count > SPARSE_BASE_MINIMUM for case in cases)
     runs = run_exact_matrix_sync()
-    assert len(runs) == len(cases) * 3
+    assert len(runs) == len(cases) * 4
     assert all(run.actual_hash == run.expected_hash for run in runs)
     assert {run.outcome for run in runs if run.case_id == "mutation"} == {"INCONCLUSIVE"}
     assert all(run.pre_hash != run.post_hash for run in runs if run.case_id == "mutation")
@@ -1686,10 +1685,15 @@ def test_exact_model_matrix_covers_all_scales_and_expected_mutation() -> None:
     assert all(run.mutation_retries == EXPECTED_MUTATION_RETRIES for run in runs if run.case_id == "mutation")
     large = [run for run in runs if run.case_id == "dense-10k"]
     counted = next(run for run in large if run.plan == "counted_batch")
+    fixed = next(run for run in large if run.plan == "fixed_1x_batch")
     offset = next(run for run in large if run.plan == "offset")
     assert counted.requests == EXPECTED_DENSE_BATCH_PHYSICAL_REQUESTS
     assert counted.batch_requests == EXPECTED_DENSE_BATCH_REQUESTS
     assert counted.batch_commands == EXPECTED_DENSE_BATCH_COMMANDS
+    assert fixed.requests == counted.requests
+    assert fixed.batch_requests == counted.batch_requests
+    assert fixed.batch_commands == counted.batch_commands
+    assert fixed.identities == counted.identities
     assert counted.requests < offset.requests
     mutation = next(case for case in cases if case.mutation)
     portal = DeterministicPortal(mutation)
@@ -1697,40 +1701,33 @@ def test_exact_model_matrix_covers_all_scales_and_expected_mutation() -> None:
     assert len(set(snapshots)) == EXPECTED_MUTATION_RETRIES + 1
 
 
-def test_deterministic_admission_proves_small_parity_and_large_benefit() -> None:
+def test_deterministic_comparison_proves_fixed_1x_parity_without_claiming_admission() -> None:
     plan = _plan(count=0)
-    benchmark_plan = cli_module._admission_model_benchmark_plan(plan)  # noqa: SLF001
+    benchmark_plan = cli_module._default_benchmark_plan(plan)  # noqa: SLF001
     validate_benchmark_plan(benchmark_plan)
-    runs = tuple(
-        run for _pair in range(benchmark_plan["controls"]["blocking_pairs"]) for run in run_exact_matrix_sync()
-    )
+    runs = tuple(run for _pair in range(benchmark_plan["controls"]["advisory_runs"]) for run in run_exact_matrix_sync())
 
     summary = cli_module._deterministic_performance_summary(  # noqa: SLF001
         runs,
         benchmark_plan=benchmark_plan,
     )
 
-    assert benchmark_plan["admission_state"] == "admission_ready"
-    assert summary["admission_passed"] is True
+    assert benchmark_plan["admission_state"] == "draft"
+    assert summary["status"] == "non_normative_model_comparison"
+    assert summary["comparison_passed"] is True
     assert all(summary["gates"].values())
     by_case = {case["case_id"]: case for case in summary["cases"]}
     assert by_case["nineteen"]["median_wall_ratio"] == 1.0
-    assert by_case["dense-10k"]["median_improvement"] >= NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT
-    assert by_case["uniform-sparse-10k"]["median_improvement"] >= NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT
-    assert by_case["clustered-sparse-10k"]["median_improvement"] >= NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT
+    assert all(case["baseline_plan"] == "fixed_1x_batch" for case in summary["cases"])
+    assert all(case["median_improvement"] == 0.0 for case in summary["cases"])
+    assert by_case["dense-10k"]["offset_reference_improvement"] >= NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT
 
 
-def test_public_admission_ready_benchmark_publishes_a_scannable_blocking_result(tmp_path: Path) -> None:
+def test_public_admission_ready_benchmark_remains_unavailable(tmp_path: Path) -> None:
     result = _run_cli("benchmark", "--admission-ready", "--artifact-dir", str(tmp_path))
-    assert result.returncode == ExitCode.COMPLETED, result.stderr
-    artifact = json.loads((tmp_path / "benchmark-evidence.json").read_text())
-    summary = json.loads((tmp_path / "performance-summary.json").read_text())
-    assert artifact["outcome"] == "PASS"
-    assert len(artifact["evidence_refs"]) == EXPECTED_ADMISSION_REFS
-    assert len(list((tmp_path / "model-oracles").glob("*.json"))) == EXPECTED_ADMISSION_ORACLES
-    assert summary["admission_passed"] is True
-    assert all(summary["gates"].values())
-    cli_module._scan_bundle(tmp_path, expected_candidate_sha=SHA)  # noqa: SLF001 - public artifact regression
+    assert result.returncode == ExitCode.UNAVAILABLE
+    assert "separately reviewed frozen baseline" in result.stderr
+    assert not (tmp_path / "benchmark-evidence.json").exists()
 
 
 def test_schema_documents_are_finite_draft_2020_12_objects() -> None:
@@ -2106,6 +2103,7 @@ def test_benchmark_parent_hashes_detect_oracle_tampering(tmp_path: Path) -> None
     matrix = json.loads((tmp_path / "model-matrix.json").read_text())
     stable = [run for run in matrix["runs"] if run["outcome"] == "PASS"]
     assert len(artifact["evidence_refs"]) == EXPECTED_BENCHMARK_REFS
+    assert len(list((tmp_path / "model-oracles").glob("*.json"))) == EXPECTED_MODEL_ORACLES
     assert artifact["metrics"]["http_attempts"] == sum(run["requests"] for run in stable)
     assert artifact["metrics"]["logical_pages"] == sum(run["logical_pages"] for run in stable)
     assert artifact["metrics"]["server_operating_seconds"] == pytest.approx(
@@ -2156,7 +2154,7 @@ def test_benchmark_rejects_per_observation_timing_redistribution(tmp_path: Path)
         cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - per-observation timing binding
 
 
-def test_benchmark_observation_counters_reject_boolean_integer_aliases(tmp_path: Path) -> None:
+def test_benchmark_batch_counters_are_exact_and_bound_to_parent_metrics(tmp_path: Path) -> None:
     result = _run_cli("benchmark", "--artifact-dir", str(tmp_path))
     assert result.returncode == ExitCode.COMPLETED, result.stderr
     matrix_path = tmp_path / "model-matrix.json"
@@ -2174,6 +2172,27 @@ def test_benchmark_observation_counters_reject_boolean_integer_aliases(tmp_path:
     artifact_path.write_text(json.dumps(artifact))
     with pytest.raises(ContractError, match="exact non-negative integers"):
         cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - bool/int alias regression
+    observation["requests"] = 1
+    observation["batch_commands"] = float(observation["batch_commands"])
+    float_hash = content_sha256(matrix)
+    artifact["evidence_refs"] = [
+        f"sha256:{float_hash}" if value == f"sha256:{new_hash}" else value for value in artifact["evidence_refs"]
+    ]
+    matrix_path.write_text(json.dumps(matrix))
+    artifact_path.write_text(json.dumps(artifact))
+    with pytest.raises(ContractError, match="exact non-negative integers"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - float/int alias regression
+    observation["batch_commands"] = int(observation["batch_commands"])
+    restored_hash = content_sha256(matrix)
+    artifact["evidence_refs"] = [
+        f"sha256:{restored_hash}" if value == f"sha256:{float_hash}" else value for value in artifact["evidence_refs"]
+    ]
+    artifact["metrics"]["batch_requests"] = 0
+    artifact["metrics"]["batch_commands"] = 0
+    matrix_path.write_text(json.dumps(matrix))
+    artifact_path.write_text(json.dumps(artifact))
+    with pytest.raises(ContractError, match="integer metrics"):
+        cli_module._scan_bundle(tmp_path)  # noqa: SLF001 - aggregate batch-counter binding
 
 
 def test_bundle_rejects_evidence_from_two_runs_even_when_each_document_is_valid(tmp_path: Path) -> None:
@@ -2289,8 +2308,8 @@ def test_admission_ready_benchmark_never_runs_the_model_matrix_as_a_substitute(t
         "--benchmark-plan",
         str(benchmark_path),
     )
-    assert result.returncode == ExitCode.INVALID
-    assert "exact MODEL-MATRIX" in result.stderr
+    assert result.returncode == ExitCode.UNAVAILABLE
+    assert "admission-ready benchmark plans" in result.stderr
 
 
 def test_model_benchmark_rejects_run_controls_it_cannot_execute_exactly(tmp_path: Path) -> None:

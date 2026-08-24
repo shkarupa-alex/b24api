@@ -605,17 +605,19 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
         raise LiveUnavailableError(
             "live benchmark execution is not admitted until a reviewed live benchmark cell exists",
         )
+    if args.admission_ready:
+        raise LiveUnavailableError(
+            "admission-ready performance evidence requires a separately reviewed frozen baseline runner",
+        )
     plan = _load_plan(args, allow_generated=True)
     if plan["portal"]["role"] != "model":
         raise LiveUnavailableError("non-model dataset plans require the unavailable reviewed live benchmark runner")
     if args.benchmark_plan is not None:
         benchmark_plan = read_json_object(args.benchmark_plan)
-        if args.admission_ready and benchmark_plan.get("admission_state") != "admission_ready":
-            raise ContractError("--admission-ready requires an admission-ready external benchmark plan")
+        if benchmark_plan.get("admission_state") != "draft":
+            raise LiveUnavailableError("admission-ready benchmark plans require a separately reviewed runner")
     else:
-        benchmark_plan = (
-            _admission_model_benchmark_plan(plan) if args.admission_ready else _default_benchmark_plan(plan)
-        )
+        benchmark_plan = _default_benchmark_plan(plan)
     validate_benchmark_plan(benchmark_plan)
     if (
         benchmark_plan["candidate_sha"] != plan["candidate_sha"]
@@ -627,11 +629,7 @@ def _benchmark(args: argparse.Namespace) -> ExitCode:
     controls_config = benchmark_plan["controls"]
 
     run_exact_matrix_sync()  # one declared warmup; its observations are intentionally discarded
-    run_count = (
-        int(controls_config["blocking_pairs"])
-        if benchmark_plan["admission_state"] == "admission_ready"
-        else int(controls_config["advisory_runs"])
-    )
+    run_count = int(controls_config["advisory_runs"])
     runs = tuple(run for _ in range(run_count) for run in run_exact_matrix_sync())
     return _benchmark_runs_and_artifact(args, plan=plan, benchmark_plan=benchmark_plan, runs=runs)
 
@@ -643,7 +641,7 @@ def _require_exact_model_benchmark_plan(benchmark_plan: Mapping[str, Any]) -> No
         not isinstance(cases, list)
         or len(cases) != 1
         or cases[0].get("id") != "MODEL-MATRIX"
-        or cases[0].get("compared_plans") != ["offset", "keyset", "counted_batch"]
+        or cases[0].get("compared_plans") != ["offset", "keyset", "fixed_1x_batch", "counted_batch"]
     ):
         raise ContractError("the deterministic runner accepts only its exact MODEL-MATRIX traversal draft")
     controls_config = benchmark_plan["controls"]
@@ -659,19 +657,15 @@ def _require_exact_model_benchmark_plan(benchmark_plan: Mapping[str, Any]) -> No
     gate = cases[0].get("benefit_gate")
     if not isinstance(gate, dict):
         raise ContractError("the deterministic runner requires one explicit benefit gate")
-    if benchmark_plan["admission_state"] == "admission_ready":
-        if (
-            benchmark_plan["thresholds_normative"] is not True
-            or gate.get("blocking") is not True
-            or gate.get("minimum_median_improvement") != NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT
-            or gate.get("paired_95_interval_excludes_parity") is not True
-            or gate.get("maximum_small_p95_ratio") != NORMATIVE_MAXIMUM_SMALL_P95_RATIO
-            or gate.get("maximum_server_operating_ratio") != NORMATIVE_MAXIMUM_OPERATING_RATIO
-            or controls_config["drift"] != {"status": "preregistered", "max_rtt_ratio": 1.2, "max_operating_ratio": 1.2}
-        ):
-            raise ContractError("admission-ready deterministic controls must equal the preregistered blocking gate")
-    elif benchmark_plan["admission_state"] != "draft":
+    if benchmark_plan["admission_state"] != "draft" or benchmark_plan["thresholds_normative"] is not False:
         raise ContractError("unsupported deterministic benchmark admission state")
+    if (
+        gate.get("blocking") is not False
+        or gate.get("paired_95_interval_excludes_parity") is not False
+        or controls_config["drift"]
+        != {"status": "tbd_live", "max_rtt_ratio": "TBD-LIVE", "max_operating_ratio": "TBD-LIVE"}
+    ):
+        raise ContractError("deterministic model comparisons must remain explicitly non-normative")
     if benchmark_plan["manifest_content_hash"] != content_sha256(_model_fixture_manifest()):
         raise ContractError("the deterministic runner requires its exact immutable model fixture manifest")
 
@@ -727,8 +721,6 @@ def _benchmark_runs_and_artifact_inner(  # noqa: PLR0913 - explicit transaction 
     stable_offset = [run for run in stable_runs if run.plan == "offset"]
     stable_keyset = [run for run in stable_runs if run.plan == "keyset"]
     matrix_width = len(runs) // int(controls_config["advisory_runs"])
-    if benchmark_plan["admission_state"] == "admission_ready":
-        matrix_width = len(runs) // int(controls_config["blocking_pairs"])
     offset_control = sum(run.operating_seconds for run in stable_offset) / sum(run.requests for run in stable_offset)
     keyset_control = sum(run.operating_seconds for run in stable_keyset) / sum(run.requests for run in stable_keyset)
     controls = derive_drift_controls(
@@ -848,9 +840,7 @@ def _benchmark_runs_and_artifact_inner(  # noqa: PLR0913 - explicit transaction 
     )
     matrix_ref = f"sha256:{content_sha256(model_matrix)}"
     performance_ref = f"sha256:{content_sha256(performance_summary)}"
-    performance_passed = bool(performance_summary["admission_passed"])
-    admission_required = benchmark_plan["admission_state"] == "admission_ready"
-    artifact_outcome = "PASS" if not admission_required or performance_passed else "FAIL"
+    artifact_outcome = "PASS"
     artifact = _operation_artifact(
         command="benchmark",
         dataset_plan=plan,
@@ -918,39 +908,42 @@ def _deterministic_performance_summary(
     *,
     benchmark_plan: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Evaluate the preregistered request-latency model without host timing noise."""
+    """Report non-normative fixed-baseline parity and offset efficiency."""
     gate = benchmark_plan["cases"][0]["benefit_gate"]
-    minimum_improvement = float(gate["minimum_median_improvement"])
     maximum_small_ratio = float(gate["maximum_small_p95_ratio"])
     maximum_operating_ratio = float(gate["maximum_server_operating_ratio"])
     case_ids = ("nineteen", "five-hundred", "dense-10k", "uniform-sparse-10k", "clustered-sparse-10k")
     summaries: list[dict[str, Any]] = []
     for case_id in case_ids:
-        baseline = [run for run in runs if run.case_id == case_id and run.plan == "offset" and run.outcome == "PASS"]
+        baseline = [
+            run for run in runs if run.case_id == case_id and run.plan == "fixed_1x_batch" and run.outcome == "PASS"
+        ]
         candidate = [
             run for run in runs if run.case_id == case_id and run.plan == "counted_batch" and run.outcome == "PASS"
         ]
-        if not baseline or len(baseline) != len(candidate):
+        offset = [run for run in runs if run.case_id == case_id and run.plan == "offset" and run.outcome == "PASS"]
+        if not baseline or len(baseline) != len(candidate) or len(baseline) != len(offset):
             raise ContractError(f"deterministic performance case is incomplete: {case_id}")
         wall_ratios = [right.wall_seconds / left.wall_seconds for left, right in zip(baseline, candidate, strict=True)]
         operating_ratios = [
             right.operating_seconds / left.operating_seconds for left, right in zip(baseline, candidate, strict=True)
         ]
+        offset_ratios = [right.wall_seconds / left.wall_seconds for left, right in zip(offset, candidate, strict=True)]
         median_wall_ratio = statistics.median(wall_ratios)
         median_operating_ratio = statistics.median(operating_ratios)
         summaries.append(
             {
                 "case_id": case_id,
                 "pairs": len(wall_ratios),
-                "baseline_plan": "offset",
+                "baseline_plan": "fixed_1x_batch",
                 "candidate_plan": "counted_batch",
                 "baseline_physical_requests": baseline[0].requests,
                 "candidate_physical_requests": candidate[0].requests,
                 "median_wall_ratio": median_wall_ratio,
                 "median_improvement": 1.0 - median_wall_ratio,
-                "paired_ratio_interval": [min(wall_ratios), max(wall_ratios)],
-                "paired_interval_excludes_parity": max(wall_ratios) < 1.0,
                 "median_server_operating_ratio": median_operating_ratio,
+                "offset_reference_physical_requests": offset[0].requests,
+                "offset_reference_improvement": 1.0 - statistics.median(offset_ratios),
                 "correctness_equal": all(
                     left.actual_hash == right.actual_hash == left.expected_hash
                     for left, right in zip(baseline, candidate, strict=True)
@@ -959,13 +952,7 @@ def _deterministic_performance_summary(
         )
     by_case = {str(item["case_id"]): item for item in summaries}
     small_passed = float(by_case["nineteen"]["median_wall_ratio"]) <= maximum_small_ratio
-    medium_passed = float(by_case["five-hundred"]["median_wall_ratio"]) <= 1.0
-    large_ids = ("dense-10k", "uniform-sparse-10k", "clustered-sparse-10k")
-    large_passed = all(
-        float(by_case[case_id]["median_improvement"]) >= minimum_improvement
-        and bool(by_case[case_id]["paired_interval_excludes_parity"])
-        for case_id in large_ids
-    )
+    fixed_baseline_parity = all(float(item["median_wall_ratio"]) <= 1.0 for item in summaries)
     operating_passed = all(
         float(item["median_server_operating_ratio"]) <= maximum_operating_ratio for item in summaries
     )
@@ -974,16 +961,16 @@ def _deterministic_performance_summary(
         "schema_version": SCHEMA_VERSION,
         "benchmark_plan_content_hash": content_sha256(benchmark_plan),
         "timing_model": benchmark_plan["controls"]["timing_model"],
+        "status": "non_normative_model_comparison",
         "cases": summaries,
         "gates": {
-            "small_p95_ratio_passed": small_passed,
-            "medium_no_slower_passed": medium_passed,
-            "large_minimum_improvement_passed": large_passed,
+            "small_reference_ratio_passed": small_passed,
+            "fixed_1x_request_parity_passed": fixed_baseline_parity,
             "server_operating_ratio_passed": operating_passed,
             "correctness_passed": correctness_passed,
         },
-        "admission_passed": all(
-            (small_passed, medium_passed, large_passed, operating_passed, correctness_passed),
+        "comparison_passed": all(
+            (small_passed, fixed_baseline_parity, operating_passed, correctness_passed),
         ),
     }
 
@@ -1879,7 +1866,7 @@ def _default_benchmark_plan(dataset_plan: Mapping[str, Any]) -> dict[str, Any]:
         "cases": [
             {
                 "id": "MODEL-MATRIX",
-                "compared_plans": ["offset", "keyset", "counted_batch"],
+                "compared_plans": ["offset", "keyset", "fixed_1x_batch", "counted_batch"],
                 "benefit_gate": {
                     "blocking": False,
                     "minimum_median_improvement": NORMATIVE_MINIMUM_MEDIAN_IMPROVEMENT,
@@ -1890,22 +1877,6 @@ def _default_benchmark_plan(dataset_plan: Mapping[str, Any]) -> dict[str, Any]:
             },
         ],
     }
-
-
-def _admission_model_benchmark_plan(dataset_plan: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the exact preregistered deterministic blocking plan."""
-    plan = _default_benchmark_plan(dataset_plan)
-    plan["admission_state"] = "admission_ready"
-    plan["thresholds_normative"] = True
-    plan["controls"]["drift"] = {
-        "status": "preregistered",
-        "max_rtt_ratio": 1.2,
-        "max_operating_ratio": 1.2,
-    }
-    gate = plan["cases"][0]["benefit_gate"]
-    gate["blocking"] = True
-    gate["paired_95_interval_excludes_parity"] = True
-    return plan
 
 
 def _model_fixture_manifest() -> dict[str, Any]:
@@ -2414,6 +2385,8 @@ def _validate_benchmark_pass_dependencies(  # noqa: C901, PLR0912
         raise ContractError("benchmark PASS has no immutable benchmark plan")
     benchmark_plan = plan_documents[0][1]
     validate_benchmark_plan(benchmark_plan)
+    if benchmark_plan["admission_state"] != "draft":
+        raise ContractError("model benchmark PASS requires its exact draft benchmark plan")
     _require_exact_model_benchmark_plan(benchmark_plan)
     if (
         benchmark_plan["candidate_sha"] != artifact["candidate_sha"]
@@ -2489,15 +2462,11 @@ def _validate_benchmark_pass_dependencies(  # noqa: C901, PLR0912
     ]
     if len(performance_candidates) != 1:
         raise ContractError("benchmark PASS performance hash does not resolve to performance-summary.json")
-    run_count = (
-        int(benchmark_plan["controls"]["blocking_pairs"])
-        if benchmark_plan["admission_state"] == "admission_ready"
-        else int(benchmark_plan["controls"]["advisory_runs"])
-    )
+    run_count = int(benchmark_plan["controls"]["advisory_runs"])
     reference_runs = tuple(run for _ in range(run_count) for run in run_exact_matrix_sync())
     expected_performance = _deterministic_performance_summary(reference_runs, benchmark_plan=benchmark_plan)
-    if performance_candidates[0] != expected_performance or expected_performance["admission_passed"] is not True:
-        raise ContractError("benchmark PASS performance summary does not satisfy its exact deterministic gate")
+    if performance_candidates[0] != expected_performance or expected_performance["comparison_passed"] is not True:
+        raise ContractError("benchmark PASS performance summary does not match its exact non-normative comparison")
     observations = matrix["runs"]
     if not isinstance(observations, list):
         raise ContractError("benchmark model matrix runs must be a list")
@@ -2525,16 +2494,12 @@ def _validate_model_observations(  # noqa: PLR0913
     """Enforce the exact deterministic stable-run set and recompute parent metrics."""
     cases = {case.case_id: case for case in exact_model_cases() if not case.mutation}
     reference_runs = {(run.case_id, run.plan): run for run in run_exact_matrix_sync() if run.outcome == "PASS"}
-    run_count = (
-        int(benchmark_plan["controls"]["blocking_pairs"])
-        if benchmark_plan["admission_state"] == "admission_ready"
-        else int(benchmark_plan["controls"]["advisory_runs"])
-    )
+    run_count = int(benchmark_plan["controls"]["advisory_runs"])
     expected_keys = {
         (iteration, case_id, plan)
         for iteration in range(1, run_count + 1)
         for case_id in cases
-        for plan in ("offset", "keyset", "counted_batch")
+        for plan in ("offset", "keyset", "fixed_1x_batch", "counted_batch")
     }
     run_fields = {
         "iteration",
@@ -2653,7 +2618,14 @@ def _validate_observation_value_types(observation: Mapping[str, Any]) -> None:
     identities = observation["identities"]
     if not isinstance(identities, list) or any(type(value) is not int or value < 0 for value in identities):
         raise ContractError("benchmark observation identities must be exact non-negative integers")
-    integer_fields = ("requests", "logical_pages", "buffered_rows_high_water", "mutation_retries")
+    integer_fields = (
+        "requests",
+        "logical_pages",
+        "batch_requests",
+        "batch_commands",
+        "buffered_rows_high_water",
+        "mutation_retries",
+    )
     if any(type(observation[field]) is not int or observation[field] < 0 for field in integer_fields):
         raise ContractError("benchmark observation counters must be exact non-negative integers")
     operating = observation["operating_seconds"]
@@ -2672,6 +2644,8 @@ def _validate_benchmark_metric_algebra(observations: list[dict[str, Any]], artif
     exact_metrics = {
         "http_attempts": sum(run["requests"] for run in observations),
         "logical_pages": sum(run["logical_pages"] for run in observations),
+        "batch_requests": sum(run["batch_requests"] for run in observations),
+        "batch_commands": sum(run["batch_commands"] for run in observations),
         "buffered_rows_high_water": max(run["buffered_rows_high_water"] for run in observations),
         "raw_rows": rows,
         "unique_rows": rows,

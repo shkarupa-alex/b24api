@@ -57,12 +57,23 @@ legacy imports, and deliberate corrections.
   correctness failures.
 - Stream cleanup preserves the first detected failure and replays genuine
   external cancellation before unrelated subsequent I/O.
+- The counted compatibility path retains HTTP/2, a bounded full-batch decoded
+  row budget, and zero-copy reuse of already immutable correlated batch
+  responses. Successful bodies no longer pay the recursive error-preview cost.
 
 ## Evidence and release boundaries
 
 - The packaged default profile set is empty.
 - No W10 optimization is admitted.
-- No live performance claim or live endpoint profile is included.
+- No normative performance admission or live endpoint profile is included.
+- The offline model now includes an independent frozen 1.0.1
+  head-plus-batched-tail baseline. It proves exact identities and physical
+  request parity with the candidate. Sequential-offset request reductions are
+  recorded only as non-normative diagnostic context.
+- A read-only operator A/B on the disposable portal observed matching identity
+  sets and request counts for 19-row and roughly 1,000-row Tasks/CRM selections.
+  Those wall-time observations are not immutable release evidence and do not
+  replace a reviewed live performance cell.
 - The supplied portal currently exposes no documented exact portal build.
   Live plans record the unknown build as null and bind portal identity to the
   normalized host plus HMAC role/principal fingerprint. Unknown build cannot

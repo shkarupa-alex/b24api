@@ -146,6 +146,17 @@ portal-build/scope applicability context; it never guesses those facts.
 The compatibility `list_size` value is enforced as a caller-declared decoded
 page cap. The cursor wrapper also sends it through its committed `LIMIT`
 control. Other wrappers do not invent an endpoint-specific limit parameter.
+The default decoded-row buffer is bounded at 2,500 rows: one complete Bitrix
+batch of 50 commands at the committed 50-row page cap. Smaller caller policy
+limits continue to narrow batching and fail closed before an oversized page is
+accepted.
+
+The deterministic model compares the counted wrapper with an independent
+frozen 1.0.1 head-plus-batched-tail implementation and reports request parity.
+Its offset comparison is diagnostic efficiency context, not a latency win over
+the predecessor and not performance admission. A fast generic no-count
+partition remains unadmitted; `list_batched_no_count` deliberately keeps its
+correct sequential keyset fallback.
 
 ItemCursorPlan requires cursor values on continued pages to be unique and
 strictly monotonic in the declared direction. Under that contract, min/max are

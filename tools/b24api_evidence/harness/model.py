@@ -216,6 +216,8 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
         coercion=IdentityCoercion.EXACT_INTEGER,
     )
     plan: OffsetSequentialPlan | KeysetPlan
+    if plan_name == "fixed_1x_batch":
+        return await _run_fixed_1x_batch_case(case, portal=portal)
     if plan_name == "counted_batch":
         return await _run_counted_batch_case(case, portal=portal, executor=executor, identity=identity)
     if plan_name == "offset":
@@ -302,7 +304,7 @@ async def run_exact_matrix() -> tuple[ModelRun, ...]:
     """Run both admitted baseline plans over the full deterministic matrix."""
     runs: list[ModelRun] = []
     for case in exact_model_cases():
-        for plan_name in ("offset", "keyset", "counted_batch"):
+        for plan_name in ("offset", "keyset", "fixed_1x_batch", "counted_batch"):
             run = await run_model_case(case, plan_name=plan_name)
             if not case.mutation and (run.identities != case.identities or run.actual_hash != run.expected_hash):
                 raise AssertionError(f"model correctness failure in {case.case_id}/{plan_name}")
@@ -313,6 +315,60 @@ async def run_exact_matrix() -> tuple[ModelRun, ...]:
 def run_exact_matrix_sync() -> tuple[ModelRun, ...]:
     """Synchronous CLI bridge for the deterministic matrix."""
     return asyncio.run(run_exact_matrix())
+
+
+async def _run_fixed_1x_batch_case(case: ModelCase, *, portal: DeterministicPortal) -> ModelRun:
+    """Replay the frozen 1.0.1 direct-head plus 50-command batched-tail algorithm."""
+    pre_hash = portal.oracle_snapshot()
+    head_wire = await portal.send(
+        Request(MODEL_METHOD, {"start": 0}, ReplaySafety.SAFE),
+        attempt_timeout=120,
+    )
+    head = json.loads(head_wire.body)
+    rows = list(head["result"])
+    total = int(head["total"])
+    tail_starts = tuple(range(PAGE_SIZE, total, PAGE_SIZE))
+    batch_requests = 0
+    for chunk_start in range(0, len(tail_starts), 50):
+        starts = tail_starts[chunk_start : chunk_start + 50]
+        commands = {f"_{index:02d}": f"{MODEL_METHOD}?start={start}" for index, start in enumerate(starts)}
+        batch_wire = await portal.send(
+            Request("batch", {"halt": True, "cmd": commands}, ReplaySafety.SAFE),
+            attempt_timeout=120,
+        )
+        batch_requests += 1
+        batch = json.loads(batch_wire.body)["result"]["result"]
+        for key in commands:
+            rows.extend(batch[key])
+    identities = tuple(int(row["ID"]) for row in rows)
+    actual_hash = content_sha256(list(identities))
+    post_hash = portal.oracle_snapshot()
+    mutation_retries = 0
+    while pre_hash != post_hash and mutation_retries < MAX_MUTATION_RETRIES:
+        mutation_retries += 1
+        pre_hash = post_hash
+        post_hash = portal.oracle_snapshot()
+    snapshot_state = "changed" if pre_hash != post_hash else "verified"
+    return ModelRun(
+        case_id=case.case_id,
+        plan="fixed_1x_batch",
+        identities=identities,
+        expected_hash=case.expected_hash,
+        actual_hash=actual_hash,
+        pre_hash=pre_hash,
+        post_hash=post_hash,
+        requests=portal.requests,
+        logical_pages=portal.logical_pages,
+        batch_requests=batch_requests,
+        batch_commands=len(tail_starts),
+        operating_seconds=portal.operating_seconds,
+        time_to_first_row_seconds=MODEL_REQUEST_SECONDS if identities else None,
+        wall_seconds=portal.requests * MODEL_REQUEST_SECONDS,
+        buffered_rows_high_water=min(2_500, max(0, total - PAGE_SIZE)),
+        outcome="INCONCLUSIVE" if case.mutation else "PASS",
+        snapshot_state=snapshot_state,
+        mutation_retries=mutation_retries,
+    )
 
 
 async def _run_counted_batch_case(

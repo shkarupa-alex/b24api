@@ -96,7 +96,8 @@ wire regressions are mandatory parts of the final evidence packet.
 
 - no real portal build source is documented;
 - no endpoint profile is packaged or admitted;
-- no live benchmark or latency benefit is claimed;
+- no normative live benchmark or latency benefit is claimed; read-only
+  operator A/B observations are disclosed only as non-admission diagnostics;
 - no W10 optimization is shipped;
 - no large live dataset was created;
 - the original CRM cleanup run is not a PASS artifact.
