@@ -5,6 +5,49 @@ replay-aware executor for direct calls, batches, pagination, and reference
 fan-out. Traversal strategies are immutable plans; incomplete traversal never
 looks like normal generator exhaustion.
 
+## Current status
+
+The 2.0 correctness release is ready for the reviewed call, batch, counted-list,
+keyset-list, and reference traversal contracts. It restores HTTP/2 with HTTP/1
+fallback, keeps retries conditional on replay safety, bounds decoded rows and
+identity tracking, and raises a typed incomplete result instead of silently
+returning a partial list.
+
+The default `list_batched` has structural performance parity with the frozen
+1.0.1 head-plus-batched-tail implementation: 19, 500, and 10,000-row model
+selections take 1, 2, and 5 physical requests in both clients and return the
+same identities. A read-only portal replay on 24 August 2026 also found no
+statistically stable wall-time difference: the median paired new/old ratios
+were 1.010 for 19 Tasks, 0.993 for 19 CRM deals, 1.013 for 932 Tasks, and 0.999
+for 1,060 CRM deals; all bootstrap intervals included parity.
+The complete methodology and measurements are in
+[`runtime-profile-2026-08-24.md`](docs/bitrix24-client-2.0/w12/runtime-profile-2026-08-24.md).
+
+This is not a claim that the new validation engine is free. On a zero-latency
+local model it uses roughly 4-6x the CPU of the minimal 1.0.1 traversal while
+checking totals, ranges, identities, budgets, correlation, and immutable
+evidence. Memray 1.20.0 measured about 4.52 MiB peak allocation for a 10,000-row
+ID-only traversal (2.52 MiB for the frozen baseline), 7.98 MiB for the live
+932-row full Tasks response, and 5.93 MiB for the live 1,060-row full CRM
+response. Twenty consecutive synthetic 10,000-row traversals peaked at 4.90
+MiB versus 4.52 MiB for one traversal, with no accumulating-memory signature.
+
+The release does not claim normative performance admission, a fast generic
+no-count traversal, or an admitted `PartitionedKeysetPlan`. The safe generic
+`list_batched_no_count` fallback can make more requests than 1.0.1 because the
+old strategy was observed returning an incomplete Tasks selection as if it
+were complete.
+
+## Installation
+
+The package requires Python 3.12 or newer. Until the reviewed 2.0 candidate is
+published, install this checkout rather than `pip install b24api` (PyPI still
+serves the 1.0.1 predecessor):
+
+~~~text
+uv sync --frozen
+~~~
+
 ## Configuration and lifecycle
 
 Set BITRIX24_API_WEBHOOK_URL and keep one client open for related work:
@@ -157,6 +200,68 @@ Its offset comparison is diagnostic efficiency context, not a latency win over
 the predecessor and not performance admission. A fast generic no-count
 partition remains unadmitted; `list_batched_no_count` deliberately keeps its
 correct sequential keyset fallback.
+
+For a counted endpoint, pass an identity when completeness and duplicate
+checks must be explicit:
+
+~~~python
+from b24api import Bitrix24, IdentitySpec, Request
+from b24api.models import IdentityCoercion
+
+deal_identity = IdentitySpec(
+    item_path=("ID",),
+    filter_key="ID",
+    order_key="ID",
+    coercion=IdentityCoercion.DECIMAL_STRING_INTEGER,
+)
+
+async with Bitrix24() as b24:
+    async for deal in b24.list_batched(
+        Request("crm.deal.list", {"select": ["ID", "TITLE"], "order": {"ID": "ASC"}}),
+        identity=deal_identity,
+    ):
+        consume(deal)
+~~~
+
+Compatibility wrappers fail closed. Code that wants to retain the terminal
+report can catch the typed error explicitly:
+
+~~~python
+from b24api.error import IncompleteTraversalError
+
+try:
+    async for deal in b24.list_batched(request, identity=deal_identity):
+        consume(deal)
+except IncompleteTraversalError as error:
+    record_terminal_report(error.report)
+    raise
+~~~
+
+## Reproducing performance and memory profiles
+
+The repository-only runner compares production counted traversal with the
+independent frozen 1.0.1 algorithm on the same deterministic portal. It never
+uses a webhook:
+
+~~~text
+uv run python tools/b24api_evidence/profile_runtime.py --samples 25 --warmups 5
+~~~
+
+To capture only measured samples, excluding imports and warmups, use the
+official [Bloomberg Memray](https://github.com/bloomberg/memray) profiler. The
+version used for the figures above was 1.20.0:
+
+~~~text
+uv run --with memray==1.20.0 python tools/b24api_evidence/profile_runtime.py \
+  --case dense-10k --plan counted_batch --samples 1 --warmups 3 \
+  --memray-output /tmp/b24api-dense-10k.bin
+uv run --with memray==1.20.0 memray stats /tmp/b24api-dense-10k.bin
+uv run --with memray==1.20.0 memray flamegraph /tmp/b24api-dense-10k.bin
+~~~
+
+These local timings measure Python overhead with a zero-latency portal. They
+must not be presented as network-latency admission or as proof of a faster
+production portal.
 
 ItemCursorPlan requires cursor values on continued pages to be unique and
 strictly monotonic in the declared direction. Under that contract, min/max are

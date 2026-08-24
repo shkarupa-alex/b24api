@@ -72,6 +72,7 @@ if TYPE_CHECKING:
 
 ROOT = Path(__file__).resolve().parents[3]
 ENTRYPOINT = ROOT / "tools/b24api_evidence.py"
+PROFILE_ENTRYPOINT = ROOT / "tools/b24api_evidence/profile_runtime.py"
 PROFILE_SET = ROOT / "docs/bitrix24-client-2.0/w0/disposable-entity-profiles.json"
 RUN_ID = "00000000-0000-4000-8000-000000000011"
 LINEAGE_ID = "00000000-0000-4000-8000-000000000012"
@@ -79,6 +80,7 @@ SHA = git_sha(ROOT)
 SHA256 = "2" * 64
 FINGERPRINT_KEY_BYTES = 32
 LARGE_CASE_ROWS = 10_000
+SMALL_CASE_ROWS = 19
 SPARSE_BASE_MINIMUM = 100_000
 EXPECTED_MUTATION_RETRIES = 3
 EXPECTED_DENSE_BATCH_PHYSICAL_REQUESTS = 5
@@ -1705,6 +1707,32 @@ def test_exact_model_matrix_covers_all_scales_and_expected_mutation() -> None:
     portal = DeterministicPortal(mutation)
     snapshots = [portal.oracle_snapshot() for _ in range(EXPECTED_MUTATION_RETRIES + 1)]
     assert len(set(snapshots)) == EXPECTED_MUTATION_RETRIES + 1
+
+
+def test_runtime_profile_runner_compares_frozen_and_current_counted_paths() -> None:
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and repository-only profiling entry point
+        [
+            sys.executable,
+            str(PROFILE_ENTRYPOINT),
+            "--case",
+            "nineteen",
+            "--samples",
+            "2",
+            "--warmups",
+            "1",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    runs = {run["plan"]: run for run in payload["results"]}
+    assert set(runs) == {"fixed_1x_batch", "counted_batch"}
+    assert runs["fixed_1x_batch"]["identity_sha256"] == runs["counted_batch"]["identity_sha256"]
+    assert runs["fixed_1x_batch"]["requests"] == runs["counted_batch"]["requests"] == 1
+    assert runs["fixed_1x_batch"]["buffered_rows_high_water"] == SMALL_CASE_ROWS
+    assert runs["counted_batch"]["buffered_rows_high_water"] == SMALL_CASE_ROWS
 
 
 def test_deterministic_comparison_proves_fixed_1x_parity_without_claiming_admission() -> None:
