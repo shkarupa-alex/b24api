@@ -270,7 +270,12 @@ class LivePortal:
                 ),
                 UNKNOWN_API_CODE,
             )
-            if raw_code == "" and raw_description == CRM_EMPTY_CODE_NOT_FOUND_DESCRIPTION:
+            if (
+                method == "crm.deal.get"
+                and status_code == 400  # noqa: PLR2004 - exact observed Bitrix24 absence contract
+                and raw_code == ""
+                and raw_description == CRM_EMPTY_CODE_NOT_FOUND_DESCRIPTION
+            ):
                 classified_code = "error_not_found"
             raw_code = None
             raw_description = None

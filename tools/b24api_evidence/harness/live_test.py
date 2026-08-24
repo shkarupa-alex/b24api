@@ -465,6 +465,28 @@ def test_crm_empty_error_code_with_any_other_description_remains_correctness_fai
         ADAPTERS["crm-deal-v1"].read(portal, "42")
 
 
+@pytest.mark.parametrize("status_code", [200, 500])
+def test_crm_empty_error_code_not_found_pair_requires_observed_http_status(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"error": "", "error_description": "Not found"})
+
+    with _portal(monkeypatch, handler) as portal, pytest.raises(LiveApiError):
+        ADAPTERS["crm-deal-v1"].read(portal, "42")
+
+
+def test_empty_error_code_not_found_pair_never_proves_tasks_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "", "error_description": "Not found"})
+
+    with _portal(monkeypatch, handler) as portal, pytest.raises(LiveApiError):
+        ADAPTERS["tasks-task-v1"].read(portal, "42")
+
+
 @pytest.mark.parametrize("status_code", [600, 999])
 def test_malformed_http_status_never_proves_point_read_absence(
     monkeypatch: pytest.MonkeyPatch,
