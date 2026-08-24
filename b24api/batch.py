@@ -216,14 +216,13 @@ class BatchExecutor:
                 outcomes.append(_command_failure(command, protocol_error, evidence=evidence))
                 continue
             outcomes.append(
-                BatchSuccess(
+                BatchSuccess._from_response(  # noqa: SLF001 - trusted correlated decoder fast path
                     command.index,
                     command.stable_key,
                     command.request,
-                    envelope.results[command.stable_key],
+                    command_response,
                     command.payload,
                     evidence,
-                    response=command_response,
                 ),
             )
         return await self._fallback(tuple(outcomes), fallback_failed=fallback_failed, context=context)
@@ -321,15 +320,14 @@ class BatchExecutor:
                 )
             else:
                 resolved.append(
-                    BatchSuccess(
+                    BatchSuccess._from_response(  # noqa: SLF001 - trusted correlated decoder fast path
                         outcome.command_index,
                         outcome.stable_key,
                         outcome.request,
-                        response.result,
+                        response,
                         outcome.payload,
                         outcome.evidence,
                         replay_disposition=ReplayDisposition.REPLAYED_DIRECT,
-                        response=response,
                     ),
                 )
         return tuple(resolved)

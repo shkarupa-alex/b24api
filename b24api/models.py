@@ -8,7 +8,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, Self, cast
 
 from b24api.query import build_query
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
@@ -976,6 +976,39 @@ class BatchSuccess:
         object.__setattr__(self, "evidence", evidence)
         object.__setattr__(self, "replay_disposition", replay_disposition)
         object.__setattr__(self, "response", response)
+
+    @classmethod
+    def _from_response(  # noqa: PLR0913 - private zero-copy correlated construction
+        cls,
+        command_index: int,
+        stable_key: str,
+        request: Request,
+        response: Response,
+        payload: object = None,
+        evidence: BatchCommandEvidence | None = None,
+        replay_disposition: ReplayDisposition | None = None,
+    ) -> Self:
+        """Share an already frozen correlated response inside the trusted decoder."""
+        _validate_batch_correlation(command_index, stable_key, request, evidence)
+        if not isinstance(response, Response):
+            raise TypeError("response must be a Response")
+        if replay_disposition is not None and not isinstance(replay_disposition, ReplayDisposition):
+            raise TypeError("replay_disposition must be a ReplayDisposition or None")
+        instance = cls.__new__(cls)
+        object.__setattr__(instance, "command_index", command_index)
+        object.__setattr__(instance, "stable_key", stable_key)
+        object.__setattr__(instance, "request", request)
+        object.__setattr__(instance, "_result", response._result)  # noqa: SLF001 - same immutable model
+        object.__setattr__(
+            instance,
+            "_decoded_rows",
+            len(response._result) if isinstance(response._result, tuple) else 1,  # noqa: SLF001
+        )
+        object.__setattr__(instance, "payload", payload)
+        object.__setattr__(instance, "evidence", evidence)
+        object.__setattr__(instance, "replay_disposition", replay_disposition)
+        object.__setattr__(instance, "response", response)
+        return instance
 
     @property
     def result(self) -> JsonValue:
