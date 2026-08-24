@@ -47,10 +47,10 @@ class ProtocolCodec:
     ) -> B24ApiError | None:
         """Return a structured error before considering generic HTTP status."""
         parsed, malformed = self._parse_body(body)
-        safe_headers = self._safe_headers(headers or {})
-        preview = self._body_preview(body)
 
         if isinstance(parsed, Mapping) and "error" in parsed:
+            safe_headers = self._safe_headers(headers or {})
+            preview = self._body_preview(body)
             original_code = parsed["error"]
             if not isinstance(original_code, str | int):
                 return self._protocol_error(
@@ -76,6 +76,8 @@ class ProtocolCodec:
             )
 
         if status_code >= HTTP_ERROR_MINIMUM:
+            safe_headers = self._safe_headers(headers or {})
+            preview = self._body_preview(body)
             evidence = ResponseEvidence(
                 http_status=status_code,
                 request_id=dict(safe_headers).get("x-request-id"),
@@ -91,6 +93,8 @@ class ProtocolCodec:
             )
 
         if malformed:
+            safe_headers = self._safe_headers(headers or {})
+            preview = self._body_preview(body)
             return self._protocol_error(
                 "Malformed JSON response",
                 status_code=status_code,

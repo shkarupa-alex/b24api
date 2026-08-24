@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import httpx
+from pytest_mock import MockerFixture
 
 from b24api.error import (
     AmbiguousExecutionError,
@@ -92,6 +93,14 @@ def test_gateway_and_protocol_evidence_are_bounded_and_redacted() -> None:
 
 def test_empty_success_has_no_error() -> None:
     assert ProtocolCodec().error_from_http(status_code=200, body=b"") is None
+
+
+def test_success_body_does_not_pay_for_recursive_error_preview(mocker: MockerFixture) -> None:
+    codec = ProtocolCodec()
+    preview = mocker.patch.object(codec, "_body_preview", side_effect=AssertionError("previewed success"))
+
+    assert codec.error_from_http(status_code=200, body=b'{"result":[{"id":1}]}') is None
+    preview.assert_not_called()
 
 
 def test_structured_description_and_request_context_are_safe() -> None:
