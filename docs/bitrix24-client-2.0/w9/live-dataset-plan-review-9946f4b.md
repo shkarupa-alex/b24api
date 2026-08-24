@@ -1,5 +1,10 @@
 # W9 live dataset plan review — candidate 9946f4b
 
+> **SUPERSEDED — DO NOT EXECUTE.** This packet was rejected and grants no
+> mutation authority. Its two local `approved_for_seed` files were removed.
+> The accepted replacement is `live-dataset-plan-review-8d76a07.md`, bound to
+> review commit `98b9b3adefff1b9c82127f70f40c4809f9902932`.
+
 ## Decision requested
 
 Approve or reject two small disposable live dataset plans generated read-only

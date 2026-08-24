@@ -29,6 +29,9 @@ is the canonical proposed plan with the two necessarily post-decision values,
 `approved_at` and the circular `plan_review_sha`, replaced by `null`; all other
 execution semantics and authorization fields remain covered. The separate CLI
 content hash binds the final executable plan including both actual values.
+When materializing that plan, the operator records the actual post-response
+UTC time and verifies it is not earlier than the review commit's committer
+time before invoking any write command.
 `benchmark` is always read-only; `benchmark --live` explicitly refuses until a reviewed live benchmark
 cell exists rather than silently substituting model evidence. Recovery is a two-step read-only exact-marker
 scan: the first run writes a preview; only a second run with

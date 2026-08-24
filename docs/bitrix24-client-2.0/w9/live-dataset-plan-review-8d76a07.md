@@ -23,6 +23,7 @@ admission, or release.
 - exact SHA: `8d76a07e85e359df2e96109f0555b7ec2503e7a5`;
 - independent clean-room verdict: ACCEPT, P1/P2/P3 = 0/0/0;
 - Python 3.14 full suite: 490 passed;
+- Python 3.12.10 full suite: 490 passed;
 - Ruff check/format, strict mypy, cumulative diff-check, detached status:
   PASS/clean;
 - normative specification SHA-256:
@@ -131,6 +132,11 @@ full-content SHA-256 values are then computed and supplied to
 reported before the decision and are not values the reviewer is asked to
 approve. The packet commit carries one `Dataset-Plan-SHA256:` trailer for each
 reviewed approval-subject hash.
+
+The recorded approval time must be the actual post-response UTC
+materialization time and must not precede the packet commit's committer time.
+This is checked and reported before either final plan is passed to a write
+command.
 
 ## Mutation and recovery boundary
 
