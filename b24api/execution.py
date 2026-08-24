@@ -155,7 +155,7 @@ class HttpxTransport:
         client_initialization_failed = False
         if resolved_client is None:
             try:
-                resolved_client = httpx.AsyncClient()
+                resolved_client = httpx.AsyncClient(http2=True)
             except Exception:  # noqa: BLE001 - sanitize environment/proxy constructor failures
                 client_initialization_failed = True
         normalized_webhook = webhook_url

@@ -192,7 +192,7 @@ def test_transport_constructor_drops_webhook_when_httpx_client_initialization_fa
 ) -> None:
     sensitive_fragment = "synthetic-constructor-private-fragment"
 
-    def fail_client() -> httpx.AsyncClient:
+    def fail_client(**_kwargs: object) -> httpx.AsyncClient:
         raise httpx.InvalidURL("synthetic client initialization failure")
 
     monkeypatch.setattr(httpx, "AsyncClient", fail_client)
@@ -209,6 +209,23 @@ def test_transport_constructor_drops_webhook_when_httpx_client_initialization_fa
             for value in traceback.tb_frame.f_locals.values():
                 assert sensitive_fragment not in repr(value)
         traceback = traceback.tb_next
+
+
+@pytest.mark.asyncio
+async def test_transport_preserves_the_committed_http2_fast_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_client = httpx.AsyncClient
+    captured: dict[str, object] = {}
+
+    def client(**kwargs: object) -> httpx.AsyncClient:
+        captured.update(kwargs)
+        return original_client(transport=httpx.MockTransport(lambda _request: httpx.Response(200)), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    transport = HttpxTransport("https://example.invalid/rest/1/token/")
+    try:
+        assert captured["http2"] is True
+    finally:
+        await transport.aclose()
 
 
 def _success(body: bytes = b'{"result":{"ok":true},"total":1,"next":1}') -> WireResponse:
