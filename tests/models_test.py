@@ -159,6 +159,11 @@ def test_execution_policy_rejects_invalid_limits() -> None:
         ExecutionPolicy(identity_tracker="memory")  # type: ignore[arg-type]
 
 
+def test_default_row_buffer_holds_one_complete_portal_batch() -> None:
+    """Keep the safe default large enough for 50 commands of 50 rows."""
+    assert ExecutionPolicy().max_buffered_rows == 50 * 50
+
+
 def test_budget_counters_count_attempts_pages_references_and_buffers_before_scheduling() -> None:
     policy = ExecutionPolicy(
         max_requests=TEST_LIMIT,

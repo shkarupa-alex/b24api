@@ -682,7 +682,10 @@ class ExecutionPolicy:
     max_elapsed: float = 900.0
     max_attempts_per_request: int = 5
     max_retry_elapsed_per_request: float = 120.0
-    max_buffered_rows: int = 1_000
+    # A full Bitrix batch may contain 50 list commands and each command may
+    # decode the portal page cap of 50 rows. Keeping the default below that
+    # product split one safe batch into several physical requests.
+    max_buffered_rows: int = 2_500
     max_direct_concurrency: int = 10
     max_active_references: int = 100
     max_tracked_identities: int = 100_000
