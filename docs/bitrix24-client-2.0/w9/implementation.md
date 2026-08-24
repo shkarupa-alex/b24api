@@ -102,6 +102,13 @@ identity and cleanup ownership do not depend on build; they remain bound to the
 host, HMAC fingerprint, scope hash, candidate, run, lineage, and exact manifest
 identities.
 
+The first approved CRM lifecycle exposed the portal's actual post-delete
+absence envelope: HTTP 400 with an empty `error` value and exact
+`error_description: "Not found"`, rather than `ERROR_NOT_FOUND`. The live
+boundary now normalizes only that exact pair to its internal typed
+`error_not_found`; any other empty code or description remains a correctness
+failure. The matching and four non-matching wire regressions are committed.
+
 The deterministic portal drives the production executor and traversal engine
 over empty, 1, 19, 500, dense/sparse/clustered/skewed/deleted 10,000-row, and
 persistent-mutation states with offset and keyset plans. The sparse case has
