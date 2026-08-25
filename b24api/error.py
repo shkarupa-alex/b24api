@@ -240,6 +240,12 @@ class BudgetExceededError(B24ApiError):
     default_origin = ErrorOrigin.BUDGET
 
 
+class ResponseTooLargeError(B24ApiError):
+    """A decompressed response exceeded the configured byte ceiling."""
+
+    default_origin = ErrorOrigin.PROTOCOL
+
+
 class AmbiguousExecutionError(B24ApiError):
     """A mutation may have executed but no conclusive response was observed."""
 
@@ -301,6 +307,7 @@ __all__ = [
     "IncompleteTraversalError",
     "PaginationError",
     "ProtocolError",
+    "ResponseTooLargeError",
     "RetryApiResponseError",
     "RetryHTTPStatusError",
     "TransportError",

@@ -443,7 +443,11 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             while True:
                 chunk = await _next_chunk(
                     source,
-                    min(self._batch_size, self._context.policy.max_buffered_rows),
+                    min(
+                        self._batch_size,
+                        self._context.policy.max_buffered_commands,
+                        self._context.policy.max_buffered_rows,
+                    ),
                     start_index=next_index,
                     context=self._context,
                 )

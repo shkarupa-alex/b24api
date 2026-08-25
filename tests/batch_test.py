@@ -49,9 +49,10 @@ class CallbackTransport:
         self.callback = callback
         self.requests: list[Request] = []
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Send one transport request attempt."""
         assert attempt_timeout > 0
+        assert max_response_bytes > 0
         self.requests.append(request)
         outcome = self.callback(request)
         if isinstance(outcome, Exception):
@@ -539,8 +540,8 @@ async def test_batch_cancellation_carries_same_terminal_report() -> None:
     started = asyncio.Event()
 
     class BlockingTransport:
-        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
-            del request, attempt_timeout
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            del request, attempt_timeout, max_response_bytes
             started.set()
             return await asyncio.Future[WireResponse]()
 
@@ -605,8 +606,8 @@ async def test_repeated_batch_cancellation_still_carries_final_report() -> None:
     started = asyncio.Event()
 
     class BlockingTransport:
-        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
-            del request, attempt_timeout
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            del request, attempt_timeout, max_response_bytes
             started.set()
             return await asyncio.Future[WireResponse]()
 

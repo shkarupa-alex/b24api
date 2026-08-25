@@ -91,9 +91,9 @@ class FunctionTransport:
         self.handler = handler
         self.requests: list[Request] = []
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Send one transport request attempt."""
-        del attempt_timeout
+        del attempt_timeout, max_response_bytes
         self.requests.append(request)
         body = json.dumps(self.handler(request), separators=(",", ":")).encode()
         return WireResponse(200, (("content-type", "application/json"),), body)
@@ -323,8 +323,9 @@ async def test_counted_wrapper_accounts_head_retries_before_emission() -> None:
         def __init__(self) -> None:
             self.requests: list[Request] = []
 
-        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
             assert attempt_timeout > 0
+            assert max_response_bytes > 0
             self.requests.append(request)
             if len(self.requests) == 1:
                 return WireResponse(

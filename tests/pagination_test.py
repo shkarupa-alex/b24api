@@ -59,9 +59,9 @@ class FunctionTransport:
         self.handler = handler
         self.requests: list[Request] = []
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Send one transport request attempt."""
-        del attempt_timeout
+        del attempt_timeout, max_response_bytes
         self.requests.append(request)
         body = json.dumps(self.handler(request), separators=(",", ":")).encode()
         return WireResponse(200, (("content-type", "application/json"),), body)
@@ -75,9 +75,9 @@ class BlockingTransport:
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Send one transport request attempt."""
-        del request, attempt_timeout
+        del request, attempt_timeout, max_response_bytes
         self.started.set()
         try:
             return await asyncio.Future[WireResponse]()
@@ -1110,7 +1110,8 @@ async def test_large_exact_identity_tracking_warns_once_and_continues() -> None:
     with pytest.warns(RuntimeWarning, match="exact duplicate/loss detection") as captured:
         result = await _collect(stream)
 
-    assert len(captured) == 1
+    matching = [warning for warning in captured if "exact duplicate/loss detection" in str(warning.message)]
+    assert len(matching) == 1
     assert len(result) == len(rows)
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.unique_rows == distinct
@@ -1170,8 +1171,8 @@ async def test_cancellation_after_decoded_response_cannot_rollback_logical_page(
             self.context: ExecutionContext | None = None
             self.locked = asyncio.Event()
 
-        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
-            del request, attempt_timeout
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            del request, attempt_timeout, max_response_bytes
             assert self.context is not None
             await self.context._lock.acquire()  # noqa: SLF001 - deterministic commit-race regression
             self.locked.set()
@@ -1211,8 +1212,8 @@ async def test_cancellation_during_failed_finalization_preserves_failure_report(
             self.context: ExecutionContext | None = None
             self.locked = asyncio.Event()
 
-        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
-            del request, attempt_timeout
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            del request, attempt_timeout, max_response_bytes
             assert self.context is not None
             await self.context._lock.acquire()  # noqa: SLF001 - deterministic finalize-race regression
             self.locked.set()

@@ -15,6 +15,7 @@ from b24api.error import (
     FailurePhase,
     HTTPGatewayError,
     ProtocolError,
+    ResponseTooLargeError,
     TransportError,
 )
 from b24api.execution import (
@@ -30,6 +31,7 @@ from b24api.models import ExecutionPolicy, ReplaySafety, Request, RetryPolicy
 
 EXPECTED_RETRIED_CALLS = 2
 HTTP_OK = 200
+SMALL_RESPONSE_CEILING = 8
 
 
 @pytest.mark.asyncio
@@ -161,9 +163,10 @@ class SequenceTransport:
         self.calls = 0
         self.timeouts: list[float] = []
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Send one transport request attempt."""
         del request
+        assert max_response_bytes > 0
         self.timeouts.append(attempt_timeout)
         outcome = self.outcomes[self.calls]
         self.calls += 1
@@ -449,7 +452,7 @@ async def test_socket_connect_and_post_dispatch_failures_have_distinct_phases() 
     transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
     try:
         with pytest.raises(TransportError) as post_dispatch:
-            await transport.send(Request("profile"), attempt_timeout=1)
+            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
         assert post_dispatch.value.phase is FailurePhase.DISPATCH_STARTED
     finally:
         await transport.aclose()
@@ -459,10 +462,53 @@ async def test_socket_connect_and_post_dispatch_failures_have_distinct_phases() 
     dead_transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
     try:
         with pytest.raises(TransportError) as not_dispatched:
-            await dead_transport.send(Request("profile"), attempt_timeout=0.2)
+                await dead_transport.send(Request("profile"), attempt_timeout=0.2, max_response_bytes=1024)
         assert not_dispatched.value.phase is FailurePhase.NOT_DISPATCHED
     finally:
         await dead_transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transport_enforces_decompressed_response_byte_ceiling_and_closes_response() -> None:
+    observed: list[httpx.Response] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(HTTP_OK, request=request, content=b'{"result":"too large"}')
+        observed.append(response)
+        return response
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpxTransport("https://example.invalid/rest/1/redacted/", client=client)
+    try:
+        with pytest.raises(ResponseTooLargeError, match="byte ceiling"):
+            await transport.send(
+                Request("profile", replay_safety=ReplaySafety.SAFE),
+                attempt_timeout=1,
+                max_response_bytes=SMALL_RESPONSE_CEILING,
+            )
+        assert transport.host == "example.invalid"
+        assert observed[0].is_closed
+    finally:
+        await transport.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_oversized_response_after_unknown_dispatch_is_ambiguous() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(HTTP_OK, request=request, content=b'{"result":"too large"}')
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
+    try:
+        with pytest.raises(AmbiguousExecutionError, match="oversized response"):
+            await Executor(transport).execute(
+                Request("crm.deal.add", replay_safety=ReplaySafety.UNKNOWN),
+                policy=ExecutionPolicy(max_response_bytes=SMALL_RESPONSE_CEILING),
+            )
+    finally:
+        await transport.aclose()
+        await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -510,7 +556,7 @@ async def test_no_trace_post_dispatch_error_classes_have_conservative_minimum_ph
     transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
     try:
         with pytest.raises(TransportError) as captured:
-            await transport.send(Request("profile"), attempt_timeout=1)
+            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
         assert captured.value.phase is FailurePhase.DISPATCH_STARTED
         assert captured.value.possible_acceptance is True
     finally:
@@ -536,7 +582,7 @@ async def test_transport_error_drops_credentialed_httpx_exception_and_request_lo
     transport = HttpxTransport(f"https://example.invalid/rest/1/{sensitive_fragment}/", client=client)
     try:
         with pytest.raises(TransportError) as captured:
-            await transport.send(Request("profile"), attempt_timeout=1)
+            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
 
         error = captured.value
         assert error.__cause__ is None
@@ -562,7 +608,7 @@ async def test_transport_cancellation_drops_httpx_traceback_and_request_locals()
     blocking = CancellationTransport()
     client = httpx.AsyncClient(transport=blocking)
     transport = HttpxTransport(f"https://example.invalid/rest/1/{sensitive_fragment}/", client=client)
-    task = asyncio.create_task(transport.send(Request("profile"), attempt_timeout=1))
+    task = asyncio.create_task(transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024))
     try:
         await blocking.entered.wait()
         task.cancel("caller cancelled")
@@ -604,7 +650,7 @@ async def test_socket_partial_body_failure_is_classified_after_headers() -> None
     transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
     try:
         with pytest.raises(TransportError) as captured:
-            await transport.send(Request("profile"), attempt_timeout=1)
+            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
         assert captured.value.phase is FailurePhase.BODY_PARTIALLY_RECEIVED
         assert captured.value.possible_acceptance is True
     finally:
@@ -631,7 +677,7 @@ async def test_out_of_range_socket_status_is_typed_and_drops_webhook_locals() ->
     transport = HttpxTransport(f"http://{host}:{port}/rest/1/{sensitive_fragment}/")
     try:
         with pytest.raises(ProtocolError, match="outside the valid range") as captured:
-            await transport.send(Request("profile"), attempt_timeout=1)
+            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
 
         error = captured.value
         assert error.__cause__ is None

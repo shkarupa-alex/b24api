@@ -27,6 +27,7 @@ from b24api.error import (
     FailurePhase,
     HTTPGatewayError,
     ProtocolError,
+    ResponseTooLargeError,
     RetryApiResponseError,
     TransportError,
 )
@@ -122,7 +123,18 @@ class Transport(Protocol):
     cooperates with cancellation or returns within ``attempt_timeout``.
     """
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+    @property
+    def host(self) -> str:
+        """Return the normalized portal host without credentials."""
+        ...
+
+    async def send(
+        self,
+        request: Request,
+        *,
+        attempt_timeout: float,
+        max_response_bytes: int,
+    ) -> WireResponse:
         """Send one transport request attempt."""
         ...
 
@@ -144,6 +156,40 @@ class _PhaseTracker:
             self.phase = FailurePhase.BODY_PARTIALLY_RECEIVED
 
 
+@dataclass(frozen=True, slots=True)
+class _BodyReadOutcome:
+    body: bytes | None = None
+    cancellation_args: tuple[object, ...] | None = None
+    transport_failure: str | None = None
+    too_large: bool = False
+
+
+async def _read_bounded_body(response: httpx.Response, maximum: int) -> _BodyReadOutcome:
+    """Consume decoded bytes without propagating credential-bearing HTTPX exceptions."""
+    body = bytearray()
+    try:
+        async for chunk in response.aiter_bytes():
+            if len(body) + len(chunk) > maximum:
+                return _BodyReadOutcome(too_large=True)
+            body.extend(chunk)
+    except asyncio.CancelledError as error:
+        return _BodyReadOutcome(cancellation_args=error.args)
+    except (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.DecodingError):
+        return _BodyReadOutcome(transport_failure="Transport failed while reading the response body")
+    except httpx.TransportError:
+        return _BodyReadOutcome(transport_failure="Unclassified transport failure while reading the response body")
+    except httpx.RequestError:
+        return _BodyReadOutcome(transport_failure="HTTP client failed while reading the response body")
+    return _BodyReadOutcome(body=bytes(body))
+
+
+def _normalized_webhook_host(webhook_url: str) -> str:
+    parsed = httpx.URL(webhook_url)
+    if parsed.host is None:
+        raise ValueError("webhook URL must contain a host")
+    return parsed.host
+
+
 class HttpxTransport:
     """HTTPX transport with conservative failure-phase classification."""
 
@@ -151,6 +197,7 @@ class HttpxTransport:
         """Initialize instance state."""
         if not webhook_url.endswith("/"):
             webhook_url += "/"
+        normalized_host = _normalized_webhook_host(webhook_url)
         resolved_client = client
         client_initialization_failed = False
         if resolved_client is None:
@@ -168,11 +215,25 @@ class HttpxTransport:
         self._client = cast("httpx.AsyncClient", resolved_client)
         self._owns_client = client is None
         self._closed = False
+        self._host = normalized_host
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:  # noqa: C901
+    @property
+    def host(self) -> str:
+        """Return the normalized portal host without credentials."""
+        return self._host
+
+    async def send(  # noqa: C901, PLR0912, PLR0915
+        self,
+        request: Request,
+        *,
+        attempt_timeout: float,
+        max_response_bytes: int,
+    ) -> WireResponse:
         """Send one transport request attempt."""
         if self._closed:
             raise RuntimeError("transport is closed")
+        if isinstance(max_response_bytes, bool) or max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be a positive integer")
         tracker = _PhaseTracker()
         failure: tuple[str, FailurePhase] | None = None
         cancellation_args: tuple[object, ...] | None = None
@@ -191,7 +252,7 @@ class HttpxTransport:
                 "write": attempt_timeout,
                 "pool": attempt_timeout,
             }
-            response = await self._client.send(http_request)
+            response = await self._client.send(http_request, stream=True)
         except asyncio.CancelledError as error:
             cancellation_args = error.args
             http_request = None
@@ -227,16 +288,38 @@ class HttpxTransport:
             http_request = None
             message, phase = failure
             raise TransportError(message, phase=phase, request_summary=request.summary)
-        status_code = response.status_code
-        if not _HTTP_STATUS_MINIMUM <= status_code <= _HTTP_STATUS_MAXIMUM:
+        pending_error: B24ApiError | None = None
+        body_outcome = _BodyReadOutcome()
+        try:
+            status_code = response.status_code
+            if not _HTTP_STATUS_MINIMUM <= status_code <= _HTTP_STATUS_MAXIMUM:
+                pending_error = ProtocolError("HTTP response status is outside the valid range")
+                headers: tuple[tuple[str, str], ...] = ()
+            else:
+                headers = tuple(response.headers.multi_items())
+                tracker.phase = FailurePhase.BODY_PARTIALLY_RECEIVED
+                body_outcome = await _read_bounded_body(response, max_response_bytes)
+        finally:
+            await response.aclose()
             del response
             http_request = None
-            raise ProtocolError("HTTP response status is outside the valid range")
-        headers = tuple(response.headers.multi_items())
-        body = response.content
-        del response
-        http_request = None
-        return WireResponse(status_code=status_code, headers=headers, body=body)
+        if body_outcome.cancellation_args is not None:
+            raise asyncio.CancelledError(*body_outcome.cancellation_args)
+        if body_outcome.transport_failure is not None:
+            raise TransportError(
+                body_outcome.transport_failure,
+                phase=tracker.phase,
+                request_summary=request.summary,
+            )
+        if body_outcome.too_large:
+            raise ResponseTooLargeError(
+                "Decompressed response body exceeded the configured byte ceiling",
+                request_summary=request.summary,
+            )
+        if pending_error is not None:
+            raise pending_error
+        tracker.phase = FailurePhase.RESPONSE_COMPLETE
+        return WireResponse(status_code=status_code, headers=headers, body=cast("bytes", body_outcome.body))
 
     async def aclose(self) -> None:
         """Close owned asynchronous resources."""
@@ -808,7 +891,11 @@ class Executor:
                     await context.reserve_attempt(attempts_for_request=attempts, retry_started=retry_started)
                     try:
                         async with asyncio.timeout(remaining):
-                            wire = await self.transport.send(request, attempt_timeout=remaining)
+                            wire = await self.transport.send(
+                                request,
+                                attempt_timeout=remaining,
+                                max_response_bytes=context.policy.max_response_bytes,
+                            )
                     except TimeoutError as error:
                         raise TransportError(
                             "Transport attempt exceeded its elapsed budget",
@@ -865,6 +952,12 @@ class Executor:
         wire: WireResponse | None = None,
     ) -> None:
         safety = request.replay_safety or ReplaySafety.UNKNOWN
+        if isinstance(error, ResponseTooLargeError) and safety is not ReplaySafety.SAFE:
+            raise AmbiguousExecutionError(
+                "Request may have executed before its oversized response was rejected",
+                request_summary=request.summary,
+                evidence=error.evidence,
+            ) from error
         if isinstance(error, TransportError) and error.possible_acceptance and safety is not ReplaySafety.SAFE:
             raise AmbiguousExecutionError(
                 "Request may have executed; automatic replay is forbidden",

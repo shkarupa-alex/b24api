@@ -71,9 +71,9 @@ class AsyncFunctionTransport:
         self.handler = handler
         self.requests: list[Request] = []
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Send one transport request attempt."""
-        del attempt_timeout
+        del attempt_timeout, max_response_bytes
         self.requests.append(request)
         outcome = self.handler(request)
         if asyncio.iscoroutine(outcome):
@@ -90,9 +90,9 @@ class BlockingTransport:
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Send one transport request attempt."""
-        del request, attempt_timeout
+        del request, attempt_timeout, max_response_bytes
         self.started.set()
         try:
             return await asyncio.Future[WireResponse]()
@@ -481,8 +481,8 @@ async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
         def __init__(self) -> None:
             self.requests: list[Request] = []
 
-        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
-            del attempt_timeout
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            del attempt_timeout, max_response_bytes
             self.requests.append(request)
             if len(self.requests) == 1:
                 return WireResponse(503, (), b"gateway")
@@ -1244,8 +1244,8 @@ async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_
     returned = asyncio.Event()
 
     class CancellationResistantTransport:
-        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
-            del request, attempt_timeout
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            del request, attempt_timeout, max_response_bytes
             started.set()
             try:
                 await asyncio.Future[None]()
@@ -1303,8 +1303,8 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
     release = asyncio.Event()
 
     class CancellationResistantTransport:
-        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
-            del attempt_timeout
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            del attempt_timeout, max_response_bytes
             if request.method == "bad":
                 await slow_started.wait()
                 return WireResponse(200, (), b"{")
@@ -1345,8 +1345,8 @@ async def test_closed_batch_worker_exits_after_transport_temporarily_resists_can
     release = asyncio.Event()
 
     class CancellationResistantTransport:
-        async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
-            del attempt_timeout
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            del attempt_timeout, max_response_bytes
             started.set()
             while not release.is_set():
                 try:

@@ -117,10 +117,17 @@ class DeterministicPortal(Transport):
         self._oracle_reads += 1
         return content_sha256(self._identities)
 
-    async def send(self, request: Request, *, attempt_timeout: float) -> WireResponse:
+    @property
+    def host(self) -> str:
+        """Return the synthetic credential-free portal host."""
+        return "model.invalid"
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Send one transport request attempt."""
         if attempt_timeout <= 0:
             raise AssertionError("model received an invalid attempt timeout")
+        if max_response_bytes <= 0:
+            raise AssertionError("model received an invalid response byte ceiling")
         self.requests += 1
         if request.method == MODEL_METHOD:
             envelope = self._page_envelope(request.copy_parameters())
@@ -249,7 +256,6 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
         max_requests=1_000,
         max_pages=1_000,
         max_elapsed=120,
-        max_tracked_identities=20_000,
     )
     stream = iter_list(
         executor,
@@ -323,6 +329,7 @@ async def _run_fixed_1x_batch_case(case: ModelCase, *, portal: DeterministicPort
     head_wire = await portal.send(
         Request(MODEL_METHOD, {"start": 0}, ReplaySafety.SAFE),
         attempt_timeout=120,
+        max_response_bytes=16 * 1024 * 1024,
     )
     head = json.loads(head_wire.body)
     rows = list(head["result"])
@@ -336,6 +343,7 @@ async def _run_fixed_1x_batch_case(case: ModelCase, *, portal: DeterministicPort
         batch_wire = await portal.send(
             Request("batch", {"halt": True, "cmd": commands}, ReplaySafety.SAFE),
             attempt_timeout=120,
+            max_response_bytes=16 * 1024 * 1024,
         )
         batch_requests += 1
         batch = json.loads(batch_wire.body)["result"]["result"]
@@ -392,7 +400,6 @@ async def _run_counted_batch_case(
         max_pages=1_000,
         max_elapsed=120,
         max_buffered_rows=2_500,
-        max_tracked_identities=20_000,
     )
     context = executor.context(policy)
     driver = PaginationDriver(
