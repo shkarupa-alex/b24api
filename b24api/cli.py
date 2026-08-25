@@ -17,7 +17,7 @@ from b24api import (
     TerminalState,
     TraversalAssurance,
 )
-from b24api.cli_contract import CliUsageError, default_contract, list_stream, read_json_source
+from b24api.cli_contract import CliUsageError, cli_request, default_contract, list_stream, read_json_source
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -86,8 +86,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _call(args: argparse.Namespace, params: dict[str, object], stdout: TextIO) -> None:
-    request = Request(args.method, params, ReplaySafety(args.replay_safety))
+async def _call(args: argparse.Namespace, request: Request, stdout: TextIO) -> None:
     async with Bitrix24() as client:
         result = await client.call_response(request) if args.raw else await client.call(request)
     _write_json(stdout, _response_json(result) if isinstance(result, Response) else result)
@@ -95,7 +94,7 @@ async def _call(args: argparse.Namespace, params: dict[str, object], stdout: Tex
 
 async def _list(
     args: argparse.Namespace,
-    params: dict[str, object],
+    request: Request,
     contract: dict[str, object],
     stdout: TextIO,
     stderr: TextIO,
@@ -103,9 +102,8 @@ async def _list(
     async with Bitrix24() as client:
         stream = list_stream(
             client,
-            method=args.method,
+            request=request,
             strategy=args.strategy,
-            params=params,
             contract=contract,
         )
         primary: BaseException | None = None
@@ -151,10 +149,12 @@ def main(  # noqa: PLR0911 - stable process-code boundary
         args = _parser().parse_args(argv)
         params = read_json_source(args.params, label="parameters", stdin=input_stream)
         if args.command == "call":
-            asyncio.run(_call(args, params, output_stream))
+            request = cli_request(args.method, params, ReplaySafety(args.replay_safety))
+            asyncio.run(_call(args, request, output_stream))
         else:
             contract = default_contract(args.strategy, args.contract, input_stream)
-            asyncio.run(_list(args, params, contract, output_stream, error_stream))
+            request = cli_request(args.method, params, ReplaySafety.SAFE)
+            asyncio.run(_list(args, request, contract, output_stream, error_stream))
     except KeyboardInterrupt:
         return _INTERRUPTED
     except SystemExit as error:

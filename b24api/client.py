@@ -12,12 +12,7 @@ from b24api.contracts.dispatch import BatchDispatch, DirectDispatch, DispatchSpe
 from b24api.contracts.policy import ExecutionPolicy
 from b24api.contracts.request import IdentitySpec, RequestLike, ResultSelector, canonical_request
 from b24api.contracts.response import Response, ResultCollectionShape
-from b24api.contracts.traversal import (
-    CursorSpec,
-    KeysetSpec,
-    OffsetSpec,
-    TraversalSpec,
-)
+from b24api.contracts.traversal import CursorSpec, KeysetSpec, OffsetSpec, TraversalSpec
 from b24api.execution import Executor, HttpxTransport, Transport, await_cleanup_resistant, rearm_cancellation
 from b24api.execution.cleanup import CloseableResource, close_owned_resources
 from b24api.references.facade import reference_stream

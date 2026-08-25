@@ -3,7 +3,7 @@
 from __future__ import annotations
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TextIO, cast
+from typing import TYPE_CHECKING, Literal, NoReturn, TextIO, cast
 
 from b24api import (
     Bitrix24,
@@ -33,6 +33,10 @@ class _DuplicateKeyError(ValueError):
     pass
 
 
+class _NonFiniteNumberError(ValueError):
+    pass
+
+
 def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -42,12 +46,19 @@ def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _reject_non_finite_number(value: str) -> NoReturn:
+    raise _NonFiniteNumberError(f"non-finite JSON number: {value}")
+
+
 def decode_one_object(text: str, *, label: str) -> dict[str, object]:
     """Decode exactly one closed JSON object without duplicate keys."""
-    decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicates)
+    decoder = json.JSONDecoder(
+        object_pairs_hook=_reject_duplicates,
+        parse_constant=_reject_non_finite_number,
+    )
     try:
         value, end = decoder.raw_decode(text.lstrip())
-    except (json.JSONDecodeError, _DuplicateKeyError) as error:
+    except (json.JSONDecodeError, _DuplicateKeyError, _NonFiniteNumberError) as error:
         raise CliUsageError(f"{label} is not valid closed JSON") from error
     leading = len(text) - len(text.lstrip())
     if text[leading + end :].strip():
@@ -55,6 +66,14 @@ def decode_one_object(text: str, *, label: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise CliUsageError(f"{label} must be exactly one JSON object")
     return cast("dict[str, object]", value)
+
+
+def cli_request(method: str, parameters: Mapping[str, object], replay_safety: ReplaySafety) -> Request:
+    """Construct one request while preserving the CLI's local-error boundary."""
+    try:
+        return Request(method, parameters, replay_safety)
+    except (TypeError, ValueError) as error:
+        raise CliUsageError("request method or parameters are invalid") from error
 
 
 def read_json_source(raw: str | None, *, label: str, stdin: TextIO) -> dict[str, object]:
@@ -221,9 +240,8 @@ def _cursor(raw: object) -> CursorSpec:
 def list_stream(
     client: Bitrix24,
     *,
-    method: str,
+    request: Request,
     strategy: str,
-    params: dict[str, object],
     contract: dict[str, object],
 ) -> OperationStream[JsonValue]:
     """Route one closed contract to exactly one public list operation."""
@@ -237,7 +255,6 @@ def list_stream(
     _closed(contract, allowed_by_strategy[strategy], label=f"{strategy} contract")
     selector, page_size = _common(contract, selector_required=strategy in {"keyset", "cursor"})
     identity = _identity(contract.get("identity"), required=strategy in {"counted", "keyset"})
-    request = Request(method, params, ReplaySafety.SAFE)
     if strategy == "sequential":
         return client.iter_list(
             request,
@@ -271,4 +288,4 @@ def list_stream(
     )
 
 
-__all__ = ["CliUsageError", "decode_one_object", "default_contract", "list_stream", "read_json_source"]
+__all__ = ["CliUsageError", "cli_request", "decode_one_object", "default_contract", "list_stream", "read_json_source"]

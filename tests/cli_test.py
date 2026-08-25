@@ -216,7 +216,10 @@ def test_parameter_file_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     assert client.calls[0].request.copy_parameters() == {"ID": 1}
 
 
-@pytest.mark.parametrize("value", ['{"x":1,"x":2}', '{"x":1} {}', "[]", "null", "1"])
+@pytest.mark.parametrize(
+    "value",
+    ['{"x":1,"x":2}', '{"x":1} {}', '{"x":NaN}', '{"x":Infinity}', "[]", "null", "1"],
+)
 def test_parameters_reject_duplicate_trailing_and_non_object_json(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
@@ -225,6 +228,27 @@ def test_parameters_reject_duplicate_trailing_and_non_object_json(
     assert code == _USAGE
     assert stdout == ""
     assert json.loads(stderr)["kind"] == "usage_error"
+
+
+@pytest.mark.parametrize("command", ["call", "list"])
+def test_invalid_method_is_a_local_usage_error_before_client_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    entered = False
+
+    class UnusedClient(_Client):
+        async def __aenter__(self) -> Self:
+            nonlocal entered
+            entered = True
+            return self
+
+    code, stdout, stderr = _run(monkeypatch, UnusedClient(), [command, "bad/method"])
+
+    assert code == _USAGE
+    assert stdout == ""
+    assert json.loads(stderr)["kind"] == "usage_error"
+    assert entered is False
 
 
 def test_sequential_default_is_mechanics_only_and_reports_once(monkeypatch: pytest.MonkeyPatch) -> None:
