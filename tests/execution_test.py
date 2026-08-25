@@ -478,7 +478,7 @@ async def test_transport_enforces_decompressed_response_byte_ceiling_and_closes_
         return response
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    transport = HttpxTransport("https://example.invalid/rest/1/redacted/", client=client)
+    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
     try:
         with pytest.raises(ResponseTooLargeError, match="byte ceiling"):
             await transport.send(
