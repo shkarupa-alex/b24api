@@ -5,31 +5,23 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from b24api.error import BudgetExceededError
-from b24api.models import (
-    BatchFailure,
+from b24api.batch.outcome import BatchFailure
+from b24api.contracts.json import JsonValue
+from b24api.contracts.policy import (
     BudgetCounters,
     CompletionAssurance,
     ExecutionPolicy,
     IdentityCoercion,
-    IdentitySpec,
-    JsonValue,
-    OperationReport,
-    ParameterPath,
-    ReferenceFailure,
-    ReferenceItem,
-    ReferenceRequest,
+    KernelState,
     ReplayDisposition,
-    ReplaySafety,
-    Request,
-    Response,
-    ResultSelector,
     SnapshotState,
-    TerminalState,
-    Violation,
-    ViolationSeverity,
-    inject_controls,
 )
+from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request, ResultSelector
+from b24api.contracts.response import Response, inject_controls
+from b24api.errors import BudgetExceededError
+from b24api.execution.snapshot import KernelReport
+from b24api.references.outcome import ReferenceFailure, ReferenceItem, ReferenceRequest
 
 EXAMPLE_CREDENTIAL = "n1x2y3z4q5w6e7r8"
 TEST_LIMIT = 2
@@ -87,7 +79,7 @@ def test_request_repr_contains_shape_not_values() -> None:
 
     assert EXAMPLE_CREDENTIAL not in repr(request)
     assert "auth" in repr(request)
-    assert request.replay_safety is None
+    assert request.replay_safety is ReplaySafety.UNKNOWN
     assert Request("profile", replay_safety=ReplaySafety.UNKNOWN).replay_safety is ReplaySafety.UNKNOWN
 
 
@@ -96,7 +88,8 @@ def test_response_is_deeply_immutable_and_selectors_are_exact() -> None:
     response = Response(source, total=1, next=1)
     source["tasks"][0]["ID"] = "changed"
 
-    assert response.list_result == [{"ID": "1"}]
+    with pytest.raises(TypeError, match="selected result"):
+        response.list_items(ResultSelector.root())
     selected = response.list_items(ResultSelector(("tasks",)))
     first_item = selected[0]
     assert isinstance(first_item, dict)
@@ -201,8 +194,8 @@ def test_budget_counters_count_attempts_pages_references_and_buffers_before_sche
 
 
 def test_report_is_frozen_and_completion_rejects_blocking_violation() -> None:
-    report = OperationReport(
-        state=TerminalState.COMPLETED,
+    report = KernelReport(
+        state=KernelState.COMPLETED,
         assurance=CompletionAssurance.CALLER_ASSERTED,
         snapshot=SnapshotState.UNVERIFIED,
         emitted_rows=1,
@@ -211,10 +204,10 @@ def test_report_is_frozen_and_completion_rejects_blocking_violation() -> None:
 
     assert report.completed is True
     with pytest.raises(FrozenInstanceError):
-        report.state = TerminalState.FAILED  # type: ignore[misc]
+        report.state = KernelState.FAILED  # type: ignore[misc]
     with pytest.raises(ValueError, match="blocking"):
-        OperationReport(
-            state=TerminalState.COMPLETED,
+        KernelReport(
+            state=KernelState.COMPLETED,
             violations=(
                 Violation(
                     severity=ViolationSeverity.BLOCKING,
@@ -225,27 +218,6 @@ def test_report_is_frozen_and_completion_rejects_blocking_violation() -> None:
         )
 
 
-def test_profile_verified_report_requires_complete_hash_only_provenance() -> None:
-    profile_hash = "a" * 64
-    evidence_hash = "b" * 64
-    report = OperationReport(
-        state=TerminalState.COMPLETED,
-        assurance=CompletionAssurance.PROFILE_VERIFIED,
-        profile_id="crm-item-v1",
-        profile_version=1,
-        profile_applicable=True,
-        profile_source_sha256=profile_hash,
-        profile_evidence_sha256=(evidence_hash,),
-        profile_evidence_candidate_sha="c" * 40,
-    )
-
-    assert report.profile_source_sha256 == profile_hash
-    with pytest.raises(ValueError, match="provenance"):
-        OperationReport(assurance=CompletionAssurance.PROFILE_VERIFIED)
-    with pytest.raises(ValueError, match="profile metadata"):
-        OperationReport(profile_version=1)
-
-
 def test_failure_repr_excludes_request_error_and_payload_values() -> None:
     request = Request("profile", {"auth": EXAMPLE_CREDENTIAL})
     failure = BatchFailure(
@@ -253,7 +225,7 @@ def test_failure_repr_excludes_request_error_and_payload_values() -> None:
         stable_key="_0",
         request=request,
         error={"auth": EXAMPLE_CREDENTIAL},
-        payload={"secret": EXAMPLE_CREDENTIAL},
+        correlation={"secret": EXAMPLE_CREDENTIAL},
     )
 
     assert EXAMPLE_CREDENTIAL not in repr(failure)
@@ -263,7 +235,7 @@ def test_reference_values_hide_correlation_and_detach_mutable_items() -> None:
     request = Request("profile", {"auth": EXAMPLE_CREDENTIAL})
     reference = ReferenceRequest(request, EXAMPLE_CREDENTIAL)
     source = {"rows": [1]}
-    item = ReferenceItem(EXAMPLE_CREDENTIAL, source, payload={"secret": EXAMPLE_CREDENTIAL})
+    item = ReferenceItem(EXAMPLE_CREDENTIAL, source, correlation={"secret": EXAMPLE_CREDENTIAL})
     source["rows"].append(2)
     exposed = item.item
     assert isinstance(exposed, dict)
@@ -278,7 +250,7 @@ def test_reference_values_hide_correlation_and_detach_mutable_items() -> None:
         page_state=TEST_LIMIT,
         partial_rows=1,
         replay_disposition=ReplayDisposition.NOT_ELIGIBLE,
-        payload={"secret": EXAMPLE_CREDENTIAL},
+        correlation={"secret": EXAMPLE_CREDENTIAL},
     )
 
     assert item.item == {"rows": [1]}

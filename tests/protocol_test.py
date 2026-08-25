@@ -1,39 +1,26 @@
 """Tests for structured error precedence and redacted exception evidence."""
 
-from dataclasses import dataclass
-
-import httpx
 from pytest_mock import MockerFixture
 
-from b24api.error import (
+from b24api.contracts.request import Request, summarize_request
+from b24api.errors import (
     AmbiguousExecutionError,
-    AmbiguousOutcomeError,
     ApiResponseError,
     B24ApiError,
     BatchCommandError,
-    BudgetError,
     BudgetExceededError,
     CapabilityError,
     HTTPGatewayError,
     PaginationError,
     ProtocolError,
-    RetryApiResponseError,
-    RetryHTTPStatusError,
     TransportError,
 )
-from b24api.models import summarize_request
-from b24api.protocol import ProtocolCodec
+from b24api.transport.protocol import ProtocolCodec
 
 EXAMPLE_CREDENTIAL = "n1x2y3z4q5w6e7r8"
 WEBHOOK = "https://portal.invalid/" + "rest/1/" + EXAMPLE_CREDENTIAL + "/"
 HTTP_SERVICE_UNAVAILABLE = 503
 HTTP_TOO_MANY_REQUESTS = 429
-
-
-@dataclass
-class _Request:
-    method: str
-    parameters: dict[str, object]
 
 
 def test_structured_body_precedes_http_status_and_preserves_codes() -> None:
@@ -65,7 +52,7 @@ def test_numeric_code_and_retry_classification() -> None:
     assert isinstance(numeric, ApiResponseError)
     assert numeric.original_code == 0
     assert numeric.code == "0"
-    assert isinstance(retryable, RetryApiResponseError)
+    assert isinstance(retryable, ApiResponseError)
     assert retryable.retryable is True
 
 
@@ -104,11 +91,11 @@ def test_success_body_does_not_pay_for_recursive_error_preview(mocker: MockerFix
 
 
 def test_structured_description_and_request_context_are_safe() -> None:
-    request = _Request(method="profile", parameters={"auth": EXAMPLE_CREDENTIAL, "select": ["ID"]})
+    request = Request(method="profile", parameters={"auth": EXAMPLE_CREDENTIAL, "select": ["ID"]})
     error = ApiResponseError(
         code="ACCESS_DENIED",
         description=f"Rejected {WEBHOOK}",
-        request=request,
+        request_summary=request.summary,
         headers={"Authorization": f"Bearer {EXAMPLE_CREDENTIAL}", "x-request-id": "safe-id"},
     )
 
@@ -120,19 +107,7 @@ def test_structured_description_and_request_context_are_safe() -> None:
     assert "/rest/1/" not in rendered
 
 
-def test_retry_http_alias_never_renders_url_or_body_secret() -> None:
-    request = httpx.Request("POST", WEBHOOK + "profile")
-    response = httpx.Response(HTTP_TOO_MANY_REQUESTS, request=request, text=f"retry {EXAMPLE_CREDENTIAL}")
-    error = RetryHTTPStatusError(f"failed at {WEBHOOK}", request=request, response=response)
-
-    rendered = str(error) + repr(error) + repr(error.to_safe_dict())
-    assert EXAMPLE_CREDENTIAL not in rendered
-    assert "/rest/1/" not in rendered
-    assert error.retryable is True
-    assert error.http_status == HTTP_TOO_MANY_REQUESTS
-
-
-def test_complete_error_hierarchy_and_aliases_import() -> None:
+def test_complete_v2_error_hierarchy() -> None:
     assert issubclass(TransportError, B24ApiError)
     assert issubclass(HTTPGatewayError, B24ApiError)
     assert issubclass(ProtocolError, B24ApiError)
@@ -140,8 +115,8 @@ def test_complete_error_hierarchy_and_aliases_import() -> None:
     assert issubclass(BatchCommandError, ApiResponseError)
     assert issubclass(CapabilityError, B24ApiError)
     assert issubclass(PaginationError, B24ApiError)
-    assert BudgetError is BudgetExceededError
-    assert AmbiguousOutcomeError is AmbiguousExecutionError
+    assert issubclass(BudgetExceededError, B24ApiError)
+    assert issubclass(AmbiguousExecutionError, B24ApiError)
     assert TransportError("transport").origin.value == "transport"
     assert CapabilityError("capability").origin.value == "capability"
     assert PaginationError("pagination").origin.value == "pagination"

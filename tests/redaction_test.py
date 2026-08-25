@@ -4,7 +4,9 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from b24api.models import BatchCommandEvidence, RequestSummary, ResponseEvidence, summarize_request
+from b24api.batch.outcome import BatchCommandEvidence
+from b24api.contracts.request import RequestSummary, summarize_request
+from b24api.contracts.response import ResponseEvidence
 from b24api.redaction import REDACTED, TRUNCATED, Redactor
 
 EXAMPLE_CREDENTIAL = "n1x2y3z4q5w6e7r8"

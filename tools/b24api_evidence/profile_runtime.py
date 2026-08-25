@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
+from harness.runtime_profile import run_capability_profile
 
 _PLANS = ("fixed_1x_batch", "counted_batch")
 _DEFAULT_CASES = (
@@ -35,6 +36,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan", choices=_PLANS, action="append")
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--warmups", type=int, default=3)
+    parser.add_argument(
+        "--capability-suite",
+        action="store_true",
+        help="profile direct, 100k logical batch, counted, references, lifecycle, and response ceiling cases",
+    )
     parser.add_argument(
         "--memray-output",
         type=Path,
@@ -134,6 +140,8 @@ def _main() -> None:
     args = _parser().parse_args()
     if args.samples <= 0 or args.warmups < 0:
         raise SystemExit("samples must be positive and warmups cannot be negative")
+    if args.capability_suite and (args.case or args.plan or args.memray_output is not None):
+        raise SystemExit("--capability-suite cannot be combined with --case, --plan, or --memray-output")
     selected = set(args.case or _DEFAULT_CASES)
     cases = tuple(case for case in exact_model_cases() if case.case_id in selected)
     plans = tuple(dict.fromkeys(args.plan or _PLANS))
@@ -150,19 +158,21 @@ def _main() -> None:
         capture_output=True,
         text=True,
     ).stdout.strip()
+    capability = asyncio.run(run_capability_profile()) if args.capability_suite else None
     results: list[dict[str, Any]] = []
-    for case in cases:
-        results.extend(
-            asyncio.run(
-                _measure_pair(
-                    case,
-                    plans=plans,
-                    warmups=args.warmups,
-                    samples=args.samples,
-                    memray_output=args.memray_output,
+    if not args.capability_suite:
+        for case in cases:
+            results.extend(
+                asyncio.run(
+                    _measure_pair(
+                        case,
+                        plans=plans,
+                        warmups=args.warmups,
+                        samples=args.samples,
+                        memray_output=args.memray_output,
+                    ),
                 ),
-            ),
-        )
+            )
     sys.stdout.write(
         json.dumps(
             {
@@ -170,6 +180,7 @@ def _main() -> None:
                 "candidate_sha": candidate_sha,
                 "python": sys.version.split()[0],
                 "results": results,
+                "capability_profile": capability,
             },
             indent=2,
             sort_keys=True,

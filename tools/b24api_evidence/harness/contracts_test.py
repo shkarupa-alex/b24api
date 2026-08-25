@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import signal
+import site
 import subprocess
 import sys
 import time
@@ -22,6 +23,7 @@ import pytest
 
 from . import cli as cli_module
 from . import contracts as contracts_module
+from . import runtime_profile as runtime_profile_module
 from .contracts import (
     FINGERPRINT_ALGORITHM,
     FINGERPRINT_KEY_FORMAT,
@@ -73,7 +75,7 @@ if TYPE_CHECKING:
 ROOT = Path(__file__).resolve().parents[3]
 ENTRYPOINT = ROOT / "tools/b24api_evidence.py"
 PROFILE_ENTRYPOINT = ROOT / "tools/b24api_evidence/profile_runtime.py"
-PROFILE_SET = ROOT / "docs/bitrix24-client-2.0/w0/disposable-entity-profiles.json"
+PROFILE_SET = ROOT / "tools/b24api_evidence/profiles/disposable-entity-profiles.json"
 RUN_ID = "00000000-0000-4000-8000-000000000011"
 LINEAGE_ID = "00000000-0000-4000-8000-000000000012"
 SHA = git_sha(ROOT)
@@ -90,6 +92,7 @@ EXPECTED_STABLE_MODEL_RUNS = 180
 EXPECTED_BENCHMARK_REFS = EXPECTED_STABLE_MODEL_RUNS + 2
 EXPECTED_MODEL_ORACLES = 200
 EXPECTED_SCHEMA_COUNT = 6
+PROFILE_BATCH_BUFFER = 7
 SECOND_CALL = 2
 BUNDLE_OVERFLOW_FILES = 513
 LEAK_FIXTURE = b"https://example.invalid/rest/1/realisticToken123/"
@@ -1735,6 +1738,23 @@ def test_runtime_profile_runner_compares_frozen_and_current_counted_paths() -> N
     assert runs["counted_batch"]["buffered_rows_high_water"] == SMALL_CASE_ROWS
 
 
+@pytest.mark.asyncio
+async def test_capability_profile_runner_enforces_resource_invariants(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime_profile_module, "_SMALL_BATCH", 100)
+    monkeypatch.setattr(runtime_profile_module, "_LARGE_BATCH", 1_000)
+
+    payload = await runtime_profile_module.run_capability_profile()
+
+    assert payload["passed"] is True
+    assert all(payload["invariants"].values())
+    cases = {case["case"]: case for case in payload["cases"]}
+    assert cases["logical-batch-1000"]["buffered_commands_high_water"] == PROFILE_BATCH_BUFFER
+    assert cases["logical-batch-1000"]["source_closed"] is True
+    assert cases["logical-batch-1000"]["correlation_entered_wire"] is False
+    assert cases["repeated-traversal-lifecycle"]["retained_resources"] == 0
+    assert cases["oversized-response"]["refused"] is True
+
+
 def test_deterministic_comparison_proves_fixed_1x_parity_without_claiming_admission() -> None:
     plan = _plan(count=0)
     benchmark_plan = cli_module._default_benchmark_plan(plan)  # noqa: SLF001
@@ -2890,10 +2910,74 @@ def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) 
     wheel = next(tmp_path.glob("*.whl"))
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
+        entry_points_name = next(name for name in names if name.endswith(".dist-info/entry_points.txt"))
+        entry_points = archive.read(entry_points_name).decode("utf-8")
     assert any(name.startswith("b24api/") for name in names)
     assert not any("b24api_evidence" in name or name.startswith("tools/") for name in names)
-    assert not any(name.endswith(("live.py", "cli.py")) for name in names)
+    assert not any(name.endswith("live.py") for name in names)
+    assert "b24api/cli.py" in names
+    assert "b24api/cli_contract.py" in names
     assert not any(name.startswith("b24api/") and name.endswith("_test.py") for name in names)
+    assert "[console_scripts]" in entry_points
+    assert "b24api = b24api.cli:main" in entry_points
+
+    environment = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(tmp_path / "wheel-venv")}
+    subprocess.run(  # noqa: S603 - fixed local uv environment command
+        [
+            uv,
+            "venv",
+            "--python",
+            sys.executable,
+            environment["UV_PROJECT_ENVIRONMENT"],
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(  # noqa: S603 - installs only the local wheel; the test runner supplies locked dependencies
+        [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            environment["UV_PROJECT_ENVIRONMENT"],
+            "--offline",
+            "--no-deps",
+            str(wheel),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    scripts = "Scripts" if os.name == "nt" else "bin"
+    executable = Path(environment["UV_PROJECT_ENVIRONMENT"]) / scripts / ("b24api.exe" if os.name == "nt" else "b24api")
+    python = Path(environment["UV_PROJECT_ENVIRONMENT"]) / scripts / ("python.exe" if os.name == "nt" else "python")
+    environment["PYTHONPATH"] = os.pathsep.join(site.getsitepackages())
+    imported = subprocess.run(  # noqa: S603 - prove import resolution uses the installed wheel
+        [str(python), "-c", "import b24api; print(b24api.__file__)"],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert Path(imported.stdout.strip()).is_relative_to(Path(environment["UV_PROJECT_ENVIRONMENT"]))
+    installed = subprocess.run(  # noqa: S603 - exact installed wheel entry point
+        [str(executable), "--help"],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert installed.stdout.startswith("usage: b24api")
+    assert "Call Bitrix24 methods and stream list rows as JSONL" in installed.stdout
+    assert "execute one method" in installed.stdout
+    assert "stream one list traversal" in installed.stdout
 
 
 def _run_cli(*arguments: str, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

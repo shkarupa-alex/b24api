@@ -76,7 +76,7 @@ if TYPE_CHECKING:
     from typing import BinaryIO
 
 ROOT = Path(__file__).resolve().parents[3]
-PROFILE_SET_PATH = ROOT / "docs/bitrix24-client-2.0/w0/disposable-entity-profiles.json"
+PROFILE_SET_PATH = ROOT / "tools/b24api_evidence/profiles/disposable-entity-profiles.json"
 DEFAULT_ARTIFACT_DIR = Path(".b24api-evidence")
 _ROLE_CHOICES = ("admin_full", "admin_limited", "employee_full", "employee_limited")
 _MODEL_WARMUPS = 1

@@ -1,23 +1,23 @@
-from b24api.query import build_query
+from b24api.batch.engine import _build_query
 
 
 def test_build_query_simple() -> None:
-    query = build_query({"foo": 1, "bar": None, "rest": "abc"})
+    query = _build_query({"foo": 1, "bar": None, "rest": "abc"})
     assert query == "foo=1&rest=abc"
 
 
 def test_build_query_empty() -> None:
-    query = build_query({"none": None, "empty": "", "zero": 0, "list": []})
+    query = _build_query({"none": None, "empty": "", "zero": 0, "list": []})
     assert query == "empty=&zero=0"
 
 
 def test_build_query_list() -> None:
-    query = build_query({"select": ["ID", "TITLE"]})
+    query = _build_query({"select": ["ID", "TITLE"]})
     assert query == "select%5B0%5D=ID&select%5B1%5D=TITLE"
 
 
 def test_build_query_deep() -> None:
-    query = build_query(
+    query = _build_query(
         {
             "user": {
                 "name": "Bob Smith",

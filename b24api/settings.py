@@ -1,10 +1,8 @@
-"""Support settings."""
+"""Environment-backed credential and transport settings."""
 
 from collections.abc import Generator
-from typing import Annotated, Any, Self, cast
+from typing import Any, Self, cast
 
-from fast_depends import Depends
-from httpx import codes
 from pydantic import Field, HttpUrl, TypeAdapter, ValidationError, field_serializer, field_validator
 from pydantic.config import ExtraValues
 from pydantic_core import InitErrorDetails, PydanticCustomError
@@ -37,34 +35,23 @@ def _settings_loading_error() -> SettingsError:
     return SettingsError("Settings loading failed")
 
 
+def _unknown_settings_error(fields: set[str]) -> ValidationError:
+    details: list[InitErrorDetails] = [
+        {
+            "type": PydanticCustomError("settings_field", "Unknown Settings field"),
+            "loc": (field,),
+            "input": _REDACTED,
+        }
+        for field in sorted(fields)
+    ]
+    return ValidationError.from_exception_data("Settings", details)
+
+
 class Settings(BaseSettings):
-    """Environment-backed client settings and optional verified portal context."""
+    """Environment-backed webhook credential and request timeout."""
 
     webhook_url: HttpUrl = Field(repr=False)
-
-    logger_name: str = "b24api"
-
-    http_timeout: int = 30
-
-    retry_statuses: list[int] = [
-        codes.LOCKED,
-        codes.TOO_EARLY,
-        codes.TOO_MANY_REQUESTS,
-        codes.INTERNAL_SERVER_ERROR,
-        codes.BAD_GATEWAY,
-        codes.SERVICE_UNAVAILABLE,
-        codes.INSUFFICIENT_STORAGE,
-    ]
-    retry_errors: list[str] = ["query_limit_exceeded", "operation_time_limit"]
-
-    retry_attempts: int = 5
-    retry_delay: float = 5
-    retry_backoff: float = 2
-
-    list_size: int = 50
-    batch_size: int = Field(default=50, ge=1, le=50)
-    portal_build: str | None = None
-    scopes: frozenset[str] = frozenset()
+    http_timeout: float = Field(default=30.0, gt=0)
 
     model_config = SettingsConfigDict(
         env_prefix="bitrix24_api_",
@@ -77,12 +64,16 @@ class Settings(BaseSettings):
         """Validate without retaining credential-bearing framework traceback frames."""
         validation_failure: ValidationError | None = None
         loading_failed = False
-        try:
-            super().__init__(**data)
-        except ValidationError as error:
-            validation_failure = _settings_validation_error(error)
-        except SettingsError:
-            loading_failed = True
+        unknown = set(data) - {"webhook_url", "http_timeout"}
+        if unknown:
+            validation_failure = _unknown_settings_error(unknown)
+        else:
+            try:
+                super().__init__(**data)
+            except ValidationError as error:
+                validation_failure = _settings_validation_error(error)
+            except SettingsError:
+                loading_failed = True
         data.clear()
         if validation_failure is not None:
             raise validation_failure
@@ -229,6 +220,3 @@ def api_settings(**kwargs: Any) -> Settings:  # noqa: ANN401
     if loading_failed:
         raise _settings_loading_error()
     return cast("Settings", result)
-
-
-ApiSettings = Annotated[Settings, Depends(api_settings)]
