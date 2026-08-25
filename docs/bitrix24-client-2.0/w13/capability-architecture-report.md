@@ -2,7 +2,7 @@
 
 Date: 2026-08-25
 
-Runtime candidate: `f073092e66d560ef41053245e5861d42776f56ba`
+Runtime candidate: `8aff7e82a481e88b58619f106a78501602a0afb8`
 
 Frozen pre-refactor comparator: `e5fd427eddb28b7079b75bfef6443c04aa6350d1`
 
@@ -101,7 +101,8 @@ in tests.
 - `Bitrix24` is a composition facade; algorithms remain in batch/traversal/reference layers.
 - Contracts import no I/O layer; transport imports no batch/traversal/reference layer; runtime
   imports no evidence tooling.
-- CLI imports the root contracts and its closed contract router, never execution drivers.
+- CLI validates non-finite JSON, method syntax and the complete closed list contract before client
+  construction; it imports the root contracts and its closed contract router, never execution drivers.
 - Production contains no Tasks/CRM/IM catalog and no mutable global registry.
 - Root exports contain only the frozen v2 facade, contracts, outcomes, helpers and errors.
 - Old wrappers, shape-changing flags, public plans/profiles, tuple payload input, top-level
@@ -124,10 +125,13 @@ The exact measurements, commands and allocation-site interpretation are in
   10,000-command peak and correlation never entered wire JSON.
 - Exact counted identity tracking above 100,000 rows continues in memory and warns once. There is
   no database, spill file or artificial identity-count failure.
-- Memray 1.20.0 measured a 5,121,382-byte dense-10k peak. Immutable JSON thawing is the largest
+- Memray 1.20.0 measured a 5,121,452-byte dense-10k peak. Immutable JSON thawing is the largest
   cumulative client allocation site; no retained stream/task resource or leak was observed.
 - Response buffering, decoded-row ceilings, active-reference bounds and 100-iteration retention
   gates passed.
+- The fresh deterministic benchmark published 200 model oracles and 182 immutable evidence
+  references in 208 evidence files (plus the persistent transaction lock), left zero pending
+  markers and passed a separate `_scan_bundle` invocation on the exact runtime SHA.
 
 ## Known boundaries and intentional non-preservation
 

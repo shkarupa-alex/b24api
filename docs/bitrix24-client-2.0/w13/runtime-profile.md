@@ -2,7 +2,7 @@
 
 Date: 2026-08-25
 
-Runtime candidate: `f073092e66d560ef41053245e5861d42776f56ba`
+Runtime candidate: `8aff7e82a481e88b58619f106a78501602a0afb8`
 
 Frozen pre-refactor comparison: `e5fd427eddb28b7079b75bfef6443c04aa6350d1`
 
@@ -43,16 +43,16 @@ Selected traced measurements:
 
 | Case | Rows/events | Requests | High-water | Wall | CPU | Peak Python allocation |
 |---|---:|---:|---:|---:|---:|---:|
-| direct call | 1 | 1 | — | 2.3 ms | 2.2 ms | 57,558 B |
-| logical batch 10k, buffer 7 | 10,000 | 1,429 | 7 commands | 2.38 s | 1.81 s | 295,761 B |
-| logical batch 100k, buffer 7 | 100,000 | 14,286 | 7 commands | 23.46 s | 17.63 s | 266,238 B |
-| counted 19 | 19 | 1 | 19 rows | 13.8 ms | 12.7 ms | 2,056,776 B |
-| counted 500 | 500 | 2 | 450 rows | 50.9 ms | 36.9 ms | 2,056,776 B |
-| counted dense 10k | 10,000 | 5 | 2,500 rows | 747 ms | 492 ms | 3,766,045 B |
-| counted uniform-sparse 10k | 10,000 | 5 | 2,500 rows | 758 ms | 510 ms | 3,779,583 B |
-| references, INPUT order | 16 events | 16 | 1 row / 2 active | 36.1 ms | 14.2 ms | 90,094 B |
-| 110 repeated traversals | 0 | 110 | — | 71.6 ms | 64.8 ms | 102,276 B |
-| oversized response refusal | — | 1 | 64 KiB + chunk | 1.2 ms | 1.2 ms | 108,343 B |
+| direct call | 1 | 1 | — | 3.3 ms | 2.7 ms | 57,672 B |
+| logical batch 10k, buffer 7 | 10,000 | 1,429 | 7 commands | 2.49 s | 1.86 s | 292,393 B |
+| logical batch 100k, buffer 7 | 100,000 | 14,286 | 7 commands | 24.50 s | 18.40 s | 288,353 B |
+| counted 19 | 19 | 1 | 19 rows | 13.8 ms | 12.8 ms | 2,056,776 B |
+| counted 500 | 500 | 2 | 450 rows | 54.2 ms | 38.2 ms | 2,056,776 B |
+| counted dense 10k | 10,000 | 5 | 2,500 rows | 738 ms | 497 ms | 3,767,635 B |
+| counted uniform-sparse 10k | 10,000 | 5 | 2,500 rows | 747 ms | 503 ms | 3,781,277 B |
+| references, INPUT order | 16 events | 16 | 1 row / 2 active | 35.8 ms | 14.4 ms | 89,554 B |
+| 110 repeated traversals | 0 | 110 | — | 74.0 ms | 67.6 ms | 88,286 B |
+| oversized response refusal | — | 1 | 64 KiB + chunk | 1.2 ms | 1.2 ms | 108,292 B |
 
 Traced wall/CPU values include `tracemalloc` overhead and are resource-characterization figures,
 not user-facing throughput claims.
@@ -65,11 +65,11 @@ hashes and physical request counts were identical in every cell.
 
 | Case | Requests base → current | Wall ratio R1 | Wall ratio R2 | CPU ratio R1 | CPU ratio R2 |
 |---|---:|---:|---:|---:|---:|
-| 19 | 1 → 1 | 0.994 | 1.003 | 0.977 | 1.005 |
-| 500 | 2 → 2 | 1.078 | 1.010 | 1.080 | 0.997 |
-| dense 10k | 5 → 5 | 1.032 | 1.017 | 1.034 | 1.014 |
-| uniform-sparse 10k | 5 → 5 | 1.024 | 1.029 | 1.027 | 1.033 |
-| clustered-sparse 10k | 5 → 5 | 1.031 | 1.012 | 1.039 | 1.013 |
+| 19 | 1 → 1 | 0.990 | 1.017 | 0.994 | 1.011 |
+| 500 | 2 → 2 | 1.017 | 0.967 | 1.028 | 0.966 |
+| dense 10k | 5 → 5 | 1.008 | 0.995 | 1.014 | 0.995 |
+| uniform-sparse 10k | 5 → 5 | 1.026 | 1.001 | 1.034 | 1.001 |
+| clustered-sparse 10k | 5 → 5 | 1.037 | 1.005 | 1.038 | 1.005 |
 
 No cell reproduced a regression above 10%. The refactor therefore satisfies its local stable
 performance gate. This does not replace live portal A/B evidence.
@@ -95,7 +95,7 @@ sequential offset traversal, not claims of improvement over the already-batched 
 
 Memray 1.20.0 recorded seven dense-10k counted samples after two warm-ups:
 
-- peak memory: 5,121,382 bytes;
+- peak memory: 5,121,452 bytes;
 - no retained stream/task resources;
 - largest cumulative Python allocation site: immutable JSON thawing in
   `b24api/contracts/json.py`;

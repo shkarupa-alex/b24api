@@ -311,8 +311,10 @@ b24api list example.item.list --strategy counted --contract @counted-contract.js
 ```
 
 Advanced list contracts are closed JSON `version: 1` documents. Counted requires identity; keyset
-requires selector, identity and keyset; cursor requires selector and cursor. Unknown/duplicate keys,
-trailing JSON and control collisions reject locally. `b24api --help` documents the compact surface.
+requires selector, identity and keyset; cursor requires selector and cursor. Invalid method syntax,
+non-finite JSON numbers, unknown/duplicate keys, trailing JSON and control collisions reject
+locally. The complete contract is validated before client construction. `b24api --help` documents
+the compact surface.
 
 Exit codes are `0` success, `2` usage/contract error, `3` unavailable configuration, `4`
 remote/protocol/correctness/incomplete failure, `5` broken output consumer and `130` cancellation.
