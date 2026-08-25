@@ -9,23 +9,32 @@ import pytest
 
 from b24api.client import Bitrix24
 from b24api.contracts import (
+    BatchDispatch,
+    Binding,
     Command,
     CommandFailure,
     CommandNotExecuted,
     CommandSuccess,
     CursorSpec,
+    DeliveryOrder,
+    DirectDispatch,
     IdentityCoercion,
     IdentitySpec,
     KeysetSpec,
     ParameterPath,
+    ParameterUpdate,
+    ReferenceComplete,
+    ReferenceFailure,
+    ReferenceItem,
     ReplaySafety,
     Request,
     ResultCollectionShape,
     ResultSelector,
+    SequentialTraversal,
     TerminalState,
     TraversalAssurance,
 )
-from b24api.error import BatchFailed, IncompleteTraversalError, InputSourceError
+from b24api.error import BatchFailed, IncompleteTraversalError, InputSourceError, ReferenceFailed
 from b24api.execution import Executor, Transport, WireResponse
 from b24api.settings import Settings
 
@@ -43,6 +52,11 @@ SMALL_BATCH_COMMANDS = 5
 FAIL_FAST_WINDOW = 4
 FAIL_FAST_HALTED = 3
 PARTIAL_WINDOW = 2
+REFERENCE_BINDINGS = 2
+REFERENCE_EVENTS = 4
+FANOUT_COMMANDS = 60
+FANOUT_BATCH_SIZE = 10
+FANOUT_BATCH_REQUESTS = 6
 
 
 class FunctionTransport:
@@ -228,6 +242,210 @@ async def test_batch_source_failure_does_not_dispatch_partial_window_and_closes_
     assert transport.requests == []
     assert stream.report is not None
     assert stream.report.not_executed == PARTIAL_WINDOW
+
+
+@pytest.mark.asyncio
+async def test_bound_references_apply_nested_updates_off_wire_and_emit_exact_completion() -> None:
+    correlations = [["owner-private", 1], ["owner-private", 2]]
+
+    def handler(request: Request) -> object:
+        parameters = request.copy_parameters()
+        assert "owner-private" not in json.dumps(parameters)
+        filters = parameters["filter"]
+        assert isinstance(filters, dict)
+        owner = filters["OWNER"]
+        assert isinstance(owner, int)
+        return {"result": [] if parameters["start"] else [{"ID": owner * 10}]}
+
+    transport = FunctionTransport(handler)
+    stream = _client(transport).iter_references(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        [
+            Binding(
+                f"owner-{owner}",
+                (ParameterUpdate(ParameterPath(("filter", "OWNER")), owner),),
+                correlations[owner - 1],
+            )
+            for owner in (1, 2)
+        ],
+        traversal=SequentialTraversal(identity=_identity()),
+        dispatch=DirectDispatch(concurrency=2, output_order=DeliveryOrder.INPUT),
+    )
+
+    events = [event async for event in stream]
+
+    assert [type(event) for event in events] == [ReferenceItem, ReferenceComplete] * 2
+    items = [event for event in events if isinstance(event, ReferenceItem)]
+    completions = [event for event in events if isinstance(event, ReferenceComplete)]
+    assert [item.item for item in items] == [{"ID": 10}, {"ID": 20}]
+    assert all(item.correlation is correlations[item.binding_index] for item in items)
+    assert all(complete.row_count == 1 for complete in completions)
+    assert "owner-private" not in repr(items[0])
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.admitted == REFERENCE_BINDINGS
+    assert stream.report.emitted == REFERENCE_EVENTS
+    assert stream.report.successes == REFERENCE_BINDINGS
+    assert stream.report.active_references_high_water == REFERENCE_BINDINGS
+
+
+@pytest.mark.asyncio
+async def test_binding_collision_rejects_before_reference_io() -> None:
+    transport = FunctionTransport(lambda _request: pytest.fail("binding collision must reject before I/O"))
+    stream = _client(transport).iter_references(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        [Binding("bad", (ParameterUpdate(ParameterPath(("start",)), 100),), object())],
+        traversal=SequentialTraversal(),
+    )
+
+    with pytest.raises(InputSourceError):
+        await anext(stream)
+
+    assert transport.requests == []
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_tolerant_reference_failure_has_no_false_completion_and_later_binding_runs() -> None:
+    def handler(request: Request) -> object:
+        parameters = request.copy_parameters()
+        filters = parameters["filter"]
+        assert isinstance(filters, dict)
+        owner = filters["OWNER"]
+        if owner == 1:
+            return {"error": "denied", "error_description": "no access"}
+        return {"result": []}
+
+    stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        [
+            Binding(
+                f"owner-{owner}",
+                (ParameterUpdate(ParameterPath(("filter", "OWNER")), owner),),
+                owner,
+            )
+            for owner in (1, 2)
+        ],
+        traversal=SequentialTraversal(),
+        dispatch=DirectDispatch(concurrency=1, output_order=DeliveryOrder.INPUT),
+    )
+
+    events = [event async for event in stream]
+
+    assert isinstance(events[0], ReferenceFailure)
+    assert events[0].binding_index == 0
+    assert isinstance(events[1], ReferenceComplete)
+    assert events[1].binding_index == 1
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert stream.report.failures == 1
+    assert stream.report.successes == 1
+
+
+@pytest.mark.asyncio
+async def test_fail_fast_reference_raises_bounded_reference_failed() -> None:
+    transport = FunctionTransport(lambda _request: {"error": "denied", "error_description": "no access"})
+    stream = _client(transport).iter_references(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        [Binding("one", (), {"private": True})],
+        traversal=SequentialTraversal(),
+        dispatch=DirectDispatch(concurrency=1),
+    )
+
+    with pytest.raises(ReferenceFailed) as captured:
+        await anext(stream)
+
+    assert len(captured.value.outcomes) == 1
+    assert isinstance(captured.value.outcomes[0], ReferenceFailure)
+    assert stream.report is captured.value.report
+
+
+@pytest.mark.asyncio
+async def test_direct_fanout_preserves_full_response_without_treating_it_as_traversal() -> None:
+    transport = FunctionTransport(
+        lambda request: {
+            "result": [request.copy_parameters()["value"]],
+            "total": 100,
+            "next": 50,
+        },
+    )
+    correlations = [{"private": index} for index in range(3)]
+    stream = _client(transport).fan_out(
+        [
+            Command(
+                Request("test.get", {"value": index}, ReplaySafety.SAFE),
+                correlations[index],
+            )
+            for index in range(3)
+        ],
+        dispatch=DirectDispatch(concurrency=2, output_order=DeliveryOrder.INPUT),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert [outcome.result for outcome in outcomes] == [[0], [1], [2]]
+    assert [outcome.response.total for outcome in outcomes] == [100, 100, 100]
+    assert [outcome.response.next for outcome in outcomes] == [50, 50, 50]
+    assert all(outcome.correlation is correlations[outcome.index] for outcome in outcomes)
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.active_references_high_water == REFERENCE_BINDINGS
+
+
+@pytest.mark.asyncio
+async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlation() -> None:
+    def handler(request: Request) -> object:
+        assert request.method == "batch"
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: {"key": key} for key in commands},
+                "result_error": {},
+            },
+        }
+
+    transport = FunctionTransport(handler)
+    stream = _client(transport).fan_out(
+        [Command(Request("test.get", {"value": index}, ReplaySafety.SAFE), index) for index in range(FANOUT_COMMANDS)],
+        dispatch=BatchDispatch(
+            batch_size=FANOUT_BATCH_SIZE,
+            concurrency=2,
+            output_order=DeliveryOrder.READY,
+        ),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert sorted(outcome.index for outcome in outcomes) == list(range(FANOUT_COMMANDS))
+    assert sorted(outcome.correlation for outcome in outcomes) == list(range(FANOUT_COMMANDS))
+    assert len(transport.requests) == FANOUT_BATCH_REQUESTS
+    assert stream.report is not None
+    assert stream.report.batch_requests == FANOUT_BATCH_REQUESTS
+    assert stream.report.batch_commands == FANOUT_COMMANDS
+
+
+@pytest.mark.asyncio
+async def test_tolerant_fanout_continues_after_one_direct_failure() -> None:
+    def handler(request: Request) -> object:
+        value = request.copy_parameters()["value"]
+        if value == 1:
+            return {"error": "denied", "error_description": "no access"}
+        return {"result": value}
+
+    stream = _client(FunctionTransport(handler)).fan_out_outcomes(
+        [Command(Request("test.get", {"value": index}, ReplaySafety.SAFE), index) for index in range(3)],
+        dispatch=DirectDispatch(concurrency=2, output_order=DeliveryOrder.INPUT),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert isinstance(outcomes[0], CommandSuccess)
+    assert isinstance(outcomes[1], CommandFailure)
+    assert isinstance(outcomes[2], CommandSuccess)
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
 
 
 def test_injected_transport_host_must_match_settings_before_io() -> None:

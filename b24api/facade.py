@@ -1470,7 +1470,7 @@ async def _legacy_reference_items(
 
 
 def _legacy_reference_value(
-    outcome: ReferenceItem | ReferenceFailure,
+    outcome: object,
     *,
     with_payload: bool,
 ) -> JsonValue | tuple[JsonValue, object]:

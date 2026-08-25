@@ -283,6 +283,7 @@ class BatchDispatch:
     """Explicit bounded batch dispatch."""
 
     batch_size: int = 50
+    concurrency: int = 1
     output_order: ReferenceOutputOrder = ReferenceOutputOrder.READY
     fallback_failed: Literal["none", "direct"] = "none"
 
@@ -290,6 +291,8 @@ class BatchDispatch:
         """Validate and normalize instance state."""
         if not _is_plain_int(self.batch_size) or not 1 <= self.batch_size <= PORTAL_BATCH_CAP:
             raise ValueError("batch_size must be between 1 and 50")
+        if not _is_plain_int(self.concurrency) or self.concurrency < 1:
+            raise ValueError("batch concurrency must be positive")
         if not isinstance(self.output_order, ReferenceOutputOrder):
             raise TypeError("output_order must be a ReferenceOutputOrder")
         if self.fallback_failed not in {"none", "direct"}:

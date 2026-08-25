@@ -54,10 +54,9 @@ from b24api.plans import (
 )
 
 type ReferenceSource = Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]
-type ReferenceStreamItem = ReferenceItem | ReferenceFailure
 _MISSING = object()
 _SYNC_EXHAUSTED = object()
-_BATCH_COALESCE_IDLE_TURNS = 4
+_BATCH_COALESCE_IDLE_TURNS = 16
 
 
 @runtime_checkable
@@ -87,6 +86,7 @@ class _Reservation:
 class _PageEvent:
     work: _Work
     items: tuple[JsonValue, ...]
+    response: Response
     item_weights: tuple[int, ...]
     unique_mask: tuple[bool, ...]
     violations: tuple[Violation, ...]
@@ -97,6 +97,7 @@ class _PageEvent:
 @dataclass(frozen=True, slots=True)
 class _DoneEvent:
     work: _Work
+    row_count: int
     violations: tuple[Violation, ...]
 
 
@@ -112,6 +113,29 @@ class _FailureEvent:
 
 
 type _Event = _PageEvent | _DoneEvent | _FailureEvent
+
+
+@dataclass(frozen=True, slots=True)
+class _KernelReferenceComplete:
+    work_index: int
+    reference: ReferenceRequest
+    row_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _KernelFanOutSuccess:
+    work_index: int
+    reference: ReferenceRequest
+    response: Response
+
+
+type ReferenceStreamItem = ReferenceItem | ReferenceFailure | _KernelReferenceComplete | _KernelFanOutSuccess
+
+
+class _ReferenceWindowError(Exception):
+    def __init__(self, failure: ReferenceFailure) -> None:
+        self.failure = failure
+        super().__init__("reference traversal window failed")
 
 
 @dataclass(slots=True)
@@ -299,6 +323,7 @@ class _BatchPageDispatcher:
             maxsize=context.policy.max_active_references,
         )
         self._worker: asyncio.Task[None] | None = None
+        self._workers: tuple[asyncio.Task[None], ...] = ()
         self._closed = False
         self.batch_requests = 0
         self.batch_commands = 0
@@ -307,7 +332,9 @@ class _BatchPageDispatcher:
         if self._closed:
             raise RuntimeError("batch page dispatcher is closed")
         if self._worker is None:
-            self._worker = asyncio.create_task(self._run())
+            concurrency = min(self.plan.concurrency, self.context.policy.max_active_references)
+            self._workers = tuple(asyncio.create_task(self._run()) for _index in range(concurrency))
+            self._worker = self._workers[0]
         reservation = await self.context.reserve_page(reference=reference_id)
         future: asyncio.Future[Response] = asyncio.get_running_loop().create_future()
         pending = _PendingBatch(request, reference_id, future)
@@ -392,23 +419,26 @@ class _BatchPageDispatcher:
             if stop_requested:
                 return
 
-    async def aclose(self) -> None:
+    async def aclose(self) -> None:  # noqa: C901 - closes every independently owned batch worker
         if self._closed:
             return
         self._closed = True
         if self._worker is None:
             return
-        if not self._worker.done():
-            self._worker.cancel()
+        for worker in self._workers:
+            if not worker.done():
+                worker.cancel()
         try:
             await asyncio.sleep(0)
-            if not self._worker.done():
+            active = tuple(worker for worker in self._workers if not worker.done())
+            if active:
                 remaining = max(0.0, self.context.policy.max_elapsed - self.context.elapsed)
-                done, _ = await asyncio.wait((self._worker,), timeout=remaining)
-                if not done:
+                _, pending_workers = await asyncio.wait(active, timeout=remaining)
+                if pending_workers:
                     raise BudgetExceededError("batch dispatcher cleanup exceeded operation time budget")
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._worker
+            for worker in self._workers:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await worker
         finally:
             while True:
                 try:
@@ -437,6 +467,9 @@ class ReferenceScheduler:
         tolerant: bool,
         policy: ExecutionPolicy,
         whole_result: bool = False,
+        emit_complete: bool = False,
+        emit_response: bool = False,
+        capture_fail_fast: bool = False,
         page_cap_hint: int | None = None,
     ) -> None:
         """Initialize instance state."""
@@ -448,6 +481,9 @@ class ReferenceScheduler:
         self.output_order = output_order
         self.tolerant = tolerant
         self.whole_result = whole_result
+        self.emit_complete = emit_complete
+        self.emit_response = emit_response
+        self.capture_fail_fast = capture_fail_fast
         self.context = executor.context(policy)
         self.page_cap = _page_cap(
             plan,
@@ -467,6 +503,7 @@ class ReferenceScheduler:
         self.violations: list[Violation] = []
         self._delivery_uniqueness: dict[int, tuple[ReferenceItem, bool]] = {}
         self._source_controller: AsyncIteratorController[ReferenceRequest] | None = None
+        self.active_references_high_water = 0
 
     async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912
         """Yield correlated operation outcomes."""
@@ -591,6 +628,7 @@ class ReferenceScheduler:
                 queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue(maxsize=1)
                 admission.queues[work.index] = queue
                 admission.tasks[work.index] = asyncio.create_task(self._run_reference(work, queue))
+                self.active_references_high_water = max(self.active_references_high_water, len(admission.tasks))
                 admission.changed.set()
         finally:
             admission.changed.set()
@@ -636,6 +674,7 @@ class ReferenceScheduler:
                     _PageEvent(
                         work,
                         page.items,
+                        page.response,
                         page.item_weights,
                         driver.last_page_unique_mask,
                         page_violations,
@@ -649,7 +688,7 @@ class ReferenceScheduler:
             if reservation is not None:
                 await self.buffer.abort(reservation)
                 reservation = None
-            await output.put(_DoneEvent(work, tuple(driver.violations[violation_offset:])))
+            await output.put(_DoneEvent(work, partial_rows, tuple(driver.violations[violation_offset:])))
         except asyncio.CancelledError:
             raise
         except _BatchPageError as error:
@@ -737,6 +776,11 @@ class ReferenceScheduler:
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
         if isinstance(event, _PageEvent):
             try:
+                if self.emit_response:
+                    yield _KernelFanOutSuccess(event.work.index, event.work.reference, event.response)
+                    for weight in event.item_weights:
+                        await self.buffer.release(event.reservation, weight)
+                    return
                 for item, weight, is_unique in zip(
                     event.items,
                     event.item_weights,
@@ -756,8 +800,24 @@ class ReferenceScheduler:
                     event.acknowledged.set_result(None)
             return
         if isinstance(event, _DoneEvent):
+            if self.emit_complete:
+                yield _KernelReferenceComplete(event.work.index, event.work.reference, event.row_count)
             return
+        request = event.work.reference.request
+        failure = ReferenceFailure(
+            event.work.reference.reference_key,
+            request,
+            event.error,
+            cursor=event.cursor,
+            page_state=event.page_state,
+            partial_rows=event.partial_rows,
+            replay_safety=request.replay_safety or ReplaySafety.UNKNOWN,
+            replay_disposition=event.replay_disposition,
+            payload=event.work.reference.payload,
+        )
         if not self.tolerant:
+            if self.capture_fail_fast:
+                raise _ReferenceWindowError(failure)
             raise event.error
         self.violations.append(
             Violation(
@@ -766,19 +826,7 @@ class ReferenceScheduler:
                 message="one reference produced a typed failure outcome",
             ),
         )
-        request = event.work.reference.request
-        safety = request.replay_safety or ReplaySafety.UNKNOWN
-        yield ReferenceFailure(
-            event.work.reference.reference_key,
-            request,
-            event.error,
-            cursor=event.cursor,
-            page_state=event.page_state,
-            partial_rows=event.partial_rows,
-            replay_safety=safety,
-            replay_disposition=event.replay_disposition,
-            payload=event.work.reference.payload,
-        )
+        yield failure
 
     def record_delivery(self, item: ReferenceItem) -> bool:
         """Record one delivered reference item."""
@@ -837,6 +885,11 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
         return self
+
+    @property
+    def active_references_high_water(self) -> int:
+        """Return the bounded scheduler admission high-water mark."""
+        return self._scheduler.active_references_high_water
 
     async def __anext__(self) -> ReferenceStreamItem:
         """Return the next asynchronous item."""
@@ -1087,6 +1140,9 @@ def iter_references(  # noqa: PLR0913
     tolerant: bool = False,
     policy: ExecutionPolicy | None = None,
     _whole_result: bool = False,
+    _emit_complete: bool = False,
+    _emit_response: bool = False,
+    _capture_fail_fast: bool = False,
     _page_cap_hint: int | None = None,
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
     _profile_id: str | None = None,
@@ -1117,6 +1173,9 @@ def iter_references(  # noqa: PLR0913
         tolerant=tolerant,
         policy=policy or ExecutionPolicy(),
         whole_result=_whole_result,
+        emit_complete=_emit_complete,
+        emit_response=_emit_response,
+        capture_fail_fast=_capture_fail_fast,
         page_cap_hint=_page_cap_hint,
     )
     return ReferenceStream(
@@ -1289,6 +1348,9 @@ __all__ = [
     "ReferenceSource",
     "ReferenceStream",
     "ReferenceStreamItem",
+    "_KernelFanOutSuccess",
+    "_KernelReferenceComplete",
+    "_ReferenceWindowError",
     "fan_out",
     "iter_references",
 ]

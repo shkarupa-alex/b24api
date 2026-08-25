@@ -46,6 +46,7 @@ def _public_report(  # noqa: PLR0913
     not_executed: int,
     unknown: int,
     buffered_commands_high_water: int,
+    active_references_high_water: int,
     early_closed: bool = False,
 ) -> OperationReport:
     state = TerminalState.EARLY_CLOSED if early_closed else _terminal_state(report.state, failures=failures)
@@ -69,6 +70,7 @@ def _public_report(  # noqa: PLR0913
         cooldown_seconds=report.cooldown_seconds,
         buffered_commands_high_water=buffered_commands_high_water,
         buffered_rows_high_water=report.buffered_rows_high_water,
+        active_references_high_water=active_references_high_water,
         violations=report.violations,
     )
 
@@ -101,6 +103,7 @@ class MappedOperationStream[S, T]:
         classify: Callable[[T], str] | None = None,
         error_mapper: Callable[[BaseException, OperationReport], BaseException] | None = None,
         error_items: Callable[[BaseException], Iterable[T]] | None = None,
+        count_admitted: Callable[[T], bool] | None = None,
         deregister: Callable[[MappedOperationStream[S, T]], None] | None = None,
     ) -> None:
         """Initialize without starting or prefetching the source."""
@@ -111,6 +114,7 @@ class MappedOperationStream[S, T]:
         self._classify = classify
         self._error_mapper = error_mapper
         self._error_items = error_items
+        self._count_admitted = count_admitted
         self._deregister = deregister
         self._report: OperationReport | None = None
         self._pull: asyncio.Task[S] | None = None
@@ -142,7 +146,7 @@ class MappedOperationStream[S, T]:
         """Close owned work on context exit."""
         await self.aclose()
 
-    async def __anext__(self) -> T:
+    async def __anext__(self) -> T:  # noqa: C901 - lifecycle and outcome finalization are one transition
         """Pull exactly one source item and map it."""
         if self._terminated:
             if self._early_closed:
@@ -165,7 +169,8 @@ class MappedOperationStream[S, T]:
             await self._close_source()
             if self._error_items is not None:
                 for item in self._error_items(error):
-                    self._admitted += 1
+                    if self._count_admitted is None or self._count_admitted(item):
+                        self._admitted += 1
                     self._record_variant(item)
             forced = TerminalState.INCOMPLETE if isinstance(error, IncompleteTraversalError) else TerminalState.FAILED
             self._finalize(forced_state=forced)
@@ -178,7 +183,8 @@ class MappedOperationStream[S, T]:
         finally:
             self._pull = None
         item = await _resolve(self._mapper(source_item))
-        self._admitted += 1
+        if self._count_admitted is None or self._count_admitted(item):
+            self._admitted += 1
         self._emitted += 1
         self._record_variant(item)
         return item
@@ -226,6 +232,8 @@ class MappedOperationStream[S, T]:
 
     def _record_variant(self, item: T) -> None:
         variant = self._classify(item) if self._classify is not None else "success"
+        if variant == "item":
+            return
         if variant == "success":
             self._successes += 1
         elif variant == "failure":
@@ -251,6 +259,7 @@ class MappedOperationStream[S, T]:
             not_executed=self._not_executed,
             unknown=self._unknown,
             buffered_commands_high_water=getattr(self._source, "buffered_commands_high_water", 0),
+            active_references_high_water=getattr(self._source, "active_references_high_water", 0),
             early_closed=self._early_closed,
         )
         if forced_state is not None and report.state is not forced_state:

@@ -10,6 +10,7 @@ from typing import Literal, Self, cast
 from b24api._stream import MappedOperationStream
 from b24api.batch_v2 import LogicalBatchKernelStream, _BatchWindowError
 from b24api.contracts import (
+    BatchDispatch,
     Command,
     CommandFailure,
     CommandNotExecuted,
@@ -17,21 +18,36 @@ from b24api.contracts import (
     CommandOutcomeUnknown,
     CommandSuccess,
     CursorSpec,
+    DirectDispatch,
+    DispatchSpec,
     ExecutionPolicy,
     IdentitySpec,
     JsonValue,
     KeysetSpec,
     OffsetSpec,
     OperationStream,
+    ReferenceEvent,
+    ReferenceOutcome,
     ReplaySafety,
     Request,
     Response,
     ResultCollectionShape,
     ResultSelector,
     TraversalAssurance,
+    TraversalSpec,
 )
 from b24api.error import BatchFailed, InputSourceError
 from b24api.execution import Executor, HttpxTransport, Transport
+from b24api.fanout_v2 import (
+    CommandSource as FanOutCommandSource,
+)
+from b24api.fanout_v2 import (
+    _fanout_error,
+    _fanout_error_items,
+    _fanout_variant,
+    _FanOutMapper,
+    kernel_fanout_stream,
+)
 from b24api.models import DuplicatePolicy, IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.pagination import _MappingValuesResultSelector
 from b24api.pagination import iter_list as _iter_list
@@ -45,6 +61,15 @@ from b24api.plans import (
     OffsetSequentialPlan,
     OffsetTerminalRule,
 )
+from b24api.reference_v2 import (
+    BindingSource,
+    _reference_error,
+    _reference_error_items,
+    _reference_terminal,
+    _reference_variant,
+    _ReferenceEventMapper,
+    kernel_reference_stream,
+)
 from b24api.settings import Settings, api_settings
 from b24api.traversal_counted import CountedItemStream
 
@@ -54,6 +79,8 @@ type _PublicStream = MappedOperationStream[object, object]
 _ROOT_SELECTOR = ResultSelector.root()
 _DEFAULT_OFFSET = OffsetSpec()
 _DEFAULT_KEYSET = KeysetSpec()
+_DEFAULT_REFERENCE_DISPATCH = BatchDispatch()
+_DEFAULT_FANOUT_DISPATCH = DirectDispatch()
 
 
 def _canonical_request(raw: RequestLike) -> Request:
@@ -270,6 +297,70 @@ class Bitrix24:
         )
         self._streams.add(cast("_PublicStream", stream))
         return cast("OperationStream[CommandOutcome[C]]", stream)
+
+    def fan_out[C](
+        self,
+        commands: FanOutCommandSource[C],
+        *,
+        dispatch: DispatchSpec = _DEFAULT_FANOUT_DISPATCH,
+        policy: ExecutionPolicy | None = None,
+    ) -> OperationStream[CommandSuccess[C]]:
+        """Dispatch independent commands fail-fast with explicit delivery order."""
+        return cast(
+            "OperationStream[CommandSuccess[C]]",
+            self._fanout_stream(commands, dispatch=dispatch, policy=policy, tolerant=False),
+        )
+
+    def fan_out_outcomes[C](
+        self,
+        commands: FanOutCommandSource[C],
+        *,
+        dispatch: DispatchSpec = _DEFAULT_FANOUT_DISPATCH,
+        policy: ExecutionPolicy | None = None,
+    ) -> OperationStream[CommandOutcome[C]]:
+        """Dispatch independent commands and retain every correlated terminal state."""
+        return self._fanout_stream(commands, dispatch=dispatch, policy=policy, tolerant=True)
+
+    def iter_references[C](
+        self,
+        request: RequestLike,
+        bindings: BindingSource[C],
+        *,
+        traversal: TraversalSpec,
+        dispatch: DispatchSpec = _DEFAULT_REFERENCE_DISPATCH,
+        policy: ExecutionPolicy | None = None,
+    ) -> OperationStream[ReferenceEvent[C]]:
+        """Traverse bound references fail-fast with explicit completion events."""
+        return cast(
+            "OperationStream[ReferenceEvent[C]]",
+            self._reference_stream(
+                request,
+                bindings,
+                traversal=traversal,
+                dispatch=dispatch,
+                policy=policy,
+                tolerant=False,
+            ),
+        )
+
+    def iter_reference_outcomes[C](
+        self,
+        request: RequestLike,
+        bindings: BindingSource[C],
+        *,
+        traversal: TraversalSpec,
+        dispatch: DispatchSpec = _DEFAULT_REFERENCE_DISPATCH,
+        policy: ExecutionPolicy | None = None,
+    ) -> OperationStream[ReferenceOutcome[C]]:
+        """Traverse bound references while retaining each correlated terminal state."""
+        return self._reference_stream(
+            request,
+            bindings,
+            traversal=traversal,
+            dispatch=dispatch,
+            policy=policy,
+            tolerant=True,
+        )
 
     def iter_list(  # noqa: PLR0913
         self,
@@ -494,6 +585,77 @@ class Bitrix24:
         if not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= ceiling:
             raise ValueError("batch_size must be within 1..50 and the command buffer ceiling")
         return effective_policy, size
+
+    def _reference_stream[C](  # noqa: PLR0913
+        self,
+        request: RequestLike,
+        bindings: BindingSource[C],
+        *,
+        traversal: TraversalSpec,
+        dispatch: DispatchSpec,
+        policy: ExecutionPolicy | None,
+        tolerant: bool,
+    ) -> OperationStream[ReferenceOutcome[C]]:
+        self._require_open()
+        effective_policy = policy or self._default_policy
+        source = kernel_reference_stream(
+            self._executor,
+            _canonical_request(request),
+            bindings,
+            traversal=traversal,
+            dispatch=dispatch,
+            policy=effective_policy,
+            tolerant=tolerant,
+        )
+        mapper = _ReferenceEventMapper()
+        stream = MappedOperationStream(
+            source,
+            mapper,
+            operation="iter_reference_outcomes" if tolerant else "iter_references",
+            classify=_reference_variant,
+            error_mapper=lambda error, report: _reference_error(error, report, mapper),
+            error_items=lambda error: _reference_error_items(error, mapper),
+            count_admitted=_reference_terminal,
+            deregister=self._discard_stream,
+        )
+        self._streams.add(cast("_PublicStream", stream))
+        return cast("OperationStream[ReferenceOutcome[C]]", stream)
+
+    def _fanout_stream[C](
+        self,
+        commands: FanOutCommandSource[C],
+        *,
+        dispatch: DispatchSpec,
+        policy: ExecutionPolicy | None,
+        tolerant: bool,
+    ) -> OperationStream[CommandOutcome[C]]:
+        self._require_open()
+        effective_policy = policy or self._default_policy
+        source = kernel_fanout_stream(
+            self._executor,
+            commands,
+            dispatch=dispatch,
+            policy=effective_policy,
+            tolerant=tolerant,
+        )
+        mapper = _FanOutMapper()
+        item_mapper = (mapper) if tolerant else (lambda event: _require_command_success(mapper(event)))
+        stream = MappedOperationStream(
+            source,
+            item_mapper,
+            operation="fan_out_outcomes" if tolerant else "fan_out",
+            classify=_fanout_variant,
+            error_mapper=lambda error, report: _fanout_error(
+                error,
+                report,
+                mapper,
+                tolerant=tolerant,
+            ),
+            error_items=lambda error: _fanout_error_items(error, mapper),
+            deregister=self._discard_stream,
+        )
+        self._streams.add(cast("_PublicStream", stream))
+        return cast("OperationStream[CommandOutcome[C]]", stream)
 
     def _discard_stream(self, stream: object) -> None:
         self._streams.discard(cast("_PublicStream", stream))
