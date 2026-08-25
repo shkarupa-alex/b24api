@@ -154,8 +154,9 @@ class BatchExecutor:
         tolerant: bool,
         fallback_failed: Literal["none", "direct"],
         context: ExecutionContext,
+        halt: bool | None = None,
     ) -> tuple[BatchOutcome, ...]:
-        request = _batch_request(commands, halt=not tolerant)
+        request = _batch_request(commands, halt=not tolerant if halt is None else halt)
         try:
             response = await self.executor.execute(request, context=context, work_class=WorkClass.BATCH)
             envelope = _decode_batch_envelope(response.result)

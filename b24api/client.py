@@ -4,11 +4,18 @@
 
 from __future__ import annotations
 import weakref
-from collections.abc import Mapping
+from collections.abc import AsyncIterable, Iterable, Mapping
 from typing import Literal, Self, cast
 
 from b24api._stream import MappedOperationStream
+from b24api.batch_v2 import LogicalBatchKernelStream, _BatchWindowError
 from b24api.contracts import (
+    Command,
+    CommandFailure,
+    CommandNotExecuted,
+    CommandOutcome,
+    CommandOutcomeUnknown,
+    CommandSuccess,
     CursorSpec,
     ExecutionPolicy,
     IdentitySpec,
@@ -23,6 +30,7 @@ from b24api.contracts import (
     ResultSelector,
     TraversalAssurance,
 )
+from b24api.error import BatchFailed, InputSourceError
 from b24api.execution import Executor, HttpxTransport, Transport
 from b24api.models import DuplicatePolicy, IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.pagination import _MappingValuesResultSelector
@@ -85,6 +93,38 @@ def _collection_selector(selector: ResultSelector, shape: ResultCollectionShape)
     if shape is ResultCollectionShape.SEQUENCE:
         return selector
     return _MappingValuesResultSelector(selector.path)
+
+
+def _batch_outcome_variant(outcome: CommandOutcome[object]) -> str:
+    if isinstance(outcome, CommandSuccess):
+        return "success"
+    if isinstance(outcome, CommandFailure):
+        return "failure"
+    if isinstance(outcome, CommandNotExecuted):
+        return "not_executed"
+    if isinstance(outcome, CommandOutcomeUnknown):
+        return "unknown"
+    raise TypeError("batch stream emitted an unknown command outcome")
+
+
+def _require_command_success(outcome: CommandOutcome[object]) -> CommandSuccess[object]:
+    if not isinstance(outcome, CommandSuccess):
+        raise TypeError("fail-fast batch kernel emitted a negative outcome")
+    return outcome
+
+
+def _batch_error_items(error: BaseException) -> tuple[CommandOutcome[object], ...]:
+    if isinstance(error, _BatchWindowError):
+        return error.outcomes
+    return ()
+
+
+def _fail_fast_batch_error(error: BaseException, report: object) -> BaseException:
+    if isinstance(error, _BatchWindowError):
+        return BatchFailed(error.outcomes, report=report)
+    if isinstance(error, InputSourceError):
+        return BatchFailed((), report=report)
+    return error
 
 
 class Bitrix24:
@@ -175,6 +215,61 @@ class Bitrix24:
         """Execute one request and return its immutable response envelope."""
         self._require_open()
         return await self._executor.execute(_canonical_request(request), policy=policy or self._default_policy)
+
+    def batch[C](
+        self,
+        commands: Iterable[Command[C]] | AsyncIterable[Command[C]],
+        *,
+        batch_size: int | None = None,
+        policy: ExecutionPolicy | None = None,
+    ) -> OperationStream[CommandSuccess[C]]:
+        """Execute an arbitrary logical batch with bounded fail-fast windows."""
+        effective_policy, effective_batch_size = self._batch_parameters(batch_size, policy)
+        source = LogicalBatchKernelStream(
+            self._executor,
+            commands,
+            batch_size=effective_batch_size,
+            fail_fast=True,
+            policy=effective_policy,
+        )
+        stream = MappedOperationStream(
+            source,
+            _require_command_success,
+            operation="batch",
+            classify=_batch_outcome_variant,
+            error_mapper=_fail_fast_batch_error,
+            error_items=_batch_error_items,
+            deregister=self._discard_stream,
+        )
+        self._streams.add(cast("_PublicStream", stream))
+        return cast("OperationStream[CommandSuccess[C]]", stream)
+
+    def batch_outcomes[C](
+        self,
+        commands: Iterable[Command[C]] | AsyncIterable[Command[C]],
+        *,
+        batch_size: int | None = None,
+        policy: ExecutionPolicy | None = None,
+    ) -> OperationStream[CommandOutcome[C]]:
+        """Execute an arbitrary logical batch and retain every correlated state."""
+        effective_policy, effective_batch_size = self._batch_parameters(batch_size, policy)
+        source = LogicalBatchKernelStream(
+            self._executor,
+            commands,
+            batch_size=effective_batch_size,
+            fail_fast=False,
+            policy=effective_policy,
+        )
+        stream = MappedOperationStream(
+            source,
+            lambda outcome: outcome,
+            operation="batch_outcomes",
+            classify=_batch_outcome_variant,
+            error_items=_batch_error_items,
+            deregister=self._discard_stream,
+        )
+        self._streams.add(cast("_PublicStream", stream))
+        return cast("OperationStream[CommandOutcome[C]]", stream)
 
     def iter_list(  # noqa: PLR0913
         self,
@@ -386,6 +481,19 @@ class Bitrix24:
         )
         self._streams.add(cast("_PublicStream", stream))
         return stream
+
+    def _batch_parameters(
+        self,
+        batch_size: int | None,
+        policy: ExecutionPolicy | None,
+    ) -> tuple[ExecutionPolicy, int]:
+        self._require_open()
+        effective_policy = policy or self._default_policy
+        ceiling = min(50, effective_policy.max_buffered_commands)
+        size = ceiling if batch_size is None else batch_size
+        if not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= ceiling:
+            raise ValueError("batch_size must be within 1..50 and the command buffer ceiling")
+        return effective_policy, size
 
     def _discard_stream(self, stream: object) -> None:
         self._streams.discard(cast("_PublicStream", stream))

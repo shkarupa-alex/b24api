@@ -9,6 +9,10 @@ import pytest
 
 from b24api.client import Bitrix24
 from b24api.contracts import (
+    Command,
+    CommandFailure,
+    CommandNotExecuted,
+    CommandSuccess,
     CursorSpec,
     IdentityCoercion,
     IdentitySpec,
@@ -21,17 +25,24 @@ from b24api.contracts import (
     TerminalState,
     TraversalAssurance,
 )
-from b24api.error import IncompleteTraversalError
+from b24api.error import BatchFailed, IncompleteTraversalError, InputSourceError
 from b24api.execution import Executor, Transport, WireResponse
 from b24api.settings import Settings
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncGenerator, Callable
 
 HTTP_OK = 200
 COUNTED_ROWS = 500
 EXPECTED_COUNTED_REQUESTS = 2
 PAGE_SIZE = 50
+LOGICAL_BATCH_COMMANDS = 63
+LOGICAL_BATCH_SIZE = 7
+LOGICAL_BATCH_REQUESTS = 9
+SMALL_BATCH_COMMANDS = 5
+FAIL_FAST_WINDOW = 4
+FAIL_FAST_HALTED = 3
+PARTIAL_WINDOW = 2
 
 
 class FunctionTransport:
@@ -82,6 +93,141 @@ async def test_call_and_call_response_have_stable_detached_types() -> None:
     assert decoded == {"items": [1, 2]}
     assert response.result == decoded
     assert response.result is not decoded
+
+
+@pytest.mark.asyncio
+async def test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_off_wire() -> None:
+    correlations = [["private", index] for index in range(LOGICAL_BATCH_COMMANDS)]
+
+    def handler(request: Request) -> object:
+        parameters = request.copy_parameters()
+        assert parameters["halt"] == 1
+        commands = parameters["cmd"]
+        assert isinstance(commands, dict)
+        serialized = json.dumps(parameters)
+        assert "private" not in serialized
+        return {
+            "result": {
+                "result": {key: {"index": int(key[1:])} for key in commands},
+                "result_error": {},
+            },
+        }
+
+    transport = FunctionTransport(handler)
+    client = _client(transport)
+    stream = client.batch(
+        (
+            Command(Request("test.get", {"index": index}, ReplaySafety.SAFE), correlations[index])
+            for index in range(LOGICAL_BATCH_COMMANDS)
+        ),
+        batch_size=LOGICAL_BATCH_SIZE,
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert [outcome.index for outcome in outcomes] == list(range(LOGICAL_BATCH_COMMANDS))
+    assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+    assert all(outcome.correlation is correlations[outcome.index] for outcome in outcomes)
+    assert "private" not in repr(outcomes[0])
+    assert len(transport.requests) == LOGICAL_BATCH_REQUESTS
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.batch_commands == LOGICAL_BATCH_COMMANDS
+    assert stream.report.buffered_commands_high_water == LOGICAL_BATCH_SIZE
+
+
+@pytest.mark.asyncio
+async def test_batch_outcomes_retains_typed_failure_without_halting_later_commands() -> None:
+    failed_index = 2
+
+    def handler(request: Request) -> object:
+        parameters = request.copy_parameters()
+        assert parameters["halt"] == 0
+        commands = parameters["cmd"]
+        assert isinstance(commands, dict)
+        errors = {
+            key: {"error": "denied", "error_description": "no access"}
+            for key in commands
+            if int(key[1:]) == failed_index
+        }
+        results = {key: int(key[1:]) for key in commands if key not in errors}
+        return {"result": {"result": results, "result_error": errors}}
+
+    stream = _client(FunctionTransport(handler)).batch_outcomes(
+        [Command(Request("test.get", replay_safety=ReplaySafety.SAFE), index) for index in range(SMALL_BATCH_COMMANDS)],
+        batch_size=SMALL_BATCH_COMMANDS,
+    )
+    outcomes = [outcome async for outcome in stream]
+
+    assert isinstance(outcomes[failed_index], CommandFailure)
+    assert all(isinstance(outcome, CommandSuccess) for index, outcome in enumerate(outcomes) if index != failed_index)
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert stream.report.successes == SMALL_BATCH_COMMANDS - 1
+    assert stream.report.failures == 1
+
+
+@pytest.mark.asyncio
+async def test_fail_fast_batch_raises_bounded_window_after_preceding_successes() -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        keys = list(commands)
+        return {
+            "result": {
+                "result": {keys[0]: 0},
+                "result_error": {keys[1]: {"error": "denied", "error_description": "stop"}},
+            },
+        }
+
+    stream = _client(FunctionTransport(handler)).batch(
+        [Command(Request("test.get", replay_safety=ReplaySafety.SAFE), index) for index in range(SMALL_BATCH_COMMANDS)],
+        batch_size=SMALL_BATCH_COMMANDS,
+    )
+
+    first = await anext(stream)
+    with pytest.raises(BatchFailed) as captured:
+        await anext(stream)
+
+    assert isinstance(first, CommandSuccess)
+    assert isinstance(captured.value.outcomes[0], CommandFailure)
+    assert all(isinstance(outcome, CommandNotExecuted) for outcome in captured.value.outcomes[1:])
+    assert len(captured.value.outcomes) == FAIL_FAST_WINDOW
+    assert stream.report is captured.value.report
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.successes == 1
+    assert stream.report.failures == 1
+    assert stream.report.not_executed == FAIL_FAST_HALTED
+
+
+@pytest.mark.asyncio
+async def test_batch_source_failure_does_not_dispatch_partial_window_and_closes_exact_source() -> None:
+    closed = False
+
+    async def commands() -> AsyncGenerator[Command[str]]:
+        nonlocal closed
+        try:
+            yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE), "a")
+            yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE), "b")
+            raise RuntimeError("source broke")
+        finally:
+            closed = True
+
+    transport = FunctionTransport(lambda _request: pytest.fail("partial window must not be dispatched"))
+    stream = _client(transport).batch_outcomes(commands(), batch_size=7)
+
+    first = await anext(stream)
+    second = await anext(stream)
+    with pytest.raises(InputSourceError):
+        await anext(stream)
+
+    assert isinstance(first, CommandNotExecuted)
+    assert isinstance(second, CommandNotExecuted)
+    assert closed
+    assert transport.requests == []
+    assert stream.report is not None
+    assert stream.report.not_executed == PARTIAL_WINDOW
 
 
 def test_injected_transport_host_must_match_settings_before_io() -> None:
