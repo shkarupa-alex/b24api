@@ -169,6 +169,7 @@ async def test_every_readme_python_example_executes_exactly_without_io(monkeypat
         commands = (Command(Request("example.item.get", {"id": value}, ReplaySafety.SAFE), value) for value in (1, 2))
         namespace: dict[str, object] = {
             "client": client,
+            "chat_ids": ("chat-1", "chat-2"),
             "commands": commands,
             "consume": lambda *_args: None,
             "handle": lambda *_args: None,

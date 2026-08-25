@@ -639,6 +639,55 @@ async def test_tolerant_local_binding_failure_emits_not_executed_and_continues()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        DirectDispatch(concurrency=1, output_order=DeliveryOrder.INPUT),
+        BatchDispatch(batch_size=2, concurrency=1, output_order=DeliveryOrder.INPUT),
+    ],
+)
+async def test_reference_source_rejects_uncorrelated_malformed_value_without_fabricating_outcome(
+    dispatch: DirectDispatch | BatchDispatch,
+) -> None:
+    correlation = object()
+
+    def bindings() -> Iterator[Binding[object]]:
+        yield Binding("valid", (), correlation)
+        yield cast("Binding[object]", object())
+
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {"result": []}
+        command_map = request.copy_parameters()["cmd"]
+        assert isinstance(command_map, dict)
+        return {
+            "result": {
+                "result": {key: [] for key in command_map},
+                "result_error": {},
+            },
+        }
+
+    stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        bindings(),
+        traversal=SequentialTraversal(),
+        dispatch=dispatch,
+    )
+
+    outcome = await anext(stream)
+    with pytest.raises(InputSourceError):
+        await anext(stream)
+
+    assert isinstance(outcome, ReferenceComplete)
+    assert outcome.correlation is correlation
+    assert stream.report is not None
+    assert stream.report.admitted == 1
+    assert stream.report.emitted == 1
+    assert stream.report.not_executed == 0
+    assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
 async def test_tolerant_reference_preserves_ambiguous_dispatch_as_unknown() -> None:
     correlation = object()
     transport = AmbiguousTransport(lambda _request: None)

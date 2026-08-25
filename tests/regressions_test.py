@@ -1,4 +1,4 @@
-"""Bounded sampled-issue traceability through the public v2 surface."""
+"""Business regressions exercised through the public client surface."""
 
 from __future__ import annotations
 import json
@@ -98,7 +98,7 @@ def _identity(
 
 
 @pytest.mark.asyncio
-async def test_issue_b1_tolerant_batch_preserves_all_correlated_states() -> None:
+async def test_tolerant_batch_preserves_all_correlated_states() -> None:
     correlations = {name: ["profile-correlation", name] for name in ("success", "failure", "not", "unknown")}
 
     def mixed_handler(request: Request) -> object:
@@ -153,7 +153,7 @@ async def test_issue_b1_tolerant_batch_preserves_all_correlated_states() -> None
 
 
 @pytest.mark.asyncio
-async def test_issue_b2_unknown_write_is_not_replayed_after_dispatch() -> None:
+async def test_unknown_write_is_not_replayed_after_dispatch() -> None:
     transport = FixtureTransport(
         lambda _request: TransportError("response lost", phase=FailurePhase.DISPATCH_STARTED),
     )
@@ -165,7 +165,7 @@ async def test_issue_b2_unknown_write_is_not_replayed_after_dispatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_issue_b3_limit_conflict_rejects_before_network() -> None:
+async def test_limit_conflict_rejects_before_network() -> None:
     transport = FixtureTransport(lambda _request: {"result": []})
     stream = _client(transport).iter_list(
         Request("sample.list", {"LIMIT": 99}, ReplaySafety.SAFE),
@@ -180,7 +180,7 @@ async def test_issue_b3_limit_conflict_rejects_before_network() -> None:
 
 
 @pytest.mark.asyncio
-async def test_issue_b4_async_binding_correlation_and_selector() -> None:
+async def test_async_binding_correlation_and_selector() -> None:
     correlations = [["profile-correlation", owner] for owner in (1, 2)]
     source_closed = False
 
@@ -221,7 +221,7 @@ async def test_issue_b4_async_binding_correlation_and_selector() -> None:
 
 
 @pytest.mark.asyncio
-async def test_issue_b5_counted_stride_uses_observed_head_width() -> None:
+async def test_counted_stride_uses_observed_head_width() -> None:
     identities = tuple(range(1, 6))
     observed_starts: list[int] = []
 
@@ -264,7 +264,7 @@ async def test_issue_b5_counted_stride_uses_observed_head_width() -> None:
 
 
 @pytest.mark.asyncio
-async def test_issue_c1b_distinct_item_filter_order_paths_are_exact() -> None:
+async def test_distinct_item_filter_order_paths_are_exact() -> None:
     sent: list[dict[str, JsonValue]] = []
 
     def handler(request: Request) -> object:
@@ -292,7 +292,7 @@ async def test_issue_c1b_distinct_item_filter_order_paths_are_exact() -> None:
 
 
 @pytest.mark.asyncio
-async def test_issue_c5_repeated_cursor_boundary_is_not_reported_complete() -> None:
+async def test_repeated_cursor_boundary_is_not_reported_complete() -> None:
     transport = FixtureTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 1}]})
     stream = _client(transport).iter_list_cursor(
         Request("sample.list", replay_safety=ReplaySafety.SAFE),
@@ -314,7 +314,7 @@ async def test_issue_c5_repeated_cursor_boundary_is_not_reported_complete() -> N
 
 
 @pytest.mark.asyncio
-async def test_issue_c34_ignored_filter_requires_application_reconciliation() -> None:
+async def test_ignored_filter_requires_application_reconciliation() -> None:
     pages = [[{"ID": 1, "owner": 10}, {"ID": 2, "owner": 20}], []]
     stream = _client(FixtureTransport(lambda _request: {"result": pages.pop(0)})).iter_list(
         Request("sample.list", {"filter": {"owner": 10}}, ReplaySafety.SAFE),
@@ -330,7 +330,7 @@ async def test_issue_c34_ignored_filter_requires_application_reconciliation() ->
 
 
 @pytest.mark.asyncio
-async def test_issue_c35_overmatched_multifield_is_not_claimed_verified() -> None:
+async def test_overmatched_multifield_is_not_claimed_verified() -> None:
     pages = [[{"ID": 1, "email": "a@example.invalid"}, {"ID": 2, "phone": "100"}], []]
     stream = _client(FixtureTransport(lambda _request: {"result": pages.pop(0)})).iter_list(
         Request("sample.list", {"filter": {"has_email": True, "has_phone": True}}, ReplaySafety.SAFE),

@@ -75,7 +75,7 @@ if TYPE_CHECKING:
 ROOT = Path(__file__).resolve().parents[3]
 ENTRYPOINT = ROOT / "tools/b24api_evidence.py"
 PROFILE_ENTRYPOINT = ROOT / "tools/b24api_evidence/profile_runtime.py"
-PROFILE_SET = ROOT / "docs/bitrix24-client-2.0/w0/disposable-entity-profiles.json"
+PROFILE_SET = ROOT / "tools/b24api_evidence/profiles/disposable-entity-profiles.json"
 RUN_ID = "00000000-0000-4000-8000-000000000011"
 LINEAGE_ID = "00000000-0000-4000-8000-000000000012"
 SHA = git_sha(ROOT)
