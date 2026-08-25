@@ -11,7 +11,7 @@ from pydantic import ValidationError
 from b24api import Bitrix24, Settings
 from b24api.settings import api_settings
 
-_WEBHOOK = "https://example.invalid/rest/1/synthetic-token/"
+_WEBHOOK = "https://bitrix24.com/rest/0/test/"
 _TIMEOUT = 17.5
 
 
