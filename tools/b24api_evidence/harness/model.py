@@ -17,7 +17,8 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.request import IdentitySpec, ReplaySafety, Request, ResultSelector
 from b24api.execution import Executor, Transport, WireResponse
-from b24api.plans import (
+from b24api.traversal import PaginationDriver, iter_list
+from b24api.traversal.plans import (
     CountedOffsetPlan,
     KeysetPlan,
     KeysetTerminalRule,
@@ -25,7 +26,6 @@ from b24api.plans import (
     OffsetSequentialPlan,
     OffsetTerminalRule,
 )
-from b24api.traversal import PaginationDriver, iter_list
 
 from .contracts import MAX_MUTATION_RETRIES, content_sha256
 

@@ -367,18 +367,22 @@ runner records request counts, wall/CPU, first-row time, high-water counters and
 
 ```console
 uv run python tools/b24api_evidence/profile_runtime.py --samples 7 --warmups 2
+uv run python tools/b24api_evidence/profile_runtime.py --capability-suite
 ```
 
 Optional Memray captures measure allocations without becoming a runtime dependency:
 
 ```console
-uv run --with memray python -m memray run -o /tmp/b24api.bin \
-  tools/b24api_evidence/profile_runtime.py --case dense-10k --plan counted_batch --samples 1 --warmups 2
+uv run --with memray python tools/b24api_evidence/profile_runtime.py \
+  --case dense-10k --plan counted_batch --samples 7 --warmups 2 \
+  --memray-output /tmp/b24api.bin
 uv run --with memray memray stats /tmp/b24api.bin
 ```
 
 Local deterministic timing is not live portal latency admission. A stable regression requires two
 discarded warm-ups, seven measurements, unchanged request counts and an independent reproduction.
+The latest exact measurements and their interpretation are in
+[`docs/bitrix24-client-2.0/w13/runtime-profile.md`](docs/bitrix24-client-2.0/w13/runtime-profile.md).
 
 ## Verification
 

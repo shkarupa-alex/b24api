@@ -10,11 +10,11 @@ from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
 )
-from b24api.plans import (
+from b24api.traversal.identity import _Page, _request_with_controls
+from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
 )
-from b24api.traversal.identity import _Page, _request_with_controls
 from b24api.traversal.values import _response_items
 
 if TYPE_CHECKING:
@@ -44,7 +44,7 @@ class _CountedBatchMixin:
         if not isinstance(self.plan, CountedOffsetPlan):
             raise TypeError("counted batch traversal requires CountedOffsetPlan")
         if self.plan.mode is not CountedOffsetMode.SEQUENTIAL_NEXT:
-            raise CapabilityError("compatibility counted batch traversal requires the canonical counted plan")
+            raise CapabilityError("counted batch traversal requires the canonical counted mode")
         self.begin_external_validation()
         outcomes: _BatchOutcomeStream | None = None
         try:

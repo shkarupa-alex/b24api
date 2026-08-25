@@ -13,12 +13,6 @@ from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
 )
-from b24api.plans import (
-    DirectDispatch,
-    DispatchPlan,
-    ListPlan,
-    ReferenceOutputOrder,
-)
 from b24api.references.dispatch import (
     ReferenceSource,
     ReferenceStreamItem,
@@ -52,6 +46,12 @@ from b24api.references.support import (
     _wait_for_event,
 )
 from b24api.traversal import PaginationDriver
+from b24api.traversal.plans import (
+    DirectDispatch,
+    DispatchPlan,
+    ListPlan,
+    ReferenceOutputOrder,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator

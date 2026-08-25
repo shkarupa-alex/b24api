@@ -1,4 +1,4 @@
-"""Protocol decoding with structured-body-before-status error precedence."""
+"""Transport decoding with structured-body-before-status error precedence."""
 
 from __future__ import annotations
 import json

@@ -1,10 +1,8 @@
 """Tests for structured error precedence and redacted exception evidence."""
 
-from dataclasses import dataclass
-
 from pytest_mock import MockerFixture
 
-from b24api.contracts.request import summarize_request
+from b24api.contracts.request import Request, summarize_request
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
@@ -17,18 +15,12 @@ from b24api.errors import (
     ProtocolError,
     TransportError,
 )
-from b24api.protocol import ProtocolCodec
+from b24api.transport.protocol import ProtocolCodec
 
 EXAMPLE_CREDENTIAL = "n1x2y3z4q5w6e7r8"
 WEBHOOK = "https://portal.invalid/" + "rest/1/" + EXAMPLE_CREDENTIAL + "/"
 HTTP_SERVICE_UNAVAILABLE = 503
 HTTP_TOO_MANY_REQUESTS = 429
-
-
-@dataclass
-class _Request:
-    method: str
-    parameters: dict[str, object]
 
 
 def test_structured_body_precedes_http_status_and_preserves_codes() -> None:
@@ -99,11 +91,11 @@ def test_success_body_does_not_pay_for_recursive_error_preview(mocker: MockerFix
 
 
 def test_structured_description_and_request_context_are_safe() -> None:
-    request = _Request(method="profile", parameters={"auth": EXAMPLE_CREDENTIAL, "select": ["ID"]})
+    request = Request(method="profile", parameters={"auth": EXAMPLE_CREDENTIAL, "select": ["ID"]})
     error = ApiResponseError(
         code="ACCESS_DENIED",
         description=f"Rejected {WEBHOOK}",
-        request=request,
+        request_summary=request.summary,
         headers={"Authorization": f"Bearer {EXAMPLE_CREDENTIAL}", "x-request-id": "safe-id"},
     )
 

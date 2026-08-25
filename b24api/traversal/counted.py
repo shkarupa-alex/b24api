@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
     from b24api.contracts.response import ResponseEvidence
     from b24api.execution import Executor
-    from b24api.plans import CountedOffsetPlan
+    from b24api.traversal.plans import CountedOffsetPlan
 
 
 def _attach_report(error: BaseException, report: KernelReport) -> None:

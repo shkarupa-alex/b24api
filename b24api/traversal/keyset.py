@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
     from b24api.contracts.json import JsonValue
     from b24api.contracts.request import ParameterPath
-    from b24api.plans import (
+    from b24api.traversal.plans import (
         KeysetPlan,
     )
 

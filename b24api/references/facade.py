@@ -31,10 +31,20 @@ from b24api.contracts.traversal import (
     TraversalSpec,
 )
 from b24api.errors import AmbiguousExecutionError, B24ApiError, CapabilityError, InputSourceError, ReferenceFailed
-from b24api.plans import (
+from b24api.references.binding import BindingSource, _BindingContext, _BindingSourceError, binding_source
+from b24api.references.dispatch import (
+    _KernelReferenceComplete,
+    _ReferenceWindowError,
+)
+from b24api.references.outcome import ReferenceFailure as KernelFailure
+from b24api.references.outcome import ReferenceItem as KernelItem
+from b24api.references.stream import (
+    iter_references as _iter_references,
+)
+from b24api.traversal.plans import (
     BatchDispatch as KernelBatchDispatch,
 )
-from b24api.plans import (
+from b24api.traversal.plans import (
     CountedOffsetPlan,
     CursorTerminalRule,
     DispatchPlan,
@@ -47,18 +57,8 @@ from b24api.plans import (
     OffsetTerminalRule,
     ReferenceOutputOrder,
 )
-from b24api.plans import (
+from b24api.traversal.plans import (
     DirectDispatch as KernelDirectDispatch,
-)
-from b24api.references.binding import BindingSource, _BindingContext, _BindingSourceError, binding_source
-from b24api.references.dispatch import (
-    _KernelReferenceComplete,
-    _ReferenceWindowError,
-)
-from b24api.references.outcome import ReferenceFailure as KernelFailure
-from b24api.references.outcome import ReferenceItem as KernelItem
-from b24api.references.stream import (
-    iter_references as _iter_references,
 )
 
 if TYPE_CHECKING:

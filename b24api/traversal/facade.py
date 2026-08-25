@@ -21,7 +21,8 @@ from b24api.contracts.request import (
     canonical_request,
 )
 from b24api.contracts.response import ResultCollectionShape
-from b24api.plans import (
+from b24api.traversal.counted import CountedItemStream
+from b24api.traversal.plans import (
     CountedOffsetPlan,
     CursorTerminalRule,
     ItemCursorPlan,
@@ -31,7 +32,6 @@ from b24api.plans import (
     OffsetSequentialPlan,
     OffsetTerminalRule,
 )
-from b24api.traversal.counted import CountedItemStream
 from b24api.traversal.stream import iter_list as _iter_list
 from b24api.traversal.values import _MappingValuesResultSelector
 

@@ -17,6 +17,7 @@ from b24api.contracts.policy import (
     SnapshotState,
 )
 from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.errors import IncompleteTraversalError, PaginationError
 from b24api.execution import (
     Executor,
     await_cancellation_resistant,
@@ -29,7 +30,7 @@ from b24api.traversal.identity import _MISSING, _attach_report, _Page
 
 if TYPE_CHECKING:
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
-    from b24api.plans import (
+    from b24api.traversal.plans import (
         ListPlan,
     )
 
@@ -168,6 +169,17 @@ class ItemStream(AsyncIterator[JsonValue]):
                 raise cancellation from error
             _attach_report(error, self.report)
             raise
+        except PaginationError as error:
+            cancellation = await await_cancellation_resistant(
+                self._finalize(KernelState.INCOMPLETE, type(error).__name__),
+            )
+            incomplete = IncompleteTraversalError(report=self.report)
+            primary_error = incomplete
+            if cancellation is not None:
+                _attach_report(cancellation, self.report)
+                pending_cancellation = cancellation
+            _attach_report(incomplete, self.report)
+            raise incomplete from error
         except BaseException as error:
             primary_error = error
             cancellation = await await_cancellation_resistant(

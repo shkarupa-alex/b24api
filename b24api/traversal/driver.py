@@ -13,16 +13,6 @@ from b24api.contracts.policy import (
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector
 from b24api.errors import CapabilityError, PaginationError
-from b24api.plans import (
-    CountedOffsetMode,
-    CountedOffsetPlan,
-    ItemCursorPlan,
-    KeysetPlan,
-    KeysetTerminalRule,
-    ListPlan,
-    OffsetSequentialPlan,
-    SingleResponsePlan,
-)
 from b24api.traversal.counted_batch import _CountedBatchMixin
 from b24api.traversal.cursor import _CursorMixin
 from b24api.traversal.identity import (
@@ -40,6 +30,16 @@ from b24api.traversal.identity import (
     _validate_confirmation_policy,
 )
 from b24api.traversal.keyset import _KeysetMixin
+from b24api.traversal.plans import (
+    CountedOffsetMode,
+    CountedOffsetPlan,
+    ItemCursorPlan,
+    KeysetPlan,
+    KeysetTerminalRule,
+    ListPlan,
+    OffsetSequentialPlan,
+    SingleResponsePlan,
+)
 from b24api.traversal.sequential import _SequentialMixin
 from b24api.traversal.values import (
     IdentityValue,

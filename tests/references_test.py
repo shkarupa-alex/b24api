@@ -34,7 +34,9 @@ from b24api.errors import (
     TransportError,
 )
 from b24api.execution import ExecutionContext, Executor, WireResponse
-from b24api.plans import (
+from b24api.references.outcome import ReferenceFailure, ReferenceItem, ReferenceRequest
+from b24api.references.stream import fan_out, iter_references
+from b24api.traversal.plans import (
     BatchDispatch,
     CountedOffsetMode,
     CountedOffsetPlan,
@@ -47,8 +49,6 @@ from b24api.plans import (
     ReferenceOutputOrder,
     SingleResponsePlan,
 )
-from b24api.references.outcome import ReferenceFailure, ReferenceItem, ReferenceRequest
-from b24api.references.stream import fan_out, iter_references
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterator

@@ -34,7 +34,7 @@ def test_readme_contains_no_removed_import_or_shape_changing_call_examples() -> 
     examples = "\n".join(PYTHON_BLOCK.findall(text))
 
     assert "from b24api.models" not in examples
-    assert "from b24api.plans" not in examples
+    assert "from b24api.traversal.plans" not in examples
     assert "raw=True" not in examples
     assert "with_payload=True" not in examples
     assert "errors=" not in examples

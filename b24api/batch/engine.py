@@ -25,8 +25,8 @@ from b24api.execution import (
     Executor,
     WorkClass,
 )
-from b24api.plans import PORTAL_BATCH_CAP
 from b24api.query import build_query
+from b24api.traversal.plans import PORTAL_BATCH_CAP
 
 if TYPE_CHECKING:
     from b24api.batch.stream import _BatchOutcomeStream

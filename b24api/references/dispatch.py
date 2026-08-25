@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from b24api.contracts.report import Violation
     from b24api.contracts.request import Request
     from b24api.contracts.response import Response
-    from b24api.plans import (
+    from b24api.traversal.plans import (
         BatchDispatch,
         DirectDispatch,
     )

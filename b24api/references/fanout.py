@@ -15,7 +15,6 @@ from b24api.contracts.command import (
     CommandSuccess,
 )
 from b24api.errors import AmbiguousExecutionError, B24ApiError, BatchFailed, CapabilityError, InputSourceError
-from b24api.plans import SingleResponsePlan
 from b24api.references.dispatch import (
     _KernelFanOutSuccess,
     _ReferenceWindowError,
@@ -26,6 +25,7 @@ from b24api.references.outcome import ReferenceRequest
 from b24api.references.stream import (
     iter_references as _iter_references,
 )
+from b24api.traversal.plans import SingleResponsePlan
 
 if TYPE_CHECKING:
     from b24api.contracts.dispatch import DispatchSpec

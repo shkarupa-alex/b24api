@@ -15,21 +15,14 @@ if TYPE_CHECKING:
 
     from b24api.contracts.json import JsonValue
     from b24api.contracts.response import Response
-    from b24api.plans import ItemCursorPlan
+    from b24api.traversal.plans import ItemCursorPlan
 
 type IdentityValue = str | int
 _MISSING = object()
 
 
-class _LegacyResultSelector(ResultSelector):
-    pass
-
-
 class _MappingValuesResultSelector(ResultSelector):
     pass
-
-
-_LEGACY_RESULT_SELECTOR = _LegacyResultSelector.root()
 
 
 def _mapping_values(response: Response, selector: ResultSelector) -> list[JsonValue]:
@@ -49,11 +42,6 @@ def _mapping_values(response: Response, selector: ResultSelector) -> list[JsonVa
 
 
 def _response_items(response: Response, selector: ResultSelector, *, single: bool = False) -> list[JsonValue]:
-    if isinstance(selector, _LegacyResultSelector):
-        try:
-            return response.list_result
-        except TypeError as error:
-            raise CapabilityError("response result is not an unambiguous legacy list") from error
     if isinstance(selector, _MappingValuesResultSelector):
         return _mapping_values(response, selector)
     if single and selector.path == () and not isinstance(response.result, list):
@@ -158,11 +146,9 @@ def _coerce_cursor(value: JsonValue, coercion: IdentityCoercion) -> IdentityValu
 def _take_cursor(values: list[IdentityValue], mode: str) -> IdentityValue:
     if mode == "first":
         return values[0]
-    if mode == "last":
-        return values[-1]
-    if any(type(value) is not type(values[0]) for value in values):
-        raise PaginationError("cursor values are not mutually orderable")
-    return min(values) if mode == "min" else max(values)
+    if mode != "last":
+        raise RuntimeError("cursor take mode escaped its closed contract")
+    return values[-1]
 
 
 __all__: list[str] = []

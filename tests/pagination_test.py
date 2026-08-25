@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import re
 from typing import TYPE_CHECKING
 
 import pytest
@@ -22,9 +23,16 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector
-from b24api.errors import BudgetExceededError, CapabilityError, PaginationError, ProtocolError
+from b24api.errors import (
+    BudgetExceededError,
+    CapabilityError,
+    IncompleteTraversalError,
+    PaginationError,
+    ProtocolError,
+)
 from b24api.execution import ExecutionContext, Executor, WireResponse
-from b24api.plans import (
+from b24api.traversal import iter_list
+from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
     CursorTerminalRule,
@@ -37,7 +45,6 @@ from b24api.plans import (
     OffsetTerminalRule,
     SingleResponsePlan,
 )
-from b24api.traversal import iter_list
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -129,6 +136,16 @@ async def _collect(stream: object) -> list[JsonValue]:
     return [item async for item in stream]  # type: ignore[attr-defined]
 
 
+async def _assert_incomplete_pagination(stream: object, pattern: str) -> IncompleteTraversalError:
+    with pytest.raises(IncompleteTraversalError) as captured:
+        await _collect(stream)
+    cause = captured.value.__cause__
+    assert isinstance(cause, PaginationError)
+    assert re.search(pattern, str(cause))
+    assert captured.value.report is stream.report  # type: ignore[attr-defined]
+    return captured.value
+
+
 @pytest.mark.asyncio
 async def test_single_stream_is_lazy_and_reports_scalar_completion() -> None:
     transport = FunctionTransport(lambda _request: {"result": {"ID": 7}})
@@ -207,11 +224,10 @@ async def test_offset_detects_ignored_control_by_repeated_page_fingerprint() -> 
         identity=_identity(),
     )
 
-    with pytest.raises(PaginationError, match="repeated page"):
-        await _collect(stream)
+    await _assert_incomplete_pagination(stream, "repeated page")
 
     assert len(transport.requests) == PAGE_SIZE
-    assert stream.report.state is KernelState.FAILED
+    assert stream.report.state is KernelState.INCOMPLETE
 
 
 @pytest.mark.asyncio
@@ -232,8 +248,7 @@ async def test_required_identity_and_oversized_pages_are_rejected() -> None:
         plan=_offset_plan(),
         identity=_identity(),
     )
-    with pytest.raises(PaginationError, match="page cap"):
-        await _collect(oversized)
+    await _assert_incomplete_pagination(oversized, "page cap")
     assert len(oversized_transport.requests) == 1
 
 
@@ -256,8 +271,7 @@ async def test_offset_exact_total_must_be_present_stable_and_not_overshot() -> N
         identity=_identity(),
     )
 
-    with pytest.raises(PaginationError, match="total drifted"):
-        await _collect(stream)
+    await _assert_incomplete_pagination(stream, "total drifted")
 
 
 @pytest.mark.asyncio
@@ -279,8 +293,7 @@ async def test_empty_page_cannot_override_an_unreached_exact_total() -> None:
         identity=_identity(),
     )
 
-    with pytest.raises(PaginationError, match="before its exact total"):
-        await _collect(stream)
+    await _assert_incomplete_pagination(stream, "before its exact total")
 
 
 @pytest.mark.asyncio
@@ -353,11 +366,10 @@ async def test_counted_offset_detects_repeated_items_when_continuation_metadata_
         plan=CountedOffsetPlan(),
     )
 
-    with pytest.raises(PaginationError, match="repeated page"):
-        await _collect(stream)
+    await _assert_incomplete_pagination(stream, "repeated page")
 
     assert len(transport.requests) == PAGE_SIZE
-    assert stream.report.state is KernelState.FAILED
+    assert stream.report.state is KernelState.INCOMPLETE
 
 
 @pytest.mark.asyncio
@@ -389,8 +401,7 @@ async def test_declared_order_is_enforced_for_single_and_offset_plans(plan: List
         identity=_identity(),
     )
 
-    with pytest.raises(PaginationError, match="strictly ascending"):
-        await _collect(stream)
+    await _assert_incomplete_pagination(stream, "strictly ascending")
 
     assert len(transport.requests) == 1
 
@@ -425,8 +436,7 @@ async def test_consistency_policy_enforces_duplicates_order_total_and_confirmati
         plan=SingleResponsePlan(duplicate_policy=DuplicatePolicy.ALLOW_DECLARED_MULTISET),
         identity=_identity(),
     )
-    with pytest.raises(PaginationError, match="duplicate identity"):
-        await _collect(duplicate_stream)
+    await _assert_incomplete_pagination(duplicate_stream, "duplicate identity")
 
     order_transport = FunctionTransport(
         lambda _request: {"result": [{"ID": 2}, {"ID": 1}]},
@@ -441,8 +451,7 @@ async def test_consistency_policy_enforces_duplicates_order_total_and_confirmati
         identity=_identity(),
         policy=order_policy,
     )
-    with pytest.raises(PaginationError, match="strictly ascending"):
-        await _collect(order_stream)
+    await _assert_incomplete_pagination(order_stream, "strictly ascending")
 
     total_transport = FunctionTransport(
         lambda _request: {"result": [{"ID": 1}, {"ID": 2}], "total": 1},
@@ -456,8 +465,7 @@ async def test_consistency_policy_enforces_duplicates_order_total_and_confirmati
         plan=SingleResponsePlan(),
         policy=total_policy,
     )
-    with pytest.raises(PaginationError, match="exact total"):
-        await _collect(total_stream)
+    await _assert_incomplete_pagination(total_stream, "exact total")
 
     confirmation_transport = FunctionTransport(lambda _request: {"result": []})
     confirmation_policy = ExecutionPolicy(
@@ -577,10 +585,13 @@ async def test_counted_offset_rejects_unproven_totals(
     transport = FunctionTransport(lambda _request: pending.pop(0))
     stream = iter_list(Executor(transport), Request("crm.item.list"), plan=CountedOffsetPlan())
 
-    with pytest.raises((CapabilityError, PaginationError), match=message):
-        await _collect(stream)
+    if message == "non-negative":
+        with pytest.raises(CapabilityError, match=message):
+            await _collect(stream)
+    else:
+        await _assert_incomplete_pagination(stream, message)
 
-    assert stream.report.state is KernelState.FAILED
+    assert stream.report.state is (KernelState.FAILED if message == "non-negative" else KernelState.INCOMPLETE)
 
 
 @pytest.mark.asyncio
@@ -701,8 +712,7 @@ async def test_keyset_rejects_page_that_does_not_respect_previous_bound() -> Non
         identity=_identity(),
     )
 
-    with pytest.raises(PaginationError, match=r"advance|lower bound"):
-        await _collect(stream)
+    await _assert_incomplete_pagination(stream, r"advance|lower bound")
 
 
 @pytest.mark.asyncio
@@ -717,7 +727,7 @@ async def test_item_cursor_advances_from_items_until_empty_confirmation() -> Non
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING,
         cursor_item_path=("ID",),
-        cursor_take="max",
+        cursor_take="last",
         terminal=CursorTerminalRule.EMPTY_CONFIRMATION,
     )
     stream = iter_list(
@@ -743,7 +753,7 @@ async def test_item_cursor_orders_cursor_values_independently_from_row_identity(
         identity_requirement=IdentityRequirement.REQUIRED,
         cursor_item_path=("cursor",),
         direction="asc",
-        cursor_take="max",
+        cursor_take="last",
         duplicate_policy=DuplicatePolicy.REPORT,
     )
     stream = iter_list(
@@ -848,8 +858,7 @@ async def test_item_cursor_rejects_wrong_order_within_first_page() -> None:
         identity=_identity(),
     )
 
-    with pytest.raises(PaginationError, match="strictly ascending"):
-        await _collect(stream)
+    await _assert_incomplete_pagination(stream, "strictly ascending")
 
 
 @pytest.mark.asyncio

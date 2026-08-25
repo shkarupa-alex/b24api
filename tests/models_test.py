@@ -88,7 +88,8 @@ def test_response_is_deeply_immutable_and_selectors_are_exact() -> None:
     response = Response(source, total=1, next=1)
     source["tasks"][0]["ID"] = "changed"
 
-    assert response.list_result == [{"ID": "1"}]
+    with pytest.raises(TypeError, match="selected result"):
+        response.list_items(ResultSelector.root())
     selected = response.list_items(ResultSelector(("tasks",)))
     first_item = selected[0]
     assert isinstance(first_item, dict)

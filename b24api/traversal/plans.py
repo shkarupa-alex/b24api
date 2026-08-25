@@ -1,4 +1,4 @@
-"""Frozen plan and dispatch descriptions with pre-I/O validation."""
+"""Internal frozen traversal plans with pre-I/O validation."""
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -200,18 +200,13 @@ class KeysetPlan(PlanContract):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ItemCursorPlan(PlanContract):
-    """Sequential item cursor whose type and order are independent of row identity.
-
-    Continued pages require unique, strictly monotonic cursor values. Under
-    that admitted contract, ``min``/``max`` are compatibility aliases of
-    ``first``/``last`` rather than distinct traversal capabilities.
-    """
+    """Sequential item cursor whose type and order are independent of row identity."""
 
     cursor_request_path: ParameterPath = _LAST_ID_PATH
     cursor_item_path: tuple[str | int, ...] = ("id",)
     cursor_coercion: IdentityCoercion = IdentityCoercion.EXACT_INTEGER
     direction: Literal["asc", "desc"] = "asc"
-    cursor_take: Literal["first", "last", "min", "max"] = "max"
+    cursor_take: Literal["first", "last"] = "last"
     limit_path: ParameterPath | None = None
     requested_page_size: int | None = None
     terminal: CursorTerminalRule = CursorTerminalRule.EMPTY_CONFIRMATION
@@ -228,7 +223,7 @@ class ItemCursorPlan(PlanContract):
             raise TypeError("cursor_coercion must be an IdentityCoercion")
         if self.direction not in {"asc", "desc"}:
             raise ValueError("cursor direction must be asc or desc")
-        if self.cursor_take not in {"first", "last", "min", "max"}:
+        if self.cursor_take not in {"first", "last"}:
             raise ValueError("cursor_take is invalid")
         if not isinstance(self.terminal, CursorTerminalRule):
             raise TypeError("terminal must be a CursorTerminalRule")

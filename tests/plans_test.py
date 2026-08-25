@@ -6,7 +6,7 @@ import pytest
 
 from b24api.contracts.policy import IdentityCoercion, IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.contracts.request import ParameterPath
-from b24api.plans import (
+from b24api.traversal.plans import (
     BatchDispatch,
     CountedOffsetMode,
     CountedOffsetPlan,

@@ -4,12 +4,13 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from b24api.contracts.request import RequestSummary, summarize_request_like
 from b24api.contracts.response import ResponseEvidence
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from b24api.contracts.request import RequestSummary
 
 
 class ErrorOrigin(StrEnum):
@@ -147,7 +148,6 @@ class ApiResponseError(B24ApiError):
         *,
         code: str | int,
         description: str | None,
-        request: Any = None,  # noqa: ANN401
         request_summary: RequestSummary | None = None,
         http_status: int | None = None,
         headers: Mapping[str, str] | None = None,
@@ -160,7 +160,7 @@ class ApiResponseError(B24ApiError):
         self.original_code = code
         self.code = str(code).lower()
         self.normalized_code = str(code).strip().casefold()
-        summary = request_summary or summarize_request_like(request, redactor=redactor)
+        summary = request_summary
         safe_description = redactor.redact_text(description) if description is not None else None
         if self.code and safe_description:
             message = f"API error [{self.code}]: {safe_description}"

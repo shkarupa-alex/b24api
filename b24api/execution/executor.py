@@ -35,7 +35,7 @@ from b24api.execution.context import (
     _raise_for_pending_cancellation,
 )
 from b24api.execution.rate import RateCoordinator, WorkClass
-from b24api.protocol import ProtocolCodec
+from b24api.transport.protocol import ProtocolCodec
 
 if TYPE_CHECKING:
     from b24api.transport.base import Transport, WireResponse

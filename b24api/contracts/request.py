@@ -1,4 +1,3 @@
-# ruff: noqa: ANN401
 """Immutable public values shared by execution and evidence layers."""
 
 from __future__ import annotations
@@ -47,23 +46,12 @@ def summarize_request(
     *,
     redactor: Redactor = DEFAULT_REDACTOR,
 ) -> RequestSummary:
-    """Build a safe summary from canonical or legacy request-like values."""
+    """Build a safe summary from an explicit method and parameter mapping."""
     safe_method = redactor.redact_text(str(method))
     keys: tuple[str, ...] = ()
     if isinstance(parameters, Mapping):
         keys = tuple(sorted(redactor.redact_text(str(key)) for key in parameters)[: redactor.max_items])
     return RequestSummary(method=safe_method, parameter_keys=keys)
-
-
-def summarize_request_like(request: Any, *, redactor: Redactor = DEFAULT_REDACTOR) -> RequestSummary | None:
-    """Summarize an optional duck-typed request without importing legacy models."""
-    if request is None:
-        return None
-    return summarize_request(
-        getattr(request, "method", type(request).__name__),
-        getattr(request, "parameters", None),
-        redactor=redactor,
-    )
 
 
 class ReplaySafety(StrEnum):

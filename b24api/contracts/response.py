@@ -114,23 +114,6 @@ class Response:
         """Return the result."""
         return _thaw_json(self._result)
 
-    @property
-    def list_result(self) -> list[JsonValue]:
-        """Return the list result."""
-        result = self.result
-        if isinstance(result, list):
-            return result
-        if not isinstance(result, dict):
-            raise TypeError("result must be a list or one-key mapping")
-        if not result:
-            return []
-        if len(result) != 1:
-            raise TypeError("mapping result must contain exactly one list")
-        value = next(iter(result.values()))
-        if not isinstance(value, list):
-            raise TypeError("mapping result value must be a list")
-        return value
-
     def list_items(self, selector: ResultSelector | None = None) -> list[JsonValue]:
         """Return list items selected from the response result."""
         selector = selector or ResultSelector.root()

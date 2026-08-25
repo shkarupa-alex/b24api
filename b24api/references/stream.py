@@ -22,14 +22,6 @@ from b24api.execution import (
     rearm_cancellation,
 )
 from b24api.execution.snapshot import KernelReport
-from b24api.plans import (
-    BatchDispatch,
-    DirectDispatch,
-    DispatchPlan,
-    ListPlan,
-    ReferenceOutputOrder,
-    SingleResponsePlan,
-)
 from b24api.references.dispatch import (
     _MISSING,
     ReferenceSource,
@@ -39,6 +31,14 @@ from b24api.references.outcome import ReferenceItem
 from b24api.references.scheduler import ReferenceScheduler
 from b24api.references.support import _attach_report
 from b24api.traversal import PaginationDriver
+from b24api.traversal.plans import (
+    BatchDispatch,
+    DirectDispatch,
+    DispatchPlan,
+    ListPlan,
+    ReferenceOutputOrder,
+    SingleResponsePlan,
+)
 
 if TYPE_CHECKING:
     from b24api.contracts.request import IdentitySpec, ResultSelector

@@ -6,7 +6,12 @@ import contextlib
 from collections.abc import AsyncGenerator, AsyncIterable, Iterator
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
-from b24api.plans import (
+from b24api.references.dispatch import (
+    _SYNC_EXHAUSTED,
+    ReferenceSource,
+    _Event,
+)
+from b24api.traversal.plans import (
     CountedOffsetPlan,
     DirectDispatch,
     DispatchPlan,
@@ -15,11 +20,6 @@ from b24api.plans import (
     ListPlan,
     OffsetSequentialPlan,
     ReferenceOutputOrder,
-)
-from b24api.references.dispatch import (
-    _SYNC_EXHAUSTED,
-    ReferenceSource,
-    _Event,
 )
 
 if TYPE_CHECKING:
