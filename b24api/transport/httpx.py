@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, cast
 
 import httpx
 
-from b24api.error import (
+from b24api.errors import (
     B24ApiError,
     FailurePhase,
     ProtocolError,

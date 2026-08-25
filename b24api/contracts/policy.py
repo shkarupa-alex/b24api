@@ -301,6 +301,6 @@ class BudgetCounters:
 
 
 def _raise_budget(message: str) -> None:
-    from b24api.error import BudgetExceededError  # noqa: PLC0415
+    from b24api.errors import BudgetExceededError  # noqa: PLC0415
 
     raise BudgetExceededError(message)

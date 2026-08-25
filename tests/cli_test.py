@@ -25,7 +25,7 @@ from b24api import (
     cli,
 )
 from b24api.contracts import IdentityCoercion
-from b24api.error import CapabilityError, IncompleteTraversalError, ProtocolError
+from b24api.errors import CapabilityError, IncompleteTraversalError, ProtocolError
 
 if TYPE_CHECKING:
     from pathlib import Path

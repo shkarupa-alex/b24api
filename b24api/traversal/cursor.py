@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
-from b24api.error import PaginationError
+from b24api.errors import PaginationError
 from b24api.traversal.identity import (
     IdentityValue,
     _compare_identities,

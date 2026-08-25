@@ -11,7 +11,7 @@ import pytest
 from b24api import execution as execution_module
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import ReplaySafety, Request
-from b24api.error import (
+from b24api.errors import (
     AmbiguousExecutionError,
     BudgetExceededError,
     FailurePhase,

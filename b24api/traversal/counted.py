@@ -12,7 +12,7 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     SnapshotState,
 )
-from b24api.error import CapabilityError, IncompleteTraversalError
+from b24api.errors import CapabilityError, IncompleteTraversalError
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
 

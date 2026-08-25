@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, cast
 
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.request import IdentitySpec, ReplaySafety, Request, ResultSelector
-from b24api.error import BudgetExceededError
+from b24api.errors import BudgetExceededError
 from b24api.execution import (
     AsyncIteratorController,
     Executor,

@@ -37,7 +37,7 @@ from b24api.contracts import (
     TraversalSpec,
 )
 from b24api.contracts.policy import DuplicatePolicy, IdentityRequirement, OrderSemantics, TotalSemantics
-from b24api.error import BatchFailed, InputSourceError
+from b24api.errors import BatchFailed, InputSourceError
 from b24api.execution import Executor, HttpxTransport, Transport
 from b24api.fanout_v2 import (
     CommandSource as FanOutCommandSource,

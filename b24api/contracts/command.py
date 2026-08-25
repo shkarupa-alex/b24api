@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
     from b24api.contracts.json import JsonValue
     from b24api.contracts.response import Response
-    from b24api.error import B24ApiError
+    from b24api.errors import B24ApiError
 
 
 @dataclass(frozen=True, slots=True)

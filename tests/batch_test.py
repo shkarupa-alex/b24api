@@ -25,7 +25,7 @@ from b24api.contracts.policy import (
     SnapshotState,
 )
 from b24api.contracts.request import ReplaySafety, Request
-from b24api.error import BatchCommandError, BudgetExceededError, FailurePhase, ProtocolError, TransportError
+from b24api.errors import BatchCommandError, BudgetExceededError, FailurePhase, ProtocolError, TransportError
 from b24api.execution import ExecutionContext, Executor, WireResponse
 
 if TYPE_CHECKING:

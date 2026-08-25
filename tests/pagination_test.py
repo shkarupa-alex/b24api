@@ -22,7 +22,7 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector
-from b24api.error import BudgetExceededError, CapabilityError, PaginationError, ProtocolError
+from b24api.errors import BudgetExceededError, CapabilityError, PaginationError, ProtocolError
 from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.plans import (
     CountedOffsetMode,

@@ -24,7 +24,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.report import ViolationSeverity
 from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request
-from b24api.error import (
+from b24api.errors import (
     ApiResponseError,
     BudgetExceededError,
     CapabilityError,

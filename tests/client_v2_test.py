@@ -34,7 +34,7 @@ from b24api.contracts import (
     TerminalState,
     TraversalAssurance,
 )
-from b24api.error import BatchFailed, IncompleteTraversalError, InputSourceError, ReferenceFailed
+from b24api.errors import BatchFailed, IncompleteTraversalError, InputSourceError, ReferenceFailed
 from b24api.execution import Executor, Transport, WireResponse
 from b24api.settings import Settings
 

@@ -19,7 +19,7 @@ from b24api.contracts.policy import (
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request, ResultSelector
 from b24api.contracts.response import Response, inject_controls
-from b24api.error import BudgetExceededError
+from b24api.errors import BudgetExceededError
 from b24api.execution.snapshot import KernelReport
 from b24api.references.outcome import ReferenceFailure, ReferenceItem, ReferenceRequest
 

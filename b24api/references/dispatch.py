@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure
 from b24api.contracts.policy import ReplayDisposition
-from b24api.error import BudgetExceededError, CapabilityError
+from b24api.errors import BudgetExceededError, CapabilityError
 from b24api.execution import (
     ExecutionContext,
     Executor,

@@ -12,7 +12,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector
-from b24api.error import CapabilityError, PaginationError
+from b24api.errors import CapabilityError, PaginationError
 from b24api.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,

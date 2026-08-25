@@ -20,7 +20,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector
 from b24api.contracts.response import Response, inject_controls
-from b24api.error import CapabilityError, PaginationError
+from b24api.errors import CapabilityError, PaginationError
 from b24api.plans import (
     CountedOffsetPlan,
     CursorTerminalRule,

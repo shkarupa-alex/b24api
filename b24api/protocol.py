@@ -6,7 +6,7 @@ from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, Any
 
 from b24api.contracts.response import ResponseEvidence
-from b24api.error import (
+from b24api.errors import (
     ApiResponseError,
     B24ApiError,
     ErrorOrigin,

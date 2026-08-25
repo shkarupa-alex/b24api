@@ -35,7 +35,7 @@ from b24api.contracts import (
     partition_reference_outcomes,
 )
 from b24api.contracts.policy import IdentityCoercion
-from b24api.error import ProtocolError
+from b24api.errors import ProtocolError
 
 CORRELATION_VALUE = 7
 DIRECT_CONCURRENCY = 3

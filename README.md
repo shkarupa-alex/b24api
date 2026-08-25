@@ -227,7 +227,7 @@ Compatibility wrappers fail closed. Code that wants to retain the terminal
 report can catch the typed error explicitly:
 
 ~~~python
-from b24api.error import IncompleteTraversalError
+from b24api.errors import IncompleteTraversalError
 
 try:
     async for deal in b24.list_batched(request, identity=deal_identity):

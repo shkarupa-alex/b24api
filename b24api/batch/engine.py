@@ -19,7 +19,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.request import ReplaySafety, Request
 from b24api.contracts.response import Response
-from b24api.error import B24ApiError, BatchCommandError, ErrorOrigin, ProtocolError
+from b24api.errors import B24ApiError, BatchCommandError, ErrorOrigin, ProtocolError
 from b24api.execution import (
     ExecutionContext,
     Executor,

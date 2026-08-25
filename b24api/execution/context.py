@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from b24api.contracts.policy import BudgetCounters, ExecutionPolicy
-from b24api.error import (
+from b24api.errors import (
     BudgetExceededError,
 )
 

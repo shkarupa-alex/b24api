@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol, Self, cast
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import OperationReport, TerminalState, TraversalAssurance
 from b24api.contracts.stream import PartialResult
-from b24api.error import IncompleteTraversalError
+from b24api.errors import IncompleteTraversalError
 
 if TYPE_CHECKING:
     from b24api.execution.snapshot import KernelReport

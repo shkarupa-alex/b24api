@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pytest_mock import MockerFixture
 
 from b24api.contracts.request import summarize_request
-from b24api.error import (
+from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
     B24ApiError,

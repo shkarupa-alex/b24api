@@ -13,7 +13,7 @@ from b24api.contracts.command import (
     CommandOutcomeUnknown,
     CommandSuccess,
 )
-from b24api.error import AmbiguousExecutionError, B24ApiError, BatchFailed, CapabilityError, InputSourceError
+from b24api.errors import AmbiguousExecutionError, B24ApiError, BatchFailed, CapabilityError, InputSourceError
 from b24api.plans import SingleResponsePlan
 from b24api.reference_v2 import _kernel_dispatch
 from b24api.references.dispatch import (

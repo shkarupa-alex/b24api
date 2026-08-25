@@ -36,7 +36,7 @@ from b24api.contracts.traversal import (
     SequentialTraversal,
     TraversalSpec,
 )
-from b24api.error import AmbiguousExecutionError, B24ApiError, CapabilityError, InputSourceError, ReferenceFailed
+from b24api.errors import AmbiguousExecutionError, B24ApiError, CapabilityError, InputSourceError, ReferenceFailed
 from b24api.plans import (
     BatchDispatch as KernelBatchDispatch,
 )

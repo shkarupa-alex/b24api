@@ -27,7 +27,7 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     SnapshotState,
 )
-from b24api.error import AmbiguousExecutionError, B24ApiError, BatchCommandError, InputSourceError, ProtocolError
+from b24api.errors import AmbiguousExecutionError, B24ApiError, BatchCommandError, InputSourceError, ProtocolError
 from b24api.execution import (
     AsyncIteratorController,
     Executor,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
-from b24api.error import CapabilityError, PaginationError
+from b24api.errors import CapabilityError, PaginationError
 from b24api.execution import (
     WorkClass,
 )

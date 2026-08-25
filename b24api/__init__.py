@@ -44,7 +44,7 @@ from b24api.contracts import (
     partition_command_outcomes,
     partition_reference_outcomes,
 )
-from b24api.error import (
+from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
     B24ApiError,
