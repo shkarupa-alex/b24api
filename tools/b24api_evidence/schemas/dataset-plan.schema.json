@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b24api.local/schemas/evidence/dataset-plan-2.0.json",
+  "title": "Reviewed Bitrix24 evidence dataset plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "run_id", "lineage_id", "original_head_sha", "candidate_sha", "generator_sha",
+    "skills_corpus_sha", "skills_recipe_tree_sha256", "credential_role",
+    "disposable_profile_set_id", "disposable_profiles_content_hash",
+    "portal", "namespace", "cells", "estimated", "cleanup", "authorization"
+  ],
+  "properties": {
+    "schema_version": {"const": "2.0"},
+    "run_id": {"$ref": "#/$defs/uuid"},
+    "lineage_id": {"$ref": "#/$defs/uuid"},
+    "original_head_sha": {"const": "08277c4d921b83b9252177b3e72a21a4c0c86109"},
+    "candidate_sha": {"$ref": "#/$defs/sha"},
+    "generator_sha": {"$ref": "#/$defs/sha"},
+    "skills_corpus_sha": {"const": "a353a58fb1de7abf2c81dd86fc7d8ad1caea8f2f"},
+    "skills_recipe_tree_sha256": {"const": "7c6c83487df9913076f16f1cab8630b065df2250f026c4679871957e51343b66"},
+    "credential_role": {"enum": ["model", "admin_full", "admin_limited", "employee_full", "employee_limited"]},
+    "disposable_profile_set_id": {"const": "w0-disposable-entities-v1"},
+    "disposable_profiles_content_hash": {"const": "425cdca3d9f0682974c50afc9af4d4d3fa90dc6233ee785290ba7632bd30b754"},
+    "portal": {"$ref": "#/$defs/portal"},
+    "namespace": {"type": "string", "pattern": "^b24api-evidence-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "cells": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"$ref": "#/$defs/cell"}},
+    "estimated": {"$ref": "#/$defs/estimated"},
+    "cleanup": {
+      "type": "object", "additionalProperties": false,
+      "required": ["feasible", "dependency_order", "absence_verification"],
+      "properties": {
+        "feasible": {"const": true},
+        "dependency_order": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 100}},
+        "absence_verification": {"const": "exact_id_point_read"}
+      }
+    },
+    "authorization": {"$ref": "#/$defs/authorization"}
+  },
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "uuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "portal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["host", "role", "fingerprint", "fingerprint_algorithm", "fingerprint_key_format", "build", "scope_hash"],
+      "properties": {
+        "host": {"type": "string", "pattern": "^[A-Za-z0-9.-]+$", "maxLength": 253},
+        "role": {"enum": ["model", "admin_full", "admin_limited", "employee_full", "employee_limited"]},
+        "fingerprint": {"$ref": "#/$defs/sha256"},
+        "fingerprint_algorithm": {"type": "string", "minLength": 1, "maxLength": 100},
+        "fingerprint_key_format": {"type": "string", "minLength": 1, "maxLength": 100},
+        "build": {"type": ["string", "null"], "minLength": 1, "maxLength": 100},
+        "scope_hash": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "cell": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "id", "disposable_profile_id", "entity_family", "target_count", "base_count",
+        "relationship_count", "distribution", "marker_field", "create_method", "read_method",
+        "delete_method", "required_scopes"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "maxLength": 100},
+        "disposable_profile_id": {"enum": ["tasks-task-v1", "crm-deal-v1"]},
+        "entity_family": {"enum": ["task", "crm_deal"]},
+        "target_count": {"type": "integer", "minimum": 0, "maximum": 500},
+        "base_count": {"type": "integer", "minimum": 0, "maximum": 500},
+        "relationship_count": {"type": "integer", "minimum": 0},
+        "distribution": {"enum": ["empty", "single", "boundary", "dense", "uniform_sparse", "clustered_sparse", "skewed", "deleted_id", "reference_graph"]},
+        "marker_field": {"const": "TITLE"},
+        "create_method": {"enum": ["tasks.task.add", "crm.deal.add"]},
+        "read_method": {"enum": ["tasks.task.get", "crm.deal.get"]},
+        "delete_method": {"enum": ["tasks.task.delete", "crm.deal.delete"]},
+        "required_scopes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["task", "crm"]}}
+      }
+    },
+    "estimated": {
+      "type": "object", "additionalProperties": false,
+      "required": ["entities", "relationships", "create_strategy", "delete_strategy", "requests", "batch_commands", "duration_seconds", "quota_impact"],
+      "properties": {
+        "entities": {"type": "integer", "minimum": 0, "maximum": 500},
+        "relationships": {"type": "integer", "minimum": 0},
+        "create_strategy": {"enum": ["direct", "batch"]},
+        "delete_strategy": {"enum": ["direct", "batch"]},
+        "requests": {"type": "integer", "minimum": 0},
+        "batch_commands": {"type": "integer", "minimum": 0},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "quota_impact": {"type": "number", "minimum": 0}
+      },
+      "allOf": [{
+        "if": {"properties": {"entities": {"minimum": 1}}, "required": ["entities"]},
+        "then": {"properties": {
+          "requests": {"minimum": 1},
+          "duration_seconds": {"exclusiveMinimum": 0}, "quota_impact": {"exclusiveMinimum": 0}
+        }}
+      }]
+    },
+    "authorization": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "live", "allow_writes", "plan_review_sha", "approved_by_user", "max_entities_per_cell"],
+      "properties": {
+        "state": {"enum": ["preview", "approved_for_seed"]},
+        "live": {"type": "boolean"}, "allow_writes": {"type": "boolean"},
+        "plan_review_sha": {"oneOf": [{"$ref": "#/$defs/sha"}, {"type": "null"}]},
+        "approved_by_user": {"type": "boolean"},
+        "approved_at": {"type": "string", "format": "date-time"},
+        "max_entities_per_cell": {"type": "integer", "minimum": 1, "maximum": 500}
+      },
+      "allOf": [{
+        "if": {"properties": {"state": {"const": "approved_for_seed"}}, "required": ["state"]},
+        "then": {"properties": {
+          "live": {"const": true}, "allow_writes": {"const": true},
+          "approved_by_user": {"const": true}, "plan_review_sha": {"$ref": "#/$defs/sha"}
+        }, "required": ["approved_at"]},
+        "else": {"properties": {
+          "live": {"const": false}, "allow_writes": {"const": false},
+          "approved_by_user": {"const": false}, "plan_review_sha": {"type": "null"}
+        }, "not": {"required": ["approved_at"]}}
+      }]
+    }
+  },
+  "$comment": "The repository semantic validator additionally enforces exact disposable-profile tuples, estimate algebra, and plan ceiling relationships."
+}
