@@ -2,7 +2,7 @@
 
 Date: 2026-08-25
 
-Runtime candidate: `8aff7e82a481e88b58619f106a78501602a0afb8`
+Runtime candidate: `083490d92b5b9d1fa876d96e14ec04beff6faa0c`
 
 Frozen pre-refactor comparator: `e5fd427eddb28b7079b75bfef6443c04aa6350d1`
 
@@ -54,7 +54,7 @@ is executable or points to the reproducible runtime profile. No planned evidence
 | Empty reference success | conflated with no emitted rows | `ReferenceComplete(row_count=0)` | `test_bound_references_apply_nested_updates_off_wire_and_emit_exact_completion` | preserved under a different primitive | No |
 | Response selector | `result_key` and plan selectors | `ResultSelector` relative to `Response.result` | B4; selector and detached response tests | preserved under a different primitive | No |
 | Mapping-shaped collections | implicit shape handling | explicit `ResultCollectionShape.MAPPING_VALUES` | `test_mapping_values_shape_preserves_mapping_insertion_order` | preserved under a different primitive | No |
-| Page-size control | wrapper-specific `list_size` / `LIMIT` | explicit `limit_path`, `page_size` cap and conflict validation | B3; control injection and page-cap tests | preserved under a different primitive | No |
+| Page-size control | wrapper-specific `list_size` / `LIMIT` | explicit `limit_path`, `page_size` cap and conflict validation | B3; control injection, reverse counted-cap and reference-local-cap tests | preserved under a different primitive | No |
 | Early close and cancellation | shared kernel behavior | `OperationStream` terminal contract | context break, client close, cancellation and cleanup-failure suites | preserved directly | No |
 | Partial bounded consumption | manual `break` | `first()` / `collect(limit=...)` | `test_partial_helper_closes_without_claiming_completion` | preserved under a different primitive | No |
 | Final operation report | intermediate mutable report | immutable post-cleanup `OperationReport` | report freeze, exactly-once CLI and cleanup-error identity tests | preserved under a different primitive | No |
@@ -96,6 +96,31 @@ in tests.
 | Early close/cancellation | stop admission, close ownership and report non-completion | never present partial consumption as complete |
 | Oversized response | abort streaming at byte ceiling | raise ceiling explicitly only when justified |
 
+## Repeat-review closure
+
+The post-implementation adversarial review found several real boundary defects. They are closed on
+the runtime SHA above rather than waived:
+
+- every reference traversal now propagates its public `page_size` as the scheduler's local page
+  cap even when no endpoint-specific wire `limit_path` exists;
+- an empty page retaining `next` is a pagination contradiction and finalizes `INCOMPLETE`, never
+  `COMPLETED`; a repeated pull re-raises the same typed terminal error and report;
+- local binding rejection emits correlated `ReferenceNotExecuted(LOCAL_VALIDATION_FAILED)`, while
+  per-reference pagination contradictions carry `IncompleteTraversalError`;
+- `CountedTraversal` with `DirectDispatch` rejects before the binding source is pulled or any I/O;
+- user-generator `TypeError`/`ValueError` is `SOURCE_FAILED`; only the client's own malformed-item
+  check is `LOCAL_VALIDATION_FAILED`;
+- early batch close reports the whole already-admitted physical window separately from the number
+  of outcomes actually emitted;
+- the installed-wheel test no longer depends on a warm package-manager cache and proves that the
+  imported `b24api` module comes from the isolated wheel environment;
+- the root surface now includes the public construction/inspection types required by its own
+  cursor, report and injected-transport contracts. The owner amendment records this narrow
+  manifest correction.
+
+The exact full suite has 499 passing tests. The concurrent-pull and in-flight-close regressions,
+typed terminal-error matrix, page-cap reverse direction and wheel entry-point checks are included.
+
 ## Architecture and legacy audit
 
 - `Bitrix24` is a composition facade; algorithms remain in batch/traversal/reference layers.
@@ -120,7 +145,8 @@ The exact measurements, commands and allocation-site interpretation are in
 - Counted request and identity parity with frozen 1.0.1 is `1/2/5` requests for
   19/500/10,000 rows across dense and sparse cases.
 - The exact refactor comparator used two warm-ups plus seven measured samples in two independent
-  reproductions. No cell reproduced a regression above 10%.
+  reproductions. The sub-millisecond 19-row cell was additionally repeated with 31 samples. No
+  stable cell reproduced a regression above 10%.
 - A 100,000-command generator stayed at seven buffered commands; its measured peak was below the
   10,000-command peak and correlation never entered wire JSON.
 - Exact counted identity tracking above 100,000 rows continues in memory and warns once. There is
@@ -129,7 +155,7 @@ The exact measurements, commands and allocation-site interpretation are in
   cumulative client allocation site; no retained stream/task resource or leak was observed.
 - Response buffering, decoded-row ceilings, active-reference bounds and 100-iteration retention
   gates passed.
-- The fresh deterministic benchmark published 200 model oracles and 182 immutable evidence
+- The fresh deterministic benchmark on `083490d` published 200 model oracles and 182 immutable evidence
   references in 208 evidence files (plus the persistent transaction lock), left zero pending
   markers and passed a separate `_scan_bundle` invocation on the exact runtime SHA.
 
