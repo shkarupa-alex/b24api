@@ -3,6 +3,7 @@
 # ruff: noqa: SLF001 - class-owned alternate construction
 
 from __future__ import annotations
+import asyncio
 import weakref
 from typing import TYPE_CHECKING, Self, cast
 
@@ -82,6 +83,7 @@ class Bitrix24:
         )
         self._host = host
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
         self._streams: weakref.WeakSet[CloseableResource] = weakref.WeakSet()
 
     @classmethod
@@ -101,6 +103,7 @@ class Bitrix24:
         instance._default_policy = policy or ExecutionPolicy()
         instance._host = host
         instance._closed = False
+        instance._close_task = None
         instance._streams = weakref.WeakSet()
         return instance
 
@@ -130,10 +133,14 @@ class Bitrix24:
 
     async def aclose(self) -> None:
         """Close active streams and then the owned transport idempotently."""
-        if self._closed:
+        if self._close_task is not None and self._close_task.done():
             return
-        self._closed = True
-        cleanup = await await_cleanup_resistant(close_owned_resources(tuple(self._streams), self._owned_transport))
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(
+                close_owned_resources(tuple(self._streams), self._owned_transport),
+            )
+        cleanup = await await_cleanup_resistant(self._close_task)
         if cleanup.error is not None:
             rearm_cancellation(cleanup.cancellation)
             raise cleanup.error

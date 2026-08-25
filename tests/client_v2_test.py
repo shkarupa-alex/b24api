@@ -1049,6 +1049,26 @@ async def test_client_close_finishes_owned_cleanup_before_replaying_cancellation
 
 
 @pytest.mark.asyncio
+async def test_concurrent_client_closes_await_one_owned_cleanup() -> None:
+    transport = BlockingCloseTransport()
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic owned-close seam
+    client._owned_transport = transport  # type: ignore[assignment]  # noqa: SLF001
+    first = asyncio.create_task(client.aclose())
+    await transport.close_started.wait()
+    second = asyncio.create_task(client.aclose())
+    await asyncio.sleep(0)
+
+    assert not first.done()
+    assert not second.done()
+    transport.release_close.set()
+    await asyncio.gather(first, second)
+
+    assert transport.closed
+    assert client._close_task is not None  # noqa: SLF001 - shared close ownership regression
+    assert client._close_task.done()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_client_context_preserves_body_error_when_owned_cleanup_fails() -> None:
     transport = FailingCloseTransport(lambda _request: {"result": None})
     client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic owned-close seam
