@@ -225,7 +225,7 @@ def test_failure_repr_excludes_request_error_and_payload_values() -> None:
         stable_key="_0",
         request=request,
         error={"auth": EXAMPLE_CREDENTIAL},
-        payload={"secret": EXAMPLE_CREDENTIAL},
+        correlation={"secret": EXAMPLE_CREDENTIAL},
     )
 
     assert EXAMPLE_CREDENTIAL not in repr(failure)
@@ -235,7 +235,7 @@ def test_reference_values_hide_correlation_and_detach_mutable_items() -> None:
     request = Request("profile", {"auth": EXAMPLE_CREDENTIAL})
     reference = ReferenceRequest(request, EXAMPLE_CREDENTIAL)
     source = {"rows": [1]}
-    item = ReferenceItem(EXAMPLE_CREDENTIAL, source, payload={"secret": EXAMPLE_CREDENTIAL})
+    item = ReferenceItem(EXAMPLE_CREDENTIAL, source, correlation={"secret": EXAMPLE_CREDENTIAL})
     source["rows"].append(2)
     exposed = item.item
     assert isinstance(exposed, dict)
@@ -250,7 +250,7 @@ def test_reference_values_hide_correlation_and_detach_mutable_items() -> None:
         page_state=TEST_LIMIT,
         partial_rows=1,
         replay_disposition=ReplayDisposition.NOT_ELIGIBLE,
-        payload={"secret": EXAMPLE_CREDENTIAL},
+        correlation={"secret": EXAMPLE_CREDENTIAL},
     )
 
     assert item.item == {"rows": [1]}

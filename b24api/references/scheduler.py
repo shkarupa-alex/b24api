@@ -400,7 +400,7 @@ class ReferenceScheduler:
                     outcome = ReferenceItem(
                         event.work.reference.reference_key,
                         item,
-                        event.work.reference.payload,
+                        event.work.reference.correlation,
                     )
                     self._delivery_uniqueness[id(outcome)] = (outcome, is_unique)
                     yield outcome
@@ -423,7 +423,7 @@ class ReferenceScheduler:
             partial_rows=event.partial_rows,
             replay_safety=request.replay_safety or ReplaySafety.UNKNOWN,
             replay_disposition=event.replay_disposition,
-            payload=event.work.reference.payload,
+            correlation=event.work.reference.correlation,
         )
         if not self.tolerant:
             if self.capture_fail_fast:

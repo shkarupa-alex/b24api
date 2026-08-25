@@ -47,7 +47,7 @@ class BatchSuccess:
     request: Request = field(repr=False)
     _result: FrozenJson = field(repr=False)
     _decoded_rows: int = field(repr=False)
-    payload: object = field(default=None, repr=False)
+    correlation: object = field(default=None, repr=False)
     evidence: BatchCommandEvidence | None = None
     replay_disposition: ReplayDisposition | None = None
     response: Response | None = field(default=None, repr=False)
@@ -58,7 +58,7 @@ class BatchSuccess:
         stable_key: str,
         request: Request,
         result: object,
-        payload: object = None,
+        correlation: object = None,
         evidence: BatchCommandEvidence | None = None,
         replay_disposition: ReplayDisposition | None = None,
         response: Response | None = None,
@@ -77,7 +77,7 @@ class BatchSuccess:
         object.__setattr__(self, "request", request)
         object.__setattr__(self, "_result", frozen_result)
         object.__setattr__(self, "_decoded_rows", len(frozen_result) if isinstance(frozen_result, tuple) else 1)
-        object.__setattr__(self, "payload", payload)
+        object.__setattr__(self, "correlation", correlation)
         object.__setattr__(self, "evidence", evidence)
         object.__setattr__(self, "replay_disposition", replay_disposition)
         object.__setattr__(self, "response", response)
@@ -89,7 +89,7 @@ class BatchSuccess:
         stable_key: str,
         request: Request,
         response: Response,
-        payload: object = None,
+        correlation: object = None,
         evidence: BatchCommandEvidence | None = None,
         replay_disposition: ReplayDisposition | None = None,
     ) -> Self:
@@ -109,7 +109,7 @@ class BatchSuccess:
             "_decoded_rows",
             len(response._result) if isinstance(response._result, tuple) else 1,  # noqa: SLF001
         )
-        object.__setattr__(instance, "payload", payload)
+        object.__setattr__(instance, "correlation", correlation)
         object.__setattr__(instance, "evidence", evidence)
         object.__setattr__(instance, "replay_disposition", replay_disposition)
         object.__setattr__(instance, "response", response)
@@ -136,7 +136,7 @@ class BatchFailure:
     error: object = field(repr=False)
     replay_safety: ReplaySafety = ReplaySafety.UNKNOWN
     replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
-    payload: object = field(default=None, repr=False)
+    correlation: object = field(default=None, repr=False)
     evidence: BatchCommandEvidence | None = None
 
     def __post_init__(self) -> None:

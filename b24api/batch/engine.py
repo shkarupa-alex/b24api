@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 import asyncio
-import contextlib
 from collections.abc import AsyncIterable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
+from urllib.parse import quote_plus
 
 from b24api.batch.outcome import (
     BatchCommandEvidence,
@@ -25,22 +25,25 @@ from b24api.execution import (
     Executor,
     WorkClass,
 )
-from b24api.query import build_query
 from b24api.traversal.plans import PORTAL_BATCH_CAP
 
 if TYPE_CHECKING:
     from b24api.batch.stream import _BatchOutcomeStream
     from b24api.contracts.json import JsonValue
 
-type RequestMapping = Mapping[str, object]
-type RequestWithPayload = tuple[Request | RequestMapping, object]
-type BatchInput = Request | RequestMapping | RequestWithPayload
-type BatchSource = Iterable[BatchInput] | AsyncIterable[BatchInput]
-type BatchStreamItem = BatchOutcome
-
-_REQUEST_PAYLOAD_TUPLE_LENGTH = 2
 _MISSING = object()
 _SYNC_EXHAUSTED = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchInput:
+    request: Request
+    correlation: object = None
+
+
+type _BatchItem = Request | _BatchInput
+type BatchSource = Iterable[_BatchItem] | AsyncIterable[_BatchItem]
+type BatchStreamItem = BatchOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,8 +51,7 @@ class _Command:
     index: int
     stable_key: str
     request: Request
-    payload: object
-    has_payload: bool
+    correlation: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +167,7 @@ class BatchExecutor:
                     command.stable_key,
                     command.request,
                     command_response,
-                    command.payload,
+                    command.correlation,
                     evidence,
                 ),
             )
@@ -185,8 +187,7 @@ class BatchExecutor:
                 index=index,
                 stable_key=f"c{index:012d}",
                 request=request,
-                payload=None,
-                has_payload=False,
+                correlation=None,
             )
             for index, request in enumerate(requests)
         )
@@ -226,38 +227,6 @@ class BatchExecutor:
         )
 
 
-def _coerce_input(raw: BatchInput) -> tuple[Request, object, bool]:
-    if isinstance(raw, tuple):
-        if len(raw) != _REQUEST_PAYLOAD_TUPLE_LENGTH:
-            raise ValueError("request/payload tuple must contain exactly two values")
-        request, payload = raw
-        return _coerce_request(request), payload, True
-    return _coerce_request(raw), None, False
-
-
-def _coerce_request(raw: Request | RequestMapping) -> Request:
-    if isinstance(raw, Request):
-        return raw
-    if not isinstance(raw, Mapping):
-        raise TypeError("batch input must be a Request, mapping, or request/payload tuple")
-    unknown = set(raw) - {"method", "parameters", "replay_safety"}
-    if unknown:
-        raise ValueError(f"unknown request fields: {sorted(unknown)}")
-    method = raw.get("method")
-    parameters = raw.get("parameters")
-    safety = raw.get("replay_safety", ReplaySafety.UNKNOWN)
-    if not isinstance(method, str):
-        raise TypeError("mapping request requires a string method")
-    if parameters is not None and not isinstance(parameters, Mapping):
-        raise TypeError("mapping request parameters must be a mapping")
-    if isinstance(safety, str):
-        with contextlib.suppress(ValueError):
-            safety = ReplaySafety(safety)
-    if not isinstance(safety, ReplaySafety):
-        raise TypeError("mapping replay_safety must be a ReplaySafety or enum value")
-    return Request(method, parameters, replay_safety=safety)
-
-
 def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
     safety_values = {command.request.replay_safety or ReplaySafety.UNKNOWN for command in commands}
     if safety_values == {ReplaySafety.SAFE}:
@@ -271,8 +240,25 @@ def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
 
 
 def _command_query(request: Request) -> str:
-    query = build_query(cast("dict[Any, Any]", request.to_wire_parameters()))
+    query = _build_query(cast("Mapping[str | int, object]", request.to_wire_parameters()))
     return request.method if not query else f"{request.method}?{query}"
+
+
+def _build_query(parameters: Mapping[str | int, object], path: str = "%s") -> str:
+    """Encode nested JSON values with Bitrix/PHP bracket semantics."""
+    parts: list[str] = []
+    for key, raw_value in parameters.items():
+        if raw_value is None:
+            continue
+        value: object = dict(enumerate(raw_value)) if isinstance(raw_value, list | tuple) else raw_value
+        if isinstance(value, Mapping):
+            nested = _build_query(value, path % key + "[%s]")
+            if nested:
+                parts.append(nested)
+            continue
+        encoded_key = quote_plus(path % key)
+        parts.append(f"{encoded_key}={quote_plus(str(value))}")
+    return "&".join(parts)
 
 
 def _decode_batch_envelope(raw: JsonValue) -> _BatchEnvelope:
@@ -338,7 +324,7 @@ def _command_failure(
         error,
         replay_safety=safety,
         replay_disposition=ReplayDisposition.ELIGIBLE if eligible else ReplayDisposition.NOT_ELIGIBLE,
-        payload=command.payload,
+        correlation=command.correlation,
         evidence=evidence,
     )
 

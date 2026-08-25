@@ -6,11 +6,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, cast
+from typing import cast
 
 from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, _thaw_json
 from b24api.contracts.policy import IdentityCoercion
-from b24api.query import build_query
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 _METHOD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
@@ -160,13 +159,6 @@ class Request:
     def to_wire_parameters(self) -> dict[str, JsonValue]:
         """Return the to wire parameters representation."""
         return self.copy_parameters()
-
-    @property
-    def query(self) -> str:
-        """Return the committed PHP-style method/query representation."""
-        parameters = self.to_wire_parameters()
-        query = build_query(cast("dict[Any, Any]", parameters))
-        return self.method if not query else f"{self.method}?{query}"
 
     @property
     def summary(self) -> RequestSummary:

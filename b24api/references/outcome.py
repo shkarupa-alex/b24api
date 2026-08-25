@@ -16,7 +16,7 @@ class ReferenceRequest:
 
     request: Request = field(repr=False)
     reference_key: str = field(repr=False)
-    payload: object = field(default=None, repr=False)
+    correlation: object = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -28,19 +28,19 @@ class ReferenceRequest:
 
 @dataclass(frozen=True, slots=True, init=False)
 class ReferenceItem:
-    """Successful reference item; raw item and payload are hidden from repr."""
+    """Successful reference item; raw item and correlation are hidden from repr."""
 
     reference_key: str = field(repr=False)
     _item: FrozenJson = field(repr=False)
-    payload: object = field(default=None, repr=False)
+    correlation: object = field(default=None, repr=False)
 
-    def __init__(self, reference_key: str, item: object, payload: object = None) -> None:
+    def __init__(self, reference_key: str, item: object, correlation: object = None) -> None:
         """Initialize instance state."""
         if not reference_key or len(reference_key) > STABLE_KEY_MAXIMUM:
             raise ValueError("reference_key must be 1..100 characters")
         object.__setattr__(self, "reference_key", reference_key)
         object.__setattr__(self, "_item", _freeze_json(item))
-        object.__setattr__(self, "payload", payload)
+        object.__setattr__(self, "correlation", correlation)
 
     @property
     def item(self) -> JsonValue:
@@ -60,7 +60,7 @@ class ReferenceFailure:
     partial_rows: int = 0
     replay_safety: ReplaySafety = ReplaySafety.UNKNOWN
     replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
-    payload: object = field(default=None, repr=False)
+    correlation: object = field(default=None, repr=False)
 
     def __init__(  # noqa: PLR0913
         self,
@@ -72,7 +72,7 @@ class ReferenceFailure:
         partial_rows: int = 0,
         replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
         replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE,
-        payload: object = None,
+        correlation: object = None,
     ) -> None:
         """Initialize instance state."""
         if not reference_key or len(reference_key) > STABLE_KEY_MAXIMUM:
@@ -95,7 +95,7 @@ class ReferenceFailure:
         object.__setattr__(self, "partial_rows", partial_rows)
         object.__setattr__(self, "replay_safety", replay_safety)
         object.__setattr__(self, "replay_disposition", replay_disposition)
-        object.__setattr__(self, "payload", payload)
+        object.__setattr__(self, "correlation", correlation)
 
     @property
     def cursor(self) -> JsonValue:

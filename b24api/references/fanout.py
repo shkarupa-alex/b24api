@@ -141,14 +141,14 @@ class _FanOutMapper:
     def __call__(self, event: KernelFanOutEvent) -> CommandOutcome[object]:
         """Convert one independently correlated terminal event."""
         if isinstance(event, _KernelFanOutSuccess):
-            context = cast("_CommandContext", event.reference.payload)
+            context = cast("_CommandContext", event.reference.correlation)
             return CommandSuccess(
                 context.index,
                 context.correlation,
                 event.reference.request.summary,
                 event.response,
             )
-        context = cast("_CommandContext", event.payload)
+        context = cast("_CommandContext", event.correlation)
         error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("fan-out command failed")
         if isinstance(error, AmbiguousExecutionError):
             return CommandOutcomeUnknown(context.index, context.correlation, event.request.summary, error)

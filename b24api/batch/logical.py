@@ -7,7 +7,7 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator
 from typing import Protocol, Self, cast, runtime_checkable
 
-from b24api.batch.engine import BatchExecutor, BatchInput, BatchSource
+from b24api.batch.engine import BatchExecutor, BatchSource, _BatchInput, _BatchItem
 from b24api.batch.outcome import BatchFailure as KernelFailure
 from b24api.batch.outcome import BatchSuccess as KernelSuccess
 from b24api.batch.stream import _iterate_source, _next_chunk
@@ -54,36 +54,36 @@ class _AsyncClosable(Protocol):
         ...
 
 
-class _SyncCommandAdapter[C](Iterator[tuple[object, object]]):
+class _SyncCommandAdapter[C](Iterator[_BatchInput]):
     def __init__(self, source: Iterable[Command[C]]) -> None:
         self._iterator = iter(source)
 
     def __iter__(self) -> Self:
         return self
 
-    def __next__(self) -> tuple[object, object]:
+    def __next__(self) -> _BatchInput:
         command = next(self._iterator)
         if not isinstance(command, Command):
             raise TypeError("batch source must yield Command values")
-        return command.request, command.correlation
+        return _BatchInput(command.request, command.correlation)
 
     def close(self) -> None:
         if isinstance(self._iterator, _SyncClosable):
             self._iterator.close()
 
 
-class _AsyncCommandAdapter[C](AsyncIterator[tuple[object, object]]):
+class _AsyncCommandAdapter[C](AsyncIterator[_BatchInput]):
     def __init__(self, source: AsyncIterable[Command[C]]) -> None:
         self._iterator = aiter(source)
 
     def __aiter__(self) -> Self:
         return self
 
-    async def __anext__(self) -> tuple[object, object]:
+    async def __anext__(self) -> _BatchInput:
         command = await anext(self._iterator)
         if not isinstance(command, Command):
             raise TypeError("batch source must yield Command values")
-        return command.request, command.correlation
+        return _BatchInput(command.request, command.correlation)
 
     async def aclose(self) -> None:
         if isinstance(self._iterator, _AsyncClosable):
@@ -92,7 +92,7 @@ class _AsyncCommandAdapter[C](AsyncIterator[tuple[object, object]]):
 
 def _adapt_source[C](
     source: CommandSource[C],
-) -> Iterable[tuple[object, object]] | AsyncIterable[tuple[object, object]]:
+) -> BatchSource:
     if isinstance(source, AsyncIterable):
         return _AsyncCommandAdapter(source)
     return _SyncCommandAdapter(source)
@@ -117,7 +117,7 @@ def _public_outcomes(
             if response is None:
                 raise ProtocolError("correlated batch success has no response envelope")
             converted.append(
-                CommandSuccess(outcome.command_index, outcome.payload, outcome.request.summary, response),
+                CommandSuccess(outcome.command_index, outcome.correlation, outcome.request.summary, response),
             )
             continue
         error = outcome.error
@@ -125,7 +125,7 @@ def _public_outcomes(
             converted.append(
                 CommandNotExecuted(
                     outcome.command_index,
-                    outcome.payload,
+                    outcome.correlation,
                     outcome.request.summary,
                     NotExecutedReason.HALTED,
                 ),
@@ -137,10 +137,10 @@ def _public_outcomes(
             error = ProtocolError("batch command failed without a typed safe error")
         if isinstance(error, AmbiguousExecutionError):
             converted.append(
-                CommandOutcomeUnknown(outcome.command_index, outcome.payload, outcome.request.summary, error),
+                CommandOutcomeUnknown(outcome.command_index, outcome.correlation, outcome.request.summary, error),
             )
         else:
-            converted.append(CommandFailure(outcome.command_index, outcome.payload, outcome.request.summary, error))
+            converted.append(CommandFailure(outcome.command_index, outcome.correlation, outcome.request.summary, error))
     return tuple(converted)
 
 
@@ -158,12 +158,12 @@ class LogicalBatchKernelStream[C]:
     ) -> None:
         """Initialize bounded admission without pulling the source."""
         self._batch_executor = BatchExecutor(executor)
-        self._source = cast("BatchSource", _adapt_source(source))
+        self._source = _adapt_source(source)
         self._batch_size = batch_size
         self._fail_fast = fail_fast
         self._context = executor.context(policy)
         self._runner: AsyncIterator[CommandOutcome[object]] | None = None
-        self._controller: AsyncIteratorController[BatchInput] | None = None
+        self._controller: AsyncIteratorController[_BatchItem] | None = None
         self._closed = False
         self._emitted = 0
         self._batch_requests = 0
@@ -196,7 +196,7 @@ class LogicalBatchKernelStream[C]:
 
     async def _run(self) -> AsyncGenerator[CommandOutcome[object]]:  # noqa: C901
         await self._context.start()
-        controller: AsyncIteratorController[BatchInput] = AsyncIteratorController(
+        controller: AsyncIteratorController[_BatchItem] = AsyncIteratorController(
             _iterate_source(self._source),
             input_error="batch input exceeded operation time budget",
             cleanup_error="batch source cleanup exceeded operation time budget",
@@ -236,7 +236,7 @@ class LogicalBatchKernelStream[C]:
                         else NotExecutedReason.SOURCE_FAILED
                     )
                     pending = tuple(
-                        CommandNotExecuted(command.index, command.payload, command.request.summary, reason)
+                        CommandNotExecuted(command.index, command.correlation, command.request.summary, reason)
                         for command in chunk.commands
                     )
                     if self._fail_fast:

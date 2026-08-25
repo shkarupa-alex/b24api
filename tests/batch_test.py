@@ -859,7 +859,7 @@ async def test_early_close_closes_original_sync_and_async_sources() -> None:
     assert async_closed is True
 
 
-def test_batch_size_and_mapping_shape_fail_before_io() -> None:
+def test_physical_batch_size_and_non_request_input_fail_before_io() -> None:
     transport = CallbackTransport(_echo_batch)
     batch = BatchExecutor(Executor(transport))
     with pytest.raises(ValueError, match="batch_size"):
@@ -869,6 +869,6 @@ def test_batch_size_and_mapping_shape_fail_before_io() -> None:
     async def consume() -> None:
         await anext(stream)
 
-    with pytest.raises(ValueError, match="unknown request fields"):
+    with pytest.raises(TypeError, match="must yield Request"):
         asyncio.run(consume())
     assert not transport.requests

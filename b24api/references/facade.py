@@ -195,15 +195,15 @@ class _ReferenceEventMapper:
     def __call__(self, event: KernelReferenceEvent) -> ReferenceOutcome[object]:
         """Convert one kernel event without interpreting correlation."""
         if isinstance(event, KernelItem):
-            context = cast("_BindingContext", event.payload)
+            context = cast("_BindingContext", event.correlation)
             item_index = self._item_indexes.get(context.index, 0)
             self._item_indexes[context.index] = item_index + 1
             return ReferenceItem(context.index, context.correlation, item_index, event.item)
         if isinstance(event, _KernelReferenceComplete):
-            context = cast("_BindingContext", event.reference.payload)
+            context = cast("_BindingContext", event.reference.correlation)
             self._item_indexes.pop(context.index, None)
             return ReferenceComplete(context.index, context.correlation, event.row_count)
-        context = cast("_BindingContext", event.payload)
+        context = cast("_BindingContext", event.correlation)
         self._item_indexes.pop(context.index, None)
         error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("reference failed")
         if isinstance(error, AmbiguousExecutionError):

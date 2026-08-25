@@ -11,12 +11,12 @@ from b24api.batch.engine import (
     _MISSING,
     _SYNC_EXHAUSTED,
     BatchExecutor,
-    BatchInput,
     BatchSource,
     BatchStreamItem,
     _batch_outcome_row_weight,
+    _BatchInput,
+    _BatchItem,
     _Chunk,
-    _coerce_input,
     _Command,
     _raise_source_error,
 )
@@ -29,6 +29,7 @@ from b24api.contracts.policy import (
     SnapshotState,
 )
 from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.contracts.request import Request
 from b24api.execution import (
     AsyncIteratorController,
     ExecutionContext,
@@ -71,7 +72,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         self._context = context or batch_executor.executor.context(policy)
         self._logical_page_per_command = logical_page_per_command
         self._runner: AsyncGenerator[BatchStreamItem] | None = None
-        self._source_controller: AsyncIteratorController[BatchInput] | None = None
+        self._source_controller: AsyncIteratorController[_BatchItem] | None = None
         self._prefetched: BatchStreamItem | object = _MISSING
         self._closed = False
         self._batch_requests = 0
@@ -260,7 +261,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
                 rearm_cancellation(pending_cancellation)
 
-    async def _cleanup_source(self, source: AsyncIteratorController[BatchInput]) -> None:
+    async def _cleanup_source(self, source: AsyncIteratorController[_BatchItem]) -> None:
         await self._context.set_buffered_rows(0)
         await source.aclose(
             remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed),
@@ -350,7 +351,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         )
 
 
-async def _iterate_source(source: BatchSource) -> AsyncGenerator[BatchInput]:
+async def _iterate_source(source: BatchSource) -> AsyncGenerator[_BatchItem]:
     if isinstance(source, AsyncIterable):
         iterator = aiter(source)
         try:
@@ -370,20 +371,20 @@ async def _iterate_source(source: BatchSource) -> AsyncGenerator[BatchInput]:
             sync_item = await _next_sync_owned(sync_iterator)
             if sync_item is _SYNC_EXHAUSTED:
                 return
-            yield cast("BatchInput", sync_item)
+            yield cast("_BatchItem", sync_item)
     finally:
         if isinstance(sync_iterator, _SyncClosable):
             await _close_sync_owned(sync_iterator)
 
 
-def _next_sync(iterator: Iterator[BatchInput]) -> BatchInput | object:
+def _next_sync(iterator: Iterator[_BatchItem]) -> _BatchItem | object:
     try:
         return next(iterator)
     except StopIteration:
         return _SYNC_EXHAUSTED
 
 
-async def _next_sync_owned(iterator: Iterator[BatchInput]) -> BatchInput | object:
+async def _next_sync_owned(iterator: Iterator[_BatchItem]) -> _BatchItem | object:
     pull = asyncio.create_task(asyncio.to_thread(_next_sync, iterator))
     try:
         return await asyncio.shield(pull)
@@ -409,7 +410,7 @@ def _attach_report(error: BaseException, report: KernelReport) -> None:
 
 
 async def _next_chunk(
-    source: AsyncIteratorController[BatchInput],
+    source: AsyncIteratorController[_BatchItem],
     size: int,
     *,
     start_index: int,
@@ -418,8 +419,7 @@ async def _next_chunk(
     commands: list[_Command] = []
     for offset in range(size):
         try:
-            raw = await source.get(context)
-            request, payload, has_payload = _coerce_input(raw)
+            item = await source.get(context)
         except StopAsyncIteration:
             break
         except Exception as error:
@@ -427,5 +427,13 @@ async def _next_chunk(
                 raise
             return _Chunk(tuple(commands), error)
         index = start_index + offset
-        commands.append(_Command(index, f"c{index:012d}", request, payload, has_payload))
+        if isinstance(item, Request):
+            request, correlation = item, None
+        elif isinstance(item, _BatchInput):
+            request, correlation = item.request, item.correlation
+        else:
+            if not commands:
+                raise TypeError("physical batch source must yield Request values")
+            return _Chunk(tuple(commands), TypeError("physical batch source must yield Request values"))
+        commands.append(_Command(index, f"c{index:012d}", request, correlation))
     return _Chunk(tuple(commands))

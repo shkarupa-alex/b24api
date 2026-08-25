@@ -37,7 +37,7 @@ class _CountedBatchMixin:
         page_size: int,
     ) -> AsyncGenerator[_Page]:
         """Execute the committed direct-head/batched-tail counted traversal."""
-        from b24api.batch.engine import BatchExecutor  # noqa: PLC0415
+        from b24api.batch.engine import BatchExecutor, _BatchInput  # noqa: PLC0415
         from b24api.batch.outcome import BatchFailure, BatchSuccess  # noqa: PLC0415
         from b24api.batch.stream import _BatchOutcomeStream  # noqa: PLC0415
 
@@ -102,13 +102,15 @@ class _CountedBatchMixin:
                 self.terminal_reason = "parallel counted traversal completed"
                 return
             requests = (
-                _request_with_controls(
-                    self.request,
-                    {
-                        self.plan.offset_path: start,
-                        **({self.plan.limit_path: page_size} if self.plan.limit_path is not None else {}),
-                    },
-                    allow_create=self.plan.allow_create_controls,
+                _BatchInput(
+                    _request_with_controls(
+                        self.request,
+                        {
+                            self.plan.offset_path: start,
+                            **({self.plan.limit_path: page_size} if self.plan.limit_path is not None else {}),
+                        },
+                        allow_create=self.plan.allow_create_controls,
+                    ),
                 )
                 for start in range(stride, total, stride)
             )
