@@ -57,7 +57,7 @@ _EXPECTED_ROWS = 2
 class FixtureTransport:
     """Credential-free method-agnostic response fixture."""
 
-    host = "issues.invalid"
+    host = "bitrix24.com"
 
     def __init__(self, handler: Callable[[Request], object]) -> None:
         """Store the deterministic response handler."""
@@ -80,7 +80,7 @@ class FixtureTransport:
 
 
 def _client(transport: FixtureTransport) -> Bitrix24:
-    return Bitrix24(Settings(webhook_url="https://issues.invalid/rest/1/local-only/"), transport=transport)
+    return Bitrix24(Settings(webhook_url="https://bitrix24.com/rest/0/test/"), transport=transport)
 
 
 def _identity(

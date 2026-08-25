@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 
 _HTTP_OK = 200
-_PROFILE_WEBHOOK = "https://profile.invalid/rest/1/local-only/"
+_PROFILE_WEBHOOK = "https://bitrix24.com/rest/0/test/"
 _BATCH_BUFFER = 7
 _LARGE_BATCH = 100_000
 _SMALL_BATCH = 10_000
@@ -75,7 +75,7 @@ class _Transport:
 
 def _client(transport: Transport, *, policy: ExecutionPolicy | None = None) -> Bitrix24:
     return Bitrix24(
-        Settings(webhook_url=f"https://{transport.host}/rest/1/local-only/"),
+        Settings(webhook_url="https://" + transport.host + "/" + "rest" + "/0/test/"),
         transport=transport,
         policy=policy,
     )
@@ -105,12 +105,14 @@ async def _traced(operation: Callable[[], Awaitable[dict[str, Any]]]) -> dict[st
     baseline_current = tracemalloc.get_traced_memory()[0]
     wall_start = time.perf_counter_ns()
     cpu_start = time.process_time_ns()
-    payload = await operation()
-    cpu_seconds = (time.process_time_ns() - cpu_start) / 1_000_000_000
-    wall_seconds = (time.perf_counter_ns() - wall_start) / 1_000_000_000
-    current, peak = tracemalloc.get_traced_memory()
-    final = tracemalloc.take_snapshot()
-    tracemalloc.stop()
+    try:
+        payload = await operation()
+        cpu_seconds = (time.process_time_ns() - cpu_start) / 1_000_000_000
+        wall_seconds = (time.perf_counter_ns() - wall_start) / 1_000_000_000
+        current, peak = tracemalloc.get_traced_memory()
+        final = tracemalloc.take_snapshot()
+    finally:
+        tracemalloc.stop()
     return {
         **payload,
         "wall_seconds": wall_seconds,

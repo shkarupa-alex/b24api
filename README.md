@@ -383,6 +383,8 @@ Local deterministic timing is not live portal latency admission. A stable regres
 discarded warm-ups, seven measurements, unchanged request counts and an independent reproduction.
 The latest exact measurements and their interpretation are in
 [`docs/bitrix24-client-2.0/w13/runtime-profile.md`](docs/bitrix24-client-2.0/w13/runtime-profile.md).
+The complete capability-preservation, issue-traceability and architecture disposition is in
+[`docs/bitrix24-client-2.0/w13/capability-architecture-report.md`](docs/bitrix24-client-2.0/w13/capability-architecture-report.md).
 
 ## Verification
 
