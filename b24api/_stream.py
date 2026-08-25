@@ -110,6 +110,9 @@ class MappedOperationStream[S, T]:
         error_mapper: Callable[[BaseException, OperationReport], BaseException] | None = None,
         error_items: Callable[[BaseException], Iterable[T]] | None = None,
         count_admitted: Callable[[T], bool] | None = None,
+        source_admitted: Callable[[], int] | None = None,
+        source_buffered_commands: Callable[[], int] | None = None,
+        source_active_references: Callable[[], int] | None = None,
         deregister: Callable[[MappedOperationStream[S, T]], None] | None = None,
     ) -> None:
         """Initialize without starting or prefetching the source."""
@@ -121,6 +124,9 @@ class MappedOperationStream[S, T]:
         self._error_mapper = error_mapper
         self._error_items = error_items
         self._count_admitted = count_admitted
+        self._source_admitted = source_admitted
+        self._source_buffered_commands = source_buffered_commands
+        self._source_active_references = source_active_references
         self._deregister = deregister
         self._report: OperationReport | None = None
         self._terminal_error: BaseException | None = None
@@ -263,14 +269,14 @@ class MappedOperationStream[S, T]:
             self._source.report,
             operation=self._operation,
             assurance=self._assurance,
-            admitted=max(self._admitted, getattr(self._source, "admitted", 0)),
+            admitted=max(self._admitted, _read_source_counter(self._source_admitted)),
             emitted=self._emitted,
             successes=self._successes,
             failures=self._failures,
             not_executed=self._not_executed,
             unknown=self._unknown,
-            buffered_commands_high_water=getattr(self._source, "buffered_commands_high_water", 0),
-            active_references_high_water=getattr(self._source, "active_references_high_water", 0),
+            buffered_commands_high_water=_read_source_counter(self._source_buffered_commands),
+            active_references_high_water=_read_source_counter(self._source_active_references),
             early_closed=self._early_closed,
         )
         if forced_state is not None and report.state is not forced_state:
@@ -279,6 +285,16 @@ class MappedOperationStream[S, T]:
         self._terminated = True
         if self._deregister is not None:
             self._deregister(self)
+
+
+def _read_source_counter(reader: Callable[[], int] | None) -> int:
+    """Read one explicitly wired non-negative source metric."""
+    if reader is None:
+        return 0
+    value = reader()
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise RuntimeError("operation source exposed an invalid report counter")
+    return value
 
 
 __all__ = ["MappedOperationStream"]

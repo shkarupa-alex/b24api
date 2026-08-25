@@ -217,17 +217,17 @@ class _ReferenceEventMapper:
         if event.not_executed_reason is not None:
             return ReferenceNotExecuted(context.index, context.correlation, event.not_executed_reason)
         error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("reference failed")
-        if isinstance(error, PaginationError):
-            pagination_error = error
+        if isinstance(error, PaginationError) or (isinstance(error, CapabilityError) and event.page_state > 0):
+            incomplete_cause = error
             error = IncompleteTraversalError(
                 report=OperationReport(
                     TerminalState.INCOMPLETE,
                     "reference",
-                    type(pagination_error).__name__,
+                    type(incomplete_cause).__name__,
                     emitted=event.partial_rows,
                 ),
             )
-            error.__cause__ = pagination_error
+            error.__cause__ = incomplete_cause
         if isinstance(error, AmbiguousExecutionError):
             return ReferenceOutcomeUnknown(context.index, context.correlation, error, event.partial_rows)
         return ReferenceFailure(context.index, context.correlation, error, event.partial_rows)
@@ -334,6 +334,7 @@ def reference_stream[C](
         error_mapper=lambda error, report: _reference_error(error, report, mapper),
         error_items=lambda error: _reference_error_items(error, mapper),
         count_admitted=_reference_terminal,
+        source_active_references=lambda: source.active_references_high_water,
         deregister=deregister,
     )
     return cast("OperationStream[ReferenceOutcome[C]]", stream)

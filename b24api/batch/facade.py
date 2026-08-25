@@ -90,6 +90,8 @@ def batch_stream[C](
         classify=_outcome_variant,
         error_mapper=_fail_fast_error,
         error_items=_error_items,
+        source_admitted=lambda: source.admitted,
+        source_buffered_commands=lambda: source.buffered_commands_high_water,
         deregister=deregister,
     )
     return cast("OperationStream[CommandSuccess[C]]", stream)
@@ -117,6 +119,8 @@ def batch_outcome_stream[C](
         operation="batch_outcomes",
         classify=_outcome_variant,
         error_items=_error_items,
+        source_admitted=lambda: source.admitted,
+        source_buffered_commands=lambda: source.buffered_commands_high_water,
         deregister=deregister,
     )
     return cast("OperationStream[CommandOutcome[C]]", stream)

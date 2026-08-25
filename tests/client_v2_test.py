@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -774,6 +774,40 @@ async def test_reference_incomplete_maps_to_typed_failure_not_unknown() -> None:
 
 
 @pytest.mark.asyncio
+async def test_counted_reference_post_io_capability_failure_is_typed_incomplete() -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: [{"ID": 1}] for key in commands},
+                "result_error": {},
+            },
+        }
+
+    correlation = object()
+    stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        [Binding("missing exact total", (), correlation)],
+        traversal=CountedTraversal(identity=_identity()),
+        dispatch=BatchDispatch(batch_size=1),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == 1
+    failure = outcomes[0]
+    assert isinstance(failure, ReferenceFailure)
+    assert failure.correlation is correlation
+    assert failure.partial_rows == 0
+    assert isinstance(failure.error, IncompleteTraversalError)
+    assert isinstance(failure.error.__cause__, CapabilityError)
+    assert failure.error.report.state is TerminalState.INCOMPLETE
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
+
+
+@pytest.mark.asyncio
 async def test_fail_fast_reference_raises_bounded_reference_failed() -> None:
     transport = FunctionTransport(lambda _request: {"error": "denied", "error_description": "no access"})
     stream = _client(transport).iter_references(
@@ -876,6 +910,55 @@ async def test_tolerant_fanout_continues_after_one_direct_failure() -> None:
     assert isinstance(outcomes[2], CommandSuccess)
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        DirectDispatch(concurrency=1, output_order=DeliveryOrder.INPUT),
+        BatchDispatch(batch_size=2, concurrency=1, output_order=DeliveryOrder.INPUT),
+    ],
+)
+@pytest.mark.parametrize("malformed_item", [False, True])
+async def test_fanout_source_failure_accounts_known_commands_without_fabricating_correlation(
+    dispatch: DirectDispatch | BatchDispatch,
+    *,
+    malformed_item: bool,
+) -> None:
+    correlation = object()
+
+    def commands() -> Iterator[Command[object]]:
+        yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE), correlation)
+        if malformed_item:
+            yield cast("Command[object]", object())
+        raise ValueError("caller source failed")
+
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {"result": {"ok": True}}
+        command_map = request.copy_parameters()["cmd"]
+        assert isinstance(command_map, dict)
+        return {
+            "result": {
+                "result": {key: {"ok": True} for key in command_map},
+                "result_error": {},
+            },
+        }
+
+    stream = _client(FunctionTransport(handler)).fan_out_outcomes(commands(), dispatch=dispatch)
+
+    outcome = await anext(stream)
+    with pytest.raises(InputSourceError):
+        await anext(stream)
+
+    assert isinstance(outcome, CommandSuccess)
+    assert outcome.correlation is correlation
+    assert stream.report is not None
+    assert stream.report.admitted == 1
+    assert stream.report.emitted == 1
+    assert stream.report.not_executed == 0
+    assert stream.report.state is TerminalState.FAILED
 
 
 def test_injected_transport_host_must_match_settings_before_io() -> None:

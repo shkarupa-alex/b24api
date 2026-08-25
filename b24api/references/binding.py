@@ -43,6 +43,10 @@ class _BindingSourceError(Exception):
     pass
 
 
+class _BindingLocalValidationError(ValueError):
+    """The client's exact binding transform rejected a known Binding."""
+
+
 def _normalized(path: ParameterPath) -> tuple[str | int, ...]:
     return tuple(part.casefold() if isinstance(part, str) else part for part in path.path)
 
@@ -111,10 +115,13 @@ def _replace_path(root: dict[str, JsonValue], path: tuple[str | int, ...], value
 
 
 def _bind_request(base: Request, binding: Binding[object], index: int, traversal: TraversalSpec) -> ReferenceRequest:
-    _validate_binding_controls(binding, traversal)
-    parameters = base.copy_parameters()
-    for update in binding.updates:
-        _replace_path(parameters, update.path.path, update.value)
+    try:
+        _validate_binding_controls(binding, traversal)
+        parameters = base.copy_parameters()
+        for update in binding.updates:
+            _replace_path(parameters, update.path.path, update.value)
+    except (KeyError, TypeError, ValueError) as error:
+        raise _BindingLocalValidationError from error
     return ReferenceRequest(
         Request(base.method, parameters, base.replay_safety),
         f"r{index:012d}",
@@ -150,7 +157,7 @@ class _SyncBindingAdapter[C](Iterator[ReferenceRequest]):
             canonical = cast("Binding[object]", binding)
             try:
                 request = _bind_request(self._base, canonical, self._index, self._traversal)
-            except (KeyError, TypeError, ValueError):
+            except _BindingLocalValidationError:
                 request = _local_validation_failure(self._base, canonical, self._index)
         except StopIteration:
             raise
@@ -182,7 +189,7 @@ class _AsyncBindingAdapter[C](AsyncIterator[ReferenceRequest]):
             canonical = cast("Binding[object]", binding)
             try:
                 request = _bind_request(self._base, canonical, self._index, self._traversal)
-            except (KeyError, TypeError, ValueError):
+            except _BindingLocalValidationError:
                 request = _local_validation_failure(self._base, canonical, self._index)
         except StopAsyncIteration:
             raise

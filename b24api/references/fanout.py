@@ -256,6 +256,7 @@ def fanout_stream[C](  # noqa: PLR0913
         classify=_fanout_variant,
         error_mapper=lambda error, report: _fanout_error(error, report, mapper, tolerant=tolerant),
         error_items=lambda error: _fanout_error_items(error, mapper),
+        source_active_references=lambda: source.active_references_high_water,
         deregister=deregister,
     )
     return cast("OperationStream[CommandOutcome[C]]", stream)

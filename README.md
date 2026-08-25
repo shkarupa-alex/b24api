@@ -264,7 +264,9 @@ async with stream:
 
 `iter_reference_outcomes()` adds correlated `ReferenceFailure`, `ReferenceNotExecuted` and
 `ReferenceOutcomeUnknown`. Identity tracking is scoped per binding, so equal child IDs under
-different parents are not conflated.
+different parents are not conflated. For `DeliveryOrder.INPUT`, a smaller local page cap can admit
+more references within `max_buffered_rows`; actual simultaneous HTTP work remains bounded by the
+selected dispatch concurrency and `max_active_references`.
 
 ## Streams, partial results and reports
 
