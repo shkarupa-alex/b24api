@@ -921,6 +921,7 @@ async def test_reference_source_failure_drains_all_admitted_outcomes(
     assert sorted(outcome.reference_key for outcome in outcomes) == ["a", "b"]
     assert len(transport.requests) == TWO_REFERENCES
     assert stream.report.state is KernelState.FAILED
+    assert not any(violation.code == "cleanup_failure" for violation in stream.report.violations)
 
 
 @pytest.mark.asyncio

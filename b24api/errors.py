@@ -10,6 +10,9 @@ from b24api.redaction import DEFAULT_REDACTOR, Redactor
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from b24api.contracts.command import CommandOutcome
+    from b24api.contracts.reference import ReferenceOutcome
+    from b24api.contracts.report import OperationReport
     from b24api.contracts.request import RequestSummary
 
 
@@ -263,7 +266,7 @@ class InputSourceError(B24ApiError):
 class BatchFailed[C](B24ApiError):  # noqa: N818 - normative public name
     """Bounded fail-fast batch window plus its final report."""
 
-    def __init__(self, outcomes: tuple[object, ...], *, report: object) -> None:
+    def __init__(self, outcomes: tuple[CommandOutcome[C], ...], *, report: OperationReport) -> None:
         """Retain only the bounded active window."""
         self.outcomes = outcomes
         self.report = report
@@ -273,7 +276,7 @@ class BatchFailed[C](B24ApiError):  # noqa: N818 - normative public name
 class ReferenceFailed[C](B24ApiError):  # noqa: N818 - normative public name
     """Bounded fail-fast reference window plus its final report."""
 
-    def __init__(self, outcomes: tuple[object, ...], *, report: object) -> None:
+    def __init__(self, outcomes: tuple[ReferenceOutcome[C], ...], *, report: OperationReport) -> None:
         """Retain only the bounded active window."""
         self.outcomes = outcomes
         self.report = report

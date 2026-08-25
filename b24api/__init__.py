@@ -16,6 +16,7 @@ from b24api.contracts import (
     DeliveryOrder,
     DirectDispatch,
     ExecutionPolicy,
+    IdentityCoercion,
     IdentitySpec,
     KeysetSpec,
     KeysetTraversal,
@@ -41,6 +42,8 @@ from b24api.contracts import (
     SequentialTraversal,
     TerminalState,
     TraversalAssurance,
+    Violation,
+    ViolationSeverity,
     partition_command_outcomes,
     partition_reference_outcomes,
 )
@@ -62,6 +65,7 @@ from b24api.errors import (
     TransportError,
 )
 from b24api.settings import Settings
+from b24api.transport import Transport, WireResponse
 
 __all__ = [
     "AmbiguousExecutionError",
@@ -87,6 +91,7 @@ __all__ = [
     "DirectDispatch",
     "ExecutionPolicy",
     "HTTPGatewayError",
+    "IdentityCoercion",
     "IdentitySpec",
     "IncompleteTraversalError",
     "InputSourceError",
@@ -118,8 +123,12 @@ __all__ = [
     "SequentialTraversal",
     "Settings",
     "TerminalState",
+    "Transport",
     "TransportError",
     "TraversalAssurance",
+    "Violation",
+    "ViolationSeverity",
+    "WireResponse",
     "partition_command_outcomes",
     "partition_reference_outcomes",
 ]

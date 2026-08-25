@@ -30,6 +30,7 @@ from b24api.traversal.plans import SingleResponsePlan
 if TYPE_CHECKING:
     from b24api.contracts.dispatch import DispatchSpec
     from b24api.contracts.policy import ExecutionPolicy
+    from b24api.contracts.report import OperationReport
     from b24api.contracts.stream import OperationStream
     from b24api.execution.snapshot import KernelReport
 
@@ -184,7 +185,7 @@ def _fanout_error_items(
 
 def _fanout_error(
     error: BaseException,
-    report: object,
+    report: OperationReport,
     mapper: _FanOutMapper,
     *,
     tolerant: bool,

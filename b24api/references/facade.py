@@ -260,7 +260,7 @@ def _reference_error_items(
     return ()
 
 
-def _reference_error(error: BaseException, report: object, mapper: _ReferenceEventMapper) -> BaseException:
+def _reference_error(error: BaseException, report: OperationReport, mapper: _ReferenceEventMapper) -> BaseException:
     if isinstance(error, _ReferenceWindowError):
         return ReferenceFailed(_reference_error_items(error, mapper), report=report)
     if isinstance(error, _BindingSourceError):
@@ -299,6 +299,7 @@ def kernel_reference_stream[C](
         policy=policy,
         _emit_complete=True,
         _capture_fail_fast=not tolerant,
+        _page_cap_hint=traversal.page_size,
     )
     return cast("ReferenceKernelStream", stream)
 

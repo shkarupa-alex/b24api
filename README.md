@@ -148,8 +148,7 @@ endpoint's exact `limit_path`; the client never guesses a method-specific parame
 
 <!-- tested: tests/client_v2_test.py::test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup -->
 ```python
-from b24api import IdentitySpec, ResultSelector
-from b24api.contracts import IdentityCoercion
+from b24api import IdentityCoercion, IdentitySpec, ResultSelector
 
 identity = IdentitySpec(
     item_path=("ID",),
@@ -314,7 +313,8 @@ Advanced list contracts are closed JSON `version: 1` documents. Counted requires
 requires selector, identity and keyset; cursor requires selector and cursor. Invalid method syntax,
 non-finite JSON numbers, unknown/duplicate keys, trailing JSON and control collisions reject
 locally. The complete contract is validated before client construction. `b24api --help` documents
-the compact surface.
+the compact surface. List requests retain the public `ReplaySafety.UNKNOWN` default; the CLI does
+not silently infer replay safety from a method name or from choosing list traversal.
 
 Exit codes are `0` success, `2` usage/contract error, `3` unavailable configuration, `4`
 remote/protocol/correctness/incomplete failure, `5` broken output consumer and `130` cancellation.

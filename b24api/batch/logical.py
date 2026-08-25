@@ -54,6 +54,10 @@ class _AsyncClosable(Protocol):
         ...
 
 
+class _CommandLocalValidationError(TypeError):
+    """A yielded source item is not a public Command value."""
+
+
 class _SyncCommandAdapter[C](Iterator[_BatchInput]):
     def __init__(self, source: Iterable[Command[C]]) -> None:
         self._iterator = iter(source)
@@ -64,7 +68,7 @@ class _SyncCommandAdapter[C](Iterator[_BatchInput]):
     def __next__(self) -> _BatchInput:
         command = next(self._iterator)
         if not isinstance(command, Command):
-            raise TypeError("batch source must yield Command values")
+            raise _CommandLocalValidationError("batch source must yield Command values")
         return _BatchInput(command.request, command.correlation)
 
     def close(self) -> None:
@@ -82,7 +86,7 @@ class _AsyncCommandAdapter[C](AsyncIterator[_BatchInput]):
     async def __anext__(self) -> _BatchInput:
         command = await anext(self._iterator)
         if not isinstance(command, Command):
-            raise TypeError("batch source must yield Command values")
+            raise _CommandLocalValidationError("batch source must yield Command values")
         return _BatchInput(command.request, command.correlation)
 
     async def aclose(self) -> None:
@@ -168,6 +172,7 @@ class LogicalBatchKernelStream[C]:
         self._emitted = 0
         self._batch_requests = 0
         self._batch_commands = 0
+        self.admitted = 0
         self.buffered_commands_high_water = 0
         self.report = KernelReport()
 
@@ -225,6 +230,7 @@ class LogicalBatchKernelStream[C]:
                 if not chunk.commands:
                     break
                 next_index += len(chunk.commands)
+                self.admitted += len(chunk.commands)
                 self.buffered_commands_high_water = max(
                     self.buffered_commands_high_water,
                     len(chunk.commands),
@@ -232,7 +238,7 @@ class LogicalBatchKernelStream[C]:
                 if chunk.source_error is not None:
                     reason = (
                         NotExecutedReason.LOCAL_VALIDATION_FAILED
-                        if isinstance(chunk.source_error, TypeError | ValueError)
+                        if isinstance(chunk.source_error, _CommandLocalValidationError)
                         else NotExecutedReason.SOURCE_FAILED
                     )
                     pending = tuple(

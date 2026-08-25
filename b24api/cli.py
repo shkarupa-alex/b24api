@@ -71,26 +71,28 @@ def _write_json(stream: TextIO, value: object) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="b24api")
+    parser = argparse.ArgumentParser(prog="b24api", description="Call Bitrix24 methods and stream list rows as JSONL.")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    call = subparsers.add_parser("call")
-    call.add_argument("method")
-    call.add_argument("--params")
-    call.add_argument("--raw", action="store_true")
+    call = subparsers.add_parser("call", help="execute one method and print one JSON value")
+    call.add_argument("method", help="Bitrix24 REST method name")
+    call.add_argument("--params", help="JSON object, @file, or - for stdin")
+    call.add_argument("--raw", action="store_true", help="print the immutable response envelope")
     call.add_argument(
         "--replay-safety",
         choices=tuple(safety.value for safety in ReplaySafety),
         default=ReplaySafety.UNKNOWN.value,
+        help="operator assertion controlling post-dispatch replay (default: unknown)",
     )
-    listing = subparsers.add_parser("list")
-    listing.add_argument("method")
-    listing.add_argument("--params")
+    listing = subparsers.add_parser("list", help="stream one list traversal as JSONL")
+    listing.add_argument("method", help="Bitrix24 REST method name")
+    listing.add_argument("--params", help="JSON object, @file, or - for stdin")
     listing.add_argument(
         "--strategy",
         choices=("sequential", "counted", "keyset", "cursor"),
         default="sequential",
+        help="traversal mechanics (default: sequential)",
     )
-    listing.add_argument("--contract")
+    listing.add_argument("--contract", help="closed v1 traversal contract as @file or -")
     return parser
 
 
@@ -160,7 +162,7 @@ def main(  # noqa: PLR0911 - stable process-code boundary
         else:
             contract = default_contract(args.strategy, args.contract, input_stream)
             route = parse_list_contract(args.strategy, contract)
-            request = cli_request(args.method, params, ReplaySafety.SAFE)
+            request = cli_request(args.method, params, ReplaySafety.UNKNOWN)
             asyncio.run(_list(request, route, output_stream, error_stream))
     except KeyboardInterrupt:
         return _INTERRUPTED

@@ -151,7 +151,7 @@ class ReferenceScheduler:
             primary_error = error
             raise
         finally:
-            cleanup = await await_cleanup_resistant(self._cleanup(iterator, admission, producer))
+            cleanup = await await_cleanup_resistant(self._cleanup(iterator, admission, producer, primary_error))
             if cleanup.error is not None:
                 cleanup_error = cleanup.error
                 if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
@@ -182,6 +182,7 @@ class ReferenceScheduler:
         iterator: AsyncIteratorController[ReferenceRequest],
         admission: _AdmissionState,
         producer: asyncio.Task[None],
+        primary_error: BaseException | None,
     ) -> None:
         producer.cancel()
         for task in admission.tasks.values():
@@ -190,16 +191,18 @@ class ReferenceScheduler:
         try:
             await self.buffer.close()
         except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
-            cleanup_errors.append(error)
+            if error is not primary_error:
+                cleanup_errors.append(error)
         try:
             await self.dispatcher.aclose()
         except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
-            cleanup_errors.append(error)
+            if error is not primary_error:
+                cleanup_errors.append(error)
         pending, task_errors = await _wait_for_cleanup_tasks(
             (producer, *admission.tasks.values()),
             remaining=max(0.0, self.context.policy.max_elapsed - self.context.elapsed),
         )
-        cleanup_errors.extend(task_errors)
+        cleanup_errors.extend(error for error in task_errors if error is not primary_error)
         if pending:
             cleanup_errors.append(BudgetExceededError("reference task cleanup exceeded operation time budget"))
         else:
@@ -208,7 +211,8 @@ class ReferenceScheduler:
                     remaining=max(0.0, self.context.policy.max_elapsed - self.context.elapsed),
                 )
             except BaseException as error:  # noqa: BLE001 - attach at the stream boundary
-                cleanup_errors.append(error)
+                if error is not primary_error:
+                    cleanup_errors.append(error)
         self._delivery_uniqueness.clear()
         if cleanup_errors:
             raise cleanup_errors[0]

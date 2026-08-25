@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import signal
+import site
 import subprocess
 import sys
 import time
@@ -2922,15 +2923,30 @@ def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) 
 
     environment = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(tmp_path / "wheel-venv")}
     subprocess.run(  # noqa: S603 - fixed local uv environment command
-        [uv, "venv", "--system-site-packages", environment["UV_PROJECT_ENVIRONMENT"]],
+        [
+            uv,
+            "venv",
+            "--python",
+            sys.executable,
+            environment["UV_PROJECT_ENVIRONMENT"],
+        ],
         cwd=tmp_path,
         env=environment,
         check=True,
         capture_output=True,
         text=True,
     )
-    subprocess.run(  # noqa: S603 - installs the local wheel and cached locked runtime dependencies
-        [uv, "pip", "install", "--python", environment["UV_PROJECT_ENVIRONMENT"], "--offline", str(wheel)],
+    subprocess.run(  # noqa: S603 - installs only the local wheel; the test runner supplies locked dependencies
+        [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            environment["UV_PROJECT_ENVIRONMENT"],
+            "--offline",
+            "--no-deps",
+            str(wheel),
+        ],
         cwd=tmp_path,
         env=environment,
         check=True,
@@ -2939,6 +2955,17 @@ def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) 
     )
     scripts = "Scripts" if os.name == "nt" else "bin"
     executable = Path(environment["UV_PROJECT_ENVIRONMENT"]) / scripts / ("b24api.exe" if os.name == "nt" else "b24api")
+    python = Path(environment["UV_PROJECT_ENVIRONMENT"]) / scripts / ("python.exe" if os.name == "nt" else "python")
+    environment["PYTHONPATH"] = os.pathsep.join(site.getsitepackages())
+    imported = subprocess.run(  # noqa: S603 - prove import resolution uses the installed wheel
+        [str(python), "-c", "import b24api; print(b24api.__file__)"],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert Path(imported.stdout.strip()).is_relative_to(Path(environment["UV_PROJECT_ENVIRONMENT"]))
     installed = subprocess.run(  # noqa: S603 - exact installed wheel entry point
         [str(executable), "--help"],
         cwd=tmp_path,
@@ -2948,6 +2975,9 @@ def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) 
         text=True,
     )
     assert installed.stdout.startswith("usage: b24api")
+    assert "Call Bitrix24 methods and stream list rows as JSONL" in installed.stdout
+    assert "execute one method" in installed.stdout
+    assert "stream one list traversal" in installed.stdout
 
 
 def _run_cli(*arguments: str, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

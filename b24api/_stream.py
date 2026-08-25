@@ -123,6 +123,7 @@ class MappedOperationStream[S, T]:
         self._count_admitted = count_admitted
         self._deregister = deregister
         self._report: OperationReport | None = None
+        self._terminal_error: BaseException | None = None
         self._pull: asyncio.Task[S] | None = None
         self._terminated = False
         self._early_closed = False
@@ -152,11 +153,13 @@ class MappedOperationStream[S, T]:
         """Close owned work on context exit."""
         await self.aclose()
 
-    async def __anext__(self) -> T:  # noqa: C901 - lifecycle and outcome finalization are one transition
+    async def __anext__(self) -> T:  # noqa: C901, PLR0912 - lifecycle and outcome finalization are one transition
         """Pull exactly one source item and map it."""
         if self._terminated:
             if self._early_closed:
                 raise RuntimeError("stream was closed before exhaustion")
+            if self._terminal_error is not None:
+                raise self._terminal_error
             raise StopAsyncIteration
         if self._pull is not None:
             raise RuntimeError("concurrent stream pulls are not allowed")
@@ -170,6 +173,7 @@ class MappedOperationStream[S, T]:
             await self._close_source()
             self._finalize(forced_state=TerminalState.CANCELLED)
             _attach_report(error, cast("OperationReport", self._report))
+            self._terminal_error = error
             raise
         except BaseException as error:
             await self._close_source()
@@ -183,6 +187,7 @@ class MappedOperationStream[S, T]:
             report = cast("OperationReport", self._report)
             propagated = self._error_mapper(error, report) if self._error_mapper is not None else error
             _attach_report(propagated, report)
+            self._terminal_error = propagated
             if propagated is error:
                 raise
             raise propagated from error
@@ -258,7 +263,7 @@ class MappedOperationStream[S, T]:
             self._source.report,
             operation=self._operation,
             assurance=self._assurance,
-            admitted=self._admitted,
+            admitted=max(self._admitted, getattr(self._source, "admitted", 0)),
             emitted=self._emitted,
             successes=self._successes,
             failures=self._failures,
@@ -269,7 +274,7 @@ class MappedOperationStream[S, T]:
             early_closed=self._early_closed,
         )
         if forced_state is not None and report.state is not forced_state:
-            report = replace(report, state=forced_state, terminal_reason=forced_state.value)
+            report = replace(report, state=forced_state)
         self._report = report
         self._terminated = True
         if self._deregister is not None:

@@ -18,6 +18,7 @@ from b24api.errors import BatchFailed, InputSourceError
 
 if TYPE_CHECKING:
     from b24api.contracts.policy import ExecutionPolicy
+    from b24api.contracts.report import OperationReport
     from b24api.contracts.stream import OperationStream
     from b24api.execution.executor import Executor
 
@@ -49,7 +50,7 @@ def _error_items(error: BaseException) -> tuple[CommandOutcome[object], ...]:
     return ()
 
 
-def _fail_fast_error(error: BaseException, report: object) -> BaseException:
+def _fail_fast_error(error: BaseException, report: OperationReport) -> BaseException:
     if isinstance(error, _BatchWindowError):
         return BatchFailed(error.outcomes, report=report)
     if isinstance(error, InputSourceError):

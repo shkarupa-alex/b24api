@@ -56,7 +56,7 @@ from b24api.execution import Executor, Transport, WireResponse
 from b24api.settings import Settings
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, Callable, Iterator
 
 HTTP_OK = 200
 COUNTED_ROWS = 500
@@ -544,6 +544,72 @@ async def test_binding_collision_rejects_before_reference_io() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tolerant_batch_distinguishes_user_source_failure_from_local_item_validation() -> None:
+    correlation = object()
+
+    def failed_source() -> Iterator[Command[object]]:
+        yield Command(Request("test.get"), correlation)
+        raise ValueError("caller source failed")
+
+    transport = FunctionTransport(lambda _request: pytest.fail("partial source window must not dispatch"))
+    stream = _client(transport).batch_outcomes(failed_source(), batch_size=2)
+
+    outcome = await anext(stream)
+    assert isinstance(outcome, CommandNotExecuted)
+    assert outcome.correlation is correlation
+    assert outcome.reason is NotExecutedReason.SOURCE_FAILED
+    with pytest.raises(InputSourceError) as captured:
+        await anext(stream)
+    with pytest.raises(InputSourceError) as repeated:
+        await anext(stream)
+    assert repeated.value is captured.value
+    assert isinstance(captured.value.__cause__, ValueError)
+    assert transport.requests == []
+
+    def invalid_item_source() -> Iterator[object]:
+        yield Command(Request("test.get"), correlation)
+        yield object()
+
+    local = _client(transport).batch_outcomes(invalid_item_source(), batch_size=2)  # type: ignore[arg-type]
+    local_outcome = await anext(local)
+    assert isinstance(local_outcome, CommandNotExecuted)
+    assert local_outcome.correlation is correlation
+    assert local_outcome.reason is NotExecutedReason.LOCAL_VALIDATION_FAILED
+    with pytest.raises(InputSourceError):
+        await anext(local)
+
+
+@pytest.mark.asyncio
+async def test_early_closed_batch_reports_every_command_admitted_into_the_physical_window() -> None:
+    def handler(request: Request) -> object:
+        command_map = request.copy_parameters()["cmd"]
+        assert isinstance(command_map, dict)
+        return {
+            "result": {
+                "result": {key: {"ok": True} for key in command_map},
+                "result_error": {},
+            },
+        }
+
+    commands = tuple(
+        Command(Request("test.get", {"index": index}, ReplaySafety.SAFE), index)
+        for index in range(SMALL_BATCH_COMMANDS)
+    )
+    stream = _client(FunctionTransport(handler)).batch_outcomes(
+        commands,
+        batch_size=SMALL_BATCH_COMMANDS,
+    )
+
+    await anext(stream)
+    await stream.aclose()
+
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.EARLY_CLOSED
+    assert stream.report.admitted == SMALL_BATCH_COMMANDS
+    assert stream.report.emitted == 1
+
+
+@pytest.mark.asyncio
 async def test_tolerant_local_binding_failure_emits_not_executed_and_continues() -> None:
     correlations = (object(), object())
     transport = FunctionTransport(lambda _request: {"result": []})
@@ -653,6 +719,30 @@ async def test_tolerant_reference_failure_has_no_false_completion_and_later_bind
     assert events[1].binding_index == 1
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
+
+
+@pytest.mark.asyncio
+async def test_reference_traversal_enforces_its_local_page_cap_without_a_wire_limit() -> None:
+    rows = [{"ID": index} for index in range(PAGE_SIZE + 1)]
+    transport = FunctionTransport(lambda _request: {"result": rows})
+    correlation = object()
+    stream = _client(transport).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        [Binding("oversized", (), correlation)],
+        traversal=SequentialTraversal(page_size=PAGE_SIZE, identity=_identity()),
+        dispatch=DirectDispatch(),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], ReferenceFailure)
+    assert outcomes[0].correlation is correlation
+    assert outcomes[0].partial_rows == 0
+    assert isinstance(outcomes[0].error, IncompleteTraversalError)
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert stream.report.buffered_rows_high_water == 0
 
 
 @pytest.mark.asyncio
@@ -999,6 +1089,56 @@ async def test_counted_missing_in_band_stride_fails_incomplete() -> None:
 
 
 @pytest.mark.asyncio
+async def test_counted_page_cap_rejects_a_wider_observed_head_before_tail_or_rows() -> None:
+    transport = FunctionTransport(
+        lambda _request: {
+            "result": [{"ID": index} for index in range(PAGE_SIZE)],
+            "total": PAGE_SIZE * 2,
+            "next": PAGE_SIZE,
+        },
+    )
+    stream = _client(transport).iter_list_counted(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        identity=_identity(),
+        page_size=2,
+    )
+
+    with pytest.raises(IncompleteTraversalError):
+        await anext(stream)
+
+    assert len(transport.requests) == 1
+    assert stream.report is not None
+    assert stream.report.emitted == 0
+    assert stream.report.state is TerminalState.INCOMPLETE
+
+
+@pytest.mark.asyncio
+async def test_empty_page_with_continuation_never_completes_and_negative_pull_is_sticky() -> None:
+    def handler(request: Request) -> object:
+        start = int(request.copy_parameters().get("start", 0))
+        if start == 0:
+            return {"result": [{"ID": 1}], "next": 1}
+        return {"result": [], "next": 2}
+
+    stream = _client(FunctionTransport(handler)).iter_list(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        identity=_identity(),
+    )
+
+    assert await anext(stream) == {"ID": 1}
+    with pytest.raises(IncompleteTraversalError) as first:
+        await anext(stream)
+    with pytest.raises(IncompleteTraversalError) as repeated:
+        await anext(stream)
+
+    assert repeated.value is first.value
+    assert repeated.value.report is stream.report
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.INCOMPLETE
+    assert stream.report.terminal_reason == "PaginationError"
+
+
+@pytest.mark.asyncio
 async def test_partial_helper_closes_without_claiming_completion() -> None:
     transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
     stream = _client(transport).iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE))
@@ -1095,6 +1235,21 @@ async def test_public_aclose_is_permitted_during_an_inflight_pull_and_cancels_ow
     assert transport.cancelled.is_set()
     assert stream.report is not None
     assert stream.report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_concurrent_public_pulls_reject_without_stealing_the_owned_pull() -> None:
+    transport = BlockingRequestTransport()
+    stream = _client(transport).iter_list(Request("test.list"))
+    owned_pull = asyncio.create_task(anext(stream))
+    await transport.started.wait()
+
+    with pytest.raises(RuntimeError, match="concurrent stream pulls"):
+        await anext(stream)
+
+    await stream.aclose()
+    with pytest.raises(asyncio.CancelledError):
+        await owned_pull
 
 
 @pytest.mark.asyncio

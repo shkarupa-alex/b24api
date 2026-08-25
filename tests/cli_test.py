@@ -277,6 +277,7 @@ def test_sequential_default_is_mechanics_only_and_reports_once(monkeypatch: pyte
     assert diagnostics[0]["code"] == "mechanics_only"
     assert diagnostics[1]["assurance"] == "mechanics_only"
     assert stderr.count('"kind":"report"') == 1
+    assert client.calls[0].request.replay_safety is ReplaySafety.UNKNOWN
     assert client.calls[0].kwargs == {
         "selector": ResultSelector.root(),
         "identity": None,

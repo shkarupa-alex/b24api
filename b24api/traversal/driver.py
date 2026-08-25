@@ -167,9 +167,10 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._identity_store.close()
         self._identity_store = None
 
-    def validate_plan(self: object) -> None:
+    @staticmethod
+    def validate_plan(plan: object) -> None:
         """Reject values outside the closed canonical plan union."""
-        if not isinstance(self, _PLAN_TYPES):
+        if not isinstance(plan, _PLAN_TYPES):
             raise TypeError("plan must be a canonical ListPlan")
 
     @staticmethod
@@ -288,6 +289,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         page_caps = tuple(value for value in (requested_page_size, self._page_cap_hint) if value is not None)
         if page_caps and len(items) > min(page_caps):
             raise PaginationError("response exceeded the declared page cap")
+        if not items and response.next is not None:
+            raise PaginationError("empty response retained a continuation")
         fingerprint = _page_fingerprint(items)
         if fingerprint in self._fingerprints:
             raise PaginationError("repeated page fingerprint detected")

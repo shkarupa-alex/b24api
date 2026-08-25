@@ -85,3 +85,11 @@ would reduce the client's usefulness. Introducing SQLite to avoid that refusal w
 API client to a storage mechanism the product does not need. The chosen design keeps correctness,
 removes configuration and storage complexity, and makes the resource trade-off visible without
 turning it into an artificial operational failure.
+
+## Post-implementation public-surface clarification
+
+The final root manifest also exports `IdentityCoercion`, `Violation`, `ViolationSeverity`,
+`Transport` and `WireResponse`. These are not engines or compatibility aliases: they are the exact
+types required to construct root-exported identity/cursor contracts, inspect typed report
+violations and implement the public injected-transport boundary. This clarification overrides the
+omission of those names from the manifest prose in base specification Section 32.11.

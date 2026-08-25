@@ -2,19 +2,11 @@
 
 from __future__ import annotations
 import math
-import re
 from collections.abc import Iterator, Mapping, Sequence
 
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type FrozenJson = JsonScalar | tuple[FrozenJson, ...] | FrozenMapping
-
-_METHOD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
-HTTP_STATUS_MINIMUM = 100
-HTTP_STATUS_MAXIMUM = 599
-VIOLATION_CODE_MAXIMUM = 100
-VIOLATION_MESSAGE_MAXIMUM = 500
-STABLE_KEY_MAXIMUM = 100
 
 
 class FrozenMapping(Mapping[str, FrozenJson]):
