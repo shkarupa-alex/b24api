@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+import b24api
 from b24api.contracts import (
     BatchDispatch,
     Binding,
@@ -39,6 +40,69 @@ from b24api.models import IdentityCoercion
 CORRELATION_VALUE = 7
 DIRECT_CONCURRENCY = 3
 BATCH_SIZE = 7
+
+
+def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
+    assert b24api.__all__ == [
+        "AmbiguousExecutionError",
+        "ApiResponseError",
+        "B24ApiError",
+        "BatchCommandError",
+        "BatchDispatch",
+        "BatchFailed",
+        "Binding",
+        "Bitrix24",
+        "BudgetExceededError",
+        "CapabilityError",
+        "Command",
+        "CommandFailure",
+        "CommandNotExecuted",
+        "CommandOutcome",
+        "CommandOutcomeUnknown",
+        "CommandSuccess",
+        "CountedTraversal",
+        "CursorSpec",
+        "CursorTraversal",
+        "DeliveryOrder",
+        "DirectDispatch",
+        "ExecutionPolicy",
+        "HTTPGatewayError",
+        "IdentitySpec",
+        "IncompleteTraversalError",
+        "InputSourceError",
+        "KeysetSpec",
+        "KeysetTraversal",
+        "NotExecutedReason",
+        "OffsetSpec",
+        "OperationReport",
+        "OperationStream",
+        "PaginationError",
+        "ParameterPath",
+        "ParameterUpdate",
+        "PartialResult",
+        "ProtocolError",
+        "ReferenceComplete",
+        "ReferenceEvent",
+        "ReferenceFailed",
+        "ReferenceFailure",
+        "ReferenceItem",
+        "ReferenceNotExecuted",
+        "ReferenceOutcome",
+        "ReferenceOutcomeUnknown",
+        "ReplaySafety",
+        "Request",
+        "Response",
+        "ResponseTooLargeError",
+        "ResultCollectionShape",
+        "ResultSelector",
+        "SequentialTraversal",
+        "Settings",
+        "TerminalState",
+        "TransportError",
+        "TraversalAssurance",
+        "partition_command_outcomes",
+        "partition_reference_outcomes",
+    ]
 
 
 def _error() -> ProtocolError:

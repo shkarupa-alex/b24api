@@ -910,7 +910,7 @@ def _canonical_request(raw: RequestLike) -> Request:  # noqa: C901, PLR0912
         raise ValueError(f"unknown request fields: {sorted(unknown)}")
     method = raw.get("method")
     parameters = raw.get("parameters", {})
-    safety = raw.get("replay_safety")
+    safety = raw.get("replay_safety", ReplaySafety.UNKNOWN)
     if not isinstance(method, str):
         raise TypeError("mapping request method must be a string")
     if not isinstance(parameters, Mapping):
@@ -920,7 +920,7 @@ def _canonical_request(raw: RequestLike) -> Request:  # noqa: C901, PLR0912
             safety = ReplaySafety(safety)
         except ValueError as error:
             raise ValueError("mapping replay_safety is invalid") from error
-    if safety is not None and not isinstance(safety, ReplaySafety):
+    if not isinstance(safety, ReplaySafety):
         raise TypeError("mapping replay_safety must be a ReplaySafety or enum value")
     dumped = to_jsonable_python(parameters)
     if not isinstance(dumped, Mapping):
@@ -971,7 +971,7 @@ def _counted_offset_request(base: Request, plan: CountedOffsetPlan, start: int) 
         )
     except (KeyError, TypeError, ValueError) as error:
         raise CapabilityError("request parameters conflict with counted traversal controls") from error
-    return Request(base.method, parameters, base.replay_safety)
+    return Request(base.method, parameters, base.replay_safety or ReplaySafety.UNKNOWN)
 
 
 def _require_profile_batch_support(profile: EndpointProfile | None) -> None:

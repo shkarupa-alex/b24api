@@ -87,7 +87,7 @@ def test_request_repr_contains_shape_not_values() -> None:
 
     assert EXAMPLE_CREDENTIAL not in repr(request)
     assert "auth" in repr(request)
-    assert request.replay_safety is None
+    assert request.replay_safety is ReplaySafety.UNKNOWN
     assert Request("profile", replay_safety=ReplaySafety.UNKNOWN).replay_safety is ReplaySafety.UNKNOWN
 
 

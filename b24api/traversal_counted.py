@@ -160,4 +160,6 @@ class CountedItemStream:
             terminal_reason=reason,
             evidence=tuple(self._evidence),
         )
+
+
 __all__ = ["CountedItemStream"]

@@ -55,8 +55,7 @@ class Binding[C]:
         if any(not isinstance(update, ParameterUpdate) for update in updates):
             raise TypeError("updates must contain only ParameterUpdate values")
         normalized = [
-            tuple(part.casefold() if isinstance(part, str) else part for part in update.path.path)
-            for update in updates
+            tuple(part.casefold() if isinstance(part, str) else part for part in update.path.path) for update in updates
         ]
         for index, left in enumerate(normalized):
             for right in normalized[index + 1 :]:
@@ -117,11 +116,7 @@ class ReferenceOutcomeUnknown[C]:
 
 type ReferenceEvent[C] = ReferenceItem[C] | ReferenceComplete[C]
 type ReferenceOutcome[C] = (
-    ReferenceItem[C]
-    | ReferenceComplete[C]
-    | ReferenceFailure[C]
-    | ReferenceNotExecuted[C]
-    | ReferenceOutcomeUnknown[C]
+    ReferenceItem[C] | ReferenceComplete[C] | ReferenceFailure[C] | ReferenceNotExecuted[C] | ReferenceOutcomeUnknown[C]
 )
 
 

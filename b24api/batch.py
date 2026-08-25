@@ -752,7 +752,7 @@ def _coerce_request(raw: Request | RequestMapping) -> Request:
         raise ValueError(f"unknown request fields: {sorted(unknown)}")
     method = raw.get("method")
     parameters = raw.get("parameters")
-    safety = raw.get("replay_safety")
+    safety = raw.get("replay_safety", ReplaySafety.UNKNOWN)
     if not isinstance(method, str):
         raise TypeError("mapping request requires a string method")
     if parameters is not None and not isinstance(parameters, Mapping):
@@ -760,7 +760,7 @@ def _coerce_request(raw: Request | RequestMapping) -> Request:
     if isinstance(safety, str):
         with contextlib.suppress(ValueError):
             safety = ReplaySafety(safety)
-    if safety is not None and not isinstance(safety, ReplaySafety):
+    if not isinstance(safety, ReplaySafety):
         raise TypeError("mapping replay_safety must be a ReplaySafety or enum value")
     return Request(method, parameters, replay_safety=safety)
 

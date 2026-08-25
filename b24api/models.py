@@ -377,20 +377,20 @@ class Request:
     """Deeply immutable canonical request with detached accessors."""
 
     method: str
-    replay_safety: ReplaySafety | None
+    replay_safety: ReplaySafety
     _parameters: FrozenMapping = field(repr=False)
 
     def __init__(
         self,
         method: str,
         parameters: Mapping[str, object] | None = None,
-        replay_safety: ReplaySafety | None = None,
+        replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
     ) -> None:
         """Initialize instance state."""
         if not _METHOD_RE.fullmatch(method):
             raise ValueError("method must contain only letters, digits, dots, and underscores")
-        if replay_safety is not None and not isinstance(replay_safety, ReplaySafety):
-            raise TypeError("replay_safety must be a ReplaySafety or None")
+        if not isinstance(replay_safety, ReplaySafety):
+            raise TypeError("replay_safety must be a ReplaySafety")
         frozen = _freeze_json(parameters or {})
         if not isinstance(frozen, FrozenMapping):
             raise TypeError("request parameters must be a mapping")

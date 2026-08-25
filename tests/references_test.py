@@ -31,6 +31,7 @@ from b24api.models import (
     ReferenceFailure,
     ReferenceItem,
     ReferenceRequest,
+    ReplaySafety,
     Request,
     RetryPolicy,
     SnapshotRequirement,
@@ -504,9 +505,9 @@ async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
         await anext(stream)
 
     assert captured.value.__dict__["report"] is stream.report
-    assert request.replay_safety is None
+    assert request.replay_safety is ReplaySafety.UNKNOWN
     assert len(transport.requests) == 1
-    assert transport.requests[0].replay_safety is None
+    assert transport.requests[0].replay_safety is ReplaySafety.UNKNOWN
     assert stream.report.retries == 0
     assert stream.report.state is TerminalState.FAILED
 

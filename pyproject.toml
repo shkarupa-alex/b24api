@@ -24,6 +24,9 @@ dependencies = [
     "tenacity>=9.1.2",
 ]
 
+[project.scripts]
+b24api = "b24api.cli:main"
+
 [tool.setuptools.package-data]
 b24api = ["data/*.json"]
 

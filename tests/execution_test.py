@@ -265,8 +265,8 @@ async def test_safe_and_unknown_retry_only_when_replay_is_proven() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("safety", [None, ReplaySafety.UNKNOWN, ReplaySafety.UNSAFE])
-async def test_ambiguous_dispatch_never_retries_unproven_request(safety: ReplaySafety | None) -> None:
+@pytest.mark.parametrize("safety", [ReplaySafety.UNKNOWN, ReplaySafety.UNSAFE])
+async def test_ambiguous_dispatch_never_retries_unproven_request(safety: ReplaySafety) -> None:
     transport = SequenceTransport(
         [TransportError("read failed", phase=FailurePhase.DISPATCH_STARTED), _success()],
     )
@@ -462,7 +462,7 @@ async def test_socket_connect_and_post_dispatch_failures_have_distinct_phases() 
     dead_transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
     try:
         with pytest.raises(TransportError) as not_dispatched:
-                await dead_transport.send(Request("profile"), attempt_timeout=0.2, max_response_bytes=1024)
+            await dead_transport.send(Request("profile"), attempt_timeout=0.2, max_response_bytes=1024)
         assert not_dispatched.value.phase is FailurePhase.NOT_DISPATCHED
     finally:
         await dead_transport.aclose()
