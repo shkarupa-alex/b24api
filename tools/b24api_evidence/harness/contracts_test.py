@@ -22,6 +22,7 @@ import pytest
 
 from . import cli as cli_module
 from . import contracts as contracts_module
+from . import runtime_profile as runtime_profile_module
 from .contracts import (
     FINGERPRINT_ALGORITHM,
     FINGERPRINT_KEY_FORMAT,
@@ -90,6 +91,7 @@ EXPECTED_STABLE_MODEL_RUNS = 180
 EXPECTED_BENCHMARK_REFS = EXPECTED_STABLE_MODEL_RUNS + 2
 EXPECTED_MODEL_ORACLES = 200
 EXPECTED_SCHEMA_COUNT = 6
+PROFILE_BATCH_BUFFER = 7
 SECOND_CALL = 2
 BUNDLE_OVERFLOW_FILES = 513
 LEAK_FIXTURE = b"https://example.invalid/rest/1/realisticToken123/"
@@ -1733,6 +1735,23 @@ def test_runtime_profile_runner_compares_frozen_and_current_counted_paths() -> N
     assert runs["fixed_1x_batch"]["requests"] == runs["counted_batch"]["requests"] == 1
     assert runs["fixed_1x_batch"]["buffered_rows_high_water"] == SMALL_CASE_ROWS
     assert runs["counted_batch"]["buffered_rows_high_water"] == SMALL_CASE_ROWS
+
+
+@pytest.mark.asyncio
+async def test_capability_profile_runner_enforces_resource_invariants(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime_profile_module, "_SMALL_BATCH", 100)
+    monkeypatch.setattr(runtime_profile_module, "_LARGE_BATCH", 1_000)
+
+    payload = await runtime_profile_module.run_capability_profile()
+
+    assert payload["passed"] is True
+    assert all(payload["invariants"].values())
+    cases = {case["case"]: case for case in payload["cases"]}
+    assert cases["logical-batch-1000"]["buffered_commands_high_water"] == PROFILE_BATCH_BUFFER
+    assert cases["logical-batch-1000"]["source_closed"] is True
+    assert cases["logical-batch-1000"]["correlation_entered_wire"] is False
+    assert cases["repeated-traversal-lifecycle"]["retained_resources"] == 0
+    assert cases["oversized-response"]["refused"] is True
 
 
 def test_deterministic_comparison_proves_fixed_1x_parity_without_claiming_admission() -> None:

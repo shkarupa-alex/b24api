@@ -18,6 +18,7 @@ from b24api.contracts import (
     CursorSpec,
     DeliveryOrder,
     DirectDispatch,
+    ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
     KeysetSpec,
@@ -57,6 +58,9 @@ REFERENCE_EVENTS = 4
 FANOUT_COMMANDS = 60
 FANOUT_BATCH_SIZE = 10
 FANOUT_BATCH_REQUESTS = 6
+LARGE_COUNTED_ROWS = 100_001
+LARGE_LOGICAL_BATCH_COMMANDS = 100_000
+LARGE_LOGICAL_BATCH_REQUESTS = 2_000
 
 
 class FunctionTransport:
@@ -148,6 +152,95 @@ async def test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_of
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.batch_commands == LOGICAL_BATCH_COMMANDS
     assert stream.report.buffered_commands_high_water == LOGICAL_BATCH_SIZE
+
+
+@pytest.mark.asyncio
+async def test_public_counted_traversal_above_100k_stays_exact_and_warns_once() -> None:
+    def page(start: int) -> list[dict[str, int]]:
+        return [{"ID": value} for value in range(start, min(start + PAGE_SIZE, LARGE_COUNTED_ROWS))]
+
+    def handler(request: Request) -> object:
+        if request.method == "test.list":
+            start = int(request.copy_parameters().get("start", 0))
+            return {"result": page(start), "total": LARGE_COUNTED_ROWS, "next": start + PAGE_SIZE}
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        results: dict[str, object] = {}
+        totals: dict[str, int] = {}
+        continuations: dict[str, int] = {}
+        for key, encoded in commands.items():
+            assert isinstance(encoded, str)
+            parameters = parse_qs(urlsplit(encoded).query)
+            start = int(parameters.get("start", ["0"])[0])
+            results[key] = page(start)
+            totals[key] = LARGE_COUNTED_ROWS
+            if start + PAGE_SIZE < LARGE_COUNTED_ROWS:
+                continuations[key] = start + PAGE_SIZE
+        return {
+            "result": {
+                "result": results,
+                "result_error": {},
+                "result_total": totals,
+                "result_next": continuations,
+            },
+        }
+
+    transport = FunctionTransport(handler)
+    client = _client(transport)
+    stream = client.iter_list_counted(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        identity=_identity(),
+    )
+
+    async def consume() -> int:
+        count = 0
+        async for row in stream:
+            assert row == {"ID": count}
+            count += 1
+        return count
+
+    with pytest.warns(RuntimeWarning, match="exact duplicate/loss detection") as captured:
+        count = await consume()
+
+    matching = [warning for warning in captured if "exact duplicate/loss detection" in str(warning.message)]
+    assert len(matching) == 1
+    assert count == LARGE_COUNTED_ROWS
+    assert stream.report is not None
+    assert stream.report.unique_rows == LARGE_COUNTED_ROWS
+    assert stream.report.assurance is TraversalAssurance.IDENTITY_EXACT
+
+
+@pytest.mark.asyncio
+async def test_public_logical_batch_accepts_100k_generator_without_input_materialization() -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: int(key[1:]) for key in commands},
+                "result_error": {},
+            },
+        }
+
+    transport = FunctionTransport(handler)
+    client = _client(transport)
+    stream = client.batch(
+        (
+            Command(Request("test.get", {"index": index}, ReplaySafety.SAFE), index)
+            for index in range(LARGE_LOGICAL_BATCH_COMMANDS)
+        ),
+        batch_size=PAGE_SIZE,
+        policy=ExecutionPolicy(max_requests=LARGE_LOGICAL_BATCH_REQUESTS + 1),
+    )
+    count = 0
+    async for outcome in stream:
+        assert outcome.correlation == count
+        count += 1
+
+    assert count == LARGE_LOGICAL_BATCH_COMMANDS
+    assert len(transport.requests) == LARGE_LOGICAL_BATCH_REQUESTS
+    assert stream.report is not None
+    assert stream.report.buffered_commands_high_water == PAGE_SIZE
 
 
 @pytest.mark.asyncio
