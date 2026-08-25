@@ -28,6 +28,7 @@ from b24api.execution import (
     rearm_cancellation,
 )
 from b24api.models import ExecutionPolicy, ReplaySafety, Request, RetryPolicy
+from b24api.transport import httpx as httpx_transport_module
 
 EXPECTED_RETRIED_CALLS = 2
 HTTP_OK = 200
@@ -144,13 +145,13 @@ async def test_transport_webhook_vault_is_opaque_and_gc_bounded() -> None:
     handle = transport._webhook_handle  # noqa: SLF001 - lifecycle regression
     reference = weakref.ref(transport)
 
-    assert sensitive_fragment not in repr(execution_module.__dict__)
+    assert sensitive_fragment not in repr(httpx_transport_module.__dict__)
     del transport
     gc.collect()
 
     assert reference() is None
     with pytest.raises(RuntimeError, match="credential is unavailable"):
-        execution_module._webhook_for(handle)  # noqa: SLF001 - lifecycle regression
+        httpx_transport_module._webhook_for(handle)  # noqa: SLF001 - lifecycle regression
     await client.aclose()
 
 
@@ -623,7 +624,7 @@ async def test_transport_cancellation_drops_httpx_traceback_and_request_locals()
         traceback = error.__traceback__
         while traceback is not None:
             if traceback.tb_frame.f_code.co_name == "send":
-                assert traceback.tb_frame.f_code.co_filename.endswith("b24api/execution.py")
+                assert traceback.tb_frame.f_code.co_filename.endswith("b24api/transport/httpx.py")
                 for value in traceback.tb_frame.f_locals.values():
                     assert sensitive_fragment not in repr(value)
             traceback = traceback.tb_next
