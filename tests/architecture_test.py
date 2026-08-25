@@ -126,6 +126,17 @@ def test_removed_modules_symbols_and_storage_backends_are_absent() -> None:
     assert "sqlite" not in runtime.casefold()
 
 
+def test_project_configuration_has_no_removed_v1_runtime_or_test_knobs() -> None:
+    configuration = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    for removed in (
+        "tests.api_test",
+        "BITRIX24_API_RETRY_DELAY",
+        "BITRIX24_API_RETRY_BACKOFF",
+    ):
+        assert removed not in configuration
+
+
 def test_module_sizes_keep_facades_small_and_state_machines_bounded() -> None:
     for path in _sources():
         relative = path.relative_to(PACKAGE).as_posix()

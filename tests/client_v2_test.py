@@ -315,10 +315,7 @@ async def test_public_keyset_above_100k_uses_monotonic_progression_without_ident
         boundary = int(raw_filter.get(">ID", -1))
         start = boundary + 1
         return {
-            "result": [
-                {"ID": value}
-                for value in range(start, min(start + page_size, LARGE_COUNTED_ROWS))
-            ],
+            "result": [{"ID": value} for value in range(start, min(start + page_size, LARGE_COUNTED_ROWS))],
         }
 
     transport = FunctionTransport(handler)

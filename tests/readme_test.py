@@ -166,10 +166,7 @@ async def test_every_readme_python_example_executes_exactly_without_io(monkeypat
     monkeypatch.setattr(b24api, "Bitrix24", _ExampleClient)
 
     for source in PYTHON_BLOCK.findall(README.read_text(encoding="utf-8")):
-        commands = (
-            Command(Request("example.item.get", {"id": value}, ReplaySafety.SAFE), value)
-            for value in (1, 2)
-        )
+        commands = (Command(Request("example.item.get", {"id": value}, ReplaySafety.SAFE), value) for value in (1, 2))
         namespace: dict[str, object] = {
             "client": client,
             "commands": commands,

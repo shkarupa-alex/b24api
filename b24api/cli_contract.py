@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, TextIO, cast
 
@@ -237,14 +238,19 @@ def _cursor(raw: object) -> CursorSpec:
         raise CliUsageError("cursor contract is invalid") from error
 
 
-def list_stream(
-    client: Bitrix24,
-    *,
-    request: Request,
-    strategy: str,
-    contract: dict[str, object],
-) -> OperationStream[JsonValue]:
-    """Route one closed contract to exactly one public list operation."""
+@dataclass(frozen=True, slots=True)
+class ListContractRoute:
+    """Fully validated public list mechanics selected by closed CLI JSON."""
+
+    strategy: Literal["sequential", "counted", "keyset", "cursor"]
+    selector: ResultSelector
+    identity: IdentitySpec | None
+    page_size: int
+    mechanics: OffsetSpec | KeysetSpec | CursorSpec
+
+
+def parse_list_contract(strategy: str, contract: dict[str, object]) -> ListContractRoute:
+    """Validate a closed list contract without constructing a client or performing I/O."""
     allowed_common = {"version", "selector", "page_size"}
     allowed_by_strategy = {
         "sequential": allowed_common | {"offset", "identity"},
@@ -252,40 +258,74 @@ def list_stream(
         "keyset": allowed_common | {"identity", "keyset"},
         "cursor": allowed_common | {"identity", "cursor"},
     }
+    if strategy not in allowed_by_strategy:
+        raise CliUsageError("list strategy is invalid")
     _closed(contract, allowed_by_strategy[strategy], label=f"{strategy} contract")
     selector, page_size = _common(contract, selector_required=strategy in {"keyset", "cursor"})
     identity = _identity(contract.get("identity"), required=strategy in {"counted", "keyset"})
-    if strategy == "sequential":
-        return client.iter_list(
-            request,
-            selector=selector,
-            identity=identity,
-            page_size=page_size,
-            offset=_offset(contract.get("offset")),
-        )
-    if strategy == "counted":
-        return client.iter_list_counted(
-            request,
-            selector=selector,
-            identity=cast("IdentitySpec", identity),
-            page_size=page_size,
-            offset=_offset(contract.get("offset")),
-        )
-    if strategy == "keyset":
-        return client.iter_list_keyset(
-            request,
-            selector=selector,
-            identity=cast("IdentitySpec", identity),
-            page_size=page_size,
-            keyset=_keyset(contract.get("keyset")),
-        )
-    return client.iter_list_cursor(
-        request,
-        selector=selector,
-        cursor=_cursor(contract.get("cursor")),
-        identity=identity,
-        page_size=page_size,
+    mechanics: OffsetSpec | KeysetSpec | CursorSpec
+    if strategy in {"sequential", "counted"}:
+        mechanics = _offset(contract.get("offset"))
+    elif strategy == "keyset":
+        mechanics = _keyset(contract.get("keyset"))
+    else:
+        mechanics = _cursor(contract.get("cursor"))
+    return ListContractRoute(
+        cast("Literal['sequential', 'counted', 'keyset', 'cursor']", strategy),
+        selector,
+        identity,
+        page_size,
+        mechanics,
     )
 
 
-__all__ = ["CliUsageError", "cli_request", "decode_one_object", "default_contract", "list_stream", "read_json_source"]
+def list_stream(
+    client: Bitrix24,
+    *,
+    request: Request,
+    route: ListContractRoute,
+) -> OperationStream[JsonValue]:
+    """Route one closed contract to exactly one public list operation."""
+    if route.strategy == "sequential":
+        return client.iter_list(
+            request,
+            selector=route.selector,
+            identity=route.identity,
+            page_size=route.page_size,
+            offset=cast("OffsetSpec", route.mechanics),
+        )
+    if route.strategy == "counted":
+        return client.iter_list_counted(
+            request,
+            selector=route.selector,
+            identity=cast("IdentitySpec", route.identity),
+            page_size=route.page_size,
+            offset=cast("OffsetSpec", route.mechanics),
+        )
+    if route.strategy == "keyset":
+        return client.iter_list_keyset(
+            request,
+            selector=route.selector,
+            identity=cast("IdentitySpec", route.identity),
+            page_size=route.page_size,
+            keyset=cast("KeysetSpec", route.mechanics),
+        )
+    return client.iter_list_cursor(
+        request,
+        selector=route.selector,
+        cursor=cast("CursorSpec", route.mechanics),
+        identity=route.identity,
+        page_size=route.page_size,
+    )
+
+
+__all__ = [
+    "CliUsageError",
+    "ListContractRoute",
+    "cli_request",
+    "decode_one_object",
+    "default_contract",
+    "list_stream",
+    "parse_list_contract",
+    "read_json_source",
+]

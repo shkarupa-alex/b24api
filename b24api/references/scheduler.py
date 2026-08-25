@@ -349,6 +349,7 @@ class ReferenceScheduler:
                 not_executed_reason=reason,
             ),
         )
+
     async def _ready(
         self,
         admission: _AdmissionState,

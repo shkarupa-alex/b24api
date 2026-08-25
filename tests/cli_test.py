@@ -192,6 +192,21 @@ def test_raw_call_emits_one_full_response_object(monkeypatch: pytest.MonkeyPatch
     assert stderr == ""
 
 
+def test_success_stdout_preserves_token_like_application_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {"access_token": "n1x2y3z4q5w6e7r8", "ok": True}
+
+    class PayloadClient(_Client):
+        async def call(self, request: Request) -> object:
+            self.calls.append(_Call("call", request, {}))
+            return payload
+
+    code, stdout, stderr = _run(monkeypatch, PayloadClient(), ["call", "test.get"])
+
+    assert code == 0
+    assert json.loads(stdout) == payload
+    assert stderr == ""
+
+
 @pytest.mark.parametrize(
     ("params", "stdin"),
     [('{"ID":1}', ""), ("-", '{"ID":1}')],
@@ -418,6 +433,31 @@ def test_contract_rejects_orphan_and_unknown_fields(
     assert code == _USAGE
     assert stdout == ""
     assert json.loads(stderr)["kind"] == "usage_error"
+
+
+def test_invalid_contract_is_rejected_before_client_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    constructed = False
+
+    def unused_client() -> _Client:
+        nonlocal constructed
+        constructed = True
+        return _Client()
+
+    monkeypatch.setattr(cli, "Bitrix24", unused_client)
+    stderr = io.StringIO()
+    code = cli.main(
+        ["list", "test.list", "--contract", _contract(tmp_path, {"version": 1, "unknown": True})],
+        stdin=io.StringIO(),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == _USAGE
+    assert json.loads(stderr.getvalue())["kind"] == "usage_error"
+    assert constructed is False
 
 
 def test_advanced_strategy_requires_contract_file(monkeypatch: pytest.MonkeyPatch) -> None:

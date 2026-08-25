@@ -17,7 +17,15 @@ from b24api import (
     TerminalState,
     TraversalAssurance,
 )
-from b24api.cli_contract import CliUsageError, cli_request, default_contract, list_stream, read_json_source
+from b24api.cli_contract import (
+    CliUsageError,
+    ListContractRoute,
+    cli_request,
+    default_contract,
+    list_stream,
+    parse_list_contract,
+    read_json_source,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -93,9 +101,8 @@ async def _call(args: argparse.Namespace, request: Request, stdout: TextIO) -> N
 
 
 async def _list(
-    args: argparse.Namespace,
     request: Request,
-    contract: dict[str, object],
+    route: ListContractRoute,
     stdout: TextIO,
     stderr: TextIO,
 ) -> None:
@@ -103,8 +110,7 @@ async def _list(
         stream = list_stream(
             client,
             request=request,
-            strategy=args.strategy,
-            contract=contract,
+            route=route,
         )
         primary: BaseException | None = None
         try:
@@ -153,8 +159,9 @@ def main(  # noqa: PLR0911 - stable process-code boundary
             asyncio.run(_call(args, request, output_stream))
         else:
             contract = default_contract(args.strategy, args.contract, input_stream)
+            route = parse_list_contract(args.strategy, contract)
             request = cli_request(args.method, params, ReplaySafety.SAFE)
-            asyncio.run(_list(args, request, contract, output_stream, error_stream))
+            asyncio.run(_list(request, route, output_stream, error_stream))
     except KeyboardInterrupt:
         return _INTERRUPTED
     except SystemExit as error:
