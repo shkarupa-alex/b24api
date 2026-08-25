@@ -16,6 +16,8 @@ from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 _METHOD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
 type PathPart = str | int
+type RequestSpec = Mapping[str, object]
+type RequestLike = Request | RequestSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,3 +188,29 @@ class Request:
     def __repr__(self) -> str:
         """Return a safe representation."""
         return f"Request(summary={self.summary!r}, replay_safety={self.replay_safety!r})"
+
+
+def canonical_request(raw: RequestLike) -> Request:
+    """Canonicalize the closed public request mapping at the API boundary."""
+    if isinstance(raw, Request):
+        return raw
+    if not isinstance(raw, Mapping):
+        raise TypeError("request must be a Request or closed request mapping")
+    unknown = set(raw) - {"method", "parameters", "replay_safety"}
+    if unknown:
+        raise ValueError(f"unknown request fields: {sorted(unknown)}")
+    method = raw.get("method")
+    parameters = raw.get("parameters")
+    safety = raw.get("replay_safety", ReplaySafety.UNKNOWN)
+    if not isinstance(method, str):
+        raise TypeError("request mapping requires a string method")
+    if parameters is not None and not isinstance(parameters, Mapping):
+        raise TypeError("request mapping parameters must be a mapping")
+    if isinstance(safety, str):
+        try:
+            safety = ReplaySafety(safety)
+        except ValueError as error:
+            raise ValueError("request replay_safety is invalid") from error
+    if not isinstance(safety, ReplaySafety):
+        raise TypeError("request replay_safety must be a ReplaySafety")
+    return Request(method, parameters, replay_safety=safety)

@@ -1,10 +1,11 @@
 """Bounded independent command fan-out over direct or physical-batch dispatch."""
 
 from __future__ import annotations
-from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, Self, cast, runtime_checkable
 
+from b24api._stream import MappedOperationStream
 from b24api.contracts.command import (
     Command,
     CommandFailure,
@@ -15,11 +16,11 @@ from b24api.contracts.command import (
 )
 from b24api.errors import AmbiguousExecutionError, B24ApiError, BatchFailed, CapabilityError, InputSourceError
 from b24api.plans import SingleResponsePlan
-from b24api.reference_v2 import _kernel_dispatch
 from b24api.references.dispatch import (
     _KernelFanOutSuccess,
     _ReferenceWindowError,
 )
+from b24api.references.facade import _kernel_dispatch
 from b24api.references.outcome import ReferenceFailure as KernelFailure
 from b24api.references.outcome import ReferenceRequest
 from b24api.references.stream import (
@@ -29,10 +30,12 @@ from b24api.references.stream import (
 if TYPE_CHECKING:
     from b24api.contracts.dispatch import DispatchSpec
     from b24api.contracts.policy import ExecutionPolicy
+    from b24api.contracts.stream import OperationStream
     from b24api.execution.snapshot import KernelReport
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
 type KernelFanOutEvent = _KernelFanOutSuccess | KernelFailure
+type Deregister = Callable[[object], None]
 
 
 class FanOutKernelStream(AsyncIterator[KernelFanOutEvent], Protocol):
@@ -164,6 +167,12 @@ def _fanout_variant(outcome: CommandOutcome[object]) -> str:
     raise TypeError("fan-out emitted an unknown command outcome")
 
 
+def _require_success(outcome: CommandOutcome[object]) -> CommandSuccess[object]:
+    if not isinstance(outcome, CommandSuccess):
+        raise TypeError("fail-fast fan-out kernel emitted a negative outcome")
+    return outcome
+
+
 def _fanout_error_items(
     error: BaseException,
     mapper: _FanOutMapper,
@@ -220,6 +229,37 @@ def kernel_fanout_stream[C](
     return cast("FanOutKernelStream", stream)
 
 
+def fanout_stream[C](  # noqa: PLR0913
+    executor: object,
+    commands: CommandSource[C],
+    *,
+    dispatch: DispatchSpec,
+    policy: ExecutionPolicy,
+    tolerant: bool,
+    deregister: Deregister,
+) -> OperationStream[CommandOutcome[C]]:
+    """Compose the public independent command fan-out stream."""
+    source = kernel_fanout_stream(
+        executor,
+        commands,
+        dispatch=dispatch,
+        policy=policy,
+        tolerant=tolerant,
+    )
+    mapper = _FanOutMapper()
+    item_mapper = mapper if tolerant else (lambda event: _require_success(mapper(event)))
+    stream = MappedOperationStream(
+        source,
+        item_mapper,
+        operation="fan_out_outcomes" if tolerant else "fan_out",
+        classify=_fanout_variant,
+        error_mapper=lambda error, report: _fanout_error(error, report, mapper, tolerant=tolerant),
+        error_items=lambda error: _fanout_error_items(error, mapper),
+        deregister=deregister,
+    )
+    return cast("OperationStream[CommandOutcome[C]]", stream)
+
+
 __all__ = [
     "CommandSource",
     "FanOutKernelStream",
@@ -228,5 +268,6 @@ __all__ = [
     "_fanout_error",
     "_fanout_error_items",
     "_fanout_variant",
+    "fanout_stream",
     "kernel_fanout_stream",
 ]
