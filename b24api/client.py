@@ -8,7 +8,7 @@ from collections.abc import AsyncIterable, Iterable, Mapping
 from typing import Literal, Self, cast
 
 from b24api._stream import MappedOperationStream
-from b24api.batch_v2 import LogicalBatchKernelStream, _BatchWindowError
+from b24api.batch.logical import LogicalBatchKernelStream, _BatchWindowError
 from b24api.contracts import (
     BatchDispatch,
     Command,

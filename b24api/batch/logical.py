@@ -7,7 +7,8 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator
 from typing import Protocol, Self, cast, runtime_checkable
 
-from b24api.batch import BatchExecutor, BatchInput, BatchSource, _iterate_source, _next_chunk
+from b24api.batch.engine import BatchExecutor, BatchInput, BatchSource
+from b24api.batch.stream import _iterate_source, _next_chunk
 from b24api.contracts.command import (
     Command,
     CommandFailure,
