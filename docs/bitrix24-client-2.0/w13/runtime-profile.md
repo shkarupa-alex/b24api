@@ -2,7 +2,7 @@
 
 Date: 2026-08-25
 
-Runtime candidate: `083490d92b5b9d1fa876d96e14ec04beff6faa0c`
+Runtime candidate: `a07b104b90d6c7a69455c34f72d0aa7dd18c87dc`
 
 Frozen pre-refactor comparison: `e5fd427eddb28b7079b75bfef6443c04aa6350d1`
 
@@ -35,7 +35,7 @@ Every blocking invariant passed:
 - dense and sparse counted identities match their exact oracles;
 - input-order references stay within row and active-reference bounds;
 - no stream or owned task remains after close;
-- 100 repeated traversals after warm-up grow by 24,071 bytes, below the 1 MiB ceiling;
+- 100 repeated traversals after warm-up grow by 24,342 bytes, below the 1 MiB ceiling;
 - oversized response collection retains at most the 64 KiB accepted prefix plus the one 16 KiB
   incoming chunk and refuses the response.
 
@@ -43,35 +43,33 @@ Selected traced measurements:
 
 | Case | Rows/events | Requests | High-water | Wall | CPU | Peak Python allocation |
 |---|---:|---:|---:|---:|---:|---:|
-| direct call | 1 | 1 | — | 2.9 ms | 2.2 ms | 57,515 B |
-| logical batch 10k, buffer 7 | 10,000 | 1,429 | 7 commands | 2.49 s | 1.88 s | 293,611 B |
-| logical batch 100k, buffer 7 | 100,000 | 14,286 | 7 commands | 24.47 s | 18.56 s | 288,234 B |
-| counted 19 | 19 | 1 | 19 rows | 13.4 ms | 12.5 ms | 2,056,776 B |
-| counted 500 | 500 | 2 | 450 rows | 52.6 ms | 38.3 ms | 2,056,776 B |
-| counted dense 10k | 10,000 | 5 | 2,500 rows | 759 ms | 514 ms | 3,767,431 B |
-| counted uniform-sparse 10k | 10,000 | 5 | 2,500 rows | 761 ms | 514 ms | 3,780,971 B |
-| references, INPUT order | 16 events | 16 | 1 row / 2 active | 36.1 ms | 14.0 ms | 91,505 B |
-| 110 repeated traversals | 0 | 110 | — | 76.7 ms | 69.8 ms | 94,079 B |
-| oversized response refusal | — | 1 | 64 KiB + chunk | 1.2 ms | 1.2 ms | 108,245 B |
+| direct call | 1 | 1 | — | 2.3 ms | 1.9 ms | 57,723 B |
+| logical batch 10k, buffer 7 | 10,000 | 1,429 | 7 commands | 2.29 s | 1.72 s | 292,231 B |
+| logical batch 100k, buffer 7 | 100,000 | 14,286 | 7 commands | 22.86 s | 17.19 s | 284,119 B |
+| counted 19 | 19 | 1 | 19 rows | 13.1 ms | 12.1 ms | 2,056,776 B |
+| counted 500 | 500 | 2 | 450 rows | 54.8 ms | 38.1 ms | 2,056,776 B |
+| counted dense 10k | 10,000 | 5 | 2,500 rows | 769 ms | 507 ms | 3,767,636 B |
+| counted uniform-sparse 10k | 10,000 | 5 | 2,500 rows | 744 ms | 499 ms | 3,781,387 B |
+| references, INPUT order | 16 events | 16 | 1 row / 2 active | 35.4 ms | 13.3 ms | 91,258 B |
+| 110 repeated traversals | 0 | 110 | — | 77.9 ms | 69.9 ms | 93,704 B |
+| oversized response refusal | — | 1 | 64 KiB + chunk | 1.3 ms | 1.3 ms | 108,339 B |
 
 Traced wall/CPU values include `tracemalloc` overhead and are resource-characterization figures,
 not user-facing throughput claims.
 
 ## Refactor performance comparison
 
-Each reproduction used two discarded warm-ups and seven measured samples. The 19-row microcell was
-also repeated twice with five warm-ups and 31 measured samples because seven-sample sub-millisecond
-ratios were visibly scheduler-noisy. Ratios below compare the current counted traversal to the same
-counted traversal at the frozen pre-refactor HEAD. Identity hashes and physical request counts were
-identical in every cell.
+Each reproduction used two discarded warm-ups and seven measured samples. Ratios below compare the
+current counted traversal to the same counted traversal at the frozen pre-refactor HEAD. Identity
+hashes and physical request counts were identical in every cell.
 
 | Case | Requests base → current | Wall ratio R1 | Wall ratio R2 | CPU ratio R1 | CPU ratio R2 |
 |---|---:|---:|---:|---:|---:|
-| 19 | 1 → 1 | 1.030 | 0.989 | 1.024 | 1.006 |
-| 500 | 2 → 2 | 1.056 | 1.021 | 1.054 | 1.010 |
-| dense 10k | 5 → 5 | 1.040 | 0.996 | 1.042 | 0.993 |
-| uniform-sparse 10k | 5 → 5 | 1.025 | 1.019 | 1.028 | 1.018 |
-| clustered-sparse 10k | 5 → 5 | 0.995 | 1.017 | 1.003 | 1.015 |
+| 19 | 1 → 1 | 0.964 | 0.948 | 0.971 | 0.959 |
+| 500 | 2 → 2 | 1.003 | 0.984 | 0.995 | 0.990 |
+| dense 10k | 5 → 5 | 0.995 | 0.986 | 0.997 | 0.985 |
+| uniform-sparse 10k | 5 → 5 | 1.006 | 0.986 | 1.008 | 0.984 |
+| clustered-sparse 10k | 5 → 5 | 0.988 | 0.979 | 0.991 | 0.977 |
 
 No cell reproduced a regression above 10%. The refactor therefore satisfies its local stable
 performance gate. This does not replace live portal A/B evidence.

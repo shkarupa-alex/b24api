@@ -2,7 +2,7 @@
 
 Date: 2026-08-25
 
-Runtime candidate: `083490d92b5b9d1fa876d96e14ec04beff6faa0c`
+Runtime candidate: `a07b104b90d6c7a69455c34f72d0aa7dd18c87dc`
 
 Frozen pre-refactor comparator: `e5fd427eddb28b7079b75bfef6443c04aa6350d1`
 
@@ -107,18 +107,24 @@ the runtime SHA above rather than waived:
   `COMPLETED`; a repeated pull re-raises the same typed terminal error and report;
 - local binding rejection emits correlated `ReferenceNotExecuted(LOCAL_VALIDATION_FAILED)`, while
   per-reference pagination contradictions carry `IncompleteTraversalError`;
+- a post-I/O counted-reference capability contradiction, including a missing exact total, also
+  carries `IncompleteTraversalError`; pre-I/O capability rejection remains a capability error;
 - `CountedTraversal` with `DirectDispatch` rejects before the binding source is pulled or any I/O;
 - user-generator `TypeError`/`ValueError` is `SOURCE_FAILED`; only the client's own malformed-item
   check is `LOCAL_VALIDATION_FAILED`;
 - early batch close reports the whole already-admitted physical window separately from the number
   of outcomes actually emitted;
+- source failures in fan-out account every known command, then raise `InputSourceError`; they do
+  not fabricate `CommandNotExecuted` for an exception or malformed value that has no correlation;
+- source-specific report counters are explicitly wired and validated instead of discovered with
+  `getattr(..., 0)` defaults;
 - the installed-wheel test no longer depends on a warm package-manager cache and proves that the
   imported `b24api` module comes from the isolated wheel environment;
 - the root surface now includes the public construction/inspection types required by its own
   cursor, report and injected-transport contracts. The owner amendment records this narrow
   manifest correction.
 
-The exact full suite has 499 passing tests. The concurrent-pull and in-flight-close regressions,
+The exact full suite has 504 passing tests. The concurrent-pull and in-flight-close regressions,
 typed terminal-error matrix, page-cap reverse direction and wheel entry-point checks are included.
 
 ## Architecture and legacy audit
@@ -145,8 +151,7 @@ The exact measurements, commands and allocation-site interpretation are in
 - Counted request and identity parity with frozen 1.0.1 is `1/2/5` requests for
   19/500/10,000 rows across dense and sparse cases.
 - The exact refactor comparator used two warm-ups plus seven measured samples in two independent
-  reproductions. The sub-millisecond 19-row cell was additionally repeated with 31 samples. No
-  stable cell reproduced a regression above 10%.
+  reproductions. No stable cell reproduced a regression above 10%.
 - A 100,000-command generator stayed at seven buffered commands; its measured peak was below the
   10,000-command peak and correlation never entered wire JSON.
 - Exact counted identity tracking above 100,000 rows continues in memory and warns once. There is
@@ -155,7 +160,7 @@ The exact measurements, commands and allocation-site interpretation are in
   cumulative client allocation site; no retained stream/task resource or leak was observed.
 - Response buffering, decoded-row ceilings, active-reference bounds and 100-iteration retention
   gates passed.
-- The fresh deterministic benchmark on `083490d` published 200 model oracles and 182 immutable evidence
+- The fresh deterministic benchmark on `a07b104` published 200 model oracles and 182 immutable evidence
   references in 208 evidence files (plus the persistent transaction lock), left zero pending
   markers and passed a separate `_scan_bundle` invocation on the exact runtime SHA.
 
