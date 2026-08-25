@@ -11,7 +11,6 @@ _START = ParameterPath(("start",))
 _FILTER = ParameterPath(("filter",))
 _ORDER = ParameterPath(("order",))
 _ROOT_SELECTOR = ResultSelector.root()
-_PORTAL_BATCH_CAP = 50
 
 
 def _positive_page_size(value: object) -> None:
@@ -90,7 +89,6 @@ class CountedTraversal:
     identity: IdentitySpec
     selector: ResultSelector = _ROOT_SELECTOR
     page_size: int = 50
-    batch_size: int | None = None
     offset: OffsetSpec = OffsetSpec()
 
     def __post_init__(self) -> None:
@@ -98,10 +96,6 @@ class CountedTraversal:
         if not isinstance(self.identity, IdentitySpec):
             raise TypeError("identity must be an IdentitySpec")
         _positive_page_size(self.page_size)
-        if self.batch_size is not None:
-            _positive_page_size(self.batch_size)
-            if self.batch_size > _PORTAL_BATCH_CAP:
-                raise ValueError("batch_size must be between 1 and 50")
 
 
 @dataclass(frozen=True, slots=True)

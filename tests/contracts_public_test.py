@@ -1,6 +1,7 @@
 """Characterization of the v2 public mechanics contracts."""
 
 from __future__ import annotations
+import inspect
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -14,9 +15,11 @@ from b24api.contracts import (
     CommandNotExecuted,
     CommandOutcomeUnknown,
     CommandSuccess,
+    CountedTraversal,
     CursorSpec,
     DeliveryOrder,
     DirectDispatch,
+    IdentitySpec,
     NotExecutedReason,
     OperationReport,
     ParameterPath,
@@ -195,6 +198,14 @@ def test_dispatch_is_a_discriminated_union_without_irrelevant_controls() -> None
         BatchDispatch(batch_size=51)
     with pytest.raises(TypeError):
         DirectDispatch(batch_size=BATCH_SIZE)  # type: ignore[call-arg]
+
+
+def test_counted_reference_traversal_has_no_competing_batch_size() -> None:
+    identity = IdentitySpec(("ID",), "ID", "ID")
+
+    assert "batch_size" not in inspect.signature(CountedTraversal).parameters
+    with pytest.raises(TypeError):
+        CountedTraversal(identity, batch_size=5)  # type: ignore[call-arg]
 
 
 def test_cursor_contract_uses_exact_public_enum_values() -> None:
