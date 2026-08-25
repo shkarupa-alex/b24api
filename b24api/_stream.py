@@ -26,9 +26,9 @@ class _ClosableIterator[T](AsyncIterator[T], Protocol):
         ...
 
 
-def _terminal_state(state: KernelState, *, failures: int) -> TerminalState:
+def _terminal_state(state: KernelState, *, negative_outcomes: int) -> TerminalState:
     if state is KernelState.COMPLETED:
-        return TerminalState.COMPLETED_WITH_FAILURES if failures else TerminalState.COMPLETED
+        return TerminalState.COMPLETED_WITH_FAILURES if negative_outcomes else TerminalState.COMPLETED
     if state is KernelState.INCOMPLETE:
         return TerminalState.INCOMPLETE
     if state is KernelState.CANCELLED:
@@ -51,7 +51,11 @@ def _public_report(  # noqa: PLR0913
     active_references_high_water: int,
     early_closed: bool = False,
 ) -> OperationReport:
-    state = TerminalState.EARLY_CLOSED if early_closed else _terminal_state(report.state, failures=failures)
+    state = (
+        TerminalState.EARLY_CLOSED
+        if early_closed
+        else _terminal_state(report.state, negative_outcomes=failures + not_executed + unknown)
+    )
     return OperationReport(
         state=state,
         operation=operation,

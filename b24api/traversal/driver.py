@@ -25,6 +25,7 @@ from b24api.traversal.identity import (
     _EffectiveConsistency,
     _identity_store,
     _IdentityStore,
+    _initial_offset,
     _Page,
     _request_with_controls,
     _validate_confirmation_policy,
@@ -242,7 +243,11 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         first: dict[ParameterPath, object] = {}
         second: dict[ParameterPath, object] = {}
         allow_create = getattr(self.plan, "allow_create_controls", True)
-        if isinstance(self.plan, OffsetSequentialPlan | CountedOffsetPlan):
+        if isinstance(self.plan, OffsetSequentialPlan):
+            initial_offset = _initial_offset(self.request, self.plan.offset_path)
+            first[self.plan.offset_path] = initial_offset
+            second[self.plan.offset_path] = initial_offset + 1
+        elif isinstance(self.plan, CountedOffsetPlan):
             first[self.plan.offset_path] = 0
             second[self.plan.offset_path] = 1
         elif isinstance(self.plan, KeysetPlan):
@@ -268,8 +273,9 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             first[self.plan.limit_path] = self.plan.requested_page_size
             second[self.plan.limit_path] = self.plan.requested_page_size
         if first:
-            _request_with_controls(self.request, first, allow_create=allow_create)
-            _request_with_controls(self.request, second, allow_create=allow_create)
+            replace = frozenset({self.plan.offset_path}) if isinstance(self.plan, OffsetSequentialPlan) else frozenset()
+            _request_with_controls(self.request, first, allow_create=allow_create, replace=replace)
+            _request_with_controls(self.request, second, allow_create=allow_create, replace=replace)
 
     def _validate_page(  # noqa: C901, PLR0912
         self,

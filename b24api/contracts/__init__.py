@@ -34,6 +34,8 @@ from b24api.contracts.request import (
     ParameterPath,
     ReplaySafety,
     Request,
+    RequestLike,
+    RequestSpec,
     RequestSummary,
     ResultSelector,
 )
@@ -88,6 +90,8 @@ __all__ = [
     "ReferenceOutcomeUnknown",
     "ReplaySafety",
     "Request",
+    "RequestLike",
+    "RequestSpec",
     "RequestSummary",
     "Response",
     "ResultCollectionShape",

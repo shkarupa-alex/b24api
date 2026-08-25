@@ -3,6 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 
+from b24api.contracts.command import NotExecutedReason
 from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _is_plain_int, _thaw_json
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ReplaySafety, Request
@@ -17,6 +18,7 @@ class ReferenceRequest:
     request: Request = field(repr=False)
     reference_key: str = field(repr=False)
     correlation: object = field(default=None, repr=False)
+    not_executed_reason: NotExecutedReason | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -24,6 +26,8 @@ class ReferenceRequest:
             raise TypeError("reference request must contain a canonical Request")
         if not self.reference_key or len(self.reference_key) > STABLE_KEY_MAXIMUM:
             raise ValueError("reference_key must be 1..100 characters")
+        if self.not_executed_reason is not None and not isinstance(self.not_executed_reason, NotExecutedReason):
+            raise TypeError("not_executed_reason must be a NotExecutedReason or None")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -61,6 +65,7 @@ class ReferenceFailure:
     replay_safety: ReplaySafety = ReplaySafety.UNKNOWN
     replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
     correlation: object = field(default=None, repr=False)
+    not_executed_reason: NotExecutedReason | None = None
 
     def __init__(  # noqa: PLR0913
         self,
@@ -73,6 +78,7 @@ class ReferenceFailure:
         replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
         replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE,
         correlation: object = None,
+        not_executed_reason: NotExecutedReason | None = None,
     ) -> None:
         """Initialize instance state."""
         if not reference_key or len(reference_key) > STABLE_KEY_MAXIMUM:
@@ -87,6 +93,8 @@ class ReferenceFailure:
             raise TypeError("replay_safety must be ReplaySafety")
         if not isinstance(replay_disposition, ReplayDisposition):
             raise TypeError("replay_disposition must be ReplayDisposition")
+        if not_executed_reason is not None and not isinstance(not_executed_reason, NotExecutedReason):
+            raise TypeError("not_executed_reason must be a NotExecutedReason or None")
         object.__setattr__(self, "reference_key", reference_key)
         object.__setattr__(self, "request", request)
         object.__setattr__(self, "error", error)
@@ -96,6 +104,7 @@ class ReferenceFailure:
         object.__setattr__(self, "replay_safety", replay_safety)
         object.__setattr__(self, "replay_disposition", replay_disposition)
         object.__setattr__(self, "correlation", correlation)
+        object.__setattr__(self, "not_executed_reason", not_executed_reason)
 
     @property
     def cursor(self) -> JsonValue:

@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
+from b24api.contracts.json import _freeze_json, _thaw_json
 from b24api.contracts.policy import (
     ConfirmationPolicy,
     DuplicatePolicy,
@@ -140,12 +141,86 @@ def _request_with_controls(
     updates: dict[ParameterPath, object],
     *,
     allow_create: bool,
+    replace: frozenset[ParameterPath] = frozenset(),
 ) -> Request:
     try:
-        parameters = inject_controls(request.copy_parameters(), updates, allow_create=allow_create)
+        parameters = request.copy_parameters()
+        for path in replace:
+            if path in updates:
+                _replace_owned_control(parameters, path, updates[path], allow_create=allow_create)
+        remaining = {path: value for path, value in updates.items() if path not in replace}
+        parameters = inject_controls(parameters, remaining, allow_create=allow_create)
     except (KeyError, TypeError, ValueError) as error:
         raise CapabilityError("request parameters conflict with required traversal controls") from error
     return Request(request.method, parameters, request.replay_safety)
+
+
+def _replace_owned_control(  # noqa: C901, PLR0912 - exact nested path replacement is one atomic operation
+    parameters: dict[str, JsonValue],
+    path: ParameterPath,
+    value: object,
+    *,
+    allow_create: bool,
+) -> None:
+    """Replace one traversal-owned leaf after its caller value was validated."""
+    current: JsonValue = parameters
+    parts = path.path
+    for part in parts[:-1]:
+        if isinstance(part, str):
+            if not isinstance(current, dict):
+                raise TypeError("control path traverses a non-mapping value")
+            matches = [key for key in current if key.casefold() == part.casefold()]
+            if len(matches) > 1:
+                raise ValueError("control path is case-insensitively ambiguous")
+            if not matches:
+                if not allow_create:
+                    raise KeyError("control container is missing")
+                current[part] = {}
+                key = part
+            else:
+                key = matches[0]
+            current = current[key]
+        else:
+            if not isinstance(current, list) or part >= len(current):
+                raise KeyError("control list index is missing")
+            current = current[part]
+    final = parts[-1]
+    replacement = _thaw_json(_freeze_json(value))
+    if isinstance(final, str):
+        if not isinstance(current, dict):
+            raise TypeError("control path terminates in a non-mapping value")
+        matches = [key for key in current if key.casefold() == final.casefold()]
+        if len(matches) > 1:
+            raise ValueError("control leaf is case-insensitively ambiguous")
+        if not matches and not allow_create:
+            raise KeyError("control leaf is missing")
+        current[matches[0] if matches else final] = replacement
+    else:
+        if not isinstance(current, list) or final >= len(current):
+            raise KeyError("control list index is missing")
+        current[final] = replacement
+
+
+def _initial_offset(request: Request, path: ParameterPath) -> int:
+    """Return a caller-supplied lexical offset, or the canonical zero default."""
+    current: object = request.copy_parameters()
+    for part in path.path:
+        if isinstance(part, str):
+            if not isinstance(current, dict):
+                return 0
+            matches = [key for key in current if key.casefold() == part.casefold()]
+            if len(matches) > 1:
+                raise CapabilityError("request contains an ambiguous initial offset path")
+            if not matches:
+                return 0
+            current = current[matches[0]]
+        else:
+            if not isinstance(current, list) or part >= len(current):
+                return 0
+            current = current[part]
+    if not isinstance(current, int) or isinstance(current, bool) or current < 0:
+        raise CapabilityError("initial offset must be a non-negative integer")
+    return current
 
 
 def _child_path(parent: ParameterPath, child: str) -> ParameterPath:

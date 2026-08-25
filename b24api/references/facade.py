@@ -23,6 +23,7 @@ from b24api.contracts.reference import (
     ReferenceOutcome,
     ReferenceOutcomeUnknown,
 )
+from b24api.contracts.report import OperationReport, TerminalState
 from b24api.contracts.request import IdentitySpec, Request, RequestLike, ResultSelector, canonical_request
 from b24api.contracts.traversal import (
     CountedTraversal,
@@ -30,7 +31,15 @@ from b24api.contracts.traversal import (
     SequentialTraversal,
     TraversalSpec,
 )
-from b24api.errors import AmbiguousExecutionError, B24ApiError, CapabilityError, InputSourceError, ReferenceFailed
+from b24api.errors import (
+    AmbiguousExecutionError,
+    B24ApiError,
+    CapabilityError,
+    IncompleteTraversalError,
+    InputSourceError,
+    PaginationError,
+    ReferenceFailed,
+)
 from b24api.references.binding import BindingSource, _BindingContext, _BindingSourceError, binding_source
 from b24api.references.dispatch import (
     _KernelReferenceComplete,
@@ -205,7 +214,20 @@ class _ReferenceEventMapper:
             return ReferenceComplete(context.index, context.correlation, event.row_count)
         context = cast("_BindingContext", event.correlation)
         self._item_indexes.pop(context.index, None)
+        if event.not_executed_reason is not None:
+            return ReferenceNotExecuted(context.index, context.correlation, event.not_executed_reason)
         error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("reference failed")
+        if isinstance(error, PaginationError):
+            pagination_error = error
+            error = IncompleteTraversalError(
+                report=OperationReport(
+                    TerminalState.INCOMPLETE,
+                    "reference",
+                    type(pagination_error).__name__,
+                    emitted=event.partial_rows,
+                ),
+            )
+            error.__cause__ = pagination_error
         if isinstance(error, AmbiguousExecutionError):
             return ReferenceOutcomeUnknown(context.index, context.correlation, error, event.partial_rows)
         return ReferenceFailure(context.index, context.correlation, error, event.partial_rows)
@@ -261,6 +283,8 @@ def kernel_reference_stream[C](
 
     if not isinstance(executor, Executor):
         raise TypeError("executor must be an Executor")
+    if isinstance(traversal, CountedTraversal) and isinstance(dispatch, DirectDispatch):
+        raise CapabilityError("counted reference traversal requires BatchDispatch")
     plan, selector, identity = _kernel_plan(traversal)
     kernel_dispatch = _kernel_dispatch(dispatch, policy)
     stream = _iter_references(

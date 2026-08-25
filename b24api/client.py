@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 import weakref
-from typing import TYPE_CHECKING, Protocol, Self, cast
+from typing import TYPE_CHECKING, Self, cast
 
 from b24api.batch.facade import batch_outcome_stream, batch_stream
 from b24api.contracts.dispatch import BatchDispatch, DirectDispatch, DispatchSpec
@@ -17,7 +17,8 @@ from b24api.contracts.traversal import (
     OffsetSpec,
     TraversalSpec,
 )
-from b24api.execution import Executor, HttpxTransport, Transport
+from b24api.execution import Executor, HttpxTransport, Transport, await_cleanup_resistant, rearm_cancellation
+from b24api.execution.cleanup import CloseableResource, close_owned_resources
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
 from b24api.references.fanout import fanout_stream
@@ -26,6 +27,7 @@ from b24api.traversal.facade import counted_stream, cursor_stream, keyset_stream
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterable, Iterable
+    from types import TracebackType
 
     from b24api.contracts.command import Command, CommandOutcome, CommandSuccess
     from b24api.contracts.json import JsonValue
@@ -38,12 +40,6 @@ _DEFAULT_OFFSET = OffsetSpec()
 _DEFAULT_KEYSET = KeysetSpec()
 _DEFAULT_REFERENCE_DISPATCH = BatchDispatch()
 _DEFAULT_FANOUT_DISPATCH = DirectDispatch()
-
-
-class _CloseableStream(Protocol):
-    async def aclose(self) -> None:
-        """Close owned operation work."""
-        ...
 
 
 def _normalized_host(host: str) -> str:
@@ -86,7 +82,7 @@ class Bitrix24:
         )
         self._host = host
         self._closed = False
-        self._streams: weakref.WeakSet[_CloseableStream] = weakref.WeakSet()
+        self._streams: weakref.WeakSet[CloseableResource] = weakref.WeakSet()
 
     @classmethod
     def _from_executor(
@@ -118,19 +114,31 @@ class Bitrix24:
         self._require_open()
         return self
 
-    async def __aexit__(self, *_exc: object) -> None:
-        """Close streams before the owned transport."""
-        await self.aclose()
+    async def __aexit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        primary: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close owned work without replacing a primary body exception."""
+        try:
+            await self.aclose()
+        except BaseException as cleanup_error:
+            if primary is not None:
+                raise primary.with_traceback(traceback) from cleanup_error
+            raise
 
     async def aclose(self) -> None:
         """Close active streams and then the owned transport idempotently."""
         if self._closed:
             return
         self._closed = True
-        for stream in tuple(self._streams):
-            await stream.aclose()
-        if self._owned_transport is not None:
-            await self._owned_transport.aclose()
+        cleanup = await await_cleanup_resistant(close_owned_resources(tuple(self._streams), self._owned_transport))
+        if cleanup.error is not None:
+            rearm_cancellation(cleanup.cancellation)
+            raise cleanup.error
+        if cleanup.cancellation is not None:
+            raise cleanup.cancellation
 
     async def call(self, request: RequestLike, *, policy: ExecutionPolicy | None = None) -> JsonValue:
         """Execute one request and return detached decoded JSON."""
@@ -376,11 +384,11 @@ class Bitrix24:
         )
 
     def _register_stream[T](self, stream: OperationStream[T]) -> OperationStream[T]:
-        self._streams.add(cast("_CloseableStream", stream))
+        self._streams.add(cast("CloseableResource", stream))
         return stream
 
     def _discard_stream(self, stream: object) -> None:
-        self._streams.discard(cast("_CloseableStream", stream))
+        self._streams.discard(cast("CloseableResource", stream))
 
     def _require_open(self) -> None:
         if self._closed:

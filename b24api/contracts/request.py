@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import cast
+from typing import TypedDict, cast
 
 from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, _thaw_json
 from b24api.contracts.policy import IdentityCoercion
@@ -14,8 +14,6 @@ from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 _METHOD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
 type PathPart = str | int
-type RequestSpec = Mapping[str, object]
-type RequestLike = Request | RequestSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +57,17 @@ class ReplaySafety(StrEnum):
     SAFE = "safe"
     UNSAFE = "unsafe"
     UNKNOWN = "unknown"
+
+
+class _OptionalRequestSpec(TypedDict, total=False):
+    parameters: Mapping[str, object]
+    replay_safety: ReplaySafety
+
+
+class RequestSpec(_OptionalRequestSpec):
+    """Closed mapping form accepted at public request boundaries."""
+
+    method: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +179,9 @@ class Request:
         return f"Request(summary={self.summary!r}, replay_safety={self.replay_safety!r})"
 
 
+type RequestLike = Request | RequestSpec
+
+
 def canonical_request(raw: RequestLike) -> Request:
     """Canonicalize the closed public request mapping at the API boundary."""
     if isinstance(raw, Request):
@@ -186,11 +198,6 @@ def canonical_request(raw: RequestLike) -> Request:
         raise TypeError("request mapping requires a string method")
     if parameters is not None and not isinstance(parameters, Mapping):
         raise TypeError("request mapping parameters must be a mapping")
-    if isinstance(safety, str):
-        try:
-            safety = ReplaySafety(safety)
-        except ValueError as error:
-            raise ValueError("request replay_safety is invalid") from error
     if not isinstance(safety, ReplaySafety):
         raise TypeError("request replay_safety must be a ReplaySafety")
     return Request(method, parameters, replay_safety=safety)

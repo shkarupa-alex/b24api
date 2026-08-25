@@ -23,6 +23,7 @@ from b24api.references.outcome import (
 )
 
 if TYPE_CHECKING:
+    from b24api.contracts.command import NotExecutedReason
     from b24api.contracts.json import JsonValue
     from b24api.contracts.report import Violation
     from b24api.contracts.request import Request
@@ -79,6 +80,7 @@ class _FailureEvent:
     partial_rows: int
     violations: tuple[Violation, ...]
     replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
+    not_executed_reason: NotExecutedReason | None = None
 
 
 type _Event = _PageEvent | _DoneEvent | _FailureEvent

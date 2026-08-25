@@ -3,6 +3,7 @@
 from __future__ import annotations
 import inspect
 from dataclasses import FrozenInstanceError
+from typing import is_typeddict
 
 import pytest
 
@@ -31,6 +32,7 @@ from b24api.contracts import (
     ReferenceOutcomeUnknown,
     ReplaySafety,
     Request,
+    RequestSpec,
     Response,
     TerminalState,
     TraversalAssurance,
@@ -43,6 +45,7 @@ from b24api.errors import ProtocolError
 CORRELATION_VALUE = 7
 DIRECT_CONCURRENCY = 3
 BATCH_SIZE = 7
+SUMMARY_LIMIT = 256
 
 
 def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
@@ -108,6 +111,21 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
     ]
 
 
+def test_request_mapping_contract_is_a_closed_typed_dict() -> None:
+    assert is_typeddict(RequestSpec)
+    assert RequestSpec.__required_keys__ == frozenset({"method"})
+    assert RequestSpec.__optional_keys__ == frozenset({"parameters", "replay_safety"})
+
+
+def test_not_executed_reason_is_the_exact_frozen_enum() -> None:
+    assert tuple(reason.value for reason in NotExecutedReason) == (
+        "halted",
+        "source_failed",
+        "local_validation_failed",
+        "scheduler_stopped",
+    )
+
+
 def _error() -> ProtocolError:
     return ProtocolError("synthetic failure")
 
@@ -169,6 +187,21 @@ def test_binding_rejects_overlapping_paths_and_never_exposes_correlation_in_repr
             ),
             correlation,
         )
+
+
+def test_binding_summary_is_redacted_utf8_text_bounded_to_256_code_points() -> None:
+    summary = "я" * SUMMARY_LIMIT
+    binding = Binding(summary, (), object())
+
+    assert binding.summary == summary
+    assert len(binding.summary) == SUMMARY_LIMIT
+    with pytest.raises(ValueError, match=r"1\.\.256"):
+        Binding("я" * (SUMMARY_LIMIT + 1), (), object())
+
+    raw_summary = "Authorization: Bearer n1x2y3z4q5w6e7r8"
+    redacted = Binding(raw_summary, (), object())
+    assert raw_summary not in redacted.summary
+    assert "n1x2y3z4q5w6e7r8" not in redacted.summary
 
 
 def test_reference_partition_retains_items_empty_completion_and_negative_variants() -> None:

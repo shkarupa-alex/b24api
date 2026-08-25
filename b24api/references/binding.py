@@ -7,6 +7,7 @@ from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, Self, cast, runtime_checkable
 
+from b24api.contracts.command import NotExecutedReason
 from b24api.contracts.reference import Binding
 from b24api.contracts.request import ParameterPath, Request
 from b24api.contracts.traversal import CountedTraversal, KeysetTraversal, SequentialTraversal, TraversalSpec
@@ -121,6 +122,16 @@ def _bind_request(base: Request, binding: Binding[object], index: int, traversal
     )
 
 
+def _local_validation_failure(base: Request, binding: Binding[object], index: int) -> ReferenceRequest:
+    """Retain an admitted binding as a proved local non-execution state."""
+    return ReferenceRequest(
+        base,
+        f"r{index:012d}",
+        _BindingContext(index, binding.correlation),
+        NotExecutedReason.LOCAL_VALIDATION_FAILED,
+    )
+
+
 class _SyncBindingAdapter[C](Iterator[ReferenceRequest]):
     def __init__(self, base: Request, source: Iterable[Binding[C]], traversal: TraversalSpec) -> None:
         self._base = base
@@ -136,7 +147,11 @@ class _SyncBindingAdapter[C](Iterator[ReferenceRequest]):
             binding = next(self._iterator)
             if not isinstance(binding, Binding):
                 raise TypeError("reference source must yield Binding values")
-            request = _bind_request(self._base, cast("Binding[object]", binding), self._index, self._traversal)
+            canonical = cast("Binding[object]", binding)
+            try:
+                request = _bind_request(self._base, canonical, self._index, self._traversal)
+            except (KeyError, TypeError, ValueError):
+                request = _local_validation_failure(self._base, canonical, self._index)
         except StopIteration:
             raise
         except Exception as error:
@@ -164,7 +179,11 @@ class _AsyncBindingAdapter[C](AsyncIterator[ReferenceRequest]):
             binding = await anext(self._iterator)
             if not isinstance(binding, Binding):
                 raise TypeError("reference source must yield Binding values")
-            request = _bind_request(self._base, cast("Binding[object]", binding), self._index, self._traversal)
+            canonical = cast("Binding[object]", binding)
+            try:
+                request = _bind_request(self._base, canonical, self._index, self._traversal)
+            except (KeyError, TypeError, ValueError):
+                request = _local_validation_failure(self._base, canonical, self._index)
         except StopAsyncIteration:
             raise
         except Exception as error:

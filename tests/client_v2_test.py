@@ -1,7 +1,9 @@
 """Characterization of the thin v2 facade and public stream lifecycle."""
 
 from __future__ import annotations
+import asyncio
 import json
+import warnings
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
 
@@ -15,6 +17,7 @@ from b24api.contracts import (
     CommandFailure,
     CommandNotExecuted,
     CommandSuccess,
+    CountedTraversal,
     CursorSpec,
     DeliveryOrder,
     DirectDispatch,
@@ -22,11 +25,15 @@ from b24api.contracts import (
     IdentityCoercion,
     IdentitySpec,
     KeysetSpec,
+    NotExecutedReason,
+    OffsetSpec,
     ParameterPath,
     ParameterUpdate,
     ReferenceComplete,
     ReferenceFailure,
     ReferenceItem,
+    ReferenceNotExecuted,
+    ReferenceOutcomeUnknown,
     ReplaySafety,
     Request,
     ResultCollectionShape,
@@ -35,7 +42,16 @@ from b24api.contracts import (
     TerminalState,
     TraversalAssurance,
 )
-from b24api.errors import BatchFailed, IncompleteTraversalError, InputSourceError, ReferenceFailed
+from b24api.errors import (
+    AmbiguousExecutionError,
+    BatchFailed,
+    CapabilityError,
+    FailurePhase,
+    IncompleteTraversalError,
+    InputSourceError,
+    ReferenceFailed,
+    TransportError,
+)
 from b24api.execution import Executor, Transport, WireResponse
 from b24api.settings import Settings
 
@@ -61,6 +77,8 @@ FANOUT_BATCH_REQUESTS = 6
 LARGE_COUNTED_ROWS = 100_001
 LARGE_LOGICAL_BATCH_COMMANDS = 100_000
 LARGE_LOGICAL_BATCH_REQUESTS = 2_000
+CUSTOM_INITIAL_OFFSET = 10
+CUSTOM_NEXT_OFFSET = 12
 
 
 class FunctionTransport:
@@ -87,6 +105,62 @@ class FunctionTransport:
         self.closed = True
 
 
+class BlockingCloseTransport(FunctionTransport):
+    """Transport whose owned close can be cancelled while it is in flight."""
+
+    def __init__(self) -> None:
+        """Create deterministic close synchronization points."""
+        super().__init__(lambda _request: {"result": None})
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+
+    async def aclose(self) -> None:
+        """Wait until the test permits the owned close to finish."""
+        self.close_started.set()
+        await self.release_close.wait()
+        self.closed = True
+
+
+class FailingCloseTransport(FunctionTransport):
+    """Transport that records close and then reports an owned cleanup failure."""
+
+    async def aclose(self) -> None:
+        """Fail after proving that close was attempted."""
+        self.closed = True
+        raise RuntimeError("owned transport cleanup failed")
+
+
+class AmbiguousTransport(FunctionTransport):
+    """Fail after possible dispatch without exposing caller-owned values."""
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        """Record the request and raise an ambiguous transport failure."""
+        del attempt_timeout, max_response_bytes
+        self.requests.append(request)
+        raise TransportError("ambiguous synthetic dispatch", phase=FailurePhase.DISPATCH_STARTED)
+
+
+class BlockingRequestTransport(FunctionTransport):
+    """Expose cancellation of one in-flight public stream pull."""
+
+    def __init__(self) -> None:
+        """Create deterministic request synchronization points."""
+        super().__init__(lambda _request: None)
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        """Block until the owner closes or cancels the active operation."""
+        del attempt_timeout, max_response_bytes
+        self.requests.append(request)
+        self.started.set()
+        try:
+            await asyncio.Future[None]()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
 def _client(transport: Transport) -> Bitrix24:
     return Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
 
@@ -111,6 +185,23 @@ async def test_call_and_call_response_have_stable_detached_types() -> None:
     assert decoded == {"items": [1, 2]}
     assert response.result == decoded
     assert response.result is not decoded
+
+
+@pytest.mark.asyncio
+async def test_closed_request_mapping_canonicalizes_immediately_and_rejects_unknown_fields() -> None:
+    transport = FunctionTransport(lambda request: {"result": request.copy_parameters()})
+    client = _client(transport)
+
+    result = await client.call(
+        {"method": "test.get", "parameters": {"ID": 7}, "replay_safety": ReplaySafety.SAFE},
+    )
+
+    assert result == {"ID": 7}
+    with pytest.raises(ValueError, match="unknown request fields"):
+        await client.call({"method": "test.get", "unexpected": True})  # type: ignore[typeddict-unknown-key]
+    with pytest.raises(TypeError, match="must be a ReplaySafety"):
+        await client.call({"method": "test.get", "replay_safety": "safe"})  # type: ignore[typeddict-item]
+    assert len(transport.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -206,6 +297,56 @@ async def test_public_counted_traversal_above_100k_stays_exact_and_warns_once() 
     assert len(matching) == 1
     assert count == LARGE_COUNTED_ROWS
     assert stream.report is not None
+    assert stream.report.unique_rows == LARGE_COUNTED_ROWS
+    assert stream.report.assurance is TraversalAssurance.IDENTITY_EXACT
+
+
+@pytest.mark.asyncio
+async def test_public_keyset_above_100k_uses_monotonic_progression_without_identity_set() -> None:
+    page_size = 2_500
+
+    def handler(request: Request) -> object:
+        parameters = request.copy_parameters()
+        assert parameters["start"] == -1
+        assert parameters["limit"] == page_size
+        assert parameters["order"] == {"ID": "ASC"}
+        raw_filter = parameters.get("filter", {})
+        assert isinstance(raw_filter, dict)
+        boundary = int(raw_filter.get(">ID", -1))
+        start = boundary + 1
+        return {
+            "result": [
+                {"ID": value}
+                for value in range(start, min(start + page_size, LARGE_COUNTED_ROWS))
+            ],
+        }
+
+    transport = FunctionTransport(handler)
+    client = _client(transport)
+    stream = client.iter_list_keyset(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=page_size,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        policy=ExecutionPolicy(
+            max_requests=100,
+            max_pages=100,
+            max_buffered_rows=page_size,
+        ),
+    )
+
+    count = 0
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        async for row in stream:
+            assert row == {"ID": count}
+            count += 1
+
+    assert count == LARGE_COUNTED_ROWS
+    assert not [warning for warning in captured if issubclass(warning.category, RuntimeWarning)]
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.unique_rows == LARGE_COUNTED_ROWS
     assert stream.report.assurance is TraversalAssurance.IDENTITY_EXACT
 
@@ -384,19 +525,102 @@ async def test_bound_references_apply_nested_updates_off_wire_and_emit_exact_com
 
 @pytest.mark.asyncio
 async def test_binding_collision_rejects_before_reference_io() -> None:
+    correlation = object()
     transport = FunctionTransport(lambda _request: pytest.fail("binding collision must reject before I/O"))
     stream = _client(transport).iter_references(
         Request("test.list", replay_safety=ReplaySafety.SAFE),
-        [Binding("bad", (ParameterUpdate(ParameterPath(("start",)), 100),), object())],
+        [Binding("bad", (ParameterUpdate(ParameterPath(("start",)), 100),), correlation)],
         traversal=SequentialTraversal(),
     )
 
-    with pytest.raises(InputSourceError):
+    with pytest.raises(ReferenceFailed) as captured:
         await anext(stream)
 
+    assert len(captured.value.outcomes) == 1
+    outcome = captured.value.outcomes[0]
+    assert isinstance(outcome, ReferenceNotExecuted)
+    assert outcome.correlation is correlation
+    assert outcome.reason is NotExecutedReason.LOCAL_VALIDATION_FAILED
     assert transport.requests == []
-    assert stream.report is not None
+    assert stream.report is captured.value.report
     assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_tolerant_local_binding_failure_emits_not_executed_and_continues() -> None:
+    correlations = (object(), object())
+    transport = FunctionTransport(lambda _request: {"result": []})
+    stream = _client(transport).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        [
+            Binding("invalid", (ParameterUpdate(ParameterPath(("start",)), 100),), correlations[0]),
+            Binding("valid", (), correlations[1]),
+        ],
+        traversal=SequentialTraversal(),
+        dispatch=DirectDispatch(concurrency=1, output_order=DeliveryOrder.INPUT),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == REFERENCE_BINDINGS
+    assert isinstance(outcomes[0], ReferenceNotExecuted)
+    assert outcomes[0].correlation is correlations[0]
+    assert outcomes[0].reason is NotExecutedReason.LOCAL_VALIDATION_FAILED
+    assert isinstance(outcomes[1], ReferenceComplete)
+    assert outcomes[1].correlation is correlations[1]
+    assert len(transport.requests) == 1
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert stream.report.not_executed == 1
+    assert stream.report.successes == 1
+
+
+@pytest.mark.asyncio
+async def test_tolerant_reference_preserves_ambiguous_dispatch_as_unknown() -> None:
+    correlation = object()
+    transport = AmbiguousTransport(lambda _request: None)
+    stream = _client(transport).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.UNKNOWN),
+        [Binding("ambiguous", (), correlation)],
+        traversal=SequentialTraversal(),
+        dispatch=DirectDispatch(concurrency=1),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert isinstance(outcome, ReferenceOutcomeUnknown)
+    assert outcome.correlation is correlation
+    assert isinstance(outcome.error, AmbiguousExecutionError)
+    assert outcome.partial_rows == 0
+    assert len(transport.requests) == 1
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert stream.report.unknown == 1
+
+
+def test_counted_reference_rejects_direct_dispatch_before_binding_pull_or_io() -> None:
+    pulled = False
+
+    async def bindings() -> AsyncGenerator[Binding[object]]:
+        nonlocal pulled
+        pulled = True
+        yield Binding("unreachable", (), object())
+
+    transport = FunctionTransport(lambda _request: {"result": []})
+    client = _client(transport)
+
+    with pytest.raises(CapabilityError, match="requires BatchDispatch"):
+        client.iter_references(
+            Request("test.list", replay_safety=ReplaySafety.SAFE),
+            bindings(),
+            traversal=CountedTraversal(identity=_identity()),
+            dispatch=DirectDispatch(),
+        )
+
+    assert not pulled
+    assert transport.requests == []
 
 
 @pytest.mark.asyncio
@@ -432,8 +656,34 @@ async def test_tolerant_reference_failure_has_no_false_completion_and_later_bind
     assert events[1].binding_index == 1
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
+
+
+@pytest.mark.asyncio
+async def test_reference_incomplete_maps_to_typed_failure_not_unknown() -> None:
+    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    correlation = object()
+    stream = _client(transport).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        [Binding("one", (), correlation)],
+        traversal=SequentialTraversal(identity=_identity()),
+        dispatch=DirectDispatch(),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == REFERENCE_BINDINGS
+    assert isinstance(outcomes[0], ReferenceItem)
+    assert isinstance(outcomes[1], ReferenceFailure)
+    failure = outcomes[1]
+    assert failure.correlation is correlation
+    assert failure.partial_rows == 1
+    assert isinstance(failure.error, IncompleteTraversalError)
+    assert failure.error.report.state is TerminalState.INCOMPLETE
+    assert failure.error.report.emitted == 1
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
     assert stream.report.failures == 1
-    assert stream.report.successes == 1
+    assert stream.report.successes == 0
 
 
 @pytest.mark.asyncio
@@ -572,7 +822,55 @@ async def test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.assurance is TraversalAssurance.MECHANICS_ONLY
+
+
+@pytest.mark.asyncio
+async def test_iter_list_starts_from_the_callers_existing_offset() -> None:
+    def handler(request: Request) -> object:
+        start = request.copy_parameters()["start"]
+        if start == CUSTOM_INITIAL_OFFSET:
+            return {
+                "result": [{"ID": CUSTOM_INITIAL_OFFSET}, {"ID": CUSTOM_INITIAL_OFFSET + 1}],
+                "next": CUSTOM_NEXT_OFFSET,
+            }
+        assert start == CUSTOM_NEXT_OFFSET
+        return {"result": []}
+
+    transport = FunctionTransport(handler)
+    client = _client(transport)
+    stream = client.iter_list(
+        Request("test.list", {"start": CUSTOM_INITIAL_OFFSET}, ReplaySafety.SAFE),
+        identity=_identity(),
+    )
+
+    assert [row async for row in stream] == [
+        {"ID": CUSTOM_INITIAL_OFFSET},
+        {"ID": CUSTOM_INITIAL_OFFSET + 1},
+    ]
+    assert [request.copy_parameters()["start"] for request in transport.requests] == [
+        CUSTOM_INITIAL_OFFSET,
+        CUSTOM_NEXT_OFFSET,
+    ]
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.assurance is TraversalAssurance.IDENTITY_EXACT
     assert stream.report is stream.report
+
+
+@pytest.mark.asyncio
+async def test_sequential_missing_offset_refuses_before_io_when_control_creation_is_disabled() -> None:
+    transport = FunctionTransport(lambda _request: pytest.fail("missing traversal control must reject before I/O"))
+    stream = _client(transport).iter_list(
+        Request("test.list"),
+        offset=OffsetSpec(allow_create_controls=False),
+    )
+
+    with pytest.raises(CapabilityError, match="conflict"):
+        await anext(stream)
+
+    assert transport.requests == []
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.FAILED
 
 
 @pytest.mark.asyncio
@@ -731,3 +1029,64 @@ async def test_client_closes_active_stream_before_owned_transport_but_not_inject
     assert not transport.closed
     with pytest.raises(RuntimeError, match="client is closed"):
         await client.call(Request("test.get"))
+
+
+@pytest.mark.asyncio
+async def test_client_close_finishes_owned_cleanup_before_replaying_cancellation() -> None:
+    transport = BlockingCloseTransport()
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic owned-close seam
+    client._owned_transport = transport  # type: ignore[assignment]  # noqa: SLF001
+    close = asyncio.create_task(client.aclose())
+    await transport.close_started.wait()
+
+    close.cancel("external-caller")
+    transport.release_close.set()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await close
+    assert captured.value.args == ("external-caller",)
+    assert transport.closed
+
+
+@pytest.mark.asyncio
+async def test_client_context_preserves_body_error_when_owned_cleanup_fails() -> None:
+    transport = FailingCloseTransport(lambda _request: {"result": None})
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic owned-close seam
+    client._owned_transport = transport  # type: ignore[assignment]  # noqa: SLF001
+
+    with pytest.raises(ValueError, match="primary body failure") as captured:
+        async with client:
+            raise ValueError("primary body failure")
+
+    assert isinstance(captured.value.__cause__, RuntimeError)
+    assert "owned transport cleanup failed" in str(captured.value.__cause__)
+    assert transport.closed
+
+
+@pytest.mark.asyncio
+async def test_public_aclose_is_permitted_during_an_inflight_pull_and_cancels_owned_work() -> None:
+    transport = BlockingRequestTransport()
+    stream = _client(transport).iter_list(Request("test.list"))
+    pull = asyncio.create_task(anext(stream))
+    await transport.started.wait()
+
+    await stream.aclose()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await pull
+    assert captured.value.__dict__["report"] is stream.report
+    assert transport.cancelled.is_set()
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_long_lived_client_registry_does_not_retain_terminated_streams() -> None:
+    client = _client(FunctionTransport(lambda _request: {"result": []}))
+
+    for _ in range(100):
+        stream = client.iter_list(Request("test.list"))
+        assert [row async for row in stream] == []
+        assert stream.report is not None
+        assert stream.report.state is TerminalState.COMPLETED
+        assert len(client._streams) == 0  # noqa: SLF001 - exact weak-registry lifecycle requirement

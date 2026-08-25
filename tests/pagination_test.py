@@ -977,7 +977,8 @@ async def test_early_close_counts_only_unique_rows_delivered_from_later_page() -
 async def test_large_exact_identity_tracking_warns_once_and_continues() -> None:
     distinct = 100_001
     rows = [{"ID": index} for index in range(distinct)]
-    rows.append({"ID": 0})
+    rows.insert(50_000, {"ID": 0})
+    rows.append({"ID": distinct - 1})
     transport = FunctionTransport(lambda _request: {"result": rows})
     policy = ExecutionPolicy(
         max_buffered_rows=len(rows),
@@ -1000,6 +1001,7 @@ async def test_large_exact_identity_tracking_warns_once_and_continues() -> None:
     assert stream.report.state is KernelState.COMPLETED
     assert stream.report.unique_rows == distinct
     assert [violation.code for violation in stream.report.violations] == ["duplicate_identity"]
+    assert "observed 2 duplicate identities" in stream.report.violations[0].message
 
 
 @pytest.mark.asyncio
@@ -1156,15 +1158,15 @@ async def test_non_traversal_snapshot_requirement_is_unverified_and_incomplete()
 
 
 @pytest.mark.asyncio
-async def test_case_insensitive_control_conflict_fails_before_network_io() -> None:
+async def test_case_insensitive_control_ambiguity_fails_before_network_io() -> None:
     transport = FunctionTransport(lambda _request: {"result": []})
     stream = iter_list(
         Executor(transport),
-        Request("crm.item.list", {"START": 99}),
+        Request("crm.item.list", {"start": 99, "START": 99}),
         plan=_offset_plan(),
     )
 
-    with pytest.raises(CapabilityError, match="conflict"):
+    with pytest.raises(CapabilityError, match="ambiguous"):
         await _collect(stream)
 
     assert transport.requests == []

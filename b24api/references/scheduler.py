@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, cast
 
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.request import IdentitySpec, ReplaySafety, Request, ResultSelector
-from b24api.errors import BudgetExceededError
+from b24api.errors import BudgetExceededError, CapabilityError
 from b24api.execution import (
     AsyncIteratorController,
     Executor,
@@ -237,7 +237,12 @@ class ReferenceScheduler:
                 next_index += 1
                 queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue(maxsize=1)
                 admission.queues[work.index] = queue
-                admission.tasks[work.index] = asyncio.create_task(self._run_reference(work, queue))
+                run = (
+                    self._emit_local_non_execution(work, queue)
+                    if reference.not_executed_reason is not None
+                    else self._run_reference(work, queue)
+                )
+                admission.tasks[work.index] = asyncio.create_task(run)
                 self.active_references_high_water = max(self.active_references_high_water, len(admission.tasks))
                 admission.changed.set()
         finally:
@@ -328,6 +333,22 @@ class ReferenceScheduler:
             if reservation is not None:
                 await self.buffer.abort(reservation)
 
+    async def _emit_local_non_execution(self, work: _Work, output: asyncio.Queue[_Event]) -> None:
+        """Emit one proved local terminal state without touching the dispatcher."""
+        reason = work.reference.not_executed_reason
+        if reason is None:
+            raise RuntimeError("local non-execution requires a reason")
+        await output.put(
+            _FailureEvent(
+                work,
+                CapabilityError("reference binding failed local validation"),
+                None,
+                0,
+                0,
+                (),
+                not_executed_reason=reason,
+            ),
+        )
     async def _ready(
         self,
         admission: _AdmissionState,
@@ -424,6 +445,7 @@ class ReferenceScheduler:
             replay_safety=request.replay_safety or ReplaySafety.UNKNOWN,
             replay_disposition=event.replay_disposition,
             correlation=event.work.reference.correlation,
+            not_executed_reason=event.not_executed_reason,
         )
         if not self.tolerant:
             if self.capture_fail_fast:

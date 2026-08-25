@@ -8,6 +8,7 @@ from b24api.execution import (
     WorkClass,
 )
 from b24api.traversal.identity import (
+    _initial_offset,
     _next_offset,
     _offset_terminal,
     _Page,
@@ -57,7 +58,7 @@ class _SequentialMixin:
         yield _Page(tuple(items), response, item_weights)
 
     async def _offset(self: Any, plan: OffsetSequentialPlan) -> AsyncGenerator[_Page]:
-        offset = 0
+        offset = _initial_offset(self.request, plan.offset_path)
         self.cursor_state = offset
         visited_offsets: set[int] = set()
         while True:
@@ -72,6 +73,7 @@ class _SequentialMixin:
                     self.request,
                     updates,
                     allow_create=plan.allow_create_controls,
+                    replace=frozenset({plan.offset_path}),
                 ),
             )
             items = _response_items(response, self.selector)
