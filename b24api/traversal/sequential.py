@@ -12,8 +12,8 @@ from b24api.traversal.identity import (
     _offset_terminal,
     _Page,
     _request_with_controls,
-    _response_items,
 )
+from b24api.traversal.values import _response_items
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator

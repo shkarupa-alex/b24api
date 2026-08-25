@@ -14,7 +14,8 @@ from b24api.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
 )
-from b24api.traversal.identity import _Page, _request_with_controls, _response_items
+from b24api.traversal.identity import _Page, _request_with_controls
+from b24api.traversal.values import _response_items
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator

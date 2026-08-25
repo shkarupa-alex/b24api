@@ -5,14 +5,12 @@ from typing import TYPE_CHECKING, Any
 
 from b24api.errors import PaginationError
 from b24api.traversal.identity import (
-    IdentityValue,
     _child_path,
-    _compare_identities,
     _keyset_terminal,
     _Page,
     _request_with_controls,
-    _response_items,
 )
+from b24api.traversal.values import IdentityValue, _compare_identities, _response_items
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator

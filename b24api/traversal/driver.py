@@ -27,26 +27,28 @@ from b24api.traversal.counted_batch import _CountedBatchMixin
 from b24api.traversal.cursor import _CursorMixin
 from b24api.traversal.identity import (
     _PLAN_TYPES,
-    IdentityValue,
     PageFetch,
     _child_path,
-    _coerce_identity,
-    _compare_identities,
     _effective_duplicate_policy,
     _effective_order_direction,
     _effective_total_semantics,
     _EffectiveConsistency,
-    _extract_path,
     _identity_store,
     _IdentityStore,
     _Page,
-    _page_fingerprint,
     _request_with_controls,
     _validate_confirmation_policy,
-    _validate_order,
 )
 from b24api.traversal.keyset import _KeysetMixin
 from b24api.traversal.sequential import _SequentialMixin
+from b24api.traversal.values import (
+    IdentityValue,
+    _coerce_identity,
+    _compare_identities,
+    _extract_path,
+    _page_fingerprint,
+    _validate_order,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator

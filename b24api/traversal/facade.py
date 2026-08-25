@@ -32,8 +32,8 @@ from b24api.plans import (
     OffsetTerminalRule,
 )
 from b24api.traversal.counted import CountedItemStream
-from b24api.traversal.identity import _MappingValuesResultSelector
 from b24api.traversal.stream import iter_list as _iter_list
+from b24api.traversal.values import _MappingValuesResultSelector
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
