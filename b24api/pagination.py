@@ -1180,7 +1180,27 @@ class _LegacyResultSelector(ResultSelector):
     """Internal marker for the committed one-key result fallback."""
 
 
+class _MappingValuesResultSelector(ResultSelector):
+    """Internal marker for explicit ordered mapping-value selection."""
+
+
 _LEGACY_RESULT_SELECTOR = _LegacyResultSelector.root()
+
+
+def _mapping_values(response: Response, selector: ResultSelector) -> list[JsonValue]:
+    selected: JsonValue = response.result
+    for part in selector.path:
+        if isinstance(part, str):
+            if not isinstance(selected, dict) or part not in selected:
+                raise CapabilityError("response result does not satisfy the declared selector")
+            selected = selected[part]
+        else:
+            if not isinstance(selected, list) or part >= len(selected):
+                raise CapabilityError("response result does not satisfy the declared selector")
+            selected = selected[part]
+    if not isinstance(selected, dict):
+        raise CapabilityError("mapping_values collection shape requires a selected mapping")
+    return list(selected.values())
 
 
 def _response_items(response: Response, selector: ResultSelector, *, single: bool = False) -> list[JsonValue]:
@@ -1189,6 +1209,8 @@ def _response_items(response: Response, selector: ResultSelector, *, single: boo
             return response.list_result
         except TypeError as error:
             raise CapabilityError("response result is not an unambiguous legacy list") from error
+    if isinstance(selector, _MappingValuesResultSelector):
+        return _mapping_values(response, selector)
     if single and selector.path == () and not isinstance(response.result, list):
         return [response.result]
     try:

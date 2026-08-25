@@ -264,6 +264,32 @@ class IncompleteTraversalError(B24ApiError):
         )
 
 
+class InputSourceError(B24ApiError):
+    """A caller-owned sync or async input source failed during admission."""
+
+    default_origin = ErrorOrigin.CAPABILITY
+
+
+class BatchFailed[C](B24ApiError):  # noqa: N818 - normative public name
+    """Bounded fail-fast batch window plus its final report."""
+
+    def __init__(self, outcomes: tuple[object, ...], *, report: object) -> None:
+        """Retain only the bounded active window."""
+        self.outcomes = outcomes
+        self.report = report
+        super().__init__("Logical batch did not complete", origin=ErrorOrigin.BATCH_COMMAND)
+
+
+class ReferenceFailed[C](B24ApiError):  # noqa: N818 - normative public name
+    """Bounded fail-fast reference window plus its final report."""
+
+    def __init__(self, outcomes: tuple[object, ...], *, report: object) -> None:
+        """Retain only the bounded active window."""
+        self.outcomes = outcomes
+        self.report = report
+        super().__init__("Reference traversal did not complete", origin=ErrorOrigin.PAGINATION)
+
+
 class RetryHTTPStatusError(HTTPGatewayError):
     """Import-compatible retryable HTTP status error with redacted presentation."""
 
@@ -298,6 +324,7 @@ __all__ = [
     "ApiResponseError",
     "B24ApiError",
     "BatchCommandError",
+    "BatchFailed",
     "BudgetError",
     "BudgetExceededError",
     "CapabilityError",
@@ -305,8 +332,10 @@ __all__ = [
     "FailurePhase",
     "HTTPGatewayError",
     "IncompleteTraversalError",
+    "InputSourceError",
     "PaginationError",
     "ProtocolError",
+    "ReferenceFailed",
     "ResponseTooLargeError",
     "RetryApiResponseError",
     "RetryHTTPStatusError",
