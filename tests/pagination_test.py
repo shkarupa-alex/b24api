@@ -18,7 +18,6 @@ from b24api.models import (
     IdentityCoercion,
     IdentityRequirement,
     IdentitySpec,
-    IdentityTracker,
     JsonValue,
     OrderSemantics,
     ParameterPath,
@@ -979,8 +978,13 @@ async def test_item_cursor_rejects_wrong_order_within_first_page() -> None:
 
 
 @pytest.mark.asyncio
-async def test_item_cursor_refuses_monotonic_identity_tracker_before_io() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1, "cursor": 1}]})
+async def test_item_cursor_uses_internal_monotonic_tracking() -> None:
+    def handler(request: Request) -> object:
+        if "LAST_ID" in request.parameters:
+            return {"result": []}
+        return {"result": [{"ID": 1, "cursor": 1}]}
+
+    transport = FunctionTransport(handler)
     plan = ItemCursorPlan(
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING,
@@ -991,12 +995,10 @@ async def test_item_cursor_refuses_monotonic_identity_tracker_before_io() -> Non
         Request("crm.item.list"),
         plan=plan,
         identity=_identity(),
-        policy=ExecutionPolicy(identity_tracker=IdentityTracker.MONOTONIC),
     )
 
-    with pytest.raises(CapabilityError, match="identity-ordered keyset"):
-        await anext(stream)
-    assert transport.requests == []
+    assert await _collect(stream) == [{"ID": 1, "cursor": 1}]
+    assert len(transport.requests) == PAGE_SIZE
 
 
 @pytest.mark.asyncio
@@ -1088,22 +1090,31 @@ async def test_early_close_counts_only_unique_rows_delivered_from_later_page() -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tracker", [IdentityTracker.MEMORY, IdentityTracker.SQLITE])
-async def test_exact_identity_trackers_enforce_budget_and_cleanup(tracker: IdentityTracker) -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
-    policy = ExecutionPolicy(max_tracked_identities=1, identity_tracker=tracker)
+async def test_large_exact_identity_tracking_warns_once_and_continues() -> None:
+    distinct = 100_001
+    rows = [{"ID": index} for index in range(distinct)]
+    rows.append({"ID": 0})
+    transport = FunctionTransport(lambda _request: {"result": rows})
+    policy = ExecutionPolicy(
+        max_buffered_rows=len(rows),
+        consistency=ConsistencyPolicy(duplicate_policy=DuplicatePolicy.REPORT),
+    )
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list"),
-        plan=SingleResponsePlan(),
+        plan=SingleResponsePlan(duplicate_policy=DuplicatePolicy.REPORT),
         identity=_identity(),
         policy=policy,
     )
 
-    with pytest.raises(BudgetExceededError, match="identity"):
-        await _collect(stream)
+    with pytest.warns(RuntimeWarning, match="exact duplicate/loss detection") as captured:
+        result = await _collect(stream)
 
-    assert stream.report.state is TerminalState.FAILED
+    assert len(captured) == 1
+    assert len(result) == len(rows)
+    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.unique_rows == distinct
+    assert [violation.code for violation in stream.report.violations] == ["duplicate_identity"]
 
 
 @pytest.mark.asyncio

@@ -309,14 +309,6 @@ class ViolationSeverity(StrEnum):
     BLOCKING = "blocking"
 
 
-class IdentityTracker(StrEnum):
-    """Exact identity storage strategy."""
-
-    MONOTONIC = "monotonic"
-    MEMORY = "memory"
-    SQLITE = "sqlite"
-
-
 PathPart = str | int
 
 
@@ -688,16 +680,12 @@ class ExecutionPolicy:
     max_buffered_rows: int = 2_500
     max_direct_concurrency: int = 10
     max_active_references: int = 100
-    max_tracked_identities: int = 100_000
-    identity_tracker: IdentityTracker = IdentityTracker.MEMORY
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     consistency: ConsistencyPolicy = field(default_factory=ConsistencyPolicy.traversal)
     debug_evidence: bool = False
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
-        if not isinstance(self.identity_tracker, IdentityTracker):
-            raise TypeError("identity_tracker must be an IdentityTracker")
         if not isinstance(self.retry, RetryPolicy) or not isinstance(self.consistency, ConsistencyPolicy):
             raise TypeError("retry and consistency must be typed policies")
         positive_integers = (
@@ -708,7 +696,6 @@ class ExecutionPolicy:
             self.max_buffered_rows,
             self.max_direct_concurrency,
             self.max_active_references,
-            self.max_tracked_identities,
         )
         if any(not _is_plain_int(value) or value < 1 for value in positive_integers):
             raise ValueError("execution count limits must be positive")
@@ -1214,7 +1201,6 @@ __all__ = [
     "IdentityCoercion",
     "IdentityRequirement",
     "IdentitySpec",
-    "IdentityTracker",
     "JsonScalar",
     "JsonValue",
     "OperationReport",

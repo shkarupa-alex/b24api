@@ -6,7 +6,7 @@ import contextlib
 import hashlib
 import itertools
 import json
-import sqlite3
+import warnings
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
@@ -29,7 +29,6 @@ from b24api.models import (
     IdentityCoercion,
     IdentityRequirement,
     IdentitySpec,
-    IdentityTracker,
     JsonValue,
     OperationReport,
     OrderSemantics,
@@ -84,10 +83,13 @@ class _IdentityStore(Protocol):
     def close(self) -> None: ...
 
 
+_LARGE_IDENTITY_WARNING_THRESHOLD = 100_000
+
+
 class _MemoryIdentityStore:
-    def __init__(self, maximum: int) -> None:
-        self._maximum = maximum
+    def __init__(self) -> None:
         self._values: set[IdentityValue] = set()
+        self._warned = False
 
     @property
     def count(self) -> int:
@@ -99,57 +101,22 @@ class _MemoryIdentityStore:
     def add(self, value: IdentityValue) -> None:
         if value in self._values:
             return
-        if len(self._values) >= self._maximum:
-            from b24api.error import BudgetExceededError  # noqa: PLC0415
-
-            raise BudgetExceededError("identity tracking budget exhausted")
         self._values.add(value)
+        if not self._warned and len(self._values) > _LARGE_IDENTITY_WARNING_THRESHOLD:
+            warnings.warn(
+                "exact duplicate/loss detection continues in memory; a very large result may consume "
+                "additional memory or run more slowly",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            self._warned = True
 
     def close(self) -> None:
         self._values.clear()
 
 
-class _SqliteIdentityStore:
-    def __init__(self, maximum: int) -> None:
-        self._maximum = maximum
-        self._count = 0
-        self._connection = sqlite3.connect("")
-        self._connection.execute(
-            "CREATE TABLE identities (kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind, value))",
-        )
-
-    @property
-    def count(self) -> int:
-        return self._count
-
-    @staticmethod
-    def _key(value: IdentityValue) -> tuple[str, str]:
-        return ("integer", str(value)) if isinstance(value, int) else ("string", value)
-
-    def contains(self, value: IdentityValue) -> bool:
-        row = self._connection.execute(
-            "SELECT 1 FROM identities WHERE kind = ? AND value = ?",
-            self._key(value),
-        ).fetchone()
-        return row is not None
-
-    def add(self, value: IdentityValue) -> None:
-        if self.contains(value):
-            return
-        if self._count >= self._maximum:
-            from b24api.error import BudgetExceededError  # noqa: PLC0415
-
-            raise BudgetExceededError("identity tracking budget exhausted")
-        self._connection.execute("INSERT INTO identities(kind, value) VALUES (?, ?)", self._key(value))
-        self._count += 1
-
-    def close(self) -> None:
-        self._connection.close()
-
-
 class _MonotonicIdentityStore:
-    def __init__(self, maximum: int) -> None:
-        self._maximum = maximum
+    def __init__(self) -> None:
         self._count = 0
         self._last: IdentityValue | None = None
 
@@ -163,10 +130,6 @@ class _MonotonicIdentityStore:
     def add(self, value: IdentityValue) -> None:
         if value == self._last:
             return
-        if self._count >= self._maximum:
-            from b24api.error import BudgetExceededError  # noqa: PLC0415
-
-            raise BudgetExceededError("identity tracking budget exhausted")
         self._last = value
         self._count += 1
 
@@ -335,8 +298,6 @@ class PaginationDriver:
                 raise CapabilityError("parallel counted traversal requires a non-negative total")
             if total < len(head_items):
                 raise CapabilityError("parallel counted traversal observed total below the head page")
-            if self.identity is not None and total > self.context.policy.max_tracked_identities:
-                raise CapabilityError("parallel counted traversal exceeds the exact identity budget")
             stride = head.next if head.next is not None else page_size
             if isinstance(stride, bool) or stride < 1:
                 raise CapabilityError("parallel counted traversal requires a positive in-band stride")
@@ -704,8 +665,6 @@ class PaginationDriver:
             raise CapabilityError("partitioned keyset requires separate reviewed authorization")
         if isinstance(plan, KeysetPlan) and plan.terminal is KeysetTerminalRule.BOUNDARY_ID_SEEN:
             raise CapabilityError("boundary-id keyset requires an externally reviewed boundary contract")
-        if policy.identity_tracker is IdentityTracker.MONOTONIC and not isinstance(plan, KeysetPlan):
-            raise CapabilityError("monotonic identity tracking requires identity-ordered keyset traversal")
         return _EffectiveConsistency(
             duplicate_policy,
             total_semantics,
@@ -1471,16 +1430,15 @@ def _take_cursor(values: list[IdentityValue], mode: str) -> IdentityValue:
     return min(values) if mode == "min" else max(values)
 
 
-def _identity_store(policy: ExecutionPolicy, plan: ListPlan, identity: IdentitySpec | None) -> _IdentityStore:
-    if identity is None:
-        return _MemoryIdentityStore(policy.max_tracked_identities)
-    if policy.identity_tracker is IdentityTracker.SQLITE:
-        return _SqliteIdentityStore(policy.max_tracked_identities)
-    if policy.identity_tracker is IdentityTracker.MONOTONIC:
-        if not isinstance(plan, KeysetPlan):
-            raise CapabilityError("monotonic identity tracking requires identity-ordered keyset traversal")
-        return _MonotonicIdentityStore(policy.max_tracked_identities)
-    return _MemoryIdentityStore(policy.max_tracked_identities)
+def _identity_store(_policy: ExecutionPolicy, plan: ListPlan, identity: IdentitySpec | None) -> _IdentityStore:
+    if isinstance(plan, KeysetPlan) or (
+        isinstance(plan, ItemCursorPlan)
+        and identity is not None
+        and identity.item_path == plan.cursor_item_path
+        and identity.coercion is plan.cursor_coercion
+    ):
+        return _MonotonicIdentityStore()
+    return _MemoryIdentityStore()
 
 
 __all__ = ["ItemStream", "PaginationDriver", "iter_list"]
