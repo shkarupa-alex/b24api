@@ -3,6 +3,7 @@
 from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -20,13 +21,17 @@ from b24api.contracts import (
     TerminalState,
     TraversalAssurance,
 )
-from b24api.execution import Executor, WireResponse
+from b24api.error import IncompleteTraversalError
+from b24api.execution import Executor, Transport, WireResponse
 from b24api.settings import Settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 HTTP_OK = 200
+COUNTED_ROWS = 500
+EXPECTED_COUNTED_REQUESTS = 2
+PAGE_SIZE = 50
 
 
 class FunctionTransport:
@@ -53,7 +58,7 @@ class FunctionTransport:
         self.closed = True
 
 
-def _client(transport: FunctionTransport) -> Bitrix24:
+def _client(transport: Transport) -> Bitrix24:
     return Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
 
 
@@ -168,6 +173,77 @@ async def test_keyset_and_cursor_are_explicit_strict_alternatives() -> None:
         ),
     )
     assert [item async for item in cursor] == [{"ID": 1}, {"ID": 2}]
+
+
+@pytest.mark.asyncio
+async def test_counted_traversal_preserves_frozen_request_shape_and_exact_identity() -> None:
+    identities = tuple(range(1, COUNTED_ROWS + 1))
+
+    def page(start: int) -> tuple[list[dict[str, int]], int | None]:
+        rows = [{"ID": identity} for identity in identities[start : start + PAGE_SIZE]]
+        next_offset = start + PAGE_SIZE if start + PAGE_SIZE < len(identities) else None
+        return rows, next_offset
+
+    def handler(request: Request) -> object:
+        if request.method == "test.list":
+            raw_start = request.copy_parameters().get("start", 0)
+            assert isinstance(raw_start, int)
+            rows, next_offset = page(raw_start)
+            return {"result": rows, "total": len(identities), "next": next_offset}
+        parameters = request.copy_parameters()
+        commands = parameters["cmd"]
+        assert isinstance(commands, dict)
+        results: dict[str, object] = {}
+        totals: dict[str, int] = {}
+        continuations: dict[str, int] = {}
+        for key, raw_query in commands.items():
+            assert isinstance(raw_query, str)
+            query = parse_qs(urlsplit(raw_query).query)
+            start = int(query["start"][0])
+            rows, next_offset = page(start)
+            results[key] = rows
+            totals[key] = len(identities)
+            if next_offset is not None:
+                continuations[key] = next_offset
+        return {
+            "result": {
+                "result": results,
+                "result_error": {},
+                "result_total": totals,
+                "result_next": continuations,
+            },
+        }
+
+    portal = FunctionTransport(handler)
+    stream = _client(portal).iter_list_counted(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        identity=_identity(),
+    )
+
+    rows = [item async for item in stream]
+
+    assert tuple(row["ID"] for row in rows if isinstance(row, dict)) == identities
+    assert len(portal.requests) == EXPECTED_COUNTED_REQUESTS
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.physical_requests == EXPECTED_COUNTED_REQUESTS
+    assert stream.report.batch_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_counted_missing_in_band_stride_fails_incomplete() -> None:
+    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}], "total": 2})
+    stream = _client(transport).iter_list_counted(
+        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        identity=_identity(),
+    )
+
+    with pytest.raises(IncompleteTraversalError, match="did not complete") as captured:
+        await anext(stream)
+
+    assert type(captured.value).__name__ == "IncompleteTraversalError"
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.INCOMPLETE
 
 
 @pytest.mark.asyncio

@@ -277,12 +277,15 @@ class PaginationDriver:
         self.begin_external_validation()
         outcomes: BatchStream | None = None
         try:
+            head_controls: dict[ParameterPath, object] = {self.plan.offset_path: 0}
+            if self.plan.limit_path is not None:
+                head_controls[self.plan.limit_path] = page_size
             head_reservation = await self.context.reserve_page()
             try:
                 head = await self.executor.execute(
                     _request_with_controls(
                         self.request,
-                        {self.plan.offset_path: 0},
+                        head_controls,
                         allow_create=self.plan.allow_create_controls,
                     ),
                     context=self.context,
@@ -330,7 +333,10 @@ class PaginationDriver:
             requests = (
                 _request_with_controls(
                     self.request,
-                    {self.plan.offset_path: start},
+                    {
+                        self.plan.offset_path: start,
+                        **({self.plan.limit_path: page_size} if self.plan.limit_path is not None else {}),
+                    },
                     allow_create=self.plan.allow_create_controls,
                 )
                 for start in range(stride, total, stride)

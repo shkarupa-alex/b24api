@@ -28,6 +28,7 @@ from b24api.models import DuplicatePolicy, IdentityRequirement, OrderSemantics, 
 from b24api.pagination import _MappingValuesResultSelector
 from b24api.pagination import iter_list as _iter_list
 from b24api.plans import (
+    CountedOffsetPlan,
     CursorTerminalRule,
     ItemCursorPlan,
     KeysetPlan,
@@ -37,6 +38,7 @@ from b24api.plans import (
     OffsetTerminalRule,
 )
 from b24api.settings import Settings, api_settings
+from b24api.traversal_counted import CountedItemStream
 
 type RequestSpec = Mapping[str, object]
 type RequestLike = Request | RequestSpec
@@ -248,6 +250,62 @@ class Bitrix24:
             operation="iter_list_keyset",
             assurance=TraversalAssurance.IDENTITY_EXACT,
         )
+
+    def iter_list_counted(  # noqa: PLR0913
+        self,
+        request: RequestLike,
+        *,
+        identity: IdentitySpec,
+        selector: ResultSelector = _ROOT_SELECTOR,
+        collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
+        page_size: int = 50,
+        batch_size: int | None = None,
+        offset: OffsetSpec = _DEFAULT_OFFSET,
+        policy: ExecutionPolicy | None = None,
+    ) -> OperationStream[JsonValue]:
+        """Return exact direct-head plus physically batched counted traversal."""
+        self._require_open()
+        if not isinstance(identity, IdentitySpec):
+            raise TypeError("identity must be an IdentitySpec")
+        if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
+            raise ValueError("page_size must be a positive integer")
+        effective_policy = policy or self._default_policy
+        effective_batch_size = min(50, effective_policy.max_buffered_commands) if batch_size is None else batch_size
+        if (
+            not isinstance(effective_batch_size, int)
+            or isinstance(effective_batch_size, bool)
+            or not 1 <= effective_batch_size <= min(50, effective_policy.max_buffered_commands)
+        ):
+            raise ValueError("batch_size must be within 1..50 and the command buffer ceiling")
+        plan = CountedOffsetPlan(
+            offset_path=offset.parameter_path,
+            limit_path=offset.limit_path,
+            requested_page_size=page_size if offset.limit_path is not None else None,
+            allow_create_controls=offset.allow_create_controls,
+            identity_requirement=IdentityRequirement.REQUIRED,
+            order_semantics=OrderSemantics.UNORDERED,
+            duplicate_policy=DuplicatePolicy.ERROR,
+            total_semantics=TotalSemantics.FILTERED_EXACT,
+        )
+        source = CountedItemStream(
+            self._executor,
+            _canonical_request(request),
+            plan=plan,
+            selector=_collection_selector(selector, collection_shape),
+            identity=identity,
+            page_size=page_size,
+            batch_size=effective_batch_size,
+            policy=effective_policy,
+        )
+        stream = MappedOperationStream(
+            source,
+            lambda item: item,
+            operation="iter_list_counted",
+            assurance=TraversalAssurance.IDENTITY_EXACT,
+            deregister=self._discard_stream,
+        )
+        self._streams.add(cast("_PublicStream", stream))
+        return stream
 
     def iter_list_cursor(  # noqa: PLR0913
         self,
