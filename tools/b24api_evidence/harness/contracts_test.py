@@ -2920,6 +2920,35 @@ def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) 
     assert "[console_scripts]" in entry_points
     assert "b24api = b24api.cli:main" in entry_points
 
+    environment = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(tmp_path / "wheel-venv")}
+    subprocess.run(  # noqa: S603 - fixed local uv environment command
+        [uv, "venv", "--system-site-packages", environment["UV_PROJECT_ENVIRONMENT"]],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(  # noqa: S603 - installs the local wheel and cached locked runtime dependencies
+        [uv, "pip", "install", "--python", environment["UV_PROJECT_ENVIRONMENT"], "--offline", str(wheel)],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    scripts = "Scripts" if os.name == "nt" else "bin"
+    executable = Path(environment["UV_PROJECT_ENVIRONMENT"]) / scripts / ("b24api.exe" if os.name == "nt" else "b24api")
+    installed = subprocess.run(  # noqa: S603 - exact installed wheel entry point
+        [str(executable), "--help"],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert installed.stdout.startswith("usage: b24api")
+
 
 def _run_cli(*arguments: str, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # noqa: S603 - fixed interpreter/entrypoint with test-controlled arguments
