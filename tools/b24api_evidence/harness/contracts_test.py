@@ -2890,11 +2890,16 @@ def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) 
     wheel = next(tmp_path.glob("*.whl"))
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
+        entry_points_name = next(name for name in names if name.endswith(".dist-info/entry_points.txt"))
+        entry_points = archive.read(entry_points_name).decode("utf-8")
     assert any(name.startswith("b24api/") for name in names)
     assert not any("b24api_evidence" in name or name.startswith("tools/") for name in names)
     assert not any(name.endswith("live.py") for name in names)
     assert "b24api/cli.py" in names
+    assert "b24api/cli_contract.py" in names
     assert not any(name.startswith("b24api/") and name.endswith("_test.py") for name in names)
+    assert "[console_scripts]" in entry_points
+    assert "b24api = b24api.cli:main" in entry_points
 
 
 def _run_cli(*arguments: str, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
