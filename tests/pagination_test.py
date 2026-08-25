@@ -28,7 +28,6 @@ from b24api.models import (
     TerminalState,
     TotalSemantics,
 )
-from b24api.pagination import iter_list
 from b24api.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
@@ -42,6 +41,7 @@ from b24api.plans import (
     OffsetTerminalRule,
     SingleResponsePlan,
 )
+from b24api.traversal import iter_list
 
 if TYPE_CHECKING:
     from collections.abc import Callable

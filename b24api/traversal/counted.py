@@ -19,7 +19,7 @@ from b24api.models import (
     SnapshotState,
     TerminalState,
 )
-from b24api.pagination import PaginationDriver
+from b24api.traversal.driver import PaginationDriver
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator

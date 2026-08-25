@@ -20,7 +20,6 @@ from b24api.models import (
     ResultSelector,
     TotalSemantics,
 )
-from b24api.pagination import PaginationDriver, iter_list
 from b24api.plans import (
     CountedOffsetPlan,
     KeysetPlan,
@@ -29,6 +28,7 @@ from b24api.plans import (
     OffsetSequentialPlan,
     OffsetTerminalRule,
 )
+from b24api.traversal import PaginationDriver, iter_list
 
 from .contracts import MAX_MUTATION_RETRIES, content_sha256
 

@@ -49,8 +49,6 @@ from b24api.fanout_v2 import (
     kernel_fanout_stream,
 )
 from b24api.models import DuplicatePolicy, IdentityRequirement, OrderSemantics, TotalSemantics
-from b24api.pagination import _MappingValuesResultSelector
-from b24api.pagination import iter_list as _iter_list
 from b24api.plans import (
     CountedOffsetPlan,
     CursorTerminalRule,
@@ -71,7 +69,8 @@ from b24api.reference_v2 import (
     kernel_reference_stream,
 )
 from b24api.settings import Settings, api_settings
-from b24api.traversal_counted import CountedItemStream
+from b24api.traversal import CountedItemStream, _MappingValuesResultSelector
+from b24api.traversal import iter_list as _iter_list
 
 type RequestSpec = Mapping[str, object]
 type RequestLike = Request | RequestSpec

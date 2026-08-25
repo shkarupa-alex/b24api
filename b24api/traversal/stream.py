@@ -1,11 +1,12 @@
-"""Bounded fair scheduling for independent and paginated references."""
+"""Lazy correctness-first sequential traversal streams and state machines."""
 
 from __future__ import annotations
 import asyncio
 import contextlib
+from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
-from typing import Self, cast
+from typing import TYPE_CHECKING, Self, cast
 
 from b24api.execution import (
     Executor,
@@ -17,8 +18,9 @@ from b24api.models import (
     CompletionAssurance,
     ExecutionPolicy,
     IdentitySpec,
+    JsonValue,
     OperationReport,
-    ReferenceItem,
+    Request,
     ResultSelector,
     SnapshotRequirement,
     SnapshotState,
@@ -26,74 +28,73 @@ from b24api.models import (
     Violation,
     ViolationSeverity,
 )
-from b24api.plans import (
-    BatchDispatch,
-    DirectDispatch,
-    DispatchPlan,
-    ListPlan,
-    ReferenceOutputOrder,
-    SingleResponsePlan,
-)
-from b24api.references.dispatch import (
-    _MISSING,
-    ReferenceSource,
-    ReferenceStreamItem,
-)
-from b24api.references.scheduler import ReferenceScheduler
-from b24api.references.support import _attach_report
-from b24api.traversal import PaginationDriver
+from b24api.traversal.driver import PaginationDriver
+from b24api.traversal.identity import _MISSING, _attach_report, _Page
+
+if TYPE_CHECKING:
+    from b24api.plans import (
+        ListPlan,
+    )
 
 
-class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
-    """Lazy reference stream with one frozen report and deterministic cleanup."""
+class ItemStream(AsyncIterator[JsonValue]):
+    """Lazy item traversal stream with deterministic cleanup and final report."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
-        scheduler: ReferenceScheduler,
-        source: ReferenceSource,
+        executor: Executor,
+        request: Request,
+        plan: ListPlan,
         *,
+        selector: ResultSelector | None = None,
+        identity: IdentitySpec | None = None,
+        policy: ExecutionPolicy | None = None,
+        page_cap_hint: int | None = None,
         assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
     ) -> None:
         """Initialize instance state."""
-        self._scheduler = scheduler
-        self._source = source
-        self._runner: AsyncGenerator[ReferenceStreamItem] | None = None
-        self._prefetched: ReferenceStreamItem | object = _MISSING
+        PaginationDriver.validate_plan(plan)
+        self._context = executor.context(policy)
+        self._driver = PaginationDriver(
+            executor,
+            request,
+            plan,
+            selector=selector,
+            identity=identity,
+            context=self._context,
+            page_cap_hint=page_cap_hint,
+        )
+        self._assurance = assurance
+        self._runner: AsyncGenerator[tuple[JsonValue, bool]] | None = None
+        self._prefetched: tuple[JsonValue, bool] | object = _MISSING
         self._closed = False
         self._emitted = 0
         self._unique_emitted = 0
-        self._assurance = assurance
         self.report = OperationReport(assurance=assurance)
 
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
         return self
 
-    @property
-    def active_references_high_water(self) -> int:
-        """Return the bounded scheduler admission high-water mark."""
-        return self._scheduler.active_references_high_water
-
-    async def __anext__(self) -> ReferenceStreamItem:
+    async def __anext__(self) -> JsonValue:
         """Return the next asynchronous item."""
         if self._closed:
             raise StopAsyncIteration
         if self._prefetched is not _MISSING:
-            item = cast("ReferenceStreamItem", self._prefetched)
+            item, is_unique = cast("tuple[JsonValue, bool]", self._prefetched)
             self._prefetched = _MISSING
-            self._record_delivery(item)
+            self._record_delivery(is_unique=is_unique)
             return item
         if self._runner is None:
             self._runner = self._run()
-        item = await anext(self._runner)
-        self._record_delivery(item)
+        item, is_unique = await anext(self._runner)
+        self._record_delivery(is_unique=is_unique)
         return item
 
-    def _record_delivery(self, item: ReferenceStreamItem) -> None:
-        if isinstance(item, ReferenceItem):
-            self._emitted += 1
-            if self._scheduler.record_delivery(item):
-                self._unique_emitted += 1
+    def _record_delivery(self, *, is_unique: bool) -> None:
+        self._emitted += 1
+        if is_unique:
+            self._unique_emitted += 1
 
     async def __aenter__(self) -> Self:
         """Enter the asynchronous context."""
@@ -112,7 +113,6 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     async def aclose(self) -> None:
         """Close owned asynchronous resources."""
         if self._closed:
-            await self._observe_source_cleanup()
             return
         self._closed = True
         try:
@@ -130,34 +130,25 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             raise
         finally:
             self._prefetched = _MISSING
-        await self._observe_source_cleanup()
         if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
             await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
 
-    async def _observe_source_cleanup(self) -> None:
-        try:
-            await self._scheduler.observe_source_cleanup()
-        except BaseException as error:
-            if self.report.state is TerminalState.NOT_STARTED:
-                cancellation = await await_cancellation_resistant(
-                    self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
-                )
-                if cancellation is not None:
-                    _attach_report(cancellation, self.report)
-                    raise cancellation from error
-            _attach_report(error, self.report)
-            raise
-
-    async def _run(self) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912, PLR0915
-        outcomes = self._scheduler.outcomes(self._source)
+    async def _run(self) -> AsyncGenerator[tuple[JsonValue, bool]]:  # noqa: C901, PLR0912, PLR0915
+        pages = self._driver.pages()
         naturally_exhausted = False
         primary_error: BaseException | None = None
         pending_cancellation: asyncio.CancelledError | None = None
         try:
-            async for outcome in outcomes:
-                yield outcome
+            async for page in pages:
+                buffered = deque(zip(page.items, self._driver.last_page_unique_mask, strict=True))
+                await self._context.set_buffered_rows(len(buffered))
+                while buffered:
+                    item, is_unique = buffered.popleft()
+                    await self._context.set_buffered_rows(len(buffered) + 1)
+                    yield item, is_unique
+                    await self._context.set_buffered_rows(len(buffered))
             naturally_exhausted = True
-            await self._finalize(TerminalState.COMPLETED, "reference input exhausted")
+            await self._finalize(TerminalState.COMPLETED, self._driver.terminal_reason or "terminal confirmed")
         except asyncio.CancelledError as error:
             primary_error = error
             repeated = await await_cancellation_resistant(
@@ -195,7 +186,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
                 primary_error,
                 asyncio.CancelledError | GeneratorExit,
             )
-            cleanup = await await_cleanup_resistant(outcomes.aclose())
+            cleanup = await await_cleanup_resistant(self._cleanup_pages(pages))
             if cleanup.error is not None:
                 cleanup_error = cleanup.error
                 if preserve_primary:
@@ -230,7 +221,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
                 Violation(
                     severity=ViolationSeverity.BLOCKING,
                     code="cleanup_failure",
-                    message=f"reference cleanup failed ({type(error).__name__})",
+                    message=f"pagination cleanup failed ({type(error).__name__})",
                 ),
             )
         self.report = replace(
@@ -241,17 +232,21 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         )
         _attach_report(error, self.report)
 
+    async def _cleanup_pages(self, pages: AsyncGenerator[_Page]) -> None:
+        await pages.aclose()
+        await self._context.set_buffered_rows(0)
+
     async def _finalize(self, state: TerminalState, reason: str) -> None:
         if self.report.state is not TerminalState.NOT_STARTED:
             return
-        snapshot = await self._scheduler.context.snapshot()
-        consistency = self._scheduler.context.policy.consistency
+        snapshot = await self._context.snapshot()
+        consistency = self._context.policy.consistency
         snapshot_state = (
             SnapshotState.NOT_REQUESTED
             if consistency.snapshot_requirement is SnapshotRequirement.TRAVERSAL_ONLY
             else SnapshotState.UNVERIFIED
         )
-        violations = tuple(self._scheduler.violations)
+        violations = tuple(self._driver.violations)
         if state is TerminalState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
             state = TerminalState.INCOMPLETE
             reason = "required snapshot was not verified"
@@ -267,14 +262,12 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             state=state,
             assurance=self._assurance,
             snapshot=snapshot_state,
-            plan_id=type(self._scheduler.plan).__name__,
-            dispatch_id=type(self._scheduler.dispatch).__name__,
+            plan_id=type(self._driver.plan).__name__,
+            dispatch_id="sequential_direct",
             emitted_rows=self._emitted,
             unique_rows=self._unique_emitted,
             physical_requests=snapshot.counters.physical_requests,
             logical_pages=snapshot.counters.logical_pages,
-            batch_requests=self._scheduler.dispatcher.batch_requests,
-            batch_commands=self._scheduler.dispatcher.batch_commands,
             retries=snapshot.retries,
             cooldown_seconds=snapshot.cooldown_seconds,
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
@@ -283,75 +276,25 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         )
 
 
-def fan_out(  # noqa: PLR0913
+def iter_list(  # noqa: PLR0913
     executor: Executor,
-    requests: ReferenceSource,
-    *,
-    dispatch: DispatchPlan,
-    output_order: ReferenceOutputOrder = ReferenceOutputOrder.READY,
-    tolerant: bool = False,
-    policy: ExecutionPolicy | None = None,
-) -> ReferenceStream:
-    """Schedule independent requests as single-response reference traversals."""
-    return iter_references(
-        executor,
-        requests,
-        plan=SingleResponsePlan(),
-        dispatch=dispatch,
-        output_order=output_order,
-        tolerant=tolerant,
-        policy=policy,
-        _whole_result=True,
-    )
-
-
-def iter_references(  # noqa: PLR0913
-    executor: Executor,
-    requests: ReferenceSource,
+    request: Request,
     *,
     plan: ListPlan,
-    dispatch: DispatchPlan,
     selector: ResultSelector | None = None,
     identity: IdentitySpec | None = None,
-    output_order: ReferenceOutputOrder = ReferenceOutputOrder.READY,
-    tolerant: bool = False,
     policy: ExecutionPolicy | None = None,
-    _whole_result: bool = False,
-    _emit_complete: bool = False,
-    _emit_response: bool = False,
-    _capture_fail_fast: bool = False,
     _page_cap_hint: int | None = None,
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
-) -> ReferenceStream:
-    """Construct a lazy bounded reference traversal stream without I/O."""
-    PaginationDriver.validate_plan(plan)
-    if not isinstance(dispatch, BatchDispatch | DirectDispatch):
-        raise TypeError("dispatch must be a canonical DispatchPlan")
-    if not isinstance(output_order, ReferenceOutputOrder):
-        raise TypeError("output_order must be ReferenceOutputOrder")
-    if dispatch.output_order is not output_order:
-        raise ValueError("dispatch and stream output order must agree")
-    if _page_cap_hint is not None and (
-        not isinstance(_page_cap_hint, int) or isinstance(_page_cap_hint, bool) or _page_cap_hint < 1
-    ):
-        raise ValueError("page cap hint must be a positive integer")
-    scheduler = ReferenceScheduler(
+) -> ItemStream:
+    """Construct a lazy canonical item stream without performing I/O."""
+    return ItemStream(
         executor,
-        plan=plan,
-        dispatch=dispatch,
+        request,
+        plan,
         selector=selector,
         identity=identity,
-        output_order=output_order,
-        tolerant=tolerant,
-        policy=policy or ExecutionPolicy(),
-        whole_result=_whole_result,
-        emit_complete=_emit_complete,
-        emit_response=_emit_response,
-        capture_fail_fast=_capture_fail_fast,
+        policy=policy,
         page_cap_hint=_page_cap_hint,
-    )
-    return ReferenceStream(
-        scheduler,
-        requests,
         assurance=_assurance,
     )

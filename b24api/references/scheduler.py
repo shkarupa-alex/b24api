@@ -24,7 +24,6 @@ from b24api.models import (
     Violation,
     ViolationSeverity,
 )
-from b24api.pagination import PaginationDriver
 from b24api.plans import (
     DirectDispatch,
     DispatchPlan,
@@ -58,6 +57,7 @@ from b24api.references.support import (
     _wait_for_cleanup_tasks,
     _wait_for_event,
 )
+from b24api.traversal import PaginationDriver
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
