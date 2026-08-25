@@ -7,9 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from b24api.error import BudgetExceededError, CapabilityError, PaginationError, ProtocolError
-from b24api.execution import ExecutionContext, Executor, WireResponse
-from b24api.models import (
+from b24api.contracts.policy import (
     CompletionAssurance,
     ConfirmationPolicy,
     ConsistencyPolicy,
@@ -17,17 +15,15 @@ from b24api.models import (
     ExecutionPolicy,
     IdentityCoercion,
     IdentityRequirement,
-    IdentitySpec,
-    JsonValue,
+    KernelState,
     OrderSemantics,
-    ParameterPath,
-    Request,
-    ResultSelector,
     SnapshotRequirement,
     SnapshotState,
-    TerminalState,
     TotalSemantics,
 )
+from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector
+from b24api.error import BudgetExceededError, CapabilityError, PaginationError, ProtocolError
+from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
@@ -45,6 +41,8 @@ from b24api.traversal import iter_list
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from b24api.contracts.json import JsonValue
 
 PAGE_SIZE = 2
 THREE_ROWS = 3
@@ -139,7 +137,7 @@ async def test_single_stream_is_lazy_and_reports_scalar_completion() -> None:
     assert transport.requests == []
     assert await _collect(stream) == [{"ID": 7}]
     assert len(transport.requests) == 1
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
     assert stream.report.logical_pages == 1
     assert stream.report.emitted_rows == 1
 
@@ -151,10 +149,10 @@ async def test_async_context_entry_starts_execution_without_delivering_prefetche
 
     async with stream as entered:
         assert len(transport.requests) == 1
-        assert entered.report.state is TerminalState.NOT_STARTED
+        assert entered.report.state is KernelState.NOT_STARTED
         assert await _collect(entered) == [{"ID": 7}]
 
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
     assert stream.report.emitted_rows == 1
 
 
@@ -166,7 +164,7 @@ async def test_single_rejects_continuation_and_records_failure() -> None:
     with pytest.raises(CapabilityError, match="continuation") as captured:
         await _collect(stream)
 
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
     assert stream.report.logical_pages == 1
     assert captured.value.__dict__["report"] is stream.report
 
@@ -213,7 +211,7 @@ async def test_offset_detects_ignored_control_by_repeated_page_fingerprint() -> 
         await _collect(stream)
 
     assert len(transport.requests) == PAGE_SIZE
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -300,7 +298,7 @@ async def test_page_budget_refuses_continuation_before_network_io() -> None:
         await _collect(stream)
 
     assert [_integer_parameter(request, "start") for request in transport.requests] == [0]
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -338,7 +336,7 @@ async def test_counted_offset_requires_one_stable_non_negative_exact_total() -> 
     )
 
     assert await _collect(stream) == [{"ID": 1}, {"ID": 2}, {"ID": 3}]
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
     assert stream.report.terminal_reason == "qualified total reached"
 
 
@@ -359,7 +357,7 @@ async def test_counted_offset_detects_repeated_items_when_continuation_metadata_
         await _collect(stream)
 
     assert len(transport.requests) == PAGE_SIZE
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -523,7 +521,7 @@ async def test_advisory_total_mismatch_is_reported_without_blocking_completion()
     )
 
     assert await _collect(stream) == [{"ID": 1}, {"ID": 2}]
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
     assert [violation.code for violation in stream.report.violations] == ["advisory_total_mismatch"]
 
 
@@ -582,7 +580,7 @@ async def test_counted_offset_rejects_unproven_totals(
     with pytest.raises((CapabilityError, PaginationError), match=message):
         await _collect(stream)
 
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -764,7 +762,7 @@ async def test_item_cursor_orders_cursor_values_independently_from_row_identity(
         {"ID": 10, "cursor": 3},
     ]
     assert [request.copy_parameters().get("LAST_ID") for request in transport.requests] == [None, 2, 3]
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
     assert stream.report.unique_rows == PAGE_SIZE
     assert [violation.code for violation in stream.report.violations] == ["duplicate_identity"]
 
@@ -799,7 +797,7 @@ async def test_item_cursor_uses_independent_cursor_coercion() -> None:
         {"uuid": "b", "cursor": 2},
     ]
     assert [request.copy_parameters().get("LAST_ID") for request in transport.requests] == [None, 2]
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -990,7 +988,7 @@ async def test_large_exact_identity_tracking_warns_once_and_continues() -> None:
     matching = [warning for warning in captured if "exact duplicate/loss detection" in str(warning.message)]
     assert len(matching) == 1
     assert len(result) == len(rows)
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
     assert stream.report.unique_rows == distinct
     assert [violation.code for violation in stream.report.violations] == ["duplicate_identity"]
 
@@ -1009,7 +1007,7 @@ async def test_buffer_budget_blocks_page_before_any_row_is_emitted() -> None:
         await _collect(stream)
 
     assert stream.report.emitted_rows == 0
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -1021,7 +1019,7 @@ async def test_early_close_is_idempotent_and_reports_cancelled_with_buffer_high_
     await stream.aclose()
     await stream.aclose()
 
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is KernelState.CANCELLED
     assert stream.report.emitted_rows == 1
     assert stream.report.buffered_rows_high_water == PAGE_SIZE
 
@@ -1038,7 +1036,7 @@ async def test_task_cancellation_propagates_to_transport_and_finalizes_report() 
         await task
 
     assert transport.cancelled.is_set()
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is KernelState.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -1079,7 +1077,7 @@ async def test_cancellation_after_decoded_response_cannot_rollback_logical_page(
 
     assert captured.value.__dict__["report"] is stream.report
     assert stream.report.logical_pages == 1
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is KernelState.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -1124,7 +1122,7 @@ async def test_cancellation_during_failed_finalization_preserves_failure_report(
 
     assert primary[0].__dict__["report"] is stream.report
     assert post_failure_executed is False
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -1143,7 +1141,7 @@ async def test_non_traversal_snapshot_requirement_is_unverified_and_incomplete()
     assert await _collect(stream) == []
     assert stream.report.assurance is CompletionAssurance.CALLER_ASSERTED
     assert stream.report.snapshot is SnapshotState.UNVERIFIED
-    assert stream.report.state is TerminalState.INCOMPLETE
+    assert stream.report.state is KernelState.INCOMPLETE
     assert not stream.report.completed
     assert [violation.code for violation in stream.report.violations] == ["snapshot_unverified"]
 

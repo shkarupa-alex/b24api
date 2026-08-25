@@ -19,10 +19,8 @@ from b24api.traversal.identity import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from b24api.models import (
-        JsonValue,
-        ParameterPath,
-    )
+    from b24api.contracts.json import JsonValue
+    from b24api.contracts.request import ParameterPath
     from b24api.plans import (
         ItemCursorPlan,
     )

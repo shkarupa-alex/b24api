@@ -14,26 +14,22 @@ from b24api.contracts.command import (
     CommandSuccess,
 )
 from b24api.error import AmbiguousExecutionError, B24ApiError, BatchFailed, CapabilityError, InputSourceError
-from b24api.models import (
-    ExecutionPolicy,
-    OperationReport,
-    ReferenceRequest,
-)
-from b24api.models import (
-    ReferenceFailure as KernelFailure,
-)
 from b24api.plans import SingleResponsePlan
 from b24api.reference_v2 import _kernel_dispatch
-from b24api.references import (
+from b24api.references.dispatch import (
     _KernelFanOutSuccess,
     _ReferenceWindowError,
 )
-from b24api.references import (
+from b24api.references.outcome import ReferenceFailure as KernelFailure
+from b24api.references.outcome import ReferenceRequest
+from b24api.references.stream import (
     iter_references as _iter_references,
 )
 
 if TYPE_CHECKING:
     from b24api.contracts.dispatch import DispatchSpec
+    from b24api.contracts.policy import ExecutionPolicy
+    from b24api.execution.snapshot import KernelReport
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
 type KernelFanOutEvent = _KernelFanOutSuccess | KernelFailure
@@ -42,7 +38,7 @@ type KernelFanOutEvent = _KernelFanOutSuccess | KernelFailure
 class FanOutKernelStream(AsyncIterator[KernelFanOutEvent], Protocol):
     """Narrow structural view of the independent scheduler output."""
 
-    report: OperationReport
+    report: KernelReport
     active_references_high_water: int
 
     async def aclose(self) -> None:

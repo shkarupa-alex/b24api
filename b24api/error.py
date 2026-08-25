@@ -4,7 +4,8 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from b24api.models import RequestSummary, ResponseEvidence, summarize_request_like
+from b24api.contracts.request import RequestSummary, summarize_request_like
+from b24api.contracts.response import ResponseEvidence
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 if TYPE_CHECKING:

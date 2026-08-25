@@ -7,19 +7,16 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
-from b24api.execution import Executor, Transport, WireResponse
-from b24api.models import (
+from b24api.contracts.policy import (
     DuplicatePolicy,
     ExecutionPolicy,
     IdentityCoercion,
     IdentityRequirement,
-    IdentitySpec,
     OrderSemantics,
-    ReplaySafety,
-    Request,
-    ResultSelector,
     TotalSemantics,
 )
+from b24api.contracts.request import IdentitySpec, ReplaySafety, Request, ResultSelector
+from b24api.execution import Executor, Transport, WireResponse
 from b24api.plans import (
     CountedOffsetPlan,
     KeysetPlan,

@@ -5,14 +5,16 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
-from b24api.models import (
+from b24api.contracts.policy import (
     DuplicatePolicy,
     IdentityCoercion,
     IdentityRequirement,
     OrderSemantics,
+    TotalSemantics,
+)
+from b24api.contracts.request import (
     ParameterPath,
     ResultSelector,
-    TotalSemantics,
 )
 
 PORTAL_BATCH_CAP = 50

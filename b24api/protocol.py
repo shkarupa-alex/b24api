@@ -3,8 +3,9 @@
 from __future__ import annotations
 import json
 from collections.abc import Collection, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from b24api.contracts.response import ResponseEvidence
 from b24api.error import (
     ApiResponseError,
     B24ApiError,
@@ -12,8 +13,10 @@ from b24api.error import (
     HTTPGatewayError,
     ProtocolError,
 )
-from b24api.models import RequestSummary, ResponseEvidence
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
+
+if TYPE_CHECKING:
+    from b24api.contracts.request import RequestSummary
 
 _SAFE_HEADER_NAMES = frozenset(
     {

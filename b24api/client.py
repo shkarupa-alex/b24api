@@ -36,6 +36,7 @@ from b24api.contracts import (
     TraversalAssurance,
     TraversalSpec,
 )
+from b24api.contracts.policy import DuplicatePolicy, IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.error import BatchFailed, InputSourceError
 from b24api.execution import Executor, HttpxTransport, Transport
 from b24api.fanout_v2 import (
@@ -48,7 +49,6 @@ from b24api.fanout_v2 import (
     _FanOutMapper,
     kernel_fanout_stream,
 )
-from b24api.models import DuplicatePolicy, IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.plans import (
     CountedOffsetPlan,
     CursorTerminalRule,

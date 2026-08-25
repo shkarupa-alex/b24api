@@ -5,7 +5,40 @@ import math
 from dataclasses import dataclass
 from enum import StrEnum
 
-from b24api.models import Violation, ViolationSeverity
+from b24api.redaction import DEFAULT_REDACTOR
+
+VIOLATION_CODE_MAXIMUM = 100
+VIOLATION_MESSAGE_MAXIMUM = 500
+
+
+class ViolationSeverity(StrEnum):
+    """Whether a bounded report violation blocks completion."""
+
+    WARNING = "warning"
+    BLOCKING = "blocking"
+
+
+@dataclass(frozen=True, slots=True)
+class Violation:
+    """Typed bounded report violation."""
+
+    severity: ViolationSeverity
+    code: str
+    message: str
+    field: str | None = None
+
+    def __post_init__(self) -> None:
+        """Redact and validate bounded diagnostic text."""
+        if not isinstance(self.severity, ViolationSeverity):
+            raise TypeError("severity must be a ViolationSeverity")
+        object.__setattr__(self, "code", DEFAULT_REDACTOR.redact_text(self.code))
+        object.__setattr__(self, "message", DEFAULT_REDACTOR.redact_text(self.message))
+        if self.field is not None:
+            object.__setattr__(self, "field", DEFAULT_REDACTOR.redact_text(self.field))
+        if not self.code or len(self.code) > VIOLATION_CODE_MAXIMUM:
+            raise ValueError("violation code must be 1..100 characters")
+        if not self.message or len(self.message) > VIOLATION_MESSAGE_MAXIMUM:
+            raise ValueError("violation message must be 1..500 characters")
 
 
 class TerminalState(StrEnum):
@@ -101,4 +134,4 @@ class OperationReport:
         return not self.exhausted
 
 
-__all__ = ["OperationReport", "TerminalState", "TraversalAssurance"]
+__all__ = ["OperationReport", "TerminalState", "TraversalAssurance", "Violation", "ViolationSeverity"]

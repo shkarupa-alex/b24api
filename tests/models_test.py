@@ -5,31 +5,23 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from b24api.error import BudgetExceededError
-from b24api.models import (
-    BatchFailure,
+from b24api.batch.outcome import BatchFailure
+from b24api.contracts.json import JsonValue
+from b24api.contracts.policy import (
     BudgetCounters,
     CompletionAssurance,
     ExecutionPolicy,
     IdentityCoercion,
-    IdentitySpec,
-    JsonValue,
-    OperationReport,
-    ParameterPath,
-    ReferenceFailure,
-    ReferenceItem,
-    ReferenceRequest,
+    KernelState,
     ReplayDisposition,
-    ReplaySafety,
-    Request,
-    Response,
-    ResultSelector,
     SnapshotState,
-    TerminalState,
-    Violation,
-    ViolationSeverity,
-    inject_controls,
 )
+from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request, ResultSelector
+from b24api.contracts.response import Response, inject_controls
+from b24api.error import BudgetExceededError
+from b24api.execution.snapshot import KernelReport
+from b24api.references.outcome import ReferenceFailure, ReferenceItem, ReferenceRequest
 
 EXAMPLE_CREDENTIAL = "n1x2y3z4q5w6e7r8"
 TEST_LIMIT = 2
@@ -201,8 +193,8 @@ def test_budget_counters_count_attempts_pages_references_and_buffers_before_sche
 
 
 def test_report_is_frozen_and_completion_rejects_blocking_violation() -> None:
-    report = OperationReport(
-        state=TerminalState.COMPLETED,
+    report = KernelReport(
+        state=KernelState.COMPLETED,
         assurance=CompletionAssurance.CALLER_ASSERTED,
         snapshot=SnapshotState.UNVERIFIED,
         emitted_rows=1,
@@ -211,10 +203,10 @@ def test_report_is_frozen_and_completion_rejects_blocking_violation() -> None:
 
     assert report.completed is True
     with pytest.raises(FrozenInstanceError):
-        report.state = TerminalState.FAILED  # type: ignore[misc]
+        report.state = KernelState.FAILED  # type: ignore[misc]
     with pytest.raises(ValueError, match="blocking"):
-        OperationReport(
-            state=TerminalState.COMPLETED,
+        KernelReport(
+            state=KernelState.COMPLETED,
             violations=(
                 Violation(
                     severity=ViolationSeverity.BLOCKING,

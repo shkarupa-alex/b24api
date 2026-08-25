@@ -4,25 +4,14 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, cast
 
+from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.contracts.request import IdentitySpec, ReplaySafety, Request, ResultSelector
 from b24api.error import BudgetExceededError
 from b24api.execution import (
     AsyncIteratorController,
     Executor,
     await_cleanup_resistant,
     rearm_cancellation,
-)
-from b24api.models import (
-    ExecutionPolicy,
-    IdentitySpec,
-    ReferenceFailure,
-    ReferenceItem,
-    ReferenceRequest,
-    ReplaySafety,
-    Request,
-    Response,
-    ResultSelector,
-    Violation,
-    ViolationSeverity,
 )
 from b24api.plans import (
     DirectDispatch,
@@ -48,6 +37,11 @@ from b24api.references.dispatch import (
     _RowBuffer,
     _Work,
 )
+from b24api.references.outcome import (
+    ReferenceFailure,
+    ReferenceItem,
+    ReferenceRequest,
+)
 from b24api.references.support import (
     _active_limit,
     _finish_task,
@@ -61,6 +55,9 @@ from b24api.traversal import PaginationDriver
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
+
+    from b24api.contracts.policy import ExecutionPolicy
+    from b24api.contracts.response import Response
 
 type _PageDispatcher = _DirectPageDispatcher | _BatchPageDispatcher
 

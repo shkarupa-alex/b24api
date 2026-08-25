@@ -9,22 +9,24 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from b24api.batch import BatchExecutor, _BatchOutcomeStream
-from b24api.error import BatchCommandError, BudgetExceededError, FailurePhase, ProtocolError, TransportError
-from b24api.execution import ExecutionContext, Executor, WireResponse
-from b24api.models import (
+from b24api.batch.engine import BatchExecutor
+from b24api.batch.outcome import (
     BatchFailure,
     BatchOutcome,
     BatchSuccess,
+)
+from b24api.batch.stream import _BatchOutcomeStream
+from b24api.contracts.policy import (
     ConsistencyPolicy,
     ExecutionPolicy,
+    KernelState,
     ReplayDisposition,
-    ReplaySafety,
-    Request,
     SnapshotRequirement,
     SnapshotState,
-    TerminalState,
 )
+from b24api.contracts.request import ReplaySafety, Request
+from b24api.error import BatchCommandError, BudgetExceededError, FailurePhase, ProtocolError, TransportError
+from b24api.execution import ExecutionContext, Executor, WireResponse
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterator
@@ -116,7 +118,7 @@ async def test_async_unlimited_input_pulls_only_one_bounded_chunk_before_first_y
     assert pulled == TEST_BATCH_SIZE
     assert transport.requests[0].copy_parameters()["halt"] == 0
     await stream.aclose()
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is KernelState.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -139,7 +141,7 @@ async def test_batch_outcomes_obey_decoded_row_buffer_ceiling() -> None:
     remaining = [item async for item in stream]
     assert len(remaining) == MIXED_COMMAND_COUNT - 1
     assert len(transport.requests) == MIXED_COMMAND_COUNT
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
     assert stream.report.buffered_rows_high_water == 1
 
 
@@ -166,7 +168,7 @@ async def test_batch_list_result_uses_nested_decoded_row_weight() -> None:
     with pytest.raises(BudgetExceededError, match="buffer") as captured:
         await anext(rejected)
     assert captured.value.__dict__["report"] is rejected.report
-    assert rejected.report.state is TerminalState.FAILED
+    assert rejected.report.state is KernelState.FAILED
     assert rejected.report.emitted_rows == 0
     assert rejected.report.buffered_rows_high_water == 0
 
@@ -192,7 +194,7 @@ async def test_context_entry_starts_batch_execution_without_counting_prefetch_as
     async with stream:
         assert len(transport.requests) == 1
 
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is KernelState.CANCELLED
     assert stream.report.emitted_rows == 0
 
 
@@ -212,7 +214,7 @@ async def test_batch_source_cleanup_error_carries_same_report() -> None:
         await stream.aclose()
 
     assert captured.value.__dict__["report"] is stream.report
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
     assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
 
 
@@ -286,7 +288,7 @@ async def test_async_batch_input_pull_obeys_operation_elapsed_budget() -> None:
         await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
 
     assert captured.value.__dict__["report"] is stream.report
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -416,7 +418,7 @@ async def test_partial_kernel_chunk_is_not_dispatched_before_source_error() -> N
     assert outcomes == []
     assert transport.requests == []
     assert stream.report.emitted_rows == 0
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -468,7 +470,7 @@ async def test_batch_iteration_cancellation_propagates_source_cleanup_error() ->
 
     await task
     assert observed == [("batch close boom", 1), ("external-caller", 1)]
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
     assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
 
 
@@ -476,7 +478,7 @@ async def test_batch_iteration_cancellation_propagates_source_cleanup_error() ->
 async def test_batch_snapshot_policy_controls_terminal_state() -> None:
     default_stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes([Request("profile")])
     assert len([item async for item in default_stream]) == 1
-    assert default_stream.report.state is TerminalState.COMPLETED
+    assert default_stream.report.state is KernelState.COMPLETED
     assert default_stream.report.snapshot is SnapshotState.NOT_REQUESTED
 
     stable_policy = ExecutionPolicy(
@@ -487,7 +489,7 @@ async def test_batch_snapshot_policy_controls_terminal_state() -> None:
         policy=stable_policy,
     )
     assert len([item async for item in stable_stream]) == 1
-    assert stable_stream.report.state is TerminalState.INCOMPLETE
+    assert stable_stream.report.state is KernelState.INCOMPLETE
     assert stable_stream.report.snapshot is SnapshotState.UNVERIFIED
     assert [violation.code for violation in stable_stream.report.violations] == ["snapshot_unverified"]
 
@@ -511,7 +513,7 @@ async def test_batch_cancellation_carries_same_terminal_report() -> None:
         await task
 
     assert captured.value.__dict__["report"] is stream.report
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is KernelState.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -551,7 +553,7 @@ async def test_shared_batch_page_reservations_roll_back_when_admission_is_cancel
         await task
 
     assert captured.value.__dict__["report"] is stream.report
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is KernelState.CANCELLED
     assert context._page_reservations == {}
 
 
@@ -578,7 +580,7 @@ async def test_repeated_batch_cancellation_still_carries_final_report() -> None:
         await task
 
     assert captured.value.__dict__["report"] is stream.report
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is KernelState.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -627,7 +629,7 @@ async def test_batch_cancellation_during_failed_finalization_preserves_failure_r
     assert "batch source failed" in str(primary[0])
     assert primary[0].__dict__["report"] is stream.report
     assert post_failure_executed is False
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -722,7 +724,7 @@ async def test_chunk_transport_failure_synthesizes_every_unresolved_outcome() ->
     assert len(outcomes) == TEST_BATCH_SIZE
     assert all(isinstance(outcome, BatchFailure) for outcome in outcomes)
     assert [outcome.command_index for outcome in outcomes] == list(range(TEST_BATCH_SIZE))
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -742,7 +744,7 @@ async def test_overflowed_batch_result_becomes_totally_correlated_protocol_failu
     assert isinstance(outcomes[0].error, ProtocolError)
     assert outcomes[0].error.http_status == HTTP_OK
     assert outcomes[0].command_index == 0
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
 
 
 @pytest.mark.asyncio

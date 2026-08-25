@@ -8,6 +8,8 @@ from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterab
 from typing import Protocol, Self, cast, runtime_checkable
 
 from b24api.batch.engine import BatchExecutor, BatchInput, BatchSource
+from b24api.batch.outcome import BatchFailure as KernelFailure
+from b24api.batch.outcome import BatchSuccess as KernelSuccess
 from b24api.batch.stream import _iterate_source, _next_chunk
 from b24api.contracts.command import (
     Command,
@@ -18,6 +20,13 @@ from b24api.contracts.command import (
     CommandSuccess,
     NotExecutedReason,
 )
+from b24api.contracts.policy import (
+    CompletionAssurance,
+    ExecutionPolicy,
+    KernelState,
+    SnapshotRequirement,
+    SnapshotState,
+)
 from b24api.error import AmbiguousExecutionError, B24ApiError, BatchCommandError, InputSourceError, ProtocolError
 from b24api.execution import (
     AsyncIteratorController,
@@ -26,20 +35,7 @@ from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
 )
-from b24api.models import (
-    BatchFailure as KernelFailure,
-)
-from b24api.models import (
-    BatchSuccess as KernelSuccess,
-)
-from b24api.models import (
-    CompletionAssurance,
-    ExecutionPolicy,
-    OperationReport,
-    SnapshotRequirement,
-    SnapshotState,
-    TerminalState,
-)
+from b24api.execution.snapshot import KernelReport
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
 
@@ -173,7 +169,7 @@ class LogicalBatchKernelStream[C]:
         self._batch_requests = 0
         self._batch_commands = 0
         self.buffered_commands_high_water = 0
-        self.report = OperationReport()
+        self.report = KernelReport()
 
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
@@ -195,8 +191,8 @@ class LogicalBatchKernelStream[C]:
         if self._runner is not None and hasattr(self._runner, "aclose"):
             await cast("_AsyncClosable", self._runner).aclose()
         await self._close_controller()
-        if self.report.state is TerminalState.NOT_STARTED:
-            await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
+        if self.report.state is KernelState.NOT_STARTED:
+            await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
 
     async def _run(self) -> AsyncGenerator[CommandOutcome[object]]:  # noqa: C901
         await self._context.start()
@@ -273,11 +269,11 @@ class LogicalBatchKernelStream[C]:
                     self._emitted += 1
                     yield batch_outcome
                 await self._context.set_buffered_rows(0)
-            await self._finalize(TerminalState.COMPLETED, "input exhausted")
+            await self._finalize(KernelState.COMPLETED, "input exhausted")
         except asyncio.CancelledError as error:
             primary_error = error
             repeated = await await_cancellation_resistant(
-                self._finalize(TerminalState.CANCELLED, "iteration cancelled"),
+                self._finalize(KernelState.CANCELLED, "iteration cancelled"),
             )
             if repeated is not None:
                 pending_cancellation = repeated
@@ -285,7 +281,7 @@ class LogicalBatchKernelStream[C]:
         except BaseException as error:
             primary_error = error
             pending_cancellation = await await_cancellation_resistant(
-                self._finalize(TerminalState.FAILED, type(error).__name__),
+                self._finalize(KernelState.FAILED, type(error).__name__),
             )
             raise
         finally:
@@ -293,7 +289,7 @@ class LogicalBatchKernelStream[C]:
             cleanup = await await_cleanup_resistant(self._close_controller())
             if cleanup.error is not None:
                 if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                    await self._finalize(TerminalState.FAILED, "batch source cleanup failed")
+                    await self._finalize(KernelState.FAILED, "batch source cleanup failed")
                     rearm_cancellation(cleanup.cancellation)
                     raise cleanup.error
                 primary_error.add_note(f"batch source cleanup also failed ({type(cleanup.error).__name__})")
@@ -312,8 +308,8 @@ class LogicalBatchKernelStream[C]:
         await controller.aclose(remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed))
         self._controller = None
 
-    async def _finalize(self, state: TerminalState, reason: str) -> None:
-        if self.report.state is not TerminalState.NOT_STARTED:
+    async def _finalize(self, state: KernelState, reason: str) -> None:
+        if self.report.state is not KernelState.NOT_STARTED:
             return
         snapshot = await self._context.snapshot()
         snapshot_state = (
@@ -321,10 +317,10 @@ class LogicalBatchKernelStream[C]:
             if self._context.policy.consistency.snapshot_requirement is SnapshotRequirement.TRAVERSAL_ONLY
             else SnapshotState.UNVERIFIED
         )
-        if state is TerminalState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
-            state = TerminalState.INCOMPLETE
+        if state is KernelState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
+            state = KernelState.INCOMPLETE
             reason = "required snapshot was not verified"
-        self.report = OperationReport(
+        self.report = KernelReport(
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
             snapshot=snapshot_state,

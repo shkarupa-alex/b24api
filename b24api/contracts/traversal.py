@@ -4,7 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from b24api.models import IdentityCoercion, IdentitySpec, ParameterPath, ResultSelector
+from b24api.contracts.policy import IdentityCoercion
+from b24api.contracts.request import IdentitySpec, ParameterPath, ResultSelector
 
 _START = ParameterPath(("start",))
 _FILTER = ParameterPath(("filter",))

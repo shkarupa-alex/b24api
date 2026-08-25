@@ -5,30 +5,28 @@ import asyncio
 import contextlib
 from typing import TYPE_CHECKING, Self
 
-from b24api.error import CapabilityError, IncompleteTraversalError
-from b24api.models import (
+from b24api.contracts.policy import (
     CompletionAssurance,
     ExecutionPolicy,
-    IdentitySpec,
-    JsonValue,
-    OperationReport,
-    Request,
-    ResponseEvidence,
-    ResultSelector,
+    KernelState,
     SnapshotRequirement,
     SnapshotState,
-    TerminalState,
 )
+from b24api.error import CapabilityError, IncompleteTraversalError
+from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from b24api.contracts.json import JsonValue
+    from b24api.contracts.request import IdentitySpec, Request, ResultSelector
+    from b24api.contracts.response import ResponseEvidence
     from b24api.execution import Executor
     from b24api.plans import CountedOffsetPlan
 
 
-def _attach_report(error: BaseException, report: OperationReport) -> None:
+def _attach_report(error: BaseException, report: KernelReport) -> None:
     with contextlib.suppress(AttributeError, TypeError):
         error.report = report  # type: ignore[attr-defined]
 
@@ -66,7 +64,7 @@ class CountedItemStream:
         self._emitted = 0
         self._unique = 0
         self._evidence: list[ResponseEvidence] = []
-        self.report = OperationReport()
+        self.report = KernelReport()
 
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
@@ -87,8 +85,8 @@ class CountedItemStream:
         self._closed = True
         if self._runner is not None:
             await self._runner.aclose()
-        if self.report.state is TerminalState.NOT_STARTED:
-            await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
+        if self.report.state is KernelState.NOT_STARTED:
+            await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
 
     async def _run(self) -> AsyncGenerator[JsonValue]:
         primary: BaseException | None = None
@@ -102,34 +100,34 @@ class CountedItemStream:
                     self._emitted += 1
                     self._unique += int(is_unique)
                     yield item
-            await self._finalize(TerminalState.COMPLETED, "counted traversal completed exactly")
+            await self._finalize(KernelState.COMPLETED, "counted traversal completed exactly")
         except asyncio.CancelledError as error:
             primary = error
-            await self._finalize(TerminalState.CANCELLED, "iteration cancelled")
+            await self._finalize(KernelState.CANCELLED, "iteration cancelled")
             _attach_report(error, self.report)
             raise
         except GeneratorExit as error:
             primary = error
-            await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
+            await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
             raise
         except BaseException as error:
             primary = error
             snapshot = await self._context.snapshot()
             if isinstance(error, CapabilityError) and snapshot.counters.physical_requests == 0:
-                await self._finalize(TerminalState.FAILED, type(error).__name__)
+                await self._finalize(KernelState.FAILED, type(error).__name__)
                 _attach_report(error, self.report)
                 raise
-            await self._finalize(TerminalState.INCOMPLETE, type(error).__name__)
+            await self._finalize(KernelState.INCOMPLETE, type(error).__name__)
             incomplete = IncompleteTraversalError(report=self.report)
             incomplete.__cause__ = error
             raise incomplete from error
         finally:
             self._closed = True
-            if primary is not None and self.report.state is TerminalState.NOT_STARTED:
-                await self._finalize(TerminalState.FAILED, type(primary).__name__)
+            if primary is not None and self.report.state is KernelState.NOT_STARTED:
+                await self._finalize(KernelState.FAILED, type(primary).__name__)
 
-    async def _finalize(self, state: TerminalState, reason: str) -> None:
-        if self.report.state is not TerminalState.NOT_STARTED:
+    async def _finalize(self, state: KernelState, reason: str) -> None:
+        if self.report.state is not KernelState.NOT_STARTED:
             return
         snapshot = await self._context.snapshot()
         batch = self._driver.batch_report
@@ -138,10 +136,10 @@ class CountedItemStream:
             if self._context.policy.consistency.snapshot_requirement is SnapshotRequirement.TRAVERSAL_ONLY
             else SnapshotState.UNVERIFIED
         )
-        if state is TerminalState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
-            state = TerminalState.INCOMPLETE
+        if state is KernelState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
+            state = KernelState.INCOMPLETE
             reason = "required snapshot was not verified"
-        self.report = OperationReport(
+        self.report = KernelReport(
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
             snapshot=snapshot_state,

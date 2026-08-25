@@ -23,11 +23,9 @@ from b24api.references.dispatch import (
 )
 
 if TYPE_CHECKING:
-    from b24api.models import (
-        ExecutionPolicy,
-        OperationReport,
-        ReferenceRequest,
-    )
+    from b24api.contracts.policy import ExecutionPolicy
+    from b24api.execution.snapshot import KernelReport
+    from b24api.references.outcome import ReferenceRequest
 
 
 @runtime_checkable
@@ -188,6 +186,6 @@ def _active_limit(order: ReferenceOutputOrder, policy: ExecutionPolicy, page_cap
     return min(policy.max_active_references, buffer_bound)
 
 
-def _attach_report(error: BaseException, report: OperationReport) -> None:
+def _attach_report(error: BaseException, report: KernelReport) -> None:
     with contextlib.suppress(AttributeError, TypeError):
         error.report = report  # type: ignore[attr-defined]

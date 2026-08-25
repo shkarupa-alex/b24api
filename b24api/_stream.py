@@ -5,13 +5,15 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import replace
-from typing import Protocol, Self, cast
+from typing import TYPE_CHECKING, Protocol, Self, cast
 
+from b24api.contracts.policy import KernelState
 from b24api.contracts.report import OperationReport, TerminalState, TraversalAssurance
 from b24api.contracts.stream import PartialResult
 from b24api.error import IncompleteTraversalError
-from b24api.models import OperationReport as KernelReport
-from b24api.models import TerminalState as KernelTerminalState
+
+if TYPE_CHECKING:
+    from b24api.execution.snapshot import KernelReport
 
 type Mapper[S, T] = Callable[[S], T | Awaitable[T]]
 
@@ -24,12 +26,12 @@ class _ClosableIterator[T](AsyncIterator[T], Protocol):
         ...
 
 
-def _terminal_state(state: KernelTerminalState, *, failures: int) -> TerminalState:
-    if state is KernelTerminalState.COMPLETED:
+def _terminal_state(state: KernelState, *, failures: int) -> TerminalState:
+    if state is KernelState.COMPLETED:
         return TerminalState.COMPLETED_WITH_FAILURES if failures else TerminalState.COMPLETED
-    if state is KernelTerminalState.INCOMPLETE:
+    if state is KernelState.INCOMPLETE:
         return TerminalState.INCOMPLETE
-    if state is KernelTerminalState.CANCELLED:
+    if state is KernelState.CANCELLED:
         return TerminalState.CANCELLED
     return TerminalState.FAILED
 

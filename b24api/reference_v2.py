@@ -5,9 +5,16 @@
 from __future__ import annotations
 from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass
-from typing import Literal, Protocol, Self, cast, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, Self, cast, runtime_checkable
 
 from b24api.contracts.dispatch import DeliveryOrder, DirectDispatch, DispatchSpec
+from b24api.contracts.policy import (
+    DuplicatePolicy,
+    ExecutionPolicy,
+    IdentityRequirement,
+    OrderSemantics,
+    TotalSemantics,
+)
 from b24api.contracts.reference import (
     Binding,
     ReferenceComplete,
@@ -17,6 +24,12 @@ from b24api.contracts.reference import (
     ReferenceOutcome,
     ReferenceOutcomeUnknown,
 )
+from b24api.contracts.request import (
+    IdentitySpec,
+    ParameterPath,
+    Request,
+    ResultSelector,
+)
 from b24api.contracts.traversal import (
     CountedTraversal,
     KeysetTraversal,
@@ -24,26 +37,6 @@ from b24api.contracts.traversal import (
     TraversalSpec,
 )
 from b24api.error import AmbiguousExecutionError, B24ApiError, CapabilityError, InputSourceError, ReferenceFailed
-from b24api.models import (
-    DuplicatePolicy,
-    ExecutionPolicy,
-    IdentityRequirement,
-    IdentitySpec,
-    JsonValue,
-    OperationReport,
-    OrderSemantics,
-    ParameterPath,
-    ReferenceRequest,
-    Request,
-    ResultSelector,
-    TotalSemantics,
-)
-from b24api.models import (
-    ReferenceFailure as KernelFailure,
-)
-from b24api.models import (
-    ReferenceItem as KernelItem,
-)
 from b24api.plans import (
     BatchDispatch as KernelBatchDispatch,
 )
@@ -63,13 +56,20 @@ from b24api.plans import (
 from b24api.plans import (
     DirectDispatch as KernelDirectDispatch,
 )
-from b24api.references import (
+from b24api.references.dispatch import (
     _KernelReferenceComplete,
     _ReferenceWindowError,
 )
-from b24api.references import (
+from b24api.references.outcome import ReferenceFailure as KernelFailure
+from b24api.references.outcome import ReferenceItem as KernelItem
+from b24api.references.outcome import ReferenceRequest
+from b24api.references.stream import (
     iter_references as _iter_references,
 )
+
+if TYPE_CHECKING:
+    from b24api.contracts.json import JsonValue
+    from b24api.execution.snapshot import KernelReport
 
 type BindingSource[C] = Iterable[Binding[C]] | AsyncIterable[Binding[C]]
 type KernelReferenceEvent = KernelItem | KernelFailure | _KernelReferenceComplete
@@ -78,7 +78,7 @@ type KernelReferenceEvent = KernelItem | KernelFailure | _KernelReferenceComplet
 class ReferenceKernelStream(AsyncIterator[KernelReferenceEvent], Protocol):
     """Narrow structural view of the reference scheduler output."""
 
-    report: OperationReport
+    report: KernelReport
     active_references_high_water: int
 
     async def aclose(self) -> None:

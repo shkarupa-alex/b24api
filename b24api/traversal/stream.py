@@ -8,30 +8,27 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
 from typing import TYPE_CHECKING, Self, cast
 
+from b24api.contracts.json import JsonValue
+from b24api.contracts.policy import (
+    CompletionAssurance,
+    ExecutionPolicy,
+    KernelState,
+    SnapshotRequirement,
+    SnapshotState,
+)
+from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.execution import (
     Executor,
     await_cancellation_resistant,
     await_cleanup_resistant,
     rearm_cancellation,
 )
-from b24api.models import (
-    CompletionAssurance,
-    ExecutionPolicy,
-    IdentitySpec,
-    JsonValue,
-    OperationReport,
-    Request,
-    ResultSelector,
-    SnapshotRequirement,
-    SnapshotState,
-    TerminalState,
-    Violation,
-    ViolationSeverity,
-)
+from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
 from b24api.traversal.identity import _MISSING, _attach_report, _Page
 
 if TYPE_CHECKING:
+    from b24api.contracts.request import IdentitySpec, Request, ResultSelector
     from b24api.plans import (
         ListPlan,
     )
@@ -70,7 +67,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         self._closed = False
         self._emitted = 0
         self._unique_emitted = 0
-        self.report = OperationReport(assurance=assurance)
+        self.report = KernelReport(assurance=assurance)
 
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
@@ -119,9 +116,9 @@ class ItemStream(AsyncIterator[JsonValue]):
             if self._runner is not None:
                 await self._runner.aclose()
         except BaseException as error:
-            if self.report.state is TerminalState.NOT_STARTED:
+            if self.report.state is KernelState.NOT_STARTED:
                 cancellation = await await_cancellation_resistant(
-                    self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
+                    self._finalize(KernelState.CANCELLED, "stream cleanup failed"),
                 )
                 if cancellation is not None:
                     _attach_report(cancellation, self.report)
@@ -130,8 +127,8 @@ class ItemStream(AsyncIterator[JsonValue]):
             raise
         finally:
             self._prefetched = _MISSING
-        if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
-            await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
+        if self.report.state is KernelState.NOT_STARTED and self._runner is not None:
+            await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
 
     async def _run(self) -> AsyncGenerator[tuple[JsonValue, bool]]:  # noqa: C901, PLR0912, PLR0915
         pages = self._driver.pages()
@@ -148,11 +145,11 @@ class ItemStream(AsyncIterator[JsonValue]):
                     yield item, is_unique
                     await self._context.set_buffered_rows(len(buffered))
             naturally_exhausted = True
-            await self._finalize(TerminalState.COMPLETED, self._driver.terminal_reason or "terminal confirmed")
+            await self._finalize(KernelState.COMPLETED, self._driver.terminal_reason or "terminal confirmed")
         except asyncio.CancelledError as error:
             primary_error = error
             repeated = await await_cancellation_resistant(
-                self._finalize(TerminalState.CANCELLED, "iteration cancelled"),
+                self._finalize(KernelState.CANCELLED, "iteration cancelled"),
             )
             if repeated is not None:
                 primary_error = repeated
@@ -163,7 +160,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         except GeneratorExit as error:
             primary_error = error
             cancellation = await await_cancellation_resistant(
-                self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion"),
+                self._finalize(KernelState.CANCELLED, "stream closed before exhaustion"),
             )
             if cancellation is not None:
                 primary_error = cancellation
@@ -174,7 +171,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         except BaseException as error:
             primary_error = error
             cancellation = await await_cancellation_resistant(
-                self._finalize(TerminalState.FAILED, type(error).__name__),
+                self._finalize(KernelState.FAILED, type(error).__name__),
             )
             if cancellation is not None:
                 _attach_report(cancellation, self.report)
@@ -204,16 +201,16 @@ class ItemStream(AsyncIterator[JsonValue]):
                 raise cleanup.cancellation
             if cleanup.cancellation is not None and preserve_primary:
                 pending_cancellation = cleanup.cancellation
-            if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
-                await self._finalize(TerminalState.CANCELLED, "stream abandoned")
-            if self.report.state is not TerminalState.NOT_STARTED:
+            if not naturally_exhausted and self.report.state is KernelState.NOT_STARTED:
+                await self._finalize(KernelState.CANCELLED, "stream abandoned")
+            if self.report.state is not KernelState.NOT_STARTED:
                 self._closed = True
             if preserve_primary:
                 rearm_cancellation(pending_cancellation)
 
     async def _record_terminal_cleanup_failure(self, error: BaseException) -> None:
-        if self.report.state is TerminalState.NOT_STARTED:
-            await self._finalize(TerminalState.FAILED, "stream cleanup failed")
+        if self.report.state is KernelState.NOT_STARTED:
+            await self._finalize(KernelState.FAILED, "stream cleanup failed")
         violations = self.report.violations
         if not any(violation.code == "cleanup_failure" for violation in violations):
             violations = (
@@ -226,7 +223,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             )
         self.report = replace(
             self.report,
-            state=TerminalState.FAILED,
+            state=KernelState.FAILED,
             terminal_reason="stream cleanup failed",
             violations=violations,
         )
@@ -236,8 +233,8 @@ class ItemStream(AsyncIterator[JsonValue]):
         await pages.aclose()
         await self._context.set_buffered_rows(0)
 
-    async def _finalize(self, state: TerminalState, reason: str) -> None:
-        if self.report.state is not TerminalState.NOT_STARTED:
+    async def _finalize(self, state: KernelState, reason: str) -> None:
+        if self.report.state is not KernelState.NOT_STARTED:
             return
         snapshot = await self._context.snapshot()
         consistency = self._context.policy.consistency
@@ -247,8 +244,8 @@ class ItemStream(AsyncIterator[JsonValue]):
             else SnapshotState.UNVERIFIED
         )
         violations = tuple(self._driver.violations)
-        if state is TerminalState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
-            state = TerminalState.INCOMPLETE
+        if state is KernelState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
+            state = KernelState.INCOMPLETE
             reason = "required snapshot was not verified"
             violations = (
                 *violations,
@@ -258,7 +255,7 @@ class ItemStream(AsyncIterator[JsonValue]):
                     message="the requested stable snapshot was not verified",
                 ),
             )
-        self.report = OperationReport(
+        self.report = KernelReport(
             state=state,
             assurance=self._assurance,
             snapshot=snapshot_state,

@@ -11,6 +11,11 @@ from b24api.contracts.command import (
     partition_command_outcomes,
 )
 from b24api.contracts.dispatch import BatchDispatch, DeliveryOrder, DirectDispatch, DispatchSpec
+from b24api.contracts.json import JsonScalar, JsonValue
+from b24api.contracts.policy import (
+    ExecutionPolicy,
+    IdentityCoercion,
+)
 from b24api.contracts.reference import (
     Binding,
     ParameterUpdate,
@@ -23,8 +28,16 @@ from b24api.contracts.reference import (
     ReferenceOutcomeUnknown,
     partition_reference_outcomes,
 )
-from b24api.contracts.report import OperationReport, TerminalState, TraversalAssurance
-from b24api.contracts.response import ResultCollectionShape
+from b24api.contracts.report import OperationReport, TerminalState, TraversalAssurance, Violation, ViolationSeverity
+from b24api.contracts.request import (
+    IdentitySpec,
+    ParameterPath,
+    ReplaySafety,
+    Request,
+    RequestSummary,
+    ResultSelector,
+)
+from b24api.contracts.response import Response, ResultCollectionShape
 from b24api.contracts.stream import OperationStream, PartialResult
 from b24api.contracts.traversal import (
     CountedTraversal,
@@ -35,21 +48,6 @@ from b24api.contracts.traversal import (
     OffsetSpec,
     SequentialTraversal,
     TraversalSpec,
-)
-from b24api.models import (
-    ExecutionPolicy,
-    IdentityCoercion,
-    IdentitySpec,
-    JsonScalar,
-    JsonValue,
-    ParameterPath,
-    ReplaySafety,
-    Request,
-    RequestSummary,
-    Response,
-    ResultSelector,
-    Violation,
-    ViolationSeverity,
 )
 
 __all__ = [

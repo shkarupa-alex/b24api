@@ -22,9 +22,7 @@ from b24api.transport.base import _HTTP_STATUS_MAXIMUM, _HTTP_STATUS_MINIMUM, Wi
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
-    from b24api.models import (
-        Request,
-    )
+    from b24api.contracts.request import Request
 
 
 def _webhook_vault() -> tuple[Callable[[str], str], Callable[[str], str], Callable[[str], None]]:

@@ -7,26 +7,26 @@ from collections.abc import AsyncIterable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from b24api.batch import BatchExecutor
+from b24api.batch.engine import BatchExecutor
+from b24api.batch.outcome import BatchFailure
+from b24api.contracts.policy import ReplayDisposition
 from b24api.error import BudgetExceededError, CapabilityError
 from b24api.execution import (
     ExecutionContext,
     Executor,
     WorkClass,
 )
-from b24api.models import (
-    BatchFailure,
-    JsonValue,
+from b24api.references.outcome import (
     ReferenceFailure,
     ReferenceItem,
     ReferenceRequest,
-    ReplayDisposition,
-    Request,
-    Response,
-    Violation,
 )
 
 if TYPE_CHECKING:
+    from b24api.contracts.json import JsonValue
+    from b24api.contracts.report import Violation
+    from b24api.contracts.request import Request
+    from b24api.contracts.response import Response
     from b24api.plans import (
         BatchDispatch,
         DirectDispatch,

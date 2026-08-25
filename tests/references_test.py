@@ -10,6 +10,20 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from b24api.contracts.policy import (
+    ConsistencyPolicy,
+    DuplicatePolicy,
+    ExecutionPolicy,
+    IdentityCoercion,
+    IdentityRequirement,
+    KernelState,
+    RetryPolicy,
+    SnapshotRequirement,
+    SnapshotState,
+    TotalSemantics,
+)
+from b24api.contracts.report import ViolationSeverity
+from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request
 from b24api.error import (
     ApiResponseError,
     BudgetExceededError,
@@ -20,26 +34,6 @@ from b24api.error import (
     TransportError,
 )
 from b24api.execution import ExecutionContext, Executor, WireResponse
-from b24api.models import (
-    ConsistencyPolicy,
-    DuplicatePolicy,
-    ExecutionPolicy,
-    IdentityCoercion,
-    IdentityRequirement,
-    IdentitySpec,
-    ParameterPath,
-    ReferenceFailure,
-    ReferenceItem,
-    ReferenceRequest,
-    ReplaySafety,
-    Request,
-    RetryPolicy,
-    SnapshotRequirement,
-    SnapshotState,
-    TerminalState,
-    TotalSemantics,
-    ViolationSeverity,
-)
 from b24api.plans import (
     BatchDispatch,
     CountedOffsetMode,
@@ -53,7 +47,8 @@ from b24api.plans import (
     ReferenceOutputOrder,
     SingleResponsePlan,
 )
-from b24api.references import fan_out, iter_references
+from b24api.references.outcome import ReferenceFailure, ReferenceItem, ReferenceRequest
+from b24api.references.stream import fan_out, iter_references
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterator
@@ -174,7 +169,7 @@ async def test_ready_order_interleaves_references_by_actual_completion() -> None
     assert (await anext(stream)).reference_key == "first"
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -294,7 +289,7 @@ async def test_invalid_reference_contract_refuses_even_empty_input(
         await anext(stream)
 
     assert captured.value.__dict__["report"] is stream.report
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
     assert transport.requests == []
 
 
@@ -337,7 +332,7 @@ async def test_composite_reference_identity_refuses_before_source_pull_or_io(
         await anext(stream)
 
     assert captured.value.__dict__["report"] is stream.report
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
     assert not pulled.is_set()
     assert transport.requests == []
 
@@ -471,7 +466,7 @@ async def test_fan_out_accepts_list_result_whose_total_matches_list_length() -> 
     assert len(outcomes) == 1
     assert isinstance(outcomes[0], ReferenceItem)
     assert outcomes[0].item == [{"ID": 1}, {"ID": 2}]
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -507,7 +502,7 @@ async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
     assert len(transport.requests) == 1
     assert transport.requests[0].replay_safety is ReplaySafety.UNKNOWN
     assert stream.report.retries == 0
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -534,7 +529,7 @@ async def test_batch_fan_out_accepts_list_result_whose_total_matches_list_length
     assert len(outcomes) == 1
     assert isinstance(outcomes[0], ReferenceItem)
     assert outcomes[0].item == [{"ID": 1}, {"ID": 2}]
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -566,7 +561,7 @@ async def test_fan_out_list_result_obeys_decoded_row_buffer(dispatch: DispatchPl
         await anext(stream)
 
     assert captured.value.__dict__["report"] is stream.report
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
     assert stream.report.emitted_rows == 0
     assert stream.report.buffered_rows_high_water == 0
 
@@ -639,7 +634,7 @@ async def test_tolerant_reference_failure_preserves_total_correlation() -> None:
     assert {outcome.reference_key for outcome in outcomes} == {"bad", "good"}
     failure = next(outcome for outcome in outcomes if isinstance(outcome, ReferenceFailure))
     assert isinstance(failure.error, ApiResponseError)
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
     assert [violation.code for violation in stream.report.violations] == ["reference_failure"]
 
 
@@ -703,7 +698,7 @@ async def test_fail_fast_reference_error_carries_same_terminal_report() -> None:
     with pytest.raises(ApiResponseError) as captured:
         await anext(stream)
 
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
     assert captured.value.__dict__["report"] is stream.report
 
 
@@ -738,7 +733,7 @@ async def test_async_input_admission_is_bounded_and_closed_on_early_exit() -> No
     assert produced <= TWO_REFERENCES
     await stream.aclose()
     assert source_closed.is_set()
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is KernelState.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -781,7 +776,7 @@ async def test_async_reference_input_pull_obeys_operation_elapsed_budget() -> No
         await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
 
     assert captured.value.__dict__["report"] is stream.report
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -925,7 +920,7 @@ async def test_reference_source_failure_drains_all_admitted_outcomes(
     assert captured.value.__dict__["report"] is stream.report
     assert sorted(outcome.reference_key for outcome in outcomes) == ["a", "b"]
     assert len(transport.requests) == TWO_REFERENCES
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -1028,7 +1023,7 @@ async def test_required_reference_snapshot_finishes_incomplete() -> None:
     )
 
     assert len(await _collect(stream)) == 1
-    assert stream.report.state is TerminalState.INCOMPLETE
+    assert stream.report.state is KernelState.INCOMPLETE
     assert stream.report.snapshot is SnapshotState.UNVERIFIED
     assert [violation.code for violation in stream.report.violations] == ["snapshot_unverified"]
 
@@ -1052,7 +1047,7 @@ async def test_duplicate_public_reference_keys_keep_independent_page_budgets() -
 
     outcomes = [outcome async for outcome in stream]
     assert len(outcomes) == TWO_REFERENCES
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is KernelState.COMPLETED
     assert stream._scheduler.buffer._reservations == []  # noqa: SLF001
 
 
@@ -1145,7 +1140,7 @@ async def test_reference_task_cancellation_closes_transport_and_buffer_state() -
 
     assert captured.value.__dict__["report"] is stream.report
     assert transport.cancelled.is_set()
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is KernelState.CANCELLED
     assert (await stream._scheduler.context.snapshot()).counters.buffered_rows == 0  # noqa: SLF001
 
 
@@ -1212,7 +1207,7 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
     assert primary[0].__dict__["report"] is stream.report
     assert cancelling_seen == [1]
     assert post_failure_executed is False
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
     assert loop_contexts == []
 
 
@@ -1232,7 +1227,7 @@ async def test_batch_reference_cancellation_interrupts_inflight_batch_request() 
         await asyncio.wait_for(task, timeout=1)
 
     assert transport.cancelled.is_set()
-    assert stream.report.state is TerminalState.CANCELLED
+    assert stream.report.state is KernelState.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -1329,7 +1324,7 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
         release.set()
 
     assert captured.value.__dict__["report"] is stream.report
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
     assert stream.report.terminal_reason == "ProtocolError"
     cleanup = [violation for violation in stream.report.violations if violation.code == "cleanup_failure"]
     assert len(cleanup) == 1
@@ -1488,7 +1483,7 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
     await task
     assert observed == [("reference close boom", 1), ("external-caller", 1)]
     assert independent_transport.requests == []
-    assert stream.report.state is TerminalState.FAILED
+    assert stream.report.state is KernelState.FAILED
     assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
 
 
@@ -1590,7 +1585,7 @@ def test_batch_reference_stream_construction_is_lazy_outside_an_event_loop() -> 
     )
 
     assert transport.requests == []
-    assert stream.report.state is TerminalState.NOT_STARTED
+    assert stream.report.state is KernelState.NOT_STARTED
 
 
 async def _collect(stream: object) -> list[ReferenceItem | ReferenceFailure]:

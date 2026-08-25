@@ -6,12 +6,9 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from b24api.contracts.policy import BudgetCounters, ExecutionPolicy
 from b24api.error import (
     BudgetExceededError,
-)
-from b24api.models import (
-    BudgetCounters,
-    ExecutionPolicy,
 )
 
 if TYPE_CHECKING:

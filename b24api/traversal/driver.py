@@ -3,23 +3,16 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from b24api.error import CapabilityError, PaginationError
-from b24api.models import (
+from b24api.contracts.policy import (
     ConfirmationPolicy,
     DuplicatePolicy,
     ExecutionPolicy,
     IdentityRequirement,
-    IdentitySpec,
-    JsonValue,
-    OperationReport,
-    ParameterPath,
-    Request,
-    Response,
-    ResultSelector,
     TotalSemantics,
-    Violation,
-    ViolationSeverity,
 )
+from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector
+from b24api.error import CapabilityError, PaginationError
 from b24api.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
@@ -58,10 +51,13 @@ from b24api.traversal.sequential import _SequentialMixin
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from b24api.contracts.json import JsonValue
+    from b24api.contracts.response import Response
     from b24api.execution import (
         ExecutionContext,
         Executor,
     )
+    from b24api.execution.snapshot import KernelReport
 
 
 class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _CursorMixin):
@@ -111,7 +107,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._advisory_totals: set[int] = set()
         self._advisory_total_drift_reported = False
         self._advisory_total_mismatch_reported = False
-        self.batch_report: OperationReport | None = None
+        self.batch_report: KernelReport | None = None
 
     async def pages(self) -> AsyncGenerator[_Page]:  # noqa: C901
         """Yield validated traversal pages."""

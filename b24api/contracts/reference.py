@@ -4,7 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
-from b24api.models import FrozenJson, JsonValue, ParameterPath, _freeze_json, _thaw_json
+from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _thaw_json
+from b24api.contracts.request import ParameterPath
 from b24api.redaction import DEFAULT_REDACTOR
 
 if TYPE_CHECKING:

@@ -4,16 +4,11 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+from b24api.contracts.policy import KernelState
 from b24api.error import CapabilityError, IncompleteTraversalError
 from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
-)
-from b24api.models import (
-    JsonValue,
-    ParameterPath,
-    Response,
-    TerminalState,
 )
 from b24api.plans import (
     CountedOffsetMode,
@@ -24,12 +19,15 @@ from b24api.traversal.identity import _Page, _request_with_controls, _response_i
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from b24api.models import OperationReport
+    from b24api.contracts.json import JsonValue
+    from b24api.contracts.request import ParameterPath
+    from b24api.contracts.response import Response
+    from b24api.execution.snapshot import KernelReport
 
 
 class _CountedBatchMixin:
     terminal_reason: str | None
-    batch_report: OperationReport | None
+    batch_report: KernelReport | None
 
     async def counted_batch_pages(  # noqa: C901, PLR0912, PLR0915
         self: Any,
@@ -38,8 +36,9 @@ class _CountedBatchMixin:
         page_size: int,
     ) -> AsyncGenerator[_Page]:
         """Execute the committed direct-head/batched-tail counted traversal."""
-        from b24api.batch import BatchExecutor, _BatchOutcomeStream  # noqa: PLC0415
-        from b24api.models import BatchFailure, BatchSuccess  # noqa: PLC0415
+        from b24api.batch.engine import BatchExecutor  # noqa: PLC0415
+        from b24api.batch.outcome import BatchFailure, BatchSuccess  # noqa: PLC0415
+        from b24api.batch.stream import _BatchOutcomeStream  # noqa: PLC0415
 
         if not isinstance(self.plan, CountedOffsetPlan):
             raise TypeError("counted batch traversal requires CountedOffsetPlan")
@@ -172,7 +171,7 @@ class _CountedBatchMixin:
                 elif preserve_primary:
                     pending_cancellation = cleanup.cancellation
                 rearm_cancellation(pending_cancellation)
-            if outcomes.report.state is not TerminalState.COMPLETED:
+            if outcomes.report.state is not KernelState.COMPLETED:
                 raise IncompleteTraversalError(report=outcomes.report)
             if self.validated_rows != total:
                 raise CapabilityError("parallel counted traversal did not emit its exact total")

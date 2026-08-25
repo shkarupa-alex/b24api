@@ -9,6 +9,8 @@ import httpx
 import pytest
 
 from b24api import execution as execution_module
+from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
+from b24api.contracts.request import ReplaySafety, Request
 from b24api.error import (
     AmbiguousExecutionError,
     BudgetExceededError,
@@ -27,7 +29,6 @@ from b24api.execution import (
     WorkClass,
     rearm_cancellation,
 )
-from b24api.models import ExecutionPolicy, ReplaySafety, Request, RetryPolicy
 from b24api.transport import httpx as httpx_transport_module
 
 EXPECTED_RETRIED_CALLS = 2

@@ -5,11 +5,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from b24api.models import JsonValue, Request, RequestSummary, Response
+from b24api.contracts.request import Request, RequestSummary
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from b24api.contracts.json import JsonValue
+    from b24api.contracts.response import Response
     from b24api.error import B24ApiError
 
 

@@ -11,6 +11,13 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING
 
+from b24api.contracts.policy import ExecutionPolicy
+from b24api.contracts.request import ReplaySafety, Request, RequestSummary
+from b24api.contracts.response import (
+    Response,
+    ResponseEvidence,
+    ResponseTime,
+)
 from b24api.error import (
     AmbiguousExecutionError,
     ApiResponseError,
@@ -28,15 +35,6 @@ from b24api.execution.context import (
     _raise_for_pending_cancellation,
 )
 from b24api.execution.rate import RateCoordinator, WorkClass
-from b24api.models import (
-    ExecutionPolicy,
-    ReplaySafety,
-    Request,
-    RequestSummary,
-    Response,
-    ResponseEvidence,
-    ResponseTime,
-)
 from b24api.protocol import ProtocolCodec
 
 if TYPE_CHECKING:

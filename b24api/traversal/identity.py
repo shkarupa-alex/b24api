@@ -8,25 +8,19 @@ import json
 import warnings
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
-from b24api.error import CapabilityError, PaginationError
-from b24api.models import (
+from b24api.contracts.policy import (
     ConfirmationPolicy,
     DuplicatePolicy,
     ExecutionPolicy,
     IdentityCoercion,
-    IdentitySpec,
-    JsonValue,
-    OperationReport,
     OrderSemantics,
-    ParameterPath,
-    Request,
-    Response,
-    ResultSelector,
     TotalSemantics,
-    inject_controls,
 )
+from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector
+from b24api.contracts.response import Response, inject_controls
+from b24api.error import CapabilityError, PaginationError
 from b24api.plans import (
     CountedOffsetPlan,
     CursorTerminalRule,
@@ -39,6 +33,10 @@ from b24api.plans import (
     OffsetTerminalRule,
     SingleResponsePlan,
 )
+
+if TYPE_CHECKING:
+    from b24api.contracts.json import JsonValue
+    from b24api.execution.snapshot import KernelReport
 
 type IdentityValue = str | int
 type PageFetch = Callable[[Request], Awaitable[Response]]
@@ -136,7 +134,7 @@ class _EffectiveConsistency:
     confirmation_policy: ConfirmationPolicy
 
 
-def _attach_report(error: BaseException, report: OperationReport) -> None:
+def _attach_report(error: BaseException, report: KernelReport) -> None:
     with contextlib.suppress(AttributeError, TypeError):
         error.report = report  # type: ignore[attr-defined]
 

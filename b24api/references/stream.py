@@ -5,27 +5,23 @@ import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
-from typing import Self, cast
+from typing import TYPE_CHECKING, Self, cast
 
+from b24api.contracts.policy import (
+    CompletionAssurance,
+    ExecutionPolicy,
+    KernelState,
+    SnapshotRequirement,
+    SnapshotState,
+)
+from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.execution import (
     Executor,
     await_cancellation_resistant,
     await_cleanup_resistant,
     rearm_cancellation,
 )
-from b24api.models import (
-    CompletionAssurance,
-    ExecutionPolicy,
-    IdentitySpec,
-    OperationReport,
-    ReferenceItem,
-    ResultSelector,
-    SnapshotRequirement,
-    SnapshotState,
-    TerminalState,
-    Violation,
-    ViolationSeverity,
-)
+from b24api.execution.snapshot import KernelReport
 from b24api.plans import (
     BatchDispatch,
     DirectDispatch,
@@ -39,9 +35,13 @@ from b24api.references.dispatch import (
     ReferenceSource,
     ReferenceStreamItem,
 )
+from b24api.references.outcome import ReferenceItem
 from b24api.references.scheduler import ReferenceScheduler
 from b24api.references.support import _attach_report
 from b24api.traversal import PaginationDriver
+
+if TYPE_CHECKING:
+    from b24api.contracts.request import IdentitySpec, ResultSelector
 
 
 class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
@@ -63,7 +63,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         self._emitted = 0
         self._unique_emitted = 0
         self._assurance = assurance
-        self.report = OperationReport(assurance=assurance)
+        self.report = KernelReport(assurance=assurance)
 
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
@@ -119,9 +119,9 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             if self._runner is not None:
                 await self._runner.aclose()
         except BaseException as error:
-            if self.report.state is TerminalState.NOT_STARTED:
+            if self.report.state is KernelState.NOT_STARTED:
                 cancellation = await await_cancellation_resistant(
-                    self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
+                    self._finalize(KernelState.CANCELLED, "stream cleanup failed"),
                 )
                 if cancellation is not None:
                     _attach_report(cancellation, self.report)
@@ -131,16 +131,16 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         finally:
             self._prefetched = _MISSING
         await self._observe_source_cleanup()
-        if self.report.state is TerminalState.NOT_STARTED and self._runner is not None:
-            await self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion")
+        if self.report.state is KernelState.NOT_STARTED and self._runner is not None:
+            await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
 
     async def _observe_source_cleanup(self) -> None:
         try:
             await self._scheduler.observe_source_cleanup()
         except BaseException as error:
-            if self.report.state is TerminalState.NOT_STARTED:
+            if self.report.state is KernelState.NOT_STARTED:
                 cancellation = await await_cancellation_resistant(
-                    self._finalize(TerminalState.CANCELLED, "stream cleanup failed"),
+                    self._finalize(KernelState.CANCELLED, "stream cleanup failed"),
                 )
                 if cancellation is not None:
                     _attach_report(cancellation, self.report)
@@ -157,11 +157,11 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             async for outcome in outcomes:
                 yield outcome
             naturally_exhausted = True
-            await self._finalize(TerminalState.COMPLETED, "reference input exhausted")
+            await self._finalize(KernelState.COMPLETED, "reference input exhausted")
         except asyncio.CancelledError as error:
             primary_error = error
             repeated = await await_cancellation_resistant(
-                self._finalize(TerminalState.CANCELLED, "iteration cancelled"),
+                self._finalize(KernelState.CANCELLED, "iteration cancelled"),
             )
             if repeated is not None:
                 primary_error = repeated
@@ -172,7 +172,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         except GeneratorExit as error:
             primary_error = error
             cancellation = await await_cancellation_resistant(
-                self._finalize(TerminalState.CANCELLED, "stream closed before exhaustion"),
+                self._finalize(KernelState.CANCELLED, "stream closed before exhaustion"),
             )
             if cancellation is not None:
                 primary_error = cancellation
@@ -183,7 +183,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         except BaseException as error:
             primary_error = error
             cancellation = await await_cancellation_resistant(
-                self._finalize(TerminalState.FAILED, type(error).__name__),
+                self._finalize(KernelState.FAILED, type(error).__name__),
             )
             if cancellation is not None:
                 _attach_report(cancellation, self.report)
@@ -213,16 +213,16 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
                 raise cleanup.cancellation
             if cleanup.cancellation is not None and preserve_primary:
                 pending_cancellation = cleanup.cancellation
-            if not naturally_exhausted and self.report.state is TerminalState.NOT_STARTED:
-                await self._finalize(TerminalState.CANCELLED, "stream abandoned")
-            if self.report.state is not TerminalState.NOT_STARTED:
+            if not naturally_exhausted and self.report.state is KernelState.NOT_STARTED:
+                await self._finalize(KernelState.CANCELLED, "stream abandoned")
+            if self.report.state is not KernelState.NOT_STARTED:
                 self._closed = True
             if preserve_primary:
                 rearm_cancellation(pending_cancellation)
 
     async def _record_terminal_cleanup_failure(self, error: BaseException) -> None:
-        if self.report.state is TerminalState.NOT_STARTED:
-            await self._finalize(TerminalState.FAILED, "stream cleanup failed")
+        if self.report.state is KernelState.NOT_STARTED:
+            await self._finalize(KernelState.FAILED, "stream cleanup failed")
         violations = self.report.violations
         if not any(violation.code == "cleanup_failure" for violation in violations):
             violations = (
@@ -235,14 +235,14 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             )
         self.report = replace(
             self.report,
-            state=TerminalState.FAILED,
+            state=KernelState.FAILED,
             terminal_reason="stream cleanup failed",
             violations=violations,
         )
         _attach_report(error, self.report)
 
-    async def _finalize(self, state: TerminalState, reason: str) -> None:
-        if self.report.state is not TerminalState.NOT_STARTED:
+    async def _finalize(self, state: KernelState, reason: str) -> None:
+        if self.report.state is not KernelState.NOT_STARTED:
             return
         snapshot = await self._scheduler.context.snapshot()
         consistency = self._scheduler.context.policy.consistency
@@ -252,8 +252,8 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             else SnapshotState.UNVERIFIED
         )
         violations = tuple(self._scheduler.violations)
-        if state is TerminalState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
-            state = TerminalState.INCOMPLETE
+        if state is KernelState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
+            state = KernelState.INCOMPLETE
             reason = "required snapshot was not verified"
             violations = (
                 *violations,
@@ -263,7 +263,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
                     message="the requested stable snapshot was not verified",
                 ),
             )
-        self.report = OperationReport(
+        self.report = KernelReport(
             state=state,
             assurance=self._assurance,
             snapshot=snapshot_state,
