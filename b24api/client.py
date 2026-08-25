@@ -185,7 +185,9 @@ class Bitrix24:
         self._transport = selected_transport
         self._owned_transport = owned_transport
         self._executor = Executor(selected_transport)
-        self._default_policy = policy or ExecutionPolicy()
+        self._default_policy = policy or ExecutionPolicy(
+            max_retry_elapsed_per_request=float(resolved.http_timeout),
+        )
         self._host = host
         self._closed = False
         self._streams: weakref.WeakSet[_PublicStream] = weakref.WeakSet()

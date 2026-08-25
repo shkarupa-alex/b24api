@@ -1,12 +1,10 @@
-"""Redacted Bitrix24 error hierarchy and compatibility aliases."""
+"""Redacted Bitrix24 error hierarchy."""
 
 from __future__ import annotations
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
-import httpx
-
-from b24api.models import RequestSummary, ResponseEvidence, summarize_request, summarize_request_like
+from b24api.models import RequestSummary, ResponseEvidence, summarize_request_like
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 if TYPE_CHECKING:
@@ -204,15 +202,6 @@ class ApiResponseError(B24ApiError):
         return safe
 
 
-class RetryApiResponseError(ApiResponseError):
-    """Structured API error classified as retryable by explicit policy."""
-
-    def __init__(self, **kwargs: Any) -> None:  # noqa: ANN401
-        """Initialize instance state."""
-        kwargs["retryable"] = True
-        super().__init__(**kwargs)
-
-
 class BatchCommandError(ApiResponseError):
     """Structured error correlated to one batch command."""
 
@@ -253,7 +242,7 @@ class AmbiguousExecutionError(B24ApiError):
 
 
 class IncompleteTraversalError(B24ApiError):
-    """Compatibility traversal ended without a completed terminal report."""
+    """Traversal ended without complete terminal evidence."""
 
     def __init__(self, *, report: object) -> None:
         """Initialize instance state."""
@@ -290,42 +279,12 @@ class ReferenceFailed[C](B24ApiError):  # noqa: N818 - normative public name
         super().__init__("Reference traversal did not complete", origin=ErrorOrigin.PAGINATION)
 
 
-class RetryHTTPStatusError(HTTPGatewayError):
-    """Import-compatible retryable HTTP status error with redacted presentation."""
-
-    def __init__(self, message: str, *, request: httpx.Request, response: httpx.Response) -> None:
-        """Initialize instance state."""
-        self.httpx_request = request
-        self.httpx_response = response
-        endpoint = request.url.path.rstrip("/").rsplit("/", maxsplit=1)[-1] or "unknown"
-        request_summary = summarize_request(f"{request.method} {endpoint}")
-        body_preview: str | None
-        try:
-            body_preview = DEFAULT_REDACTOR.safe_preview(response.content)
-        except httpx.ResponseNotRead:
-            body_preview = None
-        evidence = ResponseEvidence(http_status=response.status_code, body_preview=body_preview)
-        super().__init__(
-            f"Retryable HTTP status {response.status_code}",
-            origin=ErrorOrigin.HTTP_GATEWAY,
-            description=message,
-            request_summary=request_summary,
-            evidence=evidence,
-            retryable=True,
-        )
-
-
-BudgetError = BudgetExceededError
-AmbiguousOutcomeError = AmbiguousExecutionError
-
 __all__ = [
     "AmbiguousExecutionError",
-    "AmbiguousOutcomeError",
     "ApiResponseError",
     "B24ApiError",
     "BatchCommandError",
     "BatchFailed",
-    "BudgetError",
     "BudgetExceededError",
     "CapabilityError",
     "ErrorOrigin",
@@ -337,7 +296,5 @@ __all__ = [
     "ProtocolError",
     "ReferenceFailed",
     "ResponseTooLargeError",
-    "RetryApiResponseError",
-    "RetryHTTPStatusError",
     "TransportError",
 ]

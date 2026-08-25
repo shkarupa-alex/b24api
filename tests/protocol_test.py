@@ -2,23 +2,18 @@
 
 from dataclasses import dataclass
 
-import httpx
 from pytest_mock import MockerFixture
 
 from b24api.error import (
     AmbiguousExecutionError,
-    AmbiguousOutcomeError,
     ApiResponseError,
     B24ApiError,
     BatchCommandError,
-    BudgetError,
     BudgetExceededError,
     CapabilityError,
     HTTPGatewayError,
     PaginationError,
     ProtocolError,
-    RetryApiResponseError,
-    RetryHTTPStatusError,
     TransportError,
 )
 from b24api.models import summarize_request
@@ -65,7 +60,7 @@ def test_numeric_code_and_retry_classification() -> None:
     assert isinstance(numeric, ApiResponseError)
     assert numeric.original_code == 0
     assert numeric.code == "0"
-    assert isinstance(retryable, RetryApiResponseError)
+    assert isinstance(retryable, ApiResponseError)
     assert retryable.retryable is True
 
 
@@ -120,19 +115,7 @@ def test_structured_description_and_request_context_are_safe() -> None:
     assert "/rest/1/" not in rendered
 
 
-def test_retry_http_alias_never_renders_url_or_body_secret() -> None:
-    request = httpx.Request("POST", WEBHOOK + "profile")
-    response = httpx.Response(HTTP_TOO_MANY_REQUESTS, request=request, text=f"retry {EXAMPLE_CREDENTIAL}")
-    error = RetryHTTPStatusError(f"failed at {WEBHOOK}", request=request, response=response)
-
-    rendered = str(error) + repr(error) + repr(error.to_safe_dict())
-    assert EXAMPLE_CREDENTIAL not in rendered
-    assert "/rest/1/" not in rendered
-    assert error.retryable is True
-    assert error.http_status == HTTP_TOO_MANY_REQUESTS
-
-
-def test_complete_error_hierarchy_and_aliases_import() -> None:
+def test_complete_v2_error_hierarchy() -> None:
     assert issubclass(TransportError, B24ApiError)
     assert issubclass(HTTPGatewayError, B24ApiError)
     assert issubclass(ProtocolError, B24ApiError)
@@ -140,8 +123,8 @@ def test_complete_error_hierarchy_and_aliases_import() -> None:
     assert issubclass(BatchCommandError, ApiResponseError)
     assert issubclass(CapabilityError, B24ApiError)
     assert issubclass(PaginationError, B24ApiError)
-    assert BudgetError is BudgetExceededError
-    assert AmbiguousOutcomeError is AmbiguousExecutionError
+    assert issubclass(BudgetExceededError, B24ApiError)
+    assert issubclass(AmbiguousExecutionError, B24ApiError)
     assert TransportError("transport").origin.value == "transport"
     assert CapabilityError("capability").origin.value == "capability"
     assert PaginationError("pagination").origin.value == "pagination"

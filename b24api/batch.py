@@ -5,7 +5,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Literal, Protocol, Self, cast, runtime_checkable
+from typing import Any, Protocol, Self, cast, runtime_checkable
 
 from b24api.error import B24ApiError, BatchCommandError, ErrorOrigin, ProtocolError
 from b24api.execution import (
@@ -43,8 +43,7 @@ type RequestMapping = Mapping[str, object]
 type RequestWithPayload = tuple[Request | RequestMapping, object]
 type BatchInput = Request | RequestMapping | RequestWithPayload
 type BatchSource = Iterable[BatchInput] | AsyncIterable[BatchInput]
-type FailFastItem = JsonValue | tuple[JsonValue, object]
-type BatchStreamItem = FailFastItem | BatchOutcome
+type BatchStreamItem = BatchOutcome
 
 _REQUEST_PAYLOAD_TUPLE_LENGTH = 2
 _MISSING = object()
@@ -85,88 +84,53 @@ class _SyncClosable(Protocol):
 
 
 class BatchExecutor:
-    """Create lazy bounded streams over one shared replay-aware executor."""
+    """Execute one correlated physical Bitrix batch chunk."""
 
     def __init__(
         self,
         executor: Executor,
         *,
         portal_command_cap: int = PORTAL_BATCH_CAP,
-        fallback_eligible_codes: frozenset[str] = frozenset(),
     ) -> None:
         """Initialize instance state."""
         if isinstance(portal_command_cap, bool) or not 1 <= portal_command_cap <= PORTAL_BATCH_CAP:
             raise ValueError("portal command cap must be between 1 and 50")
         self.executor = executor
         self.portal_command_cap = portal_command_cap
-        self.fallback_eligible_codes = frozenset(code.strip().casefold() for code in fallback_eligible_codes)
 
-    def batch(
-        self,
-        requests: BatchSource,
-        *,
-        batch_size: int | None = None,
-        with_payload: bool = False,
-        policy: ExecutionPolicy | None = None,
-    ) -> BatchStream:
-        """Return a lazy fail-fast stream using Bitrix `halt=true`."""
-        return BatchStream(
-            self,
-            requests,
-            batch_size=self._batch_size(batch_size),
-            tolerant=False,
-            with_payload=with_payload,
-            fallback_failed="none",
-            policy=policy or ExecutionPolicy(),
-        )
-
-    def batch_outcomes(
+    def _outcomes(
         self,
         requests: BatchSource,
         *,
         batch_size: int | None = None,
         policy: ExecutionPolicy | None = None,
-        fallback_failed: Literal["none", "direct"] = "none",
-    ) -> BatchStream:
-        """Return a lazy stream with exactly one typed outcome per command."""
-        if fallback_failed not in {"none", "direct"}:
-            raise ValueError("fallback_failed must be none or direct")
-        return BatchStream(
-            self,
-            requests,
-            batch_size=self._batch_size(batch_size),
-            tolerant=True,
-            with_payload=False,
-            fallback_failed=fallback_failed,
-            policy=policy or ExecutionPolicy(),
-        )
-
-    def _batch_size(self, requested: int | None) -> int:
-        size = self.portal_command_cap if requested is None else requested
+    ) -> _BatchOutcomeStream:
+        """Build the internal total-outcome stream used by kernel tests and traversal."""
+        size = self.portal_command_cap if batch_size is None else batch_size
         if isinstance(size, bool) or not 1 <= size <= self.portal_command_cap:
             raise ValueError("batch_size must be within the portal command cap")
-        return size
+        return _BatchOutcomeStream(
+            self,
+            requests,
+            batch_size=size,
+            policy=policy or ExecutionPolicy(),
+        )
 
-    async def _execute_chunk(  # noqa: C901
+    async def _execute_chunk(
         self,
         commands: tuple[_Command, ...],
         *,
-        tolerant: bool,
-        fallback_failed: Literal["none", "direct"],
         context: ExecutionContext,
-        halt: bool | None = None,
+        halt: bool,
     ) -> tuple[BatchOutcome, ...]:
-        request = _batch_request(commands, halt=not tolerant if halt is None else halt)
+        request = _batch_request(commands, halt=halt)
         try:
             response = await self.executor.execute(request, context=context, work_class=WorkClass.BATCH)
             envelope = _decode_batch_envelope(response.result)
         except asyncio.CancelledError:
             raise
         except B24ApiError as error:
-            if not tolerant:
-                raise
-            failures = tuple(_shared_failure(command, error) for command in commands)
-            return await self._fallback(failures, fallback_failed=fallback_failed, context=context)
+            return tuple(_shared_failure(command, error) for command in commands)
 
         outcomes: list[BatchOutcome] = []
         for command in commands:
@@ -183,8 +147,6 @@ class BatchExecutor:
                     original_code=command_error.original_code,
                     normalized_code=command_error.normalized_code,
                 )
-                if not tolerant:
-                    raise command_error
                 outcomes.append(_command_failure(command, command_error, evidence=evidence))
                 continue
             if command.stable_key not in envelope.results:
@@ -193,8 +155,6 @@ class BatchExecutor:
                     origin=ErrorOrigin.PROTOCOL,
                     request_summary=command.request.summary,
                 )
-                if not tolerant:
-                    raise missing_error
                 outcomes.append(_command_failure(command, missing_error, evidence=evidence))
                 continue
             try:
@@ -212,8 +172,6 @@ class BatchExecutor:
                     evidence=response.evidence,
                 )
                 protocol_error.__cause__ = error
-                if not tolerant:
-                    raise protocol_error from error
                 outcomes.append(_command_failure(command, protocol_error, evidence=evidence))
                 continue
             outcomes.append(
@@ -226,14 +184,13 @@ class BatchExecutor:
                     evidence,
                 ),
             )
-        return await self._fallback(tuple(outcomes), fallback_failed=fallback_failed, context=context)
+        return tuple(outcomes)
 
     async def execute_requests(
         self,
         requests: tuple[Request, ...],
         *,
         context: ExecutionContext,
-        fallback_failed: Literal["none", "direct"] = "none",
     ) -> tuple[BatchOutcome, ...]:
         """Execute one scheduler-owned chunk with total per-command correlation."""
         if not requests or len(requests) > self.portal_command_cap:
@@ -250,9 +207,8 @@ class BatchExecutor:
         )
         return await self._execute_chunk(
             commands,
-            tolerant=True,
-            fallback_failed=fallback_failed,
             context=context,
+            halt=False,
         )
 
     def _command_error(
@@ -281,61 +237,12 @@ class BatchExecutor:
             code=code,
             description=None if description is None else str(description),
             request_summary=command.request.summary,
-            retryable=normalized in self.fallback_eligible_codes or normalized in retry_codes,
+            retryable=normalized in retry_codes,
         )
 
-    async def _fallback(
-        self,
-        outcomes: tuple[BatchOutcome, ...],
-        *,
-        fallback_failed: Literal["none", "direct"],
-        context: ExecutionContext,
-    ) -> tuple[BatchOutcome, ...]:
-        if fallback_failed == "none":
-            return outcomes
-        resolved: list[BatchOutcome] = []
-        for outcome in outcomes:
-            if not isinstance(outcome, BatchFailure) or not _fallback_eligible(outcome):
-                resolved.append(outcome)
-                continue
-            try:
-                response = await self.executor.execute(
-                    outcome.request,
-                    context=context,
-                    work_class=WorkClass.TRAVERSAL_DIRECT,
-                )
-            except asyncio.CancelledError:
-                raise
-            except B24ApiError as error:
-                resolved.append(
-                    BatchFailure(
-                        outcome.command_index,
-                        outcome.stable_key,
-                        outcome.request,
-                        error,
-                        replay_safety=outcome.replay_safety,
-                        replay_disposition=ReplayDisposition.DIRECT_REPLAY_FAILED,
-                        payload=outcome.payload,
-                        evidence=outcome.evidence,
-                    ),
-                )
-            else:
-                resolved.append(
-                    BatchSuccess._from_response(  # noqa: SLF001 - trusted correlated decoder fast path
-                        outcome.command_index,
-                        outcome.stable_key,
-                        outcome.request,
-                        response,
-                        outcome.payload,
-                        outcome.evidence,
-                        replay_disposition=ReplayDisposition.REPLAYED_DIRECT,
-                    ),
-                )
-        return tuple(resolved)
 
-
-class BatchStream(AsyncIterator[BatchStreamItem]):
-    """Lazy async/context-managed batch stream with a frozen terminal report."""
+class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
+    """Internal lazy outcome stream used by exact counted traversal."""
 
     def __init__(  # noqa: PLR0913
         self,
@@ -343,9 +250,6 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         source: BatchSource,
         *,
         batch_size: int,
-        tolerant: bool,
-        with_payload: bool,
-        fallback_failed: Literal["none", "direct"],
         policy: ExecutionPolicy,
         context: ExecutionContext | None = None,
         logical_page_per_command: bool = False,
@@ -354,9 +258,6 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
         self._executor = batch_executor
         self._source = source
         self._batch_size = batch_size
-        self._tolerant = tolerant
-        self._with_payload = with_payload
-        self._fallback_failed = fallback_failed
         if context is not None and context.policy != policy:
             raise ValueError("shared batch context must use the exact stream policy")
         self._context = context or batch_executor.executor.context(policy)
@@ -456,9 +357,6 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                     break
                 next_index += len(chunk.commands)
                 if chunk.source_error is not None:
-                    if self._tolerant:
-                        for command in chunk.commands:
-                            yield _source_failure(command, chunk.source_error)
                     _raise_source_error(chunk.source_error)
                 self._batch_requests += 1
                 self._batch_commands += len(chunk.commands)
@@ -470,9 +368,8 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                             reservations.append(reservation)
                     outcomes = await self._executor._execute_chunk(  # noqa: SLF001
                         chunk.commands,
-                        tolerant=self._tolerant,
-                        fallback_failed=self._fallback_failed,
                         context=self._context,
+                        halt=False,
                     )
                 except BaseException:
                     for reservation in reservations:
@@ -488,14 +385,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
                 await self._context.set_buffered_rows(buffered_rows)
                 for outcome in outcomes:
                     outcome_rows = _batch_outcome_row_weight(outcome)
-                    if self._tolerant:
-                        yield outcome
-                    else:
-                        success = cast("BatchSuccess", outcome)
-                        if self._with_payload:
-                            yield success.result, success.payload
-                        else:
-                            yield success.result
+                    yield outcome
                     buffered_rows -= outcome_rows
                     await self._context.set_buffered_rows(buffered_rows)
             naturally_exhausted = True
@@ -636,7 +526,7 @@ class BatchStream(AsyncIterator[BatchStreamItem]):
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
             snapshot=snapshot_state,
-            plan_id="batch_outcomes" if self._tolerant else "batch",
+            plan_id="batch_kernel",
             dispatch_id="batch",
             emitted_rows=self._emitted,
             unique_rows=self._emitted,
@@ -858,45 +748,12 @@ def _shared_failure(command: _Command, error: B24ApiError) -> BatchFailure:
     )
 
 
-def _source_failure(command: _Command, error: Exception) -> BatchFailure:
-    return BatchFailure(
-        command.index,
-        command.stable_key,
-        command.request,
-        error,
-        replay_safety=command.request.replay_safety or ReplaySafety.UNKNOWN,
-        replay_disposition=ReplayDisposition.NOT_ELIGIBLE,
-        payload=command.payload,
-        evidence=BatchCommandEvidence(command.index, command.stable_key),
-    )
-
-
 def _raise_source_error(error: Exception) -> None:
     raise error
-
-
-def _fallback_eligible(outcome: BatchFailure) -> bool:
-    return (
-        outcome.replay_safety is ReplaySafety.SAFE
-        and outcome.replay_disposition is ReplayDisposition.ELIGIBLE
-        and isinstance(outcome.error, B24ApiError)
-        and outcome.error.retryable
-    )
 
 
 def _batch_outcome_row_weight(outcome: BatchOutcome) -> int:
     return outcome.decoded_rows if isinstance(outcome, BatchSuccess) else 1
 
 
-BatchOutcomeStream = BatchStream
-
-
-__all__ = [
-    "BatchExecutor",
-    "BatchInput",
-    "BatchOutcomeStream",
-    "BatchSource",
-    "BatchStream",
-    "BatchStreamItem",
-    "FailFastItem",
-]
+__all__: list[str] = []

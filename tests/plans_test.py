@@ -12,15 +12,12 @@ from b24api.plans import (
     DirectDispatch,
     ItemCursorPlan,
     KeysetPlan,
-    KeysetTerminalRule,
     OffsetSequentialPlan,
     OffsetTerminalRule,
-    PartitionedKeysetPlan,
     SingleResponsePlan,
 )
 
 PAGE_SIZE = 50
-PARTITION_LANES = 4
 
 
 def test_single_and_offset_plans_are_frozen() -> None:
@@ -65,9 +62,7 @@ def test_counted_offset_mode_and_stride_are_coherent() -> None:
         CountedOffsetPlan(total_semantics=TotalSemantics.IGNORE)
 
 
-def test_evidence_based_terminal_rules_require_their_declared_contract() -> None:
-    with pytest.raises(ValueError, match="requested_page_size"):
-        OffsetSequentialPlan(terminal=frozenset({OffsetTerminalRule.PROFILE_SHORT_PAGE}))
+def test_qualified_total_terminal_requires_its_declared_contract() -> None:
     with pytest.raises(ValueError, match="exact or advisory"):
         OffsetSequentialPlan(
             terminal=frozenset({OffsetTerminalRule.QUALIFIED_TOTAL}),
@@ -78,12 +73,6 @@ def test_evidence_based_terminal_rules_require_their_declared_contract() -> None
         total_semantics=TotalSemantics.ADVISORY,
     )
     assert advisory.total_semantics is TotalSemantics.ADVISORY
-    with pytest.raises(ValueError, match="requested_page_size"):
-        KeysetPlan(
-            terminal=KeysetTerminalRule.PROFILE_SHORT_PAGE,
-            identity_requirement=IdentityRequirement.REQUIRED,
-            order_semantics=OrderSemantics.ASCENDING,
-        )
 
 
 def test_keyset_requires_identity_order_and_distinct_paths() -> None:
@@ -118,20 +107,13 @@ def test_keyset_requires_identity_order_and_distinct_paths() -> None:
         )
 
 
-def test_item_cursor_and_partition_validate_identity_direction_and_bounds() -> None:
+def test_item_cursor_validates_identity_and_cursor_shape() -> None:
     cursor = ItemCursorPlan(
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING,
     )
-    partition = PartitionedKeysetPlan(
-        lane_count=PARTITION_LANES,
-        identity_requirement=IdentityRequirement.REQUIRED,
-        order_semantics=OrderSemantics.ASCENDING,
-    )
-
     assert cursor.cursor_item_path == ("id",)
     assert cursor.cursor_coercion is IdentityCoercion.EXACT_INTEGER
-    assert partition.lane_count == PARTITION_LANES
     with pytest.raises(ValueError, match="cursor_item_path"):
         ItemCursorPlan(
             cursor_item_path=(),
@@ -142,12 +124,6 @@ def test_item_cursor_and_partition_validate_identity_direction_and_bounds() -> N
         ItemCursorPlan(
             cursor_coercion="integer",  # type: ignore[arg-type]
             identity_requirement=IdentityRequirement.REQUIRED,
-        )
-    with pytest.raises(ValueError, match="lane_count"):
-        PartitionedKeysetPlan(
-            lane_count=1,
-            identity_requirement=IdentityRequirement.REQUIRED,
-            order_semantics=OrderSemantics.ASCENDING,
         )
 
 

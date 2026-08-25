@@ -394,7 +394,6 @@ class _BatchPageDispatcher:
                 outcomes = await self._executor.execute_requests(
                     tuple(item.request for item in chunk),
                     context=self.context,
-                    fallback_failed=self.plan.fallback_failed,
                 )
             except asyncio.CancelledError:
                 for item in chunk:
@@ -846,17 +845,12 @@ class ReferenceScheduler:
 class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     """Lazy reference stream with one frozen report and deterministic cleanup."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         scheduler: ReferenceScheduler,
         source: ReferenceSource,
         *,
         assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
-        profile_id: str | None = None,
-        profile_version: int | None = None,
-        profile_source_sha256: str | None = None,
-        profile_evidence_sha256: tuple[str, ...] = (),
-        profile_evidence_candidate_sha: str | None = None,
     ) -> None:
         """Initialize instance state."""
         self._scheduler = scheduler
@@ -867,20 +861,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         self._emitted = 0
         self._unique_emitted = 0
         self._assurance = assurance
-        self._profile_id = profile_id
-        self._profile_version = profile_version
-        self._profile_source_sha256 = profile_source_sha256
-        self._profile_evidence_sha256 = profile_evidence_sha256
-        self._profile_evidence_candidate_sha = profile_evidence_candidate_sha
-        self.report = OperationReport(
-            assurance=assurance,
-            profile_id=profile_id,
-            profile_version=profile_version,
-            profile_applicable=True if profile_id is not None else None,
-            profile_source_sha256=profile_source_sha256,
-            profile_evidence_sha256=profile_evidence_sha256,
-            profile_evidence_candidate_sha=profile_evidence_candidate_sha,
-        )
+        self.report = OperationReport(assurance=assurance)
 
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
@@ -1086,12 +1067,6 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             snapshot=snapshot_state,
             plan_id=type(self._scheduler.plan).__name__,
             dispatch_id=type(self._scheduler.dispatch).__name__,
-            profile_id=self._profile_id,
-            profile_version=self._profile_version,
-            profile_applicable=True if self._profile_id is not None else None,
-            profile_source_sha256=self._profile_source_sha256,
-            profile_evidence_sha256=self._profile_evidence_sha256,
-            profile_evidence_candidate_sha=self._profile_evidence_candidate_sha,
             emitted_rows=self._emitted,
             unique_rows=self._unique_emitted,
             physical_requests=snapshot.counters.physical_requests,
@@ -1145,11 +1120,6 @@ def iter_references(  # noqa: PLR0913
     _capture_fail_fast: bool = False,
     _page_cap_hint: int | None = None,
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
-    _profile_id: str | None = None,
-    _profile_version: int | None = None,
-    _profile_source_sha256: str | None = None,
-    _profile_evidence_sha256: tuple[str, ...] = (),
-    _profile_evidence_candidate_sha: str | None = None,
 ) -> ReferenceStream:
     """Construct a lazy bounded reference traversal stream without I/O."""
     PaginationDriver.validate_plan(plan)
@@ -1182,11 +1152,6 @@ def iter_references(  # noqa: PLR0913
         scheduler,
         requests,
         assurance=_assurance,
-        profile_id=_profile_id,
-        profile_version=_profile_version,
-        profile_source_sha256=_profile_source_sha256,
-        profile_evidence_sha256=_profile_evidence_sha256,
-        profile_evidence_candidate_sha=_profile_evidence_candidate_sha,
     )
 
 

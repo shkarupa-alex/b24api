@@ -18,7 +18,6 @@ type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type FrozenJson = JsonScalar | tuple[FrozenJson, ...] | FrozenMapping
 
 _METHOD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 HTTP_STATUS_MINIMUM = 100
 HTTP_STATUS_MAXIMUM = 599
 VIOLATION_CODE_MAXIMUM = 100
@@ -88,10 +87,6 @@ def _thaw_json(value: FrozenJson) -> JsonValue:
 
 def _is_plain_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _is_sha256(value: object) -> bool:
-    return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,7 +284,6 @@ class CompletionAssurance(StrEnum):
     """Strength of evidence supporting completion."""
 
     ORACLE_VERIFIED = "oracle_verified"
-    PROFILE_VERIFIED = "profile_verified"
     CALLER_ASSERTED = "caller_asserted"
 
 
@@ -831,12 +825,6 @@ class OperationReport:
     snapshot: SnapshotState = SnapshotState.NOT_REQUESTED
     plan_id: str | None = None
     dispatch_id: str | None = None
-    profile_id: str | None = None
-    profile_version: int | None = None
-    profile_applicable: bool | None = None
-    profile_source_sha256: str | None = None
-    profile_evidence_sha256: tuple[str, ...] = ()
-    profile_evidence_candidate_sha: str | None = None
     emitted_rows: int = 0
     unique_rows: int = 0
     physical_requests: int = 0
@@ -860,7 +848,6 @@ class OperationReport:
             raise TypeError("snapshot must be a SnapshotState")
         object.__setattr__(self, "violations", tuple(self.violations))
         object.__setattr__(self, "evidence", tuple(self.evidence))
-        object.__setattr__(self, "profile_evidence_sha256", tuple(self.profile_evidence_sha256))
         if self.terminal_reason is not None:
             object.__setattr__(self, "terminal_reason", DEFAULT_REDACTOR.redact_text(self.terminal_reason))
         counters = (
@@ -877,7 +864,6 @@ class OperationReport:
             raise ValueError("report counters must be non-negative")
         if self.unique_rows > self.emitted_rows:
             raise ValueError("unique_rows cannot exceed emitted_rows")
-        _validate_report_profile(self)
         if self.completed and any(item.severity is ViolationSeverity.BLOCKING for item in self.violations):
             raise ValueError("completed report cannot contain blocking violations")
 
@@ -885,43 +871,6 @@ class OperationReport:
     def completed(self) -> bool:
         """Return the completed."""
         return self.state is TerminalState.COMPLETED
-
-
-def _validate_report_profile(report: OperationReport) -> None:
-    if report.profile_id is None:
-        if (
-            any(
-                value is not None
-                for value in (
-                    report.profile_version,
-                    report.profile_applicable,
-                    report.profile_source_sha256,
-                    report.profile_evidence_candidate_sha,
-                )
-            )
-            or report.profile_evidence_sha256
-        ):
-            raise ValueError("profile metadata requires profile_id")
-    else:
-        if not report.profile_id or len(report.profile_id) > STABLE_KEY_MAXIMUM:
-            raise ValueError("profile_id must be 1..100 characters")
-        if not _is_plain_int(report.profile_version) or cast("int", report.profile_version) < 1:
-            raise ValueError("profile_version must be positive")
-        if not isinstance(report.profile_applicable, bool):
-            raise TypeError("profile_applicable must be a boolean")
-        if report.profile_source_sha256 is None or not _is_sha256(report.profile_source_sha256):
-            raise ValueError("profile_source_sha256 must be a lowercase SHA-256")
-        if not report.profile_evidence_sha256 or any(not _is_sha256(value) for value in report.profile_evidence_sha256):
-            raise ValueError("profile evidence must contain lowercase SHA-256 values")
-        if report.profile_evidence_candidate_sha is None or not re.fullmatch(
-            r"[0-9a-f]{40}",
-            report.profile_evidence_candidate_sha,
-        ):
-            raise ValueError("profile evidence candidate must be a lowercase Git SHA-1")
-    if report.assurance is CompletionAssurance.PROFILE_VERIFIED and (
-        report.profile_id is None or report.profile_applicable is not True
-    ):
-        raise ValueError("profile-verified assurance requires applicable profile provenance")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -1070,49 +1019,6 @@ class ReferenceRequest:
 
 
 @dataclass(frozen=True, slots=True, init=False)
-class ReferenceBinding:
-    """Immutable top-level request updates and safe reference correlation."""
-
-    reference_summary: str
-    payload_key: str = field(repr=False)
-    _updates: FrozenMapping = field(repr=False)
-    payload: object = field(default=None, repr=False)
-
-    def __init__(
-        self,
-        reference_summary: str,
-        payload_key: str,
-        updates: Mapping[str, object] | None = None,
-        payload: object = None,
-    ) -> None:
-        """Initialize instance state."""
-        frozen = _freeze_json(updates or {})
-        if not isinstance(frozen, FrozenMapping):
-            raise TypeError("reference updates must be a mapping")
-        object.__setattr__(self, "reference_summary", DEFAULT_REDACTOR.redact_text(reference_summary))
-        object.__setattr__(self, "payload_key", payload_key)
-        object.__setattr__(self, "payload", payload)
-        object.__setattr__(self, "_updates", frozen)
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        """Validate and normalize instance state."""
-        if not self.reference_summary or len(self.reference_summary) > VIOLATION_MESSAGE_MAXIMUM:
-            raise ValueError("reference_summary must be 1..500 characters")
-        if not self.payload_key or len(self.payload_key) > STABLE_KEY_MAXIMUM:
-            raise ValueError("payload_key must be 1..100 characters")
-
-    @property
-    def updates(self) -> Mapping[str, JsonValue]:
-        """Return detached top-level parameter updates for one reference."""
-        return MappingProxyType(self.copy_updates())
-
-    def copy_updates(self) -> dict[str, JsonValue]:
-        """Return a mutable detached copy of the binding updates."""
-        return cast("dict[str, JsonValue]", _thaw_json(self._updates))
-
-
-@dataclass(frozen=True, slots=True, init=False)
 class ReferenceItem:
     """Successful reference item; raw item and payload are hidden from repr."""
 
@@ -1210,7 +1116,6 @@ __all__ = [
     "OperationReport",
     "OrderSemantics",
     "ParameterPath",
-    "ReferenceBinding",
     "ReferenceFailure",
     "ReferenceItem",
     "ReferenceOutcome",

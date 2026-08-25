@@ -11,7 +11,6 @@ from b24api.error import (
     ErrorOrigin,
     HTTPGatewayError,
     ProtocolError,
-    RetryApiResponseError,
 )
 from b24api.models import RequestSummary, ResponseEvidence
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
@@ -64,14 +63,14 @@ class ProtocolCodec:
             description = str(raw_description) if raw_description is not None else None
             normalized = str(original_code).strip().casefold()
             normalized_retry_codes = {code.casefold() for code in retry_codes}
-            error_type = RetryApiResponseError if normalized in normalized_retry_codes else ApiResponseError
-            return error_type(
+            return ApiResponseError(
                 code=original_code,
                 description=description,
                 request_summary=request_summary,
                 http_status=status_code,
                 headers=dict(safe_headers),
                 body_preview=preview,
+                retryable=normalized in normalized_retry_codes,
                 redactor=self._redactor,
             )
 

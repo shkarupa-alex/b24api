@@ -40,7 +40,6 @@ from b24api.plans import (
     OffsetContinuation,
     OffsetSequentialPlan,
     OffsetTerminalRule,
-    PartitionedKeysetPlan,
     SingleResponsePlan,
 )
 
@@ -284,30 +283,6 @@ async def test_empty_page_cannot_override_an_unreached_exact_total() -> None:
 
     with pytest.raises(PaginationError, match="before its exact total"):
         await _collect(stream)
-
-
-@pytest.mark.asyncio
-async def test_short_page_does_not_escape_before_exact_total_validation() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}], "total": 2})
-    plan = OffsetSequentialPlan(
-        limit_path=ParameterPath(("limit",)),
-        requested_page_size=2,
-        continuation=OffsetContinuation.OBSERVED_COUNT,
-        terminal=frozenset(
-            {OffsetTerminalRule.PROFILE_SHORT_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL},
-        ),
-        total_semantics=TotalSemantics.FILTERED_EXACT,
-    )
-    stream = iter_list(
-        Executor(transport),
-        Request("crm.item.list"),
-        plan=plan,
-        identity=_identity(),
-    )
-
-    with pytest.raises(PaginationError, match="before its exact total"):
-        await anext(stream)
-    assert stream.report.emitted_rows == 0
 
 
 @pytest.mark.asyncio
@@ -611,7 +586,7 @@ async def test_counted_offset_rejects_unproven_totals(
 
 
 @pytest.mark.asyncio
-async def test_unreviewed_parallel_and_partitioned_strategies_refuse_before_io() -> None:
+async def test_unreviewed_parallel_and_boundary_strategies_refuse_before_io() -> None:
     transport = FunctionTransport(lambda _request: {"result": []})
     parallel = CountedOffsetPlan(
         mode=CountedOffsetMode.PARALLEL_FIXED_STRIDE,
@@ -619,17 +594,13 @@ async def test_unreviewed_parallel_and_partitioned_strategies_refuse_before_io()
         requested_page_size=PAGE_SIZE,
         fixed_stride=PAGE_SIZE,
     )
-    partitioned = PartitionedKeysetPlan(
-        identity_requirement=IdentityRequirement.REQUIRED,
-        order_semantics=OrderSemantics.ASCENDING,
-    )
     boundary = KeysetPlan(
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING,
         terminal=KeysetTerminalRule.BOUNDARY_ID_SEEN,
     )
 
-    for plan in (parallel, partitioned, boundary):
+    for plan in (parallel, boundary):
         stream = iter_list(Executor(transport), Request("crm.item.list"), plan=plan, identity=_identity())
         with pytest.raises(CapabilityError):
             await _collect(stream)
@@ -689,55 +660,6 @@ async def test_unadmitted_consistency_controls_refuse_before_io(
     with pytest.raises(CapabilityError, match=message):
         await anext(stream)
     assert transport.requests == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("plan", "row", "terminal_reason"),
-    [
-        (
-            KeysetPlan(
-                identity_requirement=IdentityRequirement.REQUIRED,
-                order_semantics=OrderSemantics.ASCENDING,
-                limit_path=ParameterPath(("limit",)),
-                requested_page_size=PAGE_SIZE,
-                terminal=KeysetTerminalRule.PROFILE_SHORT_PAGE,
-            ),
-            {"ID": 1},
-            "profile-authorized short keyset page",
-        ),
-        (
-            ItemCursorPlan(
-                identity_requirement=IdentityRequirement.REQUIRED,
-                cursor_item_path=("cursor",),
-                limit_path=ParameterPath(("limit",)),
-                requested_page_size=PAGE_SIZE,
-                terminal=CursorTerminalRule.PROFILE_SHORT_PAGE,
-            ),
-            {"ID": 1, "cursor": 10},
-            "profile-authorized short cursor page",
-        ),
-    ],
-)
-async def test_profile_short_page_terminates_keyset_and_cursor_traversal(
-    plan: ListPlan,
-    row: JsonValue,
-    terminal_reason: str,
-) -> None:
-    transport = FunctionTransport(lambda _request: {"result": [row]})
-    stream = iter_list(
-        Executor(transport),
-        Request("crm.item.list"),
-        plan=plan,
-        identity=_identity(),
-    )
-
-    assert await _collect(stream) == [row]
-    assert len(transport.requests) == 1
-    assert stream.report.state is TerminalState.COMPLETED
-    assert stream.report.assurance is CompletionAssurance.CALLER_ASSERTED
-    assert stream.report.violations == ()
-    assert stream.report.terminal_reason == terminal_reason
 
 
 @pytest.mark.asyncio
@@ -878,51 +800,6 @@ async def test_item_cursor_uses_independent_cursor_coercion() -> None:
     ]
     assert [request.copy_parameters().get("LAST_ID") for request in transport.requests] == [None, 2]
     assert stream.report.state is TerminalState.COMPLETED
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("row", [{"ID": 1}, {"ID": 1, "cursor": None}])
-async def test_profile_cursor_exhaustion_delivers_last_page_without_cursor(row: dict[str, JsonValue]) -> None:
-    transport = FunctionTransport(lambda _request: {"result": [row]})
-    plan = ItemCursorPlan(
-        identity_requirement=IdentityRequirement.REQUIRED,
-        cursor_item_path=("cursor",),
-        terminal=CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED,
-    )
-    stream = iter_list(
-        Executor(transport),
-        Request("crm.item.list"),
-        plan=plan,
-        identity=_identity(),
-    )
-
-    assert await _collect(stream) == [row]
-    assert len(transport.requests) == 1
-    assert stream.report.state is TerminalState.COMPLETED
-    assert stream.report.terminal_reason == "profile-authorized cursor exhaustion"
-
-
-@pytest.mark.asyncio
-async def test_profile_cursor_exhaustion_rejects_mixed_cursor_presence() -> None:
-    transport = FunctionTransport(
-        lambda _request: {"result": [{"ID": 1, "cursor": 1}, {"ID": 2}]},
-    )
-    plan = ItemCursorPlan(
-        identity_requirement=IdentityRequirement.REQUIRED,
-        cursor_item_path=("cursor",),
-        terminal=CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED,
-    )
-    stream = iter_list(
-        Executor(transport),
-        Request("crm.item.list"),
-        plan=plan,
-        identity=_identity(),
-    )
-
-    with pytest.raises(PaginationError, match="cursor exhaustion is inconsistent"):
-        await _collect(stream)
-    assert stream.report.emitted_rows == 0
-    assert stream.report.state is TerminalState.FAILED
 
 
 @pytest.mark.asyncio

@@ -28,7 +28,6 @@ from b24api.error import (
     HTTPGatewayError,
     ProtocolError,
     ResponseTooLargeError,
-    RetryApiResponseError,
     TransportError,
 )
 from b24api.models import (
@@ -991,7 +990,7 @@ def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: Execution
         return not error.possible_acceptance or safety is ReplaySafety.SAFE
     if safety is not ReplaySafety.SAFE:
         return False
-    if isinstance(error, RetryApiResponseError):
+    if isinstance(error, ApiResponseError) and error.retryable:
         return True
     return isinstance(error, HTTPGatewayError) and error.http_status in policy.retry.transient_http_statuses
 

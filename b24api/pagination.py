@@ -55,7 +55,6 @@ from b24api.plans import (
     OffsetContinuation,
     OffsetSequentialPlan,
     OffsetTerminalRule,
-    PartitionedKeysetPlan,
     SingleResponsePlan,
 )
 
@@ -68,7 +67,6 @@ _PLAN_TYPES = (
     CountedOffsetPlan,
     KeysetPlan,
     ItemCursorPlan,
-    PartitionedKeysetPlan,
 )
 
 
@@ -267,7 +265,7 @@ class PaginationDriver:
         page_size: int,
     ) -> AsyncGenerator[_Page]:
         """Execute the committed direct-head/batched-tail counted traversal."""
-        from b24api.batch import BatchExecutor, BatchStream  # noqa: PLC0415
+        from b24api.batch import BatchExecutor, _BatchOutcomeStream  # noqa: PLC0415
         from b24api.models import BatchFailure, BatchSuccess  # noqa: PLC0415
 
         if not isinstance(self.plan, CountedOffsetPlan):
@@ -275,7 +273,7 @@ class PaginationDriver:
         if self.plan.mode is not CountedOffsetMode.SEQUENTIAL_NEXT:
             raise CapabilityError("compatibility counted batch traversal requires the canonical counted plan")
         self.begin_external_validation()
-        outcomes: BatchStream | None = None
+        outcomes: _BatchOutcomeStream | None = None
         try:
             head_controls: dict[ParameterPath, object] = {self.plan.offset_path: 0}
             if self.plan.limit_path is not None:
@@ -341,13 +339,10 @@ class PaginationDriver:
                 )
                 for start in range(stride, total, stride)
             )
-            outcomes = BatchStream(
+            outcomes = _BatchOutcomeStream(
                 BatchExecutor(self.executor),
                 requests,
                 batch_size=effective_batch_size,
-                tolerant=True,
-                with_payload=False,
-                fallback_failed="none",
                 policy=self.context.policy,
                 context=self.context,
                 logical_page_per_command=True,
@@ -576,7 +571,7 @@ class PaginationDriver:
             response = await self._fetch(request)
             items = _response_items(response, self.selector)
             self._validate_page(items, response=response)
-            cursor_values, cursor_exhausted = _cursor_values(items, plan)
+            cursor_values = _cursor_values(items, plan)
             _validate_order(cursor_values, plan.direction)
             if cursor is not None and cursor_values:
                 comparison = _compare_identities(cursor_values[0], cursor)
@@ -584,7 +579,7 @@ class PaginationDriver:
                     raise PaginationError("item cursor page ignored its lower bound")
                 if plan.direction == "desc" and comparison >= 0:
                     raise PaginationError("item cursor page ignored its upper bound")
-            terminal = _cursor_terminal(plan, len(items), cursor_exhausted=cursor_exhausted)
+            terminal = _cursor_terminal(plan, len(items))
             if terminal is not None:
                 self._validate_terminal_total()
             if items:
@@ -667,8 +662,6 @@ class PaginationDriver:
         )
         if isinstance(plan, CountedOffsetPlan) and plan.mode is CountedOffsetMode.PARALLEL_FIXED_STRIDE:
             raise CapabilityError("parallel fixed-stride counted traversal requires separate reviewed authorization")
-        if isinstance(plan, PartitionedKeysetPlan):
-            raise CapabilityError("partitioned keyset requires separate reviewed authorization")
         if isinstance(plan, KeysetPlan) and plan.terminal is KeysetTerminalRule.BOUNDARY_ID_SEEN:
             raise CapabilityError("boundary-id keyset requires an externally reviewed boundary contract")
         return _EffectiveConsistency(
@@ -877,11 +870,6 @@ class ItemStream(AsyncIterator[JsonValue]):
         policy: ExecutionPolicy | None = None,
         page_cap_hint: int | None = None,
         assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
-        profile_id: str | None = None,
-        profile_version: int | None = None,
-        profile_source_sha256: str | None = None,
-        profile_evidence_sha256: tuple[str, ...] = (),
-        profile_evidence_candidate_sha: str | None = None,
     ) -> None:
         """Initialize instance state."""
         PaginationDriver.validate_plan(plan)
@@ -896,25 +884,12 @@ class ItemStream(AsyncIterator[JsonValue]):
             page_cap_hint=page_cap_hint,
         )
         self._assurance = assurance
-        self._profile_id = profile_id
-        self._profile_version = profile_version
-        self._profile_source_sha256 = profile_source_sha256
-        self._profile_evidence_sha256 = profile_evidence_sha256
-        self._profile_evidence_candidate_sha = profile_evidence_candidate_sha
         self._runner: AsyncGenerator[tuple[JsonValue, bool]] | None = None
         self._prefetched: tuple[JsonValue, bool] | object = _MISSING
         self._closed = False
         self._emitted = 0
         self._unique_emitted = 0
-        self.report = OperationReport(
-            assurance=assurance,
-            profile_id=profile_id,
-            profile_version=profile_version,
-            profile_applicable=True if profile_id is not None else None,
-            profile_source_sha256=profile_source_sha256,
-            profile_evidence_sha256=profile_evidence_sha256,
-            profile_evidence_candidate_sha=profile_evidence_candidate_sha,
-        )
+        self.report = OperationReport(assurance=assurance)
 
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
@@ -1108,12 +1083,6 @@ class ItemStream(AsyncIterator[JsonValue]):
             snapshot=snapshot_state,
             plan_id=type(self._driver.plan).__name__,
             dispatch_id="sequential_direct",
-            profile_id=self._profile_id,
-            profile_version=self._profile_version,
-            profile_applicable=True if self._profile_id is not None else None,
-            profile_source_sha256=self._profile_source_sha256,
-            profile_evidence_sha256=self._profile_evidence_sha256,
-            profile_evidence_candidate_sha=self._profile_evidence_candidate_sha,
             emitted_rows=self._emitted,
             unique_rows=self._unique_emitted,
             physical_requests=snapshot.counters.physical_requests,
@@ -1136,11 +1105,6 @@ def iter_list(  # noqa: PLR0913
     policy: ExecutionPolicy | None = None,
     _page_cap_hint: int | None = None,
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
-    _profile_id: str | None = None,
-    _profile_version: int | None = None,
-    _profile_source_sha256: str | None = None,
-    _profile_evidence_sha256: tuple[str, ...] = (),
-    _profile_evidence_candidate_sha: str | None = None,
 ) -> ItemStream:
     """Construct a lazy canonical item stream without performing I/O."""
     return ItemStream(
@@ -1152,11 +1116,6 @@ def iter_list(  # noqa: PLR0913
         policy=policy,
         page_cap_hint=_page_cap_hint,
         assurance=_assurance,
-        profile_id=_profile_id,
-        profile_version=_profile_version,
-        profile_source_sha256=_profile_source_sha256,
-        profile_evidence_sha256=_profile_evidence_sha256,
-        profile_evidence_candidate_sha=_profile_evidence_candidate_sha,
     )
 
 
@@ -1368,14 +1327,6 @@ def _offset_terminal(
         and response.next is None
     ):
         return "qualified total reached"
-    if OffsetTerminalRule.PROFILE_ABSENT_NEXT in plan.terminal and response.next is None:
-        return "profile-authorized absent continuation"
-    if (
-        OffsetTerminalRule.PROFILE_SHORT_PAGE in plan.terminal
-        and plan.requested_page_size is not None
-        and page_size < plan.requested_page_size
-    ):
-        return "profile-authorized short page"
     return None
 
 
@@ -1392,39 +1343,21 @@ def _next_offset(plan: OffsetSequentialPlan, response: Response, *, current: int
 def _keyset_terminal(plan: KeysetPlan, page_size: int) -> str | None:
     if plan.terminal is KeysetTerminalRule.EMPTY_CONFIRMATION and page_size == 0:
         return "empty keyset confirmation"
-    if (
-        plan.terminal is KeysetTerminalRule.PROFILE_SHORT_PAGE
-        and plan.requested_page_size is not None
-        and page_size < plan.requested_page_size
-    ):
-        return "profile-authorized short keyset page"
     return None
 
 
-def _cursor_terminal(plan: ItemCursorPlan, page_size: int, *, cursor_exhausted: bool) -> str | None:
+def _cursor_terminal(plan: ItemCursorPlan, page_size: int) -> str | None:
     if plan.terminal is CursorTerminalRule.EMPTY_CONFIRMATION and page_size == 0:
         return "empty cursor confirmation"
-    if (
-        plan.terminal is CursorTerminalRule.PROFILE_SHORT_PAGE
-        and plan.requested_page_size is not None
-        and page_size < plan.requested_page_size
-    ):
-        return "profile-authorized short cursor page"
-    if plan.terminal is CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED and cursor_exhausted:
-        return "profile-authorized cursor exhaustion"
     return None
 
 
-def _cursor_values(items: list[JsonValue], plan: ItemCursorPlan) -> tuple[list[IdentityValue], bool]:
+def _cursor_values(items: list[JsonValue], plan: ItemCursorPlan) -> list[IdentityValue]:
     raw_values = [_extract_optional_path(item, plan.cursor_item_path) for item in items]
     exhausted = [value is _MISSING or value is None for value in raw_values]
-    if plan.terminal is CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED and (not raw_values or all(exhausted)):
-        return [], True
     if any(exhausted):
-        if plan.terminal is CursorTerminalRule.PROFILE_CURSOR_EXHAUSTED:
-            raise PaginationError("cursor exhaustion is inconsistent within the page")
         raise PaginationError(f"cursor path is missing: {plan.cursor_item_path!r}")
-    return [_coerce_cursor(cast("JsonValue", value), plan.cursor_coercion) for value in raw_values], False
+    return [_coerce_cursor(cast("JsonValue", value), plan.cursor_coercion) for value in raw_values]
 
 
 def _extract_optional_path(value: JsonValue, path: tuple[str | int, ...]) -> JsonValue | object:

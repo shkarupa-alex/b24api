@@ -2892,7 +2892,8 @@ def test_wheel_contains_library_but_no_evidence_or_live_tooling(tmp_path: Path) 
         names = archive.namelist()
     assert any(name.startswith("b24api/") for name in names)
     assert not any("b24api_evidence" in name or name.startswith("tools/") for name in names)
-    assert not any(name.endswith(("live.py", "cli.py")) for name in names)
+    assert not any(name.endswith("live.py") for name in names)
+    assert "b24api/cli.py" in names
     assert not any(name.startswith("b24api/") and name.endswith("_test.py") for name in names)
 
 

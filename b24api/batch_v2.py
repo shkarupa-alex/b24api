@@ -252,8 +252,6 @@ class LogicalBatchKernelStream[C]:
                 self._batch_commands += len(chunk.commands)
                 kernel = await self._batch_executor._execute_chunk(
                     chunk.commands,
-                    tolerant=True,
-                    fallback_failed="none",
                     context=self._context,
                     halt=self._fail_fast,
                 )

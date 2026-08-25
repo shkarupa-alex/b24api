@@ -16,7 +16,6 @@ from b24api.models import (
 )
 
 PORTAL_BATCH_CAP = 50
-MINIMUM_PARTITION_LANES = 2
 _START_PATH = ParameterPath(("start",))
 _FILTER_PATH = ParameterPath(("filter",))
 _ORDER_PATH = ParameterPath(("order",))
@@ -36,8 +35,6 @@ class OffsetTerminalRule(StrEnum):
 
     EMPTY_PAGE = "empty_page"
     QUALIFIED_TOTAL = "qualified_total"
-    PROFILE_ABSENT_NEXT = "profile_absent_next"
-    PROFILE_SHORT_PAGE = "profile_short_page"
 
 
 class CountedOffsetMode(StrEnum):
@@ -52,15 +49,12 @@ class KeysetTerminalRule(StrEnum):
 
     BOUNDARY_ID_SEEN = "boundary_id_seen"
     EMPTY_CONFIRMATION = "empty_confirmation"
-    PROFILE_SHORT_PAGE = "profile_short_page"
 
 
 class CursorTerminalRule(StrEnum):
     """Explicit item-cursor terminal evidence."""
 
     EMPTY_CONFIRMATION = "empty_confirmation"
-    PROFILE_SHORT_PAGE = "profile_short_page"
-    PROFILE_CURSOR_EXHAUSTED = "profile_cursor_exhausted"
 
 
 class ReferenceOutputOrder(StrEnum):
@@ -129,8 +123,6 @@ class OffsetSequentialPlan(PlanContract):
         _require_disjoint_paths(self.offset_path, self.limit_path)
         if not self.terminal:
             raise ValueError("offset plan requires at least one terminal rule")
-        if OffsetTerminalRule.PROFILE_SHORT_PAGE in self.terminal and self.requested_page_size is None:
-            raise ValueError("short-page terminal requires a requested_page_size")
         if OffsetTerminalRule.QUALIFIED_TOTAL in self.terminal and self.total_semantics not in {
             TotalSemantics.FILTERED_EXACT,
             TotalSemantics.ADVISORY,
@@ -189,8 +181,6 @@ class KeysetPlan(PlanContract):
         if not isinstance(self.terminal, KeysetTerminalRule):
             raise TypeError("terminal must be a KeysetTerminalRule")
         _validate_page_size(self.limit_path, self.requested_page_size)
-        if self.terminal is KeysetTerminalRule.PROFILE_SHORT_PAGE and self.requested_page_size is None:
-            raise ValueError("short-page terminal requires a requested_page_size")
         _require_disjoint_paths(
             self.filter_path,
             self.order_path,
@@ -242,40 +232,8 @@ class ItemCursorPlan(PlanContract):
             raise TypeError("terminal must be a CursorTerminalRule")
         _validate_page_size(self.limit_path, self.requested_page_size)
         _require_disjoint_paths(self.cursor_request_path, self.limit_path)
-        if self.terminal is CursorTerminalRule.PROFILE_SHORT_PAGE and self.requested_page_size is None:
-            raise ValueError("short-page terminal requires a requested_page_size")
         if self.identity_requirement is not IdentityRequirement.REQUIRED:
             raise ValueError("item cursor plan requires identity")
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class PartitionedKeysetPlan(PlanContract):
-    """Internal fixed-lane partitioned keyset evidence candidate."""
-
-    lane_count: int = 2
-    direction: Literal["asc", "desc"] = "asc"
-    filter_path: ParameterPath = _FILTER_PATH
-    order_path: ParameterPath = _ORDER_PATH
-    limit_path: ParameterPath | None = None
-    requested_page_size: int | None = None
-    merge_order: ReferenceOutputOrder = ReferenceOutputOrder.READY
-
-    def __post_init__(self) -> None:
-        """Validate and normalize instance state."""
-        super(PartitionedKeysetPlan, self).__post_init__()
-        if self.direction not in {"asc", "desc"}:
-            raise ValueError("partition direction must be asc or desc")
-        if not isinstance(self.merge_order, ReferenceOutputOrder):
-            raise TypeError("merge_order must be a ReferenceOutputOrder")
-        if not _is_plain_int(self.lane_count) or not MINIMUM_PARTITION_LANES <= self.lane_count <= PORTAL_BATCH_CAP:
-            raise ValueError("partition lane_count must be between 2 and the hard batch cap 50")
-        _validate_page_size(self.limit_path, self.requested_page_size)
-        _require_disjoint_paths(self.filter_path, self.order_path, self.limit_path)
-        if self.identity_requirement is not IdentityRequirement.REQUIRED:
-            raise ValueError("partitioned keyset requires identity")
-        expected = OrderSemantics.ASCENDING if self.direction == "asc" else OrderSemantics.DESCENDING
-        if self.order_semantics is not expected:
-            raise ValueError("partition direction contradicts order_semantics")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -285,7 +243,6 @@ class BatchDispatch:
     batch_size: int = 50
     concurrency: int = 1
     output_order: ReferenceOutputOrder = ReferenceOutputOrder.READY
-    fallback_failed: Literal["none", "direct"] = "none"
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -295,8 +252,6 @@ class BatchDispatch:
             raise ValueError("batch concurrency must be positive")
         if not isinstance(self.output_order, ReferenceOutputOrder):
             raise TypeError("output_order must be a ReferenceOutputOrder")
-        if self.fallback_failed not in {"none", "direct"}:
-            raise ValueError("fallback_failed must be none or direct")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -314,9 +269,7 @@ class DirectDispatch:
             raise TypeError("output_order must be a ReferenceOutputOrder")
 
 
-type ListPlan = (
-    SingleResponsePlan | OffsetSequentialPlan | CountedOffsetPlan | KeysetPlan | ItemCursorPlan | PartitionedKeysetPlan
-)
+type ListPlan = SingleResponsePlan | OffsetSequentialPlan | CountedOffsetPlan | KeysetPlan | ItemCursorPlan
 type DispatchPlan = BatchDispatch | DirectDispatch
 
 
@@ -358,7 +311,6 @@ __all__ = [
     "OffsetContinuation",
     "OffsetSequentialPlan",
     "OffsetTerminalRule",
-    "PartitionedKeysetPlan",
     "PlanContract",
     "ReferenceOutputOrder",
     "SingleResponsePlan",

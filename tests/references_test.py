@@ -51,6 +51,7 @@ from b24api.plans import (
     OffsetSequentialPlan,
     OffsetTerminalRule,
     ReferenceOutputOrder,
+    SingleResponsePlan,
 )
 from b24api.references import fan_out, iter_references
 
@@ -106,13 +107,8 @@ def _reference(key: str) -> ReferenceRequest:
     return ReferenceRequest(Request("crm.item.list", {"ref": key}), key)
 
 
-def _one_page_plan() -> OffsetSequentialPlan:
-    return OffsetSequentialPlan(
-        limit_path=ParameterPath(("limit",)),
-        requested_page_size=PAGE_SIZE,
-        continuation=OffsetContinuation.SERVER_NEXT,
-        terminal=frozenset({OffsetTerminalRule.PROFILE_ABSENT_NEXT}),
-    )
+def _one_page_plan() -> SingleResponsePlan:
+    return SingleResponsePlan()
 
 
 def _empty_confirmation_plan() -> OffsetSequentialPlan:
@@ -165,6 +161,7 @@ async def test_ready_order_interleaves_references_by_actual_completion() -> None
         Executor(transport),
         [_reference("first"), _reference("second")],
         plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
         dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
         identity=_identity(),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
@@ -198,6 +195,7 @@ async def test_input_order_allows_later_progress_without_cross_reference_reorder
         Executor(transport),
         [_reference("first"), _reference("second")],
         plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
         dispatch=DirectDispatch(concurrency=TWO_REFERENCES, output_order=ReferenceOutputOrder.INPUT),
         identity=_identity(),
         output_order=ReferenceOutputOrder.INPUT,
@@ -630,6 +628,7 @@ async def test_tolerant_reference_failure_preserves_total_correlation() -> None:
         Executor(transport),
         [_reference("bad"), _reference("good")],
         plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
         dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
         identity=_identity(),
         tolerant=True,
@@ -651,6 +650,7 @@ async def test_tolerant_batch_chunk_protocol_failure_yields_every_reference() ->
         Executor(transport),
         [_reference("a"), _reference("b")],
         plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
         dispatch=BatchDispatch(batch_size=TWO_REFERENCES),
         identity=_identity(),
         tolerant=True,
@@ -675,6 +675,7 @@ async def test_failed_input_head_cannot_deadlock_a_full_later_page() -> None:
         Executor(AsyncFunctionTransport(handler)),
         [_reference("first"), _reference("second")],
         plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
         dispatch=DirectDispatch(concurrency=TWO_REFERENCES, output_order=ReferenceOutputOrder.INPUT),
         identity=_identity(),
         output_order=ReferenceOutputOrder.INPUT,
@@ -727,6 +728,7 @@ async def test_async_input_admission_is_bounded_and_closed_on_early_exit() -> No
         Executor(transport),
         source(),
         plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
         dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
         identity=_identity(),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
@@ -1038,6 +1040,7 @@ async def test_duplicate_public_reference_keys_keep_independent_page_budgets() -
         Executor(transport),
         [_reference("same"), _reference("same")],
         plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
         dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
         identity=_identity(),
         policy=ExecutionPolicy(
@@ -1099,13 +1102,7 @@ async def test_early_close_keeps_delivered_unique_count_and_detected_page_warnin
             ],
         },
     )
-    plan = OffsetSequentialPlan(
-        limit_path=ParameterPath(("limit",)),
-        requested_page_size=TWO_REFERENCES,
-        continuation=OffsetContinuation.SERVER_NEXT,
-        terminal=frozenset({OffsetTerminalRule.PROFILE_ABSENT_NEXT}),
-        duplicate_policy=DuplicatePolicy.REPORT,
-    )
+    plan = SingleResponsePlan(duplicate_policy=DuplicatePolicy.REPORT)
     stream = iter_references(
         Executor(transport),
         [_reference("a")],
