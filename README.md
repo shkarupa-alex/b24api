@@ -388,10 +388,10 @@ uv run --with memray memray stats /tmp/b24api.bin
 ```
 
 These deterministic fixtures characterize local resources and network shape; they are not live
-portal latency admission. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for current measurements
-and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for guarantees and ownership boundaries.
+portal latency admission. See [docs/performance.md](docs/performance.md) for current measurements
+and [docs/architecture.md](docs/architecture.md) for guarantees and ownership boundaries.
 
-Projects moving from an earlier API surface can use [MIGRATION.md](MIGRATION.md).
+Projects moving from an earlier API surface can use [docs/migration.md](docs/migration.md).
 
 ## Verification
 
