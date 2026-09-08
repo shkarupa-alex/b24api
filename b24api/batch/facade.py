@@ -18,12 +18,16 @@ from b24api.errors import BatchFailed, InputSourceError
 
 if TYPE_CHECKING:
     from b24api.contracts.policy import ExecutionPolicy
-    from b24api.contracts.report import OperationReport
+    from b24api.contracts.report import OperationReport, Violation
     from b24api.contracts.stream import OperationStream
     from b24api.execution.executor import Executor
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
 type Deregister = Callable[[object], None]
+
+
+def _source_violations(source: object) -> tuple[Violation, ...]:
+    return tuple(cast("list[Violation]", getattr(source, "violations", ())))
 
 
 def _outcome_variant(outcome: CommandOutcome[object]) -> str:
@@ -92,6 +96,7 @@ def batch_stream[C](
         error_items=_error_items,
         source_admitted=lambda: source.admitted,
         source_buffered_commands=lambda: source.buffered_commands_high_water,
+        source_violations=lambda: _source_violations(commands),
         deregister=deregister,
     )
     return cast("OperationStream[CommandSuccess[C]]", stream)
@@ -121,6 +126,7 @@ def batch_outcome_stream[C](
         error_items=_error_items,
         source_admitted=lambda: source.admitted,
         source_buffered_commands=lambda: source.buffered_commands_high_water,
+        source_violations=lambda: _source_violations(commands),
         deregister=deregister,
     )
     return cast("OperationStream[CommandOutcome[C]]", stream)

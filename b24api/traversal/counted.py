@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 import asyncio
-import contextlib
 from typing import TYPE_CHECKING, Self
 
 from b24api.contracts.policy import (
@@ -12,7 +11,9 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     SnapshotState,
 )
+from b24api.contracts.report import retain_page_trace
 from b24api.errors import CapabilityError, IncompleteTraversalError
+from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
 
@@ -20,15 +21,10 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from b24api.contracts.json import JsonValue
-    from b24api.contracts.request import IdentitySpec, Request, ResultSelector
+    from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
     from b24api.contracts.response import ResponseEvidence
     from b24api.execution import Executor
     from b24api.traversal.plans import CountedOffsetPlan
-
-
-def _attach_report(error: BaseException, report: KernelReport) -> None:
-    with contextlib.suppress(AttributeError, TypeError):
-        error.report = report  # type: ignore[attr-defined]
 
 
 class CountedItemStream:
@@ -41,7 +37,7 @@ class CountedItemStream:
         *,
         plan: CountedOffsetPlan,
         selector: ResultSelector,
-        identity: IdentitySpec,
+        identity: TraversalIdentity | None,
         page_size: int,
         batch_size: int,
         policy: ExecutionPolicy,
@@ -139,6 +135,11 @@ class CountedItemStream:
         if state is KernelState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
             state = KernelState.INCOMPLETE
             reason = "required snapshot was not verified"
+        page_trace, page_trace_truncated = retain_page_trace(
+            tuple(self._driver.page_trace),
+            self._context.policy.page_trace_limit,
+        )
+        page_trace_truncated = page_trace_truncated or self._driver.page_trace_truncated
         self.report = KernelReport(
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
@@ -157,6 +158,8 @@ class CountedItemStream:
             violations=tuple(self._driver.violations),
             terminal_reason=reason,
             evidence=tuple(self._evidence),
+            page_trace=page_trace,
+            page_trace_truncated=page_trace_truncated,
         )
 
 

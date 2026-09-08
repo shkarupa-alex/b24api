@@ -1,4 +1,4 @@
-"""Internal lifecycle adapter from proven subsystem streams to the v2 contract."""
+"""Internal lifecycle adapter from subsystem streams to the v2 contract."""
 
 from __future__ import annotations
 import asyncio
@@ -8,9 +8,11 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
 from b24api.contracts.policy import KernelState
-from b24api.contracts.report import OperationReport, TerminalState, TraversalAssurance
+from b24api.contracts.report import OperationReport, TerminalState, TraversalAssurance, Violation
 from b24api.contracts.stream import PartialResult
 from b24api.errors import IncompleteTraversalError
+from b24api.execution.failure import attach_report as _attach_report
+from b24api.execution.failure import finalize_failure
 
 if TYPE_CHECKING:
     from b24api.execution.snapshot import KernelReport
@@ -78,12 +80,9 @@ def _public_report(  # noqa: PLR0913
         buffered_rows_high_water=report.buffered_rows_high_water,
         active_references_high_water=active_references_high_water,
         violations=report.violations,
+        page_trace=report.page_trace,
+        page_trace_truncated=report.page_trace_truncated,
     )
-
-
-def _attach_report(error: BaseException, report: OperationReport) -> None:
-    with contextlib.suppress(AttributeError, TypeError):
-        error.report = report  # type: ignore[attr-defined]
 
 
 async def _resolve[T](value: T | Awaitable[T]) -> T:
@@ -113,6 +112,8 @@ class MappedOperationStream[S, T]:
         source_admitted: Callable[[], int] | None = None,
         source_buffered_commands: Callable[[], int] | None = None,
         source_active_references: Callable[[], int] | None = None,
+        initial_violations: tuple[Violation, ...] = (),
+        source_violations: Callable[[], tuple[Violation, ...]] | None = None,
         deregister: Callable[[MappedOperationStream[S, T]], None] | None = None,
     ) -> None:
         """Initialize without starting or prefetching the source."""
@@ -127,6 +128,8 @@ class MappedOperationStream[S, T]:
         self._source_admitted = source_admitted
         self._source_buffered_commands = source_buffered_commands
         self._source_active_references = source_active_references
+        self._initial_violations = initial_violations
+        self._source_violations = source_violations
         self._deregister = deregister
         self._report: OperationReport | None = None
         self._terminal_error: BaseException | None = None
@@ -192,6 +195,13 @@ class MappedOperationStream[S, T]:
             self._finalize(forced_state=forced)
             report = cast("OperationReport", self._report)
             propagated = self._error_mapper(error, report) if self._error_mapper is not None else error
+            report, _ = finalize_failure(
+                error,
+                report,
+                operation=self._operation,
+                terminal_reason=report.terminal_reason,
+            )
+            self._report = report
             _attach_report(propagated, report)
             self._terminal_error = propagated
             if propagated is error:
@@ -279,6 +289,9 @@ class MappedOperationStream[S, T]:
             active_references_high_water=_read_source_counter(self._source_active_references),
             early_closed=self._early_closed,
         )
+        extra_violations = (*self._initial_violations, *(_read_violations(self._source_violations)))
+        if extra_violations:
+            report = replace(report, violations=(*report.violations, *extra_violations))
         if forced_state is not None and report.state is not forced_state:
             report = replace(report, state=forced_state)
         self._report = report
@@ -295,6 +308,15 @@ def _read_source_counter(reader: Callable[[], int] | None) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise RuntimeError("operation source exposed an invalid report counter")
     return value
+
+
+def _read_violations(reader: Callable[[], tuple[Violation, ...]] | None) -> tuple[Violation, ...]:
+    if reader is None:
+        return ()
+    values = tuple(reader())
+    if any(not isinstance(value, Violation) for value in values):
+        raise RuntimeError("operation source exposed invalid violations")
+    return values
 
 
 __all__ = ["MappedOperationStream"]

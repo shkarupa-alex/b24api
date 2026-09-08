@@ -72,7 +72,7 @@ def decode_one_object(text: str, *, label: str) -> dict[str, object]:
 def cli_request(method: str, parameters: Mapping[str, object], replay_safety: ReplaySafety) -> Request:
     """Construct one request while preserving the CLI's local-error boundary."""
     try:
-        return Request(method, parameters, replay_safety)
+        return Request(method, parameters=parameters, replay_safety=replay_safety)
     except (TypeError, ValueError) as error:
         raise CliUsageError("request method or parameters are invalid") from error
 
@@ -199,12 +199,12 @@ def _keyset(raw: object) -> KeysetSpec:
     start = _path(raw.get("start_suppression_path"), label="keyset.start_suppression_path", optional=True)
     limit_path, allow_create = _control_options(raw, label="keyset")
     return KeysetSpec(
-        cast("ParameterPath", filter_path),
-        cast("ParameterPath", order_path),
-        start,
-        limit_path,
-        cast("Literal['ascending', 'descending']", direction),
-        allow_create,
+        filter_path=cast("ParameterPath", filter_path),
+        order_path=cast("ParameterPath", order_path),
+        start_suppression_path=start,
+        limit_path=limit_path,
+        direction=cast("Literal['ascending', 'descending']", direction),
+        allow_create_controls=allow_create,
     )
 
 

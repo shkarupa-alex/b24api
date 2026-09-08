@@ -16,20 +16,13 @@ from b24api.contracts.request import (
     ParameterPath,
     ResultSelector,
 )
+from b24api.contracts.traversal import OffsetContinuation, SplitOrderSpec
 
 PORTAL_BATCH_CAP = 50
 _START_PATH = ParameterPath(("start",))
 _FILTER_PATH = ParameterPath(("filter",))
 _ORDER_PATH = ParameterPath(("order",))
 _LAST_ID_PATH = ParameterPath(("LAST_ID",))
-
-
-class OffsetContinuation(StrEnum):
-    """How an offset plan computes the next offset."""
-
-    SERVER_NEXT = "server_next"
-    SERVER_NEXT_OR_OBSERVED_COUNT = "server_next_or_observed_count"
-    OBSERVED_COUNT = "observed_count"
 
 
 class OffsetTerminalRule(StrEnum):
@@ -112,6 +105,7 @@ class OffsetSequentialPlan(PlanContract):
     continuation: OffsetContinuation = OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT
     terminal: frozenset[OffsetTerminalRule] = frozenset({OffsetTerminalRule.EMPTY_PAGE})
     allow_create_controls: bool = True
+    fixed_step: int | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -130,6 +124,11 @@ class OffsetSequentialPlan(PlanContract):
             TotalSemantics.ADVISORY,
         }:
             raise ValueError("qualified-total terminal requires exact or advisory total semantics")
+        if self.continuation is OffsetContinuation.FIXED_STEP:
+            if self.fixed_step is None or not _is_plain_int(self.fixed_step) or self.fixed_step < 1:
+                raise ValueError("fixed-step continuation requires a positive fixed_step")
+        elif self.fixed_step is not None:
+            raise ValueError("fixed_step is valid only for fixed-step continuation")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -143,6 +142,7 @@ class CountedOffsetPlan(PlanContract):
     requested_page_size: int | None = None
     fixed_stride: int | None = None
     allow_create_controls: bool = True
+    continuation: OffsetContinuation = OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -168,7 +168,8 @@ class KeysetPlan(PlanContract):
 
     direction: Literal["asc", "desc"] = "asc"
     filter_path: ParameterPath = _FILTER_PATH
-    order_path: ParameterPath = _ORDER_PATH
+    order_path: ParameterPath | None = _ORDER_PATH
+    split_order: SplitOrderSpec | None = None
     limit_path: ParameterPath | None = None
     requested_page_size: int | None = None
     start_suppression_path: ParameterPath | None = _START_PATH
@@ -183,9 +184,16 @@ class KeysetPlan(PlanContract):
         if not isinstance(self.terminal, KeysetTerminalRule):
             raise TypeError("terminal must be a KeysetTerminalRule")
         _validate_page_size(self.limit_path, self.requested_page_size)
+        if (self.order_path is None) == (self.split_order is None):
+            raise ValueError("keyset plan requires exactly one ordering representation")
+        order_paths = (
+            (self.order_path,)
+            if self.split_order is None
+            else (self.split_order.field_path, self.split_order.direction_path)
+        )
         _require_disjoint_paths(
             self.filter_path,
-            self.order_path,
+            *order_paths,
             self.limit_path,
             self.start_suppression_path,
         )

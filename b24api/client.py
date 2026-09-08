@@ -4,22 +4,28 @@
 
 from __future__ import annotations
 import asyncio
+import warnings
 import weakref
 from typing import TYPE_CHECKING, Self, cast
 
+from b24api._audit import audit_command_source
+from b24api._client_traversal import _TraversalFacade
 from b24api.batch.facade import batch_outcome_stream, batch_stream
 from b24api.contracts.dispatch import BatchDispatch, DirectDispatch, DispatchSpec
-from b24api.contracts.policy import ExecutionPolicy
-from b24api.contracts.request import IdentitySpec, RequestLike, ResultSelector, canonical_request
-from b24api.contracts.response import Response, ResultCollectionShape
-from b24api.contracts.traversal import CursorSpec, KeysetSpec, OffsetSpec, TraversalSpec
+from b24api.contracts.policy import ExecutionPolicy, UnknownRequestAudit
+from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.contracts.request import (
+    ReplaySafety,
+    Request,
+    RequestLike,
+    canonical_request,
+)
 from b24api.execution import Executor, HttpxTransport, Transport, await_cleanup_resistant, rearm_cancellation
 from b24api.execution.cleanup import CloseableResource, close_owned_resources
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
 from b24api.references.fanout import fanout_stream
 from b24api.settings import Settings, api_settings
-from b24api.traversal.facade import counted_stream, cursor_stream, keyset_stream, sequential_stream
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterable, Iterable
@@ -28,12 +34,11 @@ if TYPE_CHECKING:
     from b24api.contracts.command import Command, CommandOutcome, CommandSuccess
     from b24api.contracts.json import JsonValue
     from b24api.contracts.reference import ReferenceEvent, ReferenceOutcome
+    from b24api.contracts.response import BinaryResponse, Response
     from b24api.contracts.stream import OperationStream
+    from b24api.contracts.traversal import TraversalSpec
     from b24api.references.binding import BindingSource
 
-_ROOT_SELECTOR = ResultSelector.root()
-_DEFAULT_OFFSET = OffsetSpec()
-_DEFAULT_KEYSET = KeysetSpec()
 _DEFAULT_REFERENCE_DISPATCH = BatchDispatch()
 _DEFAULT_FANOUT_DISPATCH = DirectDispatch()
 
@@ -42,7 +47,7 @@ def _normalized_host(host: str) -> str:
     return host.strip().rstrip(".").casefold()
 
 
-class Bitrix24:
+class Bitrix24(_TraversalFacade):
     """Async method-agnostic client over one correctness kernel."""
 
     def __init__(
@@ -51,6 +56,7 @@ class Bitrix24:
         *,
         policy: ExecutionPolicy | None = None,
         transport: Transport | None = None,
+        unknown_request_audit: UnknownRequestAudit | None = None,
     ) -> None:
         """Compose settings, transport ownership and default policy."""
         resolved = settings if settings is not None else api_settings()
@@ -78,6 +84,7 @@ class Bitrix24:
         )
         self._host = host
         self._closed = False
+        self._unknown_request_audit = unknown_request_audit
         self._close_task: asyncio.Task[None] | None = None
         self._streams: weakref.WeakSet[CloseableResource] = weakref.WeakSet()
 
@@ -88,6 +95,7 @@ class Bitrix24:
         *,
         policy: ExecutionPolicy | None = None,
         host: str = "test.invalid",
+        unknown_request_audit: UnknownRequestAudit | None = None,
     ) -> Bitrix24:
         """Construct over an injected deterministic executor for tests."""
         instance = cls.__new__(cls)
@@ -98,6 +106,7 @@ class Bitrix24:
         instance._default_policy = policy or ExecutionPolicy()
         instance._host = host
         instance._closed = False
+        instance._unknown_request_audit = unknown_request_audit
         instance._close_task = None
         instance._streams = weakref.WeakSet()
         return instance
@@ -149,7 +158,16 @@ class Bitrix24:
     async def call_response(self, request: RequestLike, *, policy: ExecutionPolicy | None = None) -> Response:
         """Execute one request and return its immutable response envelope."""
         self._require_open()
-        return await self._executor.execute(canonical_request(request), policy=policy or self._default_policy)
+        canonical = canonical_request(request)
+        self._audit_unknown(canonical)
+        return await self._executor.execute(canonical, policy=policy or self._default_policy)
+
+    async def call_bytes(self, request: RequestLike, *, policy: ExecutionPolicy | None = None) -> BinaryResponse:
+        """Execute one request and return its bounded response bytes unchanged."""
+        self._require_open()
+        canonical = canonical_request(request)
+        self._audit_unknown(canonical)
+        return await self._executor.execute_bytes(canonical, policy=policy or self._default_policy)
 
     def batch[C](
         self,
@@ -163,7 +181,7 @@ class Bitrix24:
         return self._register_stream(
             batch_stream(
                 self._executor,
-                commands,
+                audit_command_source(commands, self._audit_unknown),
                 batch_size=batch_size,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
@@ -182,7 +200,7 @@ class Bitrix24:
         return self._register_stream(
             batch_outcome_stream(
                 self._executor,
-                commands,
+                audit_command_source(commands, self._audit_unknown),
                 batch_size=batch_size,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
@@ -200,7 +218,7 @@ class Bitrix24:
         self._require_open()
         stream = fanout_stream(
             self._executor,
-            commands,
+            audit_command_source(commands, self._audit_unknown),
             dispatch=dispatch,
             policy=policy or self._default_policy,
             tolerant=False,
@@ -220,7 +238,7 @@ class Bitrix24:
         return self._register_stream(
             fanout_stream(
                 self._executor,
-                commands,
+                audit_command_source(commands, self._audit_unknown),
                 dispatch=dispatch,
                 policy=policy or self._default_policy,
                 tolerant=True,
@@ -247,6 +265,7 @@ class Bitrix24:
             dispatch=dispatch,
             policy=policy or self._default_policy,
             tolerant=False,
+            audit=self._audit_unknown,
             deregister=self._discard_stream,
         )
         return cast("OperationStream[ReferenceEvent[C]]", self._register_stream(stream))
@@ -271,116 +290,7 @@ class Bitrix24:
                 dispatch=dispatch,
                 policy=policy or self._default_policy,
                 tolerant=True,
-                deregister=self._discard_stream,
-            ),
-        )
-
-    def iter_list(  # noqa: PLR0913
-        self,
-        request: RequestLike,
-        *,
-        selector: ResultSelector = _ROOT_SELECTOR,
-        identity: IdentitySpec | None = None,
-        collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
-        page_size: int = 50,
-        offset: OffsetSpec = _DEFAULT_OFFSET,
-        policy: ExecutionPolicy | None = None,
-    ) -> OperationStream[JsonValue]:
-        """Return conservative sequential offset/server-next traversal."""
-        self._require_open()
-        return self._register_stream(
-            sequential_stream(
-                self._executor,
-                request,
-                selector=selector,
-                identity=identity,
-                collection_shape=collection_shape,
-                page_size=page_size,
-                offset=offset,
-                policy=policy or self._default_policy,
-                deregister=self._discard_stream,
-            ),
-        )
-
-    def iter_list_counted(  # noqa: PLR0913
-        self,
-        request: RequestLike,
-        *,
-        identity: IdentitySpec,
-        selector: ResultSelector = _ROOT_SELECTOR,
-        collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
-        page_size: int = 50,
-        batch_size: int | None = None,
-        offset: OffsetSpec = _DEFAULT_OFFSET,
-        policy: ExecutionPolicy | None = None,
-    ) -> OperationStream[JsonValue]:
-        """Return exact direct-head plus physically batched counted traversal."""
-        self._require_open()
-        return self._register_stream(
-            counted_stream(
-                self._executor,
-                request,
-                identity=identity,
-                selector=selector,
-                collection_shape=collection_shape,
-                page_size=page_size,
-                batch_size=batch_size,
-                offset=offset,
-                policy=policy or self._default_policy,
-                deregister=self._discard_stream,
-            ),
-        )
-
-    def iter_list_keyset(  # noqa: PLR0913
-        self,
-        request: RequestLike,
-        *,
-        selector: ResultSelector,
-        identity: IdentitySpec,
-        collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
-        page_size: int = 50,
-        keyset: KeysetSpec = _DEFAULT_KEYSET,
-        policy: ExecutionPolicy | None = None,
-    ) -> OperationStream[JsonValue]:
-        """Return exact sequential no-count keyset traversal."""
-        self._require_open()
-        return self._register_stream(
-            keyset_stream(
-                self._executor,
-                request,
-                selector=selector,
-                identity=identity,
-                collection_shape=collection_shape,
-                page_size=page_size,
-                keyset=keyset,
-                policy=policy or self._default_policy,
-                deregister=self._discard_stream,
-            ),
-        )
-
-    def iter_list_cursor(  # noqa: PLR0913
-        self,
-        request: RequestLike,
-        *,
-        selector: ResultSelector,
-        cursor: CursorSpec,
-        identity: IdentitySpec | None = None,
-        collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
-        page_size: int = 50,
-        policy: ExecutionPolicy | None = None,
-    ) -> OperationStream[JsonValue]:
-        """Return strict dependent cursor traversal with empty confirmation."""
-        self._require_open()
-        return self._register_stream(
-            cursor_stream(
-                self._executor,
-                request,
-                selector=selector,
-                cursor=cursor,
-                identity=identity,
-                collection_shape=collection_shape,
-                page_size=page_size,
-                policy=policy or self._default_policy,
+                audit=self._audit_unknown,
                 deregister=self._discard_stream,
             ),
         )
@@ -395,6 +305,20 @@ class Bitrix24:
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("client is closed")
+
+    def _audit_unknown(self, request: Request) -> Violation | None:
+        if request.replay_safety is not ReplaySafety.UNKNOWN or self._unknown_request_audit is None:
+            return None
+        try:
+            self._unknown_request_audit(request.summary)
+        except Exception:  # noqa: BLE001 - observational hooks cannot affect dispatch
+            warnings.warn(
+                "unknown-request audit hook failed",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return Violation(ViolationSeverity.WARNING, "audit_hook_failed", "unknown-request audit hook failed")
+        return None
 
 
 __all__ = ["Bitrix24"]

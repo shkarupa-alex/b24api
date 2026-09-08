@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import math
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, cast
@@ -15,12 +16,83 @@ if TYPE_CHECKING:
 
     from b24api.contracts.request import ParameterPath
 
+_HTTP_STATUS_MINIMUM = 100
+_HTTP_STATUS_MAXIMUM = 599
+_MEDIA_TYPE_MAXIMUM = 127
+_MEDIA_TYPE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+
+def _safe_media_type(value: str | None) -> str | None:
+    """Return only a bounded normalized media type, never header parameters."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("content type must be a string or None")
+    media_type = value.split(";", 1)[0].strip().casefold()
+    return media_type if len(media_type) <= _MEDIA_TYPE_MAXIMUM and _MEDIA_TYPE.fullmatch(media_type) else None
+
 
 class ResultCollectionShape(StrEnum):
     """Closed interpretation of a selected result collection."""
 
     SEQUENCE = "sequence"
     MAPPING_VALUES = "mapping_values"
+    MAPPING_VALUES_OR_EMPTY = "mapping_values_or_empty"
+
+
+@dataclass(frozen=True, slots=True)
+class BinaryEvidence:
+    """Value-free evidence for a bounded binary response."""
+
+    status_code: int
+    content_type: str | None
+    byte_length: int
+    sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate evidence fields."""
+        if not _is_plain_int(self.status_code) or not _HTTP_STATUS_MINIMUM <= self.status_code <= _HTTP_STATUS_MAXIMUM:
+            raise ValueError("binary response status must be between 100 and 599")
+        if not _is_plain_int(self.byte_length) or self.byte_length < 0:
+            raise ValueError("binary response byte length must be non-negative")
+        object.__setattr__(self, "content_type", _safe_media_type(self.content_type))
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class BinaryResponse:
+    """Explicit byte response with body-free diagnostics."""
+
+    content_type: str | None
+    evidence: BinaryEvidence
+    _body: bytes = field(repr=False)
+
+    def __init__(self, body: bytes, *, content_type: str | None, evidence: BinaryEvidence) -> None:
+        """Copy and retain bounded response bytes."""
+        copied = bytes(body)
+        if len(copied) != evidence.byte_length:
+            raise ValueError("binary evidence length does not match body")
+        if _safe_media_type(content_type) != evidence.content_type:
+            raise ValueError("binary response content type does not match evidence")
+        object.__setattr__(self, "content_type", evidence.content_type)
+        object.__setattr__(self, "evidence", evidence)
+        object.__setattr__(self, "_body", copied)
+
+    @property
+    def body(self) -> bytes:
+        """Return immutable response bytes."""
+        return self._body
+
+    @property
+    def byte_length(self) -> int:
+        """Return response byte length."""
+        return len(self._body)
+
+    def __repr__(self) -> str:
+        """Return a body-free representation."""
+        return (
+            f"BinaryResponse(status_code={self.evidence.status_code!r}, content_type={self.content_type!r}, "
+            f"byte_length={self.byte_length!r})"
+        )
 
 
 @dataclass(frozen=True, slots=True)

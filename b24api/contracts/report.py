@@ -57,6 +57,73 @@ class TraversalAssurance(StrEnum):
 
     MECHANICS_ONLY = "mechanics_only"
     IDENTITY_EXACT = "identity_exact"
+    COUNT_MATCHED = "count_matched"
+    IDENTITY_AND_COUNT_MATCHED = "identity_and_count_matched"
+
+
+class PageDispatch(StrEnum):
+    """How one logical traversal page was dispatched."""
+
+    DIRECT = "direct"
+    BATCH = "batch"
+
+
+class PageOutcome(StrEnum):
+    """Whether a scheduled page was committed, rejected, or unknown."""
+
+    COMMITTED = "committed"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
+
+
+class PageRejectionCode(StrEnum):
+    """Bounded page-level rejection categories."""
+
+    DUPLICATE_IDENTITY = "duplicate_identity"
+    REPEATED_FINGERPRINT = "repeated_fingerprint"
+    TOTAL_DRIFT = "total_drift"
+    RANGE_CONTRADICTION = "range_contradiction"
+    COMMAND_FAILURE = "command_failure"
+    SHAPE_CONTRACT = "shape_contract"
+    IDENTITY_CONTRACT = "identity_contract"
+    AMBIGUOUS_EXECUTION = "ambiguous_execution"
+
+
+@dataclass(frozen=True, slots=True)
+class PageRecord:
+    """Value-free provenance for one logical traversal page."""
+
+    sequence: int
+    offset: int | None
+    dispatch: PageDispatch
+    batch_index: int | None
+    rows_selected: int
+    rows_admitted: int
+    reported_total: int | None
+    reported_next: int | None
+    outcome: PageOutcome
+    rejection_code: PageRejectionCode | None
+    reference_index: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate page evidence."""
+        integers = (self.sequence, self.rows_selected, self.rows_admitted)
+        optional = (self.offset, self.batch_index, self.reported_total, self.reported_next, self.reference_index)
+        if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in integers):
+            raise ValueError("page counters must be non-negative integers")
+        if any(
+            value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0)
+            for value in optional
+        ):
+            raise ValueError("optional page counters must be non-negative integers")
+        if not isinstance(self.dispatch, PageDispatch) or not isinstance(self.outcome, PageOutcome):
+            raise TypeError("page record enums must use their declared types")
+        if self.rejection_code is not None and not isinstance(self.rejection_code, PageRejectionCode):
+            raise TypeError("rejection_code must be a PageRejectionCode")
+        if self.outcome is PageOutcome.COMMITTED and self.rejection_code is not None:
+            raise ValueError("committed pages cannot carry a rejection code")
+        if self.outcome is not PageOutcome.COMMITTED and self.rows_admitted:
+            raise ValueError("uncommitted pages cannot admit rows")
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +151,8 @@ class OperationReport:
     buffered_rows_high_water: int = 0
     active_references_high_water: int = 0
     violations: tuple[Violation, ...] = ()
+    page_trace: tuple[PageRecord, ...] = ()
+    page_trace_truncated: bool = False
 
     def __post_init__(self) -> None:
         """Validate bounded terminal evidence."""
@@ -115,6 +184,11 @@ class OperationReport:
         if not math.isfinite(self.cooldown_seconds) or self.cooldown_seconds < 0:
             raise ValueError("cooldown_seconds must be finite and non-negative")
         object.__setattr__(self, "violations", tuple(self.violations))
+        object.__setattr__(self, "page_trace", tuple(self.page_trace))
+        if any(not isinstance(record, PageRecord) for record in self.page_trace):
+            raise TypeError("page_trace must contain PageRecord values")
+        if not isinstance(self.page_trace_truncated, bool):
+            raise TypeError("page_trace_truncated must be a bool")
         if self.successful and any(item.severity is ViolationSeverity.BLOCKING for item in self.violations):
             raise ValueError("successful report cannot contain blocking violations")
 
@@ -134,4 +208,34 @@ class OperationReport:
         return not self.exhausted
 
 
-__all__ = ["OperationReport", "TerminalState", "TraversalAssurance", "Violation", "ViolationSeverity"]
+def retain_page_trace(records: tuple[PageRecord, ...], limit: int) -> tuple[tuple[PageRecord, ...], bool]:
+    """Retain bounded page provenance with anomaly priority."""
+    if limit <= 0:
+        return (), bool(records)
+    if len(records) <= limit:
+        return records, False
+    anomalies = tuple(record for record in records if record.outcome is not PageOutcome.COMMITTED)
+    normal = tuple(record for record in records if record.outcome is PageOutcome.COMMITTED)
+    if len(anomalies) >= limit:
+        early = (limit + 1) // 2
+        kept = (*anomalies[:early], *anomalies[-(limit - early) :]) if limit > early else anomalies[:early]
+    else:
+        remaining = limit - len(anomalies)
+        early = min(len(normal), max(1, remaining // 4))
+        recent_count = remaining - early
+        recent = normal[-recent_count:] if recent_count else ()
+        kept = (*anomalies, *normal[:early], *recent)
+    return tuple(sorted(set(kept), key=lambda record: record.sequence)), True
+
+
+__all__ = [
+    "OperationReport",
+    "PageDispatch",
+    "PageOutcome",
+    "PageRecord",
+    "PageRejectionCode",
+    "TerminalState",
+    "TraversalAssurance",
+    "Violation",
+    "ViolationSeverity",
+]

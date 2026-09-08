@@ -5,8 +5,8 @@ import asyncio
 from collections.abc import AsyncIterable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
-from urllib.parse import quote_plus
 
+from b24api._error_types import ErrorOrigin
 from b24api.batch.outcome import (
     BatchCommandEvidence,
     BatchFailure,
@@ -19,12 +19,14 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.request import ReplaySafety, Request
 from b24api.contracts.response import Response
-from b24api.errors import B24ApiError, BatchCommandError, ErrorOrigin, ProtocolError
+from b24api.encoding import encode_php_query
+from b24api.errors import B24ApiError, BatchCommandError, ProtocolError
 from b24api.execution import (
     ExecutionContext,
     Executor,
     WorkClass,
 )
+from b24api.execution.executor import _raise_embedded_result_error
 from b24api.traversal.plans import PORTAL_BATCH_CAP
 
 if TYPE_CHECKING:
@@ -151,6 +153,22 @@ class BatchExecutor:
                     next=_optional_batch_integer(envelope.continuations, command.stable_key, field="next"),
                     evidence=response.evidence,
                 )
+                _raise_embedded_result_error(
+                    command.request,
+                    command_response.result,
+                    http_status=response.evidence.http_status or 200,
+                    retry_codes=context.policy.retry.transient_api_codes,
+                    batch=True,
+                )
+            except BatchCommandError as error:
+                command_evidence = BatchCommandEvidence(
+                    command.index,
+                    command.stable_key,
+                    original_code=error.original_code,
+                    normalized_code=error.normalized_code,
+                )
+                outcomes.append(_command_failure(command, error, evidence=command_evidence))
+                continue
             except (TypeError, ValueError) as error:
                 protocol_error = ProtocolError(
                     "Batch command metadata is malformed",
@@ -228,6 +246,10 @@ class BatchExecutor:
 
 
 def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
+    if any(command.request.encoding.value != "json" or command.request.headers.items for command in commands):
+        from b24api.errors import CapabilityError  # noqa: PLC0415
+
+        raise CapabilityError("physical batch supports JSON requests without scoped headers; use direct dispatch")
     safety_values = {command.request.replay_safety or ReplaySafety.UNKNOWN for command in commands}
     if safety_values == {ReplaySafety.SAFE}:
         safety = ReplaySafety.SAFE
@@ -236,7 +258,7 @@ def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
     else:
         safety = ReplaySafety.UNKNOWN
     encoded = {command.stable_key: _command_query(command.request) for command in commands}
-    return Request("batch", {"halt": int(halt), "cmd": encoded}, replay_safety=safety)
+    return Request("batch", parameters={"halt": int(halt), "cmd": encoded}, replay_safety=safety)
 
 
 def _command_query(request: Request) -> str:
@@ -246,19 +268,7 @@ def _command_query(request: Request) -> str:
 
 def _build_query(parameters: Mapping[str | int, object], path: str = "%s") -> str:
     """Encode nested JSON values with Bitrix/PHP bracket semantics."""
-    parts: list[str] = []
-    for key, raw_value in parameters.items():
-        if raw_value is None:
-            continue
-        value: object = dict(enumerate(raw_value)) if isinstance(raw_value, list | tuple) else raw_value
-        if isinstance(value, Mapping):
-            nested = _build_query(value, path % key + "[%s]")
-            if nested:
-                parts.append(nested)
-            continue
-        encoded_key = quote_plus(path % key)
-        parts.append(f"{encoded_key}={quote_plus(str(value))}")
-    return "&".join(parts)
+    return encode_php_query(parameters, path)
 
 
 def _decode_batch_envelope(raw: JsonValue) -> _BatchEnvelope:

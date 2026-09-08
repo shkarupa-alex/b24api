@@ -16,7 +16,7 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     SnapshotState,
 )
-from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.contracts.report import Violation, ViolationSeverity, retain_page_trace
 from b24api.errors import IncompleteTraversalError, PaginationError
 from b24api.execution import (
     Executor,
@@ -24,12 +24,13 @@ from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
 )
+from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
-from b24api.traversal.identity import _MISSING, _attach_report, _Page
+from b24api.traversal.identity import _MISSING, _Page
 
 if TYPE_CHECKING:
-    from b24api.contracts.request import IdentitySpec, Request, ResultSelector
+    from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
     from b24api.traversal.plans import (
         ListPlan,
     )
@@ -45,7 +46,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         plan: ListPlan,
         *,
         selector: ResultSelector | None = None,
-        identity: IdentitySpec | None = None,
+        identity: TraversalIdentity | None = None,
         policy: ExecutionPolicy | None = None,
         page_cap_hint: int | None = None,
         assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
@@ -171,7 +172,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             raise
         except PaginationError as error:
             cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.INCOMPLETE, type(error).__name__),
+                self._finalize(KernelState.INCOMPLETE, "PaginationError"),
             )
             incomplete = IncompleteTraversalError(report=self.report)
             primary_error = incomplete
@@ -267,6 +268,11 @@ class ItemStream(AsyncIterator[JsonValue]):
                     message="the requested stable snapshot was not verified",
                 ),
             )
+        page_trace, page_trace_truncated = retain_page_trace(
+            tuple(self._driver.page_trace),
+            self._context.policy.page_trace_limit,
+        )
+        page_trace_truncated = page_trace_truncated or self._driver.page_trace_truncated
         self.report = KernelReport(
             state=state,
             assurance=self._assurance,
@@ -282,6 +288,8 @@ class ItemStream(AsyncIterator[JsonValue]):
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
             violations=violations,
             terminal_reason=reason,
+            page_trace=page_trace,
+            page_trace_truncated=page_trace_truncated,
         )
 
 
@@ -291,7 +299,7 @@ def iter_list(  # noqa: PLR0913
     *,
     plan: ListPlan,
     selector: ResultSelector | None = None,
-    identity: IdentitySpec | None = None,
+    identity: TraversalIdentity | None = None,
     policy: ExecutionPolicy | None = None,
     _page_cap_hint: int | None = None,
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,

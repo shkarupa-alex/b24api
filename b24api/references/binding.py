@@ -3,18 +3,19 @@
 # ruff: noqa: TRY301 - iterator adapters normalize source failures
 
 from __future__ import annotations
-from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, Self, cast, runtime_checkable
 
 from b24api.contracts.command import NotExecutedReason
 from b24api.contracts.reference import Binding
-from b24api.contracts.request import ParameterPath, Request
-from b24api.contracts.traversal import CountedTraversal, KeysetTraversal, SequentialTraversal, TraversalSpec
+from b24api.contracts.traversal import TraversalSpec, traversal_control_paths
 from b24api.references.outcome import ReferenceRequest
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
+    from b24api.contracts.report import Violation
+    from b24api.contracts.request import ParameterPath, Request
 
 type BindingSource[C] = Iterable[Binding[C]] | AsyncIterable[Binding[C]]
 
@@ -56,24 +57,8 @@ def _overlaps(left: tuple[str | int, ...], right: tuple[str | int, ...]) -> bool
     return left[:shared] == right[:shared]
 
 
-def _control_paths(traversal: TraversalSpec) -> tuple[ParameterPath, ...]:
-    if isinstance(traversal, SequentialTraversal | CountedTraversal):
-        return tuple(
-            path for path in (traversal.offset.parameter_path, traversal.offset.limit_path) if path is not None
-        )
-    if isinstance(traversal, KeysetTraversal):
-        keyset = traversal.keyset
-        return tuple(
-            path
-            for path in (keyset.filter_path, keyset.order_path, keyset.start_suppression_path, keyset.limit_path)
-            if path is not None
-        )
-    cursor = traversal.cursor
-    return tuple(path for path in (cursor.parameter_path, cursor.limit_path) if path is not None)
-
-
 def _validate_binding_controls(binding: Binding[object], traversal: TraversalSpec) -> None:
-    controls = tuple(_normalized(path) for path in _control_paths(traversal))
+    controls = tuple(_normalized(path) for path in traversal_control_paths(traversal))
     for update in binding.updates:
         update_path = _normalized(update.path)
         if any(_overlaps(update_path, control) for control in controls):
@@ -123,7 +108,7 @@ def _bind_request(base: Request, binding: Binding[object], index: int, traversal
     except (KeyError, TypeError, ValueError) as error:
         raise _BindingLocalValidationError from error
     return ReferenceRequest(
-        Request(base.method, parameters, base.replay_safety),
+        base.with_parameters(parameters),
         f"r{index:012d}",
         _BindingContext(index, binding.correlation),
     )
@@ -140,11 +125,19 @@ def _local_validation_failure(base: Request, binding: Binding[object], index: in
 
 
 class _SyncBindingAdapter[C](Iterator[ReferenceRequest]):
-    def __init__(self, base: Request, source: Iterable[Binding[C]], traversal: TraversalSpec) -> None:
+    def __init__(
+        self,
+        base: Request,
+        source: Iterable[Binding[C]],
+        traversal: TraversalSpec,
+        audit: Callable[[Request], Violation | None] | None,
+    ) -> None:
         self._base = base
         self._iterator = iter(source)
         self._traversal = traversal
+        self._audit = audit
         self._index = 0
+        self.violations: list[Violation] = []
 
     def __iter__(self) -> Self:
         return self
@@ -163,6 +156,10 @@ class _SyncBindingAdapter[C](Iterator[ReferenceRequest]):
             raise
         except Exception as error:
             raise _BindingSourceError from error
+        if self._audit is not None:
+            violation = self._audit(request.request)
+            if violation is not None:
+                self.violations.append(violation)
         self._index += 1
         return request
 
@@ -172,11 +169,19 @@ class _SyncBindingAdapter[C](Iterator[ReferenceRequest]):
 
 
 class _AsyncBindingAdapter[C](AsyncIterator[ReferenceRequest]):
-    def __init__(self, base: Request, source: AsyncIterable[Binding[C]], traversal: TraversalSpec) -> None:
+    def __init__(
+        self,
+        base: Request,
+        source: AsyncIterable[Binding[C]],
+        traversal: TraversalSpec,
+        audit: Callable[[Request], Violation | None] | None,
+    ) -> None:
         self._base = base
         self._iterator = aiter(source)
         self._traversal = traversal
+        self._audit = audit
         self._index = 0
+        self.violations: list[Violation] = []
 
     def __aiter__(self) -> Self:
         return self
@@ -195,6 +200,10 @@ class _AsyncBindingAdapter[C](AsyncIterator[ReferenceRequest]):
             raise
         except Exception as error:
             raise _BindingSourceError from error
+        if self._audit is not None:
+            violation = self._audit(request.request)
+            if violation is not None:
+                self.violations.append(violation)
         self._index += 1
         return request
 
@@ -207,11 +216,12 @@ def binding_source[C](
     base: Request,
     source: BindingSource[C],
     traversal: TraversalSpec,
+    audit: Callable[[Request], Violation | None] | None = None,
 ) -> Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]:
     """Adapt a lazy binding source while preserving exact iterator ownership."""
     if isinstance(source, AsyncIterable):
-        return _AsyncBindingAdapter(base, source, traversal)
-    return _SyncBindingAdapter(base, source, traversal)
+        return _AsyncBindingAdapter(base, source, traversal, audit)
+    return _SyncBindingAdapter(base, source, traversal, audit)
 
 
 __all__ = ["BindingSource", "binding_source"]

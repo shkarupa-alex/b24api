@@ -1,8 +1,11 @@
 """Single-response and sequential offset traversal strategies."""
 
+# ruff: noqa: TRY301 - rejected-page evidence is recorded at this transaction boundary
+
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
+from b24api.contracts.report import PageDispatch, PageRejectionCode
 from b24api.errors import CapabilityError, PaginationError
 from b24api.execution import (
     WorkClass,
@@ -12,9 +15,9 @@ from b24api.traversal.identity import (
     _next_offset,
     _offset_terminal,
     _Page,
+    _PageRejectionError,
     _request_with_controls,
 )
-from b24api.traversal.values import _response_items
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -35,24 +38,34 @@ class _SequentialMixin:
 
     async def _single(self: Any, plan: SingleResponsePlan) -> AsyncGenerator[_Page]:
         response = await self._fetch(self.request)
-        qualified_count = (
-            len(response.result)
-            if self._single_result_as_item and self.selector.path == () and isinstance(response.result, list)
-            else None
-        )
-        items = (
-            [response.result]
-            if self._single_result_as_item and self.selector.path == ()
-            else _response_items(response, self.selector, single=True)
-        )
-        if qualified_count is None:
-            qualified_count = len(items)
-        if plan.reject_continuation and response.next is not None:
-            raise CapabilityError("single-response plan observed a continuation")
-        if plan.reject_positive_total_over_result and response.total is not None and response.total > qualified_count:
-            raise CapabilityError("single-response plan observed a larger qualified total")
-        self._validate_page(items, response=response, qualified_count=qualified_count)
-        self._validate_terminal_total()
+        trace_count = self.page_trace_count
+        items: list[JsonValue] = []
+        try:
+            qualified_count = (
+                len(response.result)
+                if self._single_result_as_item and self.selector.path == () and isinstance(response.result, list)
+                else None
+            )
+            items = (
+                [response.result]
+                if self._single_result_as_item and self.selector.path == ()
+                else self.select_page(response, single=True)
+            )
+            if qualified_count is None:
+                qualified_count = len(items)
+            if plan.reject_continuation and response.next is not None:
+                raise CapabilityError("single-response plan observed a continuation")
+            if (
+                plan.reject_positive_total_over_result
+                and response.total is not None
+                and response.total > qualified_count
+            ):
+                raise CapabilityError("single-response plan observed a larger qualified total")
+            self._validate_page(items, response=response, qualified_count=qualified_count, terminal=True)
+        except BaseException as error:
+            if self.page_trace_count == trace_count:
+                self.reject_external_page(items, response, error)
+            raise
         self.terminal_reason = "single response complete"
         item_weights = (qualified_count,) if self._single_result_as_item else (1,) * len(items)
         yield _Page(tuple(items), response, item_weights)
@@ -65,6 +78,7 @@ class _SequentialMixin:
             if offset in visited_offsets:
                 raise PaginationError("offset cycle detected")
             visited_offsets.add(offset)
+            self.schedule_page(offset=offset, dispatch=PageDispatch.DIRECT)
             updates: dict[ParameterPath, object] = {plan.offset_path: offset}
             if plan.limit_path is not None and plan.requested_page_size is not None:
                 updates[plan.limit_path] = plan.requested_page_size
@@ -76,29 +90,38 @@ class _SequentialMixin:
                     replace=frozenset({plan.offset_path}),
                 ),
             )
-            items = _response_items(response, self.selector)
-            self._validate_page(items, response=response)
-            terminal = _offset_terminal(
-                plan,
-                response,
-                page_size=len(items),
-                accepted=self.validated_rows,
-                confirmation=self._confirmation_policy,
-            )
-            if terminal is not None:
-                self._validate_terminal_total()
+            trace_count = self.page_trace_count
+            items: list[JsonValue] = []
+            try:
+                items = self.select_page(response)
+                terminal = _offset_terminal(
+                    plan,
+                    response,
+                    page_size=len(items),
+                    accepted=self.validated_rows + len(items),
+                    confirmation=self._confirmation_policy,
+                )
+                next_offset = (
+                    None if terminal is not None else _next_offset(plan, response, current=offset, observed=len(items))
+                )
+                if next_offset is not None and next_offset <= offset:
+                    raise PaginationError("offset did not advance")
+                self._validate_page(items, response=response, terminal=terminal is not None)
+            except BaseException as error:
+                if self.page_trace_count == trace_count:
+                    self.reject_external_page(items, response, error)
+                raise
             if items:
                 yield _Page(tuple(items), response, (1,) * len(items))
             if terminal is not None:
                 self.terminal_reason = terminal
                 return
-            next_offset = _next_offset(plan, response, current=offset, observed=len(items))
-            if next_offset <= offset:
-                raise PaginationError("offset did not advance")
+            if next_offset is None:
+                raise RuntimeError("non-terminal offset page lacks its validated next offset")
             offset = next_offset
             self.cursor_state = offset
 
-    async def _counted(self: Any, plan: CountedOffsetPlan) -> AsyncGenerator[_Page]:
+    async def _counted(self: Any, plan: CountedOffsetPlan) -> AsyncGenerator[_Page]:  # noqa: C901
         offset = 0
         self.cursor_state = offset
         visited_offsets: set[int] = set()
@@ -106,6 +129,7 @@ class _SequentialMixin:
             if offset in visited_offsets:
                 raise PaginationError("counted offset cycle detected")
             visited_offsets.add(offset)
+            self.schedule_page(offset=offset, dispatch=PageDispatch.DIRECT)
             updates: dict[ParameterPath, object] = {plan.offset_path: offset}
             if plan.limit_path is not None and plan.requested_page_size is not None:
                 updates[plan.limit_path] = plan.requested_page_size
@@ -116,34 +140,59 @@ class _SequentialMixin:
                     allow_create=plan.allow_create_controls,
                 ),
             )
-            items = _response_items(response, self.selector)
-            self._validate_page(items, response=response)
+            trace_count = self.page_trace_count
+            items: list[JsonValue] = []
+            try:
+                items = self.select_page(response)
+                prospective_rows = self.validated_rows + len(items)
+                effective_total = (
+                    response.total if response.total is not None and response.total >= 0 else self._expected_total
+                )
+                terminal = effective_total is not None and prospective_rows == effective_total
+                if not terminal and not items:
+                    raise _PageRejectionError(
+                        "counted traversal ended before its exact total",
+                        PageRejectionCode.RANGE_CONTRADICTION,
+                    )
+                next_offset = None if terminal else response.next if response.next is not None else offset + len(items)
+                if next_offset is not None and next_offset <= offset:
+                    raise PaginationError("counted offset did not advance")
+                self._validate_page(items, response=response, terminal=terminal)
+            except BaseException as error:
+                if self.page_trace_count == trace_count:
+                    self.reject_external_page(items, response, error)
+                raise
             if items:
                 yield _Page(tuple(items), response, (1,) * len(items))
             if self._expected_total is not None and self.validated_rows == self._expected_total:
-                self._validate_terminal_total()
                 self.terminal_reason = "qualified total reached"
                 return
-            if not items:
-                raise PaginationError("counted traversal ended before its exact total")
-            next_offset = response.next if response.next is not None else offset + len(items)
-            if next_offset <= offset:
-                raise PaginationError("counted offset did not advance")
+            if next_offset is None:
+                raise RuntimeError("non-terminal counted page lacks its validated next offset")
             offset = next_offset
             self.cursor_state = offset
 
     async def _fetch(self: Any, request: Request) -> Response:
         if self._fetch_override is not None:
             return cast("Response", await self._fetch_override(request))
-        reservation = await self.context.reserve_page()
+        reservation = None
         try:
+            reservation = await self.context.reserve_page()
             response = await self.executor.execute(
                 request,
                 context=self.context,
                 work_class=WorkClass.TRAVERSAL_DIRECT,
             )
             self.context.commit_page(reservation)
-        except BaseException:
-            self.context.release_page(reservation)
+        except BaseException as error:
+            if reservation is not None:
+                self.context.release_page(reservation)
+            if bool(getattr(error, "_b24api_dispatch_started", False)):
+                self.set_page_dispatch(dispatch=PageDispatch.DIRECT)
+                self.record_unknown_page(
+                    dispatch=PageDispatch.DIRECT,
+                    batch_index=None,
+                    error=error,
+                )
             raise
         return cast("Response", response)

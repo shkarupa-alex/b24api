@@ -31,6 +31,9 @@ idempotent and closes active streams before the owned transport.
 Use `call()` for detached decoded JSON and `call_response()` when you also need the immutable
 response envelope: `result`, `total`, `next`, timing and bounded diagnostic evidence.
 
+Use `call_bytes()` when a successful method response is a file rather than a Bitrix JSON envelope.
+The operation is explicit and never hides malformed JSON by falling back to bytes.
+
 <!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
 ```python
 from b24api import ReplaySafety
@@ -157,6 +160,10 @@ async with stream:
 Without `identity`, successful exhaustion is reported as `MECHANICS_ONLY`: pagination completed,
 but the client cannot prove that the portal did not duplicate or substitute rows.
 
+Mapping-backed collections are explicit as well. `MAPPING_VALUES` yields values from a selected
+mapping in insertion order; `MAPPING_VALUES_OR_EMPTY` additionally accepts only an empty terminal
+sequence and records that degradation in the operation report.
+
 ### Counted, physically batched tail
 
 The first direct page must contain an exact filtered `total` and, when more rows exist, `next`.
@@ -222,6 +229,10 @@ stream = client.iter_list_cursor(
 
 Cursor values must be unique and strictly monotonic. If an endpoint exposes only a non-unique
 boundary, use an application-owned direct-call workflow or supply a unique tie-breaker.
+
+See [architecture](docs/architecture.md), [migration](docs/migration.md),
+[performance](docs/performance.md), and [endpoint recipes](docs/recipes.md) for the complete
+contracts and selection guidance.
 
 ### One list method across many parent entities
 

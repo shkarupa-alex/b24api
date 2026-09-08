@@ -13,27 +13,29 @@ from b24api.contracts.policy import (
     OrderSemantics,
     TotalSemantics,
 )
-from b24api.contracts.report import TraversalAssurance
+from b24api.contracts.report import TraversalAssurance, Violation
 from b24api.contracts.request import (
     IdentitySpec,
     RequestLike,
     ResultSelector,
+    TraversalIdentity,
     canonical_request,
 )
 from b24api.contracts.response import ResultCollectionShape
+from b24api.contracts.traversal import OffsetContinuation, TotalTermination
 from b24api.traversal.counted import CountedItemStream
 from b24api.traversal.plans import (
+    CountedOffsetMode,
     CountedOffsetPlan,
     CursorTerminalRule,
     ItemCursorPlan,
     KeysetPlan,
     KeysetTerminalRule,
-    OffsetContinuation,
     OffsetSequentialPlan,
     OffsetTerminalRule,
 )
 from b24api.traversal.stream import iter_list as _iter_list
-from b24api.traversal.values import _MappingValuesResultSelector
+from b24api.traversal.values import _MappingValuesResultSelector, _TolerantMappingValuesResultSelector
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
@@ -53,6 +55,8 @@ def _collection_selector(selector: ResultSelector, shape: ResultCollectionShape)
         raise TypeError("collection_shape must be a ResultCollectionShape")
     if shape is ResultCollectionShape.SEQUENCE:
         return selector
+    if shape is ResultCollectionShape.MAPPING_VALUES_OR_EMPTY:
+        return _TolerantMappingValuesResultSelector(selector.path)
     return _MappingValuesResultSelector(selector.path)
 
 
@@ -62,6 +66,7 @@ def _mapped_stream(
     operation: str,
     assurance: TraversalAssurance,
     deregister: Deregister,
+    audit_violations: tuple[Violation, ...] = (),
 ) -> OperationStream[JsonValue]:
     stream: MappedOperationStream[JsonValue, JsonValue] = MappedOperationStream(
         source,
@@ -69,6 +74,7 @@ def _mapped_stream(
         operation=operation,
         assurance=assurance,
         deregister=deregister,
+        initial_violations=audit_violations,
     )
     return cast("OperationStream[JsonValue]", stream)
 
@@ -78,26 +84,43 @@ def sequential_stream(  # noqa: PLR0913
     request: RequestLike,
     *,
     selector: ResultSelector,
-    identity: IdentitySpec | None,
+    identity: TraversalIdentity | None,
     collection_shape: ResultCollectionShape,
     page_size: int,
     offset: OffsetSpec,
     policy: ExecutionPolicy,
     deregister: Deregister,
+    audit_violations: tuple[Violation, ...] = (),
 ) -> OperationStream[JsonValue]:
     """Compose conservative sequential offset/server-next traversal."""
+    if offset.continuation is OffsetContinuation.FIXED_STEP and offset.step != page_size:
+        raise ValueError("fixed-step traversal requires page_size equal to step")
     plan = OffsetSequentialPlan(
         offset_path=offset.parameter_path,
         limit_path=offset.limit_path,
         requested_page_size=page_size if offset.limit_path is not None else None,
-        continuation=OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT,
-        terminal=frozenset({OffsetTerminalRule.EMPTY_PAGE}),
+        continuation=offset.continuation,
+        fixed_step=offset.step,
+        terminal=(
+            frozenset({OffsetTerminalRule.EMPTY_PAGE})
+            if offset.total_termination is TotalTermination.DISABLED
+            else frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL})
+        ),
         allow_create_controls=offset.allow_create_controls,
         identity_requirement=IdentityRequirement.OPTIONAL,
         duplicate_policy=DuplicatePolicy.ERROR,
-        total_semantics=TotalSemantics.IGNORE,
+        total_semantics=(
+            TotalSemantics.IGNORE
+            if offset.total_termination is TotalTermination.DISABLED
+            else TotalSemantics.FILTERED_EXACT
+        ),
     )
-    assurance = TraversalAssurance.IDENTITY_EXACT if identity is not None else TraversalAssurance.MECHANICS_ONLY
+    if offset.total_termination is TotalTermination.EXACT_QUALIFIED:
+        assurance = (
+            TraversalAssurance.IDENTITY_AND_COUNT_MATCHED if identity is not None else TraversalAssurance.COUNT_MATCHED
+        )
+    else:
+        assurance = TraversalAssurance.IDENTITY_EXACT if identity is not None else TraversalAssurance.MECHANICS_ONLY
     return _plan_stream(
         executor,
         request,
@@ -110,6 +133,7 @@ def sequential_stream(  # noqa: PLR0913
         operation="iter_list",
         assurance=assurance,
         deregister=deregister,
+        audit_violations=audit_violations,
     )
 
 
@@ -124,6 +148,7 @@ def keyset_stream(  # noqa: PLR0913
     keyset: KeysetSpec,
     policy: ExecutionPolicy,
     deregister: Deregister,
+    audit_violations: tuple[Violation, ...] = (),
 ) -> OperationStream[JsonValue]:
     """Compose exact sequential no-count keyset traversal."""
     direction = _direction(keyset.direction)
@@ -131,6 +156,7 @@ def keyset_stream(  # noqa: PLR0913
         direction=direction,
         filter_path=keyset.filter_path,
         order_path=keyset.order_path,
+        split_order=keyset.split_order,
         start_suppression_path=keyset.start_suppression_path,
         limit_path=keyset.limit_path,
         requested_page_size=page_size if keyset.limit_path is not None else None,
@@ -153,6 +179,7 @@ def keyset_stream(  # noqa: PLR0913
         operation="iter_list_keyset",
         assurance=TraversalAssurance.IDENTITY_EXACT,
         deregister=deregister,
+        audit_violations=audit_violations,
     )
 
 
@@ -160,7 +187,7 @@ def counted_stream(  # noqa: PLR0913
     executor: Executor,
     request: RequestLike,
     *,
-    identity: IdentitySpec,
+    identity: TraversalIdentity | None,
     selector: ResultSelector,
     collection_shape: ResultCollectionShape,
     page_size: int,
@@ -168,21 +195,29 @@ def counted_stream(  # noqa: PLR0913
     offset: OffsetSpec,
     policy: ExecutionPolicy,
     deregister: Deregister,
+    audit_violations: tuple[Violation, ...] = (),
 ) -> OperationStream[JsonValue]:
     """Compose exact direct-head plus physically batched counted traversal."""
-    if not isinstance(identity, IdentitySpec):
-        raise TypeError("identity must be an IdentitySpec")
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         raise ValueError("page_size must be a positive integer")
+    if offset.continuation is OffsetContinuation.FIXED_STEP and offset.step != page_size:
+        raise ValueError("fixed-step traversal requires page_size equal to step")
     plan = CountedOffsetPlan(
         offset_path=offset.parameter_path,
         limit_path=offset.limit_path,
         requested_page_size=page_size if offset.limit_path is not None else None,
         allow_create_controls=offset.allow_create_controls,
-        identity_requirement=IdentityRequirement.REQUIRED,
+        identity_requirement=IdentityRequirement.OPTIONAL if identity is None else IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.UNORDERED,
         duplicate_policy=DuplicatePolicy.ERROR,
         total_semantics=TotalSemantics.FILTERED_EXACT,
+        continuation=offset.continuation,
+        mode=(
+            CountedOffsetMode.PARALLEL_FIXED_STRIDE
+            if offset.continuation is OffsetContinuation.FIXED_STEP
+            else CountedOffsetMode.SEQUENTIAL_NEXT
+        ),
+        fixed_stride=offset.step,
     )
     source = CountedItemStream(
         executor,
@@ -197,8 +232,11 @@ def counted_stream(  # noqa: PLR0913
     return _mapped_stream(
         source,
         operation="iter_list_counted",
-        assurance=TraversalAssurance.IDENTITY_EXACT,
+        assurance=(
+            TraversalAssurance.IDENTITY_AND_COUNT_MATCHED if identity is not None else TraversalAssurance.COUNT_MATCHED
+        ),
         deregister=deregister,
+        audit_violations=audit_violations,
     )
 
 
@@ -213,6 +251,7 @@ def cursor_stream(  # noqa: PLR0913
     page_size: int,
     policy: ExecutionPolicy,
     deregister: Deregister,
+    audit_violations: tuple[Violation, ...] = (),
 ) -> OperationStream[JsonValue]:
     """Compose strict dependent cursor traversal with empty confirmation."""
     cursor_identity = identity or IdentitySpec(
@@ -248,6 +287,7 @@ def cursor_stream(  # noqa: PLR0913
         operation="iter_list_cursor",
         assurance=TraversalAssurance.IDENTITY_EXACT,
         deregister=deregister,
+        audit_violations=audit_violations,
     )
 
 
@@ -257,13 +297,14 @@ def _plan_stream(  # noqa: PLR0913
     *,
     plan: OffsetSequentialPlan | KeysetPlan | ItemCursorPlan,
     selector: ResultSelector,
-    identity: IdentitySpec | None,
+    identity: TraversalIdentity | None,
     collection_shape: ResultCollectionShape,
     page_size: int,
     policy: ExecutionPolicy,
     operation: str,
     assurance: TraversalAssurance,
     deregister: Deregister,
+    audit_violations: tuple[Violation, ...] = (),
 ) -> OperationStream[JsonValue]:
     source = _iter_list(
         executor,
@@ -279,6 +320,7 @@ def _plan_stream(  # noqa: PLR0913
         operation=operation,
         assurance=assurance,
         deregister=deregister,
+        audit_violations=audit_violations,
     )
 
 

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from b24api.contracts.json import _is_plain_int
 from b24api.contracts.policy import CompletionAssurance, KernelState, SnapshotState
-from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
 from b24api.redaction import DEFAULT_REDACTOR
 
 if TYPE_CHECKING:
@@ -34,6 +34,8 @@ class KernelReport:
     violations: tuple[Violation, ...] = ()
     terminal_reason: str | None = None
     evidence: tuple[ResponseEvidence, ...] = ()
+    page_trace: tuple[PageRecord, ...] = ()
+    page_trace_truncated: bool = False
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -45,6 +47,7 @@ class KernelReport:
             raise TypeError("snapshot must be a SnapshotState")
         object.__setattr__(self, "violations", tuple(self.violations))
         object.__setattr__(self, "evidence", tuple(self.evidence))
+        object.__setattr__(self, "page_trace", tuple(self.page_trace))
         if self.terminal_reason is not None:
             object.__setattr__(self, "terminal_reason", DEFAULT_REDACTOR.redact_text(self.terminal_reason))
         counters = (

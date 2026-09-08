@@ -10,6 +10,7 @@ client does not contain endpoint catalogs, persistence, business reconciliation 
 |---|---|---|
 | Decoded direct request | `call()` | Detached decoded JSON with explicit replay policy. |
 | Response envelope | `call_response()` | Immutable result, pagination, timing and bounded evidence. |
+| Binary response | `call_bytes()` | Every bounded successful body byte returned without JSON sniffing. |
 | Arbitrary logical batch | `batch()` / `batch_outcomes()` | Lazy input, bounded physical batches, off-wire correlation and typed outcomes. |
 | Independent command fan-out | `fan_out()` / `fan_out_outcomes()` | Explicit dispatch mode, concurrency and delivery order. |
 | Sequential offset list | `iter_list()` | Server-continuation validation and terminal empty-page confirmation. |
@@ -63,3 +64,15 @@ tests and credentials are excluded.
 
 The client deliberately has no automatic endpoint profiles, shape-changing Python flags, tuple
 payload conventions, public low-level execution plans or mutable global registries.
+
+## Wire, traversal, and evidence boundaries
+
+`Request` owns immutable body encoding, scoped headers, replay safety, and an optional declarative
+embedded-result error contract. Legacy transports continue to support ordinary JSON requests;
+advanced request representations require an advertised `WireTransport` capability and fail before
+I/O otherwise. No ordinary wire value can name an absolute destination.
+
+Traversal contracts separately declare progression (`server next`, observed width, or fixed step),
+completion (empty confirmation or caller-qualified exact total), collection shape, and identity.
+Page evidence contains only bounded counters and enum classifications—never rows, identities,
+parameters, headers, URLs, or body fragments.

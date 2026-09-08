@@ -22,14 +22,14 @@ from b24api.contracts.policy import (
     SnapshotState,
     TotalSemantics,
 )
-from b24api.contracts.report import ViolationSeverity
+from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode, ViolationSeverity
 from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request
 from b24api.errors import (
+    AmbiguousExecutionError,
     ApiResponseError,
     BudgetExceededError,
     CapabilityError,
     FailurePhase,
-    HTTPGatewayError,
     ProtocolError,
     TransportError,
 )
@@ -38,7 +38,6 @@ from b24api.references.outcome import ReferenceFailure, ReferenceItem, Reference
 from b24api.references.stream import fan_out, iter_references
 from b24api.traversal.plans import (
     BatchDispatch,
-    CountedOffsetMode,
     CountedOffsetPlan,
     DirectDispatch,
     DispatchPlan,
@@ -263,13 +262,6 @@ async def test_per_reference_pagination_is_sequential_while_references_are_concu
                 consistency=ConsistencyPolicy(total_semantics=TotalSemantics.GLOBAL),
             ),
         ),
-        (
-            CountedOffsetPlan(
-                mode=CountedOffsetMode.PARALLEL_FIXED_STRIDE,
-                fixed_stride=1,
-            ),
-            ExecutionPolicy(),
-        ),
     ],
 )
 async def test_invalid_reference_contract_refuses_even_empty_input(
@@ -420,6 +412,10 @@ async def test_batch_dispatch_coalesces_pages_and_preserves_total_metadata() -> 
     assert stream.report.batch_requests == 1
     assert stream.report.batch_commands == TWO_REFERENCES
     assert stream.report.logical_pages == TWO_REFERENCES
+    assert [record.sequence for record in stream.report.page_trace] == [0, 1]
+    assert [record.reference_index for record in stream.report.page_trace] == [0, 1]
+    assert all(record.dispatch is PageDispatch.BATCH for record in stream.report.page_trace)
+    assert [record.batch_index for record in stream.report.page_trace] == [0, 1]
 
 
 @pytest.mark.asyncio
@@ -494,7 +490,7 @@ async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
         ),
     )
 
-    with pytest.raises(HTTPGatewayError) as captured:
+    with pytest.raises(AmbiguousExecutionError) as captured:
         await anext(stream)
 
     assert captured.value.__dict__["report"] is stream.report
@@ -503,6 +499,11 @@ async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
     assert transport.requests[0].replay_safety is ReplaySafety.UNKNOWN
     assert stream.report.retries == 0
     assert stream.report.state is KernelState.FAILED
+    assert len(stream.report.page_trace) == 1
+    record = stream.report.page_trace[0]
+    assert record.outcome is PageOutcome.UNKNOWN
+    assert record.dispatch is PageDispatch.DIRECT
+    assert record.rejection_code is PageRejectionCode.AMBIGUOUS_EXECUTION
 
 
 @pytest.mark.asyncio
@@ -636,6 +637,64 @@ async def test_tolerant_reference_failure_preserves_total_correlation() -> None:
     assert isinstance(failure.error, ApiResponseError)
     assert stream.report.state is KernelState.COMPLETED
     assert [violation.code for violation in stream.report.violations] == ["reference_failure"]
+    bad_record = next(record for record in stream.report.page_trace if record.reference_index == 0)
+    assert bad_record.outcome is PageOutcome.UNKNOWN
+    assert bad_record.dispatch is PageDispatch.DIRECT
+    assert bad_record.rejection_code is PageRejectionCode.COMMAND_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_tolerant_batch_command_failure_records_unknown_page_provenance() -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        key = next(iter(commands))
+        return {
+            "result": {
+                "result": {},
+                "result_error": {key: {"error": "denied", "error_description": "no"}},
+            },
+        }
+
+    stream = iter_references(
+        Executor(AsyncFunctionTransport(handler)),
+        [_reference("bad")],
+        plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
+        dispatch=BatchDispatch(batch_size=1),
+        identity=_identity(),
+        tolerant=True,
+    )
+
+    outcomes = [outcome async for outcome in stream]
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], ReferenceFailure)
+    assert len(stream.report.page_trace) == 1
+    record = stream.report.page_trace[0]
+    assert record.outcome is PageOutcome.UNKNOWN
+    assert record.dispatch is PageDispatch.BATCH
+    assert record.batch_index == 0
+    assert record.reference_index == 0
+    assert record.rejection_code is PageRejectionCode.COMMAND_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_page_trace_limit_bounds_live_reference_aggregation() -> None:
+    stream = iter_references(
+        Executor(AsyncFunctionTransport(lambda _request: {"result": []})),
+        [_reference("a"), _reference("b")],
+        plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
+        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        identity=_identity(),
+        policy=ExecutionPolicy(page_trace_limit=1),
+    )
+
+    assert [outcome async for outcome in stream] == []
+    assert len(stream._scheduler.page_trace) == 1  # noqa: SLF001
+    assert stream._scheduler.page_trace_truncated  # noqa: SLF001
+    assert len(stream.report.page_trace) == 1
+    assert stream.report.page_trace_truncated
 
 
 @pytest.mark.asyncio
@@ -939,6 +998,8 @@ async def test_reference_page_budget_blocks_second_direct_request_before_io() ->
     with pytest.raises(BudgetExceededError, match="per-reference page budget"):
         await _collect(stream)
     assert len(transport.requests) == 1
+    assert len(stream.report.page_trace) == 1
+    assert stream.report.page_trace[0].outcome is PageOutcome.COMMITTED
 
 
 @pytest.mark.asyncio
@@ -966,6 +1027,8 @@ async def test_reference_page_budget_blocks_second_batch_request_before_io() -> 
     with pytest.raises(BudgetExceededError, match="per-reference page budget"):
         await _collect(stream)
     assert len(transport.requests) == 1
+    assert len(stream.report.page_trace) == 1
+    assert stream.report.page_trace[0].outcome is PageOutcome.COMMITTED
 
 
 @pytest.mark.asyncio

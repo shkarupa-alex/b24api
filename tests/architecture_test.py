@@ -81,6 +81,23 @@ def test_runtime_layer_import_boundaries_are_acyclic_and_evidence_free() -> None
                 for name in imports
                 for forbidden in ("b24api.batch", "b24api.traversal", "b24api.references")
             )
+        if relative.parts[0] == "testing":
+            assert not any(
+                name == forbidden or name.startswith(f"{forbidden}.")
+                for name in imports
+                for forbidden in ("b24api.client", "b24api.batch", "b24api.traversal", "b24api.references")
+            )
+
+
+def test_request_derivation_uses_keyword_fields_outside_owning_module() -> None:
+    owner = PACKAGE / "contracts" / "request.py"
+    for path in _sources():
+        if path == owner:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Request":
+                assert len(node.args) <= 1, f"{path.relative_to(PACKAGE)} reconstructs Request positionally"
 
 
 def test_cli_uses_only_root_contracts_and_its_closed_router() -> None:

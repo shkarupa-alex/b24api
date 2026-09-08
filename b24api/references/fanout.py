@@ -30,13 +30,17 @@ from b24api.traversal.plans import SingleResponsePlan
 if TYPE_CHECKING:
     from b24api.contracts.dispatch import DispatchSpec
     from b24api.contracts.policy import ExecutionPolicy
-    from b24api.contracts.report import OperationReport
+    from b24api.contracts.report import OperationReport, Violation
     from b24api.contracts.stream import OperationStream
     from b24api.execution.snapshot import KernelReport
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
 type KernelFanOutEvent = _KernelFanOutSuccess | KernelFailure
 type Deregister = Callable[[object], None]
+
+
+def _source_violations(source: object) -> tuple[Violation, ...]:
+    return tuple(cast("list[Violation]", getattr(source, "violations", ())))
 
 
 class FanOutKernelStream(AsyncIterator[KernelFanOutEvent], Protocol):
@@ -257,6 +261,7 @@ def fanout_stream[C](  # noqa: PLR0913
         error_mapper=lambda error, report: _fanout_error(error, report, mapper, tolerant=tolerant),
         error_items=lambda error: _fanout_error_items(error, mapper),
         source_active_references=lambda: source.active_references_high_water,
+        source_violations=lambda: _source_violations(commands),
         deregister=deregister,
     )
     return cast("OperationStream[CommandOutcome[C]]", stream)

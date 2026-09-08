@@ -6,9 +6,11 @@ import itertools
 import json
 from typing import TYPE_CHECKING, cast
 
+from b24api.contracts.json import _json_type_name
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.request import ResultSelector
-from b24api.errors import CapabilityError, PaginationError
+from b24api.contracts.response import ResultCollectionShape
+from b24api.errors import CapabilityError, PaginationError, ResultShapeError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -17,11 +19,15 @@ if TYPE_CHECKING:
     from b24api.contracts.response import Response
     from b24api.traversal.plans import ItemCursorPlan
 
-type IdentityValue = str | int
+type IdentityValue = str | int | tuple[str | int, ...]
 _MISSING = object()
 
 
 class _MappingValuesResultSelector(ResultSelector):
+    pass
+
+
+class _TolerantMappingValuesResultSelector(_MappingValuesResultSelector):
     pass
 
 
@@ -36,8 +42,22 @@ def _mapping_values(response: Response, selector: ResultSelector) -> list[JsonVa
             if not isinstance(selected, list) or part >= len(selected):
                 raise CapabilityError("response result does not satisfy the declared selector")
             selected = selected[part]
+    if (
+        isinstance(selector, _TolerantMappingValuesResultSelector)
+        and isinstance(selected, list | tuple)
+        and not selected
+    ):
+        return []
     if not isinstance(selected, dict):
-        raise CapabilityError("mapping_values collection shape requires a selected mapping")
+        raise ResultShapeError(
+            selector=ResultSelector(selector.path),
+            expected_shape=(
+                ResultCollectionShape.MAPPING_VALUES_OR_EMPTY
+                if isinstance(selector, _TolerantMappingValuesResultSelector)
+                else ResultCollectionShape.MAPPING_VALUES
+            ),
+            observed_type=_json_type_name(selected),
+        )
     return list(selected.values())
 
 
@@ -50,6 +70,22 @@ def _response_items(response: Response, selector: ResultSelector, *, single: boo
         return response.list_items(selector)
     except (KeyError, TypeError) as error:
         raise CapabilityError("response result does not satisfy the declared selector") from error
+
+
+def _mapping_shape_degraded(response: Response, selector: ResultSelector) -> bool:
+    if not isinstance(selector, _TolerantMappingValuesResultSelector):
+        return False
+    selected: JsonValue = response.result
+    for part in selector.path:
+        if isinstance(part, str):
+            if not isinstance(selected, dict) or part not in selected:
+                return False
+            selected = selected[part]
+        else:
+            if not isinstance(selected, list) or part >= len(selected):
+                return False
+            selected = selected[part]
+    return isinstance(selected, list | tuple) and not selected
 
 
 def _page_fingerprint(items: Iterable[JsonValue]) -> str:

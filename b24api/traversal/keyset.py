@@ -1,5 +1,7 @@
 """Sequential exact keyset traversal strategy."""
 
+# ruff: noqa: TRY301 - rejected-page evidence is recorded at this transaction boundary
+
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
@@ -10,7 +12,7 @@ from b24api.traversal.identity import (
     _Page,
     _request_with_controls,
 )
-from b24api.traversal.values import IdentityValue, _compare_identities, _response_items
+from b24api.traversal.values import IdentityValue, _compare_identities
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -26,13 +28,23 @@ class _KeysetMixin:
     terminal_reason: str | None
     cursor_state: JsonValue
 
-    async def _keyset(self: Any, plan: KeysetPlan) -> AsyncGenerator[_Page]:  # noqa: C901
+    async def _keyset(self: Any, plan: KeysetPlan) -> AsyncGenerator[_Page]:  # noqa: C901, PLR0912
         identity = self._require_identity("keyset")
         cursor: IdentityValue | None = None
         while True:
-            updates: dict[ParameterPath, object] = {
-                _child_path(plan.order_path, identity.order_key): "ASC" if plan.direction == "asc" else "DESC",
-            }
+            if plan.split_order is None:
+                if plan.order_path is None:
+                    raise RuntimeError("keyset plan lacks ordering controls")
+                updates: dict[ParameterPath, object] = {
+                    _child_path(plan.order_path, identity.order_key): "ASC" if plan.direction == "asc" else "DESC",
+                }
+            else:
+                updates = {
+                    plan.split_order.field_path: plan.split_order.field_value or identity.order_key,
+                    plan.split_order.direction_path: (
+                        plan.split_order.ascending if plan.direction == "asc" else plan.split_order.descending
+                    ),
+                }
             if plan.limit_path is not None and plan.requested_page_size is not None:
                 updates[plan.limit_path] = plan.requested_page_size
             if plan.start_suppression_path is not None:
@@ -47,16 +59,22 @@ class _KeysetMixin:
                     allow_create=plan.allow_create_controls,
                 ),
             )
-            items = _response_items(response, self.selector)
-            identities = self._validate_page(items, response=response)
-            if cursor is not None and identities:
-                if plan.direction == "asc" and _compare_identities(identities[0], cursor) <= 0:
-                    raise PaginationError("keyset page ignored its lower bound")
-                if plan.direction == "desc" and _compare_identities(identities[0], cursor) >= 0:
-                    raise PaginationError("keyset page ignored its upper bound")
-            terminal = _keyset_terminal(plan, len(items))
-            if terminal is not None:
-                self._validate_terminal_total()
+            trace_count = self.page_trace_count
+            items: list[JsonValue] = []
+            try:
+                items = self.select_page(response)
+                candidate_identities = self._extract_identities(items)
+                if cursor is not None and candidate_identities:
+                    if plan.direction == "asc" and _compare_identities(candidate_identities[0], cursor) <= 0:
+                        raise PaginationError("keyset page ignored its lower bound")
+                    if plan.direction == "desc" and _compare_identities(candidate_identities[0], cursor) >= 0:
+                        raise PaginationError("keyset page ignored its upper bound")
+                terminal = _keyset_terminal(plan, len(items))
+                identities = self._validate_page(items, response=response, terminal=terminal is not None)
+            except BaseException as error:
+                if self.page_trace_count == trace_count:
+                    self.reject_external_page(items, response, error)
+                raise
             if items:
                 yield _Page(tuple(items), response, (1,) * len(items))
             if terminal is not None:

@@ -75,3 +75,22 @@ def _thaw_json(value: FrozenJson) -> JsonValue:
 
 def _is_plain_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _json_type_name(value: object) -> str:  # noqa: PLR0911
+    """Return a value-free JSON type name for diagnostics."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if _is_plain_int(value):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, Sequence) and not isinstance(value, bytes | bytearray | str):
+        return "array"
+    return type(value).__name__
