@@ -55,6 +55,8 @@ class BinaryEvidence:
             raise ValueError("binary response status must be between 100 and 599")
         if not _is_plain_int(self.byte_length) or self.byte_length < 0:
             raise ValueError("binary response byte length must be non-negative")
+        if self.sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
+            raise ValueError("binary response digest must be 64 lower-case hexadecimal characters")
         object.__setattr__(self, "content_type", _safe_media_type(self.content_type))
 
 

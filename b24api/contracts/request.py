@@ -39,7 +39,16 @@ class RequestSummary:
         )
         if not isinstance(self.encoding, BodyEncoding):
             raise TypeError("encoding must be a BodyEncoding")
-        object.__setattr__(self, "header_names", tuple(sorted(self.header_names[: DEFAULT_REDACTOR.max_items])))
+        object.__setattr__(
+            self,
+            "header_names",
+            tuple(
+                sorted(
+                    DEFAULT_REDACTOR.redact_text(str(name).casefold())
+                    for name in self.header_names[: DEFAULT_REDACTOR.max_items]
+                ),
+            ),
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return the to dict representation."""

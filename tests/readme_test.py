@@ -90,6 +90,9 @@ class _ExampleClient:
     async def call_response(self, _request: Request, **_kwargs: object) -> Response:
         return Response({"ok": True})
 
+    async def call_bytes(self, _request: Request, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(body=b"")
+
     def batch(self, commands: Iterable[Command[object]], **_kwargs: object) -> _ExampleStream[CommandSuccess[object]]:
         return _ExampleStream(
             CommandSuccess(index, command.correlation, command.request.summary, Response({"ok": True}))

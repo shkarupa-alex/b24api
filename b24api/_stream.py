@@ -194,7 +194,6 @@ class MappedOperationStream[S, T]:
             forced = TerminalState.INCOMPLETE if isinstance(error, IncompleteTraversalError) else TerminalState.FAILED
             self._finalize(forced_state=forced)
             report = cast("OperationReport", self._report)
-            propagated = self._error_mapper(error, report) if self._error_mapper is not None else error
             report, _ = finalize_failure(
                 error,
                 report,
@@ -202,6 +201,7 @@ class MappedOperationStream[S, T]:
                 terminal_reason=report.terminal_reason,
             )
             self._report = report
+            propagated = self._error_mapper(error, report) if self._error_mapper is not None else error
             _attach_report(propagated, report)
             self._terminal_error = propagated
             if propagated is error:

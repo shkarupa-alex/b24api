@@ -171,8 +171,9 @@ class ItemStream(AsyncIterator[JsonValue]):
             _attach_report(error, self.report)
             raise
         except PaginationError as error:
+            reason = str(getattr(error, "report_name", type(error).__name__))
             cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.INCOMPLETE, "PaginationError"),
+                self._finalize(KernelState.INCOMPLETE, reason),
             )
             incomplete = IncompleteTraversalError(report=self.report)
             primary_error = incomplete

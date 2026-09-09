@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from b24api import (
+    AmbiguityPolicy,
     AmbiguityReason,
     AmbiguousExecutionError,
     BatchDispatch,
@@ -16,11 +17,15 @@ from b24api import (
     Bitrix24,
     BodyEncoding,
     Command,
+    CommandFailure,
+    CommandSuccess,
     CompositeIdentitySpec,
     CountedTraversal,
     CursorSpec,
     CursorTraversal,
     DirectDispatch,
+    EnvelopeContractError,
+    ExecutionPolicy,
     IdentityCoercion,
     IdentityComponent,
     IdentitySpec,
@@ -32,9 +37,11 @@ from b24api import (
     PageOutcome,
     PageRejectionCode,
     ParameterPath,
+    ReferenceItem,
     ReplaySafety,
     Request,
     RequestHeaders,
+    RequestSummary,
     ResultCollectionShape,
     ResultErrorShape,
     ResultErrorSpec,
@@ -53,11 +60,13 @@ from b24api.errors import (
     ApiResponseError,
     CapabilityError,
     IncompleteTraversalError,
+    ProtocolError,
     ReferenceFailed,
     ResultShapeError,
 )
 from b24api.execution import Executor
 from b24api.testing import ConformanceCase, run_transport_conformance
+from b24api.transport import HttpxTransport
 from b24api.traversal import iter_list
 from b24api.traversal.plans import CountedOffsetPlan
 
@@ -67,7 +76,7 @@ REFERENCE_OUTCOMES = 2
 FANOUT_COMMANDS = 3
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 
 class _Transport:
@@ -148,12 +157,31 @@ def test_request_derivation_preserves_all_non_parameter_contracts() -> None:
     assert "opaque" not in repr(derived)
 
 
+def test_request_hash_is_structural_and_independent_of_mapping_order() -> None:
+    first = Request("example.action", {"outer": {"a": 1, "b": [2, 3]}})
+    second = Request("example.action", {"outer": {"b": [2, 3], "a": 1}})
+
+    assert first == second
+    assert hash(first) == hash(second)
+
+
 def test_headers_are_normalized_and_reserved_families_are_rejected() -> None:
     assert RequestHeaders({"X-Zeta": "z", "X-Alpha": "a"}).names == ("x-alpha", "x-zeta")
     with pytest.raises(ValueError, match="reserved"):
         RequestHeaders({"Authorization": "value"})
     with pytest.raises(ValueError, match="duplicate"):
         RequestHeaders((("X-Test", "one"), ("x-test", "two")))
+
+
+def test_public_request_summary_normalizes_and_redacts_header_names() -> None:
+    sensitive = "ABCDEFGHIJKLMNOP"
+    summary = RequestSummary(
+        method="example.action",
+        header_names=("X-Safe", f"https://secret.invalid/rest/1/{sensitive}/"),
+    )
+
+    assert "x-safe" in summary.header_names
+    assert sensitive.casefold() not in repr(summary.header_names)
 
 
 @pytest.mark.asyncio
@@ -177,6 +205,18 @@ async def test_binary_call_returns_every_success_byte_without_json_sniffing() ->
     assert response.content_type == "text/csv"
     assert response.evidence.sha256 is None
     assert "a,b" not in repr(response)
+
+
+def test_binary_evidence_rejects_non_digest_sha256() -> None:
+    with pytest.raises(ValueError, match="64 lower-case hexadecimal"):
+        BinaryEvidence(200, "application/octet-stream", 0, "not-a-digest")
+
+
+def test_wire_response_repr_drops_unbounded_invalid_media_type() -> None:
+    response = WireResponse(200, (("content-type", "x" * 500),), b"secret")
+
+    assert "x" * 20 not in repr(response)
+    assert "secret" not in repr(response)
 
 
 @pytest.mark.asyncio
@@ -258,6 +298,26 @@ async def test_unstructured_post_dispatch_status_is_ambiguous_for_unknown() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("safety", tuple(ReplaySafety))
+async def test_success_envelope_defect_is_conclusive_under_broad_ambiguity_policy(safety: ReplaySafety) -> None:
+    transport = _Transport(lambda _request: WireResponse(200, (), b"not-json"))
+    policy = ExecutionPolicy(ambiguity=AmbiguityPolicy(frozenset(range(100, 600))))
+
+    with pytest.raises(EnvelopeContractError) as captured:
+        await Executor(transport).execute(Request("example.list", replay_safety=safety), policy=policy)
+
+    assert type(captured.value).__name__ == "EnvelopeContractError"
+
+
+@pytest.mark.asyncio
+async def test_repository_httpx_transport_passes_complete_public_conformance_suite() -> None:
+    report = await run_transport_conformance(HttpxTransport)
+
+    assert report.passed
+    assert len(report.outcomes) == len(ConformanceCase)
+
+
+@pytest.mark.asyncio
 async def test_fixed_step_ignores_relative_next_and_exact_total_can_terminate() -> None:
     def handler(request: Request) -> WireResponse:
         start = request.copy_parameters().get("start", 0)
@@ -286,6 +346,83 @@ async def test_fixed_step_ignores_relative_next_and_exact_total_can_terminate() 
 
 
 @pytest.mark.asyncio
+async def test_reference_counted_fixed_step_ignores_relative_next() -> None:
+    starts: list[int] = []
+
+    def handler(request: Request) -> WireResponse:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        key, command = next(iter(commands.items()))
+        assert isinstance(command, str)
+        start = PAGE_SIZE if f"start={PAGE_SIZE}" in command else 0
+        starts.append(start)
+        if start == 0:
+            result, next_value = [{"ID": 1}, {"ID": 2}], 2
+        if start == PAGE_SIZE:
+            result, next_value = [{"ID": 3}], 1
+        return _response(
+            {
+                "result": {key: result},
+                "result_error": {},
+                "result_total": {key: 3},
+                "result_next": {key: next_value},
+            },
+        )
+
+    transport = _Transport(handler)
+    stream = _client(transport).iter_references(
+        Request("example.list", replay_safety=ReplaySafety.SAFE),
+        [Binding("one", (), object())],
+        traversal=CountedTraversal(
+            identity=None,
+            offset=OffsetSpec(
+                continuation=OffsetContinuation.FIXED_STEP,
+                step=PAGE_SIZE,
+                total_termination=TotalTermination.EXACT_QUALIFIED,
+            ),
+        ),
+        dispatch=BatchDispatch(batch_size=1, concurrency=1),
+    )
+
+    outcomes = [item async for item in stream]
+    assert [item.item for item in outcomes if isinstance(item, ReferenceItem)] == [
+        {"ID": 1},
+        {"ID": 2},
+        {"ID": 3},
+    ]
+    assert starts == [0, PAGE_SIZE]
+
+
+@pytest.mark.asyncio
+async def test_counted_fixed_step_accepts_zero_total_terminal_next_zero() -> None:
+    stream = _client(_Transport(lambda _request: _response([], total=0, next_value=0))).iter_list_counted(
+        Request("example.list", replay_safety=ReplaySafety.SAFE),
+        identity=None,
+        offset=OffsetSpec(
+            continuation=OffsetContinuation.FIXED_STEP,
+            step=PAGE_SIZE,
+            total_termination=TotalTermination.EXACT_QUALIFIED,
+        ),
+    )
+
+    assert [row async for row in stream] == []
+    assert stream.report is not None
+    assert stream.report.unique_rows == 0
+
+
+@pytest.mark.asyncio
+async def test_filtered_exact_rejects_minus_one_as_absent_on_nonterminal_page() -> None:
+    stream = _client(_Transport(lambda _request: _response([{"ID": 1}], total=-1, next_value=1))).iter_list(
+        Request("example.list", replay_safety=ReplaySafety.SAFE),
+        identity=None,
+        offset=OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED),
+    )
+
+    with pytest.raises(CapabilityError, match="non-negative total"):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
 async def test_composite_identity_detects_duplicate_tuple() -> None:
     identity = CompositeIdentitySpec(
         (
@@ -299,7 +436,7 @@ async def test_composite_identity_detects_duplicate_tuple() -> None:
         identity=identity,
     )
 
-    with pytest.raises(IncompleteTraversalError):
+    with pytest.raises(IncompleteTraversalError) as captured:
         await anext(stream)
 
     assert stream.report is not None
@@ -308,6 +445,7 @@ async def test_composite_identity_detects_duplicate_tuple() -> None:
     assert [violation.code for violation in stream.report.violations if violation.severity.value == "blocking"] == [
         "pagination_invariant",
     ]
+    assert "[pagination_invariant]" in str(captured.value)
 
 
 @pytest.mark.asyncio
@@ -337,13 +475,72 @@ async def test_shape_rejection_is_retained_as_zero_admission_page_evidence() -> 
         collection_shape=ResultCollectionShape.MAPPING_VALUES,
     )
 
-    with pytest.raises(ResultShapeError):
+    with pytest.raises(ResultShapeError) as captured:
         await anext(stream)
+
+    assert captured.value.request_summary is not None
+    assert captured.value.request_summary.method == "example.list"
+    assert captured.value.page_offset == 0
 
     assert stream.report is not None
     assert stream.report.page_trace[0].outcome is PageOutcome.REJECTED
     assert stream.report.page_trace[0].rejection_code is PageRejectionCode.SHAPE_CONTRACT
     assert stream.report.page_trace[0].rows_admitted == 0
+
+
+@pytest.mark.asyncio
+async def test_batch_isolates_embedded_shape_failure_and_normalizes_terminal_next() -> None:
+    malformed = ResultErrorSpec(ResultSelector.root(), ("code",), shape=ResultErrorShape.MAPPING)
+
+    def handler(request: Request) -> WireResponse:
+        keys = tuple(request.copy_parameters()["cmd"])
+        return _response(
+            {
+                "result": {keys[0]: "bad-shape", keys[1]: {"ok": True}},
+                "result_error": {},
+                "result_next": {keys[1]: -1},
+            },
+        )
+
+    stream = _client(_Transport(handler)).batch_outcomes(
+        [
+            Command(Request("example.bad", replay_safety=ReplaySafety.SAFE, result_error=malformed), None),
+            Command(Request("example.good", replay_safety=ReplaySafety.SAFE), None),
+        ],
+    )
+    outcomes = [outcome async for outcome in stream]
+
+    assert isinstance(outcomes[0], CommandFailure)
+    assert isinstance(outcomes[0].error, ProtocolError)
+    assert isinstance(outcomes[1], CommandSuccess)
+    assert outcomes[1].response.next is None
+
+
+@pytest.mark.asyncio
+async def test_tolerant_batch_rejects_unsupported_representation_per_command() -> None:
+    def handler(request: Request) -> WireResponse:
+        keys = tuple(request.copy_parameters()["cmd"])
+        assert len(keys) == 1
+        return _response({"result": {keys[0]: {"ok": True}}, "result_error": {}})
+
+    stream = _client(_Transport(handler)).batch_outcomes(
+        [
+            Command(
+                Request(
+                    "example.form",
+                    replay_safety=ReplaySafety.SAFE,
+                    encoding=BodyEncoding.FORM_URLENCODED,
+                ),
+                "form",
+            ),
+            Command(Request("example.json", replay_safety=ReplaySafety.SAFE), "json"),
+        ],
+    )
+    outcomes = [outcome async for outcome in stream]
+
+    assert isinstance(outcomes[0], CommandFailure)
+    assert isinstance(outcomes[0].error, CapabilityError)
+    assert isinstance(outcomes[1], CommandSuccess)
 
 
 @pytest.mark.asyncio
@@ -364,6 +561,30 @@ async def test_reference_report_aggregates_page_trace_with_global_sequences() ->
     assert [record.sequence for record in stream.report.page_trace] == [0, 1]
     assert [record.offset for record in stream.report.page_trace] == [0, 1]
     assert [record.reference_index for record in stream.report.page_trace] == [0, 0]
+
+
+def test_reference_base_control_preflight_does_not_consume_bindings() -> None:
+    consumed = False
+
+    def bindings() -> Iterator[Binding[object]]:
+        nonlocal consumed
+        consumed = True
+        yield Binding("one", (), object())
+
+    with pytest.raises(CapabilityError, match="traversal controls"):
+        _client(_Transport(lambda _request: _response([]))).iter_references(
+            Request("example.list", replay_safety=ReplaySafety.SAFE),
+            bindings(),
+            traversal=SequentialTraversal(
+                offset=OffsetSpec(
+                    parameter_path=ParameterPath(("paging", "start")),
+                    allow_create_controls=False,
+                ),
+            ),
+            dispatch=DirectDispatch(concurrency=1),
+        )
+
+    assert consumed is False
 
 
 @pytest.mark.asyncio
@@ -472,7 +693,7 @@ async def test_unknown_audit_failure_is_value_free_and_retained_in_stream_report
         Executor(_Transport(lambda _request: _response([]))),
         unknown_request_audit=broken_audit,
     )
-    with pytest.warns(RuntimeWarning, match="audit hook failed"):
+    with pytest.warns(RuntimeWarning, match="audit hook raised RuntimeError"):
         stream = client.iter_list(Request("unknown.list"))
     assert [row async for row in stream] == []
     assert stream.report is not None
@@ -588,7 +809,7 @@ async def test_lazy_audit_failures_are_retained_in_batch_report() -> None:
     )
     stream = client.fan_out_outcomes((Command(Request("unknown.one"), 1),))
 
-    with pytest.warns(RuntimeWarning, match="audit hook failed"):
+    with pytest.warns(RuntimeWarning, match="audit hook raised RuntimeError"):
         assert len([outcome async for outcome in stream]) == 1
     assert stream.report is not None
     assert any(item.code == "audit_hook_failed" for item in stream.report.violations)

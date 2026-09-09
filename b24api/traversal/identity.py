@@ -315,11 +315,18 @@ def _offset_terminal(
     return None
 
 
-def _next_offset(plan: OffsetSequentialPlan, response: Response, *, current: int, observed: int) -> int:
+def _next_offset(
+    plan: OffsetSequentialPlan | CountedOffsetPlan,
+    response: Response,
+    *,
+    current: int,
+    observed: int,
+) -> int:
     if plan.continuation is OffsetContinuation.FIXED_STEP:
-        if plan.fixed_step is None:
+        step = plan.fixed_step if isinstance(plan, OffsetSequentialPlan) else plan.fixed_stride
+        if step is None:
             raise RuntimeError("fixed-step plan lacks its validated step")
-        return current + plan.fixed_step
+        return current + step
     if plan.continuation is OffsetContinuation.SERVER_NEXT:
         if response.next is None:
             raise PaginationError("server-next traversal has no continuation")

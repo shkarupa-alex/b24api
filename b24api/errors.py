@@ -349,18 +349,19 @@ class IncompleteTraversalError(B24ApiError):
     def __init__(self, *, report: object) -> None:
         """Initialize instance state."""
         self.report = report
+        super().__init__("Traversal did not complete", origin=ErrorOrigin.PAGINATION)
+
+    def __str__(self) -> str:
+        """Render the current attached report's first blocking cause."""
         message = "Traversal did not complete"
-        violations = getattr(report, "violations", ())
+        violations = getattr(self.report, "violations", ())
         blocking = next(
             (item for item in violations if getattr(getattr(item, "severity", None), "value", None) == "blocking"),
             None,
         )
         if blocking is not None:
             message += f" [{blocking.code}] {blocking.message}"
-        super().__init__(
-            message,
-            origin=ErrorOrigin.PAGINATION,
-        )
+        return message
 
 
 class InputSourceError(B24ApiError):

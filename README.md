@@ -34,6 +34,12 @@ response envelope: `result`, `total`, `next`, timing and bounded diagnostic evid
 Use `call_bytes()` when a successful method response is a file rather than a Bitrix JSON envelope.
 The operation is explicit and never hides malformed JSON by falling back to bytes.
 
+<!-- tested: tests/client_findings_3_test.py::test_binary_call_returns_every_success_byte_without_json_sniffing -->
+```python
+archive = await client.call_bytes(Request("example.export.download", replay_safety=ReplaySafety.SAFE))
+payload = archive.body
+```
+
 <!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
 ```python
 from b24api import ReplaySafety
@@ -163,6 +169,20 @@ but the client cannot prove that the portal did not duplicate or substitute rows
 Mapping-backed collections are explicit as well. `MAPPING_VALUES` yields values from a selected
 mapping in insertion order; `MAPPING_VALUES_OR_EMPTY` additionally accepts only an empty terminal
 sequence and records that degradation in the operation report.
+
+<!-- tested: tests/client_findings_3_test.py::test_shape_rejection_is_retained_as_zero_admission_page_evidence -->
+```python
+from b24api import ResultCollectionShape
+
+stream = client.iter_list(
+    Request("example.dictionary.list", replay_safety=ReplaySafety.SAFE),
+    selector=ResultSelector(("items",)),
+    collection_shape=ResultCollectionShape.MAPPING_VALUES,
+)
+async with stream:
+    async for value in stream:
+        consume(value)
+```
 
 ### Counted, physically batched tail
 

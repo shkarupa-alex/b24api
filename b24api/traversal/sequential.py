@@ -154,7 +154,7 @@ class _SequentialMixin:
                         "counted traversal ended before its exact total",
                         PageRejectionCode.RANGE_CONTRADICTION,
                     )
-                next_offset = None if terminal else response.next if response.next is not None else offset + len(items)
+                next_offset = None if terminal else _next_offset(plan, response, current=offset, observed=len(items))
                 if next_offset is not None and next_offset <= offset:
                     raise PaginationError("counted offset did not advance")
                 self._validate_page(items, response=response, terminal=terminal)

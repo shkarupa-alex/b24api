@@ -30,6 +30,14 @@ class FrozenMapping(Mapping[str, FrozenJson]):
         """Return the number of canonical keys."""
         return len(self._values)
 
+    def __eq__(self, other: object) -> bool:
+        """Compare canonical mappings structurally."""
+        return isinstance(other, FrozenMapping) and self._values == other._values
+
+    def __hash__(self) -> int:
+        """Hash the immutable JSON tree independently of input key order."""
+        return hash(tuple(sorted(self._values.items())))
+
 
 def _freeze_json(value: object, *, active: set[int] | None = None) -> FrozenJson:
     active = active if active is not None else set()

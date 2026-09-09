@@ -11,6 +11,10 @@ def test_build_query_empty() -> None:
     assert query == "empty=&zero=0"
 
 
+def test_build_query_encodes_booleans_as_php_integer_flags() -> None:
+    assert _build_query({"enabled": True, "disabled": False}) == "enabled=1&disabled=0"
+
+
 def test_build_query_list() -> None:
     query = _build_query({"select": ["ID", "TITLE"]})
     assert query == "select%5B0%5D=ID&select%5B1%5D=TITLE"

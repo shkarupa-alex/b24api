@@ -55,6 +55,8 @@ _HTTP_STATUS_MINIMUM = 100
 _HTTP_STATUS_MAXIMUM = 599
 _HTTP_SUCCESS_MINIMUM = 200
 _HTTP_SUCCESS_MAXIMUM = 299
+_HTTP_REDIRECTION_MINIMUM = 300
+_HTTP_CLIENT_ERROR_MINIMUM = 400
 _RETRY_AFTER_CAP_SECONDS = 3_600.0
 
 
@@ -176,6 +178,7 @@ class Executor:
     ) -> WireResponse:
         """Run the shared attempt loop and return one conclusive raw response."""
         _preflight_transport(self._wire_transport, request)
+        wire_request = WireRequest(request) if self._wire_transport is not None else None
         await _checkpoint_pending_cancellation()
         await context.start()
         retry_started = self._clock()
@@ -203,6 +206,7 @@ class Executor:
                                 self.transport,
                                 self._wire_transport,
                                 request,
+                                wire_request=wire_request,
                                 attempt_timeout=remaining,
                                 max_response_bytes=context.policy.max_response_bytes,
                             )
@@ -225,19 +229,33 @@ class Executor:
                 attempts += 1
                 continue
 
-            response_error = None
+            response_error: B24ApiError | None = None
             if not binary or not _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM:
                 content_type = (wire.content_type or "").split(";", 1)[0].strip().casefold()
                 body: bytes | None = wire.body
                 if binary and content_type != "application/json" and not content_type.endswith("+json"):
                     body = None
-                response_error = self.codec.error_from_http(
-                    status_code=wire.status_code,
-                    body=body,
-                    request_summary=request.summary,
-                    headers=wire.header_map,
-                    retry_codes=context.policy.retry.transient_api_codes,
-                )
+                if wire.status_code < _HTTP_SUCCESS_MINIMUM or (
+                    _HTTP_REDIRECTION_MINIMUM <= wire.status_code < _HTTP_CLIENT_ERROR_MINIMUM
+                ):
+                    response_error = HTTPGatewayError(
+                        f"HTTP gateway error {wire.status_code}",
+                        request_summary=request.summary,
+                        evidence=_wire_evidence(wire),
+                    )
+                else:
+                    response_error = self.codec.error_from_http(
+                        status_code=wire.status_code,
+                        body=body,
+                        request_summary=request.summary,
+                        headers=wire.header_map,
+                        retry_codes=context.policy.retry.transient_api_codes,
+                    )
+                    if _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM and not isinstance(
+                        response_error,
+                        ApiResponseError,
+                    ):
+                        response_error = None
                 if response_error is None and not _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM:
                     response_error = HTTPGatewayError(
                         f"HTTP gateway error {wire.status_code}",
@@ -398,11 +416,12 @@ def _preflight_transport(transport: WireTransport | None, request: Request) -> N
         raise CapabilityError("transport does not support scoped request headers")
 
 
-async def _send_transport(
+async def _send_transport(  # noqa: PLR0913 - keeps legacy and wire boundaries explicit
     transport: Transport,
     wire_transport: WireTransport | None,
     request: Request,
     *,
+    wire_request: WireRequest | None,
     attempt_timeout: float,
     max_response_bytes: int,
 ) -> WireResponse:
@@ -410,8 +429,10 @@ async def _send_transport(
         capabilities = wire_transport.capabilities
         if not isinstance(capabilities, TransportCapabilities):
             raise CapabilityError("transport exposes malformed capabilities")
+        if wire_request is None:
+            raise RuntimeError("wire transport request was not prepared")
         return await wire_transport.send_wire(
-            WireRequest(request),
+            wire_request,
             attempt_timeout=attempt_timeout,
             max_response_bytes=max_response_bytes,
         )
@@ -465,6 +486,7 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912
     found, selected = _resolve_optional_path(result, spec.selector.path)
     if not found or selected is None:
         return
+    candidates: tuple[tuple[int | None, Mapping[object, object]], ...]
     if spec.shape is ResultErrorShape.MAPPING:
         if not isinstance(selected, Mapping):
             raise _result_protocol_error(
@@ -473,7 +495,7 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912
                 observed=selected,
                 path=spec.selector.path,
             )
-        candidates = (selected,)
+        candidates = ((None, selected),)
     else:
         if not isinstance(selected, list | tuple):
             raise _result_protocol_error(
@@ -482,16 +504,16 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912
                 observed=selected,
                 path=spec.selector.path,
             )
-        for index, candidate in enumerate(selected):
-            if not isinstance(candidate, Mapping):
-                raise _result_protocol_error(
-                    "Embedded result error item must be a mapping",
-                    request,
-                    observed=candidate,
-                    path=(*spec.selector.path, index),
-                )
-        candidates = tuple(selected)
-    for candidate in candidates:
+        candidates = tuple(enumerate(selected))
+    for index, candidate in candidates:
+        candidate_path = spec.selector.path if index is None else (*spec.selector.path, index)
+        if not isinstance(candidate, Mapping):
+            raise _result_protocol_error(
+                "Embedded result error item must be a mapping",
+                request,
+                observed=candidate,
+                path=candidate_path,
+            )
         found, code = _resolve_optional_path(candidate, spec.code_path)
         if not found or code is None or code == "" or (type(code) is int and code == 0):
             continue
@@ -500,7 +522,7 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912
                 "Embedded result error code must be a string or integer",
                 request,
                 observed=code,
-                path=(*spec.selector.path, *spec.code_path),
+                path=(*candidate_path, *spec.code_path),
             )
         description: str | None = None
         if spec.description_path is not None:
@@ -511,7 +533,7 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912
                         "Embedded result error description must be a string or integer",
                         request,
                         observed=raw_description,
-                        path=(*spec.selector.path, *spec.description_path),
+                        path=(*candidate_path, *spec.description_path),
                     )
                 description = str(raw_description)
         error_type = BatchCommandError if batch else ApiResponseError

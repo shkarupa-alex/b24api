@@ -97,11 +97,14 @@ def finalize_failure[R](
         attach_report(error, report)
         return report, error
     failure = classify_failure(error)
+    report_error = getattr(error, "report_cause", error)
+    error_name = str(getattr(report_error, "report_name", type(report_error).__name__))
+    reason = terminal_reason if terminal_reason and terminal_reason != error_name else f"{operation} failed"
     violations = tuple(getattr(report, "violations", ()))
     if not any(item.code == failure.code for item in violations):
         violations = (
             *violations,
-            Violation(failure.severity, failure.code, terminal_reason or f"{operation} failed"),
+            Violation(failure.severity, failure.code, f"{reason} ({error_name})"),
         )
     state: object = TerminalState.INCOMPLETE if failure.incomplete else TerminalState.FAILED
     if isinstance(getattr(report, "state", None), KernelState):

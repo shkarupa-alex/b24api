@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import PageDispatch
+from b24api.contracts.traversal import OffsetContinuation
 from b24api.errors import CapabilityError, IncompleteTraversalError
 from b24api.execution import (
     await_cleanup_resistant,
@@ -89,25 +90,36 @@ class _CountedBatchMixin:
                     stride = page_size
                 elif self.plan.mode is CountedOffsetMode.PARALLEL_FIXED_STRIDE:
                     stride = self.plan.fixed_stride
-                elif self.plan.continuation.value == "server_next":
+                elif self.plan.continuation is OffsetContinuation.SERVER_NEXT:
                     stride = head.next
-                elif self.plan.continuation.value == "observed_count":
+                elif self.plan.continuation is OffsetContinuation.OBSERVED_COUNT:
                     stride = len(head_items)
                 else:
-                    stride = head.next if head.next is not None else len(head_items)
+                    stride = head.next if head.next is not None and head.next > 0 else len(head_items)
                 if not isinstance(stride, int) or isinstance(stride, bool) or stride < 1:
                     raise CapabilityError("parallel counted traversal requires a positive in-band stride")
                 if len(head_items) != min(stride, total):
                     raise CapabilityError("parallel counted head length contradicts the planned exact range")
-                if total > len(head_items) and head.next is None and self.plan.continuation.value == "server_next":
+                if (
+                    total > len(head_items)
+                    and head.next is None
+                    and self.plan.continuation is OffsetContinuation.SERVER_NEXT
+                ):
                     raise CapabilityError("parallel counted traversal has no in-band tail stride")
                 if (
-                    self.plan.continuation.value in {"server_next", "server_next_or_observed_count"}
+                    self.plan.continuation
+                    in {OffsetContinuation.SERVER_NEXT, OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT}
                     and head.next is not None
+                    and head.next > 0
                     and head.next != stride
                 ):
                     raise CapabilityError("parallel counted head continuation contradicts its row count")
-                if total == len(head_items) and head.next is not None and self.plan.continuation.value != "fixed_step":
+                if (
+                    total == len(head_items)
+                    and head.next is not None
+                    and head.next > 0
+                    and self.plan.continuation is not OffsetContinuation.FIXED_STEP
+                ):
                     raise CapabilityError("parallel counted traversal completed while continuation remained")
             except BaseException as error:
                 if self.page_trace_count == trace_count:

@@ -8,6 +8,7 @@ from typing import is_typeddict
 import pytest
 
 import b24api
+import b24api.errors
 from b24api.contracts import (
     BatchDispatch,
     Binding,
@@ -46,6 +47,31 @@ CORRELATION_VALUE = 7
 DIRECT_CONCURRENCY = 3
 BATCH_SIZE = 7
 SUMMARY_LIMIT = 256
+
+
+def test_public_error_module_export_snapshot_is_static_contract_evidence() -> None:
+    assert b24api.errors.__all__ == (
+        "AmbiguousExecutionError",
+        "ApiResponseError",
+        "B24ApiError",
+        "BatchCommandError",
+        "BatchFailed",
+        "BudgetExceededError",
+        "CapabilityError",
+        "EnvelopeContractError",
+        "ErrorOrigin",
+        "FailurePhase",
+        "HTTPGatewayError",
+        "IdentityContractError",
+        "IncompleteTraversalError",
+        "InputSourceError",
+        "PaginationError",
+        "ProtocolError",
+        "ReferenceFailed",
+        "ResponseTooLargeError",
+        "ResultShapeError",
+        "TransportError",
+    )
 
 
 def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:

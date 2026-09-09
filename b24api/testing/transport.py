@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 import asyncio
+import contextlib
 import inspect
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -179,7 +181,9 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         try:
             await transport.send_wire(forged, attempt_timeout=5, max_response_bytes=1024)
         except ValueError:
+            _discard_capture(captures)
             return ConformanceOutcome(case, passed=True)
+        _discard_capture(captures)
         return ConformanceOutcome(case, passed=False)
     if case is ConformanceCase.CANCELLATION_PROPAGATES:
         task = asyncio.create_task(
@@ -198,6 +202,7 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         except ResponseTooLargeError:
             await captures.get()
             return ConformanceOutcome(case, passed=True)
+        _discard_capture(captures)
         return ConformanceOutcome(case, passed=False)
 
     request = Request("conformance.test", parameters={"plain": "a b"})
@@ -221,14 +226,17 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         request = Request("conformance.test", headers=RequestHeaders({"X-Conformance": "present"}))
         expected_header = ("x-conformance", "present")
     response = (
-        await transport.send_wire(WireRequest(request), attempt_timeout=5, max_response_bytes=1024)
-        if isinstance(transport, WireTransport)
-        else await transport.send(request, attempt_timeout=5, max_response_bytes=1024)
+        await transport.send(request, attempt_timeout=5, max_response_bytes=1024)
+        if case is ConformanceCase.LEGACY_JSON_BODY or not isinstance(transport, WireTransport)
+        else await transport.send_wire(WireRequest(request), attempt_timeout=5, max_response_bytes=1024)
     )
     capture = await captures.get()
     passed = response.status_code == _HTTP_OK
     if case is ConformanceCase.LEGACY_JSON_BODY:
-        passed = passed and capture.body == b'{"plain":"a b"}'
+        try:
+            passed = passed and json.loads(capture.body) == {"plain": "a b"}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            passed = False
     elif case is ConformanceCase.JSON_CONTENT_TYPE:
         passed = passed and capture.headers.get("content-type") == "application/json"
     elif expected_body is not None:
@@ -236,6 +244,12 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
     elif expected_header is not None:
         passed = passed and capture.headers.get(expected_header[0]) == expected_header[1]
     return ConformanceOutcome(case, passed=passed)
+
+
+def _discard_capture(captures: asyncio.Queue[_Capture]) -> None:
+    """Discard one unexpected capture without blocking later cases."""
+    with contextlib.suppress(asyncio.QueueEmpty):
+        captures.get_nowait()
 
 
 __all__ = [

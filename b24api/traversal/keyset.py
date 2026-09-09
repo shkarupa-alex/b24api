@@ -70,7 +70,12 @@ class _KeysetMixin:
                     if plan.direction == "desc" and _compare_identities(candidate_identities[0], cursor) >= 0:
                         raise PaginationError("keyset page ignored its upper bound")
                 terminal = _keyset_terminal(plan, len(items))
-                identities = self._validate_page(items, response=response, terminal=terminal is not None)
+                identities = self._validate_page(
+                    items,
+                    response=response,
+                    terminal=terminal is not None,
+                    identities=candidate_identities,
+                )
             except BaseException as error:
                 if self.page_trace_count == trace_count:
                     self.reject_external_page(items, response, error)

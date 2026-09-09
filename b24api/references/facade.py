@@ -58,6 +58,7 @@ from b24api.references.outcome import ReferenceItem as KernelItem
 from b24api.references.stream import (
     iter_references as _iter_references,
 )
+from b24api.traversal.driver import PaginationDriver
 from b24api.traversal.plans import (
     BatchDispatch as KernelBatchDispatch,
 )
@@ -315,6 +316,15 @@ def kernel_reference_stream[C](
     if isinstance(traversal, CountedTraversal) and isinstance(dispatch, DirectDispatch):
         raise CapabilityError("counted reference traversal requires BatchDispatch")
     plan, selector, identity = _kernel_plan(traversal)
+    preflight = PaginationDriver(
+        executor,
+        base,
+        plan,
+        selector=selector,
+        identity=identity,
+        context=executor.context(policy),
+    )
+    preflight._validate_capabilities()  # noqa: SLF001 - reject base controls before consuming caller input
     kernel_dispatch = _kernel_dispatch(dispatch, policy)
     stream = _iter_references(
         executor,

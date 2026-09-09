@@ -31,6 +31,7 @@ from b24api.contracts.request import (
     ResultSelector,
     TraversalIdentity,
 )
+from b24api.contracts.traversal import OffsetContinuation
 from b24api.errors import (
     AmbiguousExecutionError,
     CapabilityError,
@@ -191,6 +192,16 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         """Select one scheduled page and retain value-free evidence on shape rejection."""
         try:
             return _response_items(response, self.selector, single=single)
+        except ResultShapeError as error:
+            enriched = ResultShapeError(
+                selector=error.selector,
+                expected_shape=error.expected_shape,
+                observed_type=error.observed_type,
+                request_summary=self.request.summary,
+                page_offset=self._page_offset,
+            )
+            self._record_rejected_page([], response, enriched)
+            raise enriched from error
         except BaseException as error:
             self._record_rejected_page([], response, error)
             raise
@@ -341,6 +352,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         response: Response,
         qualified_count: int | None = None,
         terminal: bool = False,
+        identities: list[IdentityValue] | None = None,
     ) -> list[IdentityValue]:
         """Evaluate a page transactionally and commit only after all checks pass."""
         snapshot = (
@@ -359,6 +371,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                 response=response,
                 qualified_count=qualified_count,
                 terminal=terminal,
+                identities=identities,
             )
         except BaseException as error:
             (
@@ -383,12 +396,16 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         response: Response,
         qualified_count: int | None = None,
         terminal: bool = False,
+        identities: list[IdentityValue] | None = None,
     ) -> list[IdentityValue]:
         requested_page_size = getattr(self.plan, "requested_page_size", None)
         page_caps = tuple(value for value in (requested_page_size, self._page_cap_hint) if value is not None)
         if page_caps and len(items) > min(page_caps):
             raise PaginationError("response exceeded the declared page cap")
-        fixed_step = isinstance(self.plan, OffsetSequentialPlan) and self.plan.continuation.value == "fixed_step"
+        fixed_step = (
+            isinstance(self.plan, OffsetSequentialPlan | CountedOffsetPlan)
+            and self.plan.continuation is OffsetContinuation.FIXED_STEP
+        )
         if not items and response.next is not None and not fixed_step:
             raise PaginationError("empty response retained a continuation")
         if _mapping_shape_degraded(response, self.selector):
@@ -408,7 +425,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         accepted_count = len(items) if qualified_count is None else qualified_count
         self._validate_response_total(response, accepted_count)
         if self.identity is None:
-            self._last_page_unique_mask = (True,) * len(items)
+            self._last_page_unique_mask = (False,) * len(items)
             self.validated_rows += accepted_count
             self._validate_total_not_overshot()
             if terminal:
@@ -416,7 +433,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             self._fingerprints.add(fingerprint)
             self._record_committed_page(items, response)
             return []
-        identities = self._extract_identities(items)
+        identities = self._extract_identities(items) if identities is None else identities
         if self._order_direction is not None:
             _validate_order(identities, self._order_direction)
             if self._last_identity is not None and identities:
@@ -551,13 +568,14 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
     def _extract_identities(self, items: list[JsonValue]) -> list[IdentityValue]:
         if self.identity is None:
             return []
+        composite = isinstance(self.identity, CompositeIdentitySpec)
+        if isinstance(self.identity, CompositeIdentitySpec):
+            components = self.identity.components
+        else:
+            components = (IdentityComponent(self.identity.item_path, self.identity.coercion),)
         identities: list[IdentityValue] = []
         for index, item in enumerate(items):
             row_offset = self.validated_rows + index
-            if isinstance(self.identity, CompositeIdentitySpec):
-                components = self.identity.components
-            else:
-                components = (IdentityComponent(self.identity.item_path, self.identity.coercion),)
             values: list[str | int] = []
             for component_index, component in enumerate(components):
                 path = component.item_path
@@ -575,21 +593,20 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                         observed_type=observed_type,
                         row_offset=row_offset,
                         request_summary=self.request.summary,
-                        component_index=(component_index if isinstance(self.identity, CompositeIdentitySpec) else None),
-                        component_label=(component.label if isinstance(self.identity, CompositeIdentitySpec) else None),
+                        component_index=(component_index if composite else None),
+                        component_label=(component.label if composite else None),
                     ) from error
-            identities.append(tuple(values) if isinstance(self.identity, CompositeIdentitySpec) else values[0])
+            identities.append(tuple(values) if composite else values[0])
         return identities
 
     def _validate_response_total(self, response: Response, accepted_count: int) -> None:
         if self._total_semantics is TotalSemantics.FILTERED_EXACT:
-            if response.total is None:
+            if response.total in {None, -1}:
                 raise CapabilityError("filtered exact total requires a non-negative total")
-            if response.total != -1:
-                if self._expected_total is None:
-                    self._expected_total = response.total
-                elif response.total != self._expected_total:
-                    raise _PageRejectionError("traversal exact total drifted", PageRejectionCode.TOTAL_DRIFT)
+            if self._expected_total is None:
+                self._expected_total = response.total
+            elif response.total != self._expected_total:
+                raise _PageRejectionError("traversal exact total drifted", PageRejectionCode.TOTAL_DRIFT)
         elif self._total_semantics is TotalSemantics.ADVISORY and response.total is not None and response.total >= 0:
             self._advisory_totals.add(response.total)
             if len(self._advisory_totals) > 1 and not self._advisory_total_drift_reported:
@@ -661,7 +678,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
     def unique_rows(self) -> int:
         """Return the unique rows."""
         if self.identity is None:
-            return self.validated_rows
+            return 0
         if self._unique_rows_final is not None:
             return self._unique_rows_final
         if self._identity_store is None:

@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Protocol, cast, runtime_checkable
 
-from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, _thaw_json
+from b24api.contracts.json import FrozenMapping, JsonValue, _thaw_json
 from b24api.contracts.request import ReplaySafety, Request, RequestSummary, ResultErrorSpec
+from b24api.contracts.response import _safe_media_type
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 
 _HTTP_STATUS_MINIMUM = 100
@@ -45,7 +46,7 @@ class WireResponse:
 
     def __repr__(self) -> str:
         """Return value-free wire evidence."""
-        content_type = self.content_type.split(";", 1)[0].strip().casefold() if self.content_type else None
+        content_type = _safe_media_type(self.content_type)
         return (
             f"WireResponse(status_code={self.status_code!r}, content_type={content_type!r}, "
             f"byte_length={self.byte_length!r})"
@@ -85,15 +86,12 @@ class WireRequest:
         """Build from an already-canonical request."""
         if not isinstance(request, Request):
             raise TypeError("wire request requires a canonical Request")
-        frozen = _freeze_json(request.parameters)
-        if not isinstance(frozen, FrozenMapping):
-            raise TypeError("wire request parameters must be a mapping")
         object.__setattr__(self, "method", request.method)
         object.__setattr__(self, "replay_safety", request.replay_safety)
         object.__setattr__(self, "encoding", request.encoding)
         object.__setattr__(self, "headers", request.headers)
         object.__setattr__(self, "result_error", request.result_error)
-        object.__setattr__(self, "_parameters", frozen)
+        object.__setattr__(self, "_parameters", request._parameters)  # noqa: SLF001 - canonical immutable handoff
 
     @property
     def parameters(self) -> MappingProxyType[str, JsonValue]:

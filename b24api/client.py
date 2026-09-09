@@ -311,13 +311,14 @@ class Bitrix24(_TraversalFacade):
             return None
         try:
             self._unknown_request_audit(request.summary)
-        except Exception:  # noqa: BLE001 - observational hooks cannot affect dispatch
+        except Exception as error:  # noqa: BLE001 - observational hooks cannot affect dispatch
+            message = f"unknown-request audit hook raised {type(error).__name__}"
             warnings.warn(
-                "unknown-request audit hook failed",
+                message,
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return Violation(ViolationSeverity.WARNING, "audit_hook_failed", "unknown-request audit hook failed")
+            return Violation(ViolationSeverity.WARNING, "audit_hook_failed", message)
         return None
 
 
