@@ -16,6 +16,7 @@ from b24api.transport.base import Transport, TransportCapabilities, WireRequest,
 
 type TransportFactory = Callable[[str], Transport | Awaitable[Transport]]
 _HTTP_OK = 200
+_CASE_TIMEOUT_SECONDS = 6.0
 
 
 class ConformanceCase(StrEnum):
@@ -117,20 +118,34 @@ async def run_transport_conformance(
         for case in ConformanceCase:
             if case not in selected:
                 continue
-            transport_value = factory(base_url)
-            transport = await transport_value if inspect.isawaitable(transport_value) else transport_value
             try:
-                outcomes.append(await _run_case(case, transport, captures))
+                async with asyncio.timeout(_CASE_TIMEOUT_SECONDS):
+                    outcomes.append(await _run_owned_case(case, factory, base_url, captures))
+            except TimeoutError:
+                outcomes.append(ConformanceOutcome(case, passed=False, detail="TimeoutError"))
             except Exception as error:  # noqa: BLE001 - report type only, never exception values
                 outcomes.append(ConformanceOutcome(case, passed=False, detail=type(error).__name__))
-            finally:
-                close = getattr(transport, "aclose", None)
-                if close is not None:
-                    await close()
     finally:
         server.close()
         await server.wait_closed()
     return ConformanceReport(tuple(outcomes))
+
+
+async def _run_owned_case(
+    case: ConformanceCase,
+    factory: TransportFactory,
+    base_url: str,
+    captures: asyncio.Queue[_Capture],
+) -> ConformanceOutcome:
+    """Create, exercise, and close one transport within the caller's deadline."""
+    transport_value = factory(base_url)
+    transport = await transport_value if inspect.isawaitable(transport_value) else transport_value
+    try:
+        return await _run_case(case, transport, captures)
+    finally:
+        close = getattr(transport, "aclose", None)
+        if close is not None:
+            await close()
 
 
 async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915

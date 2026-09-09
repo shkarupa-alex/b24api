@@ -1,7 +1,6 @@
 """Canonical bound-reference composition over the proven bounded scheduler."""
 
 # ruff: noqa: PLR0913 - bounded orchestration adapter
-
 from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Literal, Protocol, cast
@@ -59,9 +58,7 @@ from b24api.references.stream import (
     iter_references as _iter_references,
 )
 from b24api.traversal.driver import PaginationDriver
-from b24api.traversal.plans import (
-    BatchDispatch as KernelBatchDispatch,
-)
+from b24api.traversal.plans import BatchDispatch as KernelBatchDispatch
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
@@ -325,6 +322,7 @@ def kernel_reference_stream[C](
         context=executor.context(policy),
     )
     preflight._validate_capabilities()  # noqa: SLF001 - reject base controls before consuming caller input
+    executor._preflight_request(base)  # noqa: SLF001 - reject transport representation before caller input
     kernel_dispatch = _kernel_dispatch(dispatch, policy)
     stream = _iter_references(
         executor,

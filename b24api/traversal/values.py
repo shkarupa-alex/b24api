@@ -32,16 +32,8 @@ class _TolerantMappingValuesResultSelector(_MappingValuesResultSelector):
 
 
 def _mapping_values(response: Response, selector: ResultSelector) -> list[JsonValue]:
-    selected: JsonValue = response.result
-    for part in selector.path:
-        if isinstance(part, str):
-            if not isinstance(selected, dict) or part not in selected:
-                raise CapabilityError("response result does not satisfy the declared selector")
-            selected = selected[part]
-        else:
-            if not isinstance(selected, list) or part >= len(selected):
-                raise CapabilityError("response result does not satisfy the declared selector")
-            selected = selected[part]
+    selected = _selected_value(response, selector)
+
     if (
         isinstance(selector, _TolerantMappingValuesResultSelector)
         and isinstance(selected, list | tuple)
@@ -61,15 +53,34 @@ def _mapping_values(response: Response, selector: ResultSelector) -> list[JsonVa
     return list(selected.values())
 
 
+def _selected_value(response: Response, selector: ResultSelector) -> JsonValue:
+    """Resolve a declared selector or fail without exposing response values."""
+    selected: JsonValue = response.result
+    for part in selector.path:
+        if isinstance(part, str):
+            if not isinstance(selected, dict) or part not in selected:
+                raise CapabilityError("response result does not satisfy the declared selector")
+            selected = selected[part]
+        else:
+            if not isinstance(selected, list) or part >= len(selected):
+                raise CapabilityError("response result does not satisfy the declared selector")
+            selected = selected[part]
+    return selected
+
+
 def _response_items(response: Response, selector: ResultSelector, *, single: bool = False) -> list[JsonValue]:
     if isinstance(selector, _MappingValuesResultSelector):
         return _mapping_values(response, selector)
     if single and selector.path == () and not isinstance(response.result, list):
         return [response.result]
-    try:
-        return response.list_items(selector)
-    except (KeyError, TypeError) as error:
-        raise CapabilityError("response result does not satisfy the declared selector") from error
+    selected = _selected_value(response, selector)
+    if not isinstance(selected, list):
+        raise ResultShapeError(
+            selector=selector,
+            expected_shape=ResultCollectionShape.SEQUENCE,
+            observed_type=_json_type_name(selected),
+        )
+    return selected
 
 
 def _mapping_shape_degraded(response: Response, selector: ResultSelector) -> bool:

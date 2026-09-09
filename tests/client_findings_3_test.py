@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import json
+import time
 from typing import TYPE_CHECKING
 
 import pytest
@@ -66,6 +67,7 @@ from b24api.errors import (
 )
 from b24api.execution import Executor
 from b24api.testing import ConformanceCase, run_transport_conformance
+from b24api.testing import transport as testing_transport
 from b24api.transport import HttpxTransport
 from b24api.traversal import iter_list
 from b24api.traversal.plans import CountedOffsetPlan
@@ -74,9 +76,10 @@ PAGE_SIZE = 50
 OBSERVED_REQUESTS = 2
 REFERENCE_OUTCOMES = 2
 FANOUT_COMMANDS = 3
+DISTINCT_REQUESTS = 2
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator
 
 
 class _Transport:
@@ -165,6 +168,21 @@ def test_request_hash_is_structural_and_independent_of_mapping_order() -> None:
     assert hash(first) == hash(second)
 
 
+@pytest.mark.parametrize(
+    ("first_value", "second_value"),
+    [(True, 1), (False, 0), (1, 1.0), (-0.0, 0.0)],
+)
+def test_request_equality_preserves_wire_significant_json_scalar_types(
+    first_value: object,
+    second_value: object,
+) -> None:
+    first = Request("example.action", {"outer": [first_value]})
+    second = Request("example.action", {"outer": [second_value]})
+
+    assert first != second
+    assert len({first, second}) == DISTINCT_REQUESTS
+
+
 def test_headers_are_normalized_and_reserved_families_are_rejected() -> None:
     assert RequestHeaders({"X-Zeta": "z", "X-Alpha": "a"}).names == ("x-alpha", "x-zeta")
     with pytest.raises(ValueError, match="reserved"):
@@ -210,6 +228,13 @@ async def test_binary_call_returns_every_success_byte_without_json_sniffing() ->
 def test_binary_evidence_rejects_non_digest_sha256() -> None:
     with pytest.raises(ValueError, match="64 lower-case hexadecimal"):
         BinaryEvidence(200, "application/octet-stream", 0, "not-a-digest")
+
+
+def test_binary_response_rejects_digest_that_does_not_match_body() -> None:
+    evidence = BinaryEvidence(200, "application/octet-stream", 3, "0" * 64)
+
+    with pytest.raises(ValueError, match="digest does not match body"):
+        BinaryResponse(b"abc", content_type="application/octet-stream", evidence=evidence)
 
 
 def test_wire_response_repr_drops_unbounded_invalid_media_type() -> None:
@@ -299,14 +324,25 @@ async def test_unstructured_post_dispatch_status_is_ambiguous_for_unknown() -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("safety", tuple(ReplaySafety))
-async def test_success_envelope_defect_is_conclusive_under_broad_ambiguity_policy(safety: ReplaySafety) -> None:
+async def test_malformed_nonempty_2xx_remains_protocol_error_under_broad_ambiguity_policy(
+    safety: ReplaySafety,
+) -> None:
     transport = _Transport(lambda _request: WireResponse(200, (), b"not-json"))
     policy = ExecutionPolicy(ambiguity=AmbiguityPolicy(frozenset(range(100, 600))))
 
-    with pytest.raises(EnvelopeContractError) as captured:
+    with pytest.raises(ProtocolError) as captured:
         await Executor(transport).execute(Request("example.list", replay_safety=safety), policy=policy)
 
-    assert type(captured.value).__name__ == "EnvelopeContractError"
+    assert type(captured.value).__name__ == "ProtocolError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"", b"[]", b"{}"])
+async def test_success_envelope_defects_remain_envelope_contract_errors(body: bytes) -> None:
+    transport = _Transport(lambda _request: WireResponse(200, (), body))
+
+    with pytest.raises(EnvelopeContractError):
+        await Executor(transport).execute(Request("example.list", replay_safety=ReplaySafety.SAFE))
 
 
 @pytest.mark.asyncio
@@ -315,6 +351,27 @@ async def test_repository_httpx_transport_passes_complete_public_conformance_sui
 
     assert report.passed
     assert len(report.outcomes) == len(ConformanceCase)
+
+
+@pytest.mark.asyncio
+async def test_conformance_runner_times_out_transport_that_never_reaches_responder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(testing_transport, "_CASE_TIMEOUT_SECONDS", 0.05)
+    started = time.monotonic()
+    report = await run_transport_conformance(
+        lambda _url: _Transport(lambda _request: _response(result=True)),
+        cases=frozenset({ConformanceCase.LEGACY_JSON_BODY}),
+    )
+
+    assert time.monotonic() - started < 1
+    assert report.outcomes == (
+        testing_transport.ConformanceOutcome(
+            ConformanceCase.LEGACY_JSON_BODY,
+            passed=False,
+            detail="TimeoutError",
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -410,6 +467,27 @@ async def test_counted_fixed_step_accepts_zero_total_terminal_next_zero() -> Non
     assert stream.report.unique_rows == 0
 
 
+def test_counted_rejects_unqualified_total_and_non_batchable_request_before_io() -> None:
+    transport = _WireTransport(lambda _request: _response([], total=0))
+    client = _client(transport)
+
+    with pytest.raises(ValueError, match="exact-qualified"):
+        client.iter_list_counted(Request("example.list"), offset=OffsetSpec())
+    with pytest.raises(CapabilityError, match="JSON requests without scoped headers"):
+        client.iter_list_counted(
+            Request("example.list", encoding=BodyEncoding.FORM_URLENCODED),
+            offset=OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED),
+        )
+    with pytest.raises(CapabilityError, match="JSON requests without scoped headers"):
+        client.iter_list_counted(
+            Request("example.list", headers=RequestHeaders({"X-Test": "present"})),
+            offset=OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED),
+        )
+
+    assert transport.requests == []
+    assert transport.wire_requests == []
+
+
 @pytest.mark.asyncio
 async def test_filtered_exact_rejects_minus_one_as_absent_on_nonterminal_page() -> None:
     stream = _client(_Transport(lambda _request: _response([{"ID": 1}], total=-1, next_value=1))).iter_list(
@@ -486,6 +564,22 @@ async def test_shape_rejection_is_retained_as_zero_admission_page_evidence() -> 
     assert stream.report.page_trace[0].outcome is PageOutcome.REJECTED
     assert stream.report.page_trace[0].rejection_code is PageRejectionCode.SHAPE_CONTRACT
     assert stream.report.page_trace[0].rows_admitted == 0
+
+
+@pytest.mark.asyncio
+async def test_sequence_shape_rejection_has_selector_type_and_page_context() -> None:
+    stream = _client(_Transport(lambda _request: _response({"items": {"one": 1}}))).iter_list(
+        Request("example.list", replay_safety=ReplaySafety.SAFE),
+        selector=ResultSelector(("items",)),
+    )
+
+    with pytest.raises(ResultShapeError) as captured:
+        await anext(stream)
+
+    assert captured.value.selector == ResultSelector(("items",))
+    assert captured.value.expected_shape is ResultCollectionShape.SEQUENCE
+    assert captured.value.observed_type == "object"
+    assert captured.value.page_offset == 0
 
 
 @pytest.mark.asyncio
@@ -585,6 +679,56 @@ def test_reference_base_control_preflight_does_not_consume_bindings() -> None:
         )
 
     assert consumed is False
+
+
+@pytest.mark.parametrize(
+    "candidate_request",
+    [
+        Request("example.list", encoding=BodyEncoding.FORM_URLENCODED),
+        Request("example.list", headers=RequestHeaders({"X-Test": "present"})),
+    ],
+)
+def test_reference_transport_preflight_does_not_consume_bindings(candidate_request: Request) -> None:
+    consumed = False
+
+    def bindings() -> Iterator[Binding[object]]:
+        nonlocal consumed
+        consumed = True
+        yield Binding("one", (), object())
+
+    transport = _Transport(lambda _request: _response([]))
+    with pytest.raises(CapabilityError, match="advanced request delivery"):
+        _client(transport).iter_references(
+            candidate_request,
+            bindings(),
+            traversal=SequentialTraversal(),
+            dispatch=DirectDispatch(concurrency=1),
+        )
+
+    assert consumed is False
+    assert transport.requests == []
+
+
+def test_reference_malformed_capabilities_do_not_consume_async_bindings() -> None:
+    consumed = False
+
+    async def bindings() -> AsyncIterator[Binding[object]]:
+        nonlocal consumed
+        consumed = True
+        yield Binding("one", (), object())
+
+    transport = _WireTransport(lambda _request: _response([]))
+    transport.capabilities = "malformed"  # type: ignore[assignment]
+    with pytest.raises(CapabilityError, match="malformed capabilities"):
+        _client(transport).iter_references(
+            Request("example.list"),
+            bindings(),
+            traversal=SequentialTraversal(),
+            dispatch=DirectDispatch(concurrency=1),
+        )
+
+    assert consumed is False
+    assert transport.wire_requests == []
 
 
 @pytest.mark.asyncio

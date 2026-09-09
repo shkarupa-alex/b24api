@@ -87,6 +87,10 @@ class Executor:
         self._sleep = sleep
         self._random = random_source
 
+    def _preflight_request(self, request: Request) -> None:
+        """Validate transport representation without reserving budget or dispatching."""
+        _preflight_transport(self._wire_transport, request)
+
     def context(self, policy: ExecutionPolicy | None = None) -> ExecutionContext:
         """Create an operation execution context."""
         return ExecutionContext(policy or ExecutionPolicy(), self.coordinator, clock=self._clock)
@@ -177,7 +181,7 @@ class Executor:
         on_dispatch: Callable[[], None],
     ) -> WireResponse:
         """Run the shared attempt loop and return one conclusive raw response."""
-        _preflight_transport(self._wire_transport, request)
+        self._preflight_request(request)
         wire_request = WireRequest(request) if self._wire_transport is not None else None
         await _checkpoint_pending_cancellation()
         await context.start()
@@ -251,11 +255,6 @@ class Executor:
                         headers=wire.header_map,
                         retry_codes=context.policy.retry.transient_api_codes,
                     )
-                    if _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM and not isinstance(
-                        response_error,
-                        ApiResponseError,
-                    ):
-                        response_error = None
                 if response_error is None and not _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM:
                     response_error = HTTPGatewayError(
                         f"HTTP gateway error {wire.status_code}",

@@ -29,8 +29,8 @@ from b24api.errors import (
     ApiResponseError,
     BudgetExceededError,
     CapabilityError,
-    EnvelopeContractError,
     FailurePhase,
+    ProtocolError,
     TransportError,
 )
 from b24api.execution import ExecutionContext, Executor, WireResponse
@@ -1382,14 +1382,14 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_elapsed=0.04),
     )
     try:
-        with pytest.raises(EnvelopeContractError, match="Malformed successful HTTP response") as captured:
+        with pytest.raises(ProtocolError, match="Malformed JSON response") as captured:
             await anext(stream)
     finally:
         release.set()
 
     assert captured.value.__dict__["report"] is stream.report
     assert stream.report.state is KernelState.FAILED
-    assert stream.report.terminal_reason == "EnvelopeContractError"
+    assert stream.report.terminal_reason == "ProtocolError"
     cleanup = [violation for violation in stream.report.violations if violation.code == "cleanup_failure"]
     assert len(cleanup) == 1
     assert cleanup[0].severity is ViolationSeverity.BLOCKING

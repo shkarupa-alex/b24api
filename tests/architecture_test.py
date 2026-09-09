@@ -85,8 +85,29 @@ def test_runtime_layer_import_boundaries_are_acyclic_and_evidence_free() -> None
             assert not any(
                 name == forbidden or name.startswith(f"{forbidden}.")
                 for name in imports
-                for forbidden in ("b24api.client", "b24api.batch", "b24api.traversal", "b24api.references")
+                for forbidden in (
+                    "httpx",
+                    "pytest",
+                    "b24api.client",
+                    "b24api.batch",
+                    "b24api.traversal",
+                    "b24api.references",
+                )
             )
+
+
+def test_failure_classification_importers_stay_inside_state_machine_layers() -> None:
+    owner = "b24api.execution.failure"
+    for path in _sources():
+        if owner not in _imports(path):
+            continue
+        relative = path.relative_to(PACKAGE)
+        assert relative == Path("_stream.py") or relative.parts[0] in {
+            "batch",
+            "execution",
+            "references",
+            "traversal",
+        }, f"{relative} imports the internal failure-classification seam"
 
 
 def test_request_derivation_uses_keyword_fields_outside_owning_module() -> None:

@@ -203,7 +203,7 @@ class _CountedBatchMixin:
                     expected_rows = min(stride, total - start)
                     if len(items) != expected_rows:
                         raise CapabilityError("parallel counted page length contradicts the planned exact range")
-                    if response.total is not None and response.total != total:
+                    if response.total not in {None, -1} and response.total != total:
                         raise CapabilityError("parallel counted page total contradicts the head total")
                     expected_next = start + stride if start + stride < total else None
                     if self.plan.continuation.value == "server_next" and response.next != expected_next:

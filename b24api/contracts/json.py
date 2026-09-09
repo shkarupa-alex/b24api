@@ -32,11 +32,28 @@ class FrozenMapping(Mapping[str, FrozenJson]):
 
     def __eq__(self, other: object) -> bool:
         """Compare canonical mappings structurally."""
-        return isinstance(other, FrozenMapping) and self._values == other._values
+        return isinstance(other, FrozenMapping) and _frozen_json_key(self) == _frozen_json_key(other)
 
     def __hash__(self) -> int:
-        """Hash the immutable JSON tree independently of input key order."""
-        return hash(tuple(sorted(self._values.items())))
+        """Hash immutable JSON with wire-significant scalar types preserved."""
+        return hash(_frozen_json_key(self))
+
+
+def _frozen_json_key(value: FrozenJson) -> object:  # noqa: PLR0911 - closed JSON scalar/container variants
+    """Return a recursively type-tagged structural comparison key."""
+    if value is None:
+        return ("null",)
+    if isinstance(value, bool):
+        return ("boolean", value)
+    if isinstance(value, int):
+        return ("integer", value)
+    if isinstance(value, float):
+        return ("number", value.hex())
+    if isinstance(value, str):
+        return ("string", value)
+    if isinstance(value, tuple):
+        return ("array", tuple(_frozen_json_key(item) for item in value))
+    return ("object", tuple(sorted((key, _frozen_json_key(item)) for key, item in value.items())))
 
 
 def _freeze_json(value: object, *, active: set[int] | None = None) -> FrozenJson:

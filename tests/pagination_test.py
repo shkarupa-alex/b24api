@@ -28,9 +28,9 @@ from b24api.errors import (
     ApiResponseError,
     BudgetExceededError,
     CapabilityError,
-    EnvelopeContractError,
     IncompleteTraversalError,
     PaginationError,
+    ProtocolError,
 )
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse, WorkClass
 from b24api.traversal import iter_list
@@ -331,7 +331,7 @@ async def test_selector_shape_failure_is_typed_and_reported() -> None:
         selector=ResultSelector(("items",)),
     )
 
-    with pytest.raises(CapabilityError, match="selector") as captured:
+    with pytest.raises(CapabilityError, match="must be a sequence") as captured:
         await _collect(stream)
 
     assert captured.value.__dict__["report"] is stream.report
@@ -1178,14 +1178,14 @@ async def test_cancellation_during_failed_finalization_preserves_failure_report(
     transport = MalformedAfterLockTransport()
     stream = iter_list(Executor(transport), Request("crm.item.list"), plan=SingleResponsePlan())
     transport.context = stream._context  # noqa: SLF001 - deterministic finalize-race regression
-    primary: list[EnvelopeContractError] = []
+    primary: list[ProtocolError] = []
     post_failure_executed = False
 
     async def observe_replayed_cancellation() -> None:
         nonlocal post_failure_executed
         try:
             await anext(stream)
-        except EnvelopeContractError as error:
+        except ProtocolError as error:
             primary.append(error)
         await asyncio.sleep(0)
         post_failure_executed = True

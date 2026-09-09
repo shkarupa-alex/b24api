@@ -23,6 +23,8 @@ from b24api.contracts.request import (
 )
 from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import OffsetContinuation, TotalTermination
+from b24api.contracts.wire import BodyEncoding
+from b24api.errors import CapabilityError
 from b24api.traversal.counted import CountedItemStream
 from b24api.traversal.plans import (
     CountedOffsetMode,
@@ -200,8 +202,14 @@ def counted_stream(  # noqa: PLR0913
     """Compose exact direct-head plus physically batched counted traversal."""
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         raise ValueError("page_size must be a positive integer")
+    if offset.total_termination is not TotalTermination.EXACT_QUALIFIED:
+        raise ValueError("counted traversal requires exact-qualified total termination")
     if offset.continuation is OffsetContinuation.FIXED_STEP and offset.step != page_size:
         raise ValueError("fixed-step traversal requires page_size equal to step")
+    canonical = canonical_request(request)
+    if canonical.encoding is not BodyEncoding.JSON or canonical.headers.items:
+        raise CapabilityError("counted traversal supports JSON requests without scoped headers")
+    executor._preflight_request(canonical)  # noqa: SLF001 - operation-wide preflight before stream construction
     plan = CountedOffsetPlan(
         offset_path=offset.parameter_path,
         limit_path=offset.limit_path,
@@ -221,7 +229,7 @@ def counted_stream(  # noqa: PLR0913
     )
     source = CountedItemStream(
         executor,
-        canonical_request(request),
+        canonical,
         plan=plan,
         selector=_collection_selector(selector, collection_shape),
         identity=identity,

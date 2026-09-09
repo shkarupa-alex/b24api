@@ -1,6 +1,7 @@
 """Immutable public values shared by execution and evidence layers."""
 
 from __future__ import annotations
+import hashlib
 import math
 import re
 from dataclasses import dataclass, field
@@ -75,6 +76,8 @@ class BinaryResponse:
             raise ValueError("binary evidence length does not match body")
         if _safe_media_type(content_type) != evidence.content_type:
             raise ValueError("binary response content type does not match evidence")
+        if evidence.sha256 is not None and hashlib.sha256(copied).hexdigest() != evidence.sha256:
+            raise ValueError("binary response digest does not match body")
         object.__setattr__(self, "content_type", evidence.content_type)
         object.__setattr__(self, "evidence", evidence)
         object.__setattr__(self, "_body", copied)

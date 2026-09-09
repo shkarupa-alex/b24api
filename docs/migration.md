@@ -17,6 +17,16 @@ evidence explicit. Existing JSON requests and the `Transport.send()` protocol re
   subclass of `HTTPGatewayError`. Malformed non-empty JSON remains `ProtocolError`.
 - Counted identity is optional. Without it, matching a qualified total yields count-only assurance;
   with it, the report records identity-and-count assurance.
+- Final 1xx and 3xx responses are classified as `HTTPGatewayError` with their actual status before
+  envelope decoding.
+- `RequestSummary.to_dict()` now includes bounded `encoding` and normalized `header_names` fields.
+- `WireResponse.__repr__` is intentionally value-free; do not parse or snapshot its former body text.
+
+Two construction/identity details can affect callers that used public values as low-level building blocks:
+
+- `AmbiguousExecutionError` construction now requires explicit `reason` and `declared_unsafe` keywords;
+- `Request` equality and hashing are structural and type-sensitive, so equivalent immutable request trees
+  compare equal and can be used safely as dictionary or set keys.
 
 Use `UnknownRequestCollector` as the client's `unknown_request_audit` hook to inventory requests
 that still rely on the default replay classification. The hook receives value-free summaries only.
