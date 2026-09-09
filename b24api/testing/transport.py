@@ -8,24 +8,18 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 
 from b24api.contracts.request import Request
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 from b24api.errors import ResponseTooLargeError
+from b24api.testing._isolation import IsolationController, IsolationDeadlineError, run_isolated
 from b24api.transport.base import Transport, TransportCapabilities, WireRequest, WireResponse, WireTransport
 
 type TransportFactory = Callable[[str], Transport | Awaitable[Transport]]
 _HTTP_OK = 200
 _CASE_TIMEOUT_SECONDS = 6.0
 _CLOSE_TIMEOUT_SECONDS = 1.0
-
-
-class _HarnessDeadlineError(Exception):
-    """Internal value-free deadline marker."""
-
-    def __init__(self, detail: str) -> None:
-        super().__init__(detail)
-        self.detail = detail
 
 
 class ConformanceCase(StrEnum):
@@ -88,6 +82,30 @@ async def run_transport_conformance(
     selected = frozenset(ConformanceCase) if cases is None else frozenset(cases)
     if any(not isinstance(case, ConformanceCase) for case in selected):
         raise TypeError("cases must contain ConformanceCase values")
+    outcomes: list[ConformanceOutcome] = []
+    for case in ConformanceCase:
+        if case not in selected:
+            continue
+        try:
+            outcomes.append(
+                await run_isolated(
+                    partial(_run_case_environment, case, factory),
+                    case_seconds=_CASE_TIMEOUT_SECONDS,
+                ),
+            )
+        except IsolationDeadlineError as error:
+            outcomes.append(ConformanceOutcome(case, passed=False, detail=error.detail))
+        except Exception as error:  # noqa: BLE001 - report type only, never exception values
+            outcomes.append(ConformanceOutcome(case, passed=False, detail=type(error).__name__))
+    return ConformanceReport(tuple(outcomes))
+
+
+async def _run_case_environment(
+    case: ConformanceCase,
+    factory: TransportFactory,
+    controller: IsolationController,
+) -> ConformanceOutcome:
+    """Own one case's event loop, responder, captures, and transport."""
     captures: asyncio.Queue[_Capture] = asyncio.Queue()
 
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -123,36 +141,31 @@ async def run_transport_conformance(
 
     server = await asyncio.start_server(handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
-    base_url = f"http://127.0.0.1:{port}/"
-    outcomes: list[ConformanceOutcome] = []
     try:
-        for case in ConformanceCase:
-            if case not in selected:
-                continue
-            try:
-                outcomes.append(await _run_owned_case(case, factory, base_url, captures))
-            except _HarnessDeadlineError as error:
-                outcomes.append(ConformanceOutcome(case, passed=False, detail=error.detail))
-            except Exception as error:  # noqa: BLE001 - report type only, never exception values
-                outcomes.append(ConformanceOutcome(case, passed=False, detail=type(error).__name__))
+        return await _run_owned_case(case, factory, f"http://127.0.0.1:{port}/", captures, controller)
     finally:
         server.close()
         await server.wait_closed()
-    return ConformanceReport(tuple(outcomes))
 
 
-async def _run_owned_case(
+async def _run_owned_case(  # noqa: C901 - lifecycle must preserve the first failure
     case: ConformanceCase,
     factory: TransportFactory,
     base_url: str,
     captures: asyncio.Queue[_Capture],
+    controller: IsolationController,
 ) -> ConformanceOutcome:
     """Create and exercise one transport, then close it under a separate deadline."""
     deadline = asyncio.get_running_loop().time() + _CASE_TIMEOUT_SECONDS
-    transport = await _await_bounded(
-        _call_maybe_async(factory, base_url),
-        seconds=max(0.0, deadline - asyncio.get_running_loop().time()),
-        detail="CaseDeadlineExceeded",
+    transport_value = factory(base_url)
+    transport = (
+        await _await_bounded(
+            transport_value,
+            seconds=max(0.0, deadline - asyncio.get_running_loop().time()),
+            detail="CaseDeadlineExceeded",
+        )
+        if inspect.isawaitable(transport_value)
+        else transport_value
     )
     outcome: ConformanceOutcome | None = None
     failure: BaseException | None = None
@@ -167,14 +180,17 @@ async def _run_owned_case(
     except Exception as error:  # noqa: BLE001 - report type only, never exception values
         failure = error
     finally:
+        controller.enter_cleanup(_CLOSE_TIMEOUT_SECONDS)
         close = getattr(transport, "aclose", None)
         if close is not None:
             try:
-                await _await_bounded(
-                    _call_maybe_async(close),
-                    seconds=_CLOSE_TIMEOUT_SECONDS,
-                    detail="CleanupDeadlineExceeded",
-                )
+                close_value = close()
+                if inspect.isawaitable(close_value):
+                    await _await_bounded(
+                        close_value,
+                        seconds=_CLOSE_TIMEOUT_SECONDS,
+                        detail="CleanupDeadlineExceeded",
+                    )
             except asyncio.CancelledError as error:
                 if failure is None:
                     failure = error
@@ -186,12 +202,6 @@ async def _run_owned_case(
     if outcome is None:  # pragma: no cover - defensive invariant
         raise RuntimeError("conformance case produced no outcome")
     return outcome
-
-
-async def _call_maybe_async[**P, T](call: Callable[P, T | Awaitable[T]], *args: P.args, **kwargs: P.kwargs) -> T:
-    """Invoke possibly synchronous extension code without blocking the event loop."""
-    value = await asyncio.to_thread(call, *args, **kwargs)
-    return await value if inspect.isawaitable(value) else value
 
 
 async def _await_bounded[T](awaitable: Awaitable[T], *, seconds: float, detail: str) -> T:
@@ -207,7 +217,7 @@ async def _await_bounded[T](awaitable: Awaitable[T], *, seconds: float, detail: 
         return task.result()
     task.cancel()
     task.add_done_callback(_consume_detached_task)
-    raise _HarnessDeadlineError(detail)
+    raise IsolationDeadlineError(detail)
 
 
 def _consume_detached_task[T](task: asyncio.Future[T]) -> None:

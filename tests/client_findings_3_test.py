@@ -3,6 +3,8 @@
 from __future__ import annotations
 import asyncio
 import json
+import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -182,6 +184,15 @@ def test_request_equality_preserves_wire_significant_json_scalar_types(
 
     assert first != second
     assert len({first, second}) == DISTINCT_REQUESTS
+
+
+def test_request_rejects_excessive_json_depth_before_hashing() -> None:
+    nested: object = 1
+    for _index in range(300):
+        nested = [nested]
+
+    with pytest.raises(ValueError, match="nesting exceeds"):
+        Request("example.action", {"nested": nested})
 
 
 def test_headers_are_normalized_and_reserved_families_are_rejected() -> None:
@@ -428,6 +439,66 @@ async def test_conformance_runner_distinguishes_transport_timeout_from_harness_d
     )
 
     assert report.failures[0].detail == "TimeoutError"
+
+
+@pytest.mark.asyncio
+async def test_conformance_runner_preserves_loop_affinity_and_isolates_case_responders() -> None:
+    loop_was_running: list[bool] = []
+    base_urls: list[str] = []
+
+    def factory(base_url: str) -> HttpxTransport:
+        loop_was_running.append(asyncio.get_running_loop().is_running())
+        base_urls.append(base_url)
+        return HttpxTransport(base_url)
+
+    report = await run_transport_conformance(
+        factory,
+        cases=frozenset({ConformanceCase.LEGACY_JSON_BODY, ConformanceCase.JSON_CONTENT_TYPE}),
+    )
+
+    assert report.passed
+    assert len(loop_was_running) == DISTINCT_REQUESTS
+    assert all(loop_was_running)
+    assert len(set(base_urls)) == DISTINCT_REQUESTS
+
+
+def test_cancellation_resistant_cleanup_cannot_block_process_shutdown() -> None:
+    script = """
+import asyncio
+from b24api.testing import ConformanceCase, run_transport_conformance
+from b24api.testing import transport as module
+
+module._CLOSE_TIMEOUT_SECONDS = 0.02
+
+class Resistant:
+    host = "test.invalid"
+    async def send(self, request, *, attempt_timeout, max_response_bytes):
+        raise AssertionError
+    async def aclose(self):
+        while True:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                continue
+
+async def main():
+    report = await run_transport_conformance(
+        lambda _url: Resistant(),
+        cases=frozenset({ConformanceCase.HOST_PROPERTY_CREDENTIAL_FREE}),
+    )
+    assert report.failures[0].detail == "CleanupDeadlineExceeded"
+
+asyncio.run(main())
+"""
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and in-repository regression script
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=1,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ from collections.abc import Iterator, Mapping, Sequence
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type FrozenJson = JsonScalar | tuple[FrozenJson, ...] | FrozenMapping
+_MAX_JSON_DEPTH = 256
 
 
 class FrozenMapping(Mapping[str, FrozenJson]):
@@ -66,7 +67,14 @@ def _frozen_json_key(value: FrozenJson) -> object:  # noqa: PLR0911 - closed JSO
     return value._comparison_key()  # noqa: SLF001 - closed recursive value implementation
 
 
-def _freeze_json(value: object, *, active: set[int] | None = None) -> FrozenJson:
+def _freeze_json(  # noqa: C901 - closed JSON scalar/container variants
+    value: object,
+    *,
+    active: set[int] | None = None,
+    depth: int = 0,
+) -> FrozenJson:
+    if depth > _MAX_JSON_DEPTH:
+        raise ValueError("JSON nesting exceeds the supported depth")
     active = active if active is not None else set()
     if value is None or isinstance(value, bool | int | str):
         return value
@@ -84,7 +92,7 @@ def _freeze_json(value: object, *, active: set[int] | None = None) -> FrozenJson
             for key, item in value.items():
                 if not isinstance(key, str):
                     raise TypeError("JSON object keys must be strings")
-                frozen[key] = _freeze_json(item, active=active)
+                frozen[key] = _freeze_json(item, active=active, depth=depth + 1)
             return FrozenMapping(frozen)
         finally:
             active.remove(identity)
@@ -94,7 +102,7 @@ def _freeze_json(value: object, *, active: set[int] | None = None) -> FrozenJson
             raise ValueError("cyclic JSON arrays are not supported")
         active.add(identity)
         try:
-            return tuple(_freeze_json(item, active=active) for item in value)
+            return tuple(_freeze_json(item, active=active, depth=depth + 1) for item in value)
         finally:
             active.remove(identity)
     raise TypeError(f"unsupported JSON value type: {type(value).__name__}")
