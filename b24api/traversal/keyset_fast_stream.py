@@ -240,6 +240,7 @@ def build_keyset_execution_report(  # noqa: PLR0913
         total_hint_used=total_hint.used,
         trace_retained_by_class=trace.class_counts(),
         trace_dropped_by_class=tuple((kind, dropped[kind]) for kind in TraceClass),
+        raw_rows=counters.raw_rows,
     )
 
 

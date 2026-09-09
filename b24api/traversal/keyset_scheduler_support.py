@@ -299,7 +299,13 @@ class KeysetSchedulerSupport:
                 reserve,
                 deque(),
             )
-            plan = self._lane_plan(lane, phase=KeysetPhase.ANCHOR_PROBE, request=request, reserve=reserve, single=True)
+            plan = self._lane_plan(
+                lane,
+                phase=KeysetPhase.ANCHOR_PROBE,
+                request=request,
+                reserve=reserve,
+                single=self.keyset.limit_path is not None,
+            )
             self._planning_bounds[plan.command_id] = lane.spec.bounds
             self._planning_descending[plan.command_id] = False
             plans.append(plan)

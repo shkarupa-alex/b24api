@@ -80,6 +80,7 @@ def build_scheduler_report(scheduler: KeysetFastScheduler) -> KeysetExecutionRep
         total_hint_used=scheduler._total_hint.used,
         trace_retained_by_class=scheduler.trace.class_counts(),
         trace_dropped_by_class=tuple((kind, dropped[kind]) for kind in TraceClass),
+        raw_rows=counters.raw_rows,
     )
 
 

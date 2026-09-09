@@ -1,4 +1,3 @@
-# ruff: noqa: INP001
 """Reproducible local CPU, wall-time, and allocation profiling scenarios."""
 
 from __future__ import annotations

@@ -110,6 +110,7 @@ def _stream(
     execution: RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
     *,
     direction: str = "ascending",
+    writable_limit: bool = True,
 ):
     return _client(transport).iter_list_keyset(
         Request("item.list", parameters={"filter": {"STATUS": "open"}}),
@@ -117,7 +118,7 @@ def _stream(
         identity=_identity(),
         page_size=PAGE_SIZE,
         keyset=KeysetSpec(
-            limit_path=ParameterPath(("limit",)),
+            limit_path=ParameterPath(("limit",)) if writable_limit else None,
             direction=direction,  # type: ignore[arg-type]
         ),
         execution=execution,
@@ -301,6 +302,21 @@ async def test_empty_auto_selection_completes_in_boundary_wave() -> None:
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.BOUNDARY_ONLY
     assert stream.report.keyset_execution.preselection_reason is KeysetSelectionReason.EMPTY_SELECTION
+
+
+@pytest.mark.asyncio
+async def test_partition_anchor_probe_without_writable_limit_discards_extra_rows() -> None:
+    identities = tuple(range(1, 61)) + tuple(range(100, 141))
+    stream = _stream(
+        KeysetTransport(identities),
+        PartitionedKeysetExecution(StableIntegerKeysetContract(endpoint_page_cap=PAGE_SIZE), target_lanes=3),
+        writable_limit=False,
+    )
+
+    assert [item["id"] async for item in stream] == list(identities)
+    assert stream.report is not None
+    assert stream.report.keyset_execution is not None
+    assert stream.report.keyset_execution.probe_rows_discarded > 0
 
 
 @pytest.mark.asyncio
