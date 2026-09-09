@@ -21,6 +21,14 @@ class IsolationDeadlineError(Exception):
         self.detail = detail
 
 
+class IsolationAbortError(Exception):
+    """Value-free marker for a BaseException raised by isolated code."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 @dataclass(slots=True)
 class IsolationController:
     """Thread-safe phase and result state shared with the caller loop."""
@@ -31,10 +39,10 @@ class IsolationController:
     result: object | None = None
     error: BaseException | None = None
 
-    def enter_cleanup(self, seconds: float) -> None:
+    def enter_cleanup(self, seconds: float, *, preceding_detail: str | None) -> None:
         """Start an independent cleanup budget."""
         self.deadline = time.monotonic() + seconds
-        self.detail = "CleanupDeadlineExceeded"
+        self.detail = preceding_detail or "CleanupDeadlineExceeded"
 
 
 async def run_isolated[T](
@@ -48,8 +56,10 @@ async def run_isolated[T](
     async def publish() -> None:
         try:
             controller.result = await operation(controller)
-        except BaseException as error:  # noqa: BLE001 - retain isolated cancellation
+        except Exception as error:  # noqa: BLE001 - transport exception crosses as an outcome
             controller.error = error
+        except BaseException as error:  # noqa: BLE001 - convert isolated aborts to outcomes
+            controller.error = IsolationAbortError(type(error).__name__)
         finally:
             controller.completed.set()
 
@@ -57,7 +67,7 @@ async def run_isolated[T](
         try:
             asyncio.run(publish())
         except BaseException as error:  # noqa: BLE001  # pragma: no cover - bootstrap failure
-            controller.error = error
+            controller.error = IsolationAbortError(type(error).__name__)
             controller.completed.set()
 
     threading.Thread(target=worker, name="b24api-conformance-case", daemon=True).start()

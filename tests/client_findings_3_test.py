@@ -5,6 +5,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -439,6 +440,105 @@ async def test_conformance_runner_distinguishes_transport_timeout_from_harness_d
     )
 
     assert report.failures[0].detail == "TimeoutError"
+
+
+@pytest.mark.asyncio
+async def test_isolated_base_exceptions_become_outcomes_without_cancelling_caller() -> None:
+    class CancelledSend(_Transport):
+        async def send(
+            self,
+            request: Request,
+            *,
+            attempt_timeout: float,
+            max_response_bytes: int,
+        ) -> WireResponse:
+            del request, attempt_timeout, max_response_bytes
+            raise asyncio.CancelledError
+
+    send_report = await run_transport_conformance(
+        lambda _url: CancelledSend(lambda _request: _response(result=True)),
+        cases=frozenset({ConformanceCase.LEGACY_JSON_BODY}),
+    )
+
+    class CancelledClose(_Transport):
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    close_report = await run_transport_conformance(
+        lambda _url: CancelledClose(lambda _request: _response(result=True)),
+        cases=frozenset({ConformanceCase.HOST_PROPERTY_CREDENTIAL_FREE}),
+    )
+
+    assert send_report.failures[0].detail == "CancelledError"
+    assert close_report.failures[0].detail == "CancelledError"
+    current = asyncio.current_task()
+    assert current is not None
+    assert current.cancelling() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort", [KeyboardInterrupt, SystemExit])
+async def test_isolated_process_aborts_become_value_free_outcomes(
+    abort: type[BaseException],
+) -> None:
+    class AbortingSend(_Transport):
+        async def send(
+            self,
+            request: Request,
+            *,
+            attempt_timeout: float,
+            max_response_bytes: int,
+        ) -> WireResponse:
+            del request, attempt_timeout, max_response_bytes
+            raise abort
+
+    report = await run_transport_conformance(
+        lambda _url: AbortingSend(lambda _request: _response(result=True)),
+        cases=frozenset({ConformanceCase.LEGACY_JSON_BODY}),
+    )
+
+    assert report.failures[0].detail == abort.__name__
+
+
+@pytest.mark.asyncio
+async def test_case_failure_deterministically_precedes_resistant_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(testing_transport, "_CLOSE_TIMEOUT_SECONDS", 0.02)
+    releases: list[threading.Event] = []
+
+    class TimeoutThenResistantClose(_Transport):
+        async def send(
+            self,
+            request: Request,
+            *,
+            attempt_timeout: float,
+            max_response_bytes: int,
+        ) -> WireResponse:
+            del request, attempt_timeout, max_response_bytes
+            raise TimeoutError
+
+        async def aclose(self) -> None:
+            release = threading.Event()
+            releases.append(release)
+            while not release.is_set():
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    continue
+
+    details = []
+    for _index in range(10):
+        report = await run_transport_conformance(
+            lambda _url: TimeoutThenResistantClose(lambda _request: _response(result=True)),
+            cases=frozenset({ConformanceCase.LEGACY_JSON_BODY}),
+        )
+        details.append(report.failures[0].detail)
+
+    assert details == ["TimeoutError"] * 10
+    for release in releases:
+        release.set()
+    await asyncio.sleep(0.05)
 
 
 @pytest.mark.asyncio

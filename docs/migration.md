@@ -27,8 +27,9 @@ Two construction/identity details can affect callers that used public values as 
 - `AmbiguousExecutionError` construction now requires explicit `reason` and `declared_unsafe` keywords;
 - `Request` equality and hashing are structural and type-sensitive, so equivalent immutable request trees
   compare equal and can be used safely as dictionary or set keys.
-- Request JSON nesting deeper than 256 levels is rejected at construction with `ValueError`, before equality
-  or hashing can encounter the interpreter recursion limit.
+- Canonical JSON nesting deeper than 256 levels is rejected at construction with `ValueError` for request,
+  response, parameter-update, batch, and reference values; an over-deep server response surfaces as
+  `ProtocolError`. This rejects the value before equality or hashing can encounter the recursion limit.
 
 Use `UnknownRequestCollector` as the client's `unknown_request_audit` hook to inventory requests
 that still rely on the default replay classification. The hook receives value-free summaries only.

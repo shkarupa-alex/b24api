@@ -13,7 +13,12 @@ from functools import partial
 from b24api.contracts.request import Request
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 from b24api.errors import ResponseTooLargeError
-from b24api.testing._isolation import IsolationController, IsolationDeadlineError, run_isolated
+from b24api.testing._isolation import (
+    IsolationAbortError,
+    IsolationController,
+    IsolationDeadlineError,
+    run_isolated,
+)
 from b24api.transport.base import Transport, TransportCapabilities, WireRequest, WireResponse, WireTransport
 
 type TransportFactory = Callable[[str], Transport | Awaitable[Transport]]
@@ -93,7 +98,7 @@ async def run_transport_conformance(
                     case_seconds=_CASE_TIMEOUT_SECONDS,
                 ),
             )
-        except IsolationDeadlineError as error:
+        except (IsolationAbortError, IsolationDeadlineError) as error:
             outcomes.append(ConformanceOutcome(case, passed=False, detail=error.detail))
         except Exception as error:  # noqa: BLE001 - report type only, never exception values
             outcomes.append(ConformanceOutcome(case, passed=False, detail=type(error).__name__))
@@ -148,7 +153,7 @@ async def _run_case_environment(
         await server.wait_closed()
 
 
-async def _run_owned_case(  # noqa: C901 - lifecycle must preserve the first failure
+async def _run_owned_case(  # noqa: C901, PLR0912 - preserve the first lifecycle failure
     case: ConformanceCase,
     factory: TransportFactory,
     base_url: str,
@@ -179,8 +184,10 @@ async def _run_owned_case(  # noqa: C901 - lifecycle must preserve the first fai
         failure = error
     except Exception as error:  # noqa: BLE001 - report type only, never exception values
         failure = error
+    except BaseException as error:  # noqa: BLE001 - isolate untrusted aborts
+        failure = IsolationAbortError(type(error).__name__)
     finally:
-        controller.enter_cleanup(_CLOSE_TIMEOUT_SECONDS)
+        controller.enter_cleanup(_CLOSE_TIMEOUT_SECONDS, preceding_detail=_failure_detail(failure))
         close = getattr(transport, "aclose", None)
         if close is not None:
             try:
@@ -197,11 +204,21 @@ async def _run_owned_case(  # noqa: C901 - lifecycle must preserve the first fai
             except Exception as error:  # noqa: BLE001 - report type only, never exception values
                 if failure is None:
                     failure = error
+            except BaseException as error:  # noqa: BLE001 - isolate untrusted aborts
+                if failure is None:
+                    failure = IsolationAbortError(type(error).__name__)
     if failure is not None:
         raise failure
     if outcome is None:  # pragma: no cover - defensive invariant
         raise RuntimeError("conformance case produced no outcome")
     return outcome
+
+
+def _failure_detail(error: BaseException | None) -> str | None:
+    """Return the value-free detail that cleanup must not mask."""
+    if isinstance(error, IsolationAbortError | IsolationDeadlineError):
+        return error.detail
+    return type(error).__name__ if error is not None else None
 
 
 async def _await_bounded[T](awaitable: Awaitable[T], *, seconds: float, detail: str) -> T:
