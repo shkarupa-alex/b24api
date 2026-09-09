@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from b24api.contracts.json import _is_plain_int
 from b24api.contracts.policy import CompletionAssurance, KernelState, SnapshotState
-from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
+from b24api.contracts.report import KeysetExecutionReport, PageRecord, Violation, ViolationSeverity
 from b24api.redaction import DEFAULT_REDACTOR
 
 if TYPE_CHECKING:
@@ -36,6 +36,7 @@ class KernelReport:
     evidence: tuple[ResponseEvidence, ...] = ()
     page_trace: tuple[PageRecord, ...] = ()
     page_trace_truncated: bool = False
+    keyset_execution: KeysetExecutionReport | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -66,6 +67,8 @@ class KernelReport:
             raise ValueError("unique_rows cannot exceed emitted_rows")
         if self.completed and any(item.severity is ViolationSeverity.BLOCKING for item in self.violations):
             raise ValueError("completed report cannot contain blocking violations")
+        if self.keyset_execution is not None and not isinstance(self.keyset_execution, KeysetExecutionReport):
+            raise TypeError("keyset_execution must be a KeysetExecutionReport or None")
 
     @property
     def completed(self) -> bool:

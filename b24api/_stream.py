@@ -82,6 +82,7 @@ def _public_report(  # noqa: PLR0913
         violations=report.violations,
         page_trace=report.page_trace,
         page_trace_truncated=report.page_trace_truncated,
+        keyset_execution=report.keyset_execution,
     )
 
 

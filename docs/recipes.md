@@ -44,6 +44,39 @@ keyset = KeysetSpec(
 )
 ```
 
+## Opt-in batched keyset execution
+
+Use automatic execution only after verifying stable integer identities, both order directions,
+strict numeric bounds, and the endpoint's page-completion behavior. Construction is I/O-free, but
+the first pull completes the planning barrier before yielding rows.
+
+<!-- tested: tests/keyset_fast_test.py::test_auto_range_and_partitioned_modes_are_exact -->
+```python
+from b24api import (
+    AutoKeysetExecution,
+    IdentityCoercion,
+    IdentitySpec,
+    KeysetSpec,
+    ParameterPath,
+    ResultSelector,
+    StableIntegerKeysetContract,
+)
+
+identity = IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER)
+keyset = KeysetSpec(
+    filter_path=ParameterPath(("filter",)),
+    order_path=ParameterPath(("order",)),
+)
+
+stream = client.iter_list_keyset(
+    request,
+    selector=ResultSelector.root(),
+    identity=identity,
+    keyset=keyset,
+    execution=AutoKeysetExecution(contract=StableIntegerKeysetContract()),
+)
+```
+
 ## Mapping-backed collections
 
 Use strict mapping values when the selected collection is always an ID-keyed object:

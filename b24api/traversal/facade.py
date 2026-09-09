@@ -5,7 +5,15 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal, cast
 
 from b24api._stream import MappedOperationStream, _ClosableIterator
+from b24api.batch.engine import BatchExecutor
 from b24api.batch.facade import resolve_batch_size
+from b24api.contracts.keyset_execution import (
+    AutoKeysetExecution,
+    KeysetExecution,
+    PartitionedKeysetExecution,
+    RangeKeysetExecution,
+    SequentialKeysetExecution,
+)
 from b24api.contracts.policy import (
     DuplicatePolicy,
     ExecutionPolicy,
@@ -26,6 +34,9 @@ from b24api.contracts.traversal import OffsetContinuation, TotalTermination
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.counted import CountedItemStream
+from b24api.traversal.keyset_eligibility import validate_fast_keyset
+from b24api.traversal.keyset_fast_stream import FastTraceRecorder, KeysetFastStream
+from b24api.traversal.keyset_scheduler import KeysetFastScheduler
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
@@ -148,11 +159,51 @@ def keyset_stream(  # noqa: PLR0913
     collection_shape: ResultCollectionShape,
     page_size: int,
     keyset: KeysetSpec,
+    execution: KeysetExecution,
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
 ) -> OperationStream[JsonValue]:
-    """Compose exact sequential no-count keyset traversal."""
+    """Compose compatible sequential or explicit fast no-count traversal."""
+    if not isinstance(
+        execution,
+        SequentialKeysetExecution | RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
+    ):
+        raise TypeError("execution must be a supported KeysetExecution")
+    if not isinstance(execution, SequentialKeysetExecution):
+        canonical = canonical_request(request)
+        effective_cap = validate_fast_keyset(
+            executor,
+            canonical,
+            identity=identity,
+            keyset=keyset,
+            page_size=page_size,
+            execution=execution,
+            policy=policy,
+        )
+        context = executor.context(policy)
+        trace = FastTraceRecorder(policy.page_trace_limit)
+        scheduler = KeysetFastScheduler(
+            executor=executor,
+            request=canonical,
+            identity=identity,
+            keyset=keyset,
+            selector=_collection_selector(selector, collection_shape),
+            collection_shape=collection_shape,
+            page_size=page_size,
+            effective_page_cap=effective_cap,
+            execution=execution,
+            context=context,
+            engine=BatchExecutor(executor),
+            trace=trace,
+        )
+        return _mapped_stream(
+            KeysetFastStream(scheduler),
+            operation="iter_list_keyset",
+            assurance=TraversalAssurance.IDENTITY_EXACT,
+            deregister=deregister,
+            audit_violations=audit_violations,
+        )
     direction = _direction(keyset.direction)
     plan = KeysetPlan(
         direction=direction,

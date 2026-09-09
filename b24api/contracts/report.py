@@ -5,6 +5,14 @@ import math
 from dataclasses import dataclass
 from enum import StrEnum
 
+from b24api.contracts.keyset_execution import (
+    ClosureWitness,
+    KeysetAssuranceSource,
+    KeysetExecutionKind,
+    KeysetPhase,
+    KeysetSelectionReason,
+    TraceClass,
+)
 from b24api.redaction import DEFAULT_REDACTOR
 
 VIOLATION_CODE_MAXIMUM = 100
@@ -87,6 +95,9 @@ class PageRejectionCode(StrEnum):
     SHAPE_CONTRACT = "shape_contract"
     IDENTITY_CONTRACT = "identity_contract"
     AMBIGUOUS_EXECUTION = "ambiguous_execution"
+    BATCH_ENVELOPE = "batch_envelope"
+    NOT_EXECUTED = "not_executed"
+    TRANSACTION_ABORTED = "transaction_aborted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +115,8 @@ class PageRecord:
     outcome: PageOutcome
     rejection_code: PageRejectionCode | None
     reference_index: int | None = None
+    phase: KeysetPhase | None = None
+    lane_ordinal: int | None = None
 
     def __post_init__(self) -> None:
         """Validate page evidence."""
@@ -124,6 +137,132 @@ class PageRecord:
             raise ValueError("committed pages cannot carry a rejection code")
         if self.outcome is not PageOutcome.COMMITTED and self.rows_admitted:
             raise ValueError("uncommitted pages cannot admit rows")
+        if self.phase is not None and not isinstance(self.phase, KeysetPhase):
+            raise TypeError("phase must be a KeysetPhase or None")
+        if self.lane_ordinal is not None and (
+            not isinstance(self.lane_ordinal, int) or isinstance(self.lane_ordinal, bool) or self.lane_ordinal < 0
+        ):
+            raise ValueError("lane_ordinal must be a non-negative integer or None")
+
+
+@dataclass(frozen=True, slots=True)
+class KeysetExecutionReport:
+    """Immutable aggregate evidence for one fast keyset execution."""
+
+    requested_kind: KeysetExecutionKind
+    selected_kind: KeysetExecutionKind
+    preselection_reason: KeysetSelectionReason
+    final_selection_reason: KeysetSelectionReason | None
+    assurance_source: KeysetAssuranceSource
+    planning_requests: int
+    boundary_requests: int
+    canary_requests: int
+    anchor_probe_requests: int
+    canary_commands: int
+    canary_rows: int
+    anchor_probe_commands: int
+    anchor_count: int
+    empty_anchor_probes: int
+    probe_rows_discarded: int
+    boundary_overlap_rows: int
+    head_page_admitted: bool
+    sequential_requests_estimate: int | None
+    selected_requests_estimate: int | None
+    head_rows: int
+    tail_rows: int
+    interior_span: int | None
+    interior_rows_estimate: int | None
+    total_rows_estimate: int | None
+    density_numerator: int | None
+    density_denominator: int | None
+    effective_window_width: int | None
+    range_window_count: int | None
+    target_lanes: int | None
+    actual_lanes: int | None
+    continuation_count: int
+    closure_witness_counts: tuple[tuple[ClosureWitness, int], ...]
+    effective_batch_capacity: int
+    total_hint_requested: bool
+    total_hint_observed: int | None
+    total_hint_plausible: bool
+    total_hint_used: bool
+    trace_retained_by_class: tuple[tuple[TraceClass, int], ...]
+    trace_dropped_by_class: tuple[tuple[TraceClass, int], ...]
+
+    def __post_init__(self) -> None:
+        """Validate closed aggregate report fields."""
+        enum_values = (
+            (self.requested_kind, KeysetExecutionKind),
+            (self.selected_kind, KeysetExecutionKind),
+            (self.preselection_reason, KeysetSelectionReason),
+            (self.assurance_source, KeysetAssuranceSource),
+        )
+        if any(not isinstance(value, kind) for value, kind in enum_values):
+            raise TypeError("keyset report enums must use their declared types")
+        if self.final_selection_reason is not None and not isinstance(
+            self.final_selection_reason,
+            KeysetSelectionReason,
+        ):
+            raise TypeError("final_selection_reason must be a KeysetSelectionReason or None")
+        integers = (
+            self.planning_requests,
+            self.boundary_requests,
+            self.canary_requests,
+            self.anchor_probe_requests,
+            self.canary_commands,
+            self.canary_rows,
+            self.anchor_probe_commands,
+            self.anchor_count,
+            self.empty_anchor_probes,
+            self.probe_rows_discarded,
+            self.boundary_overlap_rows,
+            self.head_rows,
+            self.tail_rows,
+            self.continuation_count,
+            self.effective_batch_capacity,
+        )
+        optional = (
+            self.sequential_requests_estimate,
+            self.selected_requests_estimate,
+            self.interior_span,
+            self.interior_rows_estimate,
+            self.total_rows_estimate,
+            self.density_numerator,
+            self.density_denominator,
+            self.effective_window_width,
+            self.range_window_count,
+            self.target_lanes,
+            self.actual_lanes,
+        )
+        if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in integers):
+            raise ValueError("keyset report counters must be non-negative integers")
+        if any(
+            value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0)
+            for value in optional
+        ):
+            raise ValueError("optional keyset report counters must be non-negative integers")
+        flags = (
+            self.head_page_admitted,
+            self.total_hint_requested,
+            self.total_hint_plausible,
+            self.total_hint_used,
+        )
+        if any(not isinstance(value, bool) for value in flags):
+            raise TypeError("keyset report flags must be booleans")
+        object.__setattr__(self, "closure_witness_counts", tuple(self.closure_witness_counts))
+        object.__setattr__(self, "trace_retained_by_class", tuple(self.trace_retained_by_class))
+        object.__setattr__(self, "trace_dropped_by_class", tuple(self.trace_dropped_by_class))
+        self._validate_counts(self.closure_witness_counts, ClosureWitness, "closure_witness_counts")
+        self._validate_counts(self.trace_retained_by_class, TraceClass, "trace_retained_by_class")
+        self._validate_counts(self.trace_dropped_by_class, TraceClass, "trace_dropped_by_class")
+
+    @staticmethod
+    def _validate_counts(values: tuple[tuple[object, int], ...], kind: type[StrEnum], field: str) -> None:
+        if any(
+            not isinstance(key, kind) or not isinstance(count, int) or isinstance(count, bool) or count < 0
+            for key, count in values
+        ):
+            raise ValueError(f"{field} must contain declared enums and non-negative integer counts")
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +292,7 @@ class OperationReport:
     violations: tuple[Violation, ...] = ()
     page_trace: tuple[PageRecord, ...] = ()
     page_trace_truncated: bool = False
+    keyset_execution: KeysetExecutionReport | None = None
 
     def __post_init__(self) -> None:
         """Validate bounded terminal evidence."""
@@ -189,6 +329,8 @@ class OperationReport:
             raise TypeError("page_trace must contain PageRecord values")
         if not isinstance(self.page_trace_truncated, bool):
             raise TypeError("page_trace_truncated must be a bool")
+        if self.keyset_execution is not None and not isinstance(self.keyset_execution, KeysetExecutionReport):
+            raise TypeError("keyset_execution must be a KeysetExecutionReport or None")
         if self.successful and any(item.severity is ViolationSeverity.BLOCKING for item in self.violations):
             raise ValueError("successful report cannot contain blocking violations")
 
@@ -229,6 +371,7 @@ def retain_page_trace(records: tuple[PageRecord, ...], limit: int) -> tuple[tupl
 
 
 __all__ = [
+    "KeysetExecutionReport",
     "OperationReport",
     "PageDispatch",
     "PageOutcome",

@@ -45,8 +45,12 @@ observed.
 
 ## Boundaries
 
-- Generic no-count traversal is exact sequential keyset/cursor traversal; it is not performance
-  admitted as a fast path.
+- Sequential no-count traversal remains the conservative default. Explicit range, partitioned, and
+  auto keyset modes recover physical batching only under a caller-asserted stable integer-keyset
+  contract; they pay a planning barrier even when the consumer stops early.
+- A returned `total` is advisory only and may raise an auto cost estimate. It never closes a lane or
+  strengthens correctness evidence. The terminal report records both the selected plan and whether
+  assurance came from the ordered prefix alone or from validated numeric-bound canaries.
 - Real portal latency, server work and network variance require a separately controlled live A/B.
 - Exact counted traversal retains identities for the operation lifetime; large exact traversals may
   therefore use substantial memory and emit a warning above 100,000 identities.

@@ -10,12 +10,15 @@ from typing import TYPE_CHECKING, NoReturn, Self
 import pytest
 
 from b24api import (
+    AutoKeysetExecution,
     CursorSpec,
     IdentitySpec,
     KeysetSpec,
     OffsetSpec,
     OperationReport,
     ParameterPath,
+    PartitionedKeysetExecution,
+    RangeKeysetExecution,
     ReplaySafety,
     Request,
     Response,
@@ -24,6 +27,7 @@ from b24api import (
     TraversalAssurance,
     cli,
 )
+from b24api.cli_contract import CliUsageError, parse_keyset_execution
 from b24api.contracts import IdentityCoercion
 from b24api.errors import CapabilityError, IncompleteTraversalError, ProtocolError
 
@@ -35,6 +39,24 @@ _UNAVAILABLE = 3
 _CORRECTNESS = 4
 _OUTPUT_CLOSED = 5
 _INTERRUPTED = 130
+
+
+def test_keyset_execution_json_is_closed_and_routes_all_fast_modes() -> None:
+    range_execution = parse_keyset_execution(
+        {"kind": "range", "page_completion": "short_page_exhausts", "window_width": 2, "batch_size": 7},
+    )
+    partitioned = parse_keyset_execution({"kind": "partitioned", "target_lanes": 3})
+    automatic = parse_keyset_execution(
+        {"kind": "auto", "range_window_width": 9, "max_range_waves": 4, "total_hint": "request_advisory"},
+    )
+
+    assert isinstance(range_execution, RangeKeysetExecution)
+    assert isinstance(partitioned, PartitionedKeysetExecution)
+    assert isinstance(automatic, AutoKeysetExecution)
+    with pytest.raises(CliUsageError):
+        parse_keyset_execution({"kind": "range", "window_width": 1})
+    with pytest.raises(CliUsageError):
+        parse_keyset_execution({"kind": "auto", "unknown": 1})
 
 
 @dataclass
