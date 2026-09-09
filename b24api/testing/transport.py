@@ -17,6 +17,15 @@ from b24api.transport.base import Transport, TransportCapabilities, WireRequest,
 type TransportFactory = Callable[[str], Transport | Awaitable[Transport]]
 _HTTP_OK = 200
 _CASE_TIMEOUT_SECONDS = 6.0
+_CLOSE_TIMEOUT_SECONDS = 1.0
+
+
+class _HarnessDeadlineError(Exception):
+    """Internal value-free deadline marker."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
 
 
 class ConformanceCase(StrEnum):
@@ -83,32 +92,34 @@ async def run_transport_conformance(
 
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            head = await reader.readuntil(b"\r\n\r\n")
-            lines = head.decode("latin-1").split("\r\n")
-            request_line = lines[0]
-            headers = {
-                name.strip().casefold(): value.strip()
-                for line in lines[1:]
-                if ":" in line
-                for name, value in (line.split(":", 1),)
-            }
-            length = int(headers.get("content-length", "0"))
-            body = await reader.readexactly(length) if length else b""
-            await captures.put(_Capture(request_line, headers, body))
-            if "cancel.test" in request_line:
-                await reader.read()
-                return
-            response_body = b'{"result":true}'
-            writer.write(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-                + str(len(response_body)).encode()
-                + b"\r\nConnection: close\r\n\r\n"
-                + response_body,
-            )
-            await writer.drain()
+            with contextlib.suppress(asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
+                head = await reader.readuntil(b"\r\n\r\n")
+                lines = head.decode("latin-1").split("\r\n")
+                request_line = lines[0]
+                headers = {
+                    name.strip().casefold(): value.strip()
+                    for line in lines[1:]
+                    if ":" in line
+                    for name, value in (line.split(":", 1),)
+                }
+                length = int(headers.get("content-length", "0"))
+                body = await reader.readexactly(length) if length else b""
+                await captures.put(_Capture(request_line, headers, body))
+                if "cancel.test" in request_line:
+                    await reader.read()
+                    return
+                response_body = b'{"result":true}'
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                    + str(len(response_body)).encode()
+                    + b"\r\nConnection: close\r\n\r\n"
+                    + response_body,
+                )
+                await writer.drain()
         finally:
             writer.close()
-            await writer.wait_closed()
+            with contextlib.suppress(ConnectionError):
+                await writer.wait_closed()
 
     server = await asyncio.start_server(handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
@@ -119,10 +130,9 @@ async def run_transport_conformance(
             if case not in selected:
                 continue
             try:
-                async with asyncio.timeout(_CASE_TIMEOUT_SECONDS):
-                    outcomes.append(await _run_owned_case(case, factory, base_url, captures))
-            except TimeoutError:
-                outcomes.append(ConformanceOutcome(case, passed=False, detail="TimeoutError"))
+                outcomes.append(await _run_owned_case(case, factory, base_url, captures))
+            except _HarnessDeadlineError as error:
+                outcomes.append(ConformanceOutcome(case, passed=False, detail=error.detail))
             except Exception as error:  # noqa: BLE001 - report type only, never exception values
                 outcomes.append(ConformanceOutcome(case, passed=False, detail=type(error).__name__))
     finally:
@@ -137,15 +147,75 @@ async def _run_owned_case(
     base_url: str,
     captures: asyncio.Queue[_Capture],
 ) -> ConformanceOutcome:
-    """Create, exercise, and close one transport within the caller's deadline."""
-    transport_value = factory(base_url)
-    transport = await transport_value if inspect.isawaitable(transport_value) else transport_value
+    """Create and exercise one transport, then close it under a separate deadline."""
+    deadline = asyncio.get_running_loop().time() + _CASE_TIMEOUT_SECONDS
+    transport = await _await_bounded(
+        _call_maybe_async(factory, base_url),
+        seconds=max(0.0, deadline - asyncio.get_running_loop().time()),
+        detail="CaseDeadlineExceeded",
+    )
+    outcome: ConformanceOutcome | None = None
+    failure: BaseException | None = None
     try:
-        return await _run_case(case, transport, captures)
+        outcome = await _await_bounded(
+            _run_case(case, transport, captures),
+            seconds=max(0.0, deadline - asyncio.get_running_loop().time()),
+            detail="CaseDeadlineExceeded",
+        )
+    except asyncio.CancelledError as error:
+        failure = error
+    except Exception as error:  # noqa: BLE001 - report type only, never exception values
+        failure = error
     finally:
         close = getattr(transport, "aclose", None)
         if close is not None:
-            await close()
+            try:
+                await _await_bounded(
+                    _call_maybe_async(close),
+                    seconds=_CLOSE_TIMEOUT_SECONDS,
+                    detail="CleanupDeadlineExceeded",
+                )
+            except asyncio.CancelledError as error:
+                if failure is None:
+                    failure = error
+            except Exception as error:  # noqa: BLE001 - report type only, never exception values
+                if failure is None:
+                    failure = error
+    if failure is not None:
+        raise failure
+    if outcome is None:  # pragma: no cover - defensive invariant
+        raise RuntimeError("conformance case produced no outcome")
+    return outcome
+
+
+async def _call_maybe_async[**P, T](call: Callable[P, T | Awaitable[T]], *args: P.args, **kwargs: P.kwargs) -> T:
+    """Invoke possibly synchronous extension code without blocking the event loop."""
+    value = await asyncio.to_thread(call, *args, **kwargs)
+    return await value if inspect.isawaitable(value) else value
+
+
+async def _await_bounded[T](awaitable: Awaitable[T], *, seconds: float, detail: str) -> T:
+    """Await extension code without waiting indefinitely for cancellation cooperation."""
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=seconds)
+    except asyncio.CancelledError:
+        task.cancel()
+        task.add_done_callback(_consume_detached_task)
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    task.add_done_callback(_consume_detached_task)
+    raise _HarnessDeadlineError(detail)
+
+
+def _consume_detached_task[T](task: asyncio.Future[T]) -> None:
+    """Retrieve any eventual exception from cancellation-resistant extension code."""
+    if not task.done():
+        return
+    with contextlib.suppress(BaseException):
+        task.result()
 
 
 async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915

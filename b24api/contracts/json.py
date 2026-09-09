@@ -12,11 +12,12 @@ type FrozenJson = JsonScalar | tuple[FrozenJson, ...] | FrozenMapping
 class FrozenMapping(Mapping[str, FrozenJson]):
     """Private immutable mapping used for canonical JSON storage."""
 
-    __slots__ = ("_values",)
+    __slots__ = ("_key", "_values")
 
     def __init__(self, values: Mapping[str, FrozenJson]) -> None:
         """Copy values into canonical immutable storage."""
         self._values = dict(values)
+        self._key: object | None = None
 
     def __getitem__(self, key: str) -> FrozenJson:
         """Return one frozen value."""
@@ -32,11 +33,20 @@ class FrozenMapping(Mapping[str, FrozenJson]):
 
     def __eq__(self, other: object) -> bool:
         """Compare canonical mappings structurally."""
-        return isinstance(other, FrozenMapping) and _frozen_json_key(self) == _frozen_json_key(other)
+        return isinstance(other, FrozenMapping) and self._comparison_key() == other._comparison_key()
 
     def __hash__(self) -> int:
         """Hash immutable JSON with wire-significant scalar types preserved."""
-        return hash(_frozen_json_key(self))
+        return hash(self._comparison_key())
+
+    def _comparison_key(self) -> object:
+        """Return the cached type-sensitive structural key."""
+        if self._key is None:
+            self._key = (
+                "object",
+                tuple(sorted((key, _frozen_json_key(item)) for key, item in self._values.items())),
+            )
+        return self._key
 
 
 def _frozen_json_key(value: FrozenJson) -> object:  # noqa: PLR0911 - closed JSON scalar/container variants
@@ -53,7 +63,7 @@ def _frozen_json_key(value: FrozenJson) -> object:  # noqa: PLR0911 - closed JSO
         return ("string", value)
     if isinstance(value, tuple):
         return ("array", tuple(_frozen_json_key(item) for item in value))
-    return ("object", tuple(sorted((key, _frozen_json_key(item)) for key, item in value.items())))
+    return value._comparison_key()  # noqa: SLF001 - closed recursive value implementation
 
 
 def _freeze_json(value: object, *, active: set[int] | None = None) -> FrozenJson:

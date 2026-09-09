@@ -1,6 +1,7 @@
 """Regression coverage for the third v2 client-findings increment."""
 
 from __future__ import annotations
+import asyncio
 import json
 import time
 from typing import TYPE_CHECKING
@@ -369,9 +370,64 @@ async def test_conformance_runner_times_out_transport_that_never_reaches_respond
         testing_transport.ConformanceOutcome(
             ConformanceCase.LEGACY_JSON_BODY,
             passed=False,
-            detail="TimeoutError",
+            detail="CaseDeadlineExceeded",
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_conformance_runner_bounds_blocking_factory_and_hanging_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(testing_transport, "_CASE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(testing_transport, "_CLOSE_TIMEOUT_SECONDS", 0.05)
+
+    def blocking_factory(_url: str) -> _Transport:
+        time.sleep(0.2)
+        return _Transport(lambda _request: _response(result=True))
+
+    started = time.monotonic()
+    factory_report = await run_transport_conformance(
+        blocking_factory,
+        cases=frozenset({ConformanceCase.LEGACY_JSON_BODY}),
+    )
+    factory_wall_ceiling = 0.15
+    assert time.monotonic() - started < factory_wall_ceiling
+    assert factory_report.failures[0].detail == "CaseDeadlineExceeded"
+
+    release_cleanup = asyncio.Event()
+
+    class HangingCloseTransport(_Transport):
+        async def aclose(self) -> None:
+            while not release_cleanup.is_set():
+                try:
+                    await release_cleanup.wait()
+                except asyncio.CancelledError:
+                    continue
+
+    started = time.monotonic()
+    cleanup_report = await run_transport_conformance(
+        lambda _url: HangingCloseTransport(lambda _request: _response(result=True)),
+        cases=frozenset({ConformanceCase.HOST_PROPERTY_CREDENTIAL_FREE}),
+    )
+    cleanup_wall_ceiling = 0.5
+    assert time.monotonic() - started < cleanup_wall_ceiling
+    assert cleanup_report.failures[0].detail == "CleanupDeadlineExceeded"
+    release_cleanup.set()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_conformance_runner_distinguishes_transport_timeout_from_harness_deadline() -> None:
+    def raises_timeout(_request: Request) -> WireResponse:
+        raise TimeoutError
+
+    report = await run_transport_conformance(
+        lambda _url: _Transport(raises_timeout),
+        cases=frozenset({ConformanceCase.LEGACY_JSON_BODY}),
+    )
+
+    assert report.failures[0].detail == "TimeoutError"
 
 
 @pytest.mark.asyncio
