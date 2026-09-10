@@ -42,6 +42,8 @@ _INTERRUPTED = 130
 
 
 def test_keyset_execution_json_is_closed_and_routes_all_fast_modes() -> None:
+    assert isinstance(parse_keyset_execution(None), AutoKeysetExecution)
+    assert isinstance(parse_keyset_execution({}), AutoKeysetExecution)
     range_execution = parse_keyset_execution(
         {"kind": "range", "page_completion": "short_page_exhausts", "window_width": 2, "batch_size": 7},
     )

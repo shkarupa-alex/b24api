@@ -38,6 +38,7 @@ from b24api.contracts import (
     Request,
     ResultCollectionShape,
     ResultSelector,
+    SequentialKeysetExecution,
     SequentialTraversal,
     TerminalState,
     TraversalAssurance,
@@ -326,6 +327,7 @@ async def test_public_keyset_above_100k_uses_monotonic_progression_without_ident
         identity=_identity(),
         page_size=page_size,
         keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        execution=SequentialKeysetExecution(),
         policy=ExecutionPolicy(
             max_requests=100,
             max_pages=100,
@@ -1125,6 +1127,7 @@ async def test_keyset_and_cursor_are_explicit_strict_alternatives() -> None:
         selector=ResultSelector.root(),
         identity=_identity(),
         keyset=KeysetSpec(),
+        execution=SequentialKeysetExecution(),
     )
     assert [item async for item in keyset] == [{"ID": 1}, {"ID": 2}, {"ID": 3}]
 

@@ -51,6 +51,7 @@ from b24api import (
     ResultErrorShape,
     ResultErrorSpec,
     ResultSelector,
+    SequentialKeysetExecution,
     SequentialTraversal,
     SplitOrderSpec,
     TotalTermination,
@@ -766,6 +767,7 @@ async def test_keyset_page_trace_never_publishes_identity_as_offset() -> None:
         Request("example.list", replay_safety=ReplaySafety.SAFE),
         selector=ResultSelector.root(),
         identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER),
+        execution=SequentialKeysetExecution(),
     )
 
     assert [row async for row in stream] == [{"ID": 900001}]
@@ -1036,6 +1038,7 @@ async def test_split_keyset_controls_and_tolerant_mapping_terminal() -> None:
             order_path=None,
             split_order=SplitOrderSpec(ParameterPath(("SORT",)), ParameterPath(("ORDER",))),
         ),
+        execution=SequentialKeysetExecution(),
     )
 
     assert [row async for row in stream] == [{"CONFIG_ID": 4}]
@@ -1123,6 +1126,7 @@ async def test_split_order_control_paths_equal_controls_injected_by_deterministi
         selector=traversal.selector,
         identity=traversal.identity,
         keyset=keyset,
+        execution=SequentialKeysetExecution(),
     )
 
     assert [row async for row in stream] == [{"ID": 1}]

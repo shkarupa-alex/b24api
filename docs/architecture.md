@@ -15,7 +15,7 @@ client does not contain endpoint catalogs, persistence, business reconciliation 
 | Independent command fan-out | `fan_out()` / `fan_out_outcomes()` | Explicit dispatch mode, concurrency and delivery order. |
 | Sequential offset list | `iter_list()` | Server-continuation validation and terminal empty-page confirmation. |
 | Counted list | `iter_list_counted()` | Direct head, batched tail and exact total/range/identity validation. |
-| No-count keyset | `iter_list_keyset()` | Compatible sequential default plus explicit range, partitioned, or deterministic auto execution for caller-asserted stable integer keysets. |
+| No-count keyset | `iter_list_keyset()` | Deterministic auto default plus explicit sequential, range, or partitioned execution for caller-asserted stable integer keysets. |
 | Dependent cursor | `iter_list_cursor()` | Strict unique monotonic cursor progress. |
 | Per-parent traversal | `iter_references()` / `iter_reference_outcomes()` | Isolated traversal state and correlation for every accepted binding. |
 | Shell access | `b24api call` / `b24api list` | JSON/JSONL stdout and diagnostics on stderr. |

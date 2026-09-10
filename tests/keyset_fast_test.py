@@ -662,6 +662,22 @@ async def test_auto_sequential_has_request_parity_and_no_canaries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_omitted_execution_defaults_to_auto() -> None:
+    identities = tuple(range(1, 80))
+    stream = _client(KeysetTransport(identities)).iter_list_keyset(
+        Request("item.list"),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=PAGE_SIZE,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+    )
+
+    assert [row["id"] async for row in stream] == list(identities)
+    assert stream.report.keyset_execution is not None
+    assert stream.report.keyset_execution.requested_kind is KeysetExecutionKind.AUTO
+
+
+@pytest.mark.asyncio
 async def test_boundary_only_estimate_excludes_the_spent_boundary_wave() -> None:
     empty = _stream(KeysetTransport(()), AutoKeysetExecution(StableIntegerKeysetContract()))
     assert [row async for row in empty] == []

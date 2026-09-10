@@ -129,7 +129,7 @@ more specialized mechanics have explicit names and explicit preconditions.
 |---|---|---|---|
 | `iter_list` | The method supports ordinary offset pagination. | Pages are requested sequentially using server `next`; no separate count request is made. | Continuation and empty terminal page; add identity for duplicate detection. |
 | `iter_list_counted` | The first response provides an exact filtered `total` and stable offset pages. | Head page is direct; all known tail offsets are grouped into physical Bitrix batches. | Exact total, ranges and identities. |
-| `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique integer identity. | Sequential by default; explicit range, partitioned, or auto execution may batch bounded work after a planning barrier. | Caller-asserted keyset contract, strict monotonic identity, bounded-plan canaries, and terminal empty confirmation. |
+| `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique integer identity. | Auto by default: it plans first, then selects boundary-only, sequential, range, or partitioned execution. | Caller-asserted keyset contract, strict monotonic identity, bounded-plan canaries, and terminal empty confirmation. |
 | `iter_list_cursor` | Each next request depends on a cursor from the previous response. | Sequential dependent cursor requests. | Strict unique monotonic cursor and empty terminal page. |
 | `iter_references` | The same list method must run for many parent parameter sets, such as comments per owner or messages per chat. | Bindings are scheduled with direct or physical-batch dispatch; each binding has its own traversal state. | Per-binding rows, completion/failure and caller correlation. |
 
@@ -206,23 +206,27 @@ range, overlap, duplicate identity or total contradiction raises `IncompleteTrav
 
 ### No-count keyset
 
-Keyset traversal is sequential by default, preserving the compatible request shape and first-pull
-behavior. An explicit execution contract can instead capture both ordered boundaries, validate five
-capability canaries, and batch numeric ranges or occupied-anchor partitions. Planning completes
-before any row is emitted, so partial consumption still pays that barrier cost. Fast execution fails
-synchronously when its declared controls or policy capacity are ineligible.
+Keyset traversal uses automatic execution by default. Omitting `execution` is equivalent to
+`AutoKeysetExecution(StableIntegerKeysetContract())`: the client captures both ordered boundaries,
+then selects boundary-only, sequential, range, or partitioned execution from the observed geometry
+and available policy capacity. Planning completes before any row is emitted, so partial consumption
+still pays that barrier cost. A sequential selection made by auto is a cost decision; a failed or
+contradictory fast plan is never silently restarted as sequential.
 
-The caller must assert that the endpoint has a stable, unique integer key, honors strict numeric
-bounds and ordering, and satisfies the chosen page-completion rule. Concurrent mutation outside the
-captured middle is handled by the finishing sweep; mutation inside it is outside this assertion.
+By using the default, the caller asserts that the endpoint has a stable, unique integer key, honors
+strict numeric bounds and ordering, and satisfies empty-confirmation completion. Concurrent mutation
+outside the captured middle is handled by the finishing sweep; mutation inside it is outside this
+assertion. Pass `SequentialKeysetExecution()` explicitly when an endpoint cannot satisfy the fast
+contract or when the previous request-by-request behavior is required.
+
 An advisory `total` may only raise an automatic cost estimate and never proves completion. Reports
 record the selected strategy and reason: unbounded auto continuation has the same
 `ordered_prefix_only` assurance as sequential traversal, while bounded plans additionally report
 `canary_verified_bounds`.
 
-<!-- tested: tests/client_v2_test.py::test_keyset_and_cursor_are_explicit_strict_alternatives -->
+<!-- tested: tests/keyset_fast_test.py::test_omitted_execution_defaults_to_auto -->
 ```python
-from b24api import AutoKeysetExecution, KeysetSpec, ParameterPath, StableIntegerKeysetContract
+from b24api import KeysetSpec, ParameterPath
 
 stream = client.iter_list_keyset(
     Request("example.item.list", replay_safety=ReplaySafety.SAFE),
@@ -232,7 +236,6 @@ stream = client.iter_list_keyset(
         filter_path=ParameterPath(("filter",)),
         order_path=ParameterPath(("order",)),
     ),
-    execution=AutoKeysetExecution(contract=StableIntegerKeysetContract()),
 )
 ```
 

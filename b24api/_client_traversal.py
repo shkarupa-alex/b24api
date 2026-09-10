@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from b24api.contracts.keyset_execution import KeysetExecution, SequentialKeysetExecution
+from b24api.contracts.keyset_execution import AutoKeysetExecution, KeysetExecution, StableIntegerKeysetContract
 from b24api.contracts.request import IdentitySpec, RequestLike, ResultSelector, TraversalIdentity, canonical_request
 from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import CursorSpec, KeysetSpec, OffsetSpec, TotalTermination
@@ -21,7 +21,7 @@ _ROOT_SELECTOR = ResultSelector.root()
 _DEFAULT_OFFSET = OffsetSpec()
 _DEFAULT_COUNTED_OFFSET = OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED)
 _DEFAULT_KEYSET = KeysetSpec()
-_DEFAULT_SEQUENTIAL_KEYSET_EXECUTION = SequentialKeysetExecution()
+_DEFAULT_AUTO_KEYSET_EXECUTION = AutoKeysetExecution(StableIntegerKeysetContract())
 
 
 class _TraversalFacade:
@@ -113,10 +113,10 @@ class _TraversalFacade:
         collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
         page_size: int = 50,
         keyset: KeysetSpec = _DEFAULT_KEYSET,
-        execution: KeysetExecution = _DEFAULT_SEQUENTIAL_KEYSET_EXECUTION,
+        execution: KeysetExecution = _DEFAULT_AUTO_KEYSET_EXECUTION,
         policy: ExecutionPolicy | None = None,
     ) -> OperationStream[JsonValue]:
-        """Return exact sequential no-count keyset traversal."""
+        """Return automatic no-count keyset traversal with explicit execution override."""
         self._require_open()
         canonical = canonical_request(request)
         audit_violation = self._audit_unknown(canonical)

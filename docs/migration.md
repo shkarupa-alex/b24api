@@ -51,7 +51,7 @@ preserving names or return-shaping flags.
 | Tolerant batch | `batch_outcomes()` | Handle the closed success/failure/not-executed/unknown union. |
 | Sequential offset list | `iter_list()` | Conservative default; follows server continuation sequentially. |
 | Counted batched list | `iter_list_counted()` | Direct head plus physically batched tail; requires an exact total; identity is optional but strengthens assurance. |
-| No-count/keyset list | `iter_list_keyset()` | Sequential remains the default; opt into range, partitioned, or auto only for a caller-asserted stable unique integer key and writable strict bounds/order controls. |
+| No-count/keyset list | `iter_list_keyset()` | Auto is now the default and may select boundary-only, sequential, range, or partitioned execution after a planning barrier. |
 | Cursor wrappers | `iter_list_cursor()` | Requires a strict unique monotonic cursor. |
 | Independent request wrappers | `fan_out()` / `fan_out_outcomes()` | Explicit direct or batch dispatch and delivery order. |
 | Per-parent/reference wrappers | `Binding` + `iter_references()` / `iter_reference_outcomes()` | Parent correlation and traversal state are explicit and isolated. |
@@ -65,11 +65,31 @@ preserving names or return-shaping flags.
 - automatic unsafe direct fallback;
 - public low-level execution plans and compatibility data models.
 
-There is no assumption-free fast no-count shortcut. Existing calls stay sequential. For a verified
-integer keyset, pass an explicit execution contract and account for its pre-emission planning cost;
-otherwise keep exact sequential keyset/cursor traversal. Use `iter_list_counted()` only when an
-endpoint supplies an exact filtered total. Fast keyset totals remain advisory, and the application
-still owns mutation and business-filter reconciliation.
+There is no assumption-free fast no-count shortcut. Calls that omit `execution` now assert the
+default `StableIntegerKeysetContract` and use auto planning, so verify that the endpoint honors a
+unique integer identity, strict numeric bounds, ordering, and empty-confirmation completion. Account
+for the pre-emission planning cost. Fast keyset totals remain advisory, and the application still
+owns mutation and business-filter reconciliation.
+
+If auto is ineligible for an endpoint, exposes a portal incompatibility, or the old request-by-request
+behavior is required, opt out per call. This performs the original sequential keyset traversal and
+does not run the auto planning barrier:
+
+```python
+from b24api import SequentialKeysetExecution
+
+stream = client.iter_list_keyset(
+    request,
+    selector=selector,
+    identity=identity,
+    keyset=keyset,
+    execution=SequentialKeysetExecution(),
+)
+```
+
+For CLI keyset contracts, use `"execution": {"kind": "sequential"}`. Omitting `execution` (or
+passing an empty execution object) selects auto. Use `iter_list_counted()` only when an endpoint
+supplies an exact filtered total.
 
 ## Practical migration order
 

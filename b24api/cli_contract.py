@@ -220,10 +220,10 @@ def _keyset(raw: object) -> KeysetSpec:
 def parse_keyset_execution(payload: Mapping[str, JsonValue] | None) -> KeysetExecution:
     """Parse the closed per-call keyset execution object."""
     if payload is None:
-        return SequentialKeysetExecution()
+        return AutoKeysetExecution(StableIntegerKeysetContract())
     if not isinstance(payload, dict):
         raise CliUsageError("execution must be an object")
-    kind = payload.get("kind", "sequential")
+    kind = payload.get("kind", "auto")
     if not isinstance(kind, str):
         raise CliUsageError("execution.kind must be a string")
     if kind not in {"sequential", "range", "partitioned", "auto"}:
