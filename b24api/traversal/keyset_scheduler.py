@@ -144,8 +144,10 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         self._lanes: list[LaneState] = []
         self._lane_rows: dict[int, list[JsonValue]] = {}
         self._lane_identities: dict[int, list[int]] = {}
+        self._lane_commands: dict[int, list[tuple[str, int]]] = {}
         self._lane_index = 0
         self._anchor_rows: dict[int, JsonValue] = {}
+        self._anchor_commands: dict[int, str] = {}
         self._anchor_count = 0
         self._target_lanes: int | None = None
         self._window_width: int | None = None
@@ -458,11 +460,13 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         ]
         self._lane_rows = {lane.spec.ordinal: [] for lane in self._lanes}
         self._lane_identities = {lane.spec.ordinal: [] for lane in self._lanes}
+        self._lane_commands = {lane.spec.ordinal: [] for lane in self._lanes}
         if self._selected is KeysetExecutionKind.PARTITIONED and self._anchor_count:
             await self._adjust_buffer(self._anchor_count)
 
     def _admit_receipt(self, receipt: LaneReceipt) -> None:
         commit = self.admission.validate_and_commit(receipt)
+        self.trace.admit(receipt.command_id, len(commit.rows))
         if commit.rows:
             self._pending.append(commit.rows)
 
@@ -549,6 +553,7 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
             lane.rounds += 1
             self._lane_rows[lane.spec.ordinal].extend(receipt.rows)
             self._lane_identities[lane.spec.ordinal].extend(receipt.identities)
+            self._lane_commands[lane.spec.ordinal].append((receipt.command_id, len(receipt.rows)))
             if receipt.identities:
                 lane.cursor = receipt.identities[-1]
             witness = receipt.witness
@@ -583,22 +588,6 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         ):
             return ClosureWitness.SHORT_PAGE
         return None
-
-    def _drain_closed_lanes(self) -> None:
-        while self._lane_index < len(self._lanes) and self._lanes[self._lane_index].status is LaneStatus.CLOSED:
-            lane = self._lanes[self._lane_index]
-            receipt = LaneReceipt(
-                lane.spec.ordinal,
-                f"body-admit-{lane.spec.ordinal}",
-                tuple(self._lane_rows[lane.spec.ordinal]),
-                tuple(self._lane_identities[lane.spec.ordinal]),
-                False,
-                self._lane_identities[lane.spec.ordinal][-1] if self._lane_identities[lane.spec.ordinal] else None,
-                lane.witness,
-                (),
-            )
-            self._admit_receipt(receipt)
-            self._lane_index += 1
 
     async def _finish_page(self) -> None:
         if self._finish_cursor is None:
@@ -688,6 +677,7 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         self._pending.clear()
         self._lane_rows.clear()
         self._lane_identities.clear()
+        self._lane_commands.clear()
         self.admission.assert_clean()
 
     def report_fragment(self) -> KeysetExecutionReport:

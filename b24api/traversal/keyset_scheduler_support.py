@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections import deque
 from typing import TYPE_CHECKING, Any, cast
 
-from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode, Violation, ViolationSeverity
 from b24api.errors import PaginationError
@@ -17,6 +17,7 @@ from b24api.traversal.page_validation import (
     LaneCommandPlan,
     LaneReceipt,
     ReceiptRejection,
+    classify_rejection,
     validate_lane_receipt,
 )
 
@@ -100,17 +101,14 @@ class KeysetSchedulerSupport:
                 if isinstance(receipt, ReceiptRejection):
                     failed = True
                     self.violations.append(receipt.violation)
+                    page_outcome, rejection_code = classify_rejection(outcome)
                     self._record(
                         plan,
                         index=index,
                         selected=0,
                         admitted=0,
-                        outcome=PageOutcome.REJECTED,
-                        rejection=(
-                            PageRejectionCode.COMMAND_FAILURE
-                            if isinstance(outcome, BatchFailure)
-                            else PageRejectionCode.RANGE_CONTRADICTION
-                        ),
+                        outcome=page_outcome,
+                        rejection=rejection_code,
                         violation=receipt.violation,
                     )
                 else:
@@ -221,9 +219,10 @@ class KeysetSchedulerSupport:
         desc: LaneReceipt,
     ) -> tuple[tuple[LaneCommandPlan, ...], dict[str, tuple[int, ...]]]:
         prefixes = (asc.identities, tuple(reversed(desc.identities)))
+        pairs = tuple((values[index], values[index + 1]) for values in prefixes for index in range(len(values) - 1))
         pair = next(
-            ((values[index], values[index + 1]) for values in prefixes for index in range(len(values) - 1)),
-            None,
+            ((left, right) for left, right in pairs if len(str(abs(left))) != len(str(abs(right)))),
+            pairs[0] if pairs else None,
         )
         if pair is None or self.effective_page_cap < 2:
             raise PaginationError("boundary facts cannot construct five capability canaries")
@@ -322,6 +321,7 @@ class KeysetSchedulerSupport:
             anchor = receipt.identities[0]
             anchors.append(anchor)
             self._anchor_rows.setdefault(anchor, receipt.rows[0])
+            self._anchor_commands.setdefault(anchor, receipt.command_id)
             discarded += max(0, len(receipt.rows) - 1)
         normalized = normalize_anchors(lo=lo, upper_exclusive=hi, anchors=tuple(anchors))
         discarded += len(anchors) - len(normalized)
@@ -360,6 +360,28 @@ class KeysetSchedulerSupport:
         for offset in range(0, len(plans), size):
             receipts.extend(await self._wave(plans[offset : offset + size]))
         return tuple(receipts)
+
+    def _drain_closed_lanes(self: Any) -> None:
+        while self._lane_index < len(self._lanes) and self._lanes[self._lane_index].status is LaneStatus.CLOSED:
+            lane = self._lanes[self._lane_index]
+            identities = self._lane_identities[lane.spec.ordinal]
+            receipt = LaneReceipt(
+                lane.spec.ordinal,
+                f"body-admit-{lane.spec.ordinal}",
+                tuple(self._lane_rows[lane.spec.ordinal]),
+                tuple(identities),
+                False,
+                identities[-1] if identities else None,
+                lane.witness,
+                (),
+            )
+            self._admit_receipt(receipt)
+            for command_id, rows in self._lane_commands[lane.spec.ordinal]:
+                self.trace.admit(command_id, rows)
+            anchor = lane.spec.retained_upper_anchor
+            if anchor is not None and anchor in self._anchor_commands:
+                self.trace.admit(self._anchor_commands[anchor], 1)
+            self._lane_index += 1
 
 
 __all__ = ["KeysetSchedulerSupport"]

@@ -107,8 +107,10 @@ class FixturePortal:
             commands = parameters["cmd"]
             if not isinstance(commands, dict) or any(not isinstance(value, str) for value in commands.values()):
                 raise TypeError("fixture batch commands must be strings")
-            result = {key: self._rows(self._decode(cast("str", value))) for key, value in commands.items()}
-            payload: object = {"result": {"result": result, "result_error": []}}
+            decoded = {key: self._decode(cast("str", value)) for key, value in commands.items()}
+            result = {key: self._rows(values) for key, values in decoded.items()}
+            totals = {key: len(self.identities) for key, values in decoded.items() if str(values.get("start")) == "0"}
+            payload: object = {"result": {"result": result, "result_error": [], "result_total": totals}}
         else:
             payload = {"result": self._rows(parameters)}
         return WireResponse(200, (("content-type", "application/json"),), json.dumps(payload).encode())
@@ -119,12 +121,19 @@ class FixturePortal:
 
 def _cells() -> tuple[Cell, ...]:
     sparse = tuple(sorted({*range(3, 301), *(300 + 5 * index for index in range(1, 821)), *range(4400, 4601)}))
+    advisory_raise = (
+        *(1 + 10 * index for index in range(50)),
+        *range(492, 4_500),
+        *(4_500 + 10 * index for index in range(50)),
+    )
     return (
         Cell("small", tuple(range(1, 81))),
         Cell("intermediate", tuple(range(1, 201))),
         Cell("dense_large", tuple(range(1, 1001))),
         Cell("dense_total_hint", tuple(range(1, 1001)), TotalHintMode.REQUEST_ADVISORY),
         Cell("sparse_wide", sparse),
+        Cell("sparse_total_hint", sparse, TotalHintMode.REQUEST_ADVISORY),
+        Cell("advisory_raises_estimate", advisory_raise, TotalHintMode.REQUEST_ADVISORY),
         Cell(
             "clustered",
             tuple(value for block in range(5) for value in range(1 + block * 1_000, 201 + block * 1_000)),

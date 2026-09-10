@@ -17,6 +17,7 @@ from b24api import (
     IdentitySpec,
     KeysetExecutionKind,
     KeysetPageCompletion,
+    KeysetPhase,
     KeysetSelectionReason,
     KeysetSpec,
     ParameterPath,
@@ -57,15 +58,22 @@ class KeysetTransport:
 
     host = "test.invalid"
 
-    def __init__(self, identities: tuple[int, ...], *, ignore_direction: bool = False) -> None:
+    def __init__(
+        self,
+        identities: tuple[int, ...],
+        *,
+        ignore_direction: bool = False,
+        ignore_bounds: bool = False,
+    ) -> None:
         self.identities = identities
         self.ignore_direction = ignore_direction
+        self.ignore_bounds = ignore_bounds
         self.requests: list[Request] = []
 
     def _rows(self, parameters: dict[str, JsonValue]) -> list[dict[str, int]]:
         selected = self.identities
         filters = parameters.get("filter", {})
-        if isinstance(filters, dict):
+        if isinstance(filters, dict) and not self.ignore_bounds:
             if ">ID" in filters:
                 selected = tuple(value for value in selected if value > int(filters[">ID"]))
             if "<ID" in filters:
@@ -272,6 +280,11 @@ async def test_explicit_modes_match_sparse_ordered_oracle(direction: str, kind: 
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind(kind)
     assert stream.report.keyset_execution.canary_commands == 5
+    assert all(
+        record.rows_admitted == record.rows_selected
+        for record in stream.report.page_trace
+        if record.phase is KeysetPhase.BODY and record.rows_selected
+    )
 
 
 @pytest.mark.asyncio
@@ -323,6 +336,18 @@ async def test_partition_anchor_probe_without_writable_limit_discards_extra_rows
 async def test_boundary_direction_contradiction_fails_before_emission() -> None:
     transport = KeysetTransport(tuple(range(1, 31)), ignore_direction=True)
     stream = _stream(transport, RangeKeysetExecution(StableIntegerKeysetContract()))
+    with pytest.raises(IncompleteTraversalError):
+        await anext(stream)
+    assert stream.report is not None
+    assert stream.report.emitted == 0
+    assert stream.report.state is TerminalState.INCOMPLETE
+
+
+@pytest.mark.asyncio
+async def test_ignored_numeric_bounds_fail_canaries_before_emission() -> None:
+    transport = KeysetTransport(tuple(range(1, 31)), ignore_bounds=True)
+    stream = _stream(transport, RangeKeysetExecution(StableIntegerKeysetContract()))
+
     with pytest.raises(IncompleteTraversalError):
         await anext(stream)
     assert stream.report is not None

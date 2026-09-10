@@ -81,6 +81,8 @@ class FastTraceRecorder:
             kind: deque(maxlen=self._quotas[kind] // 2) for kind in TraceClass
         }
         self._dropped: dict[TraceClass, int] = dict.fromkeys(TraceClass, 0)
+        self._command_sequences: dict[str, int] = {}
+        self._sequence_commands: dict[int, str] = {}
         self._phase_commands: Counter[KeysetPhase] = Counter()
         self._phase_rows: Counter[KeysetPhase] = Counter()
         self._phase_empty: Counter[KeysetPhase] = Counter()
@@ -128,12 +130,36 @@ class FastTraceRecorder:
         tail = self._tails[trace_class]
         if len(head) < head_cap:
             head.append(record)
+            self._retain_command(observation.command_id, record.sequence)
         elif tail.maxlen:
             if len(tail) == tail.maxlen:
                 self._dropped[trace_class] += 1
+                self._forget_sequence(tail[0].sequence)
             tail.append(record)
+            self._retain_command(observation.command_id, record.sequence)
         else:
             self._dropped[trace_class] += 1
+
+    def _retain_command(self, command_id: str, sequence: int) -> None:
+        self._command_sequences[command_id] = sequence
+        self._sequence_commands[sequence] = command_id
+
+    def _forget_sequence(self, sequence: int) -> None:
+        command_id = self._sequence_commands.pop(sequence, None)
+        if command_id is not None:
+            self._command_sequences.pop(command_id, None)
+
+    def admit(self, command_id: str, rows: int) -> None:
+        """Finalize admission on one retained successful observation."""
+        sequence = self._command_sequences.pop(command_id, None)
+        if sequence is None:
+            return
+        self._sequence_commands.pop(sequence, None)
+        for records in (*self._heads.values(), *self._tails.values()):
+            for index, record in enumerate(records):
+                if record.sequence == sequence:
+                    records[index] = replace(record, rows_admitted=rows)
+                    return
 
     def phase_commands(self, phase: KeysetPhase) -> int:
         """Return observed command count for one phase."""
@@ -220,7 +246,7 @@ def build_keyset_execution_report(  # noqa: PLR0913
         head_page_admitted=counters.admitted_rows > 0,
         sequential_requests_estimate=(preselection.sequential_estimate.requests if preselection is not None else None),
         selected_requests_estimate=selected_estimate,
-        head_rows=preselection.boundary.head_rows if False else 0,
+        head_rows=0,
         tail_rows=0,
         interior_span=preselection.interior_span if preselection is not None else None,
         interior_rows_estimate=preselection.interior_rows_estimate if preselection is not None else None,

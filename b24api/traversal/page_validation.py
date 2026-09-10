@@ -8,9 +8,9 @@ from typing import TYPE_CHECKING
 
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
-from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.contracts.report import PageOutcome, PageRejectionCode, Violation, ViolationSeverity
 from b24api.contracts.request import ResultSelector
-from b24api.errors import PaginationError
+from b24api.errors import AmbiguousExecutionError, PaginationError, ProtocolError
 from b24api.traversal.keyset_range import closure_witness
 from b24api.traversal.values import _coerce_identity, _extract_path, _response_items, _validate_order
 
@@ -72,6 +72,21 @@ def select_rows(*, outcome: BatchSuccess, selector: ResultSelector) -> tuple[Jso
     if outcome.response is None:
         raise PaginationError("batch command lacks correlated response evidence")
     return tuple(_response_items(outcome.response, selector))
+
+
+def classify_rejection(outcome: BatchOutcome) -> tuple[PageOutcome, PageRejectionCode]:
+    """Classify one correlated failure without inspecting unsafe values."""
+    if not isinstance(outcome, BatchFailure):
+        return PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION
+    error = outcome.error
+    if isinstance(error, AmbiguousExecutionError):
+        return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION
+    if isinstance(error, ProtocolError):
+        summary = error.request_summary
+        if summary is not None and summary.method == "batch":
+            return PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE
+        return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION
+    return PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE
 
 
 def validate_lane_receipt(  # noqa: PLR0913
@@ -168,6 +183,7 @@ __all__ = [
     "LaneCommandPlan",
     "LaneReceipt",
     "ReceiptRejection",
+    "classify_rejection",
     "select_rows",
     "validate_boundary_direction",
     "validate_lane_receipt",

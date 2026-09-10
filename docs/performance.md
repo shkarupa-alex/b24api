@@ -15,6 +15,12 @@ latency admission.
   --case dense-10k --plan counted_batch --samples 7 --warmups 2 \
   --memray-output /tmp/b24api-dense.bin
 .venv/bin/memray stats /tmp/b24api-dense.bin --json -o /tmp/b24api-dense-stats.json
+
+# Batched-keyset fixture matrix and automatic threshold analysis
+.venv/bin/python tools/b24api_keyset_admission.py fixture /tmp/keyset-fixture.json
+
+# Read-only live range sandwiches (uses BITRIX24_API_WEBHOOK_URL)
+.venv/bin/python tools/b24api_keyset_admission.py live-range /tmp/keyset-live.json --samples 5
 ```
 
 ## Results
@@ -42,6 +48,12 @@ ceiling, and no stream or owned task remained after close.
 Memray 1.20.0 measured a 5,121,452-byte peak for seven dense-10k counted samples after two warmups.
 Immutable JSON thawing was the largest cumulative client allocation site; no retention leak was
 observed.
+
+On 2026-09-10, the committed keyset admission harness ran five accepted read-only range sandwiches
+after one warm-up on a 934-row list. Every ordered digest matched both sequential controls, with no
+exclusions, omissions, duplicates, or output over-fetch. Range used 5 physical requests versus 20;
+the paired median request ratio was 0.25 and the paired median wall-time ratio was 0.571. These are
+harness-produced observations for that portal cell, not general latency promises.
 
 ## Boundaries
 
