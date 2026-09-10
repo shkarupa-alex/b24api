@@ -25,7 +25,13 @@ from b24api.contracts.policy import (
     SnapshotState,
 )
 from b24api.contracts.request import ReplaySafety, Request
-from b24api.errors import BatchCommandError, BudgetExceededError, FailurePhase, ProtocolError, TransportError
+from b24api.errors import (
+    BatchCommandError,
+    BudgetExceededError,
+    FailurePhase,
+    ProtocolError,
+    TransportError,
+)
 from b24api.execution import ExecutionContext, Executor, WireResponse
 
 if TYPE_CHECKING:
@@ -682,6 +688,31 @@ async def test_php_empty_result_array_preserves_all_command_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_default_batch_preserves_unknown_total_sentinel() -> None:
+    def unknown_total(request: Request) -> WireResponse:
+        keys = _batch_keys(request)
+        body = json.dumps(
+            {
+                "result": {
+                    "result": {key: [] for key in keys},
+                    "result_error": [],
+                    "result_total": dict.fromkeys(keys, -1),
+                },
+            },
+        ).encode()
+        return WireResponse(200, (("content-type", "application/json"),), body)
+
+    stream = BatchExecutor(Executor(CallbackTransport(unknown_total)))._outcomes(
+        [Request("profile", replay_safety=ReplaySafety.SAFE)],
+    )
+    outcome = await anext(stream)
+
+    assert isinstance(outcome, BatchSuccess)
+    assert outcome.response is not None
+    assert outcome.response.total == -1
+
+
+@pytest.mark.asyncio
 async def test_tolerant_per_command_error_and_missing_result_each_get_one_outcome() -> None:
     def partial(request: Request) -> WireResponse:
         keys = _batch_keys(request)
@@ -825,6 +856,25 @@ async def test_malformed_batch_pagination_metadata_is_correlated_failure() -> No
     outcome = await anext(stream)
     assert isinstance(outcome, BatchFailure)
     assert isinstance(outcome.error, ProtocolError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["extra", "duplicate"])
+async def test_public_batch_preserves_tolerant_unknown_or_duplicate_correlation_keys(fault: str) -> None:
+    def malformed_correlation(request: Request) -> WireResponse:
+        key = _batch_keys(request)[0]
+        if fault == "extra":
+            body = json.dumps(
+                {"result": {"result": {key: {}, "unexpected": {}}, "result_error": []}},
+            ).encode()
+        else:
+            body = ('{"result":{"result":{"' + key + '":{},"' + key + '":{}},"result_error":[]}}').encode()
+        return WireResponse(status_code=HTTP_OK, headers=(), body=body)
+
+    stream = BatchExecutor(Executor(CallbackTransport(malformed_correlation)))._outcomes([Request("profile")])
+    outcome = await anext(stream)
+
+    assert isinstance(outcome, BatchSuccess)
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector
+from b24api.contracts.traversal import KeysetSpec
 from b24api.errors import (
     ApiResponseError,
     BudgetExceededError,
@@ -34,6 +35,13 @@ from b24api.errors import (
 )
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse, WorkClass
 from b24api.traversal import iter_list
+from b24api.traversal.keyset_step import (
+    keyset_page_request,
+    keyset_page_terminal,
+    next_keyset_cursor,
+    sequential_keyset_plan,
+    validate_keyset_continuation,
+)
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     CursorTerminalRule,
@@ -131,6 +139,34 @@ def _keyset_plan() -> KeysetPlan:
         limit_path=ParameterPath(("limit",)),
         requested_page_size=PAGE_SIZE,
     )
+
+
+@pytest.mark.parametrize(
+    ("direction", "wire_direction", "operator"),
+    [("ascending", "ASC", ">ID"), ("descending", "DESC", "<ID")],
+)
+def test_shared_keyset_page_step_preserves_sequential_controls(
+    direction: str,
+    wire_direction: str,
+    operator: str,
+) -> None:
+    keyset = KeysetSpec(direction=direction, limit_path=ParameterPath(("limit",)))  # type: ignore[arg-type]
+    plan = sequential_keyset_plan(keyset, PAGE_SIZE)
+    original = Request("item.list", {"filter": {"ACTIVE": "Y"}})
+
+    request = keyset_page_request(original, plan=plan, identity=_identity(), cursor=7)
+
+    assert original.copy_parameters() == {"filter": {"ACTIVE": "Y"}}
+    assert request.copy_parameters() == {
+        "filter": {"ACTIVE": "Y", operator: 7},
+        "order": {"ID": wire_direction},
+        "start": -1,
+        "limit": PAGE_SIZE,
+    }
+    validate_keyset_continuation(plan, 7, [8] if direction == "ascending" else [6])
+    assert next_keyset_cursor(7, [8] if direction == "ascending" else [6]) == (8 if direction == "ascending" else 6)
+    assert keyset_page_terminal(plan, 1) is None
+    assert keyset_page_terminal(plan, 0) == "empty keyset confirmation"
 
 
 async def _collect(stream: object) -> list[JsonValue]:

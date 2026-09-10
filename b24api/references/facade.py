@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from b24api._stream import MappedOperationStream
 from b24api.contracts.dispatch import DeliveryOrder, DirectDispatch, DispatchSpec
+from b24api.contracts.keyset_execution import SequentialKeysetExecution
 from b24api.contracts.policy import (
     DuplicatePolicy,
     ExecutionPolicy,
@@ -152,6 +153,8 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
             traversal.identity,
         )
     if isinstance(traversal, KeysetTraversal):
+        if not isinstance(traversal.execution, SequentialKeysetExecution):
+            raise CapabilityError("reference keyset traversal supports sequential execution only")
         keyset_mechanics = traversal.keyset
         direction = _direction(keyset_mechanics.direction)
         return (

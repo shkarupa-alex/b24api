@@ -20,6 +20,7 @@ _STATE_MACHINES = {
     "references/scheduler.py",
     "references/stream.py",
     "traversal/driver.py",
+    "traversal/keyset_scheduler.py",
     "traversal/stream.py",
 }
 _FORBIDDEN_ROOT_MODULES = {
@@ -181,3 +182,47 @@ def test_module_sizes_keep_facades_small_and_state_machines_bounded() -> None:
         line_count = len(path.read_text(encoding="utf-8").splitlines())
         ceiling = 700 if relative in _STATE_MACHINES else 400
         assert line_count <= ceiling, f"{relative} has {line_count} lines; ceiling is {ceiling}"
+
+
+def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
+    fast_sources = tuple(sorted((PACKAGE / "traversal").glob("keyset_*.py")))
+    delta_callers = {path.name for path in fast_sources if "adjust_buffered_rows(" in path.read_text(encoding="utf-8")}
+    assert delta_callers == {"keyset_scheduler.py"}
+    assert all("set_buffered_rows(" not in path.read_text(encoding="utf-8") for path in fast_sources)
+    scheduler = (PACKAGE / "traversal" / "keyset_scheduler.py").read_text(encoding="utf-8")
+    assert "class KeysetFastScheduler:" in scheduler
+    assert not (PACKAGE / "traversal" / "keyset_scheduler_support.py").exists()
+    assert not (PACKAGE / "traversal" / "keyset_scheduler_state.py").exists()
+    assert all("SchedulerState" not in path.read_text(encoding="utf-8") for path in fast_sources)
+    sequential = (PACKAGE / "traversal" / "keyset.py").read_text(encoding="utf-8")
+    assert "from b24api.traversal.keyset_step import" in sequential
+    assert "from b24api.traversal import keyset_step" in scheduler
+    assert "keyset_page_request(" in sequential
+    assert "keyset_step.keyset_page_request(" in scheduler
+
+    for name in ("keyset_auto.py", "keyset_costs.py"):
+        selector = (PACKAGE / "traversal" / name).read_text(encoding="utf-8")
+        for forbidden in ("random", "time.", "os.environ", "float("):
+            assert forbidden not in selector
+        tree = ast.parse(selector)
+        assert not any(isinstance(node, ast.Constant) and isinstance(node.value, float) for node in ast.walk(tree))
+
+    ceilings = {
+        PACKAGE / "contracts" / "keyset_execution.py": 250,
+        PACKAGE / "traversal" / "keyset_auto.py": 250,
+        PACKAGE / "traversal" / "keyset_fast_plan.py": 300,
+        PACKAGE / "traversal" / "keyset_fast_stream.py": 400,
+        PACKAGE / "traversal" / "keyset_scheduler.py": 700,
+    }
+    for path, ceiling in ceilings.items():
+        assert len(path.read_text(encoding="utf-8").splitlines()) <= ceiling
+
+    transactions = ast.parse((PACKAGE / "traversal" / "keyset_transactions.py").read_text(encoding="utf-8"))
+    assert not any(isinstance(node, ast.ClassDef) for node in transactions.body)
+    assignments = (ast.Assign, ast.AnnAssign, ast.AugAssign)
+    assert all(
+        isinstance(node, ast.Assign)
+        and all(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
+        for node in transactions.body
+        if isinstance(node, assignments)
+    )

@@ -5,6 +5,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
+from b24api.contracts.keyset_execution import (
+    AutoKeysetExecution,
+    KeysetExecution,
+    PartitionedKeysetExecution,
+    RangeKeysetExecution,
+    SequentialKeysetExecution,
+)
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.request import IdentitySpec, ParameterPath, ResultSelector, TraversalIdentity
 
@@ -12,6 +19,7 @@ _START = ParameterPath(("start",))
 _FILTER = ParameterPath(("filter",))
 _ORDER = ParameterPath(("order",))
 _ROOT_SELECTOR = ResultSelector.root()
+_SEQUENTIAL_KEYSET_EXECUTION = SequentialKeysetExecution()
 
 
 class OffsetContinuation(StrEnum):
@@ -186,10 +194,16 @@ class KeysetTraversal:
     identity: IdentitySpec
     page_size: int = 50
     keyset: KeysetSpec = KeysetSpec()
+    execution: KeysetExecution = _SEQUENTIAL_KEYSET_EXECUTION
 
     def __post_init__(self) -> None:
         """Validate page cap."""
         _positive_page_size(self.page_size)
+        if not isinstance(
+            self.execution,
+            SequentialKeysetExecution | RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
+        ):
+            raise TypeError("execution must be a supported KeysetExecution")
 
 
 @dataclass(frozen=True, slots=True)

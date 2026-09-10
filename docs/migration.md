@@ -51,7 +51,7 @@ preserving names or return-shaping flags.
 | Tolerant batch | `batch_outcomes()` | Handle the closed success/failure/not-executed/unknown union. |
 | Sequential offset list | `iter_list()` | Conservative default; follows server continuation sequentially. |
 | Counted batched list | `iter_list_counted()` | Direct head plus physically batched tail; requires an exact total; identity is optional but strengthens assurance. |
-| No-count/keyset list | `iter_list_keyset()` | Exact sequential keyset; requires a reliable unique identity filter/order. |
+| No-count/keyset list | `iter_list_keyset()` | Sequential remains the default; opt into range, partitioned, or auto only for a caller-asserted stable unique integer key and writable strict bounds/order controls. |
 | Cursor wrappers | `iter_list_cursor()` | Requires a strict unique monotonic cursor. |
 | Independent request wrappers | `fan_out()` / `fan_out_outcomes()` | Explicit direct or batch dispatch and delivery order. |
 | Per-parent/reference wrappers | `Binding` + `iter_references()` / `iter_reference_outcomes()` | Parent correlation and traversal state are explicit and isolated. |
@@ -65,9 +65,11 @@ preserving names or return-shaping flags.
 - automatic unsafe direct fallback;
 - public low-level execution plans and compatibility data models.
 
-There is no generic fast no-count shortcut in this 2.x release. If an endpoint supplies an exact filtered total,
-use `iter_list_counted()`. Otherwise use exact keyset/cursor traversal or an application-owned
-workflow with endpoint-specific reconciliation.
+There is no assumption-free fast no-count shortcut. Existing calls stay sequential. For a verified
+integer keyset, pass an explicit execution contract and account for its pre-emission planning cost;
+otherwise keep exact sequential keyset/cursor traversal. Use `iter_list_counted()` only when an
+endpoint supplies an exact filtered total. Fast keyset totals remain advisory, and the application
+still owns mutation and business-filter reconciliation.
 
 ## Practical migration order
 

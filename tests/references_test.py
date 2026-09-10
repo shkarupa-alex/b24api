@@ -419,6 +419,39 @@ async def test_batch_dispatch_coalesces_pages_and_preserves_total_metadata() -> 
 
 
 @pytest.mark.asyncio
+async def test_reference_batch_preserves_tolerant_duplicate_json_members() -> None:
+    class DuplicateMemberTransport:
+        async def send(
+            self,
+            request: Request,
+            *,
+            attempt_timeout: float,
+            max_response_bytes: int,
+        ) -> WireResponse:
+            del attempt_timeout, max_response_bytes
+            commands = request.copy_parameters()["cmd"]
+            assert isinstance(commands, dict)
+            key = next(iter(commands))
+            body = (
+                '{"result":{"result":{"' + key + '":[{"ID":1}],"' + key + '":[{"ID":1}]},"result_error":[]}}'
+            ).encode()
+            return WireResponse(200, (("content-type", "application/json"),), body)
+
+    stream = iter_references(
+        Executor(DuplicateMemberTransport()),
+        [_reference("a")],
+        plan=_one_page_plan(),
+        dispatch=BatchDispatch(batch_size=1),
+        identity=_identity(),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], ReferenceItem)
+
+
+@pytest.mark.asyncio
 async def test_batch_fan_out_coalesces_whole_results_as_one_item_per_reference() -> None:
     def handler(request: Request) -> object:
         commands = request.copy_parameters()["cmd"]
