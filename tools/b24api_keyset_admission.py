@@ -27,7 +27,8 @@ if TYPE_CHECKING or __package__:
         lower_median,
     )
 else:
-    from b24api_evidence.keyset_admission import (
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from tools.b24api_evidence.keyset_admission import (
         LIVE_ATTEMPT_WINDOWS,
         REQUIRED_LIVE_MATRIX_FEATURES,
         SCHEMA_VERSION,

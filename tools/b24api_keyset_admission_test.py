@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +22,27 @@ from b24api import (
 )
 from tools import b24api_keyset_admission as harness
 from tools.b24api_evidence.keyset_admission import LIVE_ATTEMPT_WINDOWS
+
+ROOT = Path(__file__).resolve().parents[1]
+ENTRYPOINT = ROOT / "tools/b24api_keyset_admission.py"
+
+
+def test_standalone_entrypoint_prefers_its_repository_over_environment_checkout(tmp_path: Path) -> None:
+    stale_package = tmp_path / "b24api"
+    stale_package.mkdir()
+    (stale_package / "__init__.py").write_text('raise RuntimeError("stale checkout imported")\n', encoding="utf-8")
+
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and repository entrypoint
+        [sys.executable, str(ENTRYPOINT), "--help"],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("usage: b24api_keyset_admission.py")
 
 
 @pytest.mark.asyncio
