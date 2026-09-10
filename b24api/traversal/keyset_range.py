@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion
-from b24api.traversal.keyset_fast_plan import LaneBounds, LaneSpec, plan_windows
+from b24api.traversal.keyset_fast_plan import LaneBounds, LaneSpec, LaneState, plan_windows
 
 
 def range_window_width(  # noqa: PLR0913
@@ -36,7 +36,12 @@ def closure_witness(
     if not identities:
         return ClosureWitness.EMPTY
     upper = bounds.upper_exclusive
-    if upper is not None and identities == tuple(range(cursor + 1, upper)):
+    if (
+        upper is not None
+        and len(identities) == upper - cursor - 1
+        and identities[0] == cursor + 1
+        and identities[-1] == upper - 1
+    ):
         return ClosureWitness.LATTICE_FULL
     if upper is not None and identities[-1] == upper - 1:
         return ClosureWitness.TOP
@@ -45,4 +50,31 @@ def closure_witness(
     return None
 
 
-__all__ = ["LaneSpec", "closure_witness", "plan_windows", "range_window_width"]
+def descending_closure_witness(
+    lane: LaneState,
+    identities: tuple[int, ...],
+    *,
+    completion: KeysetPageCompletion,
+    page_cap: int,
+) -> ClosureWitness | None:
+    """Classify descending closure with exact lattice proof taking precedence."""
+    if not identities:
+        return ClosureWitness.EMPTY
+    lower = lane.spec.bounds.lower_exclusive
+    cursor = lane.cursor
+    if (
+        lower is not None
+        and cursor is not None
+        and len(identities) == cursor - lower - 1
+        and identities[0] == cursor - 1
+        and identities[-1] == lower + 1
+    ):
+        return ClosureWitness.LATTICE_FULL
+    if lower is not None and identities[-1] == lower + 1:
+        return ClosureWitness.TOP
+    if completion is KeysetPageCompletion.SHORT_PAGE_EXHAUSTS and len(identities) < page_cap:
+        return ClosureWitness.SHORT_PAGE
+    return None
+
+
+__all__ = ["LaneSpec", "closure_witness", "descending_closure_witness", "plan_windows", "range_window_width"]

@@ -1,5 +1,7 @@
 """Transport lifecycle, replay-aware retries, and shared rate coordination."""
 
+# ruff: noqa: FBT001, FBT002
+
 from __future__ import annotations
 import asyncio
 import contextlib
@@ -570,9 +572,7 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912
         )
 
 
-def _decode_success(
-    wire: WireResponse, *, request_summary: RequestSummary, strict_json_members: bool = False,
-) -> Response:
+def _decode_success(wire: WireResponse, request_summary: RequestSummary, strict_json_members: bool = False) -> Response:
     evidence = _wire_evidence(wire)
     try:
         payload = json.loads(

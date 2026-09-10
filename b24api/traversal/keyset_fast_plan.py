@@ -107,19 +107,34 @@ class LazyRangePlan:
         if self.next_ordinal >= self.count:
             return
         spec = window_spec(
-            lo=self.lo, upper_exclusive=self.upper_exclusive, width=self.width,
-            ordinal=self.next_ordinal, count=self.count, descending=self.descending,
+            lo=self.lo,
+            upper_exclusive=self.upper_exclusive,
+            width=self.width,
+            ordinal=self.next_ordinal,
+            count=self.count,
+            descending=self.descending,
         )
         self.next_ordinal += 1
-        lanes.append(LaneState(
-            spec, spec.bounds.upper_exclusive if spec.descending else spec.bounds.lower_exclusive,
-            LaneStatus.OPEN, None, 0, 0, deque(),
-        ))
+        lanes.append(
+            LaneState(
+                spec,
+                spec.bounds.upper_exclusive if spec.descending else spec.bounds.lower_exclusive,
+                LaneStatus.OPEN,
+                None,
+                0,
+                0,
+                deque(),
+            ),
+        )
         rows[spec.ordinal], identities[spec.ordinal], commands[spec.ordinal] = [], [], []
 
     def fill(
-        self, capacity: int, lanes: list[LaneState], rows: dict[int, list[JsonValue]],
-        identities: dict[int, list[int]], commands: dict[int, list[tuple[str, int]]],
+        self,
+        capacity: int,
+        lanes: list[LaneState],
+        rows: dict[int, list[JsonValue]],
+        identities: dict[int, list[int]],
+        commands: dict[int, list[tuple[str, int]]],
     ) -> None:
         """Fill one bounded sliding group without materializing the full range."""
         while len(lanes) < capacity and self.next_ordinal < self.count:
@@ -127,25 +142,41 @@ class LazyRangePlan:
 
 
 def build_capability_plans(  # noqa: PLR0913
-    commands: tuple[CapabilityCommand, ...], phase: KeysetPhase,
-    controls: Callable[..., Request], lane_plan: Callable[..., LaneCommandPlan], page_cap: int,
-    planning_bounds: dict[str, LaneBounds], planning_descending: dict[str, bool],
+    commands: tuple[CapabilityCommand, ...],
+    phase: KeysetPhase,
+    controls: Callable[..., Request],
+    lane_plan: Callable[..., LaneCommandPlan],
+    page_cap: int,
+    planning_bounds: dict[str, LaneBounds],
+    planning_descending: dict[str, bool],
 ) -> tuple[LaneCommandPlan, ...]:
     """Create capability commands and their validation lookup state."""
     plans = []
     for command in commands:
         bounds = command.bounds
         request = controls(
-            direction="DESC" if command.descending else "ASC", lower=bounds.lower_exclusive,
-            upper=bounds.upper_exclusive, limit=1 if command.expects_single_row else page_cap)
+            direction="DESC" if command.descending else "ASC",
+            lower=bounds.lower_exclusive,
+            upper=bounds.upper_exclusive,
+            limit=1 if command.expects_single_row else page_cap,
+        )
         lane = LaneState(
             LaneSpec(
-                ordinal=command.ordinal, kind=LaneKind.LANE, bounds=bounds, descending=command.descending,
-                owns_output=False, retained_upper_anchor=None),
+                ordinal=command.ordinal,
+                kind=LaneKind.LANE,
+                bounds=bounds,
+                descending=command.descending,
+                owns_output=False,
+                retained_upper_anchor=None,
+            ),
             bounds.upper_exclusive if command.descending else bounds.lower_exclusive,
-            LaneStatus.OPEN, None, 0, command.reserve, deque())
-        plan = lane_plan(lane, phase=phase, request=request, reserve=command.reserve,
-                         single=command.expects_single_row)
+            LaneStatus.OPEN,
+            None,
+            0,
+            command.reserve,
+            deque(),
+        )
+        plan = lane_plan(lane, phase=phase, request=request, reserve=command.reserve, single=command.expects_single_row)
         planning_bounds[plan.command_id] = bounds
         planning_descending[plan.command_id] = command.descending
         plans.append(plan)
@@ -188,8 +219,12 @@ def plan_windows(*, lo: Identity, upper_exclusive: Identity, width: int) -> tupl
     count = window_count(lo=lo, upper_exclusive=upper_exclusive, width=width)
     return tuple(
         window_spec(
-            lo=lo, upper_exclusive=upper_exclusive, width=width,
-            ordinal=ordinal, count=count, descending=False,
+            lo=lo,
+            upper_exclusive=upper_exclusive,
+            width=width,
+            ordinal=ordinal,
+            count=count,
+            descending=False,
         )
         for ordinal in range(count)
     )
@@ -206,8 +241,13 @@ def window_count(*, lo: Identity, upper_exclusive: Identity, width: int) -> int:
 
 
 def window_spec(  # noqa: PLR0913
-    *, lo: Identity, upper_exclusive: Identity, width: int,
-    ordinal: int, count: int, descending: bool,
+    *,
+    lo: Identity,
+    upper_exclusive: Identity,
+    width: int,
+    ordinal: int,
+    count: int,
+    descending: bool,
 ) -> LaneSpec:
     """Create one output-ordered range lane from constant-size geometry state."""
     if not 0 <= ordinal < count:
@@ -216,8 +256,12 @@ def window_spec(  # noqa: PLR0913
     lower = lo + geometric * (width - 1)
     upper = min(upper_exclusive, lower + width)
     return LaneSpec(
-        ordinal=ordinal, kind=LaneKind.WINDOW, bounds=LaneBounds(lower, upper),
-        descending=descending, owns_output=True, retained_upper_anchor=None,
+        ordinal=ordinal,
+        kind=LaneKind.WINDOW,
+        bounds=LaneBounds(lower, upper),
+        descending=descending,
+        owns_output=True,
+        retained_upper_anchor=None,
     )
 
 

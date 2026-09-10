@@ -77,6 +77,8 @@ EXPECTED_FIXTURE_AUTO_SELECTIONS = {
     "advisory_raises_estimate": "partitioned",
     "clustered": "partitioned",
 }
+
+
 @dataclass(frozen=True, slots=True)
 class Cell:
     """One pinned deterministic selection."""
@@ -206,7 +208,10 @@ def _live_cells() -> tuple[LiveCell, ...]:
         _task_live_cell("tasks_all_advisory", {}, TotalHintMode.REQUEST_ADVISORY, "range"),
         _task_live_cell("tasks_responsible_1", {"RESPONSIBLE_ID": 1}, TotalHintMode.IGNORE, "partitioned"),
         _task_live_cell(
-            "tasks_created_by_1", {"CREATED_BY": 1}, TotalHintMode.REQUEST_ADVISORY, "partitioned",
+            "tasks_created_by_1",
+            {"CREATED_BY": 1},
+            TotalHintMode.REQUEST_ADVISORY,
+            "partitioned",
         ),
         _task_live_cell("tasks_status_2", {"STATUS": 2}, TotalHintMode.IGNORE, "range"),
     )
@@ -406,10 +411,13 @@ def _record(
 async def generate(samples: int, *, sha: str) -> dict[str, Any]:
     """Generate frozen credential-free read-only sandwiches."""
     observations: list[dict[str, Any]] = []
+    python_version = platform.python_version()
+    portal_fingerprint = hashlib.sha256(b"b24api-keyset-deterministic-fixture-v4").hexdigest()
     for cell in _cells():
         for round_index in range(_fixture_sample_count(cell, samples) + 1):
             rotation = round_index % len(MODES)
             for mode in (*MODES[rotation:], *MODES[:rotation]):
+                sample_wall_clock = time.time()
                 sample_started = time.monotonic()
                 before_run = await _run(cell, None)
                 candidate_run = await _run(cell, mode)
@@ -424,6 +432,10 @@ async def generate(samples: int, *, sha: str) -> dict[str, Any]:
                         "mode": mode,
                         "warmup": round_index == 0,
                         "sha": sha,
+                        "schema_version": SCHEMA_VERSION,
+                        "python_version": python_version,
+                        "portal_fingerprint": portal_fingerprint,
+                        "wall_clock_unix": sample_wall_clock,
                         "rotation_offset": rotation,
                         "window_seconds": time.monotonic() - sample_started,
                         "page_size": PAGE_SIZE,
@@ -452,8 +464,8 @@ async def generate(samples: int, *, sha: str) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "source": "deterministic_fixture",
         "sha": sha,
-        "python_version": platform.python_version(),
-        "portal_fingerprint": hashlib.sha256(b"b24api-keyset-deterministic-fixture-v4").hexdigest(),
+        "python_version": python_version,
+        "portal_fingerprint": portal_fingerprint,
         "wall_clock_unix": time.time(),
         "manifest": {
             "performance_scope": scope,
@@ -483,7 +495,10 @@ async def _run_live(cell: LiveCell, mode: str | None) -> MeasuredRun:
             ),
             selector=ResultSelector(cell.selector_path),
             identity=IdentitySpec(
-                cell.item_path, cell.filter_role, cell.order_role, IdentityCoercion.DECIMAL_STRING_INTEGER,
+                cell.item_path,
+                cell.filter_role,
+                cell.order_role,
+                IdentityCoercion.DECIMAL_STRING_INTEGER,
             ),
             page_size=PAGE_SIZE,
             keyset=KeysetSpec(
@@ -514,11 +529,16 @@ async def generate_live_range(
         raise ValueError("live modes must be a non-empty unique subset of declared modes")
     observations: list[dict[str, Any]] = []
     observed_identities: dict[str, tuple[int, ...]] = {}
+    settings = Settings()
+    portal_host = settings.webhook_url.host or "unknown"
+    python_version = platform.python_version()
+    portal_fingerprint = hashlib.sha256(portal_host.casefold().encode()).hexdigest()
     cells = _live_cells()
     for cell in cells:
         for round_index in range(samples + 1):
             rotation = round_index % len(modes)
             for mode in (*modes[rotation:], *modes[:rotation]):
+                sample_wall_clock = time.time()
                 sample_started = time.monotonic()
                 before_run = await _run_live(cell, None)
                 candidate_run = await _run_live(cell, mode)
@@ -533,8 +553,14 @@ async def generate_live_range(
                         "mode": mode,
                         "warmup": round_index == 0,
                         "sha": sha,
+                        "schema_version": SCHEMA_VERSION,
+                        "python_version": python_version,
+                        "portal_fingerprint": portal_fingerprint,
+                        "wall_clock_unix": sample_wall_clock,
                         "attempt_window": (
-                            0 if round_index == 0 else min(
+                            0
+                            if round_index == 0
+                            else min(
                                 LIVE_ATTEMPT_WINDOWS,
                                 1 + ((round_index - 1) * LIVE_ATTEMPT_WINDOWS // max(samples, 1)),
                             )
@@ -554,8 +580,6 @@ async def generate_live_range(
                         "sequential_after": after,
                     },
                 )
-    settings = Settings()
-    portal_host = settings.webhook_url.host or "unknown"
     covered_features = _live_coverage(cells, observed_identities)
     missing_features = sorted(REQUIRED_LIVE_MATRIX_FEATURES - covered_features)
     shortfalls = [
@@ -582,17 +606,13 @@ async def generate_live_range(
         "schema_version": SCHEMA_VERSION,
         "source": "live_read_only",
         "sha": sha,
-        "python_version": platform.python_version(),
-        "portal_fingerprint": hashlib.sha256(portal_host.casefold().encode()).hexdigest(),
+        "python_version": python_version,
+        "portal_fingerprint": portal_fingerprint,
         "wall_clock_unix": time.time(),
         "manifest": {
             "performance_scope": performance_scope,
             "correctness_scope": correctness_scope,
-            "expected_auto_selections": {
-                cell.name: cell.expected_auto_selection
-                for cell in cells
-                if "auto" in modes
-            },
+            "expected_auto_selections": {cell.name: cell.expected_auto_selection for cell in cells if "auto" in modes},
             "modes": list(modes),
             "attempt_windows": LIVE_ATTEMPT_WINDOWS,
             "live_matrix": {
@@ -707,6 +727,9 @@ def main() -> int:
             "schema_version": SCHEMA_VERSION,
             "source": "combined_live_fixture",
             "sha": live.get("sha"),
+            "python_version": live.get("python_version"),
+            "portal_fingerprint": live.get("portal_fingerprint"),
+            "wall_clock_unix": time.time(),
             "live_artifact": live,
             "fixture_artifact": fixture,
             "substitutions": json.loads(args.substitutions.read_text(encoding="utf-8")),

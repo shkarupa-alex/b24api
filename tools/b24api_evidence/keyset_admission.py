@@ -9,6 +9,7 @@ from typing import Any, cast
 
 SCHEMA_VERSION = 1
 SHA256_HEX_LENGTH = 40
+PORTAL_FINGERPRINT_LENGTH = 64
 SMALL_MAX_REQUESTS = 3
 INTERMEDIATE_MAX_REQUESTS = 10
 LARGE_REQUEST_RATIO = 0.60
@@ -43,7 +44,10 @@ def _current_candidate_sha() -> str:
     if git is None:
         raise RuntimeError("git is required to bind keyset admission evidence")
     return subprocess.run(  # noqa: S603 - resolved executable and fixed arguments
-        [git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        [git, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 
@@ -51,11 +55,34 @@ def _validate_artifact_binding(artifact: dict[str, Any], candidate_sha: str) -> 
     source, sha = artifact.get("source"), artifact.get("sha")
     if source not in _SOURCES:
         raise ValueError("keyset admission artifact source is missing or unsupported")
-    if (not isinstance(sha, str) or len(sha) != SHA256_HEX_LENGTH
-            or any(character not in "0123456789abcdef" for character in sha)):
+    if (
+        not isinstance(sha, str)
+        or len(sha) != SHA256_HEX_LENGTH
+        or any(character not in "0123456789abcdef" for character in sha)
+    ):
         raise ValueError("keyset admission artifact requires an exact lowercase candidate SHA")
     if sha != candidate_sha:
         raise ValueError("keyset admission artifact does not match the current candidate SHA")
+    required = {"python_version", "portal_fingerprint", "wall_clock_unix"}
+    if not required.issubset(artifact):
+        raise ValueError("keyset admission artifact is missing required provenance")
+    fingerprint = artifact["portal_fingerprint"]
+    if (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != PORTAL_FINGERPRINT_LENGTH
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise ValueError("keyset admission artifact requires a lowercase portal fingerprint")
+    if not isinstance(artifact["python_version"], str) or not artifact["python_version"]:
+        raise ValueError("keyset admission artifact requires a Python version")
+    wall_clock = artifact["wall_clock_unix"]
+    if (
+        not isinstance(wall_clock, int | float)
+        or isinstance(wall_clock, bool)
+        or not math.isfinite(wall_clock)
+        or wall_clock <= 0
+    ):
+        raise ValueError("keyset admission artifact requires a finite wall clock")
 
 
 def _request_band(requests: int) -> str:
@@ -144,17 +171,56 @@ def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
     )
     for sample in artifact["samples"]:
         required_fields = {
-            "cell", "mode", "warmup", "sha", "window_seconds", "page_size", "batch_size",
-            "target_lanes", "writable_limit", "contract", "total_hint", "rotation_offset",
-            "control_requests", "control_wall_seconds", "sequential_before", "candidate", "sequential_after",
+            "cell",
+            "mode",
+            "warmup",
+            "sha",
+            "schema_version",
+            "python_version",
+            "portal_fingerprint",
+            "wall_clock_unix",
+            "window_seconds",
+            "page_size",
+            "batch_size",
+            "target_lanes",
+            "writable_limit",
+            "contract",
+            "total_hint",
+            "rotation_offset",
+            "control_requests",
+            "control_wall_seconds",
+            "sequential_before",
+            "candidate",
+            "sequential_after",
         }
         if not required_fields.issubset(sample):
             raise ValueError("keyset admission sample is missing required metadata")
         if sample["sha"] != candidate_sha:
             raise ValueError("keyset admission sample does not match the current candidate SHA")
+        if (
+            sample["schema_version"] != SCHEMA_VERSION
+            or sample["python_version"] != artifact["python_version"]
+            or sample["portal_fingerprint"] != artifact["portal_fingerprint"]
+        ):
+            raise ValueError("keyset admission sample provenance does not match its artifact")
+        sample_wall_clock = sample["wall_clock_unix"]
+        if (
+            not isinstance(sample_wall_clock, int | float)
+            or isinstance(sample_wall_clock, bool)
+            or not math.isfinite(sample_wall_clock)
+            or sample_wall_clock <= 0
+        ):
+            raise ValueError("keyset admission sample requires a finite wall clock")
+        for role in ("sequential_before", "candidate", "sequential_after"):
+            if "first_row_seconds" not in sample[role]:
+                raise ValueError("keyset admission run is missing first-row timing")
         window_seconds = sample["window_seconds"]
-        if (not isinstance(window_seconds, int | float) or isinstance(window_seconds, bool)
-                or not math.isfinite(window_seconds) or window_seconds <= 0):
+        if (
+            not isinstance(window_seconds, int | float)
+            or isinstance(window_seconds, bool)
+            or not math.isfinite(window_seconds)
+            or window_seconds <= 0
+        ):
             raise ValueError("keyset admission sample requires positive finite contemporaneity")
         key = (sample["cell"], sample["mode"])
         exclusion = _exclusion(sample)
@@ -184,11 +250,7 @@ def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
     group_results: list[dict[str, Any]] = []
     for (cell, mode), samples in sorted(groups.items()):
         accepted = [sample for sample in samples if not sample["warmup"] and sample["exclusion_reason"] is None]
-        observed_bands = {
-            _request_band(sample["control_requests"])
-            for sample in samples
-            if not sample["warmup"]
-        }
+        observed_bands = {_request_band(sample["control_requests"]) for sample in samples if not sample["warmup"]}
         band = next(iter(observed_bands)) if len(observed_bands) == 1 else None
         required, threshold_req, threshold_time, use_p95 = (
             _BAND_RULES[band] if band is not None else (20, 0.0, 0.0, True)
@@ -245,10 +307,7 @@ def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
         for result in group_results
         if (result["cell"], result["mode"]) in scoped and not result["performance_passed"]
     ]
-    performance_failures.extend(
-        {"cell": cell, "mode": mode}
-        for cell, mode in sorted(scoped - observed)
-    )
+    performance_failures.extend({"cell": cell, "mode": mode} for cell, mode in sorted(scoped - observed))
     material_range = any(
         result["mode"] == "range"
         and (result["cell"], result["mode"]) in scoped
@@ -282,7 +341,9 @@ def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
 
 
 def _analyze_combined_artifact(  # noqa: C901, PLR0912, PLR0915
-    artifact: dict[str, Any], *, candidate_sha: str,
+    artifact: dict[str, Any],
+    *,
+    candidate_sha: str,
 ) -> dict[str, Any]:
     """Admit fixture performance only for proven three-window live shortfalls."""
     live = artifact.get("live_artifact")
@@ -322,9 +383,7 @@ def _analyze_combined_artifact(  # noqa: C901, PLR0912, PLR0915
         live_group = live_groups.get(live_key)
         fixture_group = fixture_groups.get(fixture_key)
         windows = {
-            sample.get("attempt_window")
-            for sample in live_samples.get(live_key, ())
-            if not sample.get("warmup")
+            sample.get("attempt_window") for sample in live_samples.get(live_key, ()) if not sample.get("warmup")
         }
         reasons = entry.get("reason_codes")
         valid = False
@@ -357,9 +416,7 @@ def _analyze_combined_artifact(  # noqa: C901, PLR0912, PLR0915
         group = live_groups.get(key)
         if (group is None or not group["performance_passed"]) and key not in declared:
             unresolved.append({"cell": key[0], "mode": key[1]})
-    matrix_failed = any(
-        failure["cell"] == "__live_matrix__" for failure in live_result["performance_failures"]
-    )
+    matrix_failed = any(failure["cell"] == "__live_matrix__" for failure in live_result["performance_failures"])
     performance_failures = [*substitution_failures, *unresolved]
     if matrix_failed:
         performance_failures.append({"cell": "__live_matrix__", "mode": "all"})

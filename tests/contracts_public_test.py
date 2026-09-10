@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import inspect
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 from typing import is_typeddict
 
 import pytest
@@ -71,6 +71,58 @@ def test_public_error_module_export_snapshot_is_static_contract_evidence() -> No
         "ResponseTooLargeError",
         "ResultShapeError",
         "TransportError",
+    )
+
+
+def test_keyset_execution_report_declaration_snapshot() -> None:
+    expected = (
+        ("requested_kind", "KeysetExecutionKind"),
+        ("selected_kind", "KeysetExecutionKind"),
+        ("preselection_reason", "KeysetSelectionReason"),
+        ("final_selection_reason", "KeysetSelectionReason | None"),
+        ("assurance_source", "KeysetAssuranceSource"),
+        ("planning_requests", "int"),
+        ("boundary_requests", "int"),
+        ("canary_requests", "int"),
+        ("anchor_probe_requests", "int"),
+        ("canary_commands", "int"),
+        ("canary_rows", "int"),
+        ("anchor_probe_commands", "int"),
+        ("anchor_count", "int"),
+        ("empty_anchor_probes", "int"),
+        ("probe_rows_discarded", "int"),
+        ("boundary_overlap_rows", "int"),
+        ("head_page_admitted", "bool"),
+        ("sequential_requests_estimate", "int | None"),
+        ("selected_requests_estimate", "int | None"),
+        ("head_rows", "int"),
+        ("tail_rows", "int"),
+        ("interior_span", "int | None"),
+        ("interior_rows_estimate", "int | None"),
+        ("total_rows_estimate", "int | None"),
+        ("density_numerator", "int | None"),
+        ("density_denominator", "int | None"),
+        ("effective_window_width", "int | None"),
+        ("range_window_count", "int | None"),
+        ("target_lanes", "int | None"),
+        ("actual_lanes", "int | None"),
+        ("continuation_count", "int"),
+        ("closure_witness_counts", "tuple[tuple[ClosureWitness, int], ...]"),
+        ("effective_batch_capacity", "int"),
+        ("total_hint_requested", "bool"),
+        ("total_hint_observed", "int | None"),
+        ("total_hint_plausible", "bool"),
+        ("total_hint_used", "bool"),
+        ("trace_retained_by_class", "tuple[tuple[TraceClass, int], ...]"),
+        ("trace_dropped_by_class", "tuple[tuple[TraceClass, int], ...]"),
+    )
+
+    assert (
+        tuple(
+            (field.name, b24api.KeysetExecutionReport.__annotations__[field.name])
+            for field in fields(b24api.KeysetExecutionReport)
+        )
+        == expected
     )
 
 

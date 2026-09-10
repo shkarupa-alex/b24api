@@ -29,15 +29,23 @@ def drain_complete_lanes(  # noqa: PLR0913
     while lane_index < len(lanes):
         lane = lanes[lane_index]
         identities, rows, commands = (
-            identities_by_lane[lane.spec.ordinal], rows_by_lane[lane.spec.ordinal],
+            identities_by_lane[lane.spec.ordinal],
+            rows_by_lane[lane.spec.ordinal],
             commands_by_lane[lane.spec.ordinal],
         )
         if rows or commands:
-            admit(LaneReceipt(
-                lane_ordinal=lane.spec.ordinal, command_id=f"body-admit-{lane.spec.ordinal}",
-                rows=tuple(rows), identities=tuple(identities), page_full=False,
-                last_identity=identities[-1] if identities else None, witness=lane.witness, warnings=(),
-            ))
+            admit(
+                LaneReceipt(
+                    lane_ordinal=lane.spec.ordinal,
+                    command_id=f"body-admit-{lane.spec.ordinal}",
+                    rows=tuple(rows),
+                    identities=tuple(identities),
+                    page_full=False,
+                    last_identity=identities[-1] if identities else None,
+                    witness=lane.witness,
+                    warnings=(),
+                ),
+            )
             anchor = lane.spec.retained_upper_anchor if lane.status is LaneStatus.CLOSED else None
             for index, (command_id, count) in enumerate(commands):
                 trace_admit(command_id, count + int(anchor is not None and index == len(commands) - 1))

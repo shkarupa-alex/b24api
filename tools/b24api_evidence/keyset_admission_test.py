@@ -15,7 +15,10 @@ from .keyset_admission import REQUIRED_LIVE_MATRIX_FEATURES, analyze_artifact, l
 GIT = shutil.which("git")
 assert GIT is not None
 CANDIDATE_SHA = subprocess.run(  # noqa: S603 - resolved fixed test executable
-    [GIT, "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    [GIT, "rev-parse", "HEAD"],
+    check=True,
+    capture_output=True,
+    text=True,
 ).stdout.strip()
 
 
@@ -24,6 +27,7 @@ def _run(*, digest: str = "same", requests: int = 10, seconds: float = 1.0) -> d
         "digest": digest,
         "requests": requests,
         "wall_seconds": seconds,
+        "first_row_seconds": seconds / 2,
         "retries": 0,
         "cooldown_seconds": 0.0,
         "transport_fault": False,
@@ -52,6 +56,10 @@ def _artifact() -> dict[str, Any]:
                 "mode": "range",
                 "warmup": index == 0,
                 "sha": CANDIDATE_SHA,
+                "schema_version": 1,
+                "python_version": "3.13.0",
+                "portal_fingerprint": "a" * 64,
+                "wall_clock_unix": 1.0,
                 "window_seconds": 1.0,
                 "rotation_offset": index % 3,
                 "page_size": 50,
@@ -71,6 +79,9 @@ def _artifact() -> dict[str, Any]:
         "schema_version": 1,
         "source": "live_read_only",
         "sha": CANDIDATE_SHA,
+        "python_version": "3.13.0",
+        "portal_fingerprint": "a" * 64,
+        "wall_clock_unix": 1.0,
         "manifest": {
             "performance_scope": [["large", "range"]],
             "correctness_scope": [["large", "range"]],
@@ -114,6 +125,16 @@ def test_analyzer_rejects_unbound_or_incomplete_release_metadata() -> None:
     with pytest.raises(ValueError, match="required metadata"):
         analyze_artifact(missing_window)
 
+    missing_provenance = deepcopy(_artifact())
+    missing_provenance.pop("python_version")
+    with pytest.raises(ValueError, match="provenance"):
+        analyze_artifact(missing_provenance)
+
+    missing_first_row = deepcopy(_artifact())
+    missing_first_row["samples"][0]["candidate"].pop("first_row_seconds")
+    with pytest.raises(ValueError, match="first-row"):
+        analyze_artifact(missing_first_row)
+
 
 def test_standalone_fixture_cannot_supply_release_performance_evidence() -> None:
     artifact = _artifact()
@@ -138,10 +159,18 @@ def test_combined_evidence_requires_three_live_windows_and_exact_shortfall_reaso
         "complete": True,
         "covered_features": sorted(
             {
-                "unfiltered", "filtered", "two_large_selections", "small_selection",
-                "density_below_5_percent", "density_5_to_25_percent", "density_above_50_percent",
-                "clustered_or_skewed", "tasks_split_roles", "same_case_endpoint",
-                "total_hint_ignore", "total_hint_advisory",
+                "unfiltered",
+                "filtered",
+                "two_large_selections",
+                "small_selection",
+                "density_below_5_percent",
+                "density_5_to_25_percent",
+                "density_above_50_percent",
+                "clustered_or_skewed",
+                "tasks_split_roles",
+                "same_case_endpoint",
+                "total_hint_ignore",
+                "total_hint_advisory",
             },
         ),
     }
@@ -152,14 +181,19 @@ def test_combined_evidence_requires_three_live_windows_and_exact_shortfall_reaso
         "schema_version": 1,
         "source": "combined_live_fixture",
         "sha": CANDIDATE_SHA,
+        "python_version": "3.13.0",
+        "portal_fingerprint": "a" * 64,
+        "wall_clock_unix": 1.0,
         "live_artifact": live,
         "fixture_artifact": fixture,
-        "substitutions": [{
-            "live_cell": "large",
-            "fixture_cell": "large",
-            "mode": "range",
-            "reason_codes": ["insufficient_accepted_samples"],
-        }],
+        "substitutions": [
+            {
+                "live_cell": "large",
+                "fixture_cell": "large",
+                "mode": "range",
+                "reason_codes": ["insufficient_accepted_samples"],
+            },
+        ],
     }
 
     result = analyze_artifact(combined)

@@ -691,13 +691,15 @@ async def test_php_empty_result_array_preserves_all_command_errors() -> None:
 async def test_default_batch_preserves_unknown_total_sentinel() -> None:
     def unknown_total(request: Request) -> WireResponse:
         keys = _batch_keys(request)
-        body = json.dumps({
-            "result": {
-                "result": {key: [] for key in keys},
-                "result_error": [],
-                "result_total": dict.fromkeys(keys, -1),
+        body = json.dumps(
+            {
+                "result": {
+                    "result": {key: [] for key in keys},
+                    "result_error": [],
+                    "result_total": dict.fromkeys(keys, -1),
+                },
             },
-        }).encode()
+        ).encode()
         return WireResponse(200, (("content-type", "application/json"),), body)
 
     stream = BatchExecutor(Executor(CallbackTransport(unknown_total)))._outcomes(
@@ -866,13 +868,7 @@ async def test_public_batch_preserves_tolerant_unknown_or_duplicate_correlation_
                 {"result": {"result": {key: {}, "unexpected": {}}, "result_error": []}},
             ).encode()
         else:
-            body = (
-                '{"result":{"result":{"'
-                + key
-                + '":{},"'
-                + key
-                + '":{}},"result_error":[]}}'
-            ).encode()
+            body = ('{"result":{"result":{"' + key + '":{},"' + key + '":{}},"result_error":[]}}').encode()
         return WireResponse(status_code=HTTP_OK, headers=(), body=body)
 
     stream = BatchExecutor(Executor(CallbackTransport(malformed_correlation)))._outcomes([Request("profile")])

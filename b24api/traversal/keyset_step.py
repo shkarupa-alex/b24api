@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from b24api.contracts.request import IdentitySpec, ParameterPath, Request
     from b24api.contracts.traversal import KeysetSpec
 
+
 def sequential_keyset_plan(keyset: KeysetSpec, page_size: int) -> KeysetPlan:
     """Describe the unchanged sequential wire and completion contract for a keyset."""
     direction: Literal["asc", "desc"] = "asc" if keyset.direction == "ascending" else "desc"

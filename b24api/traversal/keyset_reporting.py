@@ -33,7 +33,14 @@ def initial_report_selection(
         if isinstance(execution, RangeKeysetExecution)
         else KeysetSelectionReason.INSUFFICIENT_PREDICTED_GAIN
     )
-    return KeysetExecutionKind.AUTO, reason
+    selected = (
+        KeysetExecutionKind.PARTITIONED
+        if isinstance(execution, PartitionedKeysetExecution)
+        else KeysetExecutionKind.RANGE
+        if isinstance(execution, RangeKeysetExecution)
+        else KeysetExecutionKind.AUTO
+    )
+    return selected, reason
 
 
 def build_scheduler_report(scheduler: KeysetFastScheduler) -> KeysetExecutionReport:

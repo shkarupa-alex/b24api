@@ -10,15 +10,12 @@ from typing import TYPE_CHECKING
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
-    ClosureWitness,
     KeysetExecutionKind,
     KeysetPageCompletion,
     KeysetPhase,
     PartitionedKeysetExecution,
     RangeKeysetExecution,
-    TraceClass,
 )
-from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode, Violation
 from b24api.errors import PaginationError
 from b24api.traversal.keyset_auto import BoundaryFacts, TotalHintState, normalize_total_hint
 from b24api.traversal.keyset_fast_plan import (
@@ -31,16 +28,15 @@ from b24api.traversal.keyset_fast_plan import (
     plan_windows,
     window_count,
 )
-from b24api.traversal.keyset_observation import PageObservation
 from b24api.traversal.keyset_partition import anchor_guesses, normalize_anchors
 from b24api.traversal.keyset_range import range_window_width
 
 if TYPE_CHECKING:
     from b24api.batch.outcome import BatchOutcome
     from b24api.contracts.json import JsonValue
-    from b24api.contracts.response import Response
     from b24api.contracts.traversal import KeysetSpec
     from b24api.traversal.page_validation import LaneCommandPlan, LaneReceipt
+
 
 @dataclass(frozen=True, slots=True)
 class CapabilityCommand:
@@ -99,39 +95,45 @@ def analyze_boundary(
     if ascending.identities and descending.identities:
         maximum_hint += max(0, min(descending.identities) - max(ascending.identities) - 1)
     total_hint = normalize_total_hint(
-        requested=advisory, head=ascending_total, tail=descending_total, maximum=maximum_hint,
+        requested=advisory,
+        head=ascending_total,
+        tail=descending_total,
+        maximum=maximum_hint,
     )
     overlap = bool(
-        ascending.identities
-        and descending.identities
-        and max(ascending.identities) >= min(descending.identities),
+        ascending.identities and descending.identities and max(ascending.identities) >= min(descending.identities),
     )
     adjacent = bool(
-        ascending.identities
-        and descending.identities
-        and min(descending.identities) - max(ascending.identities) == 1,
+        ascending.identities and descending.identities and min(descending.identities) - max(ascending.identities) == 1,
     )
     facts = BoundaryFacts(
-        len(ascending.rows), len(descending.rows),
+        len(ascending.rows),
+        len(descending.rows),
         min(ascending.identities) if ascending.identities else None,
         max(ascending.identities) if ascending.identities else None,
         min(descending.identities) if descending.identities else None,
         max(descending.identities) if descending.identities else None,
-        overlap, adjacent,
+        overlap,
+        adjacent,
     )
     if not ascending.identities or not descending.identities:
         return BoundaryAnalysis(facts, total_hint, None, None, None)
     interior_span = max(0, min(descending.identities) - max(ascending.identities) - 1)
     density_denominator = max(
         1,
-        max(ascending.identities) - min(ascending.identities)
+        max(ascending.identities)
+        - min(ascending.identities)
         + 1
         + max(descending.identities)
         - min(descending.identities)
         + 1,
     )
     return BoundaryAnalysis(
-        facts, total_hint, interior_span, len(ascending.rows) + len(descending.rows), density_denominator,
+        facts,
+        total_hint,
+        interior_span,
+        len(ascending.rows) + len(descending.rows),
+        density_denominator,
     )
 
 
@@ -242,7 +244,8 @@ def compact_anchor_receipts(
 
 
 def boundary_totals(
-    plans: tuple[LaneCommandPlan, ...], outcomes: tuple[BatchOutcome, ...],
+    plans: tuple[LaneCommandPlan, ...],
+    outcomes: tuple[BatchOutcome, ...],
 ) -> dict[str, int | None]:
     """Retain boundary scalar totals without retaining response row payloads."""
     if not all(plan.phase is KeysetPhase.BOUNDARY for plan in plans):
@@ -313,26 +316,6 @@ def selected_lane_geometry(  # noqa: PLR0913
     return LaneGeometry(specs, width, count)
 
 
-def descending_closure_witness(
-    lane: LaneState,
-    identities: tuple[int, ...],
-    *,
-    completion: KeysetPageCompletion,
-    page_cap: int,
-) -> ClosureWitness | None:
-    """Classify descending closure with exact lattice proof taking precedence."""
-    if not identities:
-        return ClosureWitness.EMPTY
-    lower = lane.spec.bounds.lower_exclusive
-    if lower is not None and lane.cursor is not None and identities == tuple(range(lane.cursor - 1, lower, -1)):
-        return ClosureWitness.LATTICE_FULL
-    if lower is not None and identities[-1] == lower + 1:
-        return ClosureWitness.TOP
-    if completion is KeysetPageCompletion.SHORT_PAGE_EXHAUSTS and len(identities) < page_cap:
-        return ClosureWitness.SHORT_PAGE
-    return None
-
-
 def lane_for_command(
     plan: LaneCommandPlan,
     *,
@@ -345,7 +328,12 @@ def lane_for_command(
     if plan.phase is KeysetPhase.BOUNDARY:
         return LaneState(
             LaneSpec(plan.lane_ordinal, LaneKind.HEAD, LaneBounds(None, None), plan.lane_ordinal == 1, True, None),
-            None, LaneStatus.OPEN, None, 0, plan.reserved_rows, deque(),
+            None,
+            LaneStatus.OPEN,
+            None,
+            0,
+            plan.reserved_rows,
+            deque(),
         )
     if plan.phase in {KeysetPhase.CANARY, KeysetPhase.ANCHOR_PROBE}:
         bounds = planning_bounds[plan.command_id]
@@ -353,37 +341,17 @@ def lane_for_command(
         return LaneState(
             LaneSpec(plan.lane_ordinal, LaneKind.LANE, bounds, descending, False, None),
             bounds.upper_exclusive if descending else bounds.lower_exclusive,
-            LaneStatus.OPEN, None, 0, plan.reserved_rows, deque(),
+            LaneStatus.OPEN,
+            None,
+            0,
+            plan.reserved_rows,
+            deque(),
         )
     if plan.phase is KeysetPhase.FINISH:
         if finish_lane is None:
             raise RuntimeError("finish command lacks its scheduler-owned lane")
         return finish_lane
     return next(lane for lane in lanes if lane.spec.ordinal == plan.lane_ordinal)
-
-
-def page_observation(  # noqa: PLR0913
-    ordinal: int,
-    plan: LaneCommandPlan,
-    *,
-    index: int | None,
-    selected: int,
-    admitted: int,
-    effective_page_cap: int,
-    outcome: PageOutcome = PageOutcome.COMMITTED,
-    rejection: PageRejectionCode | None = None,
-    violation: Violation | None = None,
-    response: Response | None = None,
-    witness: ClosureWitness | None = None,
-    dispatch: PageDispatch = PageDispatch.BATCH,
-) -> PageObservation:
-    """Build value-only trace evidence independently of scheduler sequencing."""
-    return PageObservation(
-        ordinal, plan.phase, plan.lane_ordinal, plan.command_id, dispatch, index, selected, admitted,
-        response.total if response is not None and response.total is not None and response.total >= 0 else None,
-        response.next if response is not None else None,
-        selected == effective_page_cap, witness, outcome, rejection, violation, TraceClass.BODY,
-    )
 
 
 __all__: list[str] = []

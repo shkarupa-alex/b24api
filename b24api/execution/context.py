@@ -131,10 +131,7 @@ class ExecutionContext:
             used = self._counters.logical_pages + len(self._page_reservations)
             if used + count > self.policy.max_pages:
                 raise BudgetExceededError("logical page budget cannot fit the requested wave")
-            reservations = tuple(
-                _PageReservation(self._page_sequence + offset, None)
-                for offset in range(count)
-            )
+            reservations = tuple(_PageReservation(self._page_sequence + offset, None) for offset in range(count))
             self._page_sequence += count
             self._page_reservations.update(dict.fromkeys(reservations))
             return reservations

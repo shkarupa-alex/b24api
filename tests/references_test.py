@@ -433,11 +433,7 @@ async def test_reference_batch_preserves_tolerant_duplicate_json_members() -> No
             assert isinstance(commands, dict)
             key = next(iter(commands))
             body = (
-                '{"result":{"result":{"'
-                + key
-                + '":[{"ID":1}],"'
-                + key
-                + '":[{"ID":1}]},"result_error":[]}}'
+                '{"result":{"result":{"' + key + '":[{"ID":1}],"' + key + '":[{"ID":1}]},"result_error":[]}}'
             ).encode()
             return WireResponse(200, (("content-type", "application/json"),), body)
 

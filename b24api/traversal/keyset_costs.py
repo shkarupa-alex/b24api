@@ -65,17 +65,24 @@ def ceil_div(numerator: int, denominator: int) -> int:
 
 
 def selected_range_geometry(
-    *, execution: RangeKeysetExecution | AutoKeysetExecution, completion: KeysetPageCompletion,
-    page_cap: int, ascending: tuple[int, ...], descending: tuple[int, ...],
+    *,
+    execution: RangeKeysetExecution | AutoKeysetExecution,
+    completion: KeysetPageCompletion,
+    page_cap: int,
+    ascending: tuple[int, ...],
+    descending: tuple[int, ...],
 ) -> tuple[int, int]:
     """Return selected range width and count without materializing windows."""
     lo, hi = max(ascending), min(descending)
     explicit = execution.window_width if isinstance(execution, RangeKeysetExecution) else execution.range_window_width
     width = range_window_width(
-        completion=completion, page_cap=page_cap, span=max(0, hi - lo - 1),
+        completion=completion,
+        page_cap=page_cap,
+        span=max(0, hi - lo - 1),
         density_numerator=len(ascending) + len(descending),
-        density_denominator=max(1, max(ascending) - min(ascending) + 1
-                                + max(descending) - min(descending) + 1), explicit=explicit)
+        density_denominator=max(1, max(ascending) - min(ascending) + 1 + max(descending) - min(descending) + 1),
+        explicit=explicit,
+    )
     span = max(0, hi - lo - 1)
     return width, ceil_div(span, width - 1) if span else 0
 

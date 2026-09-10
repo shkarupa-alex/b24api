@@ -1,18 +1,21 @@
 """Value-only staging record for fast keyset trace observations."""
 
+# ruff: noqa: SLF001
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn
 
-from b24api.contracts.report import PageOutcome, PageRejectionCode, Violation, ViolationSeverity
+from b24api.contracts.keyset_execution import ClosureWitness, TraceClass
+from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode, Violation, ViolationSeverity
 from b24api.errors import PaginationError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from b24api.contracts.keyset_execution import ClosureWitness, KeysetPhase, TraceClass
-    from b24api.contracts.report import PageDispatch
+    from b24api.contracts.keyset_execution import KeysetPhase
     from b24api.contracts.response import Response
+    from b24api.traversal.keyset_scheduler import KeysetFastScheduler
     from b24api.traversal.ordered_admission import OrderedAdmissionState
     from b24api.traversal.page_validation import LaneCommandPlan, LaneReceipt
 
@@ -39,6 +42,76 @@ class PageObservation:
     trace_class: TraceClass
 
 
+def page_observation(  # noqa: PLR0913
+    ordinal: int,
+    plan: LaneCommandPlan,
+    *,
+    index: int | None,
+    selected: int,
+    admitted: int,
+    effective_page_cap: int,
+    outcome: PageOutcome = PageOutcome.COMMITTED,
+    rejection: PageRejectionCode | None = None,
+    violation: Violation | None = None,
+    response: Response | None = None,
+    witness: ClosureWitness | None = None,
+    dispatch: PageDispatch = PageDispatch.BATCH,
+) -> PageObservation:
+    """Build value-only trace evidence independently of scheduler sequencing."""
+    return PageObservation(
+        ordinal,
+        plan.phase,
+        plan.lane_ordinal,
+        plan.command_id,
+        dispatch,
+        index,
+        selected,
+        admitted,
+        response.total if response is not None and response.total is not None and response.total >= 0 else None,
+        response.next if response is not None else None,
+        selected == effective_page_cap,
+        witness,
+        outcome,
+        rejection,
+        violation,
+        TraceClass.BODY,
+    )
+
+
+def record_scheduler_observation(  # noqa: PLR0913
+    scheduler: KeysetFastScheduler,
+    plan: LaneCommandPlan,
+    *,
+    index: int | None,
+    selected: int,
+    admitted: int,
+    outcome: PageOutcome,
+    rejection: PageRejectionCode | None,
+    violation: Violation | None,
+    response: Response | None,
+    witness: ClosureWitness | None,
+    dispatch: PageDispatch,
+) -> None:
+    """Record one scheduler observation and advance its sole ordinal."""
+    scheduler.trace.record(
+        page_observation(
+            scheduler._observation_ordinal,
+            plan,
+            index=index,
+            selected=selected,
+            admitted=admitted,
+            effective_page_cap=scheduler.effective_page_cap,
+            outcome=outcome,
+            rejection=rejection,
+            violation=violation,
+            response=response,
+            witness=witness,
+            dispatch=dispatch,
+        ),
+    )
+    scheduler._observation_ordinal += 1
+
+
 def flush_staged_observations(
     staged: list[tuple[LaneCommandPlan, int, int, Response | None, ClosureWitness | None]],
     record: Callable[..., None],
@@ -53,9 +126,14 @@ def flush_staged_observations(
             continue
         is_offending = offending is None or plan.command_id in offending
         record(
-            plan, index=index, selected=selected, admitted=0, outcome=PageOutcome.REJECTED,
-            rejection=(PageRejectionCode.RANGE_CONTRADICTION if is_offending
-                       else PageRejectionCode.TRANSACTION_ABORTED),
+            plan,
+            index=index,
+            selected=selected,
+            admitted=0,
+            outcome=PageOutcome.REJECTED,
+            rejection=(
+                PageRejectionCode.RANGE_CONTRADICTION if is_offending else PageRejectionCode.TRANSACTION_ABORTED
+            ),
             violation=violation if is_offending else None,
         )
     staged.clear()
@@ -81,7 +159,9 @@ def stage_or_record_observation(  # noqa: PLR0913
 
 def abort_staged_observations(
     staged: list[tuple[LaneCommandPlan, int, int, Response | None, ClosureWitness | None]],
-    record: Callable[..., None], admission: OrderedAdmissionState, violations: list[Violation],
+    record: Callable[..., None],
+    admission: OrderedAdmissionState,
+    violations: list[Violation],
 ) -> None:
     """Finalize earlier semantic waves when a later planning wave fails."""
     if not staged:
@@ -90,14 +170,22 @@ def abort_staged_observations(
     canary = sum(item[2] for item in staged if item[0].phase.value == "canary")
     admission.record_discarded(boundary)
     admission.record_raw(canary, discarded=True)
-    violation = violations[-1] if violations else Violation(
-        ViolationSeverity.BLOCKING, "planning_aborted", "fast keyset semantic planning aborted")
+    violation = (
+        violations[-1]
+        if violations
+        else Violation(ViolationSeverity.BLOCKING, "planning_aborted", "fast keyset semantic planning aborted")
+    )
     flush_staged_observations(staged, record, violation=violation, offending=set())
 
 
 def reject_boundary_observations(  # noqa: PLR0913
     staged: list[tuple[LaneCommandPlan, int, int, Response | None, ClosureWitness | None]],
-    record: Callable[..., None], admission: OrderedAdmissionState, *, rows: int, violation: Violation, raw: bool,
+    record: Callable[..., None],
+    admission: OrderedAdmissionState,
+    *,
+    rows: int,
+    violation: Violation,
+    raw: bool,
 ) -> None:
     """Finalize invalid boundary evidence without manufacturing commits."""
     admission.record_raw(rows, discarded=True) if raw else admission.record_discarded(rows)
@@ -106,7 +194,10 @@ def reject_boundary_observations(  # noqa: PLR0913
 
 def raise_boundary_cap_contradiction(
     staged: list[tuple[LaneCommandPlan, int, int, Response | None, ClosureWitness | None]],
-    record: Callable[..., None], admission: OrderedAdmissionState, violations: list[Violation], rows: int,
+    record: Callable[..., None],
+    admission: OrderedAdmissionState,
+    violations: list[Violation],
+    rows: int,
 ) -> NoReturn:
     """Reject staged boundaries that fail the declared page-cap contract."""
     message = "boundary pages did not establish page-cap agreement"
@@ -117,9 +208,12 @@ def raise_boundary_cap_contradiction(
 
 
 def validate_canary_observations(  # noqa: PLR0913
-    receipts: tuple[LaneReceipt, ...], expected: dict[str, tuple[int, ...]],
+    receipts: tuple[LaneReceipt, ...],
+    expected: dict[str, tuple[int, ...]],
     staged: list[tuple[LaneCommandPlan, int, int, Response | None, ClosureWitness | None]],
-    record: Callable[..., None], admission: OrderedAdmissionState, violations: list[Violation],
+    record: Callable[..., None],
+    admission: OrderedAdmissionState,
+    violations: list[Violation],
 ) -> None:
     """Finalize all phase-owned observations after semantic canary validation."""
     by_id = {receipt.command_id: receipt for receipt in receipts}
@@ -127,7 +221,10 @@ def validate_canary_observations(  # noqa: PLR0913
     admission.record_raw(sum(len(receipt.rows) for receipt in receipts), discarded=True)
     if offending:
         violation = Violation(
-            ViolationSeverity.BLOCKING, "canary_contradiction", "bounded keyset capability canary failed")
+            ViolationSeverity.BLOCKING,
+            "canary_contradiction",
+            "bounded keyset capability canary failed",
+        )
         violations.append(violation)
         admission.record_discarded(sum(item[2] for item in staged if item[0].phase.value == "boundary"))
         flush_staged_observations(staged, record, violation=violation, offending=offending)

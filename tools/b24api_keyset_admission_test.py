@@ -8,8 +8,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from b24api import AutoKeysetExecution, PartitionedKeysetExecution, RangeKeysetExecution, ReplaySafety, Request
+from b24api import (
+    AutoKeysetExecution,
+    PartitionedKeysetExecution,
+    RangeKeysetExecution,
+    ReplaySafety,
+    Request,
+    TotalHintMode,
+)
 from tools import b24api_keyset_admission as harness
+from tools.b24api_evidence.keyset_admission import LIVE_ATTEMPT_WINDOWS
 
 
 @pytest.mark.asyncio
@@ -85,21 +93,27 @@ async def test_live_generator_sandwiches_every_declared_mode_without_network(mon
     monkeypatch.setattr(
         harness,
         "_live_cells",
-        lambda: (harness._task_live_cell("tasks_all", {}, harness.TotalHintMode.IGNORE, "range"),),
+        lambda: (harness._task_live_cell("tasks_all", {}, TotalHintMode.IGNORE, "range"),),
     )
 
     artifact = await harness.generate_live_range(0, sha="candidate")
 
     assert calls == [
-        ("tasks_all", None), ("tasks_all", "range"), ("tasks_all", None),
-        ("tasks_all", None), ("tasks_all", "partitioned"), ("tasks_all", None),
-        ("tasks_all", None), ("tasks_all", "auto"), ("tasks_all", None),
+        ("tasks_all", None),
+        ("tasks_all", "range"),
+        ("tasks_all", None),
+        ("tasks_all", None),
+        ("tasks_all", "partitioned"),
+        ("tasks_all", None),
+        ("tasks_all", None),
+        ("tasks_all", "auto"),
+        ("tasks_all", None),
     ]
     assert [sample["mode"] for sample in artifact["samples"]] == list(harness.MODES)
     manifest = artifact["manifest"]
     assert manifest["correctness_scope"] == [["tasks_all", mode] for mode in harness.MODES]
     assert manifest["modes"] == list(harness.MODES)
-    assert manifest["attempt_windows"] == harness.LIVE_ATTEMPT_WINDOWS
+    assert manifest["attempt_windows"] == LIVE_ATTEMPT_WINDOWS
     assert manifest["live_matrix"]["complete"] is True
     assert manifest["live_matrix"]["shortfalls"]
     assert manifest["live_matrix"]["fallback"]["kind"] == "deterministic_fixture"
@@ -122,7 +136,7 @@ async def test_legacy_live_range_alias_can_retain_range_only_semantics(monkeypat
     monkeypatch.setattr(
         harness,
         "_live_cells",
-        lambda: (harness._task_live_cell("tasks_all", {}, harness.TotalHintMode.IGNORE, "range"),),
+        lambda: (harness._task_live_cell("tasks_all", {}, TotalHintMode.IGNORE, "range"),),
     )
 
     artifact = await harness.generate_live_range(0, sha="candidate", modes=("range",))
@@ -139,8 +153,8 @@ def test_live_matrix_freezes_requested_filters_hints_and_identity_roles() -> Non
     assert json.loads(cells["tasks_created_by_1"].parameters_json)["filter"] == {"CREATED_BY": 1}
     assert json.loads(cells["tasks_status_2"].parameters_json)["filter"] == {"STATUS": 2}
     assert {cell.total_hint for cell in cells.values()} == {
-        harness.TotalHintMode.IGNORE,
-        harness.TotalHintMode.REQUEST_ADVISORY,
+        TotalHintMode.IGNORE,
+        TotalHintMode.REQUEST_ADVISORY,
     }
     assert cells["tasks_all"].filter_role != cells["tasks_all"].order_role
     assert all(cell.filter_role != cell.order_role for cell in cells.values())
