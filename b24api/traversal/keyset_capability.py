@@ -29,6 +29,7 @@ from b24api.traversal.keyset_fast_plan import (
     LaneStatus,
     plan_lanes_from_anchors,
     plan_windows,
+    window_count,
 )
 from b24api.traversal.keyset_observation import PageObservation
 from b24api.traversal.keyset_partition import anchor_guesses, normalize_anchors
@@ -40,7 +41,6 @@ if TYPE_CHECKING:
     from b24api.contracts.response import Response
     from b24api.contracts.traversal import KeysetSpec
     from b24api.traversal.page_validation import LaneCommandPlan, LaneReceipt
-
 
 @dataclass(frozen=True, slots=True)
 class CapabilityCommand:
@@ -292,8 +292,8 @@ def selected_lane_geometry(  # noqa: PLR0913
             ),
             explicit=explicit,
         )
+        count = window_count(lo=lo, upper_exclusive=hi, width=width)
         specs = plan_windows(lo=lo, upper_exclusive=hi, width=width)
-        count = len(specs)
     else:
         specs = plan_lanes_from_anchors(lo=lo, upper_exclusive=hi, anchors=anchors)
     if keyset.direction == "descending":

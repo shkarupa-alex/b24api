@@ -121,6 +121,24 @@ class ExecutionContext:
         except TimeoutError as error:
             raise BudgetExceededError("page reservation exceeded operation time budget") from error
 
+    async def reserve_pages(self, count: int) -> tuple[_PageReservation, ...]:
+        """Atomically reserve a fixed operation-local page wave or fail immediately."""
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            raise ValueError("page reservation count must be a positive integer")
+        async with self._lock:
+            if self.policy.max_elapsed - self.elapsed <= 0:
+                raise BudgetExceededError("page reservation exceeded operation time budget")
+            used = self._counters.logical_pages + len(self._page_reservations)
+            if used + count > self.policy.max_pages:
+                raise BudgetExceededError("logical page budget cannot fit the requested wave")
+            reservations = tuple(
+                _PageReservation(self._page_sequence + offset, None)
+                for offset in range(count)
+            )
+            self._page_sequence += count
+            self._page_reservations.update(dict.fromkeys(reservations))
+            return reservations
+
     def commit_page(self, reservation: _PageReservation) -> None:
         """Atomically charge one decoded response with no cancellation point."""
         if reservation not in self._page_reservations:

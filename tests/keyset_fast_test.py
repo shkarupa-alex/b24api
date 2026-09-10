@@ -16,6 +16,7 @@ from b24api import (
     AutoKeysetExecution,
     Bitrix24,
     ClosureWitness,
+    ConsistencyPolicy,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
@@ -37,6 +38,7 @@ from b24api import (
     TotalHintMode,
     TraceClass,
 )
+from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError, IncompleteTraversalError
 from b24api.execution import Executor, WireResponse
@@ -852,6 +854,12 @@ async def test_ignored_numeric_bounds_fail_canaries_before_emission() -> None:
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.canary_rows > 0
     assert stream.report.keyset_execution.probe_rows_discarded > 0
+    assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.UNSELECTED
+    assert stream.report.keyset_execution.preselection_reason is KeysetSelectionReason.PLANNING_INCOMPLETE
+    assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.UNVERIFIED
+    canaries = [record for record in stream.report.page_trace if record.phase is KeysetPhase.CANARY]
+    assert canaries
+    assert all(record.outcome is PageOutcome.REJECTED for record in canaries)
 
 
 def test_fast_ineligible_requests_fail_synchronously_without_io() -> None:
@@ -873,6 +881,30 @@ def test_fast_ineligible_requests_fail_synchronously_without_io() -> None:
                 StableIntegerKeysetContract(page_completion=KeysetPageCompletion.SHORT_PAGE_EXHAUSTS),
             ),
         )
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize(
+    "consistency",
+    [
+        ConsistencyPolicy(total_semantics=TotalSemantics.FILTERED_EXACT),
+        ConsistencyPolicy(order_semantics=OrderSemantics.DESCENDING),
+        ConsistencyPolicy(identity_requirement=IdentityRequirement.COMPOSITE),
+    ],
+)
+def test_fast_rejects_incompatible_universal_consistency_without_io(
+    consistency: ConsistencyPolicy,
+) -> None:
+    transport = KeysetTransport(tuple(range(1, 31)))
+    client = _client(transport, policy=ExecutionPolicy(consistency=consistency))
+
+    with pytest.raises(CapabilityError):
+        client.iter_list_keyset(
+            Request("item.list"), selector=ResultSelector.root(), identity=_identity(), page_size=PAGE_SIZE,
+            keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+            execution=RangeKeysetExecution(StableIntegerKeysetContract()),
+        )
+
     assert transport.requests == []
 
 
@@ -981,6 +1013,19 @@ async def test_advisory_boundary_total_is_ignored_when_not_a_non_negative_intege
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.total_hint_observed is None
     assert stream.report.keyset_execution.total_hint_plausible is False
+
+
+@pytest.mark.asyncio
+async def test_keyset_report_rejects_boolean_total_hint_observation() -> None:
+    stream = _stream(
+        KeysetTransport(tuple(range(1, 31)), boundary_total=30),
+        AutoKeysetExecution(StableIntegerKeysetContract(), total_hint=TotalHintMode.REQUEST_ADVISORY),
+    )
+    assert [row["id"] async for row in stream] == list(range(1, 31))
+    assert stream.report.keyset_execution is not None
+
+    with pytest.raises(ValueError, match="optional keyset report counters"):
+        replace(stream.report.keyset_execution, total_hint_observed=True)
 
 
 @pytest.mark.asyncio
@@ -1116,3 +1161,64 @@ async def test_descending_full_integer_window_reports_lattice_closure() -> None:
     closures = dict(stream.report.keyset_execution.closure_witness_counts)
     assert closures[ClosureWitness.LATTICE_FULL] == 4
     assert closures[ClosureWitness.TOP] == 0
+
+
+@pytest.mark.asyncio
+async def test_partial_page_budget_rejects_a_wave_without_waiting_for_elapsed_budget() -> None:
+    policy = ExecutionPolicy(max_pages=3, max_elapsed=20.0)
+    transport = KeysetTransport(tuple(range(1, 80)))
+    stream = _client(transport, policy=policy).iter_list_keyset(
+        Request("item.list"), selector=ResultSelector.root(), identity=_identity(), page_size=PAGE_SIZE,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        execution=RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    with pytest.raises(IncompleteTraversalError):
+        async with asyncio.timeout(0.5):
+            await anext(stream)
+
+    assert stream.report.state is TerminalState.INCOMPLETE
+    assert stream.report.emitted == 0
+
+
+@pytest.mark.asyncio
+async def test_range_windows_are_materialized_one_lane_at_a_time() -> None:
+    identities = (*range(1, 6), *range(1_000_001, 1_000_006))
+    stream = _stream(
+        KeysetTransport(identities),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+    scheduler = stream._source._scheduler
+
+    await scheduler.plan_barrier()
+
+    assert scheduler._window_count == 249_999
+    assert len(scheduler._lanes) == 1
+    assert len(scheduler._lane_rows) == 1
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_later_partition_lanes_are_not_rescheduled_while_frontier_is_open() -> None:
+    stream = _stream(
+        KeysetTransport(tuple(range(1, 201))),
+        PartitionedKeysetExecution(StableIntegerKeysetContract(), target_lanes=3),
+    )
+    scheduler = stream._source._scheduler
+    await scheduler.plan_barrier()
+
+    await scheduler._body_wave()
+    first_lengths = {ordinal: len(rows) for ordinal, rows in scheduler._lane_rows.items()}
+    frontier = scheduler._lane_index
+    frontier_ordinal = scheduler._lanes[frontier].spec.ordinal
+    assert scheduler._lanes[frontier].status.value == "open"
+    await scheduler._body_wave()
+    second_lengths = {ordinal: len(rows) for ordinal, rows in scheduler._lane_rows.items()}
+
+    assert second_lengths[frontier_ordinal] > first_lengths[frontier_ordinal]
+    assert all(
+        second_lengths[ordinal] == first_lengths[ordinal]
+        for ordinal in second_lengths
+        if ordinal != frontier_ordinal
+    )
+    await stream.aclose()

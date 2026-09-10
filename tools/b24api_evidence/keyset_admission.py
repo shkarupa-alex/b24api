@@ -59,8 +59,6 @@ def nearest_rank_p95(values: list[float]) -> float:
 
 
 def _exclusion(sample: dict[str, Any]) -> str | None:
-    if sample.get("window_seconds", 0.0) > MAX_SANDWICH_WINDOW_SECONDS:
-        return "window_exceeded"
     before, candidate, after = (sample[role] for role in ("sequential_before", "candidate", "sequential_after"))
     if before["digest"] != after["digest"]:
         return "mutation_invalid"
@@ -124,6 +122,7 @@ def analyze_artifact(  # noqa: C901, PLR0915
         groups[key].append(sample)
         before, candidate, after = (sample[role] for role in ("sequential_before", "candidate", "sequential_after"))
         checks = {
+            "contemporaneous": sample.get("window_seconds", 0.0) <= MAX_SANDWICH_WINDOW_SECONDS,
             "stable_digest": before["digest"] == after["digest"] == candidate["digest"],
             "omissions": candidate["omissions"] == 0,
             "duplicates": candidate["duplicates"] == 0,

@@ -5,7 +5,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from b24api.contracts.keyset_execution import KeysetExecutionKind, KeysetPageCompletion
+from b24api.contracts.keyset_execution import (
+    AutoKeysetExecution,
+    KeysetExecutionKind,
+    KeysetPageCompletion,
+    RangeKeysetExecution,
+)
 from b24api.traversal.keyset_range import range_window_width
 
 
@@ -35,6 +40,7 @@ class SelectorInputs:
     range_window_width: int | None
     completion: KeysetPageCompletion
     advisory_total: int | None
+    descending: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +62,22 @@ class CostEstimate:
 def ceil_div(numerator: int, denominator: int) -> int:
     """Return integer ceiling division."""
     return (numerator + denominator - 1) // denominator
+
+
+def selected_range_geometry(
+    *, execution: RangeKeysetExecution | AutoKeysetExecution, completion: KeysetPageCompletion,
+    page_cap: int, ascending: tuple[int, ...], descending: tuple[int, ...],
+) -> tuple[int, int]:
+    """Return selected range width and count without materializing windows."""
+    lo, hi = max(ascending), min(descending)
+    explicit = execution.window_width if isinstance(execution, RangeKeysetExecution) else execution.range_window_width
+    width = range_window_width(
+        completion=completion, page_cap=page_cap, span=max(0, hi - lo - 1),
+        density_numerator=len(ascending) + len(descending),
+        density_denominator=max(1, max(ascending) - min(ascending) + 1
+                                + max(descending) - min(descending) + 1), explicit=explicit)
+    span = max(0, hi - lo - 1)
+    return width, ceil_div(span, width - 1) if span else 0
 
 
 def _geometry(inputs: SelectorInputs) -> tuple[int, int, int, int, int]:
@@ -91,9 +113,10 @@ def estimates(
     """Compute every frozen candidate formula from integer observations."""
     span, numerator, denominator, interior_rows, all_rows = _geometry(inputs)
     cap, capacity = inputs.effective_page_cap, inputs.batch_capacity
+    admitted_head_rows = inputs.boundary.tail_rows if inputs.descending else inputs.boundary.head_rows
     sequential = CostEstimate(
         KeysetExecutionKind.SEQUENTIAL,
-        max(1, ceil_div(max(0, all_rows - inputs.boundary.head_rows), cap)) + finish_requests,
+        max(1, ceil_div(max(0, all_rows - admitted_head_rows), cap)) + finish_requests,
         True,
         None,
         None,
@@ -152,4 +175,4 @@ def estimates(
     return sequential, range_estimate, partition, (span, numerator, denominator, interior_rows, all_rows)
 
 
-__all__ = ["BoundaryFacts", "CostEstimate", "SelectorInputs", "ceil_div", "estimates"]
+__all__ = ["BoundaryFacts", "CostEstimate", "SelectorInputs", "ceil_div", "estimates", "selected_range_geometry"]

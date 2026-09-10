@@ -57,6 +57,8 @@ def test_keyset_execution_json_is_closed_and_routes_all_fast_modes() -> None:
         parse_keyset_execution({"kind": "range", "window_width": 1})
     with pytest.raises(CliUsageError):
         parse_keyset_execution({"kind": "auto", "unknown": 1})
+    with pytest.raises(CliUsageError, match="must be a string"):
+        parse_keyset_execution({"kind": []})  # type: ignore[dict-item]
 
 
 @dataclass

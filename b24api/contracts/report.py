@@ -233,6 +233,7 @@ class KeysetExecutionReport:
             self.range_window_count,
             self.target_lanes,
             self.actual_lanes,
+            self.total_hint_observed,
         )
         if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in integers):
             raise ValueError("keyset report counters must be non-negative integers")

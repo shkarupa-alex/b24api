@@ -5,11 +5,56 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from b24api.errors import PaginationError
+from b24api.traversal.keyset_fast_plan import LaneState, LaneStatus, LazyRangePlan
+from b24api.traversal.page_validation import LaneReceipt
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from b24api.contracts.json import JsonValue
     from b24api.contracts.request import IdentitySpec
-    from b24api.traversal.page_validation import LaneReceipt
+
+
+def drain_complete_lanes(  # noqa: PLR0913
+    lane_index: int,
+    lanes: list[LaneState],
+    rows_by_lane: dict[int, list[JsonValue]],
+    identities_by_lane: dict[int, list[int]],
+    commands_by_lane: dict[int, list[tuple[str, int]]],
+    admit: Callable[[LaneReceipt], None],
+    trace_admit: Callable[[str, int], None],
+    lazy_range: LazyRangePlan | None,
+) -> int:
+    """Drain only complete frontier lanes and advance lazy range geometry."""
+    while lane_index < len(lanes):
+        lane = lanes[lane_index]
+        if lane.status is LaneStatus.OPEN:
+            return lane_index
+        identities, rows, commands = (
+            identities_by_lane[lane.spec.ordinal], rows_by_lane[lane.spec.ordinal],
+            commands_by_lane[lane.spec.ordinal],
+        )
+        if rows or commands:
+            admit(LaneReceipt(
+                lane_ordinal=lane.spec.ordinal, command_id=f"body-admit-{lane.spec.ordinal}",
+                rows=tuple(rows), identities=tuple(identities), page_full=False,
+                last_identity=identities[-1] if identities else None, witness=lane.witness, warnings=(),
+            ))
+            anchor = lane.spec.retained_upper_anchor if lane.status is LaneStatus.CLOSED else None
+            for index, (command_id, count) in enumerate(commands):
+                trace_admit(command_id, count + int(anchor is not None and index == len(commands) - 1))
+            rows.clear()
+            identities.clear()
+            commands.clear()
+        lane_index += 1
+        if lazy_range is not None:
+            rows_by_lane.pop(lane.spec.ordinal, None)
+            identities_by_lane.pop(lane.spec.ordinal, None)
+            commands_by_lane.pop(lane.spec.ordinal, None)
+            lanes.clear()
+            lane_index = 0
+            lazy_range.append_next(lanes, rows_by_lane, identities_by_lane, commands_by_lane)
+    return lane_index
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,4 +152,4 @@ class OrderedAdmissionState:
         self._last = None
 
 
-__all__ = ["AdmissionCommit", "FastCounters", "OrderedAdmissionState"]
+__all__ = ["AdmissionCommit", "FastCounters", "OrderedAdmissionState", "drain_complete_lanes"]

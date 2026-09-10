@@ -39,6 +39,8 @@ def build_scheduler_report(scheduler: KeysetFastScheduler) -> KeysetExecutionRep
             KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS
             if scheduler._selected in {KeysetExecutionKind.RANGE, KeysetExecutionKind.PARTITIONED}
             else KeysetAssuranceSource.ORDERED_PREFIX_ONLY
+            if scheduler._selected is not KeysetExecutionKind.UNSELECTED
+            else KeysetAssuranceSource.UNVERIFIED
         ),
         planning_requests=scheduler._planning_physical_requests,
         boundary_requests=scheduler._planning_requests[KeysetPhase.BOUNDARY],
@@ -67,8 +69,10 @@ def build_scheduler_report(scheduler: KeysetFastScheduler) -> KeysetExecutionRep
         range_window_count=scheduler._window_count,
         target_lanes=scheduler._target_lanes,
         actual_lanes=(
-            len(scheduler._lanes)
-            if scheduler._selected in {KeysetExecutionKind.RANGE, KeysetExecutionKind.PARTITIONED}
+            scheduler._window_count
+            if scheduler._selected is KeysetExecutionKind.RANGE
+            else len(scheduler._lanes)
+            if scheduler._selected is KeysetExecutionKind.PARTITIONED
             else None
         ),
         continuation_count=scheduler._continuations,

@@ -224,6 +224,8 @@ def parse_keyset_execution(payload: Mapping[str, JsonValue] | None) -> KeysetExe
     if not isinstance(payload, dict):
         raise CliUsageError("execution must be an object")
     kind = payload.get("kind", "sequential")
+    if not isinstance(kind, str):
+        raise CliUsageError("execution.kind must be a string")
     if kind not in {"sequential", "range", "partitioned", "auto"}:
         raise CliUsageError("execution.kind is invalid")
     common = {"kind", "page_completion", "batch_size", "endpoint_page_cap"}
@@ -233,7 +235,7 @@ def parse_keyset_execution(payload: Mapping[str, JsonValue] | None) -> KeysetExe
         "partitioned": common | {"target_lanes"},
         "auto": common | {"target_lanes", "range_window_width", "max_range_waves", "total_hint"},
     }
-    _closed(payload, allowed[cast("str", kind)], label="execution")
+    _closed(payload, allowed[kind], label="execution")
     if kind == "sequential":
         return SequentialKeysetExecution()
     try:

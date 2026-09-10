@@ -11,7 +11,14 @@ from b24api.contracts.keyset_execution import (
     PartitionedKeysetExecution,
     RangeKeysetExecution,
 )
-from b24api.contracts.policy import ConfirmationPolicy, IdentityCoercion, SnapshotRequirement
+from b24api.contracts.policy import (
+    ConfirmationPolicy,
+    IdentityCoercion,
+    IdentityRequirement,
+    OrderSemantics,
+    SnapshotRequirement,
+    TotalSemantics,
+)
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.identity import _child_path, _request_with_controls
@@ -83,7 +90,7 @@ def _effective_cap(
     return effective
 
 
-def validate_fast_keyset(  # noqa: C901, PLR0913
+def validate_fast_keyset(  # noqa: C901, PLR0912, PLR0913
     executor: Executor,
     request: Request,
     *,
@@ -105,6 +112,14 @@ def validate_fast_keyset(  # noqa: C901, PLR0913
         raise CapabilityError("fast keyset traversal cannot prove the requested snapshot assurance")
     if consistency.confirmation_policy not in {ConfirmationPolicy.NONE, ConfirmationPolicy.EMPTY_AFTER_BOUNDARY}:
         raise CapabilityError("fast keyset traversal cannot supply the requested confirmation policy")
+    if consistency.total_semantics is not TotalSemantics.IGNORE:
+        raise CapabilityError("fast keyset traversal cannot supply policy-level total semantics")
+    if consistency.identity_requirement is IdentityRequirement.COMPOSITE:
+        raise CapabilityError("fast keyset traversal requires a scalar identity contract")
+    requested_order = consistency.order_semantics
+    actual_order = OrderSemantics.ASCENDING if keyset.direction == "ascending" else OrderSemantics.DESCENDING
+    if requested_order not in {OrderSemantics.UNORDERED, actual_order}:
+        raise CapabilityError("fast keyset traversal cannot supply the requested order semantics")
     _reject_owned_controls(request, identity, keyset)
     effective_cap = _effective_cap(execution, keyset, page_size)
     retained_anchors = execution.target_lanes if isinstance(execution, PartitionedKeysetExecution) else 0

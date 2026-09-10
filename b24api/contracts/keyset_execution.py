@@ -32,6 +32,7 @@ class KeysetExecutionKind(StrEnum):
     PARTITIONED = "partitioned"
     AUTO = "auto"
     BOUNDARY_ONLY = "boundary_only"
+    UNSELECTED = "unselected"
 
 
 class KeysetSelectionReason(StrEnum):
@@ -49,6 +50,7 @@ class KeysetSelectionReason(StrEnum):
     POST_PROBE_RANGE_PREFERRED = "post_probe_range_preferred"
     POST_PROBE_GAIN_LOST = "post_probe_gain_lost"
     DEGENERATE_SINGLE_LANE = "degenerate_single_lane"
+    PLANNING_INCOMPLETE = "planning_incomplete"
 
 
 class KeysetAssuranceSource(StrEnum):
@@ -56,6 +58,7 @@ class KeysetAssuranceSource(StrEnum):
 
     ORDERED_PREFIX_ONLY = "ordered_prefix_only"
     CANARY_VERIFIED_BOUNDS = "canary_verified_bounds"
+    UNVERIFIED = "unverified"
 
 
 class KeysetPhase(StrEnum):

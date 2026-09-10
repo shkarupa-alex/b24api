@@ -188,8 +188,11 @@ def test_analyzer_rejects_overlong_sandwich_and_any_run_resource_leak() -> None:
 
     result = analyze_artifact(artifact)
 
-    assert result["groups"][0]["exclusions"] == 1
-    assert {failure["check"] for failure in result["correctness_failures"]} == {"resources"}
+    assert result["groups"][0]["exclusions"] == 0
+    assert {failure["check"] for failure in result["correctness_failures"]} == {
+        "contemporaneous",
+        "resources",
+    }
 
 
 def test_material_range_requires_a_scoped_passing_range_group() -> None:
