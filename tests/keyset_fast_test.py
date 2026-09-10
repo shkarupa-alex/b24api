@@ -584,6 +584,7 @@ async def test_boundary_direction_contradiction_fails_before_emission() -> None:
     assert stream.report is not None
     assert stream.report.emitted == 0
     assert stream.report.state is TerminalState.INCOMPLETE
+    assert stream._source._scheduler._boundary_totals == {}
 
 
 @pytest.mark.asyncio

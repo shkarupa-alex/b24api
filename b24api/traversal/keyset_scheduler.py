@@ -83,11 +83,10 @@ class KeysetFastScheduler:
         self.violations: list[Violation] = []
         self.batch_requests, self.batch_commands = 0, 0
         self._planning_requests = Counter[KeysetPhase]()
-        self._planning_physical_requests = 0
+        self._planning_physical_requests = self._continuations = 0
+        self._boundary_totals: dict[str, int | None] = {}
         self._closures = Counter[ClosureWitness]()
-        self._continuations = 0
-        self._observation_ordinal = 0
-        self._command_ordinal = 0
+        self._observation_ordinal = self._command_ordinal = 0
         self._planned, self._closed, self._terminal = False, False, False
         self._plan_outcome: PlanOutcome | None = None
         self._preselection: Preselection | None = None
@@ -687,6 +686,7 @@ class KeysetFastScheduler:
         self._anchor_commands.clear()
         self._planning_bounds.clear()
         self._planning_descending.clear()
+        self._boundary_totals.clear()
         self._plan_outcome = None
         self.admission.assert_clean()
         self.admission.close()
