@@ -111,6 +111,7 @@ class BatchExecutor:
         *,
         context: ExecutionContext,
         halt: bool,
+        advisory_totals: bool = False,
     ) -> tuple[BatchOutcome, ...]:
         rejected: dict[int, BatchOutcome] = {}
         eligible = commands
@@ -121,14 +122,26 @@ class BatchExecutor:
         request = _batch_request(eligible, halt=halt)
         try:
             response = await self.executor.execute(request, context=context, work_class=WorkClass.BATCH)
-            envelope = _decode_batch_envelope(response.result)
+            envelope = _decode_batch_envelope(
+                response.result,
+                expected_keys=frozenset(command.stable_key for command in eligible),
+            )
         except asyncio.CancelledError:
             raise
         except B24ApiError as error:
             failures = tuple(_shared_failure(command, error) for command in eligible)
             return _merge_outcomes(commands, failures, rejected)
 
-        outcomes = tuple(self._decode_command(command, envelope, response, context=context) for command in eligible)
+        outcomes = tuple(
+            self._decode_command(
+                command,
+                envelope,
+                response,
+                context=context,
+                advisory_totals=advisory_totals,
+            )
+            for command in eligible
+        )
         return _merge_outcomes(commands, outcomes, rejected)
 
     def _decode_command(
@@ -138,6 +151,7 @@ class BatchExecutor:
         response: Response,
         *,
         context: ExecutionContext,
+        advisory_totals: bool = False,
     ) -> BatchOutcome:
         evidence = BatchCommandEvidence(command.index, command.stable_key)
         if command.stable_key in envelope.errors:
@@ -163,7 +177,12 @@ class BatchExecutor:
         try:
             command_response = Response(
                 envelope.results[command.stable_key],
-                total=_optional_batch_integer(envelope.totals, command.stable_key, field="total"),
+                total=_optional_batch_integer(
+                    envelope.totals,
+                    command.stable_key,
+                    field="total",
+                    malformed_as_none=advisory_totals,
+                ),
                 next=_optional_batch_integer(envelope.continuations, command.stable_key, field="next"),
                 evidence=response.evidence,
             )
@@ -207,6 +226,7 @@ class BatchExecutor:
         requests: tuple[Request, ...],
         *,
         context: ExecutionContext,
+        advisory_totals: bool = False,
     ) -> tuple[BatchOutcome, ...]:
         """Execute one scheduler-owned chunk with total per-command correlation."""
         if not requests or len(requests) > self.portal_command_cap:
@@ -224,6 +244,7 @@ class BatchExecutor:
             commands,
             context=context,
             halt=False,
+            advisory_totals=advisory_totals,
         )
 
     def _command_error(
@@ -280,7 +301,7 @@ def _build_query(parameters: Mapping[str | int, object], path: str = "%s") -> st
     return encode_php_query(parameters, path)
 
 
-def _decode_batch_envelope(raw: JsonValue) -> _BatchEnvelope:
+def _decode_batch_envelope(raw: JsonValue, *, expected_keys: frozenset[str]) -> _BatchEnvelope:
     if not isinstance(raw, dict):
         raise ProtocolError("Batch result envelope must be an object", origin=ErrorOrigin.PROTOCOL)
     if "result_error" not in raw:
@@ -289,6 +310,15 @@ def _decode_batch_envelope(raw: JsonValue) -> _BatchEnvelope:
     errors = _decode_php_map(raw["result_error"], field="result_error")
     totals = _decode_optional_php_map(raw, field="result_total")
     continuations = _decode_optional_php_map(raw, field="result_next")
+    result_keys = frozenset(results)
+    error_keys = frozenset(errors)
+    if result_keys & error_keys or not (result_keys | error_keys).issubset(expected_keys):
+        raise ProtocolError(
+            "Batch result correlation keys are duplicated or unknown",
+            origin=ErrorOrigin.PROTOCOL,
+        )
+    if not frozenset(totals).issubset(expected_keys) or not frozenset(continuations).issubset(expected_keys):
+        raise ProtocolError("Batch metadata contains an unknown correlation key", origin=ErrorOrigin.PROTOCOL)
     return _BatchEnvelope(
         results=results,
         errors=errors,
@@ -303,12 +333,24 @@ def _decode_optional_php_map(raw: dict[str, JsonValue], *, field: str) -> dict[s
     return _decode_php_map(raw[field], field=field)
 
 
-def _optional_batch_integer(values: Mapping[str, object], key: str, *, field: str) -> int | None:
+def _optional_batch_integer(
+    values: Mapping[str, object],
+    key: str,
+    *,
+    field: str,
+    malformed_as_none: bool = False,
+) -> int | None:
     if key not in values:
         return None
     value = values[key]
     if not isinstance(value, int) or isinstance(value, bool):
+        if malformed_as_none:
+            return None
         raise TypeError(f"batch {field} must be an integer")
+    if field == "total" and value < 0:
+        if malformed_as_none or value == -1:
+            return None
+        raise ValueError("batch total must be -1 or non-negative")
     if field == "next" and value == -1:
         return None
     return value

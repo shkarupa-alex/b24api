@@ -27,6 +27,7 @@ from b24api import (
     ResultSelector,
     StableIntegerKeysetContract,
     TerminalState,
+    TotalHintMode,
 )
 from b24api.errors import CapabilityError, IncompleteTraversalError
 from b24api.execution import Executor, WireResponse
@@ -64,10 +65,12 @@ class KeysetTransport:
         *,
         ignore_direction: bool = False,
         ignore_bounds: bool = False,
+        boundary_total: object | None = None,
     ) -> None:
         self.identities = identities
         self.ignore_direction = ignore_direction
         self.ignore_bounds = ignore_bounds
+        self.boundary_total = boundary_total
         self.requests: list[Request] = []
 
     def _rows(self, parameters: dict[str, JsonValue]) -> list[dict[str, int]]:
@@ -92,7 +95,15 @@ class KeysetTransport:
             results = {
                 key: self._rows(_decode_command(value)) for key, value in commands.items() if isinstance(value, str)
             }
-            payload = {"result": {"result": results, "result_error": []}}
+            envelope: dict[str, JsonValue] = {"result": results, "result_error": []}
+            if self.boundary_total is not None:
+                envelope["result_total"] = {
+                    key: self.boundary_total  # type: ignore[dict-item]
+                    for key, value in commands.items()
+                    if isinstance(value, str)
+                    and not any(bound in _decode_command(value).get("filter", {}) for bound in (">ID", "<ID"))
+                }
+            payload = {"result": envelope}
         else:
             payload = {"result": self._rows(request.copy_parameters())}
         return WireResponse(
@@ -391,3 +402,57 @@ async def test_fast_context_enter_is_io_free_and_request_is_immutable() -> None:
     async with stream:
         assert transport.requests == []
     assert request.copy_parameters() == {"filter": {"STATUS": "open"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("operation", "expected"), [("first", 1), ("collect", 3)])
+async def test_fast_bounded_consumption_freezes_an_early_close_report(operation: str, expected: int) -> None:
+    stream = _stream(
+        KeysetTransport(tuple(range(1, 80))),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    partial = await stream.first() if operation == "first" else await stream.collect(limit=expected)
+
+    assert len(partial.value) == expected
+    assert partial.report.state is TerminalState.EARLY_CLOSED
+    assert partial.report.emitted == expected
+    assert partial.report.unique_rows == expected
+    assert partial.report.buffered_rows_high_water <= ExecutionPolicy().max_buffered_rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_total", [-1, True, "79", 79.5])
+async def test_advisory_boundary_total_is_ignored_when_not_a_non_negative_integer(malformed_total: object) -> None:
+    stream = _stream(
+        KeysetTransport(tuple(range(1, 80)), boundary_total=malformed_total),
+        AutoKeysetExecution(
+            StableIntegerKeysetContract(),
+            total_hint=TotalHintMode.REQUEST_ADVISORY,
+        ),
+    )
+
+    assert [row["id"] async for row in stream] == list(range(1, 80))
+    assert stream.report is not None
+    assert stream.report.keyset_execution is not None
+    assert stream.report.keyset_execution.total_hint_observed is None
+    assert stream.report.keyset_execution.total_hint_plausible is False
+
+
+@pytest.mark.asyncio
+async def test_partition_body_wave_accounts_for_pinned_tail_and_anchors() -> None:
+    page_size = 50
+    identities = tuple(range(1, 5_001))
+    transport = KeysetTransport(identities)
+    stream = _client(transport).iter_list_keyset(
+        Request("item.list"),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=page_size,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        execution=PartitionedKeysetExecution(StableIntegerKeysetContract(), target_lanes=50),
+    )
+
+    assert [row["id"] async for row in stream] == list(identities)
+    assert stream.report is not None
+    assert stream.report.buffered_rows_high_water <= ExecutionPolicy().max_buffered_rows

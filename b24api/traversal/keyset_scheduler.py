@@ -1,7 +1,5 @@
 """One ordered scheduler for range, occupied-anchor, and automatic keysets."""
-
-# ruff: noqa: D101, D102, D107, FBT003, PLC0415, PLR0915, TRY301
-
+# ruff: noqa: D101, D102, D107, FBT003, PLC0415, PLR0915, SLF001, TRY301
 from __future__ import annotations
 from collections import Counter, deque
 from dataclasses import dataclass, replace
@@ -28,6 +26,7 @@ from b24api.contracts.report import (
     Violation,
 )
 from b24api.errors import PaginationError
+from b24api.traversal import keyset_scheduler_support as _support
 from b24api.traversal.keyset_auto import (
     AnchorFacts,
     BoundaryFacts,
@@ -47,11 +46,11 @@ from b24api.traversal.keyset_fast_plan import (
     LaneSpec,
     LaneState,
     LaneStatus,
+    fit_wave,
     plan_lanes_from_anchors,
     plan_windows,
 )
 from b24api.traversal.keyset_range import range_window_width
-from b24api.traversal.keyset_scheduler_support import KeysetSchedulerSupport
 from b24api.traversal.ordered_admission import FastCounters, OrderedAdmissionState
 from b24api.traversal.page_validation import (
     LaneCommandPlan,
@@ -65,12 +64,10 @@ if TYPE_CHECKING:
     from b24api.batch.engine import BatchExecutor
     from b24api.contracts.json import JsonValue
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
-    from b24api.contracts.response import ResultCollectionShape
+    from b24api.contracts.response import Response, ResultCollectionShape
     from b24api.contracts.traversal import KeysetSpec
     from b24api.execution import ExecutionContext, Executor
     from b24api.traversal.keyset_fast_stream import FastTraceRecorder
-
-
 @dataclass(frozen=True, slots=True)
 class PlanOutcome:
     plan: FastKeysetPlan
@@ -78,7 +75,7 @@ class PlanOutcome:
     final: FinalSelection | None
 
 
-class KeysetFastScheduler(KeysetSchedulerSupport):
+class KeysetFastScheduler:
     """Own fast planning, wave transactions, ordered admission, and finish."""
 
     def __init__(  # noqa: PLR0913
@@ -149,6 +146,8 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         self._anchor_rows: dict[int, JsonValue] = {}
         self._anchor_commands: dict[int, str] = {}
         self._anchor_count = 0
+        self._anchor_probe_commands = 0
+        self._empty_anchor_probes = 0
         self._target_lanes: int | None = None
         self._window_width: int | None = None
         self._window_count: int | None = None
@@ -165,26 +164,22 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         self._interior_estimate: int | None = None
         self._total_estimate: int | None = None
         self._selected_estimate: int | None = None
-
+        self._frozen_report: KeysetExecutionReport | None = None
+        self._planning_bounds: dict[str, LaneBounds] = {}
+        self._planning_descending: dict[str, bool] = {}
+        self._last_wave_responses: dict[str, Response] = {}
     @property
     def counters(self) -> FastCounters:
-        """Return current row counters."""
         return self.admission.snapshot_counters()
-
     @property
     def terminal(self) -> bool:
-        """Whether traversal exhaustion was confirmed."""
         return self._terminal
-
     def mark_emitted(self, count: int) -> None:
-        """Record public delivery while scheduler retains offered-row accounting."""
         self.admission.mark_emitted(count)
-
     def _next_command_id(self, phase: KeysetPhase) -> str:
         value = f"{phase.value}-{self._command_ordinal}"
         self._command_ordinal += 1
         return value
-
     async def _adjust_buffer(self, delta: int) -> None:
         if not delta:
             return
@@ -218,20 +213,19 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         return self._contract.page_completion
 
     async def plan_barrier(self) -> PlanOutcome:  # noqa: C901, PLR0912
-        """Cross boundary, optional canary/anchor, and final-selection barriers."""
         if self._planned:
             if self._plan_outcome is None:
                 raise RuntimeError("planned scheduler has no outcome")
             return self._plan_outcome
-        self._planning_bounds: dict[str, LaneBounds] = {}
-        self._planning_descending: dict[str, bool] = {}
+        self._planning_bounds.clear()
+        self._planning_descending.clear()
         advisory = (
             isinstance(self.execution, AutoKeysetExecution)
             and self.execution.total_hint is TotalHintMode.REQUEST_ADVISORY
         )
         boundary_plans = []
         for ordinal, direction in enumerate(("ASC", "DESC")):
-            request = self._controls(
+            request = _support._controls(self,
                 direction=direction,
                 limit=self.effective_page_cap,
                 advisory_start=advisory,
@@ -253,7 +247,7 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
                 deque(),
             )
             boundary_plans.append(self._lane_plan(lane, phase=KeysetPhase.BOUNDARY, request=request))
-        asc, desc = await self._wave(tuple(boundary_plans))
+        asc, desc = await _support._wave(self, tuple(boundary_plans))
         contradiction = validate_boundary_direction(ascending=asc, descending=desc)
         if contradiction is not None:
             self.violations.append(contradiction.violation)
@@ -263,12 +257,11 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         head, tail = (asc, desc) if self.keyset.direction == "ascending" else (desc, asc)
         self._head, self._tail = head, tail
         self._head_rows, self._tail_rows = len(head.rows), len(tail.rows)
-        all_boundary = (*asc.identities, *desc.identities)
         maximum_hint = len(asc.rows) + len(desc.rows)
         if asc.identities and desc.identities:
             maximum_hint += max(0, min(desc.identities) - max(asc.identities) - 1)
-        asc_response = self._response_for(boundary_plans[0], asc)
-        desc_response = self._response_for(boundary_plans[1], desc)
+        asc_response = _support._response_for(self, boundary_plans[0], asc)
+        desc_response = _support._response_for(self, boundary_plans[1], desc)
         self._total_hint = normalize_total_hint(
             requested=advisory,
             head=asc_response.total if asc_response is not None else None,
@@ -327,10 +320,10 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
             elif self._preselection.plan is Preselected.SEQUENTIAL:
                 selected = KeysetExecutionKind.SEQUENTIAL
             elif self._preselection.plan is Preselected.RANGE:
-                await self._canaries(asc, desc)
+                await _support._canaries(self, asc, desc)
                 selected = KeysetExecutionKind.RANGE
             else:
-                anchors = await self._partition_planning(asc, desc, self.execution.target_lanes)
+                anchors = await _support._partition_planning(self, asc, desc, self.execution.target_lanes)
                 self._final = finalize(
                     inputs,
                     self._preselection,
@@ -347,24 +340,29 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
                 if selected is KeysetExecutionKind.SEQUENTIAL
                 else self._preselection.range_estimate.requests
                 if self._preselection.range_estimate is not None and selected is KeysetExecutionKind.RANGE
-                else 0
+                else 1 + int(bool(asc.rows))
             )
             self._target_lanes = self.execution.target_lanes
         elif not asc.rows or overlap or adjacent:
             selected = KeysetExecutionKind.BOUNDARY_ONLY
+            self._reason = (
+                KeysetSelectionReason.EXPLICIT_PARTITIONED
+                if isinstance(self.execution, PartitionedKeysetExecution)
+                else KeysetSelectionReason.EXPLICIT_RANGE
+            )
         else:
             if self._completion is KeysetPageCompletion.SHORT_PAGE_EXHAUSTS and (
                 len(asc.rows) != self.effective_page_cap or len(desc.rows) != self.effective_page_cap
             ):
                 raise PaginationError("boundary pages did not establish page-cap agreement")
             if isinstance(self.execution, RangeKeysetExecution):
-                await self._canaries(asc, desc)
+                await _support._canaries(self, asc, desc)
                 selected = KeysetExecutionKind.RANGE
                 self._reason = KeysetSelectionReason.EXPLICIT_RANGE
             elif isinstance(self.execution, PartitionedKeysetExecution):
                 selected = KeysetExecutionKind.PARTITIONED
                 self._reason = KeysetSelectionReason.EXPLICIT_PARTITIONED
-                await self._partition_planning(asc, desc, self.execution.target_lanes)
+                await _support._partition_planning(self, asc, desc, self.execution.target_lanes)
                 self._target_lanes = self.execution.target_lanes
             else:
                 raise TypeError("unknown fast keyset execution")
@@ -384,7 +382,6 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         )
         self._plan_outcome = PlanOutcome(plan, self._preselection, self._final)
         self._planned = True
-        del all_boundary
         return self._plan_outcome
 
     async def _configure_selected(self, asc: LaneReceipt, desc: LaneReceipt) -> None:
@@ -393,8 +390,7 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         self._head_admitted = bool(head.rows)
         if self._selected is KeysetExecutionKind.SEQUENTIAL:
             discarded = len(desc.rows) if head is asc else len(asc.rows)
-            self.admission.record_raw(0, discarded=True)
-            self.admission._counters.probe_rows_discarded += discarded  # noqa: SLF001 - scheduler is counter owner
+            self.admission._counters.probe_rows_discarded += discarded
             await self._adjust_buffer(-discarded)
             self._finish_cursor = head.identities[-1] if head.identities else None
             self._finishing = bool(head.rows)
@@ -472,17 +468,10 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
 
     def _admit_tail(self, tail: LaneReceipt) -> None:
         rows_ids = list(zip(tail.rows, tail.identities, strict=True))
-        if self.keyset.direction == "ascending":
-            rows_ids.reverse()
-        else:
-            rows_ids.reverse()
-        seen = self.admission.seen_identities
-        filtered = [(row, identity) for row, identity in rows_ids if identity not in seen]
+        rows_ids.reverse()
+        filtered = [(row, identity) for row, identity in rows_ids if not self.admission.has_seen(identity)]
         overlap = len(rows_ids) - len(filtered)
         self.admission.record_boundary_overlap(overlap)
-        if overlap:
-            # The duplicate tail rows remain pinned only until normalization.
-            pass
         normalized = replace(
             tail,
             rows=tuple(row for row, _ in filtered),
@@ -492,7 +481,6 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         self._admit_receipt(normalized)
 
     async def next_rows(self) -> tuple[JsonValue, ...]:
-        """Return the next ordered admitted chunk, or empty on confirmed exhaustion."""
         if self._closed or self._terminal:
             return ()
         if self._offered_rows:
@@ -523,27 +511,36 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         self._offered_rows = len(rows)
         return rows
 
-    async def _body_wave(self) -> None:
+    async def _body_wave(self) -> None:  # noqa: C901
         open_lanes = [lane for lane in self._lanes[self._lane_index :] if lane.status is LaneStatus.OPEN]
         if not open_lanes:
-            self._drain_closed_lanes()
+            _support._drain_closed_lanes(self)
             return
-        plans = []
-        for lane in open_lanes[: max(1, self.batch_capacity)]:
+        candidates = []
+        for lane in open_lanes[: self.batch_capacity]:
             lower = lane.spec.bounds.lower_exclusive
             upper = lane.spec.bounds.upper_exclusive
             if lane.spec.descending:
                 upper = lane.cursor
             else:
                 lower = lane.cursor
-            request = self._controls(
+            request = _support._controls(self,
                 direction="DESC" if lane.spec.descending else "ASC",
                 lower=lower,
                 upper=upper,
                 limit=self.effective_page_cap,
             )
-            plans.append(self._lane_plan(lane, phase=KeysetPhase.BODY, request=request))
-        receipts = await self._wave(tuple(plans))
+            candidates.append(self._lane_plan(lane, phase=KeysetPhase.BODY, request=request))
+        plan_candidates = tuple(candidates)
+        plans = fit_wave(
+            plan_candidates,
+            reserves=tuple(plan.reserved_rows for plan in plan_candidates),
+            commands=self.batch_capacity,
+            rows=self.context.policy.max_buffered_rows - self._buffer_balance,
+        )
+        if not plans:
+            raise RuntimeError("fast keyset body wave has no available row capacity")
+        receipts = await _support._wave(self, plans)
         retained = sum(len(receipt.rows) for receipt in receipts)
         await self._adjust_buffer(retained)
         self.admission.record_raw(retained)
@@ -564,7 +561,6 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
                 continue
             lane.status = LaneStatus.CLOSED
             lane.witness = witness
-            self._closures[witness] += 1
             anchor = lane.spec.retained_upper_anchor
             if anchor is not None:
                 row = self._anchor_rows.get(anchor)
@@ -574,7 +570,9 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
                 self._lane_identities[lane.spec.ordinal].append(anchor)
                 lane.witness = ClosureWitness.ANCHOR_FENCE
                 self._closures[ClosureWitness.ANCHOR_FENCE] += 1
-        self._drain_closed_lanes()
+            else:
+                self._closures[witness] += 1
+        _support._drain_closed_lanes(self)
 
     def _descending_witness(self, lane: LaneState, receipt: LaneReceipt) -> ClosureWitness | None:
         if not receipt.identities:
@@ -582,6 +580,12 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         lower = lane.spec.bounds.lower_exclusive
         if lower is not None and receipt.identities[-1] == lower + 1:
             return ClosureWitness.TOP
+        if (
+            lower is not None
+            and lane.cursor is not None
+            and receipt.identities == tuple(range(lane.cursor - 1, lower, -1))
+        ):
+            return ClosureWitness.LATTICE_FULL
         if (
             self._completion is KeysetPageCompletion.SHORT_PAGE_EXHAUSTS
             and len(receipt.identities) < self.effective_page_cap
@@ -594,7 +598,7 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
             self._terminal = True
             return
         direction = "ASC" if self.keyset.direction == "ascending" else "DESC"
-        request = self._controls(
+        request = _support._controls(self,
             direction=direction,
             lower=self._finish_cursor if direction == "ASC" else None,
             upper=self._finish_cursor if direction == "DESC" else None,
@@ -631,7 +635,7 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
             )
             if isinstance(receipt, ReceiptRejection):
                 self.violations.append(receipt.violation)
-                self._record(
+                _support._record(self,
                     plan,
                     index=None,
                     selected=0,
@@ -644,7 +648,7 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
                 raise PaginationError(receipt.detail)
             await self._adjust_buffer(-self.effective_page_cap + len(receipt.rows))
             self.admission.record_raw(len(receipt.rows))
-            self._record(
+            _support._record(self,
                 plan,
                 index=None,
                 selected=len(receipt.rows),
@@ -670,20 +674,26 @@ class KeysetFastScheduler(KeysetSchedulerSupport):
         if self._closed:
             return
         self._closed = True
+        self._frozen_report = self.report_fragment()
         if self._buffer_balance:
             await self._adjust_buffer(-self._buffer_balance)
         if self._buffer_balance != 0:
             raise RuntimeError("fast scheduler buffer balance survived cleanup")
-        self._pending.clear()
-        self._lane_rows.clear()
-        self._lane_identities.clear()
-        self._lane_commands.clear()
+        for retained in (self._pending, self._lane_rows, self._lane_identities, self._lane_commands, self._lanes):
+            retained.clear()
+        self._head = self._tail = None
+        self._anchor_rows.clear()
+        self._anchor_commands.clear()
+        self._last_wave_responses = {}
+        self._planning_bounds.clear()
+        self._planning_descending.clear()
         self.admission.assert_clean()
+        self.admission.close()
 
     def report_fragment(self) -> KeysetExecutionReport:
-        """Build immutable aggregate execution evidence."""
+        if self._frozen_report is not None:
+            return self._frozen_report
         from b24api.traversal.keyset_reporting import build_scheduler_report
-
         return build_scheduler_report(self)
 
 

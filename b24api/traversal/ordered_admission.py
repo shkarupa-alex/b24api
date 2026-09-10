@@ -1,8 +1,6 @@
 """Atomic global ordering, duplicate, and counter ownership for fast keysets."""
 
 from __future__ import annotations
-import hashlib
-import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -43,8 +41,6 @@ class OrderedAdmissionState:
         self.direction = direction
         self.identity = identity
         self._last: int | None = None
-        self._identities: set[int] = set()
-        self._fingerprints: set[str] = set()
         self._counters = FastCounters()
 
     @property
@@ -52,15 +48,16 @@ class OrderedAdmissionState:
         """Return the last globally admitted identity."""
         return self._last
 
-    @property
-    def seen_identities(self) -> frozenset[int]:
-        """Return an immutable identity snapshot for boundary normalization."""
-        return frozenset(self._identities)
+    def has_seen(self, identity: int) -> bool:
+        """Return whether monotonic admission has already crossed an identity."""
+        if self._last is None:
+            return False
+        return identity <= self._last if self.direction == "asc" else identity >= self._last
 
     def validate_and_commit(self, receipt: LaneReceipt) -> AdmissionCommit:
         """Atomically validate and commit an entire ordered receipt."""
         identities = receipt.identities
-        if len(set(identities)) != len(identities) or any(value in self._identities for value in identities):
+        if len(set(identities)) != len(identities):
             raise PaginationError("fast keyset traversal observed a duplicate identity")
         last = self._last
         for value in identities:
@@ -69,19 +66,8 @@ class OrderedAdmissionState:
             if last is not None and self.direction == "desc" and value >= last:
                 raise PaginationError("descending fast keyset global order did not advance")
             last = value
-        fingerprints = tuple(
-            hashlib.sha256(
-                json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(),
-            ).hexdigest()
-            for row in receipt.rows
-        )
-        if any(value in self._fingerprints for value in fingerprints):
-            raise PaginationError("fast keyset traversal repeated an admitted row fingerprint")
         self._last = last
-        self._identities.update(identities)
-        self._fingerprints.update(fingerprints)
         self._counters.admitted_rows += len(receipt.rows)
-        self._counters.unique_rows += len(receipt.rows)
         return AdmissionCommit(receipt.rows, identities, len(receipt.rows))
 
     def record_raw(self, count: int, *, discarded: bool = False) -> None:
@@ -105,6 +91,7 @@ class OrderedAdmissionState:
         if count < 0:
             raise ValueError("emitted count cannot be negative")
         self._counters.emitted_rows += count
+        self._counters.unique_rows += count
 
     def snapshot_counters(self) -> FastCounters:
         """Return a detached mutable-counter snapshot."""
@@ -114,6 +101,10 @@ class OrderedAdmissionState:
         """Validate counter relationships at terminal cleanup."""
         if self._counters.emitted_rows > self._counters.admitted_rows:
             raise RuntimeError("fast keyset emitted rows exceed admitted rows")
+
+    def close(self) -> None:
+        """Release identity state after terminal evidence has been frozen."""
+        self._last = None
 
 
 __all__ = ["AdmissionCommit", "FastCounters", "OrderedAdmissionState"]

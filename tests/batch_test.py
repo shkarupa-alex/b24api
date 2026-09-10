@@ -25,7 +25,14 @@ from b24api.contracts.policy import (
     SnapshotState,
 )
 from b24api.contracts.request import ReplaySafety, Request
-from b24api.errors import BatchCommandError, BudgetExceededError, FailurePhase, ProtocolError, TransportError
+from b24api.errors import (
+    BatchCommandError,
+    BudgetExceededError,
+    EnvelopeContractError,
+    FailurePhase,
+    ProtocolError,
+    TransportError,
+)
 from b24api.execution import ExecutionContext, Executor, WireResponse
 
 if TYPE_CHECKING:
@@ -234,7 +241,7 @@ async def test_primary_batch_failure_survives_secondary_source_cleanup_failure()
     stream = BatchExecutor(Executor(CallbackTransport(malformed)))._outcomes(source(), batch_size=1)
     outcome = await anext(stream)
     assert isinstance(outcome, BatchFailure)
-    assert isinstance(outcome.error, ProtocolError)
+    assert isinstance(outcome.error, ProtocolError | EnvelopeContractError)
 
     with pytest.raises(RuntimeError, match="batch source close boom"):
         await stream.aclose()
@@ -825,6 +832,32 @@ async def test_malformed_batch_pagination_metadata_is_correlated_failure() -> No
     outcome = await anext(stream)
     assert isinstance(outcome, BatchFailure)
     assert isinstance(outcome.error, ProtocolError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["extra", "duplicate"])
+async def test_batch_envelope_rejects_unknown_or_duplicate_correlation_keys(fault: str) -> None:
+    def malformed_correlation(request: Request) -> WireResponse:
+        key = _batch_keys(request)[0]
+        if fault == "extra":
+            body = json.dumps(
+                {"result": {"result": {key: {}, "unexpected": {}}, "result_error": []}},
+            ).encode()
+        else:
+            body = (
+                '{"result":{"result":{"'
+                + key
+                + '":{},"'
+                + key
+                + '":{}},"result_error":[]}}'
+            ).encode()
+        return WireResponse(status_code=HTTP_OK, headers=(), body=body)
+
+    stream = BatchExecutor(Executor(CallbackTransport(malformed_correlation)))._outcomes([Request("profile")])
+    outcome = await anext(stream)
+
+    assert isinstance(outcome, BatchFailure)
+    assert isinstance(outcome.error, ProtocolError | EnvelopeContractError)
 
 
 @pytest.mark.asyncio

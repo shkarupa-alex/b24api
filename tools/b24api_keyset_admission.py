@@ -64,6 +64,7 @@ class MeasuredRun:
     report: OperationReport
     wall_seconds: float
     first_row_seconds: float
+    resources_leaked: bool = False
 
 
 class FixturePortal:
@@ -184,7 +185,14 @@ async def _run(cell: Cell, mode: str | None) -> MeasuredRun:
         keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
         **kwargs,
     )
-    return await _consume(stream)
+    run = await _consume(stream)
+    return MeasuredRun(
+        run.identities,
+        run.report,
+        run.wall_seconds,
+        run.first_row_seconds,
+        bool(client._streams),  # noqa: SLF001 - the admission harness verifies deregistration
+    )
 
 
 def _digest(identities: list[int]) -> str:
@@ -195,14 +203,17 @@ def _record(
     run: MeasuredRun,
     *,
     oracle: set[int] | None = None,
-    deterministic_time: bool = True,
 ) -> dict[str, Any]:
     identities, report, measured = run.identities, run.report, run.wall_seconds
     execution = report.keyset_execution
     selected = execution.selected_kind.value if execution is not None else "sequential"
     expected = set(identities) if oracle is None else oracle
     actual = set(identities)
-    raw_rows = execution.raw_rows if execution is not None else len(identities)
+    raw_rows = (
+        report.admitted + execution.probe_rows_discarded + execution.boundary_overlap_rows
+        if execution is not None
+        else len(identities)
+    )
     return {
         "digest": _digest(identities),
         "rows": len(identities),
@@ -215,11 +226,11 @@ def _record(
         "duplicates": len(identities) - len(actual),
         "output_overfetch": len(actual - expected),
         "false_completion": int(report.state.value != "completed"),
-        "resources_leaked": False,
+        "resources_leaked": run.resources_leaked,
         "requests": report.physical_requests,
         "commands": report.batch_commands,
         "logical_pages": report.logical_pages,
-        "wall_seconds": report.physical_requests * 0.001 if deterministic_time else measured,
+        "wall_seconds": measured,
         "first_row_seconds": run.first_row_seconds,
         "measured_wall_seconds": measured,
         "server_seconds": None,
@@ -332,7 +343,14 @@ async def _run_live(mode: str | None) -> MeasuredRun:
             ),
             **kwargs,
         )
-        return await _consume(stream)
+        run = await _consume(stream)
+        return MeasuredRun(
+            run.identities,
+            run.report,
+            run.wall_seconds,
+            run.first_row_seconds,
+            bool(client._streams),  # noqa: SLF001 - the admission harness verifies deregistration
+        )
 
 
 async def generate_live_range(samples: int, *, sha: str) -> dict[str, Any]:
@@ -343,13 +361,12 @@ async def generate_live_range(samples: int, *, sha: str) -> dict[str, Any]:
         before_run = await _run_live(None)
         candidate_run = await _run_live("range")
         after_run = await _run_live(None)
-        before = _record(before_run, deterministic_time=False)
+        before = _record(before_run)
         candidate = _record(
             candidate_run,
             oracle=set(before_run.identities),
-            deterministic_time=False,
         )
-        after = _record(after_run, deterministic_time=False)
+        after = _record(after_run)
         observations.append(
             {
                 "cell": "tasks_all",

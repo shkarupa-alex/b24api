@@ -163,6 +163,18 @@ def plan_lanes_from_anchors(
     return tuple(lanes)
 
 
+def fit_wave[T](plans: tuple[T, ...], *, reserves: tuple[int, ...], commands: int, rows: int) -> tuple[T, ...]:
+    """Return the largest deterministic prefix fitting both capacities."""
+    selected = 0
+    reserved = 0
+    for reserve in reserves[:commands]:
+        if reserved + reserve > rows:
+            break
+        selected += 1
+        reserved += reserve
+    return plans[:selected]
+
+
 __all__ = [
     "FastKeysetPlan",
     "Identity",
@@ -171,6 +183,7 @@ __all__ = [
     "LaneSpec",
     "LaneState",
     "LaneStatus",
+    "fit_wave",
     "plan_lanes_from_anchors",
     "plan_windows",
 ]

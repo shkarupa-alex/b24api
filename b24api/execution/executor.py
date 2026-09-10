@@ -548,7 +548,11 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912
 def _decode_success(wire: WireResponse, *, request_summary: RequestSummary) -> Response:
     evidence = _wire_evidence(wire)
     try:
-        payload = json.loads(wire.body, parse_constant=_reject_json_constant)
+        payload = json.loads(
+            wire.body,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
         raise EnvelopeContractError(
             "Malformed successful HTTP response",
@@ -648,6 +652,16 @@ def _wire_evidence(wire: WireResponse) -> ResponseEvidence:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON constant is forbidden: {value}")
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Decode an object while enforcing unique JSON member names."""
+    decoded: dict[str, object] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise ValueError(f"duplicate JSON object name: {key}")
+        decoded[key] = value
+    return decoded
 
 
 __all__ = ["Executor"]

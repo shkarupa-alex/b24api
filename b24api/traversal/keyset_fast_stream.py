@@ -5,59 +5,27 @@
 from __future__ import annotations
 import asyncio
 from collections import Counter, deque
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING, Self
 
-from b24api.contracts.keyset_execution import (
-    ClosureWitness,
-    KeysetAssuranceSource,
-    KeysetExecutionKind,
-    KeysetPhase,
-    KeysetSelectionReason,
-    TraceClass,
-)
+from b24api.contracts.keyset_execution import KeysetPhase, TraceClass
 from b24api.contracts.policy import CompletionAssurance, KernelState, SnapshotRequirement, SnapshotState
 from b24api.contracts.report import (
-    KeysetExecutionReport,
-    PageDispatch,
     PageOutcome,
     PageRecord,
-    PageRejectionCode,
     Violation,
+    ViolationSeverity,
 )
 from b24api.errors import IncompleteTraversalError, PaginationError
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
+from b24api.traversal.keyset_observation import PageObservation
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from b24api.contracts.json import JsonValue
-    from b24api.traversal.keyset_auto import FinalSelection, Preselection, TotalHintState
     from b24api.traversal.keyset_scheduler import KeysetFastScheduler
-    from b24api.traversal.ordered_admission import FastCounters
-
-
-@dataclass(frozen=True, slots=True)
-class PageObservation:
-    """Final value-free staging record for one fast logical page."""
-
-    ordinal: int
-    phase: KeysetPhase
-    lane_ordinal: int | None
-    command_id: str
-    dispatch: PageDispatch
-    batch_index: int | None
-    rows_selected: int
-    rows_admitted: int
-    reported_total: int | None
-    reported_next: int | None
-    page_full: bool
-    witness: ClosureWitness | None
-    outcome: PageOutcome
-    rejection_code: PageRejectionCode | None
-    violation: Violation | None
-    trace_class: TraceClass
 
 
 class FastTraceRecorder:
@@ -188,88 +156,6 @@ class FastTraceRecorder:
         return tuple((kind, len(self._heads[kind]) + len(self._tails[kind])) for kind in TraceClass)
 
 
-def build_keyset_execution_report(  # noqa: PLR0913
-    *,
-    requested: KeysetExecutionKind,
-    preselection: Preselection | None,
-    final: FinalSelection | None,
-    counters: FastCounters,
-    trace: FastTraceRecorder,
-    total_hint: TotalHintState,
-) -> KeysetExecutionReport:
-    """Build a redacted immutable aggregate from planner and trace state."""
-    phase_requests = {phase: int(trace.phase_commands(phase) > 0) for phase in KeysetPhase}
-    selected = (
-        final.kind
-        if final is not None
-        else (
-            KeysetExecutionKind.BOUNDARY_ONLY
-            if preselection is not None and preselection.plan.value == "boundary_only"
-            else KeysetExecutionKind.SEQUENTIAL
-        )
-    )
-    reason = (
-        preselection.reason
-        if preselection is not None
-        else (
-            KeysetSelectionReason.EXPLICIT_RANGE
-            if requested is KeysetExecutionKind.RANGE
-            else KeysetSelectionReason.EXPLICIT_PARTITIONED
-        )
-    )
-    selected_estimate = final.estimate.requests if final is not None else None
-    records, dropped = trace.snapshot()
-    del records
-    return KeysetExecutionReport(
-        requested_kind=requested,
-        selected_kind=selected,
-        preselection_reason=reason,
-        final_selection_reason=final.reason if final is not None else None,
-        assurance_source=(
-            KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS
-            if selected in {KeysetExecutionKind.RANGE, KeysetExecutionKind.PARTITIONED}
-            else KeysetAssuranceSource.ORDERED_PREFIX_ONLY
-        ),
-        planning_requests=sum(
-            phase_requests[phase] for phase in (KeysetPhase.BOUNDARY, KeysetPhase.CANARY, KeysetPhase.ANCHOR_PROBE)
-        ),
-        boundary_requests=phase_requests[KeysetPhase.BOUNDARY],
-        canary_requests=phase_requests[KeysetPhase.CANARY],
-        anchor_probe_requests=phase_requests[KeysetPhase.ANCHOR_PROBE],
-        canary_commands=trace.phase_commands(KeysetPhase.CANARY),
-        canary_rows=trace.phase_rows(KeysetPhase.CANARY),
-        anchor_probe_commands=trace.phase_commands(KeysetPhase.ANCHOR_PROBE),
-        anchor_count=0,
-        empty_anchor_probes=trace.phase_empty(KeysetPhase.ANCHOR_PROBE),
-        probe_rows_discarded=counters.probe_rows_discarded,
-        boundary_overlap_rows=counters.boundary_overlap_rows,
-        head_page_admitted=counters.admitted_rows > 0,
-        sequential_requests_estimate=(preselection.sequential_estimate.requests if preselection is not None else None),
-        selected_requests_estimate=selected_estimate,
-        head_rows=0,
-        tail_rows=0,
-        interior_span=preselection.interior_span if preselection is not None else None,
-        interior_rows_estimate=preselection.interior_rows_estimate if preselection is not None else None,
-        total_rows_estimate=preselection.total_rows_estimate if preselection is not None else None,
-        density_numerator=preselection.density_numerator if preselection is not None else None,
-        density_denominator=preselection.density_denominator if preselection is not None else None,
-        effective_window_width=(final.estimate.window_width if final is not None else None),
-        range_window_count=(final.estimate.window_count if final is not None else None),
-        target_lanes=None,
-        actual_lanes=final.lane_count if final is not None else None,
-        continuation_count=trace.phase_commands(KeysetPhase.BODY) + trace.phase_commands(KeysetPhase.FINISH),
-        closure_witness_counts=(),
-        effective_batch_capacity=0,
-        total_hint_requested=total_hint.requested,
-        total_hint_observed=total_hint.observed,
-        total_hint_plausible=total_hint.plausible,
-        total_hint_used=total_hint.used,
-        trace_retained_by_class=trace.class_counts(),
-        trace_dropped_by_class=tuple((kind, dropped[kind]) for kind in TraceClass),
-        raw_rows=counters.raw_rows,
-    )
-
-
 class KeysetFastStream:
     """Single-use lifecycle shell around the fast scheduler."""
 
@@ -292,8 +178,7 @@ class KeysetFastStream:
             while not self._buffer:
                 rows = await self._scheduler.next_rows()
                 if not rows:
-                    await self._scheduler.aclose()
-                    await self._finalize(KernelState.COMPLETED, "fast keyset traversal completed")
+                    await self._terminate(KernelState.COMPLETED, "fast keyset traversal completed")
                     self._closed = True
                     raise StopAsyncIteration
                 self._buffer.extend(rows)
@@ -303,20 +188,17 @@ class KeysetFastStream:
         except StopAsyncIteration:
             raise
         except asyncio.CancelledError as error:
-            await self._scheduler.aclose()
-            await self._finalize(KernelState.CANCELLED, "iteration cancelled")
+            await self._terminate(KernelState.CANCELLED, "iteration cancelled", primary=error)
             _attach_report(error, self.report)
             self._closed = True
             raise
         except PaginationError as error:
-            await self._scheduler.aclose()
-            await self._finalize(KernelState.INCOMPLETE, type(error).__name__)
+            await self._terminate(KernelState.INCOMPLETE, type(error).__name__, primary=error)
             incomplete = IncompleteTraversalError(report=self.report)
             self._closed = True
             raise incomplete from error
         except BaseException as error:
-            await self._scheduler.aclose()
-            await self._finalize(KernelState.FAILED, type(error).__name__)
+            await self._terminate(KernelState.FAILED, type(error).__name__, primary=error)
             _attach_report(error, self.report)
             self._closed = True
             raise
@@ -326,8 +208,22 @@ class KeysetFastStream:
         if self._closed:
             return
         self._closed = True
-        await self._scheduler.aclose()
-        await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
+        await self._terminate(KernelState.CANCELLED, "stream closed before exhaustion")
+
+    async def _terminate(self, state: KernelState, reason: str, *, primary: BaseException | None = None) -> None:
+        cleanup: BaseException | None = None
+        try:
+            await self._scheduler.aclose()
+        except BaseException as error:  # noqa: BLE001 - cleanup is secondary to traversal outcome
+            cleanup = error
+            self._scheduler.violations.append(
+                Violation(ViolationSeverity.BLOCKING, "cleanup_failure", type(error).__name__),
+            )
+        if cleanup is not None and state is KernelState.COMPLETED:
+            state, reason = KernelState.FAILED, "fast keyset cleanup failed"
+        await self._finalize(state, reason)
+        if cleanup is not None and primary is not None:
+            primary.add_note(f"fast keyset cleanup also failed ({type(cleanup).__name__})")
 
     async def _finalize(self, state: KernelState, reason: str) -> None:
         if self.report.state is not KernelState.NOT_STARTED:
@@ -365,4 +261,4 @@ class KeysetFastStream:
         )
 
 
-__all__ = ["FastTraceRecorder", "KeysetFastStream", "PageObservation", "build_keyset_execution_report"]
+__all__ = ["FastTraceRecorder", "KeysetFastStream", "PageObservation"]

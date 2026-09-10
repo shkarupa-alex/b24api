@@ -189,6 +189,11 @@ def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
     delta_callers = {path.name for path in fast_sources if "adjust_buffered_rows(" in path.read_text(encoding="utf-8")}
     assert delta_callers == {"keyset_scheduler.py"}
     assert all("set_buffered_rows(" not in path.read_text(encoding="utf-8") for path in fast_sources)
+    scheduler = (PACKAGE / "traversal" / "keyset_scheduler.py").read_text(encoding="utf-8")
+    support = (PACKAGE / "traversal" / "keyset_scheduler_support.py").read_text(encoding="utf-8")
+    assert "class KeysetFastScheduler:" in scheduler
+    assert "KeysetSchedulerSupport" not in scheduler
+    assert "self: Any" not in support
 
     selector = (PACKAGE / "traversal" / "keyset_auto.py").read_text(encoding="utf-8")
     for forbidden in ("random", "time.", "os.environ", "float("):

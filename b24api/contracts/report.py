@@ -188,7 +188,6 @@ class KeysetExecutionReport:
     total_hint_used: bool
     trace_retained_by_class: tuple[tuple[TraceClass, int], ...]
     trace_dropped_by_class: tuple[tuple[TraceClass, int], ...]
-    raw_rows: int = 0
 
     def __post_init__(self) -> None:
         """Validate closed aggregate report fields."""
@@ -221,7 +220,6 @@ class KeysetExecutionReport:
             self.tail_rows,
             self.continuation_count,
             self.effective_batch_capacity,
-            self.raw_rows,
         )
         optional = (
             self.sequential_requests_estimate,

@@ -50,7 +50,7 @@ Use automatic execution only after verifying stable integer identities, both ord
 strict numeric bounds, and the endpoint's page-completion behavior. Construction is I/O-free, but
 the first pull completes the planning barrier before yielding rows.
 
-<!-- tested: tests/keyset_fast_test.py::test_auto_range_and_partitioned_modes_are_exact -->
+<!-- tested: tests/keyset_fast_test.py::test_explicit_modes_match_sparse_ordered_oracle -->
 ```python
 from b24api import (
     AutoKeysetExecution,
