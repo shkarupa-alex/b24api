@@ -178,6 +178,19 @@ def test_individual_improvement_gate_requires_request_and_wall_improvement() -> 
     assert result["groups"][0]["performance_passed"] is False
 
 
+def test_intermediate_individual_gate_uses_the_declared_wall_tolerance() -> None:
+    artifact = deepcopy(_artifact())
+    for sample in artifact["samples"]:  # type: ignore[index]
+        sample["candidate"]["requests"] = 10
+        sample["candidate"]["wall_seconds"] = 1.04
+
+    result = analyze_artifact(artifact)  # type: ignore[arg-type]
+
+    assert result["groups"][0]["median_request_ratio"] == 1.0
+    assert result["groups"][0]["p95_time_ratio"] == 1.04
+    assert result["groups"][0]["performance_passed"] is True
+
+
 def test_live_admission_fails_closed_without_the_required_matrix() -> None:
     artifact = deepcopy(_artifact())
     artifact["source"] = "live_read_only"

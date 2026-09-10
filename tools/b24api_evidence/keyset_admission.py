@@ -143,7 +143,7 @@ def analyze_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # noqa: C901,
         time_stat = p95_time if use_p95 else median_time
         parity = baseline <= INTERMEDIATE_MAX_REQUESTS
         improved = sum(
-            (request_ratio <= 1.0 and time_ratio <= 1.0)
+            (request_ratio <= 1.0 and time_ratio <= threshold_time)
             if parity
             else (request_ratio < 1.0 and time_ratio < 1.0)
             for request_ratio, time_ratio in zip(ratios_req, ratios_time, strict=True)

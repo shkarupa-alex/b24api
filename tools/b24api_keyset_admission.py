@@ -60,7 +60,7 @@ if TYPE_CHECKING:
 PAGE_SIZE = 50
 TARGET_LANES = 20
 MODES = ("range", "partitioned", "auto")
-FIXTURE_REQUEST_LATENCY_SECONDS = 0.005
+FIXTURE_REQUEST_LATENCY_SECONDS = 0.020
 MIN_LARGE_LIVE_SELECTIONS = 2
 LOW_DENSITY_LIMIT = 0.05
 MID_DENSITY_LIMIT = 0.25
@@ -443,7 +443,7 @@ async def generate(samples: int, *, sha: str) -> dict[str, Any]:
         "source": "deterministic_fixture",
         "sha": sha,
         "python_version": platform.python_version(),
-        "portal_fingerprint": hashlib.sha256(b"b24api-keyset-deterministic-fixture-v2").hexdigest(),
+        "portal_fingerprint": hashlib.sha256(b"b24api-keyset-deterministic-fixture-v3").hexdigest(),
         "wall_clock_unix": time.time(),
         "manifest": {
             "performance_scope": scope,
