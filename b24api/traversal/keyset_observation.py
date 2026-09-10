@@ -241,25 +241,25 @@ async def close_scheduler(scheduler: KeysetFastScheduler) -> None:
         return
     scheduler.admission.discard_unadmitted_raw()
     scheduler._frozen_report = scheduler.report_fragment()
-    if scheduler._buffer_balance:
-        await scheduler._adjust_buffer(-scheduler._buffer_balance)
-    if scheduler._buffer_balance != 0:
+    if scheduler.transactions.buffer_balance:
+        await scheduler.adjust_buffer(-scheduler.transactions.buffer_balance)
+    if scheduler.transactions.buffer_balance != 0:
         raise RuntimeError("fast scheduler buffer balance survived cleanup")
     for retained in (
-        scheduler._pending,
-        scheduler._lane_rows,
-        scheduler._lane_identities,
-        scheduler._lane_commands,
-        scheduler._lanes,
+        scheduler.transactions.pending,
+        scheduler.transactions.lane_rows,
+        scheduler.transactions.lane_identities,
+        scheduler.transactions.lane_commands,
+        scheduler.transactions.lanes,
     ):
         retained.clear()
     scheduler._tail = None
-    scheduler._anchor_rows.clear()
-    scheduler._anchor_commands.clear()
-    scheduler._planning_bounds.clear()
-    scheduler._planning_descending.clear()
-    scheduler._boundary_totals.clear()
-    scheduler._staged_observations.clear()
+    scheduler.transactions.anchor_rows.clear()
+    scheduler.transactions.anchor_commands.clear()
+    scheduler.transactions.planning_bounds.clear()
+    scheduler.transactions.planning_descending.clear()
+    scheduler.transactions.boundary_totals.clear()
+    scheduler.transactions.staged_observations.clear()
     scheduler._plan_outcome = None
     scheduler._range_geometry = None
     scheduler.admission.assert_clean()

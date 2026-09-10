@@ -1,6 +1,6 @@
 """Transactional fast-keyset receipt selection and lane-local validation."""
 
-# ruff: noqa: BLE001, C901, PLR0912, PLR2004, TRY301
+# ruff: noqa: C901, PLR0912, PLR2004, TRY301
 
 from __future__ import annotations
 from dataclasses import dataclass, replace
@@ -10,7 +10,13 @@ from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageOutcome, PageRejectionCode, Violation, ViolationSeverity
 from b24api.contracts.request import ResultSelector
-from b24api.errors import AmbiguousExecutionError, EnvelopeContractError, PaginationError, ProtocolError
+from b24api.errors import (
+    AmbiguousExecutionError,
+    CapabilityError,
+    EnvelopeContractError,
+    PaginationError,
+    ProtocolError,
+)
 from b24api.traversal.keyset_range import closure_witness
 from b24api.traversal.values import _coerce_identity, _extract_path, _response_items, _validate_order
 
@@ -161,7 +167,7 @@ def validate_lane_receipt(  # noqa: PLR0913
             witness,
             (),
         )
-    except Exception as error:
+    except (CapabilityError, PaginationError) as error:
         return _rejection(plan, str(error), code="range_contradiction", selected_rows=len(rows))
 
 

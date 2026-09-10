@@ -43,7 +43,7 @@ from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSe
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError, IncompleteTraversalError
 from b24api.execution import Executor, WireResponse
-from b24api.traversal import keyset_scheduler
+from b24api.traversal import keyset_scheduler, page_validation
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
 from b24api.traversal.keyset_fast_stream import FastTraceRecorder
@@ -722,7 +722,7 @@ async def test_boundary_overlap_releases_duplicate_row_capacity_immediately() ->
 
     scheduler = source._scheduler
     assert scheduler.counters.boundary_overlap_rows == 3
-    assert scheduler._buffer_balance == 7
+    assert scheduler.transactions.buffer_balance == 7
     await source.aclose()
 
 
@@ -788,13 +788,13 @@ async def test_partition_transfers_anchor_ownership_without_retaining_payload() 
     )
     scheduler = stream._source._scheduler
     await scheduler.plan_barrier()
-    assert scheduler._anchor_rows
+    assert scheduler.transactions.anchor_rows
 
     while rows := await scheduler.next_rows():
         scheduler.mark_emitted(len(rows))
 
-    assert scheduler._anchor_rows == {}
-    assert scheduler._anchor_commands == {}
+    assert scheduler.transactions.anchor_rows == {}
+    assert scheduler.transactions.anchor_commands == {}
     await scheduler.aclose()
 
 
@@ -821,9 +821,9 @@ async def test_auto_discards_precharged_anchor_objects_when_post_probe_gain_is_l
     scheduler = stream._source._scheduler
     assert scheduler._selected is KeysetExecutionKind.SEQUENTIAL
     assert scheduler._anchor_count > 0
-    assert scheduler._anchor_rows == scheduler._anchor_commands == {}
-    assert scheduler._boundary_totals == {}
-    assert scheduler._buffer_balance == PAGE_SIZE
+    assert scheduler.transactions.anchor_rows == scheduler.transactions.anchor_commands == {}
+    assert scheduler.transactions.boundary_totals == {}
+    assert scheduler.transactions.buffer_balance == PAGE_SIZE
     await stream.aclose()
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.ORDERED_PREFIX_ONLY
@@ -913,7 +913,25 @@ async def test_boundary_direction_contradiction_fails_before_emission() -> None:
     assert stream.report is not None
     assert stream.report.emitted == 0
     assert stream.report.state is TerminalState.INCOMPLETE
-    assert stream._source._scheduler._boundary_totals == {}
+    assert stream._source._scheduler.transactions.boundary_totals == {}
+
+
+@pytest.mark.asyncio
+async def test_internal_lane_validation_error_is_not_reclassified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = _stream(
+        KeysetTransport(tuple(range(1, 20))),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    def fail_selection(*_args: object, **_kwargs: object) -> list[JsonValue]:
+        raise RuntimeError("internal validation defect")
+
+    monkeypatch.setattr(page_validation, "_response_items", fail_selection)
+
+    with pytest.raises(RuntimeError, match="internal validation defect"):
+        await anext(stream)
 
 
 @pytest.mark.asyncio
@@ -1073,7 +1091,7 @@ async def test_fast_bounded_consumption_freezes_an_early_close_report(operation:
     assert partial.report.buffered_rows_high_water <= ExecutionPolicy().max_buffered_rows
     assert stream._source._scheduler._plan_outcome is None
     assert not stream._source._buffer
-    assert stream._source._scheduler._anchor_rows == {}
+    assert stream._source._scheduler.transactions.anchor_rows == {}
 
 
 @pytest.mark.asyncio
@@ -1107,7 +1125,7 @@ async def test_fast_close_finishes_cleanup_before_propagating_cancellation(
     source = stream._source
     await anext(source)
     scheduler = source._scheduler
-    original = scheduler._adjust_buffer
+    original = scheduler.adjust_buffer
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -1117,7 +1135,7 @@ async def test_fast_close_finishes_cleanup_before_propagating_cancellation(
             await release.wait()
         await original(delta)
 
-    monkeypatch.setattr(scheduler, "_adjust_buffer", pause_cleanup)
+    monkeypatch.setattr(scheduler, "adjust_buffer", pause_cleanup)
     closing = asyncio.create_task(source.aclose())
     await entered.wait()
     closing.cancel()
@@ -1128,7 +1146,7 @@ async def test_fast_close_finishes_cleanup_before_propagating_cancellation(
 
     assert scheduler._closed is True
     assert source._closed is True
-    assert scheduler._buffer_balance == 0
+    assert scheduler.transactions.buffer_balance == 0
     assert not source._buffer
 
 
@@ -1228,8 +1246,8 @@ async def test_partition_anchor_waves_discard_unneeded_rows_before_the_next_wave
     scheduler = stream._source._scheduler
     await scheduler.plan_barrier()
 
-    assert scheduler._boundary_totals == {}
-    assert scheduler._buffer_balance == page_size * 2 + 50
+    assert scheduler.transactions.boundary_totals == {}
+    assert scheduler.transactions.buffer_balance == page_size * 2 + 50
     assert [row["id"] async for row in stream] == list(identities)
     assert stream.report is not None
     assert stream.report.buffered_rows_high_water <= policy.max_buffered_rows
@@ -1347,8 +1365,8 @@ async def test_range_windows_are_materialized_one_bounded_group_at_a_time() -> N
     await scheduler.plan_barrier()
 
     assert scheduler._window_count == 249_999
-    assert len(scheduler._lanes) == scheduler.batch_capacity
-    assert len(scheduler._lane_rows) == scheduler.batch_capacity
+    assert len(scheduler.transactions.lanes) == scheduler.batch_capacity
+    assert len(scheduler.transactions.lane_rows) == scheduler.batch_capacity
     await stream.aclose()
 
 
@@ -1541,12 +1559,12 @@ async def test_later_partition_lanes_are_not_rescheduled_while_frontier_is_open(
     await scheduler.plan_barrier()
 
     await scheduler._body_wave()
-    frontier = scheduler._lane_index
-    frontier_ordinal = scheduler._lanes[frontier].spec.ordinal
-    first_rounds = {lane.spec.ordinal: lane.rounds for lane in scheduler._lanes}
-    assert scheduler._lanes[frontier].status.value == "open"
+    frontier = scheduler.transactions.lane_index
+    frontier_ordinal = scheduler.transactions.lanes[frontier].spec.ordinal
+    first_rounds = {lane.spec.ordinal: lane.rounds for lane in scheduler.transactions.lanes}
+    assert scheduler.transactions.lanes[frontier].status.value == "open"
     await scheduler._body_wave()
-    second_rounds = {lane.spec.ordinal: lane.rounds for lane in scheduler._lanes}
+    second_rounds = {lane.spec.ordinal: lane.rounds for lane in scheduler.transactions.lanes}
 
     assert second_rounds[frontier_ordinal] > first_rounds[frontier_ordinal]
     assert all(rounds <= second_rounds[frontier_ordinal] for rounds in second_rounds.values())

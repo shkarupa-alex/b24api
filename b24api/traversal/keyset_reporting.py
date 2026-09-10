@@ -64,10 +64,10 @@ def build_scheduler_report(scheduler: KeysetFastScheduler) -> KeysetExecutionRep
             and scheduler._selected in {KeysetExecutionKind.RANGE, KeysetExecutionKind.PARTITIONED}
             else KeysetAssuranceSource.ORDERED_PREFIX_ONLY
         ),
-        planning_requests=scheduler._planning_physical_requests,
-        boundary_requests=scheduler._planning_requests[KeysetPhase.BOUNDARY],
-        canary_requests=scheduler._planning_requests[KeysetPhase.CANARY],
-        anchor_probe_requests=scheduler._planning_requests[KeysetPhase.ANCHOR_PROBE],
+        planning_requests=scheduler.transactions.planning_physical_requests,
+        boundary_requests=scheduler.transactions.planning_requests[KeysetPhase.BOUNDARY],
+        canary_requests=scheduler.transactions.planning_requests[KeysetPhase.CANARY],
+        anchor_probe_requests=scheduler.transactions.planning_requests[KeysetPhase.ANCHOR_PROBE],
         canary_commands=scheduler.trace.phase_commands(KeysetPhase.CANARY),
         canary_rows=scheduler.trace.phase_rows(KeysetPhase.CANARY),
         anchor_probe_commands=getattr(scheduler, "_anchor_probe_commands", 0),
@@ -93,12 +93,12 @@ def build_scheduler_report(scheduler: KeysetFastScheduler) -> KeysetExecutionRep
         actual_lanes=(
             scheduler._window_count
             if scheduler._selected is KeysetExecutionKind.RANGE
-            else len(scheduler._lanes)
+            else len(scheduler.transactions.lanes)
             if scheduler._selected is KeysetExecutionKind.PARTITIONED
             else None
         ),
-        continuation_count=scheduler._continuations,
-        closure_witness_counts=tuple((kind, scheduler._closures[kind]) for kind in ClosureWitness),
+        continuation_count=scheduler.transactions.continuations,
+        closure_witness_counts=tuple((kind, scheduler.transactions.closures[kind]) for kind in ClosureWitness),
         effective_batch_capacity=scheduler.batch_capacity,
         total_hint_requested=scheduler._total_hint.requested,
         total_hint_observed=scheduler._total_hint.observed,

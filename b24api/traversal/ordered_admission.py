@@ -135,6 +135,10 @@ class OrderedAdmissionState:
             raise ValueError("discarded count cannot be negative")
         self._counters.probe_rows_discarded += count
 
+    def record_probe_discarded(self, count: int) -> None:
+        """Record uncounted boundary probe rows that do not own output."""
+        self._counters.probe_rows_discarded += count
+
     def record_boundary_overlap(self, count: int) -> None:
         """Record boundary rows normalized out before admission."""
         self._counters.boundary_overlap_rows += count

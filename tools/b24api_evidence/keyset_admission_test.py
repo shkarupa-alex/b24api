@@ -11,10 +11,11 @@ import pytest
 from .keyset_admission import (
     REQUIRED_LIVE_MATRIX_FEATURES,
     ROOT,
-    _current_candidate_sha,
-    analyze_artifact,
     lower_median,
     nearest_rank_p95,
+)
+from .keyset_admission import (
+    analyze_artifact as _analyze_artifact,
 )
 from .repository import git_sha
 
@@ -24,13 +25,18 @@ if TYPE_CHECKING:
 CANDIDATE_SHA = git_sha(ROOT)
 
 
-def test_candidate_sha_is_bound_to_repository_when_caller_cwd_is_elsewhere(
+def analyze_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+    """Analyze fixtures without consulting mutable developer checkout state."""
+    return _analyze_artifact(artifact, _candidate_sha=CANDIDATE_SHA)
+
+
+def test_fixture_sha_is_bound_to_repository_when_caller_cwd_is_elsewhere(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
 
-    assert _current_candidate_sha() == CANDIDATE_SHA
+    assert git_sha(ROOT) == CANDIDATE_SHA
 
 
 def _run(*, digest: str = "same", requests: int = 10, seconds: float = 1.0) -> dict[str, Any]:

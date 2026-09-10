@@ -1,7 +1,5 @@
 """Transport lifecycle, replay-aware retries, and shared rate coordination."""
 
-# ruff: noqa: FBT001, FBT002
-
 from __future__ import annotations
 import asyncio
 import contextlib
@@ -572,7 +570,12 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912
         )
 
 
-def _decode_success(wire: WireResponse, request_summary: RequestSummary, strict_json_members: bool = False) -> Response:
+def _decode_success(
+    wire: WireResponse,
+    request_summary: RequestSummary,
+    *,
+    strict_json_members: bool = False,
+) -> Response:
     evidence = _wire_evidence(wire)
     try:
         payload = json.loads(
@@ -594,8 +597,7 @@ def _decode_success(wire: WireResponse, request_summary: RequestSummary, strict_
             request_summary=request_summary,
             evidence=evidence,
         )
-    total = payload.get("total")
-    next_value = payload.get("next")
+    total, next_value = payload.get("total"), payload.get("next")
     if total is not None and (not isinstance(total, int) or isinstance(total, bool)):
         raise EnvelopeContractError(
             "Response total must be an integer",
@@ -652,8 +654,7 @@ def _decode_response_time(raw: object) -> ResponseTime | None:
             raise ValueError("response time contains an invalid number")
         return float(value)
 
-    operating = raw.get("operating")
-    operating_reset_at = raw.get("operating_reset_at")
+    operating, operating_reset_at = raw.get("operating"), raw.get("operating_reset_at")
     return ResponseTime(
         start=number("start"),
         finish=number("finish"),

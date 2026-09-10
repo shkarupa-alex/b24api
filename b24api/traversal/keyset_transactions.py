@@ -1,6 +1,6 @@
-"""Stateless I/O transactions used by the single fast keyset scheduler."""
+"""Stateless I/O transactions used by the fast keyset scheduler."""
 
-# ruff: noqa: C901, FBT003, PLR0915, SLF001, TRY301
+# ruff: noqa: C901, FBT003, PLR0915, TRY301
 
 from __future__ import annotations
 from collections import deque
@@ -27,28 +27,19 @@ from b24api.traversal.keyset_fast_plan import (
 )
 from b24api.traversal.keyset_observation import stage_or_record_observation
 from b24api.traversal.keyset_range import descending_closure_witness
-from b24api.traversal.page_validation import ReceiptRejection, classify_rejection, validate_lane_receipt
+from b24api.traversal.keyset_transaction_contract import boundary_totals, build_controlled_request, build_lane_plan
+from b24api.traversal.page_validation import (
+    LaneCommandPlan,
+    ReceiptRejection,
+    classify_rejection,
+    validate_lane_receipt,
+)
 
 if TYPE_CHECKING:
-    from b24api.batch.outcome import BatchOutcome
     from b24api.contracts.request import Request
     from b24api.traversal.keyset_scheduler import KeysetFastScheduler
-    from b24api.traversal.page_validation import LaneCommandPlan, LaneReceipt
+    from b24api.traversal.page_validation import LaneReceipt
     from b24api.traversal.plans import KeysetPlan
-
-
-def boundary_totals(
-    plans: tuple[LaneCommandPlan, ...],
-    outcomes: tuple[BatchOutcome, ...],
-) -> dict[str, int | None]:
-    """Retain boundary scalar totals without retaining response row payloads."""
-    if not all(plan.phase is KeysetPhase.BOUNDARY for plan in plans):
-        return {}
-    return {
-        plan.command_id: outcome.response.total
-        for plan, outcome in zip(plans, outcomes, strict=True)
-        if isinstance(outcome, BatchSuccess) and outcome.response is not None
-    }
 
 
 def build_canary_plans(
@@ -61,11 +52,11 @@ def build_canary_plans(
     plans = build_capability_plans(
         commands,
         KeysetPhase.CANARY,
-        scheduler._controls,
-        scheduler._lane_plan,
+        lambda **kwargs: build_controlled_request(scheduler, **kwargs),
+        lambda lane, **kwargs: build_lane_plan(scheduler, lane, **kwargs),
         scheduler.effective_page_cap,
-        scheduler._planning_bounds,
-        scheduler._planning_descending,
+        scheduler.transactions.planning_bounds,
+        scheduler.transactions.planning_descending,
     )
     expected = {
         plan.command_id: command.expected
@@ -92,11 +83,11 @@ def build_anchor_plans(
     return build_capability_plans(
         commands,
         KeysetPhase.ANCHOR_PROBE,
-        scheduler._controls,
-        scheduler._lane_plan,
+        lambda **kwargs: build_controlled_request(scheduler, **kwargs),
+        lambda lane, **kwargs: build_lane_plan(scheduler, lane, **kwargs),
         scheduler.effective_page_cap,
-        scheduler._planning_bounds,
-        scheduler._planning_descending,
+        scheduler.transactions.planning_bounds,
+        scheduler.transactions.planning_descending,
     )
 
 
@@ -109,11 +100,11 @@ async def execute_wave(
         raise ValueError("fast keyset wave must contain 1..50 commands")
     reserved_rows = sum(plan.reserved_rows for plan in plans)
     charged_rows = 0
-    if reserved_rows > scheduler.context.policy.max_buffered_rows - scheduler._buffer_balance:
+    if reserved_rows > scheduler.context.policy.max_buffered_rows - scheduler.transactions.buffer_balance:
         raise BudgetExceededError("fast keyset wave exceeds currently available row capacity")
     reservations = await scheduler.context.reserve_pages(len(plans))
     try:
-        await scheduler._adjust_buffer(reserved_rows)
+        await scheduler.adjust_buffer(reserved_rows)
         charged_rows = reserved_rows
         advisory = (
             all(plan.phase is KeysetPhase.BOUNDARY for plan in plans)
@@ -126,14 +117,14 @@ async def execute_wave(
             strict_envelope=True,
             strict_json_members=True,
         )
-        scheduler._boundary_totals = boundary_totals(plans, outcomes)
+        scheduler.transactions.boundary_totals = boundary_totals(plans, outcomes)
         scheduler.batch_requests += 1
         scheduler.batch_commands += len(plans)
         planning = {KeysetPhase.BOUNDARY, KeysetPhase.CANARY, KeysetPhase.ANCHOR_PROBE}
         phases = {plan.phase for plan in plans}
-        scheduler._planning_physical_requests += int(bool(phases & planning))
+        scheduler.transactions.planning_physical_requests += int(bool(phases & planning))
         for phase in phases & planning:
-            scheduler._planning_requests[phase] += 1
+            scheduler.transactions.planning_requests[phase] += 1
         receipts: list[LaneReceipt] = []
         failed, selected_rows = False, 0
         for index, (plan, outcome, reservation) in enumerate(zip(plans, outcomes, reservations, strict=True)):
@@ -143,10 +134,10 @@ async def execute_wave(
             commit(reservation)
             lane = lane_for_command(
                 plan,
-                planning_bounds=scheduler._planning_bounds,
-                planning_descending=scheduler._planning_descending,
-                finish_lane=getattr(scheduler, "_finish_lane", None),
-                lanes=scheduler._lanes,
+                planning_bounds=scheduler.transactions.planning_bounds,
+                planning_descending=scheduler.transactions.planning_descending,
+                finish_lane=scheduler.transactions.finish_lane,
+                lanes=scheduler.transactions.lanes,
             )
             receipt = validate_lane_receipt(
                 plan=plan,
@@ -163,7 +154,7 @@ async def execute_wave(
                 failed = True
                 scheduler.violations.append(receipt.violation)
                 page_outcome, rejection_code = classify_rejection(outcome)
-                scheduler._record(
+                scheduler.record_page(
                     plan,
                     index=index,
                     selected=receipt.selected_rows,
@@ -178,7 +169,7 @@ async def execute_wave(
             successful = {receipt.command_id: receipt for receipt in receipts}
             for index, plan in enumerate(plans):
                 if plan.command_id in successful:
-                    scheduler._record(
+                    scheduler.record_page(
                         plan,
                         index=index,
                         selected=len(successful[plan.command_id].rows),
@@ -193,8 +184,8 @@ async def execute_wave(
             outcome = outcomes[index]
             response = outcome.response if isinstance(outcome, BatchSuccess) else None
             stage_or_record_observation(
-                scheduler._staged_observations,
-                scheduler._record,
+                scheduler.transactions.staged_observations,
+                scheduler.record_page,
                 stage=stage_semantics,
                 plan=plan,
                 index=index,
@@ -206,20 +197,24 @@ async def execute_wave(
     finally:
         for reservation in reservations:
             scheduler.context.release_page(reservation)
-        await scheduler._adjust_buffer(-min(charged_rows, scheduler._buffer_balance))
+        await scheduler.adjust_buffer(-min(charged_rows, scheduler.transactions.buffer_balance))
 
 
 async def execute_body_wave(scheduler: KeysetFastScheduler) -> None:
     """Advance one bounded group without letting a later lane outrun the frontier."""
-    open_lanes = [lane for lane in scheduler._lanes[scheduler._lane_index :] if lane.status is LaneStatus.OPEN]
+    open_lanes = [
+        lane
+        for lane in scheduler.transactions.lanes[scheduler.transactions.lane_index :]
+        if lane.status is LaneStatus.OPEN
+    ]
     if not open_lanes:
-        scheduler._drain_admission_frontier()
+        scheduler.drain_admission_frontier()
         return
     frontier = open_lanes[0]
     candidates_lanes = [
         lane
         for lane in open_lanes
-        if lane is frontier or not scheduler._lane_rows[lane.spec.ordinal] or lane.rounds <= frontier.rounds
+        if lane is frontier or not scheduler.transactions.lane_rows[lane.spec.ordinal] or lane.rounds <= frontier.rounds
     ][: scheduler.batch_capacity]
     candidates = []
     for lane in candidates_lanes:
@@ -229,33 +224,34 @@ async def execute_body_wave(scheduler: KeysetFastScheduler) -> None:
             upper = lane.cursor
         else:
             lower = lane.cursor
-        request = scheduler._controls(
+        request = build_controlled_request(
+            scheduler,
             direction="DESC" if lane.spec.descending else "ASC",
             lower=lower,
             upper=upper,
             limit=scheduler.effective_page_cap,
         )
-        candidates.append(scheduler._lane_plan(lane, phase=KeysetPhase.BODY, request=request))
+        candidates.append(build_lane_plan(scheduler, lane, phase=KeysetPhase.BODY, request=request))
     plan_candidates = tuple(candidates)
     plans = fit_wave(
         plan_candidates,
         reserves=tuple(plan.reserved_rows for plan in plan_candidates),
         commands=scheduler.batch_capacity,
-        rows=scheduler.context.policy.max_buffered_rows - scheduler._buffer_balance,
+        rows=scheduler.context.policy.max_buffered_rows - scheduler.transactions.buffer_balance,
     )
     if not plans:
         raise BudgetExceededError("fast keyset body wave has no available row capacity")
-    receipts = await scheduler._wave(plans)
+    receipts = await scheduler.execute_wave(plans)
     retained = sum(len(receipt.rows) for receipt in receipts)
-    await scheduler._adjust_buffer(retained)
+    await scheduler.adjust_buffer(retained)
     scheduler.admission.record_raw(retained)
     by_ordinal = {receipt.lane_ordinal: receipt for receipt in receipts}
     for lane in candidates_lanes[: len(plans)]:
         receipt = by_ordinal[lane.spec.ordinal]
         lane.rounds += 1
-        scheduler._lane_rows[lane.spec.ordinal].extend(receipt.rows)
-        scheduler._lane_identities[lane.spec.ordinal].extend(receipt.identities)
-        scheduler._lane_commands[lane.spec.ordinal].append((receipt.command_id, len(receipt.rows)))
+        scheduler.transactions.lane_rows[lane.spec.ordinal].extend(receipt.rows)
+        scheduler.transactions.lane_identities[lane.spec.ordinal].extend(receipt.identities)
+        scheduler.transactions.lane_commands[lane.spec.ordinal].append((receipt.command_id, len(receipt.rows)))
         witness = receipt.witness
         if lane.spec.descending:
             witness = descending_closure_witness(
@@ -267,23 +263,23 @@ async def execute_body_wave(scheduler: KeysetFastScheduler) -> None:
         if receipt.identities:
             lane.cursor = receipt.identities[-1]
         if witness is None:
-            scheduler._continuations += 1
+            scheduler.transactions.continuations += 1
             continue
         lane.status = LaneStatus.CLOSED
         lane.witness = witness
         anchor = lane.spec.retained_upper_anchor
         if anchor is not None:
-            row = scheduler._anchor_rows.pop(anchor, None)
+            row = scheduler.transactions.anchor_rows.pop(anchor, None)
             if row is None:
                 raise PaginationError("partition lane lost its retained anchor")
-            scheduler._anchor_commands.pop(anchor, None)
-            scheduler._lane_rows[lane.spec.ordinal].append(row)
-            scheduler._lane_identities[lane.spec.ordinal].append(anchor)
+            scheduler.transactions.anchor_commands.pop(anchor, None)
+            scheduler.transactions.lane_rows[lane.spec.ordinal].append(row)
+            scheduler.transactions.lane_identities[lane.spec.ordinal].append(anchor)
             lane.witness = ClosureWitness.ANCHOR_FENCE
-            scheduler._closures[ClosureWitness.ANCHOR_FENCE] += 1
+            scheduler.transactions.closures[ClosureWitness.ANCHOR_FENCE] += 1
         else:
-            scheduler._closures[witness] += 1
-    scheduler._drain_admission_frontier()
+            scheduler.transactions.closures[witness] += 1
+    scheduler.drain_admission_frontier()
 
 
 async def execute_finish_page(
@@ -292,29 +288,29 @@ async def execute_finish_page(
     request: Request,
 ) -> None:
     """Execute one direct sequential finish page and record its final admission outcome."""
-    if scheduler._finish_cursor is None:
-        scheduler._terminal = True
+    if scheduler.transactions.finish_cursor is None:
+        scheduler.transactions.terminal = True
         return
     direction = "ASC" if finish_plan.direction == "asc" else "DESC"
     bounds = LaneBounds(
-        scheduler._finish_cursor if direction == "ASC" else None,
-        scheduler._finish_cursor if direction == "DESC" else None,
+        scheduler.transactions.finish_cursor if direction == "ASC" else None,
+        scheduler.transactions.finish_cursor if direction == "DESC" else None,
     )
     spec = LaneSpec(0, LaneKind.FINISH, bounds, direction == "DESC", True, None)
     finish_lane = LaneState(
         spec,
-        scheduler._finish_cursor,
+        scheduler.transactions.finish_cursor,
         LaneStatus.OPEN,
         None,
         0,
         0,
         deque(),
     )
-    scheduler._finish_lane = finish_lane
-    plan = scheduler._lane_plan(finish_lane, phase=KeysetPhase.FINISH, request=request)
+    scheduler.transactions.finish_lane = finish_lane
+    plan = build_lane_plan(scheduler, finish_lane, phase=KeysetPhase.FINISH, request=request)
     reservation = await scheduler.context.reserve_page()
     try:
-        await scheduler._adjust_buffer(scheduler.effective_page_cap)
+        await scheduler.adjust_buffer(scheduler.effective_page_cap)
         response = await scheduler.executor.execute(request, context=scheduler.context)
         scheduler.context.commit_page(reservation)
         outcome = BatchSuccess(0, "finish", request, response.result, response=response)
@@ -331,7 +327,7 @@ async def execute_finish_page(
         if isinstance(receipt, ReceiptRejection):
             scheduler.violations.append(receipt.violation)
             scheduler.admission.record_raw(receipt.selected_rows, discarded=True)
-            scheduler._record(
+            scheduler.record_page(
                 plan,
                 index=None,
                 selected=receipt.selected_rows,
@@ -343,13 +339,13 @@ async def execute_finish_page(
             )
             raise PaginationError(receipt.detail)
         terminal = keyset_step.keyset_page_terminal(finish_plan, len(receipt.rows))
-        await scheduler._adjust_buffer(-scheduler.effective_page_cap + len(receipt.rows))
+        await scheduler.adjust_buffer(-scheduler.effective_page_cap + len(receipt.rows))
         scheduler.admission.record_raw(len(receipt.rows))
         try:
             commit = scheduler.admission.validate_and_commit(receipt)
         except PaginationError:
             scheduler.admission.record_discarded(len(receipt.rows))
-            scheduler._record(
+            scheduler.record_page(
                 plan,
                 index=None,
                 selected=len(receipt.rows),
@@ -361,7 +357,7 @@ async def execute_finish_page(
                 dispatch=PageDispatch.DIRECT,
             )
             raise
-        scheduler._record(
+        scheduler.record_page(
             plan,
             index=None,
             selected=len(receipt.rows),
@@ -372,19 +368,19 @@ async def execute_finish_page(
         )
         scheduler.trace.admit(receipt.command_id, len(commit.rows))
         if commit.rows:
-            scheduler._pending.append(commit.rows)
+            scheduler.transactions.pending.append(commit.rows)
         if terminal is not None:
-            scheduler._terminal = True
-            scheduler._finishing = False
+            scheduler.transactions.terminal = True
+            scheduler.transactions.finishing = False
             return
-        scheduler._finish_cursor = keyset_step.next_keyset_cursor(
-            scheduler._finish_cursor,
+        scheduler.transactions.finish_cursor = keyset_step.next_keyset_cursor(
+            scheduler.transactions.finish_cursor,
             receipt.identities,
         )
     except BaseException:
         scheduler.context.release_page(reservation)
         raise
-    if scheduler._buffer_balance > scheduler.context.policy.max_buffered_rows:
+    if scheduler.transactions.buffer_balance > scheduler.context.policy.max_buffered_rows:
         raise RuntimeError("fast scheduler buffer accounting escaped policy")
 
 
