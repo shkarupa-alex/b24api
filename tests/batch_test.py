@@ -836,7 +836,7 @@ async def test_malformed_batch_pagination_metadata_is_correlated_failure() -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["extra", "duplicate"])
-async def test_batch_envelope_rejects_unknown_or_duplicate_correlation_keys(fault: str) -> None:
+async def test_public_batch_preserves_tolerant_unknown_or_duplicate_correlation_keys(fault: str) -> None:
     def malformed_correlation(request: Request) -> WireResponse:
         key = _batch_keys(request)[0]
         if fault == "extra":
@@ -856,8 +856,7 @@ async def test_batch_envelope_rejects_unknown_or_duplicate_correlation_keys(faul
     stream = BatchExecutor(Executor(CallbackTransport(malformed_correlation)))._outcomes([Request("profile")])
     outcome = await anext(stream)
 
-    assert isinstance(outcome, BatchFailure)
-    assert isinstance(outcome.error, ProtocolError | EnvelopeContractError)
+    assert isinstance(outcome, BatchSuccess)
 
 
 @pytest.mark.asyncio

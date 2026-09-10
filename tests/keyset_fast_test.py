@@ -12,6 +12,7 @@ import pytest
 from b24api import (
     AutoKeysetExecution,
     Bitrix24,
+    ClosureWitness,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
@@ -20,6 +21,8 @@ from b24api import (
     KeysetPhase,
     KeysetSelectionReason,
     KeysetSpec,
+    PageOutcome,
+    PageRejectionCode,
     ParameterPath,
     PartitionedKeysetExecution,
     RangeKeysetExecution,
@@ -28,11 +31,15 @@ from b24api import (
     StableIntegerKeysetContract,
     TerminalState,
     TotalHintMode,
+    TraceClass,
 )
+from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError, IncompleteTraversalError
 from b24api.execution import Executor, WireResponse
 from b24api.traversal.keyset_auto import BoundaryFacts, Preselected, SelectorInputs, preselect
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
+from b24api.traversal.keyset_fast_stream import FastTraceRecorder
+from b24api.traversal.keyset_observation import PageObservation
 from b24api.traversal.keyset_partition import anchor_guesses
 
 if TYPE_CHECKING:
@@ -66,11 +73,13 @@ class KeysetTransport:
         ignore_direction: bool = False,
         ignore_bounds: bool = False,
         boundary_total: object | None = None,
+        default_limit: int = PAGE_SIZE,
     ) -> None:
         self.identities = identities
         self.ignore_direction = ignore_direction
         self.ignore_bounds = ignore_bounds
         self.boundary_total = boundary_total
+        self.default_limit = default_limit
         self.requests: list[Request] = []
 
     def _rows(self, parameters: dict[str, JsonValue]) -> list[dict[str, int]]:
@@ -83,7 +92,7 @@ class KeysetTransport:
                 selected = tuple(value for value in selected if value < int(filters["<ID"]))
         order = parameters.get("order", {})
         descending = isinstance(order, dict) and order.get("id") == "DESC" and not self.ignore_direction
-        limit = int(parameters.get("limit", PAGE_SIZE))
+        limit = int(parameters.get("limit", self.default_limit))
         return [{"id": value} for value in sorted(selected, reverse=descending)[:limit]]
 
     async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
@@ -114,6 +123,49 @@ class KeysetTransport:
 
     async def aclose(self) -> None:
         pass
+
+
+class MalformedBatchEnvelopeTransport(KeysetTransport):
+    """Inject one deterministic correlation-envelope fault into every batch."""
+
+    def __init__(self, identities: tuple[int, ...], *, fault: str) -> None:
+        super().__init__(identities)
+        self.fault = fault
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        response = await super().send(
+            request,
+            attempt_timeout=attempt_timeout,
+            max_response_bytes=max_response_bytes,
+        )
+        if request.method != "batch":
+            return response
+        payload = json.loads(response.body)
+        result = payload["result"]["result"]
+        if self.fault == "extra":
+            result["unexpected"] = []
+        elif self.fault == "missing":
+            result.pop(next(iter(result)))
+        elif self.fault == "row_duplicate":
+            encoded = json.dumps(payload, separators=(",", ":"))
+            return WireResponse(
+                response.status_code,
+                response.headers,
+                encoded.replace('{"id":', '{"name":"first","name":"last","id":', 1).encode(),
+            )
+        else:
+            encoded = json.dumps(payload, separators=(",", ":"))
+            key_prefix = f"{json.dumps(next(iter(result)))}:"
+            return WireResponse(
+                response.status_code,
+                response.headers,
+                encoded.replace(key_prefix, f"{key_prefix}[],{key_prefix}", 1).encode(),
+            )
+        return WireResponse(
+            response.status_code,
+            response.headers,
+            json.dumps(payload, separators=(",", ":")).encode(),
+        )
 
 
 def _client(transport: KeysetTransport, *, policy: ExecutionPolicy | None = None) -> Bitrix24:
@@ -299,6 +351,108 @@ async def test_explicit_modes_match_sparse_ordered_oracle(direction: str, kind: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["ascending", "descending"])
+async def test_short_page_contract_closes_sparse_windows_in_both_directions(direction: str) -> None:
+    identities = (*range(1, 6), 10, 20, *range(100, 105))
+    stream = _stream(
+        KeysetTransport(identities),
+        RangeKeysetExecution(
+            StableIntegerKeysetContract(page_completion=KeysetPageCompletion.SHORT_PAGE_EXHAUSTS),
+            window_width=50,
+        ),
+        direction=direction,
+    )
+
+    assert [item["id"] async for item in stream] == sorted(identities, reverse=direction == "descending")
+    assert stream.report is not None
+    assert stream.report.keyset_execution is not None
+    closures = dict(stream.report.keyset_execution.closure_witness_counts)
+    assert closures[ClosureWitness.SHORT_PAGE] == 1
+    assert closures[ClosureWitness.EMPTY] == 1
+
+
+@pytest.mark.asyncio
+async def test_ascending_full_integer_window_reports_lattice_closure() -> None:
+    identities = tuple(range(1, 31))
+    stream = _stream(
+        KeysetTransport(identities),
+        RangeKeysetExecution(StableIntegerKeysetContract(), window_width=6),
+    )
+
+    assert [item["id"] async for item in stream] == list(identities)
+    assert stream.report is not None
+    assert stream.report.keyset_execution is not None
+    closures = dict(stream.report.keyset_execution.closure_witness_counts)
+    assert closures[ClosureWitness.LATTICE_FULL] == 4
+    assert closures[ClosureWitness.TOP] == 0
+
+
+@pytest.mark.parametrize(
+    ("capacity", "quotas"),
+    [
+        (64, {TraceClass.PLANNING: 8, TraceClass.TERMINAL: 8, TraceClass.BODY: 16, TraceClass.ANOMALY: 32}),
+        (13, {TraceClass.PLANNING: 1, TraceClass.TERMINAL: 1, TraceClass.BODY: 3, TraceClass.ANOMALY: 8}),
+    ],
+)
+def test_fast_trace_uses_exact_deterministic_class_quotas(
+    capacity: int,
+    quotas: dict[TraceClass, int],
+) -> None:
+    def populated_recorder() -> tuple[FastTraceRecorder, set[int]]:
+        recorder = FastTraceRecorder(capacity)
+        expected_sequences: set[int] = set()
+        ordinal = 0
+        phases = {
+            TraceClass.PLANNING: KeysetPhase.BOUNDARY,
+            TraceClass.TERMINAL: KeysetPhase.FINISH,
+            TraceClass.BODY: KeysetPhase.BODY,
+            TraceClass.ANOMALY: KeysetPhase.BOUNDARY,
+        }
+        for trace_class, quota in quotas.items():
+            sequences: list[int] = []
+            for _ in range(quota + 3):
+                sequences.append(ordinal)
+                anomaly = trace_class is TraceClass.ANOMALY
+                recorder.record(
+                    PageObservation(
+                        ordinal=ordinal,
+                        phase=phases[trace_class],
+                        lane_ordinal=0,
+                        command_id=f"command-{ordinal}",
+                        dispatch=PageDispatch.BATCH,
+                        batch_index=ordinal,
+                        rows_selected=0,
+                        rows_admitted=0,
+                        reported_total=None,
+                        reported_next=None,
+                        page_full=False,
+                        witness=None,
+                        outcome=PageOutcome.REJECTED if anomaly else PageOutcome.COMMITTED,
+                        rejection_code=PageRejectionCode.RANGE_CONTRADICTION if anomaly else None,
+                        violation=None,
+                        trace_class=TraceClass.BODY,
+                    ),
+                )
+                ordinal += 1
+            head = (quota + 1) // 2
+            tail = quota // 2
+            expected_sequences.update(sequences[:head])
+            if tail:
+                expected_sequences.update(sequences[-tail:])
+        return recorder, expected_sequences
+
+    recorder, expected_sequences = populated_recorder()
+    records, dropped = recorder.snapshot()
+    repeated, _ = populated_recorder()
+
+    assert len(records) == capacity
+    assert {record.sequence for record in records} == expected_sequences
+    assert dict(recorder.class_counts()) == quotas
+    assert dropped == dict.fromkeys(TraceClass, 3)
+    assert repeated.snapshot() == recorder.snapshot()
+
+
+@pytest.mark.asyncio
 async def test_auto_sequential_has_request_parity_and_no_canaries() -> None:
     transport = KeysetTransport(tuple(range(1, 21)))
     stream = _stream(
@@ -326,6 +480,53 @@ async def test_empty_auto_selection_completes_in_boundary_wave() -> None:
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.BOUNDARY_ONLY
     assert stream.report.keyset_execution.preselection_reason is KeysetSelectionReason.EMPTY_SELECTION
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["extra", "duplicate"])
+async def test_fast_wave_invalid_correlation_rejects_every_observation_as_batch_envelope(fault: str) -> None:
+    stream = _stream(
+        MalformedBatchEnvelopeTransport(tuple(range(1, 21)), fault=fault),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    with pytest.raises(IncompleteTraversalError):
+        _ = [item async for item in stream]
+
+    assert stream.report is not None
+    assert len(stream.report.page_trace) == 2
+    assert {(record.outcome, record.rejection_code) for record in stream.report.page_trace} == {
+        (PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE),
+    }
+
+
+@pytest.mark.asyncio
+async def test_fast_wave_missing_correlation_rejects_command_and_aborts_decoded_sibling() -> None:
+    stream = _stream(
+        MalformedBatchEnvelopeTransport(tuple(range(1, 21)), fault="missing"),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    with pytest.raises(IncompleteTraversalError):
+        _ = [item async for item in stream]
+
+    assert stream.report is not None
+    assert len(stream.report.page_trace) == 2
+    assert {(record.outcome, record.rejection_code) for record in stream.report.page_trace} == {
+        (PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE),
+        (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED),
+    }
+
+
+@pytest.mark.asyncio
+async def test_fast_wave_tolerates_duplicate_non_correlation_row_member() -> None:
+    identities = tuple(range(1, 21))
+    stream = _stream(
+        MalformedBatchEnvelopeTransport(identities, fault="row_duplicate"),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    assert [item["id"] async for item in stream] == list(identities)
 
 
 @pytest.mark.asyncio
@@ -419,6 +620,7 @@ async def test_fast_bounded_consumption_freezes_an_early_close_report(operation:
     assert partial.report.emitted == expected
     assert partial.report.unique_rows == expected
     assert partial.report.buffered_rows_high_water <= ExecutionPolicy().max_buffered_rows
+    assert stream._source._scheduler._plan_outcome is None
 
 
 @pytest.mark.asyncio
@@ -456,3 +658,76 @@ async def test_partition_body_wave_accounts_for_pinned_tail_and_anchors() -> Non
     assert [row["id"] async for row in stream] == list(identities)
     assert stream.report is not None
     assert stream.report.buffered_rows_high_water <= ExecutionPolicy().max_buffered_rows
+
+
+@pytest.mark.asyncio
+async def test_partition_planning_accounts_for_free_rows_without_a_writable_limit() -> None:
+    page_size = 50
+    identities = tuple(range(1, 5_001))
+    transport = KeysetTransport(identities, default_limit=page_size)
+    stream = _client(transport).iter_list_keyset(
+        Request("item.list"),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=page_size,
+        keyset=KeysetSpec(),
+        execution=PartitionedKeysetExecution(
+            StableIntegerKeysetContract(endpoint_page_cap=page_size),
+            target_lanes=44,
+        ),
+    )
+
+    assert [row["id"] async for row in stream] == list(identities)
+    assert stream.report is not None
+    assert stream.report.buffered_rows_high_water <= ExecutionPolicy().max_buffered_rows
+
+
+@pytest.mark.parametrize("execution", [RangeKeysetExecution(StableIntegerKeysetContract()),
+                                        PartitionedKeysetExecution(StableIntegerKeysetContract())])
+def test_explicit_bounded_mode_rejects_policy_without_post_boundary_capacity(
+    execution: RangeKeysetExecution | PartitionedKeysetExecution,
+) -> None:
+    transport = KeysetTransport(tuple(range(1, 31)))
+    client = _client(transport, policy=ExecutionPolicy(max_buffered_rows=3 * PAGE_SIZE - 1))
+
+    with pytest.raises(CapabilityError, match="retain boundaries"):
+        client.iter_list_keyset(
+            Request("item.list"), selector=ResultSelector.root(), identity=_identity(), page_size=PAGE_SIZE,
+            keyset=KeysetSpec(limit_path=ParameterPath(("limit",))), execution=execution,
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_auto_uses_post_boundary_capacity_and_selects_sequential_when_none_remains() -> None:
+    identities = (*range(1, 6), *range(1_006, 1_011))
+    transport = KeysetTransport(identities)
+    stream = _client(transport, policy=ExecutionPolicy(max_buffered_rows=2 * PAGE_SIZE)).iter_list_keyset(
+        Request("item.list"), selector=ResultSelector.root(), identity=_identity(), page_size=PAGE_SIZE,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        execution=AutoKeysetExecution(StableIntegerKeysetContract(), target_lanes=20),
+    )
+
+    assert [row["id"] async for row in stream] == list(identities)
+    assert stream.report is not None
+    assert stream.report.keyset_execution is not None
+    assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.SEQUENTIAL
+    assert stream.report.keyset_execution.effective_batch_capacity == 0
+
+
+@pytest.mark.asyncio
+async def test_descending_full_integer_window_reports_lattice_closure() -> None:
+    identities = tuple(range(1, 31))
+    stream = _stream(
+        KeysetTransport(identities),
+        RangeKeysetExecution(StableIntegerKeysetContract(), window_width=6),
+        direction="descending",
+    )
+
+    assert [item["id"] async for item in stream] == list(reversed(identities))
+    assert stream.report is not None
+    assert stream.report.keyset_execution is not None
+    closures = dict(stream.report.keyset_execution.closure_witness_counts)
+    assert closures[ClosureWitness.LATTICE_FULL] == 4
+    assert closures[ClosureWitness.TOP] == 0

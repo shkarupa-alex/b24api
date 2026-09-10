@@ -336,12 +336,6 @@ def _next_offset(
     return current + observed
 
 
-def _keyset_terminal(plan: KeysetPlan, page_size: int) -> str | None:
-    if plan.terminal is KeysetTerminalRule.EMPTY_CONFIRMATION and page_size == 0:
-        return "empty keyset confirmation"
-    return None
-
-
 def _cursor_terminal(plan: ItemCursorPlan, page_size: int) -> str | None:
     if plan.terminal is CursorTerminalRule.EMPTY_CONFIRMATION and page_size == 0:
         return "empty cursor confirmation"

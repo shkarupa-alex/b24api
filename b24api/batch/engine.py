@@ -105,13 +105,15 @@ class BatchExecutor:
             policy=policy or ExecutionPolicy(),
         )
 
-    async def _execute_chunk(
+    async def _execute_chunk(  # noqa: PLR0913
         self,
         commands: tuple[_Command, ...],
         *,
         context: ExecutionContext,
         halt: bool,
         advisory_totals: bool = False,
+        strict_envelope: bool = False,
+        strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
         rejected: dict[int, BatchOutcome] = {}
         eligible = commands
@@ -121,14 +123,31 @@ class BatchExecutor:
                 return tuple(rejected[command.index] for command in commands)
         request = _batch_request(eligible, halt=halt)
         try:
-            response = await self.executor.execute(request, context=context, work_class=WorkClass.BATCH)
+            response = await self.executor.execute(
+                request,
+                context=context,
+                work_class=WorkClass.BATCH,
+                strict_json_members=strict_json_members,
+            )
             envelope = _decode_batch_envelope(
                 response.result,
                 expected_keys=frozenset(command.stable_key for command in eligible),
+                strict=strict_envelope,
             )
         except asyncio.CancelledError:
             raise
         except B24ApiError as error:
+            if strict_envelope and isinstance(error, ProtocolError) and error.request_summary is None:
+                scoped_error = ProtocolError(
+                    str(error),
+                    origin=error.origin,
+                    description=error.description,
+                    request_summary=request.summary,
+                    evidence=error.evidence,
+                    retryable=error.retryable,
+                )
+                scoped_error.__cause__ = error
+                error = scoped_error
             failures = tuple(_shared_failure(command, error) for command in eligible)
             return _merge_outcomes(commands, failures, rejected)
 
@@ -227,6 +246,8 @@ class BatchExecutor:
         *,
         context: ExecutionContext,
         advisory_totals: bool = False,
+        strict_envelope: bool = False,
+        strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
         """Execute one scheduler-owned chunk with total per-command correlation."""
         if not requests or len(requests) > self.portal_command_cap:
@@ -245,6 +266,8 @@ class BatchExecutor:
             context=context,
             halt=False,
             advisory_totals=advisory_totals,
+            strict_envelope=strict_envelope,
+            strict_json_members=strict_json_members,
         )
 
     def _command_error(
@@ -301,7 +324,12 @@ def _build_query(parameters: Mapping[str | int, object], path: str = "%s") -> st
     return encode_php_query(parameters, path)
 
 
-def _decode_batch_envelope(raw: JsonValue, *, expected_keys: frozenset[str]) -> _BatchEnvelope:
+def _decode_batch_envelope(
+    raw: JsonValue,
+    *,
+    expected_keys: frozenset[str],
+    strict: bool = False,
+) -> _BatchEnvelope:
     if not isinstance(raw, dict):
         raise ProtocolError("Batch result envelope must be an object", origin=ErrorOrigin.PROTOCOL)
     if "result_error" not in raw:
@@ -312,12 +340,14 @@ def _decode_batch_envelope(raw: JsonValue, *, expected_keys: frozenset[str]) -> 
     continuations = _decode_optional_php_map(raw, field="result_next")
     result_keys = frozenset(results)
     error_keys = frozenset(errors)
-    if result_keys & error_keys or not (result_keys | error_keys).issubset(expected_keys):
+    if strict and (result_keys & error_keys or not (result_keys | error_keys).issubset(expected_keys)):
         raise ProtocolError(
             "Batch result correlation keys are duplicated or unknown",
             origin=ErrorOrigin.PROTOCOL,
         )
-    if not frozenset(totals).issubset(expected_keys) or not frozenset(continuations).issubset(expected_keys):
+    if strict and (
+        not frozenset(totals).issubset(expected_keys) or not frozenset(continuations).issubset(expected_keys)
+    ):
         raise ProtocolError("Batch metadata contains an unknown correlation key", origin=ErrorOrigin.PROTOCOL)
     return _BatchEnvelope(
         results=results,

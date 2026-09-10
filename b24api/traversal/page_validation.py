@@ -10,7 +10,7 @@ from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageOutcome, PageRejectionCode, Violation, ViolationSeverity
 from b24api.contracts.request import ResultSelector
-from b24api.errors import AmbiguousExecutionError, PaginationError, ProtocolError
+from b24api.errors import AmbiguousExecutionError, EnvelopeContractError, PaginationError, ProtocolError
 from b24api.traversal.keyset_range import closure_witness
 from b24api.traversal.values import _coerce_identity, _extract_path, _response_items, _validate_order
 
@@ -81,11 +81,11 @@ def classify_rejection(outcome: BatchOutcome) -> tuple[PageOutcome, PageRejectio
     error = outcome.error
     if isinstance(error, AmbiguousExecutionError):
         return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION
-    if isinstance(error, ProtocolError):
+    if isinstance(error, ProtocolError | EnvelopeContractError):
         summary = error.request_summary
         if summary is not None and summary.method == "batch":
-            return PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE
-        return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION
+            return PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE
+        return PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE
     return PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE
 
 

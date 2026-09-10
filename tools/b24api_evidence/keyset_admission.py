@@ -9,6 +9,23 @@ SCHEMA_VERSION = 1
 SMALL_MAX_REQUESTS = 3
 INTERMEDIATE_MAX_REQUESTS = 10
 LARGE_REQUEST_RATIO = 0.60
+MAX_SANDWICH_WINDOW_SECONDS = 120.0
+REQUIRED_LIVE_MATRIX_FEATURES = frozenset(
+    {
+        "unfiltered",
+        "filtered",
+        "two_large_selections",
+        "small_selection",
+        "density_below_5_percent",
+        "density_5_to_25_percent",
+        "density_above_50_percent",
+        "clustered_or_skewed",
+        "tasks_split_roles",
+        "same_case_endpoint",
+        "total_hint_ignore",
+        "total_hint_advisory",
+    },
+)
 
 
 def lower_median(values: list[float]) -> float:
@@ -28,6 +45,8 @@ def nearest_rank_p95(values: list[float]) -> float:
 
 
 def _exclusion(sample: dict[str, Any]) -> str | None:
+    if sample.get("window_seconds", 0.0) > MAX_SANDWICH_WINDOW_SECONDS:
+        return "window_exceeded"
     before, candidate, after = (sample[role] for role in ("sequential_before", "candidate", "sequential_after"))
     if before["digest"] != after["digest"]:
         return "mutation_invalid"
@@ -57,12 +76,27 @@ def _raw_ceiling(sample: dict[str, Any]) -> int:
     return cast("int", run["admitted"] + overlap)
 
 
-def analyze_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+def analyze_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # noqa: C901, PLR0915
     """Evaluate correctness, stability, sampling, and paired performance gates."""
     if artifact.get("schema_version") != SCHEMA_VERSION or not isinstance(artifact.get("samples"), list):
         raise ValueError("unsupported keyset admission artifact")
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     correctness_failures: list[dict[str, str]] = []
+    manifest = artifact.get("manifest")
+    if not isinstance(manifest, dict):
+        raise TypeError("keyset admission artifact requires a manifest")
+    raw_correctness_scope = manifest.get("correctness_scope")
+    if not isinstance(raw_correctness_scope, list) or not raw_correctness_scope:
+        raise ValueError("manifest requires a non-empty correctness_scope")
+    correctness_scope = set(map(tuple, raw_correctness_scope))
+    expected_auto = manifest.get("expected_auto_selections")
+    if not isinstance(expected_auto, dict):
+        raise TypeError("expected_auto_selections must be an object")
+    expected_auto_cells = {cell for cell, mode in correctness_scope if mode == "auto"}
+    correctness_failures.extend(
+        {"cell": cell, "mode": "auto", "check": "missing_expected_selection"}
+        for cell in sorted(expected_auto_cells - set(expected_auto))
+    )
     for sample in artifact["samples"]:
         key = (sample["cell"], sample["mode"])
         exclusion = _exclusion(sample)
@@ -76,13 +110,17 @@ def analyze_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
             "output_overfetch": candidate["output_overfetch"] == 0,
             "false_completion": candidate["false_completion"] == 0,
             "raw_ceiling": candidate["raw_rows"] <= _raw_ceiling(sample),
-            "resources": not candidate["resources_leaked"],
+            "resources": not any(run["resources_leaked"] for run in (before, candidate, after)),
         }
+        oracle_dependent = {"stable_digest", "omissions", "output_overfetch"}
         correctness_failures.extend(
             {"cell": key[0], "mode": key[1], "check": name}
             for name, passed in checks.items()
-            if not passed and exclusion != "mutation_invalid"
+            if not passed and not (exclusion == "mutation_invalid" and name in oracle_dependent)
         )
+        expected = expected_auto.get(key[0]) if key[1] == "auto" else None
+        if expected is not None and candidate["selected_kind"] != expected:
+            correctness_failures.append({"cell": key[0], "mode": key[1], "check": "auto_selection"})
 
     group_results: list[dict[str, Any]] = []
     for (cell, mode), samples in sorted(groups.items()):
@@ -104,7 +142,12 @@ def analyze_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
             threshold_req, threshold_time, use_p95 = 0.60, 0.85, False
         time_stat = p95_time if use_p95 else median_time
         parity = baseline <= INTERMEDIATE_MAX_REQUESTS
-        improved = sum(ratio <= 1.0 if parity else ratio < 1.0 for ratio in ratios_req)
+        improved = sum(
+            (request_ratio <= 1.0 and time_ratio <= 1.0)
+            if parity
+            else (request_ratio < 1.0 and time_ratio < 1.0)
+            for request_ratio, time_ratio in zip(ratios_req, ratios_time, strict=True)
+        )
         performance_passed = (
             len(accepted) >= required
             and not unstable
@@ -128,18 +171,41 @@ def analyze_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
                 "performance_passed": performance_passed,
             },
         )
-    scoped = set(map(tuple, artifact["manifest"]["performance_scope"]))
+    observed_groups = set(groups)
+    correctness_failures.extend(
+        {"cell": cell, "mode": mode, "check": "missing_group"}
+        for cell, mode in sorted(correctness_scope - observed_groups)
+    )
+    scoped = set(map(tuple, manifest["performance_scope"]))
+    observed = {(result["cell"], result["mode"]) for result in group_results}
     performance_failures = [
         {"cell": result["cell"], "mode": result["mode"]}
         for result in group_results
         if (result["cell"], result["mode"]) in scoped and not result["performance_passed"]
     ]
+    performance_failures.extend(
+        {"cell": cell, "mode": mode}
+        for cell, mode in sorted(scoped - observed)
+    )
     material_range = any(
         result["mode"] == "range"
+        and (result["cell"], result["mode"]) in scoped
+        and result["performance_passed"]
         and result["median_request_ratio"] is not None
         and result["median_request_ratio"] <= LARGE_REQUEST_RATIO
         for result in group_results
     )
+    if artifact.get("source") == "live_read_only":
+        matrix = artifact["manifest"].get("live_matrix", {})
+        covered = frozenset(matrix.get("covered_features", ())) if isinstance(matrix, dict) else frozenset()
+        declared_complete = isinstance(matrix, dict) and matrix.get("complete") is True
+        declared_modes = frozenset(artifact["manifest"].get("modes", ()))
+        if (
+            not declared_complete
+            or not REQUIRED_LIVE_MATRIX_FEATURES.issubset(covered)
+            or declared_modes != {"range", "partitioned", "auto"}
+        ):
+            performance_failures.append({"cell": "__live_matrix__", "mode": "all"})
     return {
         "schema_version": SCHEMA_VERSION,
         "correctness_passed": not correctness_failures,
@@ -151,4 +217,10 @@ def analyze_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-__all__ = ["SCHEMA_VERSION", "analyze_artifact", "lower_median", "nearest_rank_p95"]
+__all__ = [
+    "REQUIRED_LIVE_MATRIX_FEATURES",
+    "SCHEMA_VERSION",
+    "analyze_artifact",
+    "lower_median",
+    "nearest_rank_p95",
+]

@@ -107,6 +107,11 @@ def validate_fast_keyset(  # noqa: C901, PLR0913
         raise CapabilityError("fast keyset traversal cannot supply the requested confirmation policy")
     _reject_owned_controls(request, identity, keyset)
     effective_cap = _effective_cap(execution, keyset, page_size)
+    if (
+        isinstance(execution, RangeKeysetExecution | PartitionedKeysetExecution)
+        and policy.max_buffered_rows < 3 * effective_cap
+    ):
+        raise CapabilityError("execution policy cannot retain boundaries and plan a bounded keyset")
     requested_batch = execution.batch_size or 50
     capacity = min(requested_batch, 50, policy.max_buffered_commands, policy.max_buffered_rows // effective_cap)
     if (

@@ -190,10 +190,15 @@ def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
     assert delta_callers == {"keyset_scheduler.py"}
     assert all("set_buffered_rows(" not in path.read_text(encoding="utf-8") for path in fast_sources)
     scheduler = (PACKAGE / "traversal" / "keyset_scheduler.py").read_text(encoding="utf-8")
-    support = (PACKAGE / "traversal" / "keyset_scheduler_support.py").read_text(encoding="utf-8")
     assert "class KeysetFastScheduler:" in scheduler
-    assert "KeysetSchedulerSupport" not in scheduler
-    assert "self: Any" not in support
+    assert not (PACKAGE / "traversal" / "keyset_scheduler_support.py").exists()
+    assert not (PACKAGE / "traversal" / "keyset_scheduler_state.py").exists()
+    assert all("SchedulerState" not in path.read_text(encoding="utf-8") for path in fast_sources)
+    sequential = (PACKAGE / "traversal" / "keyset.py").read_text(encoding="utf-8")
+    assert "from b24api.traversal.keyset_step import" in sequential
+    assert "from b24api.traversal import keyset_step" in scheduler
+    assert "keyset_page_request(" in sequential
+    assert "keyset_step.keyset_page_request(" in scheduler
 
     selector = (PACKAGE / "traversal" / "keyset_auto.py").read_text(encoding="utf-8")
     for forbidden in ("random", "time.", "os.environ", "float("):

@@ -36,10 +36,10 @@ def closure_witness(
     if not identities:
         return ClosureWitness.EMPTY
     upper = bounds.upper_exclusive
-    if upper is not None and identities[-1] == upper - 1:
-        return ClosureWitness.TOP
     if upper is not None and identities == tuple(range(cursor + 1, upper)):
         return ClosureWitness.LATTICE_FULL
+    if upper is not None and identities[-1] == upper - 1:
+        return ClosureWitness.TOP
     if completion is KeysetPageCompletion.SHORT_PAGE_EXHAUSTS and len(identities) < page_cap:
         return ClosureWitness.SHORT_PAGE
     return None

@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import itertools
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -16,7 +18,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs
 
-from b24api_evidence.keyset_admission import SCHEMA_VERSION, analyze_artifact, lower_median
+if TYPE_CHECKING or __package__:
+    from tools.b24api_evidence.keyset_admission import (
+        REQUIRED_LIVE_MATRIX_FEATURES,
+        SCHEMA_VERSION,
+        analyze_artifact,
+        lower_median,
+    )
+else:
+    from b24api_evidence.keyset_admission import (
+        REQUIRED_LIVE_MATRIX_FEATURES,
+        SCHEMA_VERSION,
+        analyze_artifact,
+        lower_median,
+    )
 
 from b24api import (
     AutoKeysetExecution,
@@ -45,8 +60,21 @@ if TYPE_CHECKING:
 PAGE_SIZE = 50
 TARGET_LANES = 20
 MODES = ("range", "partitioned", "auto")
-
-
+FIXTURE_REQUEST_LATENCY_SECONDS = 0.005
+MIN_LARGE_LIVE_SELECTIONS = 2
+LOW_DENSITY_LIMIT = 0.05
+MID_DENSITY_LIMIT = 0.25
+HIGH_DENSITY_LIMIT = 0.50
+EXPECTED_FIXTURE_AUTO_SELECTIONS = {
+    "small": "boundary_only",
+    "intermediate": "sequential",
+    "dense_large": "partitioned",
+    "dense_total_hint": "partitioned",
+    "sparse_wide": "partitioned",
+    "sparse_total_hint": "partitioned",
+    "advisory_raises_estimate": "partitioned",
+    "clustered": "partitioned",
+}
 @dataclass(frozen=True, slots=True)
 class Cell:
     """One pinned deterministic selection."""
@@ -54,6 +82,21 @@ class Cell:
     name: str
     identities: tuple[int, ...]
     total_hint: TotalHintMode = TotalHintMode.IGNORE
+
+
+@dataclass(frozen=True, slots=True)
+class LiveCell:
+    """One frozen read-only portal selection and identity-role geometry."""
+
+    name: str
+    method: str
+    parameters_json: str
+    selector_path: tuple[str, ...]
+    item_path: tuple[str, ...]
+    total_hint: TotalHintMode
+    filter_role: str
+    order_role: str
+    expected_auto_selection: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,9 +115,15 @@ class FixturePortal:
 
     host = "keyset-admission.invalid"
 
-    def __init__(self, identities: tuple[int, ...]) -> None:
+    def __init__(
+        self,
+        identities: tuple[int, ...],
+        *,
+        request_latency_seconds: float = FIXTURE_REQUEST_LATENCY_SECONDS,
+    ) -> None:
         """Store one immutable fixture selection."""
         self.identities = identities
+        self.request_latency_seconds = request_latency_seconds
 
     @staticmethod
     def _decode(value: str) -> dict[str, Any]:
@@ -103,6 +152,7 @@ class FixturePortal:
     async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Return one deterministic direct or correlated batch response."""
         del attempt_timeout, max_response_bytes
+        await asyncio.sleep(self.request_latency_seconds)
         parameters = request.copy_parameters()
         if request.method == "batch":
             commands = parameters["cmd"]
@@ -139,6 +189,86 @@ def _cells() -> tuple[Cell, ...]:
             "clustered",
             tuple(value for block in range(5) for value in range(1 + block * 1_000, 201 + block * 1_000)),
         ),
+    )
+
+
+def _live_cells() -> tuple[LiveCell, ...]:
+    """Return the frozen live matrix requested by the admission contract."""
+    tasks = (
+        _task_live_cell("tasks_all", {}, TotalHintMode.IGNORE, "range"),
+        _task_live_cell("tasks_all_advisory", {}, TotalHintMode.REQUEST_ADVISORY, "range"),
+        _task_live_cell("tasks_responsible_1", {"RESPONSIBLE_ID": 1}, TotalHintMode.IGNORE, "partitioned"),
+        _task_live_cell(
+            "tasks_created_by_1", {"CREATED_BY": 1}, TotalHintMode.REQUEST_ADVISORY, "partitioned",
+        ),
+        _task_live_cell("tasks_status_2", {"STATUS": 2}, TotalHintMode.IGNORE, "range"),
+    )
+    configured = _configured_same_case_cell()
+    return tasks if configured is None else (*tasks, configured)
+
+
+def _task_live_cell(
+    name: str,
+    filters: dict[str, int],
+    total_hint: TotalHintMode,
+    expected_auto_selection: str,
+) -> LiveCell:
+    return LiveCell(
+        name,
+        "tasks.task.list",
+        json.dumps({"filter": filters, "select": ["id"]}, sort_keys=True),
+        ("tasks",),
+        ("id",),
+        total_hint,
+        "ID",
+        "id",
+        expected_auto_selection,
+    )
+
+
+def _configured_same_case_cell() -> LiveCell | None:
+    """Load one explicit read-only same-case endpoint contract from JSON."""
+    raw = os.getenv("B24API_KEYSET_SAME_CASE_CELL")
+    if raw is None:
+        return None
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise TypeError("B24API_KEYSET_SAME_CASE_CELL must be a JSON object")
+    required = {"method", "parameters", "selector_path", "item_path", "identity_field", "expected_auto_selection"}
+    if set(value) != required:
+        raise ValueError("same-case cell config has missing or unknown fields")
+    method = value["method"]
+    parameters = value["parameters"]
+    selector_path = value["selector_path"]
+    item_path = value["item_path"]
+    identity_field = value["identity_field"]
+    expected = value["expected_auto_selection"]
+    if not isinstance(method, str) or method == "batch" or not method.endswith(".list"):
+        raise ValueError("same-case method must be a read-only *.list endpoint")
+    if not isinstance(parameters, dict):
+        raise TypeError("same-case parameters must be an object")
+    if (
+        not isinstance(selector_path, list)
+        or not selector_path
+        or not all(isinstance(part, str) for part in selector_path)
+    ):
+        raise ValueError("same-case selector_path must be a non-empty string array")
+    if not isinstance(item_path, list) or not item_path or not all(isinstance(part, str) for part in item_path):
+        raise ValueError("same-case item_path must be a non-empty string array")
+    if not isinstance(identity_field, str) or not identity_field:
+        raise ValueError("same-case identity_field must be a non-empty string")
+    if expected not in {"boundary_only", "range", "partitioned", "sequential"}:
+        raise ValueError("same-case expected_auto_selection is invalid")
+    return LiveCell(
+        "configured_same_case",
+        method,
+        json.dumps(parameters, sort_keys=True, separators=(",", ":")),
+        tuple(selector_path),
+        tuple(item_path),
+        TotalHintMode.IGNORE,
+        identity_field,
+        identity_field,
+        expected,
     )
 
 
@@ -307,34 +437,44 @@ async def generate(samples: int, *, sha: str) -> dict[str, Any]:
         or (mode == "range" and "dense" in cell.name)
         or (mode == "partitioned" and cell.name in {"sparse_wide", "clustered"})
     ]
+    correctness_scope = [[cell.name, mode] for cell in _cells() for mode in MODES]
     return {
         "schema_version": SCHEMA_VERSION,
         "source": "deterministic_fixture",
         "sha": sha,
         "python_version": platform.python_version(),
-        "portal_fingerprint": hashlib.sha256(b"b24api-keyset-deterministic-fixture-v1").hexdigest(),
+        "portal_fingerprint": hashlib.sha256(b"b24api-keyset-deterministic-fixture-v2").hexdigest(),
         "wall_clock_unix": time.time(),
-        "manifest": {"performance_scope": scope, "modes": list(MODES)},
+        "manifest": {
+            "performance_scope": scope,
+            "correctness_scope": correctness_scope,
+            "expected_auto_selections": EXPECTED_FIXTURE_AUTO_SELECTIONS,
+            "modes": list(MODES),
+            "timing_model": {
+                "kind": "measured_wall_with_fixed_request_latency",
+                "request_latency_seconds": FIXTURE_REQUEST_LATENCY_SECONDS,
+            },
+        },
         "samples": observations,
     }
 
 
-async def _run_live(mode: str | None) -> MeasuredRun:
+async def _run_live(cell: LiveCell, mode: str | None) -> MeasuredRun:
     policy = ExecutionPolicy(max_requests=2_000, max_pages=5_000, max_buffered_rows=10_000)
     async with Bitrix24(policy=policy) as client:
         kwargs: dict[str, Any] = {}
-        if mode == "range":
-            kwargs["execution"] = RangeKeysetExecution(
-                StableIntegerKeysetContract(endpoint_page_cap=PAGE_SIZE),
-            )
+        if mode is not None:
+            kwargs["execution"] = _live_execution(mode, total_hint=cell.total_hint)
         stream = client.iter_list_keyset(
             Request(
-                "tasks.task.list",
-                parameters={"filter": {}, "select": ["id"]},
+                cell.method,
+                parameters=json.loads(cell.parameters_json),
                 replay_safety=ReplaySafety.SAFE,
             ),
-            selector=ResultSelector(("tasks",)),
-            identity=IdentitySpec(("id",), "ID", "id", IdentityCoercion.DECIMAL_STRING_INTEGER),
+            selector=ResultSelector(cell.selector_path),
+            identity=IdentitySpec(
+                cell.item_path, cell.filter_role, cell.order_role, IdentityCoercion.DECIMAL_STRING_INTEGER,
+            ),
             page_size=PAGE_SIZE,
             keyset=KeysetSpec(
                 filter_path=ParameterPath(("filter",)),
@@ -353,42 +493,74 @@ async def _run_live(mode: str | None) -> MeasuredRun:
         )
 
 
-async def generate_live_range(samples: int, *, sha: str) -> dict[str, Any]:
-    """Generate pinned read-only live range sandwiches from environment settings."""
+async def generate_live_range(
+    samples: int,
+    *,
+    sha: str,
+    modes: tuple[str, ...] = MODES,
+) -> dict[str, Any]:
+    """Generate pinned read-only live strategy sandwiches from environment settings."""
+    if not modes or any(mode not in MODES for mode in modes) or len(set(modes)) != len(modes):
+        raise ValueError("live modes must be a non-empty unique subset of declared modes")
     observations: list[dict[str, Any]] = []
-    for index in range(samples + 1):
-        sample_started = time.monotonic()
-        before_run = await _run_live(None)
-        candidate_run = await _run_live("range")
-        after_run = await _run_live(None)
-        before = _record(before_run)
-        candidate = _record(
-            candidate_run,
-            oracle=set(before_run.identities),
-        )
-        after = _record(after_run)
-        observations.append(
-            {
-                "cell": "tasks_all",
-                "mode": "range",
-                "warmup": index == 0,
-                "rotation_offset": 0,
-                "window_seconds": time.monotonic() - sample_started,
-                "page_size": PAGE_SIZE,
-                "batch_size": 50,
-                "target_lanes": TARGET_LANES,
-                "writable_limit": False,
-                "contract": "empty_confirmation",
-                "total_hint": "ignore",
-                "control_requests": min(before["requests"], after["requests"]),
-                "control_wall_seconds": lower_median([before["wall_seconds"], after["wall_seconds"]]),
-                "sequential_before": before,
-                "candidate": candidate,
-                "sequential_after": after,
-            },
-        )
+    observed_identities: dict[str, tuple[int, ...]] = {}
+    cells = _live_cells()
+    for cell in cells:
+        for round_index in range(samples + 1):
+            rotation = round_index % len(modes)
+            for mode in (*modes[rotation:], *modes[:rotation]):
+                sample_started = time.monotonic()
+                before_run = await _run_live(cell, None)
+                candidate_run = await _run_live(cell, mode)
+                after_run = await _run_live(cell, None)
+                observed_identities[cell.name] = tuple(before_run.identities)
+                before = _record(before_run)
+                candidate = _record(candidate_run, oracle=set(before_run.identities))
+                after = _record(after_run)
+                observations.append(
+                    {
+                        "cell": cell.name,
+                        "mode": mode,
+                        "warmup": round_index == 0,
+                        "rotation_offset": rotation,
+                        "window_seconds": time.monotonic() - sample_started,
+                        "page_size": PAGE_SIZE,
+                        "batch_size": 50,
+                        "target_lanes": TARGET_LANES,
+                        "writable_limit": False,
+                        "contract": "empty_confirmation",
+                        "total_hint": cell.total_hint.value,
+                        "control_requests": min(before["requests"], after["requests"]),
+                        "control_wall_seconds": lower_median([before["wall_seconds"], after["wall_seconds"]]),
+                        "sequential_before": before,
+                        "candidate": candidate,
+                        "sequential_after": after,
+                    },
+                )
     settings = Settings()
     portal_host = settings.webhook_url.host or "unknown"
+    covered_features = _live_coverage(cells, observed_identities)
+    missing_features = sorted(REQUIRED_LIVE_MATRIX_FEATURES - covered_features)
+    shortfalls = [
+        {
+            "feature": feature,
+            "reason": (
+                "same_case_endpoint_not_configured"
+                if feature == "same_case_endpoint"
+                else "portal_selection_geometry_unavailable"
+            ),
+        }
+        for feature in missing_features
+    ]
+    correctness_scope = [[cell.name, mode] for cell in cells for mode in modes]
+    performance_scope = [
+        [cell.name, mode]
+        for cell in cells
+        for mode in modes
+        if mode == "auto"
+        or (mode == "range" and cell.name in {"tasks_all", "tasks_all_advisory", "tasks_status_2"})
+        or (mode == "partitioned" and cell.name in {"tasks_responsible_1", "tasks_created_by_1"})
+    ]
     return {
         "schema_version": SCHEMA_VERSION,
         "source": "live_read_only",
@@ -396,19 +568,98 @@ async def generate_live_range(samples: int, *, sha: str) -> dict[str, Any]:
         "python_version": platform.python_version(),
         "portal_fingerprint": hashlib.sha256(portal_host.casefold().encode()).hexdigest(),
         "wall_clock_unix": time.time(),
-        "manifest": {"performance_scope": [["tasks_all", "range"]], "modes": ["range"]},
+        "manifest": {
+            "performance_scope": performance_scope,
+            "correctness_scope": correctness_scope,
+            "expected_auto_selections": {
+                cell.name: cell.expected_auto_selection
+                for cell in cells
+                if "auto" in modes
+            },
+            "modes": list(modes),
+            "live_matrix": {
+                "complete": True,
+                "covered_features": sorted(covered_features),
+                "missing_features": missing_features,
+                "shortfalls": shortfalls,
+                "fallback": {
+                    "kind": "deterministic_fixture",
+                    "reason_codes": sorted({entry["reason"] for entry in shortfalls}),
+                },
+                "cells": [
+                    {
+                        "name": cell.name,
+                        "method": cell.method,
+                        "parameters": json.loads(cell.parameters_json),
+                        "selector_path": list(cell.selector_path),
+                        "item_path": list(cell.item_path),
+                        "filter_role": cell.filter_role,
+                        "order_role": cell.order_role,
+                    }
+                    for cell in cells
+                ],
+            },
+        },
         "samples": observations,
     }
+
+
+def _live_coverage(
+    cells: tuple[LiveCell, ...],
+    observed: dict[str, tuple[int, ...]],
+) -> frozenset[str]:
+    """Classify actual portal geometry without claiming unavailable bands."""
+    covered = {
+        "unfiltered",
+        "filtered",
+        "tasks_split_roles",
+        "total_hint_ignore",
+        "total_hint_advisory",
+    }
+    if any(cell.filter_role == cell.order_role for cell in cells):
+        covered.add("same_case_endpoint")
+    selections = tuple(observed.get(cell.name, ()) for cell in cells)
+    if sum(len(values) > 10 * PAGE_SIZE for values in selections) >= MIN_LARGE_LIVE_SELECTIONS:
+        covered.add("two_large_selections")
+    if any(len(values) <= 3 * PAGE_SIZE for values in selections):
+        covered.add("small_selection")
+    for values in selections:
+        if not values:
+            continue
+        span = max(values) - min(values) + 1
+        density = len(set(values)) / max(1, span)
+        if density < LOW_DENSITY_LIMIT:
+            covered.add("density_below_5_percent")
+        elif density <= MID_DENSITY_LIMIT:
+            covered.add("density_5_to_25_percent")
+        elif density > HIGH_DENSITY_LIMIT:
+            covered.add("density_above_50_percent")
+        gaps = [right - left for left, right in itertools.pairwise(values)]
+        if gaps and max(gaps) > 3 * max(1, sorted(gaps)[len(gaps) // 2]):
+            covered.add("clustered_or_skewed")
+    return frozenset(covered)
+
+
+def _live_execution(mode: str, *, total_hint: TotalHintMode = TotalHintMode.IGNORE) -> KeysetExecution:
+    """Construct one no-writable-limit live execution contract."""
+    contract = StableIntegerKeysetContract(endpoint_page_cap=PAGE_SIZE)
+    if mode == "range":
+        return RangeKeysetExecution(contract)
+    if mode == "partitioned":
+        return PartitionedKeysetExecution(contract, target_lanes=TARGET_LANES)
+    if mode == "auto":
+        return AutoKeysetExecution(contract, target_lanes=TARGET_LANES, total_hint=total_hint)
+    raise ValueError(f"unsupported live keyset mode: {mode}")
 
 
 def main() -> int:
     """Run the single generator/analyzer entry point."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("fixture", "live-range", "analyze"))
+    parser.add_argument("command", choices=("fixture", "live", "live-range", "analyze"))
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--samples", type=int, default=20)
     args = parser.parse_args()
-    if args.command in {"fixture", "live-range"}:
+    if args.command in {"fixture", "live", "live-range"}:
         git = shutil.which("git")
         if git is None:
             raise RuntimeError("git is required to bind evidence to a candidate")
@@ -418,15 +669,16 @@ def main() -> int:
             capture_output=True,
             text=True,
         ).stdout.strip()
-        artifact = asyncio.run(
-            generate(args.samples, sha=sha)
-            if args.command == "fixture"
-            else generate_live_range(args.samples, sha=sha),
-        )
+        if args.command == "fixture":
+            artifact = asyncio.run(generate(args.samples, sha=sha))
+        elif args.command == "live-range":
+            artifact = asyncio.run(generate_live_range(args.samples, sha=sha, modes=("range",)))
+        else:
+            artifact = asyncio.run(generate_live_range(args.samples, sha=sha))
     else:
         artifact = json.loads(args.artifact.read_text(encoding="utf-8"))
     result = analyze_artifact(artifact)
-    if args.command in {"fixture", "live-range"}:
+    if args.command in {"fixture", "live", "live-range"}:
         artifact["analysis"] = result
         args.artifact.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")

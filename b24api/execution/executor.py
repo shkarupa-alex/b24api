@@ -53,6 +53,24 @@ type Sleeper = Callable[[float], Awaitable[None]]
 
 _HTTP_STATUS_MINIMUM = 100
 _HTTP_STATUS_MAXIMUM = 599
+
+
+class _DecodedJsonObject(dict[str, object]):
+    """Last-member-wins JSON object retaining duplicate-name evidence."""
+
+    __slots__ = ("duplicate_names",)
+
+    def __init__(self, pairs: list[tuple[str, object]]) -> None:
+        duplicates: list[str] = []
+        values: dict[str, object] = {}
+        for key, value in pairs:
+            if key in values:
+                duplicates.append(key)
+            values[key] = value
+        super().__init__(values)
+        self.duplicate_names = tuple(duplicates)
+
+
 _HTTP_SUCCESS_MINIMUM = 200
 _HTTP_SUCCESS_MAXIMUM = 299
 _HTTP_REDIRECTION_MINIMUM = 300
@@ -102,16 +120,23 @@ class Executor:
         context: ExecutionContext | None = None,
         policy: ExecutionPolicy | None = None,
         work_class: WorkClass = WorkClass.INTERACTIVE_DIRECT,
+        strict_json_members: bool = False,
     ) -> Response:
         """Execute one canonical request."""
         if context is not None and policy is not None:
             raise ValueError("pass context or policy, not both")
         if not isinstance(request, Request):
             raise TypeError("request must be canonical Request")
+        if not isinstance(strict_json_members, bool):
+            raise TypeError("strict_json_members must be a boolean")
         context = context or self.context(policy)
         wire = await self._execute_wire(request, context=context, work_class=work_class, binary=False)
         try:
-            response = _decode_success(wire, request_summary=request.summary)
+            response = _decode_success(
+                wire,
+                request_summary=request.summary,
+                strict_json_members=strict_json_members,
+            )
             _raise_embedded_result_error(
                 request,
                 response.result,
@@ -545,14 +570,18 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912
         )
 
 
-def _decode_success(wire: WireResponse, *, request_summary: RequestSummary) -> Response:
+def _decode_success(
+    wire: WireResponse, *, request_summary: RequestSummary, strict_json_members: bool = False,
+) -> Response:
     evidence = _wire_evidence(wire)
     try:
         payload = json.loads(
             wire.body,
             parse_constant=_reject_json_constant,
-            object_pairs_hook=_reject_duplicate_json_keys,
+            object_pairs_hook=_DecodedJsonObject if strict_json_members else None,
         )
+        if strict_json_members:
+            _reject_duplicate_batch_correlation_keys(payload)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
         raise EnvelopeContractError(
             "Malformed successful HTTP response",
@@ -654,14 +683,17 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON constant is forbidden: {value}")
 
 
-def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    """Decode an object while enforcing unique JSON member names."""
-    decoded: dict[str, object] = {}
-    for key, value in pairs:
-        if key in decoded:
-            raise ValueError(f"duplicate JSON object name: {key}")
-        decoded[key] = value
-    return decoded
+def _reject_duplicate_batch_correlation_keys(payload: object) -> None:
+    """Enforce unique command keys without changing ordinary row JSON semantics."""
+    if not isinstance(payload, Mapping):
+        return
+    batch_envelope = payload.get("result")
+    if not isinstance(batch_envelope, Mapping):
+        return
+    for field in ("result", "result_error", "result_total", "result_next"):
+        correlation = batch_envelope.get(field)
+        if isinstance(correlation, _DecodedJsonObject) and correlation.duplicate_names:
+            raise ValueError(f"duplicate batch correlation key in {field}")
 
 
 __all__ = ["Executor"]

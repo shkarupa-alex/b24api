@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from b24api.contracts.request import IdentitySpec
     from b24api.contracts.response import ResultCollectionShape
     from b24api.contracts.traversal import KeysetSpec
+    from b24api.traversal.keyset_auto import FinalSelection, Preselection
 
 type Identity = int
 MIN_WINDOW_WIDTH = 2
@@ -95,6 +96,15 @@ class FastKeysetPlan:
     keyset: KeysetSpec
     collection_shape: ResultCollectionShape
     finish_cursor: Identity | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlanOutcome:
+    """Freeze the selected plan together with automatic-selection evidence."""
+
+    plan: FastKeysetPlan
+    preselection: Preselection | None
+    final: FinalSelection | None
 
 
 def plan_windows(*, lo: Identity, upper_exclusive: Identity, width: int) -> tuple[LaneSpec, ...]:
@@ -183,6 +193,7 @@ __all__ = [
     "LaneSpec",
     "LaneState",
     "LaneStatus",
+    "PlanOutcome",
     "fit_wave",
     "plan_lanes_from_anchors",
     "plan_windows",

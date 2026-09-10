@@ -37,13 +37,13 @@ from b24api.traversal.counted import CountedItemStream
 from b24api.traversal.keyset_eligibility import validate_fast_keyset
 from b24api.traversal.keyset_fast_stream import FastTraceRecorder, KeysetFastStream
 from b24api.traversal.keyset_scheduler import KeysetFastScheduler
+from b24api.traversal.keyset_step import sequential_keyset_plan
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
     CursorTerminalRule,
     ItemCursorPlan,
     KeysetPlan,
-    KeysetTerminalRule,
     OffsetSequentialPlan,
     OffsetTerminalRule,
 )
@@ -204,22 +204,7 @@ def keyset_stream(  # noqa: PLR0913
             deregister=deregister,
             audit_violations=audit_violations,
         )
-    direction = _direction(keyset.direction)
-    plan = KeysetPlan(
-        direction=direction,
-        filter_path=keyset.filter_path,
-        order_path=keyset.order_path,
-        split_order=keyset.split_order,
-        start_suppression_path=keyset.start_suppression_path,
-        limit_path=keyset.limit_path,
-        requested_page_size=page_size if keyset.limit_path is not None else None,
-        terminal=KeysetTerminalRule.EMPTY_CONFIRMATION,
-        allow_create_controls=keyset.allow_create_controls,
-        identity_requirement=IdentityRequirement.REQUIRED,
-        order_semantics=OrderSemantics.ASCENDING if direction == "asc" else OrderSemantics.DESCENDING,
-        duplicate_policy=DuplicatePolicy.ERROR,
-        total_semantics=TotalSemantics.IGNORE,
-    )
+    plan = sequential_keyset_plan(keyset, page_size)
     return _plan_stream(
         executor,
         request,
