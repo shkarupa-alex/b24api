@@ -2989,3 +2989,15 @@ def _run_cli(*arguments: str, environment: dict[str, str] | None = None) -> subp
         capture_output=True,
         text=True,
     )
+
+
+def test_standalone_entrypoint_prefers_its_repository_over_environment_checkout(tmp_path: Path) -> None:
+    stale_package = tmp_path / "b24api"
+    stale_package.mkdir()
+    (stale_package / "__init__.py").write_text('raise RuntimeError("stale checkout imported")\n', encoding="utf-8")
+    environment = {**os.environ, "PYTHONPATH": str(tmp_path)}
+
+    result = _run_cli("--help", environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("usage: b24api_evidence.py")

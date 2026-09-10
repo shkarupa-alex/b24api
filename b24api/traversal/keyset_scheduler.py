@@ -294,7 +294,7 @@ class KeysetFastScheduler:
             wave_receipts = await self._wave(wave)
             if compact_anchors:
                 wave_receipts, discarded, retained = compact_anchor_receipts(wave_receipts)
-                self.admission.record_raw(discarded)
+                self.admission.record_raw(discarded + retained)
                 self.admission.record_discarded(discarded)
                 await self._adjust_buffer(retained)
             receipts.extend(wave_receipts)
@@ -309,13 +309,13 @@ class KeysetFastScheduler:
             abort_staged_observations(self._staged_observations, self._record, self.admission, self.violations)
             raise
 
-    def _consume_anchors(self, receipts: tuple[LaneReceipt, ...], *, lo: int, hi: int) -> tuple[int, ...]:
+    def _consume_anchors(self, receipts: tuple[LaneReceipt, ...], lo: int, hi: int, charged: int) -> tuple[int, ...]:
         result = normalize_anchor_receipts(receipts, lo=lo, upper_exclusive=hi)
         self._anchor_rows = result.rows
         self._anchor_commands = result.commands
         self._empty_anchor_probes = result.empty_probes
         self._anchor_count = len(result.anchors)
-        self.admission.record_raw(result.raw_rows)
+        self.admission.record_raw(result.raw_rows - charged)
         self.admission.record_discarded(result.discarded_rows)
         return result.anchors
 
@@ -349,7 +349,7 @@ class KeysetFastScheduler:
                 self.admission.record_discarded(len(asc.rows) + len(desc.rows))
             abort_staged_observations(self._staged_observations, self._record, self.admission, self.violations)
             raise
-        result = self._consume_anchors(anchor_receipts, lo=max(asc.identities), hi=min(desc.identities))
+        result = self._consume_anchors(anchor_receipts, max(asc.identities), min(desc.identities), precharged)
         await self._adjust_buffer(self._anchor_count - precharged)
         return result
 

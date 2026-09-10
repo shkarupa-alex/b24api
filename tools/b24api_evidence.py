@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from tools.b24api_evidence.harness.cli import main
 else:
-    sys.path.insert(0, str(Path(__file__).with_suffix("")))
-    from harness.cli import main
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from tools.b24api_evidence.harness.cli import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

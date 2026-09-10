@@ -825,6 +825,8 @@ async def test_auto_discards_precharged_anchor_objects_when_post_probe_gain_is_l
     assert scheduler._boundary_totals == {}
     assert scheduler._buffer_balance == PAGE_SIZE
     await stream.aclose()
+    assert stream.report.keyset_execution is not None
+    assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.ORDERED_PREFIX_ONLY
 
 
 @pytest.mark.asyncio
@@ -1475,6 +1477,20 @@ async def test_separate_anchor_failure_discards_previously_validated_boundaries(
     assert stream.report.keyset_execution is not None
     selected = sum(record.rows_selected for record in stream.report.page_trace)
     assert stream.report.keyset_execution.probe_rows_discarded == selected
+
+
+@pytest.mark.asyncio
+async def test_later_anchor_wave_failure_accounts_for_prior_compacted_rows() -> None:
+    stream = _stream(
+        NthBatchMissingResultTransport(tuple(range(1, 101)), batch_ordinal=6),
+        PartitionedKeysetExecution(StableIntegerKeysetContract(), batch_size=2, target_lanes=5),
+    )
+
+    with pytest.raises(IncompleteTraversalError):
+        await anext(stream)
+    assert stream.report.keyset_execution is not None
+    assert stream._source._scheduler.counters.raw_rows == 18
+    assert stream.report.keyset_execution.probe_rows_discarded == 18
 
 
 @pytest.mark.asyncio

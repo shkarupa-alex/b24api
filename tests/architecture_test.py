@@ -219,3 +219,10 @@ def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
 
     transactions = ast.parse((PACKAGE / "traversal" / "keyset_transactions.py").read_text(encoding="utf-8"))
     assert not any(isinstance(node, ast.ClassDef) for node in transactions.body)
+    assignments = (ast.Assign, ast.AnnAssign, ast.AugAssign)
+    assert all(
+        isinstance(node, ast.Assign)
+        and all(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
+        for node in transactions.body
+        if isinstance(node, assignments)
+    )

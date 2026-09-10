@@ -61,6 +61,7 @@ def build_scheduler_report(scheduler: KeysetFastScheduler) -> KeysetExecutionRep
         assurance_source=(
             KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS
             if scheduler._assured
+            and scheduler._selected in {KeysetExecutionKind.RANGE, KeysetExecutionKind.PARTITIONED}
             else KeysetAssuranceSource.ORDERED_PREFIX_ONLY
         ),
         planning_requests=scheduler._planning_physical_requests,
