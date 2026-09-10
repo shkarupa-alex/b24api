@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 import inspect
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 from typing import is_typeddict
 
 import pytest
 
 import b24api
+import b24api.errors
 from b24api.contracts import (
     BatchDispatch,
     Binding,
@@ -48,46 +49,149 @@ BATCH_SIZE = 7
 SUMMARY_LIMIT = 256
 
 
-def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
-    assert b24api.__all__ == [
+def test_public_error_module_export_snapshot_is_static_contract_evidence() -> None:
+    assert b24api.errors.__all__ == (
         "AmbiguousExecutionError",
         "ApiResponseError",
         "B24ApiError",
         "BatchCommandError",
-        "BatchDispatch",
         "BatchFailed",
-        "Binding",
-        "Bitrix24",
         "BudgetExceededError",
         "CapabilityError",
+        "EnvelopeContractError",
+        "ErrorOrigin",
+        "FailurePhase",
+        "HTTPGatewayError",
+        "IdentityContractError",
+        "IncompleteTraversalError",
+        "InputSourceError",
+        "PaginationError",
+        "ProtocolError",
+        "ReferenceFailed",
+        "ResponseTooLargeError",
+        "ResultShapeError",
+        "TransportError",
+    )
+
+
+def test_keyset_execution_report_declaration_snapshot() -> None:
+    expected = (
+        ("requested_kind", "KeysetExecutionKind"),
+        ("selected_kind", "KeysetExecutionKind"),
+        ("preselection_reason", "KeysetSelectionReason"),
+        ("final_selection_reason", "KeysetSelectionReason | None"),
+        ("assurance_source", "KeysetAssuranceSource"),
+        ("planning_requests", "int"),
+        ("boundary_requests", "int"),
+        ("canary_requests", "int"),
+        ("anchor_probe_requests", "int"),
+        ("canary_commands", "int"),
+        ("canary_rows", "int"),
+        ("anchor_probe_commands", "int"),
+        ("anchor_count", "int"),
+        ("empty_anchor_probes", "int"),
+        ("probe_rows_discarded", "int"),
+        ("boundary_overlap_rows", "int"),
+        ("head_page_admitted", "bool"),
+        ("sequential_requests_estimate", "int | None"),
+        ("selected_requests_estimate", "int | None"),
+        ("head_rows", "int"),
+        ("tail_rows", "int"),
+        ("interior_span", "int | None"),
+        ("interior_rows_estimate", "int | None"),
+        ("total_rows_estimate", "int | None"),
+        ("density_numerator", "int | None"),
+        ("density_denominator", "int | None"),
+        ("effective_window_width", "int | None"),
+        ("range_window_count", "int | None"),
+        ("target_lanes", "int | None"),
+        ("actual_lanes", "int | None"),
+        ("continuation_count", "int"),
+        ("closure_witness_counts", "tuple[tuple[ClosureWitness, int], ...]"),
+        ("effective_batch_capacity", "int"),
+        ("total_hint_requested", "bool"),
+        ("total_hint_observed", "int | None"),
+        ("total_hint_plausible", "bool"),
+        ("total_hint_used", "bool"),
+        ("trace_retained_by_class", "tuple[tuple[TraceClass, int], ...]"),
+        ("trace_dropped_by_class", "tuple[tuple[TraceClass, int], ...]"),
+    )
+
+    assert (
+        tuple(
+            (field.name, b24api.KeysetExecutionReport.__annotations__[field.name])
+            for field in fields(b24api.KeysetExecutionReport)
+        )
+        == expected
+    )
+
+
+def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
+    assert b24api.__all__ == [
+        "AmbiguityPolicy",
+        "AmbiguityReason",
+        "AmbiguousExecutionError",
+        "ApiResponseError",
+        "AutoKeysetExecution",
+        "B24ApiError",
+        "BatchCommandError",
+        "BatchDispatch",
+        "BatchFailed",
+        "BinaryEvidence",
+        "BinaryResponse",
+        "Binding",
+        "Bitrix24",
+        "BodyEncoding",
+        "BudgetExceededError",
+        "CapabilityError",
+        "ClosureWitness",
         "Command",
         "CommandFailure",
         "CommandNotExecuted",
         "CommandOutcome",
         "CommandOutcomeUnknown",
         "CommandSuccess",
+        "CompositeIdentitySpec",
+        "ConsistencyPolicy",
         "CountedTraversal",
         "CursorSpec",
         "CursorTraversal",
         "DeliveryOrder",
         "DirectDispatch",
+        "EnvelopeContractError",
         "ExecutionPolicy",
         "HTTPGatewayError",
         "IdentityCoercion",
+        "IdentityComponent",
+        "IdentityContractError",
         "IdentitySpec",
         "IncompleteTraversalError",
         "InputSourceError",
+        "KeysetAssuranceSource",
+        "KeysetExecution",
+        "KeysetExecutionKind",
+        "KeysetExecutionReport",
+        "KeysetPageCompletion",
+        "KeysetPhase",
+        "KeysetSelectionReason",
         "KeysetSpec",
         "KeysetTraversal",
         "NotExecutedReason",
+        "OffsetContinuation",
         "OffsetSpec",
         "OperationReport",
         "OperationStream",
+        "PageDispatch",
+        "PageOutcome",
+        "PageRecord",
+        "PageRejectionCode",
         "PaginationError",
         "ParameterPath",
         "ParameterUpdate",
         "PartialResult",
+        "PartitionedKeysetExecution",
         "ProtocolError",
+        "RangeKeysetExecution",
         "ReferenceComplete",
         "ReferenceEvent",
         "ReferenceFailed",
@@ -98,28 +202,49 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "ReferenceOutcomeUnknown",
         "ReplaySafety",
         "Request",
+        "RequestHeaders",
+        "RequestSummary",
         "Response",
         "ResponseTooLargeError",
         "ResultCollectionShape",
+        "ResultErrorShape",
+        "ResultErrorSpec",
         "ResultSelector",
+        "ResultShapeError",
+        "RetryPolicy",
+        "SequentialKeysetExecution",
         "SequentialTraversal",
         "Settings",
+        "SplitOrderSpec",
+        "StableIntegerKeysetContract",
         "TerminalState",
+        "TotalHintMode",
+        "TotalTermination",
+        "TraceClass",
         "Transport",
+        "TransportCapabilities",
         "TransportError",
         "TraversalAssurance",
+        "TraversalIdentity",
+        "UnknownRequestAudit",
+        "UnknownRequestCollector",
         "Violation",
         "ViolationSeverity",
+        "WireRequest",
         "WireResponse",
+        "WireTransport",
         "partition_command_outcomes",
         "partition_reference_outcomes",
+        "traversal_control_paths",
     ]
 
 
 def test_request_mapping_contract_is_a_closed_typed_dict() -> None:
     assert is_typeddict(RequestSpec)
     assert RequestSpec.__required_keys__ == frozenset({"method"})
-    assert RequestSpec.__optional_keys__ == frozenset({"parameters", "replay_safety"})
+    assert RequestSpec.__optional_keys__ == frozenset(
+        {"parameters", "replay_safety", "encoding", "headers", "result_error"},
+    )
 
 
 def test_not_executed_reason_is_the_exact_frozen_enum() -> None:

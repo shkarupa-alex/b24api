@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from b24api.contracts.json import _is_plain_int
 
+if TYPE_CHECKING:
+    from b24api.contracts.request import RequestSummary
+
 HTTP_STATUS_MINIMUM = 100
 HTTP_STATUS_MAXIMUM = 599
+PAGE_TRACE_LIMIT_MAXIMUM = 1024
 
 
 class ReplayDisposition(StrEnum):
@@ -106,6 +112,67 @@ class SnapshotState(StrEnum):
     CHANGED = "changed"
 
 
+class AmbiguityReason(StrEnum):
+    """Why a dispatched request has no conclusive execution outcome."""
+
+    HTTP_STATUS_AFTER_DISPATCH = "http_status_after_dispatch"
+    CONNECTION_LOST_AFTER_DISPATCH = "connection_lost_after_dispatch"
+    RESPONSE_LIMIT_AFTER_DISPATCH = "response_limit_after_dispatch"
+    DEADLINE_AFTER_DISPATCH = "deadline_after_dispatch"
+
+
+@dataclass(frozen=True, slots=True)
+class AmbiguityPolicy:
+    """Unstructured statuses that do not prove non-execution."""
+
+    ambiguous_unstructured_statuses: frozenset[int] = frozenset({408, *range(500, 600)})
+
+    def __post_init__(self) -> None:
+        """Validate and freeze the status set."""
+        object.__setattr__(self, "ambiguous_unstructured_statuses", frozenset(self.ambiguous_unstructured_statuses))
+        if any(
+            not _is_plain_int(status) or status < HTTP_STATUS_MINIMUM or status > HTTP_STATUS_MAXIMUM
+            for status in self.ambiguous_unstructured_statuses
+        ):
+            raise ValueError("ambiguity HTTP statuses must be between 100 and 599")
+
+
+type UnknownRequestAudit = Callable[[RequestSummary], None]
+
+
+class UnknownRequestCollector:
+    """Bounded observational collector for requests with undeclared replay safety."""
+
+    def __init__(self, *, limit: int = 256) -> None:
+        """Create a collector retaining at most ``limit`` summaries."""
+        if not _is_plain_int(limit) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        self._limit = limit
+        self._summaries: list[RequestSummary] = []
+        self._observed = 0
+
+    def __call__(self, summary: RequestSummary) -> None:
+        """Record one immutable request summary."""
+        self._observed += 1
+        if len(self._summaries) < self._limit:
+            self._summaries.append(summary)
+
+    @property
+    def summaries(self) -> tuple[RequestSummary, ...]:
+        """Return retained summaries in first-observed order."""
+        return tuple(self._summaries)
+
+    @property
+    def observed(self) -> int:
+        """Return the total number observed, including after saturation."""
+        return self._observed
+
+    def clear(self) -> None:
+        """Clear retained summaries and the observation counter."""
+        self._summaries.clear()
+        self._observed = 0
+
+
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
     """Explicit retry classifications and delay bounds."""
@@ -191,12 +258,23 @@ class ExecutionPolicy:
     max_active_references: int = 100
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     consistency: ConsistencyPolicy = field(default_factory=ConsistencyPolicy.traversal)
+    ambiguity: AmbiguityPolicy = field(default_factory=AmbiguityPolicy)
+    binary_digest: bool = False
+    page_trace_limit: int = 64
     debug_evidence: bool = False
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
-        if not isinstance(self.retry, RetryPolicy) or not isinstance(self.consistency, ConsistencyPolicy):
-            raise TypeError("retry and consistency must be typed policies")
+        if (
+            not isinstance(self.retry, RetryPolicy)
+            or not isinstance(self.consistency, ConsistencyPolicy)
+            or not isinstance(self.ambiguity, AmbiguityPolicy)
+        ):
+            raise TypeError("retry, consistency and ambiguity must be typed policies")
+        if not isinstance(self.binary_digest, bool) or not isinstance(self.debug_evidence, bool):
+            raise TypeError("boolean policy controls must be bool values")
+        if not _is_plain_int(self.page_trace_limit) or not 0 <= self.page_trace_limit <= PAGE_TRACE_LIMIT_MAXIMUM:
+            raise ValueError("page_trace_limit must be between 0 and 1024")
         positive_integers = (
             self.max_requests,
             self.max_pages,

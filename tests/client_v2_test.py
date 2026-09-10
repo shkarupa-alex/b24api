@@ -298,7 +298,7 @@ async def test_public_counted_traversal_above_100k_stays_exact_and_warns_once() 
     assert count == LARGE_COUNTED_ROWS
     assert stream.report is not None
     assert stream.report.unique_rows == LARGE_COUNTED_ROWS
-    assert stream.report.assurance is TraversalAssurance.IDENTITY_EXACT
+    assert stream.report.assurance is TraversalAssurance.IDENTITY_AND_COUNT_MATCHED
 
 
 @pytest.mark.asyncio
@@ -1212,6 +1212,7 @@ async def test_counted_missing_in_band_stride_fails_incomplete() -> None:
         identity=_identity(),
     )
 
+    assert await anext(stream) == {"ID": 1}
     with pytest.raises(IncompleteTraversalError, match="did not complete") as captured:
         await anext(stream)
 

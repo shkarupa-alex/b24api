@@ -24,7 +24,6 @@ from b24api.traversal.plans import (
 
 if TYPE_CHECKING:
     from b24api.contracts.policy import ExecutionPolicy
-    from b24api.execution.snapshot import KernelReport
     from b24api.references.outcome import ReferenceRequest
 
 
@@ -184,8 +183,3 @@ def _active_limit(order: ReferenceOutputOrder, policy: ExecutionPolicy, page_cap
         return policy.max_active_references
     buffer_bound = max(1, policy.max_buffered_rows // page_cap + 1)
     return min(policy.max_active_references, buffer_bound)
-
-
-def _attach_report(error: BaseException, report: KernelReport) -> None:
-    with contextlib.suppress(AttributeError, TypeError):
-        error.report = report  # type: ignore[attr-defined]

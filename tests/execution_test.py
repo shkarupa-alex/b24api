@@ -248,6 +248,16 @@ def _policy(*, attempts: int = 3, delay: float = 0.0, elapsed: float = 10.0) -> 
 
 
 @pytest.mark.asyncio
+async def test_terminal_negative_one_next_is_normalized() -> None:
+    transport = SequenceTransport([_success(b'{"result":[],"next":-1}')])
+
+    response = await Executor(transport).execute(Request("mobile.disk.folder.getchildren"))
+
+    assert response.result == []
+    assert response.next is None
+
+
+@pytest.mark.asyncio
 async def test_safe_and_unknown_retry_only_when_replay_is_proven() -> None:
     pre_dispatch = TransportError("connect", phase=FailurePhase.NOT_DISPATCHED)
     safe_transport = SequenceTransport([pre_dispatch, _success()])
@@ -750,7 +760,6 @@ async def test_negative_one_total_sentinel_is_preserved_but_lower_values_are_typ
 @pytest.mark.parametrize(
     "body",
     [
-        pytest.param(b'{"result":[],"next":-1}', id="negative-next"),
         pytest.param(b'{"result":1e400}', id="overflowed-result-number"),
         pytest.param(b'{"result":[],"time":{"duration":-1}}', id="negative-server-duration"),
     ],

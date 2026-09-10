@@ -55,7 +55,33 @@ def _response_json(response: Response) -> dict[str, object]:
 
 
 def _report_json(report: OperationReport) -> dict[str, object]:
-    return {"kind": "report", **dataclasses.asdict(report)}
+    result: dict[str, object] = {
+        "kind": "report",
+        "state": report.state,
+        "operation": report.operation,
+        "terminal_reason": report.terminal_reason,
+        "assurance": report.assurance,
+        "admitted": report.admitted,
+        "emitted": report.emitted,
+        "successes": report.successes,
+        "failures": report.failures,
+        "not_executed": report.not_executed,
+        "unknown": report.unknown,
+        "unique_rows": report.unique_rows,
+        "physical_requests": report.physical_requests,
+        "logical_pages": report.logical_pages,
+        "batch_requests": report.batch_requests,
+        "batch_commands": report.batch_commands,
+        "retries": report.retries,
+        "cooldown_seconds": report.cooldown_seconds,
+        "buffered_commands_high_water": report.buffered_commands_high_water,
+        "buffered_rows_high_water": report.buffered_rows_high_water,
+        "active_references_high_water": report.active_references_high_water,
+        "violations": tuple(dataclasses.asdict(item) for item in report.violations),
+    }
+    if report.keyset_execution is not None:
+        result["keyset_execution"] = dataclasses.asdict(report.keyset_execution)
+    return result
 
 
 def _safe_error(error: BaseException) -> dict[str, object]:

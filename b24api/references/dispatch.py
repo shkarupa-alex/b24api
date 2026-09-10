@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure
 from b24api.contracts.policy import ReplayDisposition
+from b24api.contracts.report import PageDispatch
 from b24api.errors import BudgetExceededError, CapabilityError
 from b24api.execution import (
     ExecutionContext,
@@ -25,7 +26,7 @@ from b24api.references.outcome import (
 if TYPE_CHECKING:
     from b24api.contracts.command import NotExecutedReason
     from b24api.contracts.json import JsonValue
-    from b24api.contracts.report import Violation
+    from b24api.contracts.report import PageRecord, Violation
     from b24api.contracts.request import Request
     from b24api.contracts.response import Response
     from b24api.traversal.plans import (
@@ -60,6 +61,7 @@ class _PageEvent:
     item_weights: tuple[int, ...]
     unique_mask: tuple[bool, ...]
     violations: tuple[Violation, ...]
+    page_records: tuple[PageRecord, ...]
     reservation: _Reservation
     acknowledged: asyncio.Future[None]
 
@@ -69,6 +71,7 @@ class _DoneEvent:
     work: _Work
     row_count: int
     violations: tuple[Violation, ...]
+    page_records: tuple[PageRecord, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +82,7 @@ class _FailureEvent:
     page_state: int
     partial_rows: int
     violations: tuple[Violation, ...]
+    page_records: tuple[PageRecord, ...] = ()
     replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
     not_executed_reason: NotExecutedReason | None = None
 
@@ -107,13 +111,23 @@ class _ReferenceWindowError(Exception):
     def __init__(self, failure: ReferenceFailure) -> None:
         self.failure = failure
         super().__init__("reference traversal window failed")
+        self.report_cause = failure.error if isinstance(failure.error, BaseException) else self
+        if self.report_cause is not self:
+            self.__cause__ = self.report_cause
 
 
 @dataclass(slots=True)
 class _PendingBatch:
     request: Request
     reference_id: str
-    future: asyncio.Future[Response]
+    future: asyncio.Future[_DispatchedPage]
+
+
+@dataclass(frozen=True, slots=True)
+class _DispatchedPage:
+    response: Response
+    dispatch: PageDispatch
+    batch_index: int | None = None
 
 
 @dataclass(slots=True)
@@ -253,7 +267,7 @@ class _DirectPageDispatcher:
         self.batch_requests = 0
         self.batch_commands = 0
 
-    async def fetch(self, request: Request, reference_id: str) -> Response:
+    async def fetch(self, request: Request, reference_id: str) -> _DispatchedPage:
         reservation = await self.context.reserve_page(reference=reference_id)
         remaining = self.context.policy.max_elapsed - self.context.elapsed
         if remaining <= 0:
@@ -274,7 +288,7 @@ class _DirectPageDispatcher:
         except BaseException:
             self.context.release_page(reservation)
             raise
-        return response
+        return _DispatchedPage(response, PageDispatch.DIRECT)
 
     async def aclose(self) -> None:
         return
@@ -299,7 +313,7 @@ class _BatchPageDispatcher:
         self.batch_requests = 0
         self.batch_commands = 0
 
-    async def fetch(self, request: Request, reference_id: str) -> Response:
+    async def fetch(self, request: Request, reference_id: str) -> _DispatchedPage:
         if self._closed:
             raise RuntimeError("batch page dispatcher is closed")
         if self._worker is None:
@@ -307,7 +321,7 @@ class _BatchPageDispatcher:
             self._workers = tuple(asyncio.create_task(self._run()) for _index in range(concurrency))
             self._worker = self._workers[0]
         reservation = await self.context.reserve_page(reference=reference_id)
-        future: asyncio.Future[Response] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[_DispatchedPage] = asyncio.get_running_loop().create_future()
         pending = _PendingBatch(request, reference_id, future)
         remaining = self.context.policy.max_elapsed - self.context.elapsed
         if remaining <= 0:
@@ -385,7 +399,9 @@ class _BatchPageDispatcher:
                 if success.response is None:
                     item.future.set_exception(CapabilityError("batch page response metadata is unavailable"))
                     continue
-                item.future.set_result(success.response)
+                item.future.set_result(
+                    _DispatchedPage(success.response, PageDispatch.BATCH, success.command_index),
+                )
             if stop_requested:
                 return
 

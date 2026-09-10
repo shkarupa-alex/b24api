@@ -10,14 +10,22 @@ from typing import TYPE_CHECKING, cast
 
 import httpx
 
+from b24api._error_types import FailurePhase
+from b24api.contracts.wire import BodyEncoding, _validate_headers
+from b24api.encoding import encode_php_query
 from b24api.errors import (
     B24ApiError,
-    FailurePhase,
     ProtocolError,
     ResponseTooLargeError,
     TransportError,
 )
-from b24api.transport.base import _HTTP_STATUS_MAXIMUM, _HTTP_STATUS_MINIMUM, WireResponse
+from b24api.transport.base import (
+    _HTTP_STATUS_MAXIMUM,
+    _HTTP_STATUS_MINIMUM,
+    TransportCapabilities,
+    WireRequest,
+    WireResponse,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -105,6 +113,11 @@ def _normalized_webhook_host(webhook_url: str) -> str:
 class HttpxTransport:
     """HTTPX transport with conservative failure-phase classification."""
 
+    capabilities = TransportCapabilities(
+        encodings=frozenset({BodyEncoding.JSON, BodyEncoding.FORM_URLENCODED}),
+        scoped_headers=True,
+    )
+
     def __init__(self, webhook_url: str, *, client: httpx.AsyncClient | None = None) -> None:
         """Initialize instance state."""
         if not webhook_url.endswith("/"):
@@ -134,7 +147,7 @@ class HttpxTransport:
         """Return the normalized portal host without credentials."""
         return self._host
 
-    async def send(  # noqa: C901, PLR0912, PLR0915
+    async def send(
         self,
         request: Request,
         *,
@@ -142,6 +155,20 @@ class HttpxTransport:
         max_response_bytes: int,
     ) -> WireResponse:
         """Send one transport request attempt."""
+        return await self.send_wire(
+            WireRequest(request),
+            attempt_timeout=attempt_timeout,
+            max_response_bytes=max_response_bytes,
+        )
+
+    async def send_wire(  # noqa: C901, PLR0912, PLR0915
+        self,
+        request: WireRequest,
+        *,
+        attempt_timeout: float,
+        max_response_bytes: int,
+    ) -> WireResponse:
+        """Send one explicitly represented transport request attempt."""
         if self._closed:
             raise RuntimeError("transport is closed")
         if isinstance(max_response_bytes, bool) or max_response_bytes < 1:
@@ -151,12 +178,27 @@ class HttpxTransport:
         cancellation_args: tuple[object, ...] | None = None
         http_request: httpx.Request | None = None
         try:
-            http_request = self._client.build_request(
-                "POST",
-                f"{_webhook_for(self._webhook_handle)}{request.method}",
-                headers={"Content-Type": "application/json"},
-                json=request.to_wire_parameters(),
-            )
+            request_headers = dict(_validate_headers(request.headers.items))
+            parameters = request.copy_parameters()
+            if request.encoding is BodyEncoding.JSON:
+                request_headers["content-type"] = "application/json"
+                http_request = self._client.build_request(
+                    "POST",
+                    f"{_webhook_for(self._webhook_handle)}{request.method}",
+                    headers=request_headers,
+                    json=parameters,
+                )
+            elif request.encoding is BodyEncoding.FORM_URLENCODED:
+                request_headers["content-type"] = "application/x-www-form-urlencoded"
+                content = encode_php_query(cast("Mapping[str | int, object]", parameters)).encode()
+                http_request = self._client.build_request(
+                    "POST",
+                    f"{_webhook_for(self._webhook_handle)}{request.method}",
+                    headers=request_headers,
+                    content=content,
+                )
+            else:  # pragma: no cover - guarded by typed contracts/capabilities
+                raise TypeError("unsupported body encoding")
             http_request.extensions["trace"] = tracker
             http_request.extensions["timeout"] = {
                 "connect": attempt_timeout,
@@ -206,9 +248,9 @@ class HttpxTransport:
             status_code = response.status_code
             if not _HTTP_STATUS_MINIMUM <= status_code <= _HTTP_STATUS_MAXIMUM:
                 pending_error = ProtocolError("HTTP response status is outside the valid range")
-                headers: tuple[tuple[str, str], ...] = ()
+                response_headers: tuple[tuple[str, str], ...] = ()
             else:
-                headers = tuple(response.headers.multi_items())
+                response_headers = tuple(response.headers.multi_items())
                 tracker.phase = FailurePhase.BODY_PARTIALLY_RECEIVED
                 body_outcome = await _read_bounded_body(response, max_response_bytes)
         finally:
@@ -231,7 +273,7 @@ class HttpxTransport:
         if pending_error is not None:
             raise pending_error
         tracker.phase = FailurePhase.RESPONSE_COMPLETE
-        return WireResponse(status_code=status_code, headers=headers, body=cast("bytes", body_outcome.body))
+        return WireResponse(status_code=status_code, headers=response_headers, body=cast("bytes", body_outcome.body))
 
     async def aclose(self) -> None:
         """Close owned asynchronous resources."""

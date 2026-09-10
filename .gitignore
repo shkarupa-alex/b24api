@@ -107,6 +107,7 @@ ENV/
 .codex/
 .pytest_cache/
 .b24api-evidence/
+spec/
 .DS_Store
 *.pyc
 *.swp

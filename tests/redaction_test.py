@@ -74,7 +74,12 @@ def test_safe_evidence_values_are_frozen_and_serializable() -> None:
     response = ResponseEvidence(http_status=200, headers=(("x-request-id", "safe"),))
     command = BatchCommandEvidence(command_index=0, stable_key="_0", original_code=0, normalized_code="0")
 
-    assert summary.to_dict() == {"method": "profile", "parameter_keys": ["select"]}
+    assert summary.to_dict() == {
+        "method": "profile",
+        "parameter_keys": ["select"],
+        "encoding": "json",
+        "header_names": [],
+    }
     assert response.to_dict()["headers"] == {"x-request-id": "safe"}
     assert command.to_dict()["original_code"] == 0
     with pytest.raises(FrozenInstanceError):

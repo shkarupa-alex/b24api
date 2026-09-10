@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Self, cast
 
 import pytest
 
+from tools.b24api_evidence import profile_runtime as profile_runtime_module
+
 from . import cli as cli_module
 from . import contracts as contracts_module
 from . import runtime_profile as runtime_profile_module
@@ -45,6 +47,7 @@ from .contracts import (
     append_manifest_record,
     atomic_write_json,
     build_manifest_record,
+    clean_candidate_sha,
     content_sha256,
     derive_drift_controls,
     git_sha,
@@ -96,6 +99,29 @@ PROFILE_BATCH_BUFFER = 7
 SECOND_CALL = 2
 BUNDLE_OVERFLOW_FILES = 513
 LEAK_FIXTURE = b"https://example.invalid/rest/1/realisticToken123/"
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_clean_candidate_sha_rejects_uncommitted_tracked_content(tmp_path: Path, *, staged: bool) -> None:
+    git = shutil.which("git")
+    assert git is not None
+
+    def run_git(*arguments: str) -> None:
+        subprocess.run([git, *arguments], cwd=tmp_path, check=True)  # noqa: S603 - disposable local repository
+
+    run_git("init", "--quiet")
+    run_git("config", "user.email", "test@example.invalid")
+    run_git("config", "user.name", "Test")
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("reviewed\n", encoding="utf-8")
+    run_git("add", "tracked.txt")
+    run_git("commit", "--quiet", "-m", "initial")
+    tracked.write_text("changed\n", encoding="utf-8")
+    if staged:
+        run_git("add", "tracked.txt")
+
+    with pytest.raises(ContractError, match="clean tracked tree"):
+        clean_candidate_sha(tmp_path)
 
 
 def _plan(*, count: int = 5) -> dict[str, Any]:
@@ -2989,3 +3015,75 @@ def _run_cli(*arguments: str, environment: dict[str, str] | None = None) -> subp
         capture_output=True,
         text=True,
     )
+
+
+def test_standalone_entrypoint_prefers_its_repository_over_environment_checkout(tmp_path: Path) -> None:
+    stale_package = tmp_path / "b24api"
+    stale_package.mkdir()
+    (stale_package / "__init__.py").write_text('raise RuntimeError("stale checkout imported")\n', encoding="utf-8")
+    environment = {**os.environ, "PYTHONPATH": str(tmp_path)}
+
+    result = _run_cli("--help", environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("usage: b24api_evidence.py")
+
+
+def test_profile_entrypoint_prefers_its_repository_over_environment_checkout(tmp_path: Path) -> None:
+    stale_package = tmp_path / "b24api"
+    stale_package.mkdir()
+    (stale_package / "__init__.py").write_text('raise RuntimeError("stale checkout imported")\n', encoding="utf-8")
+
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and repository entrypoint
+        [sys.executable, str(PROFILE_ENTRYPOINT), "--help"],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("usage: profile_runtime.py")
+
+
+def test_profile_entrypoint_binds_sha_to_repository_when_cwd_is_elsewhere(tmp_path: Path) -> None:
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and repository entrypoint
+        [
+            sys.executable,
+            str(PROFILE_ENTRYPOINT),
+            "--case",
+            "nineteen",
+            "--plan",
+            "fixed_1x_batch",
+            "--samples",
+            "1",
+            "--warmups",
+            "0",
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["candidate_sha"] == SHA
+
+
+def test_profile_entrypoint_rechecks_candidate_before_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candidates = iter((SHA, "f" * 40))
+    monkeypatch.setattr(profile_runtime_module, "clean_candidate_sha", lambda _root: next(candidates))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["profile_runtime.py", "--case", "nineteen", "--plan", "fixed_1x_batch", "--samples", "1", "--warmups", "0"],
+    )
+
+    with pytest.raises(RuntimeError, match="candidate changed while profiling"):
+        profile_runtime_module._main()  # noqa: SLF001 - final-attestation regression
+
+    assert capsys.readouterr().out == ""

@@ -31,6 +31,15 @@ idempotent and closes active streams before the owned transport.
 Use `call()` for detached decoded JSON and `call_response()` when you also need the immutable
 response envelope: `result`, `total`, `next`, timing and bounded diagnostic evidence.
 
+Use `call_bytes()` when a successful method response is a file rather than a Bitrix JSON envelope.
+The operation is explicit and never hides malformed JSON by falling back to bytes.
+
+<!-- tested: tests/client_findings_3_test.py::test_binary_call_returns_every_success_byte_without_json_sniffing -->
+```python
+archive = await client.call_bytes(Request("example.export.download", replay_safety=ReplaySafety.SAFE))
+payload = archive.body
+```
+
 <!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
 ```python
 from b24api import ReplaySafety
@@ -120,7 +129,7 @@ more specialized mechanics have explicit names and explicit preconditions.
 |---|---|---|---|
 | `iter_list` | The method supports ordinary offset pagination. | Pages are requested sequentially using server `next`; no separate count request is made. | Continuation and empty terminal page; add identity for duplicate detection. |
 | `iter_list_counted` | The first response provides an exact filtered `total` and stable offset pages. | Head page is direct; all known tail offsets are grouped into physical Bitrix batches. | Exact total, ranges and identities. |
-| `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique identity. | Sequential pages advance an identity boundary; no count request. | Strict monotonic identity and empty terminal page. |
+| `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique integer identity. | Sequential by default; explicit range, partitioned, or auto execution may batch bounded work after a planning barrier. | Caller-asserted keyset contract, strict monotonic identity, bounded-plan canaries, and terminal empty confirmation. |
 | `iter_list_cursor` | Each next request depends on a cursor from the previous response. | Sequential dependent cursor requests. | Strict unique monotonic cursor and empty terminal page. |
 | `iter_references` | The same list method must run for many parent parameter sets, such as comments per owner or messages per chat. | Bindings are scheduled with direct or physical-batch dispatch; each binding has its own traversal state. | Per-binding rows, completion/failure and caller correlation. |
 
@@ -157,6 +166,24 @@ async with stream:
 Without `identity`, successful exhaustion is reported as `MECHANICS_ONLY`: pagination completed,
 but the client cannot prove that the portal did not duplicate or substitute rows.
 
+Mapping-backed collections are explicit as well. `MAPPING_VALUES` yields values from a selected
+mapping in insertion order; `MAPPING_VALUES_OR_EMPTY` additionally accepts only an empty terminal
+sequence and records that degradation in the operation report.
+
+<!-- tested: tests/client_findings_3_test.py::test_shape_rejection_is_retained_as_zero_admission_page_evidence -->
+```python
+from b24api import ResultCollectionShape
+
+stream = client.iter_list(
+    Request("example.dictionary.list", replay_safety=ReplaySafety.SAFE),
+    selector=ResultSelector(("items",)),
+    collection_shape=ResultCollectionShape.MAPPING_VALUES,
+)
+async with stream:
+    async for value in stream:
+        consume(value)
+```
+
 ### Counted, physically batched tail
 
 The first direct page must contain an exact filtered `total` and, when more rows exist, `next`.
@@ -179,13 +206,23 @@ range, overlap, duplicate identity or total contradiction raises `IncompleteTrav
 
 ### No-count keyset
 
-Keyset traversal does not ask the server for a count. The method must honor ordering and a strict
-identity boundary such as `filter[>ID]`. It is intentionally sequential because a future boundary
-cannot be known safely before the preceding page arrives.
+Keyset traversal is sequential by default, preserving the compatible request shape and first-pull
+behavior. An explicit execution contract can instead capture both ordered boundaries, validate five
+capability canaries, and batch numeric ranges or occupied-anchor partitions. Planning completes
+before any row is emitted, so partial consumption still pays that barrier cost. Fast execution fails
+synchronously when its declared controls or policy capacity are ineligible.
+
+The caller must assert that the endpoint has a stable, unique integer key, honors strict numeric
+bounds and ordering, and satisfies the chosen page-completion rule. Concurrent mutation outside the
+captured middle is handled by the finishing sweep; mutation inside it is outside this assertion.
+An advisory `total` may only raise an automatic cost estimate and never proves completion. Reports
+record the selected strategy and reason: unbounded auto continuation has the same
+`ordered_prefix_only` assurance as sequential traversal, while bounded plans additionally report
+`canary_verified_bounds`.
 
 <!-- tested: tests/client_v2_test.py::test_keyset_and_cursor_are_explicit_strict_alternatives -->
 ```python
-from b24api import KeysetSpec, ParameterPath
+from b24api import AutoKeysetExecution, KeysetSpec, ParameterPath, StableIntegerKeysetContract
 
 stream = client.iter_list_keyset(
     Request("example.item.list", replay_safety=ReplaySafety.SAFE),
@@ -195,6 +232,7 @@ stream = client.iter_list_keyset(
         filter_path=ParameterPath(("filter",)),
         order_path=ParameterPath(("order",)),
     ),
+    execution=AutoKeysetExecution(contract=StableIntegerKeysetContract()),
 )
 ```
 
@@ -222,6 +260,10 @@ stream = client.iter_list_cursor(
 
 Cursor values must be unique and strictly monotonic. If an endpoint exposes only a non-unique
 boundary, use an application-owned direct-call workflow or supply a unique tie-breaker.
+
+See [architecture](docs/architecture.md), [migration](docs/migration.md),
+[performance](docs/performance.md), and [endpoint recipes](docs/recipes.md) for the complete
+contracts and selection guidance.
 
 ### One list method across many parent entities
 

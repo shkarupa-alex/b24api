@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 import asyncio
+from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
-from b24api.contracts.report import Violation, ViolationSeverity
-from b24api.contracts.request import IdentitySpec, ReplaySafety, Request, ResultSelector
+from b24api.contracts.report import PageDispatch, PageRecord, Violation, ViolationSeverity, retain_page_trace
+from b24api.contracts.request import ReplaySafety, Request, ResultSelector, TraversalIdentity
 from b24api.errors import BudgetExceededError, CapabilityError
 from b24api.execution import (
     AsyncIteratorController,
@@ -20,6 +21,7 @@ from b24api.references.dispatch import (
     _BatchPageDispatcher,
     _BatchPageError,
     _DirectPageDispatcher,
+    _DispatchedPage,
     _DoneEvent,
     _Event,
     _FailureEvent,
@@ -47,6 +49,7 @@ from b24api.references.support import (
 )
 from b24api.traversal import PaginationDriver
 from b24api.traversal.plans import (
+    BatchDispatch,
     DirectDispatch,
     DispatchPlan,
     ListPlan,
@@ -72,7 +75,7 @@ class ReferenceScheduler:
         plan: ListPlan,
         dispatch: DispatchPlan,
         selector: ResultSelector | None,
-        identity: IdentitySpec | None,
+        identity: TraversalIdentity | None,
         output_order: ReferenceOutputOrder,
         tolerant: bool,
         policy: ExecutionPolicy,
@@ -111,9 +114,12 @@ class ReferenceScheduler:
         head_reserve = self.page_cap if output_order is ReferenceOutputOrder.INPUT else 0
         self.buffer = _RowBuffer(policy.max_buffered_rows, self.context, head_reserve=head_reserve)
         self.violations: list[Violation] = []
+        self.page_trace: list[PageRecord] = []
+        self.page_trace_truncated = False
         self._delivery_uniqueness: dict[int, tuple[ReferenceItem, bool]] = {}
         self._source_controller: AsyncIteratorController[ReferenceRequest] | None = None
         self.active_references_high_water = 0
+        self._next_page_sequence = 0
 
     async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912
         """Yield correlated operation outcomes."""
@@ -252,23 +258,53 @@ class ReferenceScheduler:
         finally:
             admission.changed.set()
 
-    async def _run_reference(self, work: _Work, output: asyncio.Queue[_Event]) -> None:
+    async def _run_reference(  # noqa: C901, PLR0915 - owns the per-reference transaction boundary
+        self,
+        work: _Work,
+        output: asyncio.Queue[_Event],
+    ) -> None:
         reservation: _Reservation | None = None
         partial_rows = 0
         page_state = 0
         violation_offset = 0
+        trace_offset = 0
+        scheduled_sequences: list[int] = []
 
         async def fetch(request: Request) -> Response:
             nonlocal page_state, reservation
-            reservation = await self.buffer.reserve(work.index, self.page_cap)
+            sequence = self._next_page_sequence
+            self._next_page_sequence += 1
+            scheduled_sequences.append(sequence)
             try:
-                response = await self.dispatcher.fetch(request, f"r{work.index}")
-            except BaseException:
-                await self.buffer.abort(reservation)
+                reservation = await self.buffer.reserve(work.index, self.page_cap)
+                dispatched: _DispatchedPage = await self.dispatcher.fetch(request, f"r{work.index}")
+            except BaseException as error:
+                if reservation is not None:
+                    await self.buffer.abort(reservation)
                 reservation = None
+                dispatch = PageDispatch.BATCH if isinstance(self.dispatch, BatchDispatch) else PageDispatch.DIRECT
+                batch_index = error.failure.command_index if isinstance(error, _BatchPageError) else None
+                report_error = (
+                    error.failure.error
+                    if isinstance(error, _BatchPageError) and isinstance(error.failure.error, BaseException)
+                    else error
+                )
+                if isinstance(error, _BatchPageError) or bool(
+                    getattr(error, "_b24api_dispatch_started", False),
+                ):
+                    driver.set_page_dispatch(dispatch=dispatch, batch_index=batch_index)
+                    driver.record_unknown_page(
+                        dispatch=dispatch,
+                        batch_index=batch_index,
+                        error=report_error,
+                    )
                 raise
+            driver.set_page_dispatch(
+                dispatch=dispatched.dispatch,
+                batch_index=dispatched.batch_index,
+            )
             page_state += 1
-            return response
+            return dispatched.response
 
         driver = PaginationDriver(
             self.executor,
@@ -297,17 +333,34 @@ class ReferenceScheduler:
                         page.item_weights,
                         driver.last_page_unique_mask,
                         page_violations,
+                        self._annotate_page_records(
+                            work,
+                            self._new_page_records(driver, trace_offset),
+                            scheduled_sequences,
+                        ),
                         reservation,
                         acknowledged,
                     ),
                 )
+                trace_offset = driver.page_trace_count
                 await acknowledged
                 partial_rows += len(page.items)
                 reservation = None
             if reservation is not None:
                 await self.buffer.abort(reservation)
                 reservation = None
-            await output.put(_DoneEvent(work, partial_rows, tuple(driver.violations[violation_offset:])))
+            await output.put(
+                _DoneEvent(
+                    work,
+                    partial_rows,
+                    tuple(driver.violations[violation_offset:]),
+                    self._annotate_page_records(
+                        work,
+                        self._new_page_records(driver, trace_offset),
+                        scheduled_sequences,
+                    ),
+                ),
+            )
         except asyncio.CancelledError:
             raise
         except _BatchPageError as error:
@@ -319,6 +372,11 @@ class ReferenceScheduler:
                     page_state,
                     partial_rows,
                     tuple(driver.violations[violation_offset:]),
+                    self._annotate_page_records(
+                        work,
+                        self._new_page_records(driver, trace_offset),
+                        scheduled_sequences,
+                    ),
                     error.failure.replay_disposition,
                 ),
             )
@@ -331,6 +389,11 @@ class ReferenceScheduler:
                     page_state,
                     partial_rows,
                     tuple(driver.violations[violation_offset:]),
+                    self._annotate_page_records(
+                        work,
+                        self._new_page_records(driver, trace_offset),
+                        scheduled_sequences,
+                    ),
                 ),
             )
         finally:
@@ -399,6 +462,33 @@ class ReferenceScheduler:
 
     def _record_event_violations(self, event: _Event) -> None:
         self.violations.extend(event.violations)
+        combined = tuple(sorted((*self.page_trace, *event.page_records), key=lambda record: record.sequence))
+        retained, truncated = retain_page_trace(combined, self.context.policy.page_trace_limit)
+        self.page_trace[:] = retained
+        self.page_trace_truncated = self.page_trace_truncated or truncated
+
+    @staticmethod
+    def _new_page_records(driver: PaginationDriver, previous_count: int) -> tuple[PageRecord, ...]:
+        if driver.page_trace_count == previous_count:
+            return ()
+        if driver.page_trace_count != previous_count + 1 or driver.last_page_record is None:
+            raise RuntimeError("one logical fetch must produce at most one page record")
+        return (driver.last_page_record,)
+
+    @staticmethod
+    def _annotate_page_records(
+        work: _Work,
+        records: tuple[PageRecord, ...],
+        scheduled_sequences: list[int],
+    ) -> tuple[PageRecord, ...]:
+        return tuple(
+            replace(
+                record,
+                sequence=scheduled_sequences[record.sequence],
+                reference_index=work.index,
+            )
+            for record in records
+        )
 
     def _record_cleanup_failure(self, error: BaseException) -> None:
         self.violations.append(

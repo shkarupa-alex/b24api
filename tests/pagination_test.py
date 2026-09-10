@@ -22,18 +22,27 @@ from b24api.contracts.policy import (
     SnapshotState,
     TotalSemantics,
 )
+from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector
+from b24api.contracts.traversal import KeysetSpec
 from b24api.errors import (
+    ApiResponseError,
     BudgetExceededError,
     CapabilityError,
     IncompleteTraversalError,
     PaginationError,
     ProtocolError,
 )
-from b24api.execution import ExecutionContext, Executor, WireResponse
+from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse, WorkClass
 from b24api.traversal import iter_list
+from b24api.traversal.keyset_step import (
+    keyset_page_request,
+    keyset_page_terminal,
+    next_keyset_cursor,
+    sequential_keyset_plan,
+    validate_keyset_continuation,
+)
 from b24api.traversal.plans import (
-    CountedOffsetMode,
     CountedOffsetPlan,
     CursorTerminalRule,
     ItemCursorPlan,
@@ -130,6 +139,34 @@ def _keyset_plan() -> KeysetPlan:
         limit_path=ParameterPath(("limit",)),
         requested_page_size=PAGE_SIZE,
     )
+
+
+@pytest.mark.parametrize(
+    ("direction", "wire_direction", "operator"),
+    [("ascending", "ASC", ">ID"), ("descending", "DESC", "<ID")],
+)
+def test_shared_keyset_page_step_preserves_sequential_controls(
+    direction: str,
+    wire_direction: str,
+    operator: str,
+) -> None:
+    keyset = KeysetSpec(direction=direction, limit_path=ParameterPath(("limit",)))  # type: ignore[arg-type]
+    plan = sequential_keyset_plan(keyset, PAGE_SIZE)
+    original = Request("item.list", {"filter": {"ACTIVE": "Y"}})
+
+    request = keyset_page_request(original, plan=plan, identity=_identity(), cursor=7)
+
+    assert original.copy_parameters() == {"filter": {"ACTIVE": "Y"}}
+    assert request.copy_parameters() == {
+        "filter": {"ACTIVE": "Y", operator: 7},
+        "order": {"ID": wire_direction},
+        "start": -1,
+        "limit": PAGE_SIZE,
+    }
+    validate_keyset_continuation(plan, 7, [8] if direction == "ascending" else [6])
+    assert next_keyset_cursor(7, [8] if direction == "ascending" else [6]) == (8 if direction == "ascending" else 6)
+    assert keyset_page_terminal(plan, 1) is None
+    assert keyset_page_terminal(plan, 0) == "empty keyset confirmation"
 
 
 async def _collect(stream: object) -> list[JsonValue]:
@@ -294,6 +331,10 @@ async def test_empty_page_cannot_override_an_unreached_exact_total() -> None:
     )
 
     await _assert_incomplete_pagination(stream, "before its exact total")
+    assert stream.report.page_trace[-1].outcome is PageOutcome.REJECTED
+    assert stream.report.page_trace[-1].rejection_code is PageRejectionCode.TOTAL_DRIFT
+    assert stream.report.page_trace[-1].rows_admitted == 0
+    assert stream.report.terminal_reason == "PaginationError"
 
 
 @pytest.mark.asyncio
@@ -312,6 +353,8 @@ async def test_page_budget_refuses_continuation_before_network_io() -> None:
 
     assert [_integer_parameter(request, "start") for request in transport.requests] == [0]
     assert stream.report.state is KernelState.FAILED
+    assert len(stream.report.page_trace) == 1
+    assert stream.report.page_trace[0].outcome is PageOutcome.COMMITTED
 
 
 @pytest.mark.asyncio
@@ -324,7 +367,7 @@ async def test_selector_shape_failure_is_typed_and_reported() -> None:
         selector=ResultSelector(("items",)),
     )
 
-    with pytest.raises(CapabilityError, match="selector") as captured:
+    with pytest.raises(CapabilityError, match="must be a sequence") as captured:
         await _collect(stream)
 
     assert captured.value.__dict__["report"] is stream.report
@@ -560,7 +603,7 @@ async def test_conflicting_policy_and_plan_semantics_refuse_before_io() -> None:
 @pytest.mark.parametrize(
     ("responses", "message"),
     [
-        (({"result": [], "total": -1},), "non-negative"),
+        (({"result": [], "total": -1},), "before its exact total"),
         (
             (
                 {"result": [{"ID": 1}], "total": 2, "next": 1},
@@ -585,34 +628,97 @@ async def test_counted_offset_rejects_unproven_totals(
     transport = FunctionTransport(lambda _request: pending.pop(0))
     stream = iter_list(Executor(transport), Request("crm.item.list"), plan=CountedOffsetPlan())
 
-    if message == "non-negative":
-        with pytest.raises(CapabilityError, match=message):
-            await _collect(stream)
-    else:
-        await _assert_incomplete_pagination(stream, message)
+    await _assert_incomplete_pagination(stream, message)
 
-    assert stream.report.state is (KernelState.FAILED if message == "non-negative" else KernelState.INCOMPLETE)
+    assert stream.report.state is KernelState.INCOMPLETE
+    expected_code = PageRejectionCode.TOTAL_DRIFT if message == "drifted" else PageRejectionCode.RANGE_CONTRADICTION
+    assert stream.report.page_trace[-1].rejection_code is expected_code
 
 
 @pytest.mark.asyncio
-async def test_unreviewed_parallel_and_boundary_strategies_refuse_before_io() -> None:
-    transport = FunctionTransport(lambda _request: {"result": []})
-    parallel = CountedOffsetPlan(
-        mode=CountedOffsetMode.PARALLEL_FIXED_STRIDE,
-        limit_path=ParameterPath(("limit",)),
-        requested_page_size=PAGE_SIZE,
-        fixed_stride=PAGE_SIZE,
+async def test_page_trace_limit_bounds_live_driver_evidence() -> None:
+    responses = [
+        {"result": [{"ID": 1}], "next": 1},
+        {"result": [{"ID": 2}], "next": 2},
+        {"result": [{"ID": 3}], "next": 3},
+        {"result": []},
+    ]
+    stream = iter_list(
+        Executor(FunctionTransport(lambda _request: responses.pop(0))),
+        Request("crm.item.list"),
+        plan=OffsetSequentialPlan(
+            continuation=OffsetContinuation.SERVER_NEXT,
+            terminal=frozenset({OffsetTerminalRule.EMPTY_PAGE}),
+        ),
+        identity=_identity(),
+        policy=ExecutionPolicy(page_trace_limit=1),
     )
+
+    assert len([item async for item in stream]) == THREE_ROWS
+    assert len(stream._driver.page_trace) == 1  # noqa: SLF001
+    assert stream._driver.page_trace_truncated  # noqa: SLF001
+    assert len(stream.report.page_trace) == 1
+    assert stream.report.page_trace_truncated
+
+
+@pytest.mark.asyncio
+async def test_direct_fetch_failure_records_unknown_scheduled_page() -> None:
+    stream = iter_list(
+        Executor(
+            FunctionTransport(
+                lambda _request: {"error": "ACCESS_DENIED", "error_description": "denied"},
+            ),
+        ),
+        Request("crm.item.list"),
+        plan=_offset_plan(),
+        identity=_identity(),
+    )
+
+    with pytest.raises(ApiResponseError) as captured:
+        await _collect(stream)
+
+    assert captured.value.__dict__["report"] is stream.report
+    assert len(stream.report.page_trace) == 1
+    record = stream.report.page_trace[0]
+    assert record.outcome is PageOutcome.UNKNOWN
+    assert record.dispatch is PageDispatch.DIRECT
+    assert record.rejection_code is PageRejectionCode.COMMAND_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_cancellation_while_waiting_for_dispatch_records_no_unknown_page() -> None:
+    coordinator = RateCoordinator(max_concurrency=1)
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT)
+    stream = iter_list(
+        Executor(FunctionTransport(lambda _request: {"result": []}), coordinator=coordinator),
+        Request("crm.item.list"),
+        plan=_offset_plan(),
+        identity=_identity(),
+    )
+    pending = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+    pending.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert stream.report.page_trace == ()
+    await held.release()
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_boundary_keyset_strategy_refuses_before_io() -> None:
+    transport = FunctionTransport(lambda _request: {"result": []})
     boundary = KeysetPlan(
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING,
         terminal=KeysetTerminalRule.BOUNDARY_ID_SEEN,
     )
 
-    for plan in (parallel, boundary):
-        stream = iter_list(Executor(transport), Request("crm.item.list"), plan=plan, identity=_identity())
-        with pytest.raises(CapabilityError):
-            await _collect(stream)
+    stream = iter_list(Executor(transport), Request("crm.item.list"), plan=boundary, identity=_identity())
+    with pytest.raises(CapabilityError):
+        await _collect(stream)
 
     assert transport.requests == []
 

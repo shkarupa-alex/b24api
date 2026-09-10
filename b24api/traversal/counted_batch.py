@@ -1,10 +1,14 @@
 """Counted physical-batch traversal strategy."""
 
+# ruff: noqa: TRY301 - rejection evidence is recorded at this transaction boundary
+
 from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
 from b24api.contracts.policy import KernelState
+from b24api.contracts.report import PageDispatch
+from b24api.contracts.traversal import OffsetContinuation
 from b24api.errors import CapabilityError, IncompleteTraversalError
 from b24api.execution import (
     await_cleanup_resistant,
@@ -15,7 +19,6 @@ from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
 )
-from b24api.traversal.values import _response_items
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -43,16 +46,16 @@ class _CountedBatchMixin:
 
         if not isinstance(self.plan, CountedOffsetPlan):
             raise TypeError("counted batch traversal requires CountedOffsetPlan")
-        if self.plan.mode is not CountedOffsetMode.SEQUENTIAL_NEXT:
-            raise CapabilityError("counted batch traversal requires the canonical counted mode")
         self.begin_external_validation()
         outcomes: _BatchOutcomeStream | None = None
         try:
             head_controls: dict[ParameterPath, object] = {self.plan.offset_path: 0}
             if self.plan.limit_path is not None:
                 head_controls[self.plan.limit_path] = page_size
-            head_reservation = await self.context.reserve_page()
+            self.schedule_page(offset=0, dispatch=PageDispatch.DIRECT)
+            head_reservation = None
             try:
+                head_reservation = await self.context.reserve_page()
                 head = await self.executor.execute(
                     _request_with_controls(
                         self.request,
@@ -61,26 +64,67 @@ class _CountedBatchMixin:
                     ),
                     context=self.context,
                 )
-            except BaseException:
-                self.context.release_page(head_reservation)
+            except BaseException as error:
+                if head_reservation is not None:
+                    self.context.release_page(head_reservation)
+                if bool(getattr(error, "_b24api_dispatch_started", False)):
+                    self.record_unknown_page(
+                        dispatch=PageDispatch.DIRECT,
+                        batch_index=None,
+                        error=error,
+                    )
                 raise
             self.context.commit_page(head_reservation)
-            head_items = _response_items(head, self.selector)
-            await self.context.set_buffered_rows(len(head_items))
-            total = head.total
-            if total is None or total < 0:
-                raise CapabilityError("parallel counted traversal requires a non-negative total")
-            if total < len(head_items):
-                raise CapabilityError("parallel counted traversal observed total below the head page")
-            stride = head.next if head.next is not None else page_size
-            if isinstance(stride, bool) or stride < 1:
-                raise CapabilityError("parallel counted traversal requires a positive in-band stride")
-            if total > len(head_items) and head.next is None:
-                raise CapabilityError("parallel counted traversal has no in-band tail stride")
-            if head.next is not None and head.next != len(head_items):
-                raise CapabilityError("parallel counted head continuation contradicts its row count")
-            if total == len(head_items) and head.next is not None:
-                raise CapabilityError("parallel counted traversal completed while continuation remained")
+            trace_count = self.page_trace_count
+            head_items: list[JsonValue] = []
+            try:
+                head_items = self.select_page(head)
+                await self.context.set_buffered_rows(len(head_items))
+                total = head.total
+                if total is None or total < 0:
+                    raise CapabilityError("parallel counted traversal requires a non-negative total")
+                if total < len(head_items):
+                    raise CapabilityError("parallel counted traversal observed total below the head page")
+                stride: int | None
+                if total == 0 and not head_items:
+                    stride = page_size
+                elif self.plan.mode is CountedOffsetMode.PARALLEL_FIXED_STRIDE:
+                    stride = self.plan.fixed_stride
+                elif self.plan.continuation is OffsetContinuation.SERVER_NEXT:
+                    stride = head.next
+                elif self.plan.continuation is OffsetContinuation.OBSERVED_COUNT:
+                    stride = len(head_items)
+                else:
+                    stride = head.next if head.next is not None and head.next > 0 else len(head_items)
+                if not isinstance(stride, int) or isinstance(stride, bool) or stride < 1:
+                    raise CapabilityError("parallel counted traversal requires a positive in-band stride")
+                if len(head_items) != min(stride, total):
+                    raise CapabilityError("parallel counted head length contradicts the planned exact range")
+                if (
+                    total > len(head_items)
+                    and head.next is None
+                    and self.plan.continuation is OffsetContinuation.SERVER_NEXT
+                ):
+                    raise CapabilityError("parallel counted traversal has no in-band tail stride")
+                if (
+                    self.plan.continuation
+                    in {OffsetContinuation.SERVER_NEXT, OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT}
+                    and head.next is not None
+                    and head.next > 0
+                    and head.next != stride
+                ):
+                    raise CapabilityError("parallel counted head continuation contradicts its row count")
+                if (
+                    total == len(head_items)
+                    and head.next is not None
+                    and head.next > 0
+                    and self.plan.continuation is not OffsetContinuation.FIXED_STEP
+                ):
+                    raise CapabilityError("parallel counted traversal completed while continuation remained")
+            except BaseException as error:
+                if self.page_trace_count == trace_count:
+                    self.reject_external_page(head_items, head, error)
+                raise
             tail_pages = (total - 1) // stride if total > len(head_items) else 0
             budget = await self.context.snapshot()
             if budget.counters.logical_pages + tail_pages > self.context.policy.max_pages:
@@ -94,11 +138,10 @@ class _CountedBatchMixin:
             minimum_tail_requests = (tail_pages + effective_batch_size - 1) // effective_batch_size
             if budget.counters.physical_requests + minimum_tail_requests > self.context.policy.max_requests:
                 raise CapabilityError("parallel counted traversal exceeds the physical request budget")
-            self.validate_external_page(head_items, head)
+            self.validate_external_page(head_items, head, terminal=total == len(head_items))
             yield _Page(tuple(head_items), head, (1,) * len(head_items))
             await self.context.set_buffered_rows(0)
             if total == len(head_items):
-                self.finish_external_validation()
                 self.terminal_reason = "parallel counted traversal completed"
                 return
             requests = (
@@ -125,6 +168,22 @@ class _CountedBatchMixin:
 
             def validated_outcome(outcome: object) -> tuple[Response, list[JsonValue]]:
                 if isinstance(outcome, BatchFailure):
+                    error = (
+                        outcome.error
+                        if isinstance(outcome.error, BaseException)
+                        else CapabilityError("parallel counted batch command failed")
+                    )
+                    start = stride * (outcome.command_index + 1)
+                    self.schedule_page(
+                        offset=start,
+                        dispatch=PageDispatch.BATCH,
+                        batch_index=outcome.command_index,
+                    )
+                    self.record_unknown_page(
+                        dispatch=PageDispatch.BATCH,
+                        batch_index=outcome.command_index,
+                        error=error,
+                    )
                     if isinstance(outcome.error, BaseException):
                         raise outcome.error
                     raise CapabilityError("parallel counted batch command failed")
@@ -132,16 +191,34 @@ class _CountedBatchMixin:
                     raise CapabilityError("parallel counted batch outcome lacks correlated response evidence")
                 response = outcome.response
                 start = stride * (outcome.command_index + 1)
-                items = _response_items(response, self.selector)
-                expected_rows = min(stride, total - start)
-                if len(items) != expected_rows:
-                    raise CapabilityError("parallel counted page length contradicts the planned exact range")
-                if response.total is not None and response.total != total:
-                    raise CapabilityError("parallel counted page total contradicts the head total")
-                expected_next = start + stride if start + stride < total else None
-                if response.next != expected_next:
-                    raise CapabilityError("parallel counted continuation contradicts the planned exact range")
-                self.validate_external_page(items, response)
+                self.schedule_page(
+                    offset=start,
+                    dispatch=PageDispatch.BATCH,
+                    batch_index=outcome.command_index,
+                )
+                trace_count = self.page_trace_count
+                items: list[JsonValue] = []
+                try:
+                    items = self.select_page(response)
+                    expected_rows = min(stride, total - start)
+                    if len(items) != expected_rows:
+                        raise CapabilityError("parallel counted page length contradicts the planned exact range")
+                    if response.total not in {None, -1} and response.total != total:
+                        raise CapabilityError("parallel counted page total contradicts the head total")
+                    expected_next = start + stride if start + stride < total else None
+                    if self.plan.continuation.value == "server_next" and response.next != expected_next:
+                        raise CapabilityError("parallel counted continuation contradicts the planned exact range")
+                    if (
+                        self.plan.continuation.value == "server_next_or_observed_count"
+                        and response.next is not None
+                        and response.next != expected_next
+                    ):
+                        raise CapabilityError("parallel counted continuation contradicts the planned exact range")
+                    self.validate_external_page(items, response, terminal=start + stride >= total)
+                except BaseException as error:
+                    if self.page_trace_count == trace_count:
+                        self.reject_external_page(items, response, error)
+                    raise
                 return response, items
 
             primary_error: BaseException | None = None
@@ -178,7 +255,6 @@ class _CountedBatchMixin:
                 raise IncompleteTraversalError(report=outcomes.report)
             if self.validated_rows != total:
                 raise CapabilityError("parallel counted traversal did not emit its exact total")
-            self.finish_external_validation()
             self.terminal_reason = "parallel counted traversal completed"
         finally:
             self.close_external_validation()

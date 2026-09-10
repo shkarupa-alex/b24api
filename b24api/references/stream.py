@@ -14,13 +14,14 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     SnapshotState,
 )
-from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.contracts.report import Violation, ViolationSeverity, retain_page_trace
 from b24api.execution import (
     Executor,
     await_cancellation_resistant,
     await_cleanup_resistant,
     rearm_cancellation,
 )
+from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 from b24api.references.dispatch import (
     _MISSING,
@@ -29,7 +30,6 @@ from b24api.references.dispatch import (
 )
 from b24api.references.outcome import ReferenceItem
 from b24api.references.scheduler import ReferenceScheduler
-from b24api.references.support import _attach_report
 from b24api.traversal import PaginationDriver
 from b24api.traversal.plans import (
     BatchDispatch,
@@ -41,7 +41,7 @@ from b24api.traversal.plans import (
 )
 
 if TYPE_CHECKING:
-    from b24api.contracts.request import IdentitySpec, ResultSelector
+    from b24api.contracts.request import ResultSelector, TraversalIdentity
 
 
 class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
@@ -182,8 +182,14 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             raise
         except BaseException as error:
             primary_error = error
+            terminal_error = getattr(error, "report_cause", error)
+            if not isinstance(terminal_error, BaseException):
+                terminal_error = error
+            terminal_name = getattr(terminal_error, "report_name", type(terminal_error).__name__)
+            if not isinstance(terminal_name, str):
+                terminal_name = type(terminal_error).__name__
             cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.FAILED, type(error).__name__),
+                self._finalize(KernelState.FAILED, terminal_name),
             )
             if cancellation is not None:
                 _attach_report(cancellation, self.report)
@@ -251,7 +257,8 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             if consistency.snapshot_requirement is SnapshotRequirement.TRAVERSAL_ONLY
             else SnapshotState.UNVERIFIED
         )
-        violations = tuple(self._scheduler.violations)
+        source_violations = tuple(getattr(self._source, "violations", ()))
+        violations = (*self._scheduler.violations, *source_violations)
         if state is KernelState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
             state = KernelState.INCOMPLETE
             reason = "required snapshot was not verified"
@@ -263,6 +270,11 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
                     message="the requested stable snapshot was not verified",
                 ),
             )
+        page_trace, page_trace_truncated = retain_page_trace(
+            tuple(sorted(self._scheduler.page_trace, key=lambda record: record.sequence)),
+            self._scheduler.context.policy.page_trace_limit,
+        )
+        page_trace_truncated = page_trace_truncated or self._scheduler.page_trace_truncated
         self.report = KernelReport(
             state=state,
             assurance=self._assurance,
@@ -280,6 +292,8 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
             violations=violations,
             terminal_reason=reason,
+            page_trace=page_trace,
+            page_trace_truncated=page_trace_truncated,
         )
 
 
@@ -312,7 +326,7 @@ def iter_references(  # noqa: PLR0913
     plan: ListPlan,
     dispatch: DispatchPlan,
     selector: ResultSelector | None = None,
-    identity: IdentitySpec | None = None,
+    identity: TraversalIdentity | None = None,
     output_order: ReferenceOutputOrder = ReferenceOutputOrder.READY,
     tolerant: bool = False,
     policy: ExecutionPolicy | None = None,

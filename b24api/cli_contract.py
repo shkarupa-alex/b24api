@@ -7,23 +7,32 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, TextIO, cast
 
 from b24api import (
+    AutoKeysetExecution,
     Bitrix24,
     CursorSpec,
     IdentitySpec,
+    KeysetPageCompletion,
     KeysetSpec,
     OffsetSpec,
     ParameterPath,
+    PartitionedKeysetExecution,
+    RangeKeysetExecution,
     ReplaySafety,
     Request,
     ResultSelector,
+    SequentialKeysetExecution,
+    StableIntegerKeysetContract,
+    TotalHintMode,
 )
-from b24api.contracts import IdentityCoercion, JsonValue, OperationStream
+from b24api.contracts import IdentityCoercion, JsonValue, KeysetExecution, OperationStream
+from b24api.contracts.keyset_execution import KeysetExecutionJson
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
 _CONTRACT_VERSION = 1
 _PORTAL_BATCH_CAP = 50
+_SEQUENTIAL_KEYSET_EXECUTION = SequentialKeysetExecution()
 
 
 class CliUsageError(ValueError):
@@ -72,7 +81,7 @@ def decode_one_object(text: str, *, label: str) -> dict[str, object]:
 def cli_request(method: str, parameters: Mapping[str, object], replay_safety: ReplaySafety) -> Request:
     """Construct one request while preserving the CLI's local-error boundary."""
     try:
-        return Request(method, parameters, replay_safety)
+        return Request(method, parameters=parameters, replay_safety=replay_safety)
     except (TypeError, ValueError) as error:
         raise CliUsageError("request method or parameters are invalid") from error
 
@@ -199,13 +208,66 @@ def _keyset(raw: object) -> KeysetSpec:
     start = _path(raw.get("start_suppression_path"), label="keyset.start_suppression_path", optional=True)
     limit_path, allow_create = _control_options(raw, label="keyset")
     return KeysetSpec(
-        cast("ParameterPath", filter_path),
-        cast("ParameterPath", order_path),
-        start,
-        limit_path,
-        cast("Literal['ascending', 'descending']", direction),
-        allow_create,
+        filter_path=cast("ParameterPath", filter_path),
+        order_path=cast("ParameterPath", order_path),
+        start_suppression_path=start,
+        limit_path=limit_path,
+        direction=cast("Literal['ascending', 'descending']", direction),
+        allow_create_controls=allow_create,
     )
+
+
+def parse_keyset_execution(payload: Mapping[str, JsonValue] | None) -> KeysetExecution:
+    """Parse the closed per-call keyset execution object."""
+    if payload is None:
+        return SequentialKeysetExecution()
+    if not isinstance(payload, dict):
+        raise CliUsageError("execution must be an object")
+    kind = payload.get("kind", "sequential")
+    if not isinstance(kind, str):
+        raise CliUsageError("execution.kind must be a string")
+    if kind not in {"sequential", "range", "partitioned", "auto"}:
+        raise CliUsageError("execution.kind is invalid")
+    common = {"kind", "page_completion", "batch_size", "endpoint_page_cap"}
+    allowed = {
+        "sequential": {"kind"},
+        "range": common | {"window_width"},
+        "partitioned": common | {"target_lanes"},
+        "auto": common | {"target_lanes", "range_window_width", "max_range_waves", "total_hint"},
+    }
+    _closed(payload, allowed[kind], label="execution")
+    if kind == "sequential":
+        return SequentialKeysetExecution()
+    try:
+        contract = StableIntegerKeysetContract(
+            page_completion=KeysetPageCompletion(
+                payload.get("page_completion", KeysetPageCompletion.EMPTY_CONFIRMATION.value),
+            ),
+            endpoint_page_cap=cast("int | None", payload.get("endpoint_page_cap")),
+        )
+        batch_size = cast("int | None", payload.get("batch_size"))
+        if kind == "range":
+            return RangeKeysetExecution(
+                contract,
+                batch_size=batch_size,
+                window_width=cast("int | None", payload.get("window_width")),
+            )
+        if kind == "partitioned":
+            return PartitionedKeysetExecution(
+                contract,
+                batch_size=batch_size,
+                target_lanes=cast("int", payload.get("target_lanes", 20)),
+            )
+        return AutoKeysetExecution(
+            contract,
+            batch_size=batch_size,
+            target_lanes=cast("int", payload.get("target_lanes", 20)),
+            range_window_width=cast("int | None", payload.get("range_window_width")),
+            max_range_waves=cast("int", payload.get("max_range_waves", 2)),
+            total_hint=TotalHintMode(payload.get("total_hint", TotalHintMode.IGNORE.value)),
+        )
+    except (TypeError, ValueError) as error:
+        raise CliUsageError("execution contract is invalid") from error
 
 
 def _cursor(raw: object) -> CursorSpec:
@@ -247,6 +309,7 @@ class ListContractRoute:
     identity: IdentitySpec | None
     page_size: int
     mechanics: OffsetSpec | KeysetSpec | CursorSpec
+    execution: KeysetExecution = _SEQUENTIAL_KEYSET_EXECUTION
 
 
 def parse_list_contract(strategy: str, contract: dict[str, object]) -> ListContractRoute:
@@ -255,7 +318,7 @@ def parse_list_contract(strategy: str, contract: dict[str, object]) -> ListContr
     allowed_by_strategy = {
         "sequential": allowed_common | {"offset", "identity"},
         "counted": allowed_common | {"offset", "identity"},
-        "keyset": allowed_common | {"identity", "keyset"},
+        "keyset": allowed_common | {"identity", "keyset", "execution"},
         "cursor": allowed_common | {"identity", "cursor"},
     }
     if strategy not in allowed_by_strategy:
@@ -276,6 +339,9 @@ def parse_list_contract(strategy: str, contract: dict[str, object]) -> ListContr
         identity,
         page_size,
         mechanics,
+        parse_keyset_execution(cast("Mapping[str, JsonValue] | None", contract.get("execution")))
+        if strategy == "keyset"
+        else SequentialKeysetExecution(),
     )
 
 
@@ -309,6 +375,7 @@ def list_stream(
             identity=cast("IdentitySpec", route.identity),
             page_size=route.page_size,
             keyset=cast("KeysetSpec", route.mechanics),
+            execution=route.execution,
         )
     return client.iter_list_cursor(
         request,
@@ -321,11 +388,13 @@ def list_stream(
 
 __all__ = [
     "CliUsageError",
+    "KeysetExecutionJson",
     "ListContractRoute",
     "cli_request",
     "decode_one_object",
     "default_contract",
     "list_stream",
+    "parse_keyset_execution",
     "parse_list_contract",
     "read_json_source",
 ]

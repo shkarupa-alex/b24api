@@ -1,4 +1,3 @@
-# ruff: noqa: INP001
 """Reproducible local CPU, wall-time, and allocation profiling scenarios."""
 
 from __future__ import annotations
@@ -9,16 +8,23 @@ import hashlib
 import importlib
 import json
 import math
-import shutil
 import statistics
-import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
-from harness.runtime_profile import run_capability_profile
+ROOT = Path(__file__).resolve().parents[2]
+
+if TYPE_CHECKING or __package__:
+    from .harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
+    from .harness.runtime_profile import run_capability_profile
+    from .repository import clean_candidate_sha
+else:
+    sys.path.insert(0, str(ROOT))
+    from tools.b24api_evidence.harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
+    from tools.b24api_evidence.harness.runtime_profile import run_capability_profile
+    from tools.b24api_evidence.repository import clean_candidate_sha
 
 _PLANS = ("fixed_1x_batch", "counted_batch")
 _DEFAULT_CASES = (
@@ -149,15 +155,7 @@ def _main() -> None:
         raise SystemExit("--memray-output requires exactly one --case and one --plan")
     if args.memray_output is not None and args.memray_output.exists():
         raise SystemExit(f"Memray output already exists: {args.memray_output}")
-    git = shutil.which("git")
-    if git is None:
-        raise SystemExit("git is required to bind profiling output to a candidate")
-    candidate_sha = subprocess.run(  # noqa: S603 - resolved git binary, fixed arguments
-        (git, "rev-parse", "HEAD"),
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    candidate_sha = clean_candidate_sha(ROOT)
     capability = asyncio.run(run_capability_profile()) if args.capability_suite else None
     results: list[dict[str, Any]] = []
     if not args.capability_suite:
@@ -173,6 +171,8 @@ def _main() -> None:
                     ),
                 ),
             )
+    if clean_candidate_sha(ROOT) != candidate_sha:
+        raise RuntimeError("candidate changed while profiling")
     sys.stdout.write(
         json.dumps(
             {

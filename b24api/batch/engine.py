@@ -5,8 +5,8 @@ import asyncio
 from collections.abc import AsyncIterable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
-from urllib.parse import quote_plus
 
+from b24api._error_types import ErrorOrigin
 from b24api.batch.outcome import (
     BatchCommandEvidence,
     BatchFailure,
@@ -19,12 +19,14 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.request import ReplaySafety, Request
 from b24api.contracts.response import Response
-from b24api.errors import B24ApiError, BatchCommandError, ErrorOrigin, ProtocolError
+from b24api.encoding import encode_php_query
+from b24api.errors import B24ApiError, BatchCommandError, CapabilityError, ProtocolError
 from b24api.execution import (
     ExecutionContext,
     Executor,
     WorkClass,
 )
+from b24api.execution.executor import _raise_embedded_result_error
 from b24api.traversal.plans import PORTAL_BATCH_CAP
 
 if TYPE_CHECKING:
@@ -103,81 +105,149 @@ class BatchExecutor:
             policy=policy or ExecutionPolicy(),
         )
 
-    async def _execute_chunk(
+    async def _execute_chunk(  # noqa: PLR0913
         self,
         commands: tuple[_Command, ...],
         *,
         context: ExecutionContext,
         halt: bool,
+        advisory_totals: bool = False,
+        strict_envelope: bool = False,
+        strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
-        request = _batch_request(commands, halt=halt)
+        rejected: dict[int, BatchOutcome] = {}
+        eligible = commands
+        if not halt:
+            eligible, rejected = _partition_capabilities(commands)
+            if not eligible:
+                return tuple(rejected[command.index] for command in commands)
+        request = _batch_request(eligible, halt=halt)
         try:
-            response = await self.executor.execute(request, context=context, work_class=WorkClass.BATCH)
-            envelope = _decode_batch_envelope(response.result)
+            response = await self.executor.execute(
+                request,
+                context=context,
+                work_class=WorkClass.BATCH,
+                strict_json_members=strict_json_members,
+            )
+            envelope = _decode_batch_envelope(
+                response.result,
+                expected_keys=frozenset(command.stable_key for command in eligible),
+                strict=strict_envelope,
+            )
         except asyncio.CancelledError:
             raise
         except B24ApiError as error:
-            return tuple(_shared_failure(command, error) for command in commands)
+            if strict_envelope and isinstance(error, ProtocolError) and error.request_summary is None:
+                scoped_error = ProtocolError(
+                    str(error),
+                    origin=error.origin,
+                    description=error.description,
+                    request_summary=request.summary,
+                    evidence=error.evidence,
+                    retryable=error.retryable,
+                )
+                scoped_error.__cause__ = error
+                error = scoped_error
+            failures = tuple(_shared_failure(command, error) for command in eligible)
+            return _merge_outcomes(commands, failures, rejected)
 
-        outcomes: list[BatchOutcome] = []
-        for command in commands:
-            evidence = BatchCommandEvidence(command.index, command.stable_key)
-            if command.stable_key in envelope.errors:
-                command_error = self._command_error(
-                    envelope.errors[command.stable_key],
-                    command,
-                    retry_codes=context.policy.retry.transient_api_codes,
-                )
-                evidence = BatchCommandEvidence(
-                    command.index,
-                    command.stable_key,
-                    original_code=command_error.original_code,
-                    normalized_code=command_error.normalized_code,
-                )
-                outcomes.append(_command_failure(command, command_error, evidence=evidence))
-                continue
-            if command.stable_key not in envelope.results:
-                missing_error = ProtocolError(
-                    "Batch result map is missing a submitted command",
-                    origin=ErrorOrigin.PROTOCOL,
-                    request_summary=command.request.summary,
-                )
-                outcomes.append(_command_failure(command, missing_error, evidence=evidence))
-                continue
-            try:
-                command_response = Response(
-                    envelope.results[command.stable_key],
-                    total=_optional_batch_integer(envelope.totals, command.stable_key, field="total"),
-                    next=_optional_batch_integer(envelope.continuations, command.stable_key, field="next"),
-                    evidence=response.evidence,
-                )
-            except (TypeError, ValueError) as error:
-                protocol_error = ProtocolError(
-                    "Batch command metadata is malformed",
-                    origin=ErrorOrigin.PROTOCOL,
-                    request_summary=command.request.summary,
-                    evidence=response.evidence,
-                )
-                protocol_error.__cause__ = error
-                outcomes.append(_command_failure(command, protocol_error, evidence=evidence))
-                continue
-            outcomes.append(
-                BatchSuccess._from_response(  # noqa: SLF001 - trusted correlated decoder fast path
-                    command.index,
-                    command.stable_key,
-                    command.request,
-                    command_response,
-                    command.correlation,
-                    evidence,
-                ),
+        outcomes = tuple(
+            self._decode_command(
+                command,
+                envelope,
+                response,
+                context=context,
+                advisory_totals=advisory_totals,
             )
-        return tuple(outcomes)
+            for command in eligible
+        )
+        return _merge_outcomes(commands, outcomes, rejected)
+
+    def _decode_command(
+        self,
+        command: _Command,
+        envelope: _BatchEnvelope,
+        response: Response,
+        *,
+        context: ExecutionContext,
+        advisory_totals: bool = False,
+    ) -> BatchOutcome:
+        evidence = BatchCommandEvidence(command.index, command.stable_key)
+        if command.stable_key in envelope.errors:
+            command_error = self._command_error(
+                envelope.errors[command.stable_key],
+                command,
+                retry_codes=context.policy.retry.transient_api_codes,
+            )
+            command_evidence = BatchCommandEvidence(
+                command.index,
+                command.stable_key,
+                original_code=command_error.original_code,
+                normalized_code=command_error.normalized_code,
+            )
+            return _command_failure(command, command_error, evidence=command_evidence)
+        if command.stable_key not in envelope.results:
+            missing_error = ProtocolError(
+                "Batch result map is missing a submitted command",
+                origin=ErrorOrigin.PROTOCOL,
+                request_summary=command.request.summary,
+            )
+            return _command_failure(command, missing_error, evidence=evidence)
+        try:
+            command_response = Response(
+                envelope.results[command.stable_key],
+                total=_optional_batch_integer(
+                    envelope.totals,
+                    command.stable_key,
+                    field="total",
+                    malformed_as_none=advisory_totals,
+                ),
+                next=_optional_batch_integer(envelope.continuations, command.stable_key, field="next"),
+                evidence=response.evidence,
+            )
+            _raise_embedded_result_error(
+                command.request,
+                command_response.result,
+                http_status=response.evidence.http_status or 200,
+                retry_codes=context.policy.retry.transient_api_codes,
+                batch=True,
+            )
+        except BatchCommandError as error:
+            command_evidence = BatchCommandEvidence(
+                command.index,
+                command.stable_key,
+                original_code=error.original_code,
+                normalized_code=error.normalized_code,
+            )
+            return _command_failure(command, error, evidence=command_evidence)
+        except ProtocolError as error:
+            return _command_failure(command, error, evidence=evidence)
+        except (TypeError, ValueError) as error:
+            protocol_error = ProtocolError(
+                "Batch command metadata is malformed",
+                origin=ErrorOrigin.PROTOCOL,
+                request_summary=command.request.summary,
+                evidence=response.evidence,
+            )
+            protocol_error.__cause__ = error
+            return _command_failure(command, protocol_error, evidence=evidence)
+        return BatchSuccess._from_response(  # noqa: SLF001 - trusted correlated decoder fast path
+            command.index,
+            command.stable_key,
+            command.request,
+            command_response,
+            command.correlation,
+            evidence,
+        )
 
     async def execute_requests(
         self,
         requests: tuple[Request, ...],
         *,
         context: ExecutionContext,
+        advisory_totals: bool = False,
+        strict_envelope: bool = False,
+        strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
         """Execute one scheduler-owned chunk with total per-command correlation."""
         if not requests or len(requests) > self.portal_command_cap:
@@ -195,6 +265,9 @@ class BatchExecutor:
             commands,
             context=context,
             halt=False,
+            advisory_totals=advisory_totals,
+            strict_envelope=strict_envelope,
+            strict_json_members=strict_json_members,
         )
 
     def _command_error(
@@ -228,6 +301,8 @@ class BatchExecutor:
 
 
 def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
+    if any(command.request.encoding.value != "json" or command.request.headers.items for command in commands):
+        raise CapabilityError("physical batch supports JSON requests without scoped headers; use direct dispatch")
     safety_values = {command.request.replay_safety or ReplaySafety.UNKNOWN for command in commands}
     if safety_values == {ReplaySafety.SAFE}:
         safety = ReplaySafety.SAFE
@@ -236,7 +311,7 @@ def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
     else:
         safety = ReplaySafety.UNKNOWN
     encoded = {command.stable_key: _command_query(command.request) for command in commands}
-    return Request("batch", {"halt": int(halt), "cmd": encoded}, replay_safety=safety)
+    return Request("batch", parameters={"halt": int(halt), "cmd": encoded}, replay_safety=safety)
 
 
 def _command_query(request: Request) -> str:
@@ -246,22 +321,15 @@ def _command_query(request: Request) -> str:
 
 def _build_query(parameters: Mapping[str | int, object], path: str = "%s") -> str:
     """Encode nested JSON values with Bitrix/PHP bracket semantics."""
-    parts: list[str] = []
-    for key, raw_value in parameters.items():
-        if raw_value is None:
-            continue
-        value: object = dict(enumerate(raw_value)) if isinstance(raw_value, list | tuple) else raw_value
-        if isinstance(value, Mapping):
-            nested = _build_query(value, path % key + "[%s]")
-            if nested:
-                parts.append(nested)
-            continue
-        encoded_key = quote_plus(path % key)
-        parts.append(f"{encoded_key}={quote_plus(str(value))}")
-    return "&".join(parts)
+    return encode_php_query(parameters, path)
 
 
-def _decode_batch_envelope(raw: JsonValue) -> _BatchEnvelope:
+def _decode_batch_envelope(
+    raw: JsonValue,
+    *,
+    expected_keys: frozenset[str],
+    strict: bool = False,
+) -> _BatchEnvelope:
     if not isinstance(raw, dict):
         raise ProtocolError("Batch result envelope must be an object", origin=ErrorOrigin.PROTOCOL)
     if "result_error" not in raw:
@@ -270,6 +338,17 @@ def _decode_batch_envelope(raw: JsonValue) -> _BatchEnvelope:
     errors = _decode_php_map(raw["result_error"], field="result_error")
     totals = _decode_optional_php_map(raw, field="result_total")
     continuations = _decode_optional_php_map(raw, field="result_next")
+    result_keys = frozenset(results)
+    error_keys = frozenset(errors)
+    if strict and (result_keys & error_keys or not (result_keys | error_keys).issubset(expected_keys)):
+        raise ProtocolError(
+            "Batch result correlation keys are duplicated or unknown",
+            origin=ErrorOrigin.PROTOCOL,
+        )
+    if strict and (
+        not frozenset(totals).issubset(expected_keys) or not frozenset(continuations).issubset(expected_keys)
+    ):
+        raise ProtocolError("Batch metadata contains an unknown correlation key", origin=ErrorOrigin.PROTOCOL)
     return _BatchEnvelope(
         results=results,
         errors=errors,
@@ -284,12 +363,27 @@ def _decode_optional_php_map(raw: dict[str, JsonValue], *, field: str) -> dict[s
     return _decode_php_map(raw[field], field=field)
 
 
-def _optional_batch_integer(values: Mapping[str, object], key: str, *, field: str) -> int | None:
+def _optional_batch_integer(
+    values: Mapping[str, object],
+    key: str,
+    *,
+    field: str,
+    malformed_as_none: bool = False,
+) -> int | None:
     if key not in values:
         return None
     value = values[key]
     if not isinstance(value, int) or isinstance(value, bool):
+        if malformed_as_none:
+            return None
         raise TypeError(f"batch {field} must be an integer")
+    if field == "total" and value < 0:
+        if malformed_as_none:
+            return None
+        if value < -1:
+            raise ValueError("batch total must be -1 or non-negative")
+    if field == "next" and value == -1:
+        return None
     return value
 
 
@@ -307,6 +401,39 @@ def _decode_php_map(raw: JsonValue, *, field: str) -> dict[str, JsonValue]:
             origin=ErrorOrigin.PROTOCOL,
         )
     return raw
+
+
+def _merge_outcomes(
+    commands: tuple[_Command, ...],
+    executed: tuple[BatchOutcome, ...],
+    rejected: Mapping[int, BatchOutcome],
+) -> tuple[BatchOutcome, ...]:
+    """Restore caller order after tolerant local capability rejection."""
+    by_index = {outcome.command_index: outcome for outcome in executed}
+    by_index.update(rejected)
+    return tuple(by_index[command.index] for command in commands)
+
+
+def _partition_capabilities(
+    commands: tuple[_Command, ...],
+) -> tuple[tuple[_Command, ...], dict[int, BatchOutcome]]:
+    """Separate tolerant commands that physical batch cannot represent."""
+    eligible: list[_Command] = []
+    rejected: dict[int, BatchOutcome] = {}
+    for command in commands:
+        if command.request.encoding.value == "json" and not command.request.headers.items:
+            eligible.append(command)
+            continue
+        error = CapabilityError(
+            "physical batch supports JSON requests without scoped headers; use direct dispatch",
+            request_summary=command.request.summary,
+        )
+        rejected[command.index] = _command_failure(
+            command,
+            error,
+            evidence=BatchCommandEvidence(command.index, command.stable_key),
+        )
+    return tuple(eligible), rejected
 
 
 def _command_failure(

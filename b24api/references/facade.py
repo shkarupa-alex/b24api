@@ -1,13 +1,13 @@
 """Canonical bound-reference composition over the proven bounded scheduler."""
 
 # ruff: noqa: PLR0913 - bounded orchestration adapter
-
 from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from b24api._stream import MappedOperationStream
 from b24api.contracts.dispatch import DeliveryOrder, DirectDispatch, DispatchSpec
+from b24api.contracts.keyset_execution import SequentialKeysetExecution
 from b24api.contracts.policy import (
     DuplicatePolicy,
     ExecutionPolicy,
@@ -23,12 +23,20 @@ from b24api.contracts.reference import (
     ReferenceOutcome,
     ReferenceOutcomeUnknown,
 )
-from b24api.contracts.report import OperationReport, TerminalState
-from b24api.contracts.request import IdentitySpec, Request, RequestLike, ResultSelector, canonical_request
+from b24api.contracts.report import OperationReport, TerminalState, Violation
+from b24api.contracts.request import (
+    IdentitySpec,
+    Request,
+    RequestLike,
+    ResultSelector,
+    TraversalIdentity,
+    canonical_request,
+)
 from b24api.contracts.traversal import (
     CountedTraversal,
     KeysetTraversal,
     SequentialTraversal,
+    TotalTermination,
     TraversalSpec,
 )
 from b24api.errors import (
@@ -50,10 +58,10 @@ from b24api.references.outcome import ReferenceItem as KernelItem
 from b24api.references.stream import (
     iter_references as _iter_references,
 )
+from b24api.traversal.driver import PaginationDriver
+from b24api.traversal.plans import BatchDispatch as KernelBatchDispatch
 from b24api.traversal.plans import (
-    BatchDispatch as KernelBatchDispatch,
-)
-from b24api.traversal.plans import (
+    CountedOffsetMode,
     CountedOffsetPlan,
     CursorTerminalRule,
     DispatchPlan,
@@ -93,7 +101,7 @@ def _direction(value: str) -> Literal["asc", "desc"]:
     return "asc" if value == "ascending" else "desc"
 
 
-def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, IdentitySpec | None]:
+def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, TraversalIdentity | None]:
     if isinstance(traversal, SequentialTraversal):
         offset_mechanics = traversal.offset
         return (
@@ -101,12 +109,21 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Id
                 offset_path=offset_mechanics.parameter_path,
                 limit_path=offset_mechanics.limit_path,
                 requested_page_size=traversal.page_size if offset_mechanics.limit_path is not None else None,
-                continuation=OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT,
-                terminal=frozenset({OffsetTerminalRule.EMPTY_PAGE}),
+                continuation=offset_mechanics.continuation,
+                fixed_step=offset_mechanics.step,
+                terminal=(
+                    frozenset({OffsetTerminalRule.EMPTY_PAGE})
+                    if offset_mechanics.total_termination is TotalTermination.DISABLED
+                    else frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL})
+                ),
                 allow_create_controls=offset_mechanics.allow_create_controls,
                 identity_requirement=IdentityRequirement.OPTIONAL,
                 duplicate_policy=DuplicatePolicy.ERROR,
-                total_semantics=TotalSemantics.IGNORE,
+                total_semantics=(
+                    TotalSemantics.IGNORE
+                    if offset_mechanics.total_termination is TotalTermination.DISABLED
+                    else TotalSemantics.FILTERED_EXACT
+                ),
             ),
             traversal.selector,
             traversal.identity,
@@ -119,14 +136,25 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Id
                 limit_path=counted_mechanics.limit_path,
                 requested_page_size=(traversal.page_size if counted_mechanics.limit_path is not None else None),
                 allow_create_controls=counted_mechanics.allow_create_controls,
-                identity_requirement=IdentityRequirement.REQUIRED,
+                identity_requirement=(
+                    IdentityRequirement.OPTIONAL if traversal.identity is None else IdentityRequirement.REQUIRED
+                ),
                 duplicate_policy=DuplicatePolicy.ERROR,
                 total_semantics=TotalSemantics.FILTERED_EXACT,
+                continuation=counted_mechanics.continuation,
+                mode=(
+                    CountedOffsetMode.PARALLEL_FIXED_STRIDE
+                    if counted_mechanics.continuation is OffsetContinuation.FIXED_STEP
+                    else CountedOffsetMode.SEQUENTIAL_NEXT
+                ),
+                fixed_stride=counted_mechanics.step,
             ),
             traversal.selector,
             traversal.identity,
         )
     if isinstance(traversal, KeysetTraversal):
+        if not isinstance(traversal.execution, SequentialKeysetExecution):
+            raise CapabilityError("reference keyset traversal supports sequential execution only")
         keyset_mechanics = traversal.keyset
         direction = _direction(keyset_mechanics.direction)
         return (
@@ -134,6 +162,7 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Id
                 direction=direction,
                 filter_path=keyset_mechanics.filter_path,
                 order_path=keyset_mechanics.order_path,
+                split_order=keyset_mechanics.split_order,
                 start_suppression_path=keyset_mechanics.start_suppression_path,
                 limit_path=keyset_mechanics.limit_path,
                 requested_page_size=(traversal.page_size if keyset_mechanics.limit_path is not None else None),
@@ -277,6 +306,7 @@ def kernel_reference_stream[C](
     dispatch: DispatchSpec,
     policy: ExecutionPolicy,
     tolerant: bool,
+    audit: Callable[[Request], Violation | None] | None = None,
 ) -> ReferenceKernelStream:
     """Build the internal owned stream after all base controls are validated."""
     from b24api.execution import Executor  # noqa: PLC0415 - narrow internal composition import
@@ -286,10 +316,20 @@ def kernel_reference_stream[C](
     if isinstance(traversal, CountedTraversal) and isinstance(dispatch, DirectDispatch):
         raise CapabilityError("counted reference traversal requires BatchDispatch")
     plan, selector, identity = _kernel_plan(traversal)
+    preflight = PaginationDriver(
+        executor,
+        base,
+        plan,
+        selector=selector,
+        identity=identity,
+        context=executor.context(policy),
+    )
+    preflight._validate_capabilities()  # noqa: SLF001 - reject base controls before consuming caller input
+    executor._preflight_request(base)  # noqa: SLF001 - reject transport representation before caller input
     kernel_dispatch = _kernel_dispatch(dispatch, policy)
     stream = _iter_references(
         executor,
-        binding_source(base, bindings, traversal),
+        binding_source(base, bindings, traversal, audit),
         plan=plan,
         dispatch=kernel_dispatch,
         selector=selector,
@@ -313,17 +353,22 @@ def reference_stream[C](
     dispatch: DispatchSpec,
     policy: ExecutionPolicy,
     tolerant: bool,
+    audit: Callable[[Request], Violation | None] | None = None,
     deregister: Deregister,
 ) -> OperationStream[ReferenceOutcome[C]]:
     """Compose the public bound-reference stream over the scheduler kernel."""
+    base = canonical_request(request)
+    if not isinstance(dispatch, DirectDispatch) and (base.encoding.value != "json" or base.headers.items):
+        raise CapabilityError("physical batch supports JSON requests without scoped headers; use direct dispatch")
     source = kernel_reference_stream(
         executor,
-        canonical_request(request),
+        base,
         bindings,
         traversal=traversal,
         dispatch=dispatch,
         policy=policy,
         tolerant=tolerant,
+        audit=audit,
     )
     mapper = _ReferenceEventMapper()
     stream = MappedOperationStream(

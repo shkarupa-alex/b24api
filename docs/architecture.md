@@ -10,11 +10,12 @@ client does not contain endpoint catalogs, persistence, business reconciliation 
 |---|---|---|
 | Decoded direct request | `call()` | Detached decoded JSON with explicit replay policy. |
 | Response envelope | `call_response()` | Immutable result, pagination, timing and bounded evidence. |
+| Binary response | `call_bytes()` | Every bounded successful body byte returned without JSON sniffing. |
 | Arbitrary logical batch | `batch()` / `batch_outcomes()` | Lazy input, bounded physical batches, off-wire correlation and typed outcomes. |
 | Independent command fan-out | `fan_out()` / `fan_out_outcomes()` | Explicit dispatch mode, concurrency and delivery order. |
 | Sequential offset list | `iter_list()` | Server-continuation validation and terminal empty-page confirmation. |
 | Counted list | `iter_list_counted()` | Direct head, batched tail and exact total/range/identity validation. |
-| No-count keyset | `iter_list_keyset()` | Strict monotonic identity progress without a count request. |
+| No-count keyset | `iter_list_keyset()` | Compatible sequential default plus explicit range, partitioned, or deterministic auto execution for caller-asserted stable integer keysets. |
 | Dependent cursor | `iter_list_cursor()` | Strict unique monotonic cursor progress. |
 | Per-parent traversal | `iter_references()` / `iter_reference_outcomes()` | Isolated traversal state and correlation for every accepted binding. |
 | Shell access | `b24api call` / `b24api list` | JSON/JSONL stdout and diagnostics on stderr. |
@@ -63,3 +64,22 @@ tests and credentials are excluded.
 
 The client deliberately has no automatic endpoint profiles, shape-changing Python flags, tuple
 payload conventions, public low-level execution plans or mutable global registries.
+
+## Wire, traversal, and evidence boundaries
+
+`Request` owns immutable body encoding, scoped headers, replay safety, and an optional declarative
+embedded-result error contract. Legacy transports continue to support ordinary JSON requests;
+advanced request representations require an advertised `WireTransport` capability and fail before
+I/O otherwise. No ordinary wire value can name an absolute destination.
+
+Traversal contracts separately declare progression (`server next`, observed width, or fixed step),
+completion (empty confirmation or caller-qualified exact total), collection shape, and identity.
+Page evidence contains only bounded counters and enum classifications—never rows, identities,
+parameters, headers, URLs, or body fragments.
+
+Fast keyset execution has a planning barrier before emission. Boundary-only and automatic
+sequential continuation rely on the same ordered-prefix assurance as the default; numeric range and
+partition plans must first pass bounded capability canaries. Advisory totals are isolated from
+completion and admission. One scheduler owns wave correlation, ordered admission, row-buffer deltas,
+finishing continuation, cleanup, and the immutable selection report. Stateless transaction functions
+execute its batch/body/finish I/O but define no scheduler class or persistent state of their own.

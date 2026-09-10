@@ -1,7 +1,6 @@
 """Lazy correctness-first sequential traversal streams and state machines."""
 
 from __future__ import annotations
-import contextlib
 import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -15,7 +14,7 @@ from b24api.contracts.policy import (
     OrderSemantics,
     TotalSemantics,
 )
-from b24api.contracts.request import IdentitySpec, ParameterPath, Request
+from b24api.contracts.request import IdentitySpec, ParameterPath, Request, TraversalIdentity
 from b24api.contracts.response import Response, inject_controls
 from b24api.errors import CapabilityError, PaginationError
 from b24api.traversal.plans import (
@@ -33,7 +32,7 @@ from b24api.traversal.plans import (
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
-    from b24api.execution.snapshot import KernelReport
+    from b24api.contracts.report import PageRejectionCode
     from b24api.traversal.values import IdentityValue
 
 type PageFetch = Callable[[Request], Awaitable[Response]]
@@ -45,6 +44,16 @@ _PLAN_TYPES = (
     KeysetPlan,
     ItemCursorPlan,
 )
+
+
+class _PageRejectionError(PaginationError):
+    """Pagination error carrying a stable page-evidence category."""
+
+    report_name = "PaginationError"
+
+    def __init__(self, message: str, rejection_code: PageRejectionCode) -> None:
+        self.rejection_code = rejection_code
+        super().__init__(message)
 
 
 class _IdentityStore(Protocol):
@@ -131,11 +140,6 @@ class _EffectiveConsistency:
     confirmation_policy: ConfirmationPolicy
 
 
-def _attach_report(error: BaseException, report: KernelReport) -> None:
-    with contextlib.suppress(AttributeError, TypeError):
-        error.report = report  # type: ignore[attr-defined]
-
-
 def _request_with_controls(
     request: Request,
     updates: dict[ParameterPath, object],
@@ -152,7 +156,7 @@ def _request_with_controls(
         parameters = inject_controls(parameters, remaining, allow_create=allow_create)
     except (KeyError, TypeError, ValueError) as error:
         raise CapabilityError("request parameters conflict with required traversal controls") from error
-    return Request(request.method, parameters, request.replay_safety)
+    return request.with_parameters(parameters)
 
 
 def _replace_owned_control(  # noqa: C901, PLR0912 - exact nested path replacement is one atomic operation
@@ -305,13 +309,24 @@ def _offset_terminal(
         and response.total is not None
         and response.total >= 0
         and accepted == response.total
-        and response.next is None
+        and (response.next is None or plan.continuation is OffsetContinuation.FIXED_STEP)
     ):
         return "qualified total reached"
     return None
 
 
-def _next_offset(plan: OffsetSequentialPlan, response: Response, *, current: int, observed: int) -> int:
+def _next_offset(
+    plan: OffsetSequentialPlan | CountedOffsetPlan,
+    response: Response,
+    *,
+    current: int,
+    observed: int,
+) -> int:
+    if plan.continuation is OffsetContinuation.FIXED_STEP:
+        step = plan.fixed_step if isinstance(plan, OffsetSequentialPlan) else plan.fixed_stride
+        if step is None:
+            raise RuntimeError("fixed-step plan lacks its validated step")
+        return current + step
     if plan.continuation is OffsetContinuation.SERVER_NEXT:
         if response.next is None:
             raise PaginationError("server-next traversal has no continuation")
@@ -321,22 +336,16 @@ def _next_offset(plan: OffsetSequentialPlan, response: Response, *, current: int
     return current + observed
 
 
-def _keyset_terminal(plan: KeysetPlan, page_size: int) -> str | None:
-    if plan.terminal is KeysetTerminalRule.EMPTY_CONFIRMATION and page_size == 0:
-        return "empty keyset confirmation"
-    return None
-
-
 def _cursor_terminal(plan: ItemCursorPlan, page_size: int) -> str | None:
     if plan.terminal is CursorTerminalRule.EMPTY_CONFIRMATION and page_size == 0:
         return "empty cursor confirmation"
     return None
 
 
-def _identity_store(_policy: ExecutionPolicy, plan: ListPlan, identity: IdentitySpec | None) -> _IdentityStore:
+def _identity_store(_policy: ExecutionPolicy, plan: ListPlan, identity: TraversalIdentity | None) -> _IdentityStore:
     if isinstance(plan, KeysetPlan) or (
         isinstance(plan, ItemCursorPlan)
-        and identity is not None
+        and isinstance(identity, IdentitySpec)
         and identity.item_path == plan.cursor_item_path
         and identity.coercion is plan.cursor_coercion
     ):

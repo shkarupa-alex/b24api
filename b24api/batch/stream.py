@@ -37,6 +37,7 @@ from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
 )
+from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 
 
@@ -402,11 +403,6 @@ async def _close_sync_owned(iterator: _SyncClosable) -> None:
         with contextlib.suppress(BaseException):
             await close
         raise
-
-
-def _attach_report(error: BaseException, report: KernelReport) -> None:
-    with contextlib.suppress(AttributeError, TypeError):
-        error.report = report  # type: ignore[attr-defined]
 
 
 async def _next_chunk(

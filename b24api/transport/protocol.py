@@ -5,11 +5,11 @@ import json
 from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, Any
 
+from b24api._error_types import ErrorOrigin
 from b24api.contracts.response import ResponseEvidence
 from b24api.errors import (
     ApiResponseError,
     B24ApiError,
-    ErrorOrigin,
     HTTPGatewayError,
     ProtocolError,
 )

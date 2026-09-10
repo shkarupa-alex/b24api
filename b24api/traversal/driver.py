@@ -1,8 +1,11 @@
 """Lazy correctness-first sequential traversal streams and state machines."""
 
 from __future__ import annotations
-from typing import TYPE_CHECKING
+import contextlib
+from dataclasses import replace
+from typing import TYPE_CHECKING, cast
 
+from b24api.contracts.json import _json_type_name
 from b24api.contracts.policy import (
     ConfirmationPolicy,
     DuplicatePolicy,
@@ -10,9 +13,32 @@ from b24api.contracts.policy import (
     IdentityRequirement,
     TotalSemantics,
 )
-from b24api.contracts.report import Violation, ViolationSeverity
-from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector
-from b24api.errors import CapabilityError, PaginationError
+from b24api.contracts.report import (
+    PageDispatch,
+    PageOutcome,
+    PageRecord,
+    PageRejectionCode,
+    Violation,
+    ViolationSeverity,
+    retain_page_trace,
+)
+from b24api.contracts.request import (
+    CompositeIdentitySpec,
+    IdentityComponent,
+    IdentitySpec,
+    ParameterPath,
+    Request,
+    ResultSelector,
+    TraversalIdentity,
+)
+from b24api.contracts.traversal import OffsetContinuation
+from b24api.errors import (
+    AmbiguousExecutionError,
+    CapabilityError,
+    IdentityContractError,
+    PaginationError,
+    ResultShapeError,
+)
 from b24api.traversal.counted_batch import _CountedBatchMixin
 from b24api.traversal.cursor import _CursorMixin
 from b24api.traversal.identity import (
@@ -27,12 +53,12 @@ from b24api.traversal.identity import (
     _IdentityStore,
     _initial_offset,
     _Page,
+    _PageRejectionError,
     _request_with_controls,
     _validate_confirmation_policy,
 )
 from b24api.traversal.keyset import _KeysetMixin
 from b24api.traversal.plans import (
-    CountedOffsetMode,
     CountedOffsetPlan,
     ItemCursorPlan,
     KeysetPlan,
@@ -47,7 +73,9 @@ from b24api.traversal.values import (
     _coerce_identity,
     _compare_identities,
     _extract_path,
+    _mapping_shape_degraded,
     _page_fingerprint,
+    _response_items,
     _validate_order,
 )
 
@@ -73,7 +101,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         plan: ListPlan,
         *,
         selector: ResultSelector | None,
-        identity: IdentitySpec | None,
+        identity: TraversalIdentity | None,
         context: ExecutionContext,
         fetch: PageFetch | None = None,
         single_result_as_item: bool = False,
@@ -111,6 +139,13 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._advisory_total_drift_reported = False
         self._advisory_total_mismatch_reported = False
         self.batch_report: KernelReport | None = None
+        self.page_trace: list[PageRecord] = []
+        self._page_trace_count = 0
+        self.page_trace_truncated = False
+        self._last_page_record: PageRecord | None = None
+        self._page_dispatch = PageDispatch.DIRECT
+        self._page_batch_index: int | None = None
+        self._page_offset: int | None = None
 
     async def pages(self) -> AsyncGenerator[_Page]:  # noqa: C901
         """Yield validated traversal pages."""
@@ -147,17 +182,33 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._validate_capabilities()
         self._identity_store = _identity_store(self.context.policy, self.plan, self.identity)
 
-    def validate_external_page(self, items: list[JsonValue], response: Response) -> None:
+    def validate_external_page(self, items: list[JsonValue], response: Response, *, terminal: bool = False) -> None:
         """Validate one externally dispatched page with the canonical traversal state machine."""
         if self._identity_store is None:
             raise RuntimeError("page validation is not active")
-        self._validate_page(items, response=response)
+        self._validate_page(items, response=response, terminal=terminal)
 
-    def finish_external_validation(self) -> None:
-        """Validate the canonical terminal-total contract for externally dispatched pages."""
-        if self._identity_store is None:
-            raise RuntimeError("page validation is not active")
-        self._validate_terminal_total()
+    def select_page(self, response: Response, *, single: bool = False) -> list[JsonValue]:
+        """Select one scheduled page and retain value-free evidence on shape rejection."""
+        try:
+            return _response_items(response, self.selector, single=single)
+        except ResultShapeError as error:
+            enriched = ResultShapeError(
+                selector=error.selector,
+                expected_shape=error.expected_shape,
+                observed_type=error.observed_type,
+                request_summary=self.request.summary,
+                page_offset=self._page_offset,
+            )
+            self._record_rejected_page([], response, enriched)
+            raise enriched from error
+        except BaseException as error:
+            self._record_rejected_page([], response, error)
+            raise
+
+    def reject_external_page(self, items: list[JsonValue], response: Response, error: BaseException) -> None:
+        """Record a pre-commit external range or capability rejection exactly once."""
+        self._record_rejected_page(items, response, error)
 
     def close_external_validation(self) -> None:
         """Release the canonical identity store retained by external page validation."""
@@ -176,7 +227,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
     @staticmethod
     def validate_contract(
         plan: ListPlan,
-        identity: IdentitySpec | None,
+        identity: TraversalIdentity | None,
         policy: ExecutionPolicy,
     ) -> _EffectiveConsistency:
         """Validate request-independent plan/policy capabilities before input or I/O."""
@@ -185,8 +236,10 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         if (
             plan.identity_requirement is IdentityRequirement.COMPOSITE
             or consistency.identity_requirement is IdentityRequirement.COMPOSITE
-        ):
-            raise CapabilityError("composite identity requires a separately reviewed identity contract")
+        ) and not isinstance(identity, CompositeIdentitySpec):
+            raise CapabilityError("composite identity contract requires CompositeIdentitySpec")
+        if isinstance(identity, CompositeIdentitySpec) and isinstance(plan, KeysetPlan | ItemCursorPlan):
+            raise CapabilityError("composite identity is supported only by sequential and counted traversal")
         if (
             plan.identity_requirement is IdentityRequirement.REQUIRED
             or consistency.identity_requirement is IdentityRequirement.REQUIRED
@@ -211,8 +264,6 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             consistency.confirmation_policy,
             total_semantics,
         )
-        if isinstance(plan, CountedOffsetPlan) and plan.mode is CountedOffsetMode.PARALLEL_FIXED_STRIDE:
-            raise CapabilityError("parallel fixed-stride counted traversal requires separate reviewed authorization")
         if isinstance(plan, KeysetPlan) and plan.terminal is KeysetTerminalRule.BOUNDARY_ID_SEEN:
             raise CapabilityError("boundary-id keyset requires an externally reviewed boundary contract")
         return _EffectiveConsistency(
@@ -223,7 +274,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         )
 
     def _require_identity(self, plan_name: str) -> IdentitySpec:
-        if self.identity is None:
+        if not isinstance(self.identity, IdentitySpec):
             raise CapabilityError(f"{plan_name} traversal requires IdentitySpec")
         return self.identity
 
@@ -253,11 +304,27 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             second[self.plan.offset_path] = 1
         elif isinstance(self.plan, KeysetPlan):
             identity = self._require_identity("keyset")
-            order_path = _child_path(self.plan.order_path, identity.order_key)
+            if self.plan.split_order is None:
+                if self.plan.order_path is None:
+                    raise RuntimeError("keyset plan lacks ordering controls")
+                order_updates: dict[ParameterPath, object] = {
+                    _child_path(self.plan.order_path, identity.order_key): (
+                        "ASC" if self.plan.direction == "asc" else "DESC"
+                    ),
+                }
+            else:
+                order_updates = {
+                    self.plan.split_order.field_path: self.plan.split_order.field_value or identity.order_key,
+                    self.plan.split_order.direction_path: (
+                        self.plan.split_order.ascending
+                        if self.plan.direction == "asc"
+                        else self.plan.split_order.descending
+                    ),
+                }
             operator = ">" if self.plan.direction == "asc" else "<"
             filter_path = _child_path(self.plan.filter_path, f"{operator}{identity.filter_key}")
-            first[order_path] = "ASC" if self.plan.direction == "asc" else "DESC"
-            second[order_path] = first[order_path]
+            first.update(order_updates)
+            second.update(order_updates)
             first[filter_path] = 0
             second[filter_path] = 1
             if self.plan.start_suppression_path is not None:
@@ -278,33 +345,95 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             _request_with_controls(self.request, first, allow_create=allow_create, replace=replace)
             _request_with_controls(self.request, second, allow_create=allow_create, replace=replace)
 
-    def _validate_page(  # noqa: C901, PLR0912
+    def _validate_page(
         self,
         items: list[JsonValue],
         *,
         response: Response,
         qualified_count: int | None = None,
+        terminal: bool = False,
+        identities: list[IdentityValue] | None = None,
+    ) -> list[IdentityValue]:
+        """Evaluate a page transactionally and commit only after all checks pass."""
+        snapshot = (
+            self.validated_rows,
+            self._expected_total,
+            set(self._advisory_totals),
+            self._advisory_total_drift_reported,
+            self._advisory_total_mismatch_reported,
+            len(self.violations),
+            self._last_identity,
+            self._last_page_unique_mask,
+        )
+        try:
+            return self._validate_page_impl(
+                items,
+                response=response,
+                qualified_count=qualified_count,
+                terminal=terminal,
+                identities=identities,
+            )
+        except BaseException as error:
+            (
+                self.validated_rows,
+                self._expected_total,
+                advisory_totals,
+                self._advisory_total_drift_reported,
+                self._advisory_total_mismatch_reported,
+                violation_count,
+                self._last_identity,
+                self._last_page_unique_mask,
+            ) = snapshot
+            self._advisory_totals = advisory_totals
+            del self.violations[violation_count:]
+            self._record_rejected_page(items, response, error)
+            raise
+
+    def _validate_page_impl(  # noqa: C901, PLR0912, PLR0915
+        self,
+        items: list[JsonValue],
+        *,
+        response: Response,
+        qualified_count: int | None = None,
+        terminal: bool = False,
+        identities: list[IdentityValue] | None = None,
     ) -> list[IdentityValue]:
         requested_page_size = getattr(self.plan, "requested_page_size", None)
         page_caps = tuple(value for value in (requested_page_size, self._page_cap_hint) if value is not None)
         if page_caps and len(items) > min(page_caps):
             raise PaginationError("response exceeded the declared page cap")
-        if not items and response.next is not None:
+        fixed_step = (
+            isinstance(self.plan, OffsetSequentialPlan | CountedOffsetPlan)
+            and self.plan.continuation is OffsetContinuation.FIXED_STEP
+        )
+        if not items and response.next is not None and not fixed_step:
             raise PaginationError("empty response retained a continuation")
+        if _mapping_shape_degraded(response, self.selector):
+            self.violations.append(
+                Violation(
+                    severity=ViolationSeverity.WARNING,
+                    code="collection_shape_degraded",
+                    message="mapping collection terminated as an empty sequence",
+                ),
+            )
         fingerprint = _page_fingerprint(items)
         if fingerprint in self._fingerprints:
-            raise PaginationError("repeated page fingerprint detected")
-        self._fingerprints.add(fingerprint)
+            raise _PageRejectionError(
+                "repeated page fingerprint detected",
+                PageRejectionCode.REPEATED_FINGERPRINT,
+            )
         accepted_count = len(items) if qualified_count is None else qualified_count
         self._validate_response_total(response, accepted_count)
         if self.identity is None:
-            self._last_page_unique_mask = (True,) * len(items)
+            self._last_page_unique_mask = (False,) * len(items)
             self.validated_rows += accepted_count
             self._validate_total_not_overshot()
+            if terminal:
+                self._validate_terminal_total()
+            self._fingerprints.add(fingerprint)
+            self._record_committed_page(items, response)
             return []
-        identities = [
-            _coerce_identity(_extract_path(item, self.identity.item_path), self.identity.coercion) for item in items
-        ]
+        identities = self._extract_identities(items) if identities is None else identities
         if self._order_direction is not None:
             _validate_order(identities, self._order_direction)
             if self._last_identity is not None and identities:
@@ -323,7 +452,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             local.add(value)
         self._last_page_unique_mask = tuple(unique_mask)
         if duplicates and self._duplicate_policy is DuplicatePolicy.ERROR:
-            raise PaginationError("duplicate identity detected")
+            raise _PageRejectionError("duplicate identity detected", PageRejectionCode.DUPLICATE_IDENTITY)
         if duplicates and self._duplicate_policy is DuplicatePolicy.REPORT:
             self.violations.append(
                 Violation(
@@ -332,22 +461,152 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                     message=f"observed {len(duplicates)} duplicate identities",
                 ),
             )
+        if self._expected_total is not None and self.validated_rows + accepted_count > self._expected_total:
+            raise _PageRejectionError("traversal exceeded its exact total", PageRejectionCode.TOTAL_DRIFT)
+        self.validated_rows += accepted_count
+        if terminal:
+            self._validate_terminal_total()
         for value in local:
             self._store.add(value)
         if identities:
             self._last_identity = identities[-1]
-        self.validated_rows += accepted_count
-        self._validate_total_not_overshot()
+        self._fingerprints.add(fingerprint)
+        self._record_committed_page(items, response)
+        return identities
+
+    def _record_committed_page(self, items: list[JsonValue], response: Response) -> None:
+        self._append_page_record(
+            PageRecord(
+                sequence=0,
+                offset=self._page_offset,
+                dispatch=self._page_dispatch,
+                batch_index=self._page_batch_index,
+                rows_selected=len(items),
+                rows_admitted=len(items),
+                reported_total=None if response.total in {None, -1} else response.total,
+                reported_next=None if response.next in {None, -1} else response.next,
+                outcome=PageOutcome.COMMITTED,
+                rejection_code=None,
+            ),
+        )
+
+    def schedule_page(
+        self,
+        *,
+        offset: int | None,
+        dispatch: PageDispatch,
+        batch_index: int | None = None,
+    ) -> None:
+        """Set value-free provenance before one logical page is decoded."""
+        self.cursor_state = offset
+        self._page_offset = offset
+        self._page_dispatch = dispatch
+        self._page_batch_index = batch_index
+
+    def set_page_dispatch(self, *, dispatch: PageDispatch, batch_index: int | None = None) -> None:
+        """Attach physical dispatch provenance without changing the logical cursor."""
+        self._page_dispatch = dispatch
+        self._page_batch_index = batch_index
+
+    def record_unknown_page(
+        self,
+        *,
+        dispatch: PageDispatch,
+        batch_index: int | None,
+        error: BaseException,
+    ) -> None:
+        """Record a scheduled page whose rows could not be decoded."""
+        code = (
+            PageRejectionCode.AMBIGUOUS_EXECUTION
+            if isinstance(error, AmbiguousExecutionError)
+            else PageRejectionCode.COMMAND_FAILURE
+        )
+        self._append_page_record(
+            PageRecord(
+                sequence=0,
+                offset=self._page_offset,
+                dispatch=dispatch,
+                batch_index=batch_index,
+                rows_selected=0,
+                rows_admitted=0,
+                reported_total=None,
+                reported_next=None,
+                outcome=PageOutcome.UNKNOWN,
+                rejection_code=code,
+            ),
+        )
+
+    def _record_rejected_page(
+        self,
+        items: list[JsonValue],
+        response: Response,
+        error: BaseException,
+    ) -> None:
+        if isinstance(error, IdentityContractError):
+            code = PageRejectionCode.IDENTITY_CONTRACT
+        elif isinstance(error, ResultShapeError):
+            code = PageRejectionCode.SHAPE_CONTRACT
+        elif isinstance(error, _PageRejectionError):
+            code = error.rejection_code
+        else:
+            code = PageRejectionCode.RANGE_CONTRADICTION
+        self._append_page_record(
+            PageRecord(
+                sequence=0,
+                offset=self._page_offset,
+                dispatch=self._page_dispatch,
+                batch_index=self._page_batch_index,
+                rows_selected=len(items),
+                rows_admitted=0,
+                reported_total=None if response.total in {None, -1} else response.total,
+                reported_next=None if response.next in {None, -1} else response.next,
+                outcome=PageOutcome.REJECTED,
+                rejection_code=code,
+            ),
+        )
+
+    def _extract_identities(self, items: list[JsonValue]) -> list[IdentityValue]:
+        if self.identity is None:
+            return []
+        composite = isinstance(self.identity, CompositeIdentitySpec)
+        if isinstance(self.identity, CompositeIdentitySpec):
+            components = self.identity.components
+        else:
+            components = (IdentityComponent(self.identity.item_path, self.identity.coercion),)
+        identities: list[IdentityValue] = []
+        for index, item in enumerate(items):
+            row_offset = self.validated_rows + index
+            values: list[str | int] = []
+            for component_index, component in enumerate(components):
+                path = component.item_path
+                coercion = component.coercion
+                try:
+                    raw = _extract_path(item, path)
+                    values.append(cast("str | int", _coerce_identity(raw, coercion)))
+                except PaginationError as error:
+                    observed_type = "missing"
+                    with contextlib.suppress(PaginationError):
+                        observed_type = _json_type_name(_extract_path(item, path))
+                    raise IdentityContractError(
+                        path=path,
+                        coercion=coercion,
+                        observed_type=observed_type,
+                        row_offset=row_offset,
+                        request_summary=self.request.summary,
+                        component_index=(component_index if composite else None),
+                        component_label=(component.label if composite else None),
+                    ) from error
+            identities.append(tuple(values) if composite else values[0])
         return identities
 
     def _validate_response_total(self, response: Response, accepted_count: int) -> None:
         if self._total_semantics is TotalSemantics.FILTERED_EXACT:
-            if response.total is None or response.total < 0:
+            if response.total in {None, -1}:
                 raise CapabilityError("filtered exact total requires a non-negative total")
             if self._expected_total is None:
                 self._expected_total = response.total
             elif response.total != self._expected_total:
-                raise PaginationError("traversal exact total drifted")
+                raise _PageRejectionError("traversal exact total drifted", PageRejectionCode.TOTAL_DRIFT)
         elif self._total_semantics is TotalSemantics.ADVISORY and response.total is not None and response.total >= 0:
             self._advisory_totals.add(response.total)
             if len(self._advisory_totals) > 1 and not self._advisory_total_drift_reported:
@@ -366,7 +625,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
 
     def _validate_total_not_overshot(self) -> None:
         if self._expected_total is not None and self.validated_rows > self._expected_total:
-            raise PaginationError("traversal exceeded its exact total")
+            raise _PageRejectionError("traversal exceeded its exact total", PageRejectionCode.TOTAL_DRIFT)
 
     def _validate_terminal_total(self) -> None:
         if self._total_semantics is TotalSemantics.ADVISORY:
@@ -389,13 +648,37 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         if self._expected_total is None:
             raise CapabilityError("terminal traversal lacks its filtered exact total")
         if self.validated_rows != self._expected_total:
-            raise PaginationError("traversal terminated before its exact total")
+            raise _PageRejectionError(
+                "traversal terminated before its exact total",
+                PageRejectionCode.TOTAL_DRIFT,
+            )
+
+    def _append_page_record(self, record: PageRecord) -> None:
+        record = replace(record, sequence=self._page_trace_count)
+        self._page_trace_count += 1
+        self._last_page_record = record
+        retained, truncated = retain_page_trace(
+            (*self.page_trace, record),
+            self.context.policy.page_trace_limit,
+        )
+        self.page_trace[:] = retained
+        self.page_trace_truncated = self.page_trace_truncated or truncated
+
+    @property
+    def page_trace_count(self) -> int:
+        """Return the number of records observed before online retention."""
+        return self._page_trace_count
+
+    @property
+    def last_page_record(self) -> PageRecord | None:
+        """Return the most recently observed page record, retained or not."""
+        return self._last_page_record
 
     @property
     def unique_rows(self) -> int:
         """Return the unique rows."""
         if self.identity is None:
-            return self.validated_rows
+            return 0
         if self._unique_rows_final is not None:
             return self._unique_rows_final
         if self._identity_store is None:

@@ -26,6 +26,7 @@ from b24api.contracts import IdentityCoercion
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
+RECIPES = ROOT / "docs" / "recipes.md"
 TEST_REFERENCE = re.compile(r"<!-- tested: ([^:]+\.py)::([A-Za-z0-9_]+) -->")
 CONSOLE_TEST_REFERENCE = re.compile(r"<!-- tested-console: ([^:]+\.py)::([A-Za-z0-9_]+) -->")
 PYTHON_BLOCK = re.compile(r"```python\n(.*?)\n```", re.DOTALL)
@@ -89,6 +90,9 @@ class _ExampleClient:
 
     async def call_response(self, _request: Request, **_kwargs: object) -> Response:
         return Response({"ok": True})
+
+    async def call_bytes(self, _request: Request, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(body=b"", content_type="application/octet-stream")
 
     def batch(self, commands: Iterable[Command[object]], **_kwargs: object) -> _ExampleStream[CommandSuccess[object]]:
         return _ExampleStream(
@@ -185,6 +189,22 @@ async def test_every_readme_python_example_executes_exactly_without_io(monkeypat
             "source_ids": (1, 2),
         }
         code = compile(source, str(README), "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        result = eval(code, namespace)  # noqa: S307 - exact trusted repository documentation source
+        if result is not None:
+            await cast("Any", result)
+
+
+@pytest.mark.asyncio
+async def test_every_recipe_python_example_executes_exactly_without_io() -> None:
+    """Keep copyable endpoint recipes executable as public contracts evolve."""
+    client = _ExampleClient()
+    for source in PYTHON_BLOCK.findall(RECIPES.read_text(encoding="utf-8")):
+        namespace: dict[str, object] = {
+            "client": client,
+            "request": Request("example.item.list", replay_safety=ReplaySafety.SAFE),
+            "write_file": lambda *_args, **_kwargs: None,
+        }
+        code = compile(source, str(RECIPES), "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
         result = eval(code, namespace)  # noqa: S307 - exact trusted repository documentation source
         if result is not None:
             await cast("Any", result)

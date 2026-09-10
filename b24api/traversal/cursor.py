@@ -1,5 +1,7 @@
 """Strict dependent item-cursor traversal strategy."""
 
+# ruff: noqa: TRY301 - rejected-page evidence is recorded at this transaction boundary
+
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
@@ -13,7 +15,6 @@ from b24api.traversal.values import (
     IdentityValue,
     _compare_identities,
     _cursor_values,
-    _response_items,
     _take_cursor,
     _validate_order,
 )
@@ -51,19 +52,24 @@ class _CursorMixin:
                 )
             )
             response = await self._fetch(request)
-            items = _response_items(response, self.selector)
-            self._validate_page(items, response=response)
-            cursor_values = _cursor_values(items, plan)
-            _validate_order(cursor_values, plan.direction)
-            if cursor is not None and cursor_values:
-                comparison = _compare_identities(cursor_values[0], cursor)
-                if plan.direction == "asc" and comparison <= 0:
-                    raise PaginationError("item cursor page ignored its lower bound")
-                if plan.direction == "desc" and comparison >= 0:
-                    raise PaginationError("item cursor page ignored its upper bound")
-            terminal = _cursor_terminal(plan, len(items))
-            if terminal is not None:
-                self._validate_terminal_total()
+            trace_count = self.page_trace_count
+            items: list[JsonValue] = []
+            try:
+                items = self.select_page(response)
+                cursor_values = _cursor_values(items, plan)
+                _validate_order(cursor_values, plan.direction)
+                if cursor is not None and cursor_values:
+                    comparison = _compare_identities(cursor_values[0], cursor)
+                    if plan.direction == "asc" and comparison <= 0:
+                        raise PaginationError("item cursor page ignored its lower bound")
+                    if plan.direction == "desc" and comparison >= 0:
+                        raise PaginationError("item cursor page ignored its upper bound")
+                terminal = _cursor_terminal(plan, len(items))
+                self._validate_page(items, response=response, terminal=terminal is not None)
+            except BaseException as error:
+                if self.page_trace_count == trace_count:
+                    self.reject_external_page(items, response, error)
+                raise
             if items:
                 yield _Page(tuple(items), response, (1,) * len(items))
             if terminal is not None:

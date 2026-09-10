@@ -15,7 +15,27 @@ latency admission.
   --case dense-10k --plan counted_batch --samples 7 --warmups 2 \
   --memray-output /tmp/b24api-dense.bin
 .venv/bin/memray stats /tmp/b24api-dense.bin --json -o /tmp/b24api-dense-stats.json
+
+# Batched-keyset fixture matrix and automatic threshold analysis
+.venv/bin/python tools/b24api_keyset_admission.py fixture /tmp/keyset-fixture.json
+
+# Read-only live range/partitioned/auto sandwiches (uses BITRIX24_API_WEBHOOK_URL)
+.venv/bin/python tools/b24api_keyset_admission.py live /tmp/keyset-live.json --samples 5
+
+# Release admission: combine same-SHA live and fixture artifacts with an explicit substitution map
+.venv/bin/python tools/b24api_keyset_admission.py combine /tmp/keyset-admission.json \
+  --live-artifact /tmp/keyset-live.json --fixture-artifact /tmp/keyset-fixture.json \
+  --substitutions /tmp/keyset-substitutions.json
 ```
+
+The live matrix records task filters, identity-role geometry, portal-dependent density/size
+shortfalls, and deterministic-fallback reason codes in the artifact manifest. Same-case coverage
+requires `B24API_KEYSET_SAME_CASE_CELL` to contain an explicit JSON contract for a read-only
+`*.list` method, parameters, selector/item paths, identity field, and expected auto selection; task
+lists are not used for that cell because their numeric filter and order roles differ.
+Standalone deterministic fixtures verify correctness but cannot pass the release performance gate.
+Fixture performance is admitted only through the combined artifact for a deficient live cell/mode
+whose samples cover all three attempt windows and whose exact shortfall reasons are recorded.
 
 ## Results
 
@@ -43,10 +63,20 @@ Memray 1.20.0 measured a 5,121,452-byte peak for seven dense-10k counted samples
 Immutable JSON thawing was the largest cumulative client allocation site; no retention leak was
 observed.
 
+On 2026-09-10, the committed keyset admission harness ran five accepted read-only range sandwiches
+after one warm-up on a 934-row list. Every ordered digest matched both sequential controls, with no
+exclusions, omissions, duplicates, or output over-fetch. Range used 5 physical requests versus 20;
+the paired median request ratio was 0.25 and the paired median wall-time ratio was 0.318. These are
+harness-produced observations for that portal cell, not general latency promises.
+
 ## Boundaries
 
-- Generic no-count traversal is exact sequential keyset/cursor traversal; it is not performance
-  admitted as a fast path.
+- Sequential no-count traversal remains the conservative default. Explicit range, partitioned, and
+  auto keyset modes recover physical batching only under a caller-asserted stable integer-keyset
+  contract; they pay a planning barrier even when the consumer stops early.
+- A returned `total` is advisory only and may raise an auto cost estimate. It never closes a lane or
+  strengthens correctness evidence. The terminal report records both the selected plan and whether
+  assurance came from the ordered prefix alone or from validated numeric-bound canaries.
 - Real portal latency, server work and network variance require a separately controlled live A/B.
 - Exact counted traversal retains identities for the operation lifetime; large exact traversals may
   therefore use substantial memory and emit a warning above 100,000 identities.
