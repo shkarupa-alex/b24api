@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 import math
+import shutil
+import subprocess
 from collections import defaultdict
 from typing import Any, cast
 
 SCHEMA_VERSION = 1
+SHA256_HEX_LENGTH = 40
 SMALL_MAX_REQUESTS = 3
 INTERMEDIATE_MAX_REQUESTS = 10
 LARGE_REQUEST_RATIO = 0.60
@@ -32,6 +35,27 @@ _BAND_RULES = {
     "intermediate": (5, 1.0, 1.05, True),
     "large": (5, 0.60, 0.85, False),
 }
+_SOURCES = frozenset({"deterministic_fixture", "live_read_only", "combined_live_fixture"})
+
+
+def _current_candidate_sha() -> str:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("git is required to bind keyset admission evidence")
+    return subprocess.run(  # noqa: S603 - resolved executable and fixed arguments
+        [git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _validate_artifact_binding(artifact: dict[str, Any], candidate_sha: str) -> None:
+    source, sha = artifact.get("source"), artifact.get("sha")
+    if source not in _SOURCES:
+        raise ValueError("keyset admission artifact source is missing or unsupported")
+    if (not isinstance(sha, str) or len(sha) != SHA256_HEX_LENGTH
+            or any(character not in "0123456789abcdef" for character in sha)):
+        raise ValueError("keyset admission artifact requires an exact lowercase candidate SHA")
+    if sha != candidate_sha:
+        raise ValueError("keyset admission artifact does not match the current candidate SHA")
 
 
 def _request_band(requests: int) -> str:
@@ -88,14 +112,17 @@ def _raw_ceiling(sample: dict[str, Any]) -> int:
     return cast("int", run["admitted"] + overlap)
 
 
-def analyze_artifact(  # noqa: C901, PLR0915
+def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
     artifact: dict[str, Any],
     *,
     _fixture_substitution: bool = False,
+    _candidate_sha: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate correctness, stability, sampling, and paired performance gates."""
+    candidate_sha = _candidate_sha or _current_candidate_sha()
+    _validate_artifact_binding(artifact, candidate_sha)
     if artifact.get("source") == "combined_live_fixture":
-        return _analyze_combined_artifact(artifact)
+        return _analyze_combined_artifact(artifact, candidate_sha=candidate_sha)
     if artifact.get("schema_version") != SCHEMA_VERSION or not isinstance(artifact.get("samples"), list):
         raise ValueError("unsupported keyset admission artifact")
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -116,13 +143,26 @@ def analyze_artifact(  # noqa: C901, PLR0915
         for cell in sorted(expected_auto_cells - set(expected_auto))
     )
     for sample in artifact["samples"]:
+        required_fields = {
+            "cell", "mode", "warmup", "sha", "window_seconds", "page_size", "batch_size",
+            "target_lanes", "writable_limit", "contract", "total_hint", "rotation_offset",
+            "control_requests", "control_wall_seconds", "sequential_before", "candidate", "sequential_after",
+        }
+        if not required_fields.issubset(sample):
+            raise ValueError("keyset admission sample is missing required metadata")
+        if sample["sha"] != candidate_sha:
+            raise ValueError("keyset admission sample does not match the current candidate SHA")
+        window_seconds = sample["window_seconds"]
+        if (not isinstance(window_seconds, int | float) or isinstance(window_seconds, bool)
+                or not math.isfinite(window_seconds) or window_seconds <= 0):
+            raise ValueError("keyset admission sample requires positive finite contemporaneity")
         key = (sample["cell"], sample["mode"])
         exclusion = _exclusion(sample)
         sample["exclusion_reason"] = exclusion
         groups[key].append(sample)
         before, candidate, after = (sample[role] for role in ("sequential_before", "candidate", "sequential_after"))
         checks = {
-            "contemporaneous": sample.get("window_seconds", 0.0) <= MAX_SANDWICH_WINDOW_SECONDS,
+            "contemporaneous": window_seconds <= MAX_SANDWICH_WINDOW_SECONDS,
             "stable_digest": before["digest"] == after["digest"] == candidate["digest"],
             "omissions": candidate["omissions"] == 0,
             "duplicates": candidate["duplicates"] == 0,
@@ -241,7 +281,9 @@ def analyze_artifact(  # noqa: C901, PLR0915
     }
 
 
-def _analyze_combined_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
+def _analyze_combined_artifact(  # noqa: C901, PLR0912, PLR0915
+    artifact: dict[str, Any], *, candidate_sha: str,
+) -> dict[str, Any]:
     """Admit fixture performance only for proven three-window live shortfalls."""
     live = artifact.get("live_artifact")
     fixture = artifact.get("fixture_artifact")
@@ -255,8 +297,8 @@ def _analyze_combined_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # n
     if live.get("sha") != fixture.get("sha") or artifact.get("sha") != live.get("sha"):
         raise ValueError("combined admission evidence must bind one candidate SHA")
 
-    live_result = analyze_artifact(live)
-    fixture_result = analyze_artifact(fixture, _fixture_substitution=True)
+    live_result = analyze_artifact(live, _candidate_sha=candidate_sha)
+    fixture_result = analyze_artifact(fixture, _fixture_substitution=True, _candidate_sha=candidate_sha)
     live_groups = {(group["cell"], group["mode"]): group for group in live_result["groups"]}
     fixture_groups = {(group["cell"], group["mode"]): group for group in fixture_result["groups"]}
     live_samples: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)

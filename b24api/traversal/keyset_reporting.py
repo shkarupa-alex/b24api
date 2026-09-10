@@ -11,13 +11,29 @@ from b24api.contracts.keyset_execution import (
     KeysetAssuranceSource,
     KeysetExecutionKind,
     KeysetPhase,
+    KeysetSelectionReason,
     PartitionedKeysetExecution,
+    RangeKeysetExecution,
     TraceClass,
 )
 from b24api.contracts.report import KeysetExecutionReport
 
 if TYPE_CHECKING:
     from b24api.traversal.keyset_scheduler import KeysetFastScheduler
+
+
+def initial_report_selection(
+    execution: RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
+) -> tuple[KeysetExecutionKind, KeysetSelectionReason]:
+    """Represent incomplete planning inside the existing closed report enums."""
+    reason = (
+        KeysetSelectionReason.EXPLICIT_PARTITIONED
+        if isinstance(execution, PartitionedKeysetExecution)
+        else KeysetSelectionReason.EXPLICIT_RANGE
+        if isinstance(execution, RangeKeysetExecution)
+        else KeysetSelectionReason.INSUFFICIENT_PREDICTED_GAIN
+    )
+    return KeysetExecutionKind.AUTO, reason
 
 
 def build_scheduler_report(scheduler: KeysetFastScheduler) -> KeysetExecutionReport:
@@ -37,10 +53,8 @@ def build_scheduler_report(scheduler: KeysetFastScheduler) -> KeysetExecutionRep
         final_selection_reason=scheduler._final.reason if scheduler._final is not None else None,
         assurance_source=(
             KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS
-            if scheduler._selected in {KeysetExecutionKind.RANGE, KeysetExecutionKind.PARTITIONED}
+            if scheduler._assured
             else KeysetAssuranceSource.ORDERED_PREFIX_ONLY
-            if scheduler._selected is not KeysetExecutionKind.UNSELECTED
-            else KeysetAssuranceSource.UNVERIFIED
         ),
         planning_requests=scheduler._planning_physical_requests,
         boundary_requests=scheduler._planning_requests[KeysetPhase.BOUNDARY],
@@ -87,4 +101,4 @@ def build_scheduler_report(scheduler: KeysetFastScheduler) -> KeysetExecutionRep
     )
 
 
-__all__ = ["build_scheduler_report"]
+__all__ = ["build_scheduler_report", "initial_report_selection"]

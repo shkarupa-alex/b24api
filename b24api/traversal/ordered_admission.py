@@ -28,8 +28,6 @@ def drain_complete_lanes(  # noqa: PLR0913
     """Drain only complete frontier lanes and advance lazy range geometry."""
     while lane_index < len(lanes):
         lane = lanes[lane_index]
-        if lane.status is LaneStatus.OPEN:
-            return lane_index
         identities, rows, commands = (
             identities_by_lane[lane.spec.ordinal], rows_by_lane[lane.spec.ordinal],
             commands_by_lane[lane.spec.ordinal],
@@ -46,14 +44,16 @@ def drain_complete_lanes(  # noqa: PLR0913
             rows.clear()
             identities.clear()
             commands.clear()
+        if lane.status is LaneStatus.OPEN:
+            return lane_index
         lane_index += 1
         if lazy_range is not None:
             rows_by_lane.pop(lane.spec.ordinal, None)
             identities_by_lane.pop(lane.spec.ordinal, None)
             commands_by_lane.pop(lane.spec.ordinal, None)
-            lanes.clear()
+            lanes.pop(0)
             lane_index = 0
-            lazy_range.append_next(lanes, rows_by_lane, identities_by_lane, commands_by_lane)
+            lazy_range.fill(len(lanes) + 1, lanes, rows_by_lane, identities_by_lane, commands_by_lane)
     return lane_index
 
 

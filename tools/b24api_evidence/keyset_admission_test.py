@@ -3,12 +3,20 @@
 # ruff: noqa: PLR2004
 
 from __future__ import annotations
+import shutil
+import subprocess
 from copy import deepcopy
 from typing import Any
 
 import pytest
 
-from .keyset_admission import analyze_artifact, lower_median, nearest_rank_p95
+from .keyset_admission import REQUIRED_LIVE_MATRIX_FEATURES, analyze_artifact, lower_median, nearest_rank_p95
+
+GIT = shutil.which("git")
+assert GIT is not None
+CANDIDATE_SHA = subprocess.run(  # noqa: S603 - resolved fixed test executable
+    [GIT, "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+).stdout.strip()
 
 
 def _run(*, digest: str = "same", requests: int = 10, seconds: float = 1.0) -> dict[str, Any]:
@@ -43,9 +51,15 @@ def _artifact() -> dict[str, Any]:
                 "cell": "large",
                 "mode": "range",
                 "warmup": index == 0,
+                "sha": CANDIDATE_SHA,
+                "window_seconds": 1.0,
+                "rotation_offset": index % 3,
                 "page_size": 50,
+                "batch_size": 50,
                 "target_lanes": 20,
                 "writable_limit": True,
+                "contract": "empty_confirmation",
+                "total_hint": "ignore",
                 "control_requests": 10,
                 "control_wall_seconds": 1.0,
                 "sequential_before": before,
@@ -55,10 +69,17 @@ def _artifact() -> dict[str, Any]:
         )
     return {
         "schema_version": 1,
+        "source": "live_read_only",
+        "sha": CANDIDATE_SHA,
         "manifest": {
             "performance_scope": [["large", "range"]],
             "correctness_scope": [["large", "range"]],
             "expected_auto_selections": {},
+            "modes": ["range", "partitioned", "auto"],
+            "live_matrix": {
+                "complete": True,
+                "covered_features": sorted(REQUIRED_LIVE_MATRIX_FEATURES),
+            },
         },
         "samples": samples,
     }
@@ -77,6 +98,23 @@ def test_analyzer_accepts_paired_large_cell_and_material_range_gain() -> None:
     assert result["material_range_speedup"] is True
 
 
+def test_analyzer_rejects_unbound_or_incomplete_release_metadata() -> None:
+    missing_source = deepcopy(_artifact())
+    missing_source.pop("source")
+    with pytest.raises(ValueError, match="source"):
+        analyze_artifact(missing_source)
+
+    wrong_sha = deepcopy(_artifact())
+    wrong_sha["sha"] = "0" * 40
+    with pytest.raises(ValueError, match="current candidate"):
+        analyze_artifact(wrong_sha)
+
+    missing_window = deepcopy(_artifact())
+    missing_window["samples"][0].pop("window_seconds")
+    with pytest.raises(ValueError, match="required metadata"):
+        analyze_artifact(missing_window)
+
+
 def test_standalone_fixture_cannot_supply_release_performance_evidence() -> None:
     artifact = _artifact()
     artifact["source"] = "deterministic_fixture"
@@ -91,9 +129,9 @@ def test_standalone_fixture_cannot_supply_release_performance_evidence() -> None
 
 def test_combined_evidence_requires_three_live_windows_and_exact_shortfall_reasons() -> None:
     fixture = _artifact()
-    fixture.update({"source": "deterministic_fixture", "sha": "candidate"})
+    fixture.update({"source": "deterministic_fixture", "sha": CANDIDATE_SHA})
     live = deepcopy(_artifact())
-    live.update({"source": "live_read_only", "sha": "candidate"})
+    live.update({"source": "live_read_only", "sha": CANDIDATE_SHA})
     live["manifest"]["modes"] = ["range", "partitioned", "auto"]
     live["manifest"]["attempt_windows"] = 3
     live["manifest"]["live_matrix"] = {
@@ -113,7 +151,7 @@ def test_combined_evidence_requires_three_live_windows_and_exact_shortfall_reaso
     combined: dict[str, Any] = {
         "schema_version": 1,
         "source": "combined_live_fixture",
-        "sha": "candidate",
+        "sha": CANDIDATE_SHA,
         "live_artifact": live,
         "fixture_artifact": fixture,
         "substitutions": [{

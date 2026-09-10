@@ -1,5 +1,5 @@
 """One ordered scheduler for range, occupied-anchor, and automatic keysets."""
-# ruff: noqa: D102, D107, FBT003, I001, PLC0415, PLR0915, SLF001, TRY301
+# ruff: noqa: D102, D107, FBT003, I001, PLR0915, SLF001, TRY301
 from __future__ import annotations
 from collections import Counter, deque
 from dataclasses import replace
@@ -10,7 +10,7 @@ from b24api.contracts.keyset_execution import (
     KeysetSelectionReason, PartitionedKeysetExecution, RangeKeysetExecution, TotalHintMode,
 )
 from b24api.contracts.report import (
-    KeysetExecutionReport, PageDispatch, PageOutcome, PageRejectionCode, Violation, ViolationSeverity,
+    KeysetExecutionReport, PageDispatch, PageOutcome, PageRejectionCode, Violation,
 )
 from b24api.errors import BudgetExceededError, PaginationError
 from b24api.traversal import keyset_step
@@ -29,7 +29,11 @@ from b24api.traversal.keyset_fast_plan import (
 )
 from b24api.traversal.keyset_costs import selected_range_geometry
 from b24api.traversal.ordered_admission import FastCounters, OrderedAdmissionState, drain_complete_lanes
-from b24api.traversal.keyset_observation import flush_staged_observations, stage_or_record_observation
+from b24api.traversal.keyset_observation import (
+    abort_staged_observations, flush_staged_observations, raise_boundary_cap_contradiction,
+    reject_boundary_observations, stage_or_record_observation, validate_canary_observations,
+)
+from b24api.traversal.keyset_reporting import build_scheduler_report, initial_report_selection
 from b24api.traversal.page_validation import (
     LaneCommandPlan, LaneReceipt, ReceiptRejection, classify_rejection, normalize_tail_receipt,
     validate_boundary_direction, validate_lane_receipt,
@@ -66,10 +70,7 @@ class KeysetFastScheduler:
         self.keyset = keyset
         self.selector, self.collection_shape = selector, collection_shape
         self.page_size, self.effective_page_cap = page_size, effective_page_cap
-        self.execution = execution
-        self.context = context
-        self.engine = engine
-        self.trace = trace
+        self.execution, self.context, self.engine, self.trace = execution, context, engine, trace
         self.completion = execution.contract.page_completion
         requested_batch = getattr(execution, "batch_size", None) or 50
         self.batch_capacity = min(
@@ -96,8 +97,8 @@ class KeysetFastScheduler:
         self._total_hint = TotalHintState(False, None, False, False)
         self._tail: LaneReceipt | None = None
         self._head_admitted = self._finishing = False
-        self._selected = KeysetExecutionKind.UNSELECTED
-        self._reason = KeysetSelectionReason.PLANNING_INCOMPLETE
+        self._selected, self._reason = initial_report_selection(execution)
+        self._assured = False
         self._lanes: list[LaneState] = []
         self._lane_rows: dict[int, list[JsonValue]] = {}
         self._lane_identities: dict[int, list[int]] = {}
@@ -262,24 +263,10 @@ class KeysetFastScheduler:
             page_cap=self.effective_page_cap, writable_limit=self.keyset.limit_path is not None,
         )
         return self._capability_plans(commands, KeysetPhase.ANCHOR_PROBE)
-    def _validate_canaries(self, receipts: tuple[LaneReceipt, ...],
-                           expected: dict[str, tuple[int, ...]]) -> None:
-        by_id = {receipt.command_id: receipt for receipt in receipts}
-        offending = {
-            command_id
-            for command_id, values in expected.items()
-            if by_id[command_id].identities != values
-        }
-        if offending:
-            violation = Violation(
-                ViolationSeverity.BLOCKING, "canary_contradiction", "bounded keyset capability canary failed",
-            )
-            self.violations.append(violation)
-            flush_staged_observations(self._staged_observations, self._record,
-                                      violation=violation, offending=offending)
-            raise PaginationError("bounded keyset capability canary failed")
-        flush_staged_observations(self._staged_observations, self._record)
-        self.admission.record_raw(sum(len(receipt.rows) for receipt in receipts), discarded=True)
+    def _validate_canaries(self, receipts: tuple[LaneReceipt, ...], expected: dict[str, tuple[int, ...]]) -> None:
+        validate_canary_observations(
+            receipts, expected, self._staged_observations, self._record, self.admission, self.violations)
+        self._assured = True
     async def _chunked_waves(
         self, plans: tuple[LaneCommandPlan, ...], *, compact_anchors: bool = False,
     ) -> tuple[LaneReceipt, ...]:
@@ -303,7 +290,11 @@ class KeysetFastScheduler:
         return tuple(receipts)
     async def _canaries(self, asc: LaneReceipt, desc: LaneReceipt) -> None:
         plans, expected = self._canary_plans(asc, desc)
-        self._validate_canaries(await self._chunked_waves(plans), expected)
+        try:
+            self._validate_canaries(await self._chunked_waves(plans), expected)
+        except BaseException:
+            abort_staged_observations(self._staged_observations, self._record, self.admission, self.violations)
+            raise
     def _consume_anchors(self, receipts: tuple[LaneReceipt, ...], *, lo: int, hi: int) -> tuple[int, ...]:
         result = normalize_anchor_receipts(receipts, lo=lo, upper_exclusive=hi)
         self._anchor_rows = result.rows
@@ -323,15 +314,19 @@ class KeysetFastScheduler:
             rows=self.context.policy.max_buffered_rows - self._buffer_balance,
         )
         precharged = 0
-        if len(co_scheduled) == len(planning):
-            receipts = await self._wave(co_scheduled)
-            canary_receipts, anchor_receipts = receipts[: len(canaries)], receipts[len(canaries) :]
-            self._validate_canaries(canary_receipts, expected)
-        else:
-            canary_receipts = await self._chunked_waves(canaries)
-            self._validate_canaries(canary_receipts, expected)
-            anchor_receipts = await self._chunked_waves(anchors, compact_anchors=True) if anchors else ()
-            precharged = sum(bool(receipt.rows) for receipt in anchor_receipts)
+        try:
+            if len(co_scheduled) == len(planning):
+                receipts = await self._wave(co_scheduled)
+                canary_receipts, anchor_receipts = receipts[: len(canaries)], receipts[len(canaries) :]
+                self._validate_canaries(canary_receipts, expected)
+            else:
+                canary_receipts = await self._chunked_waves(canaries)
+                self._validate_canaries(canary_receipts, expected)
+                anchor_receipts = await self._chunked_waves(anchors, compact_anchors=True) if anchors else ()
+                precharged = sum(bool(receipt.rows) for receipt in anchor_receipts)
+        except BaseException:
+            abort_staged_observations(self._staged_observations, self._record, self.admission, self.violations)
+            raise
         result = self._consume_anchors(anchor_receipts, lo=max(asc.identities), hi=min(desc.identities))
         await self._adjust_buffer(self._anchor_count - precharged)
         return result
@@ -363,10 +358,10 @@ class KeysetFastScheduler:
         contradiction = validate_boundary_direction(ascending=asc, descending=desc)
         if contradiction is not None:
             self.violations.append(contradiction.violation)
-            flush_staged_observations(self._staged_observations, self._record,
-                                      violation=contradiction.violation)
+            reject_boundary_observations(
+                self._staged_observations, self._record, self.admission,
+                rows=len(asc.rows) + len(desc.rows), violation=contradiction.violation, raw=True)
             raise PaginationError(contradiction.detail)
-        flush_staged_observations(self._staged_observations, self._record)
         self.admission.record_raw(len(asc.rows) + len(desc.rows))
         await self._adjust_buffer(len(asc.rows) + len(desc.rows))
         available_rows = self.context.policy.max_buffered_rows - self._buffer_balance
@@ -397,6 +392,7 @@ class KeysetFastScheduler:
                 preselect(inputs), anchor_capacity=anchor_capable_batch_capacity(
                     current=self.batch_capacity, available_rows=available_rows, page_cap=self.effective_page_cap,
                     target_lanes=self.execution.target_lanes))
+            self._reason = self._preselection.reason
             if self._total_hint.plausible:
                 baseline = preselect(replace(inputs, advisory_total=None))
                 used = self._preselection.interior_rows_estimate > baseline.interior_rows_estimate
@@ -406,7 +402,9 @@ class KeysetFastScheduler:
             bounded = self._preselection.plan in {Preselected.RANGE, Preselected.PROBE_ANCHORS}
             if (bounded and self.completion is KeysetPageCompletion.SHORT_PAGE_EXHAUSTS
                     and (len(asc.rows) != self.effective_page_cap or len(desc.rows) != self.effective_page_cap)):
-                raise PaginationError("boundary pages did not establish page-cap agreement")
+                raise_boundary_cap_contradiction(
+                    self._staged_observations, self._record, self.admission, self.violations,
+                    len(asc.rows) + len(desc.rows))
             if self._preselection.plan is Preselected.BOUNDARY_ONLY:
                 selected = KeysetExecutionKind.BOUNDARY_ONLY
             elif self._preselection.plan is Preselected.SEQUENTIAL:
@@ -424,7 +422,6 @@ class KeysetFastScheduler:
                     await self._adjust_buffer(-self._anchor_count)
                     self._anchor_rows.clear()
                     self._anchor_commands.clear()
-            self._reason = self._preselection.reason
             self._selected_estimate = (
                 self._final.estimate.requests
                 if self._final is not None
@@ -443,7 +440,9 @@ class KeysetFastScheduler:
         else:
             if (self.completion is KeysetPageCompletion.SHORT_PAGE_EXHAUSTS
                     and (len(asc.rows) != self.effective_page_cap or len(desc.rows) != self.effective_page_cap)):
-                raise PaginationError("boundary pages did not establish page-cap agreement")
+                raise_boundary_cap_contradiction(
+                    self._staged_observations, self._record, self.admission, self.violations,
+                    len(asc.rows) + len(desc.rows))
             if isinstance(self.execution, RangeKeysetExecution):
                 await self._canaries(asc, desc)
                 selected = KeysetExecutionKind.RANGE
@@ -456,6 +455,7 @@ class KeysetFastScheduler:
                 self._target_lanes = self.execution.target_lanes
             else:
                 raise TypeError("unknown fast keyset execution")
+        flush_staged_observations(self._staged_observations, self._record)
         self._selected = selected
         if not asc.rows or analysis.facts.overlapping or analysis.facts.adjacent:
             self._density_num = self._density_den = None
@@ -499,7 +499,8 @@ class KeysetFastScheduler:
             self._window_width, self._window_count = width, count
             self._range_geometry = LazyRangePlan(
                 max(asc.identities), min(desc.identities), width, count, self.keyset.direction == "descending")
-            self._range_geometry.append_next(self._lanes, self._lane_rows, self._lane_identities, self._lane_commands)
+            self._range_geometry.fill(self.batch_capacity, self._lanes, self._lane_rows,
+                                      self._lane_identities, self._lane_commands)
             return
         geometry = selected_lane_geometry(
             selected=self._selected, execution=self.execution, keyset=self.keyset, completion=self.completion,
@@ -695,6 +696,5 @@ class KeysetFastScheduler:
     def report_fragment(self) -> KeysetExecutionReport:
         if self._frozen_report is not None:
             return self._frozen_report
-        from b24api.traversal.keyset_reporting import build_scheduler_report
         return build_scheduler_report(self)
 __all__ = ["KeysetFastScheduler", "PlanOutcome"]

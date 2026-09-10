@@ -410,6 +410,7 @@ async def generate(samples: int, *, sha: str) -> dict[str, Any]:
         for round_index in range(_fixture_sample_count(cell, samples) + 1):
             rotation = round_index % len(MODES)
             for mode in (*MODES[rotation:], *MODES[:rotation]):
+                sample_started = time.monotonic()
                 before_run = await _run(cell, None)
                 candidate_run = await _run(cell, mode)
                 after_run = await _run(cell, None)
@@ -422,7 +423,9 @@ async def generate(samples: int, *, sha: str) -> dict[str, Any]:
                         "cell": cell.name,
                         "mode": mode,
                         "warmup": round_index == 0,
+                        "sha": sha,
                         "rotation_offset": rotation,
+                        "window_seconds": time.monotonic() - sample_started,
                         "page_size": PAGE_SIZE,
                         "batch_size": 50,
                         "target_lanes": TARGET_LANES,
@@ -529,6 +532,7 @@ async def generate_live_range(
                         "cell": cell.name,
                         "mode": mode,
                         "warmup": round_index == 0,
+                        "sha": sha,
                         "attempt_window": (
                             0 if round_index == 0 else min(
                                 LIVE_ATTEMPT_WINDOWS,

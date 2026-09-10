@@ -117,6 +117,14 @@ class LazyRangePlan:
         ))
         rows[spec.ordinal], identities[spec.ordinal], commands[spec.ordinal] = [], [], []
 
+    def fill(
+        self, capacity: int, lanes: list[LaneState], rows: dict[int, list[JsonValue]],
+        identities: dict[int, list[int]], commands: dict[int, list[tuple[str, int]]],
+    ) -> None:
+        """Fill one bounded sliding group without materializing the full range."""
+        while len(lanes) < capacity and self.next_ordinal < self.count:
+            self.append_next(lanes, rows, identities, commands)
+
 
 def build_capability_plans(  # noqa: PLR0913
     commands: tuple[CapabilityCommand, ...], phase: KeysetPhase,
