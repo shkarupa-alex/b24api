@@ -4,13 +4,14 @@
 
 from __future__ import annotations
 from copy import deepcopy
+from typing import Any
 
 import pytest
 
 from .keyset_admission import analyze_artifact, lower_median, nearest_rank_p95
 
 
-def _run(*, digest: str = "same", requests: int = 10, seconds: float = 1.0) -> dict[str, object]:
+def _run(*, digest: str = "same", requests: int = 10, seconds: float = 1.0) -> dict[str, Any]:
     return {
         "digest": digest,
         "requests": requests,
@@ -31,7 +32,7 @@ def _run(*, digest: str = "same", requests: int = 10, seconds: float = 1.0) -> d
     }
 
 
-def _artifact() -> dict[str, object]:
+def _artifact() -> dict[str, Any]:
     samples = []
     for index in range(6):
         before = _run()
@@ -93,9 +94,9 @@ def test_combined_evidence_requires_three_live_windows_and_exact_shortfall_reaso
     fixture.update({"source": "deterministic_fixture", "sha": "candidate"})
     live = deepcopy(_artifact())
     live.update({"source": "live_read_only", "sha": "candidate"})
-    live["manifest"]["modes"] = ["range", "partitioned", "auto"]  # type: ignore[index]
-    live["manifest"]["attempt_windows"] = 3  # type: ignore[index]
-    live["manifest"]["live_matrix"] = {  # type: ignore[index]
+    live["manifest"]["modes"] = ["range", "partitioned", "auto"]
+    live["manifest"]["attempt_windows"] = 3
+    live["manifest"]["live_matrix"] = {
         "complete": True,
         "covered_features": sorted(
             {
@@ -106,10 +107,10 @@ def test_combined_evidence_requires_three_live_windows_and_exact_shortfall_reaso
             },
         ),
     }
-    live["samples"] = live["samples"][:4]  # type: ignore[index]
-    for index, sample in enumerate(live["samples"]):  # type: ignore[index]
+    live["samples"] = live["samples"][:4]
+    for index, sample in enumerate(live["samples"]):
         sample["attempt_window"] = 0 if sample["warmup"] else index
-    combined = {
+    combined: dict[str, Any] = {
         "schema_version": 1,
         "source": "combined_live_fixture",
         "sha": "candidate",
@@ -135,6 +136,17 @@ def test_combined_evidence_requires_three_live_windows_and_exact_shortfall_reaso
         sample["sequential_after"]["requests"] = 11
     assert analyze_artifact(band_mismatch)["performance_passed"] is False
 
+    excluded_large = deepcopy(combined)
+    for sample in excluded_large["live_artifact"]["samples"]:
+        sample["control_requests"] = 11
+        sample["sequential_before"]["requests"] = 11
+        sample["sequential_after"]["requests"] = 11
+        sample["candidate"]["transport_fault"] = True
+    result = analyze_artifact(excluded_large)
+    assert result["groups"]["live"][0]["accepted"] == 0
+    assert result["groups"]["live"][0]["band"] == "large"
+    assert result["performance_passed"] is False
+
     no_substitution = deepcopy(combined)
     no_substitution["substitutions"] = []
     no_substitution["live_artifact"]["samples"].extend(
@@ -146,35 +158,35 @@ def test_combined_evidence_requires_three_live_windows_and_exact_shortfall_reaso
         sample["candidate"]["wall_seconds"] = 1.0
     assert analyze_artifact(no_substitution)["performance_passed"] is False
 
-    live["samples"][3]["attempt_window"] = 2  # type: ignore[index]
+    live["samples"][3]["attempt_window"] = 2
     assert analyze_artifact(combined)["performance_passed"] is False
 
 
 def test_analyzer_retains_mutation_exclusion_and_blocks_digest_mismatch() -> None:
     mutation = deepcopy(_artifact())
-    mutation["samples"][1]["sequential_after"]["digest"] = "changed"  # type: ignore[index]
-    mutation_result = analyze_artifact(mutation)  # type: ignore[arg-type]
+    mutation["samples"][1]["sequential_after"]["digest"] = "changed"
+    mutation_result = analyze_artifact(mutation)
     assert mutation_result["groups"][0]["exclusions"] == 1
     assert mutation_result["correctness_passed"] is True
 
     mutation_with_leak = deepcopy(mutation)
-    mutation_with_leak["samples"][1]["sequential_after"]["resources_leaked"] = True  # type: ignore[index]
-    leaked_result = analyze_artifact(mutation_with_leak)  # type: ignore[arg-type]
+    mutation_with_leak["samples"][1]["sequential_after"]["resources_leaked"] = True
+    leaked_result = analyze_artifact(mutation_with_leak)
     assert {failure["check"] for failure in leaked_result["correctness_failures"]} == {"resources"}
 
     mismatch = deepcopy(_artifact())
-    mismatch["samples"][1]["candidate"]["digest"] = "wrong"  # type: ignore[index]
-    mismatch_result = analyze_artifact(mismatch)  # type: ignore[arg-type]
+    mismatch["samples"][1]["candidate"]["digest"] = "wrong"
+    mismatch_result = analyze_artifact(mismatch)
     assert mismatch_result["correctness_passed"] is False
     assert mismatch_result["correctness_failures"][0]["check"] == "stable_digest"
 
 
 def test_analyzer_rejects_overlong_sandwich_and_any_run_resource_leak() -> None:
     artifact = deepcopy(_artifact())
-    artifact["samples"][1]["window_seconds"] = 120.1  # type: ignore[index]
-    artifact["samples"][2]["sequential_before"]["resources_leaked"] = True  # type: ignore[index]
+    artifact["samples"][1]["window_seconds"] = 120.1
+    artifact["samples"][2]["sequential_before"]["resources_leaked"] = True
 
-    result = analyze_artifact(artifact)  # type: ignore[arg-type]
+    result = analyze_artifact(artifact)
 
     assert result["groups"][0]["exclusions"] == 1
     assert {failure["check"] for failure in result["correctness_failures"]} == {"resources"}
@@ -182,9 +194,9 @@ def test_analyzer_rejects_overlong_sandwich_and_any_run_resource_leak() -> None:
 
 def test_material_range_requires_a_scoped_passing_range_group() -> None:
     artifact = deepcopy(_artifact())
-    artifact["manifest"]["performance_scope"] = []  # type: ignore[index]
+    artifact["manifest"]["performance_scope"] = []
 
-    result = analyze_artifact(artifact)  # type: ignore[arg-type]
+    result = analyze_artifact(artifact)
 
     assert result["material_range_speedup"] is False
     assert result["performance_passed"] is False
@@ -192,24 +204,24 @@ def test_material_range_requires_a_scoped_passing_range_group() -> None:
 
 def test_analyzer_rejects_a_declared_scope_with_no_samples() -> None:
     artifact = deepcopy(_artifact())
-    artifact["manifest"]["performance_scope"].append(["missing", "auto"])  # type: ignore[index]
+    artifact["manifest"]["performance_scope"].append(["missing", "auto"])
 
-    result = analyze_artifact(artifact)  # type: ignore[arg-type]
+    result = analyze_artifact(artifact)
 
     assert {tuple(failure.values()) for failure in result["performance_failures"]} >= {("missing", "auto")}
 
 
 def test_analyzer_rejects_missing_correctness_groups_and_auto_selection_drift() -> None:
     artifact = deepcopy(_artifact())
-    artifact["manifest"]["correctness_scope"].extend(  # type: ignore[index]
+    artifact["manifest"]["correctness_scope"].extend(
         [["missing", "partitioned"], ["large", "auto"]],
     )
-    artifact["manifest"]["expected_auto_selections"] = {"large": "range"}  # type: ignore[index]
-    for sample in artifact["samples"]:  # type: ignore[index]
+    artifact["manifest"]["expected_auto_selections"] = {"large": "range"}
+    for sample in artifact["samples"]:
         sample["mode"] = "auto"
         sample["candidate"]["selected_kind"] = "partitioned"
 
-    result = analyze_artifact(artifact)  # type: ignore[arg-type]
+    result = analyze_artifact(artifact)
 
     failures = {(failure["cell"], failure["mode"], failure["check"]) for failure in result["correctness_failures"]}
     assert ("missing", "partitioned", "missing_group") in failures
@@ -218,9 +230,9 @@ def test_analyzer_rejects_missing_correctness_groups_and_auto_selection_drift() 
 
 def test_analyzer_requires_a_frozen_expectation_for_every_auto_cell() -> None:
     artifact = deepcopy(_artifact())
-    artifact["manifest"]["correctness_scope"].append(["large", "auto"])  # type: ignore[index]
+    artifact["manifest"]["correctness_scope"].append(["large", "auto"])
 
-    result = analyze_artifact(artifact)  # type: ignore[arg-type]
+    result = analyze_artifact(artifact)
 
     assert {failure["check"] for failure in result["correctness_failures"]} >= {
         "missing_expected_selection",
@@ -229,23 +241,23 @@ def test_analyzer_requires_a_frozen_expectation_for_every_auto_cell() -> None:
 
 def test_analyzer_rejects_an_artifact_without_a_frozen_correctness_manifest() -> None:
     artifact = deepcopy(_artifact())
-    del artifact["manifest"]["correctness_scope"]  # type: ignore[index]
+    del artifact["manifest"]["correctness_scope"]
 
     with pytest.raises(ValueError, match="correctness_scope"):
-        analyze_artifact(artifact)  # type: ignore[arg-type]
+        analyze_artifact(artifact)
 
 
 def test_individual_improvement_gate_requires_request_and_wall_improvement() -> None:
     artifact = deepcopy(_artifact())
     times = iter((0.7, 0.7, 0.8, 1.1, 1.1))
-    for index, sample in enumerate(artifact["samples"]):  # type: ignore[index]
+    for index, sample in enumerate(artifact["samples"]):
         sample["control_requests"] = 11
         sample["sequential_before"]["requests"] = 11
         sample["sequential_after"]["requests"] = 11
         if index:
             sample["candidate"]["wall_seconds"] = next(times)
 
-    result = analyze_artifact(artifact)  # type: ignore[arg-type]
+    result = analyze_artifact(artifact)
 
     assert result["groups"][0]["median_request_ratio"] < 0.6
     assert result["groups"][0]["median_time_ratio"] < 0.85
@@ -254,11 +266,11 @@ def test_individual_improvement_gate_requires_request_and_wall_improvement() -> 
 
 def test_intermediate_individual_gate_uses_the_declared_wall_tolerance() -> None:
     artifact = deepcopy(_artifact())
-    for sample in artifact["samples"]:  # type: ignore[index]
+    for sample in artifact["samples"]:
         sample["candidate"]["requests"] = 10
         sample["candidate"]["wall_seconds"] = 1.04
 
-    result = analyze_artifact(artifact)  # type: ignore[arg-type]
+    result = analyze_artifact(artifact)
 
     assert result["groups"][0]["median_request_ratio"] == 1.0
     assert result["groups"][0]["p95_time_ratio"] == 1.04
@@ -268,12 +280,12 @@ def test_intermediate_individual_gate_uses_the_declared_wall_tolerance() -> None
 def test_live_admission_fails_closed_without_the_required_matrix() -> None:
     artifact = deepcopy(_artifact())
     artifact["source"] = "live_read_only"
-    artifact["manifest"]["live_matrix"] = {  # type: ignore[index]
+    artifact["manifest"]["live_matrix"] = {
         "complete": False,
         "covered_features": ["unfiltered", "total_hint_ignore"],
     }
 
-    result = analyze_artifact(artifact)  # type: ignore[arg-type]
+    result = analyze_artifact(artifact)
 
     assert {tuple(failure.values()) for failure in result["performance_failures"]} >= {
         ("__live_matrix__", "all"),

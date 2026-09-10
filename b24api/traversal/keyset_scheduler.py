@@ -122,7 +122,6 @@ class KeysetFastScheduler:
         self._frozen_report: KeysetExecutionReport | None = None
         self._planning_bounds: dict[str, LaneBounds] = {}
         self._planning_descending: dict[str, bool] = {}
-        self._boundary_totals: dict[str, int | None] = {}
     @property
     def counters(self) -> FastCounters:
         return self.admission.snapshot_counters()
@@ -686,7 +685,6 @@ class KeysetFastScheduler:
         self._tail = None
         self._anchor_rows.clear()
         self._anchor_commands.clear()
-        self._boundary_totals.clear()
         self._planning_bounds.clear()
         self._planning_descending.clear()
         self._plan_outcome = None

@@ -14,10 +14,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
-from harness.runtime_profile import run_capability_profile
+if TYPE_CHECKING or __package__:
+    from .harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
+    from .harness.runtime_profile import run_capability_profile
+else:
+    from harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
+    from harness.runtime_profile import run_capability_profile
 
 _PLANS = ("fixed_1x_batch", "counted_batch")
 _DEFAULT_CASES = (

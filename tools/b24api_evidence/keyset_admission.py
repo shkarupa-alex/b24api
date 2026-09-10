@@ -27,6 +27,19 @@ REQUIRED_LIVE_MATRIX_FEATURES = frozenset(
         "total_hint_advisory",
     },
 )
+_BAND_RULES = {
+    "small": (20, 1.0, 1.10, True),
+    "intermediate": (5, 1.0, 1.05, True),
+    "large": (5, 0.60, 0.85, False),
+}
+
+
+def _request_band(requests: int) -> str:
+    if requests <= SMALL_MAX_REQUESTS:
+        return "small"
+    if requests <= INTERMEDIATE_MAX_REQUESTS:
+        return "intermediate"
+    return "large"
 
 
 def lower_median(values: list[float]) -> float:
@@ -77,7 +90,7 @@ def _raw_ceiling(sample: dict[str, Any]) -> int:
     return cast("int", run["admitted"] + overlap)
 
 
-def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
+def analyze_artifact(  # noqa: C901, PLR0915
     artifact: dict[str, Any],
     *,
     _fixture_substitution: bool = False,
@@ -132,8 +145,15 @@ def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
     group_results: list[dict[str, Any]] = []
     for (cell, mode), samples in sorted(groups.items()):
         accepted = [sample for sample in samples if not sample["warmup"] and sample["exclusion_reason"] is None]
-        baseline = accepted[0]["control_requests"] if accepted else 0
-        required = 20 if baseline <= SMALL_MAX_REQUESTS else 5
+        observed_bands = {
+            _request_band(sample["control_requests"])
+            for sample in samples
+            if not sample["warmup"]
+        }
+        band = next(iter(observed_bands)) if len(observed_bands) == 1 else None
+        required, threshold_req, threshold_time, use_p95 = (
+            _BAND_RULES[band] if band is not None else (20, 0.0, 0.0, True)
+        )
         exclusions = sum(not sample["warmup"] and sample["exclusion_reason"] is not None for sample in samples)
         unstable = exclusions > 3 * max(1, len(accepted)) / 5
         ratios_req = [sample["candidate"]["requests"] / sample["control_requests"] for sample in accepted]
@@ -141,14 +161,8 @@ def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
         median_req = lower_median(ratios_req) if ratios_req else None
         median_time = lower_median(ratios_time) if ratios_time else None
         p95_time = nearest_rank_p95(ratios_time) if ratios_time else None
-        if baseline <= SMALL_MAX_REQUESTS:
-            band, threshold_req, threshold_time, use_p95 = "small", 1.0, 1.10, True
-        elif baseline <= INTERMEDIATE_MAX_REQUESTS:
-            band, threshold_req, threshold_time, use_p95 = "intermediate", 1.0, 1.05, True
-        else:
-            band, threshold_req, threshold_time, use_p95 = "large", 0.60, 0.85, False
         time_stat = p95_time if use_p95 else median_time
-        parity = baseline <= INTERMEDIATE_MAX_REQUESTS
+        parity = band != "large"
         improved = sum(
             (request_ratio <= 1.0 and time_ratio <= threshold_time)
             if parity
@@ -156,7 +170,8 @@ def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
             for request_ratio, time_ratio in zip(ratios_req, ratios_time, strict=True)
         )
         performance_passed = (
-            len(accepted) >= required
+            band is not None
+            and len(accepted) >= required
             and not unstable
             and median_req is not None
             and median_req <= threshold_req
@@ -255,10 +270,11 @@ def _analyze_combined_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # n
     for entry in substitutions:
         if not isinstance(entry, dict):
             raise TypeError("each substitution must be an object")
-        live_key = (entry.get("live_cell"), entry.get("mode"))
-        fixture_key = (entry.get("fixture_cell"), entry.get("mode"))
-        if not all(isinstance(value, str) for value in (*live_key, fixture_key[0])):
-            raise ValueError("substitution cells and mode must be strings")
+        live_cell, fixture_cell, mode = entry.get("live_cell"), entry.get("fixture_cell"), entry.get("mode")
+        if not isinstance(live_cell, str) or not isinstance(fixture_cell, str) or not isinstance(mode, str):
+            raise TypeError("substitution cells and mode must be strings")
+        live_key = (live_cell, mode)
+        fixture_key = (fixture_cell, mode)
         if live_key in declared:
             raise ValueError("duplicate live substitution")
         declared[live_key] = entry
@@ -270,25 +286,25 @@ def _analyze_combined_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # n
             if not sample.get("warmup")
         }
         reasons = entry.get("reason_codes")
-        deficient = live_group is not None and (
-            live_group["accepted"] < live_group["required"] or live_group["unstable"]
-        )
-        expected_reasons = set()
-        if live_group is not None and live_group["accepted"] < live_group["required"]:
-            expected_reasons.add("insufficient_accepted_samples")
-        if live_group is not None and live_group["unstable"]:
-            expected_reasons.add("unstable")
-        valid = (
-            deficient
-            and live["manifest"].get("attempt_windows") == LIVE_ATTEMPT_WINDOWS
-            and windows == set(range(1, LIVE_ATTEMPT_WINDOWS + 1))
-            and isinstance(reasons, list)
-            and set(reasons) == expected_reasons
-            and fixture_group is not None
-            and fixture_key in set(map(tuple, fixture["manifest"]["performance_scope"]))
-            and live_group["band"] == fixture_group["band"]
-            and fixture_group["performance_passed"]
-        )
+        valid = False
+        if live_group is not None and fixture_group is not None:
+            deficient = live_group["accepted"] < live_group["required"] or live_group["unstable"]
+            expected_reasons = set()
+            if live_group["accepted"] < live_group["required"]:
+                expected_reasons.add("insufficient_accepted_samples")
+            if live_group["unstable"]:
+                expected_reasons.add("unstable")
+            valid = (
+                deficient
+                and live["manifest"].get("attempt_windows") == LIVE_ATTEMPT_WINDOWS
+                and windows == set(range(1, LIVE_ATTEMPT_WINDOWS + 1))
+                and isinstance(reasons, list)
+                and set(reasons) == expected_reasons
+                and fixture_key in set(map(tuple, fixture["manifest"]["performance_scope"]))
+                and live_group["band"] is not None
+                and live_group["band"] == fixture_group["band"]
+                and fixture_group["performance_passed"]
+            )
         if not valid:
             substitution_failures.append({"cell": str(live_key[0]), "mode": str(live_key[1])})
         else:
