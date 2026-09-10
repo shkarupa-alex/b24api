@@ -27,6 +27,8 @@ from urllib.parse import urlsplit
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError
 
+from tools.b24api_evidence import repository as repository_state
+
 SCHEMA_VERSION: Final = "2.0"
 ORIGINAL_HEAD_SHA: Final = "08277c4d921b83b9252177b3e72a21a4c0c86109"
 FIXED_1X_SHA: Final = "82f2d9ddafa50e5229c4191b66b0ad6db4ad4600"
@@ -1026,39 +1028,18 @@ def tracked_repository_paths(root: Path) -> list[Path]:
 
 def git_sha(root: Path) -> str:
     """Resolve the repository's exact candidate commit."""
-    git = shutil.which("git")
-    if git is None:
-        raise ContractError("git executable is unavailable")
     try:
-        value = subprocess.run(  # noqa: S603 - fixed git executable and literal arguments
-            [git, "rev-parse", "HEAD"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise ContractError("cannot resolve candidate git SHA") from error
-    _require_sha(value, "candidate git SHA")
-    return value
+        return repository_state.git_sha(root)
+    except repository_state.RepositoryStateError as error:
+        raise ContractError(str(error)) from error
 
 
 def require_clean_tracked_tree(root: Path) -> None:
     """Reject evidence from staged or unstaged tracked content outside HEAD."""
-    git = shutil.which("git")
-    if git is None:
-        raise ContractError("git executable is unavailable")
-    for arguments in (("diff", "--quiet", "--"), ("diff", "--cached", "--quiet", "--")):
-        result = subprocess.run(  # noqa: S603 - fixed git executable and literal arguments
-            [git, *arguments],
-            cwd=root,
-            check=False,
-            capture_output=True,
-        )
-        if result.returncode == 1:
-            raise ContractError("evidence requires a clean tracked tree at the exact candidate SHA")
-        if result.returncode != 0:
-            raise ContractError("cannot verify tracked-tree cleanliness")
+    try:
+        repository_state.require_clean_tracked_tree(root)
+    except repository_state.RepositoryStateError as error:
+        raise ContractError(str(error)) from error
 
 
 def clean_candidate_sha(root: Path) -> str:

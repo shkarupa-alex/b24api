@@ -10,16 +10,18 @@ import pytest
 
 from .keyset_admission import (
     REQUIRED_LIVE_MATRIX_FEATURES,
+    ROOT,
     _current_candidate_sha,
     analyze_artifact,
     lower_median,
     nearest_rank_p95,
 )
+from .repository import git_sha
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-CANDIDATE_SHA = _current_candidate_sha()
+CANDIDATE_SHA = git_sha(ROOT)
 
 
 def test_candidate_sha_is_bound_to_repository_when_caller_cwd_is_elsewhere(

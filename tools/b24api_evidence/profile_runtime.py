@@ -17,14 +17,14 @@ from typing import TYPE_CHECKING, Any
 ROOT = Path(__file__).resolve().parents[2]
 
 if TYPE_CHECKING or __package__:
-    from .harness.contracts import clean_candidate_sha
     from .harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
     from .harness.runtime_profile import run_capability_profile
+    from .repository import clean_candidate_sha
 else:
     sys.path.insert(0, str(ROOT))
-    from tools.b24api_evidence.harness.contracts import clean_candidate_sha
     from tools.b24api_evidence.harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
     from tools.b24api_evidence.harness.runtime_profile import run_capability_profile
+    from tools.b24api_evidence.repository import clean_candidate_sha
 
 _PLANS = ("fixed_1x_batch", "counted_batch")
 _DEFAULT_CASES = (

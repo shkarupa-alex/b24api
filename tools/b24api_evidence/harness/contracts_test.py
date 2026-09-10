@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Self, cast
 
 import pytest
 
+from tools.b24api_evidence import profile_runtime as profile_runtime_module
+
 from . import cli as cli_module
 from . import contracts as contracts_module
 from . import runtime_profile as runtime_profile_module
@@ -3067,3 +3069,21 @@ def test_profile_entrypoint_binds_sha_to_repository_when_cwd_is_elsewhere(tmp_pa
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["candidate_sha"] == SHA
+
+
+def test_profile_entrypoint_rechecks_candidate_before_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candidates = iter((SHA, "f" * 40))
+    monkeypatch.setattr(profile_runtime_module, "clean_candidate_sha", lambda _root: next(candidates))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["profile_runtime.py", "--case", "nineteen", "--plan", "fixed_1x_batch", "--samples", "1", "--warmups", "0"],
+    )
+
+    with pytest.raises(RuntimeError, match="candidate changed while profiling"):
+        profile_runtime_module._main()  # noqa: SLF001 - final-attestation regression
+
+    assert capsys.readouterr().out == ""

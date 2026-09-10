@@ -31,6 +31,7 @@ def test_standalone_entrypoint_prefers_its_repository_over_environment_checkout(
     stale_package = tmp_path / "b24api"
     stale_package.mkdir()
     (stale_package / "__init__.py").write_text('raise RuntimeError("stale checkout imported")\n', encoding="utf-8")
+    (tmp_path / "jsonschema.py").write_text('raise RuntimeError("heavy harness imported")\n', encoding="utf-8")
 
     result = subprocess.run(  # noqa: S603 - fixed interpreter and repository entrypoint
         [sys.executable, str(ENTRYPOINT), "--help"],

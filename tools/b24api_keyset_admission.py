@@ -56,7 +56,7 @@ from b24api import (  # noqa: E402 - direct execution binds imports to this chec
     TotalHintMode,
 )
 from b24api.execution import Executor, WireResponse  # noqa: E402
-from tools.b24api_evidence.harness.contracts import clean_candidate_sha  # noqa: E402
+from tools.b24api_evidence.repository import clean_candidate_sha  # noqa: E402
 
 if TYPE_CHECKING:
     from b24api.contracts import KeysetExecution

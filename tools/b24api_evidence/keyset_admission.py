@@ -6,7 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
 
-from .harness.contracts import clean_candidate_sha
+from .repository import clean_candidate_sha
 
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_VERSION = 1
