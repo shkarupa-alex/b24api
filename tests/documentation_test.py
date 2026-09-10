@@ -1,13 +1,18 @@
 """Integrity checks for the compact maintained documentation set."""
 
 from __future__ import annotations
+import ast
 import re
 from pathlib import Path
+from types import SimpleNamespace
+
+import b24api
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
 DOCS = ROOT / "docs"
 MIGRATION = DOCS / "migration.md"
+PYTHON_BLOCK = re.compile(r"```python\n(.*?)\n```", re.DOTALL)
 
 
 def test_docs_are_flat_compact_and_linked_from_readme() -> None:
@@ -52,3 +57,21 @@ def test_architecture_document_names_the_complete_public_capability_family() -> 
         "iter_references()",
     ):
         assert operation in text
+
+
+def test_migration_python_examples_execute_without_io() -> None:
+    blocks = PYTHON_BLOCK.findall(MIGRATION.read_text(encoding="utf-8"))
+    assert blocks
+    for source in blocks:
+        namespace: dict[str, object] = {
+            "client": SimpleNamespace(iter_list_keyset=lambda *_args, **kwargs: kwargs),
+            "identity": object(),
+            "keyset": object(),
+            "request": object(),
+            "selector": object(),
+        }
+        code = compile(source, str(MIGRATION), "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        exec(code, namespace)  # noqa: S102 - exact trusted repository documentation source
+        stream = namespace["stream"]
+        assert isinstance(stream, dict)
+        assert isinstance(stream["execution"], b24api.SequentialKeysetExecution)

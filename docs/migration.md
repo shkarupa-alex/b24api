@@ -1,7 +1,8 @@
 # Migrating within b24api 2.x
 
-This 2.x release keeps the established defaults but makes wire representation, traversal completion, and failure
-evidence explicit. Existing JSON requests and the `Transport.send()` protocol remain supported.
+This release keeps the established wire representation and transport compatibility, but changes
+the default execution of direct no-count keyset traversal from sequential to auto. Existing JSON
+requests and the `Transport.send()` protocol remain supported.
 
 ## Important semantic corrections
 
@@ -65,11 +66,20 @@ preserving names or return-shaping flags.
 - automatic unsafe direct fallback;
 - public low-level execution plans and compatibility data models.
 
-There is no assumption-free fast no-count shortcut. Calls that omit `execution` now assert the
-default `StableIntegerKeysetContract` and use auto planning, so verify that the endpoint honors a
-unique integer identity, strict numeric bounds, ordering, and empty-confirmation completion. Account
-for the pre-emission planning cost. Fast keyset totals remain advisory, and the application still
-owns mutation and business-filter reconciliation.
+There is no assumption-free fast no-count shortcut. Direct `Bitrix24.iter_list_keyset()` calls and
+CLI keyset contracts that omit `execution` now assert the default `StableIntegerKeysetContract` and
+use auto planning, so verify that the endpoint honors a unique integer identity, strict numeric
+bounds, ordering, and empty-confirmation completion. `KeysetTraversal` used by reference traversal
+remains explicitly sequential because reference keysets do not support fast execution. Account for
+the pre-emission planning cost. Fast keyset totals remain advisory, and the application still owns
+mutation and business-filter reconciliation.
+
+Static ineligibility raises `CapabilityError` synchronously from the `iter_list_keyset(...)` call,
+before iteration starts. Typical causes include a non-integer identity, caller-supplied order,
+start, or strict-bound controls, incompatible consistency requirements, and insufficient policy
+capacity. If the endpoint accepts the controls but violates the declared ordering or bounds, the
+first pull fails closed with `IncompleteTraversalError` (for example, `range_contradiction`) before
+any row is emitted. Auto never restarts such a failed traversal as sequential.
 
 If auto is ineligible for an endpoint, exposes a portal incompatibility, or the old request-by-request
 behavior is required, opt out per call. This performs the original sequential keyset traversal and
@@ -89,7 +99,9 @@ stream = client.iter_list_keyset(
 
 For CLI keyset contracts, use `"execution": {"kind": "sequential"}`. Omitting `execution` (or
 passing an empty execution object) selects auto. Use `iter_list_counted()` only when an endpoint
-supplies an exact filtered total.
+supplies an exact filtered total. CLI reports now include a `keyset_execution` object for default
+keyset traversal; report consumers should treat that additive field as part of the selected-plan
+evidence.
 
 ## Practical migration order
 

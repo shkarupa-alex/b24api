@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 _CONTRACT_VERSION = 1
 _PORTAL_BATCH_CAP = 50
-_SEQUENTIAL_KEYSET_EXECUTION = SequentialKeysetExecution()
+_DEFAULT_AUTO_KEYSET_EXECUTION = AutoKeysetExecution(StableIntegerKeysetContract())
 
 
 class CliUsageError(ValueError):
@@ -220,7 +220,7 @@ def _keyset(raw: object) -> KeysetSpec:
 def parse_keyset_execution(payload: Mapping[str, JsonValue] | None) -> KeysetExecution:
     """Parse the closed per-call keyset execution object."""
     if payload is None:
-        return AutoKeysetExecution(StableIntegerKeysetContract())
+        return _DEFAULT_AUTO_KEYSET_EXECUTION
     if not isinstance(payload, dict):
         raise CliUsageError("execution must be an object")
     kind = payload.get("kind", "auto")
@@ -309,7 +309,7 @@ class ListContractRoute:
     identity: IdentitySpec | None
     page_size: int
     mechanics: OffsetSpec | KeysetSpec | CursorSpec
-    execution: KeysetExecution = _SEQUENTIAL_KEYSET_EXECUTION
+    execution: KeysetExecution = _DEFAULT_AUTO_KEYSET_EXECUTION
 
 
 def parse_list_contract(strategy: str, contract: dict[str, object]) -> ListContractRoute:

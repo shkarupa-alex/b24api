@@ -219,6 +219,13 @@ outside the captured middle is handled by the finishing sweep; mutation inside i
 assertion. Pass `SequentialKeysetExecution()` explicitly when an endpoint cannot satisfy the fast
 contract or when the previous request-by-request behavior is required.
 
+Static incompatibility with the auto contract raises `CapabilityError` from the
+`iter_list_keyset(...)` call before iteration begins. A portal that accepts but contradicts the
+declared controls fails before emission with `IncompleteTraversalError`; auto never restarts that
+operation silently. `KeysetTraversal` inside reference traversal remains sequential-only. The
+terminal report now includes `keyset_execution` for omitted-execution keyset calls so consumers can
+see the requested and selected plan.
+
 An advisory `total` may only raise an automatic cost estimate and never proves completion. Reports
 record the selected strategy and reason: unbounded auto continuation has the same
 `ordered_prefix_only` assurance as sequential traversal, while bounded plans additionally report

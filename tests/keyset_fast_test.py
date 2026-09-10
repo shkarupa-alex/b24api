@@ -677,6 +677,38 @@ async def test_omitted_execution_defaults_to_auto() -> None:
     assert stream.report.keyset_execution.requested_kind is KeysetExecutionKind.AUTO
 
 
+def test_omitted_execution_rejects_fast_ineligible_request_synchronously() -> None:
+    transport = KeysetTransport((1, 2, 3))
+    client = _client(transport)
+
+    with pytest.raises(CapabilityError):
+        client.iter_list_keyset(
+            Request("item.list", parameters={"filter": {">id": 1}}),
+            selector=ResultSelector.root(),
+            identity=_identity(),
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_omitted_execution_fails_closed_on_direction_contradiction() -> None:
+    transport = KeysetTransport(tuple(range(1, 31)), ignore_direction=True)
+    stream = _client(transport).iter_list_keyset(
+        Request("item.list", parameters={"filter": {"STATUS": "open"}}),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=PAGE_SIZE,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+    )
+
+    with pytest.raises(IncompleteTraversalError, match="range_contradiction"):
+        await anext(stream)
+
+    assert stream.report.emitted == 0
+    assert stream.report.state is TerminalState.INCOMPLETE
+
+
 @pytest.mark.asyncio
 async def test_boundary_only_estimate_excludes_the_spent_boundary_wave() -> None:
     empty = _stream(KeysetTransport(()), AutoKeysetExecution(StableIntegerKeysetContract()))

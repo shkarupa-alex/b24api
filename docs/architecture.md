@@ -78,8 +78,8 @@ Page evidence contains only bounded counters and enum classifications—never ro
 parameters, headers, URLs, or body fragments.
 
 Fast keyset execution has a planning barrier before emission. Boundary-only and automatic
-sequential continuation rely on the same ordered-prefix assurance as the default; numeric range and
-partition plans must first pass bounded capability canaries. Advisory totals are isolated from
+sequential continuation rely on the same ordered-prefix assurance as sequential traversal; numeric
+range and partition plans must first pass bounded capability canaries. Advisory totals are isolated from
 completion and admission. One scheduler owns wave correlation, ordered admission, row-buffer deltas,
 finishing continuation, cleanup, and the immutable selection report. Stateless transaction functions
 execute its batch/body/finish I/O but define no scheduler class or persistent state of their own.

@@ -164,7 +164,7 @@ def keyset_stream(  # noqa: PLR0913
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
 ) -> OperationStream[JsonValue]:
-    """Compose compatible sequential or explicit fast no-count traversal."""
+    """Compose sequential or automatic/explicit fast no-count traversal."""
     if not isinstance(
         execution,
         SequentialKeysetExecution | RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,

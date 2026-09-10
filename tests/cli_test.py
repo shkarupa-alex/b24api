@@ -27,7 +27,7 @@ from b24api import (
     TraversalAssurance,
     cli,
 )
-from b24api.cli_contract import CliUsageError, parse_keyset_execution
+from b24api.cli_contract import CliUsageError, ListContractRoute, parse_keyset_execution
 from b24api.contracts import IdentityCoercion
 from b24api.errors import CapabilityError, IncompleteTraversalError, ProtocolError
 
@@ -44,6 +44,14 @@ _INTERRUPTED = 130
 def test_keyset_execution_json_is_closed_and_routes_all_fast_modes() -> None:
     assert isinstance(parse_keyset_execution(None), AutoKeysetExecution)
     assert isinstance(parse_keyset_execution({}), AutoKeysetExecution)
+    route = ListContractRoute(
+        "keyset",
+        ResultSelector.root(),
+        IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER),
+        50,
+        KeysetSpec(),
+    )
+    assert isinstance(route.execution, AutoKeysetExecution)
     range_execution = parse_keyset_execution(
         {"kind": "range", "page_completion": "short_page_exhausts", "window_width": 2, "batch_size": 7},
     )
