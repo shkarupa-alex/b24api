@@ -128,6 +128,24 @@ def test_combined_evidence_requires_three_live_windows_and_exact_shortfall_reaso
     assert result["correctness_passed"] is True
     assert result["performance_passed"] is True
 
+    band_mismatch = deepcopy(combined)
+    for sample in band_mismatch["live_artifact"]["samples"]:
+        sample["control_requests"] = 11
+        sample["sequential_before"]["requests"] = 11
+        sample["sequential_after"]["requests"] = 11
+    assert analyze_artifact(band_mismatch)["performance_passed"] is False
+
+    no_substitution = deepcopy(combined)
+    no_substitution["substitutions"] = []
+    no_substitution["live_artifact"]["samples"].extend(
+        deepcopy(no_substitution["live_artifact"]["samples"][-1:]) * 2,
+    )
+    for sample in no_substitution["live_artifact"]["samples"]:
+        sample["warmup"] = False
+        sample["candidate"]["requests"] = 10
+        sample["candidate"]["wall_seconds"] = 1.0
+    assert analyze_artifact(no_substitution)["performance_passed"] is False
+
     live["samples"][3]["attempt_window"] = 2  # type: ignore[index]
     assert analyze_artifact(combined)["performance_passed"] is False
 

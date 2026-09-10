@@ -7,6 +7,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
+from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     ClosureWitness,
@@ -34,6 +35,7 @@ from b24api.traversal.keyset_partition import anchor_guesses, normalize_anchors
 from b24api.traversal.keyset_range import range_window_width
 
 if TYPE_CHECKING:
+    from b24api.batch.outcome import BatchOutcome
     from b24api.contracts.json import JsonValue
     from b24api.contracts.response import Response
     from b24api.contracts.traversal import KeysetSpec
@@ -237,6 +239,24 @@ def compact_anchor_receipts(
     )
     retained = sum(bool(receipt.rows) for receipt in receipts)
     return compact, sum(len(receipt.rows) for receipt in receipts) - retained, retained
+
+
+def boundary_totals(
+    plans: tuple[LaneCommandPlan, ...], outcomes: tuple[BatchOutcome, ...],
+) -> dict[str, int | None]:
+    """Retain boundary scalar totals without retaining response row payloads."""
+    if not all(plan.phase is KeysetPhase.BOUNDARY for plan in plans):
+        return {}
+    return {
+        plan.command_id: outcome.response.total
+        for plan, outcome in zip(plans, outcomes, strict=True)
+        if isinstance(outcome, BatchSuccess) and outcome.response is not None
+    }
+
+
+def anchor_capable_batch_capacity(*, current: int, available_rows: int, page_cap: int, target_lanes: int) -> int:
+    """Disable auto anchor probing unless one body page and all possible anchors fit."""
+    return current if available_rows >= page_cap + target_lanes else 0
 
 
 def selected_lane_geometry(  # noqa: PLR0913

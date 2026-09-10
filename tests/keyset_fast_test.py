@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 import json
+from dataclasses import replace
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs
 
@@ -36,6 +37,7 @@ from b24api import (
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError, IncompleteTraversalError
 from b24api.execution import Executor, WireResponse
+from b24api.traversal import keyset_scheduler
 from b24api.traversal.keyset_auto import BoundaryFacts, Preselected, SelectorInputs, preselect
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
 from b24api.traversal.keyset_fast_stream import FastTraceRecorder
@@ -470,6 +472,35 @@ async def test_auto_sequential_has_request_parity_and_no_canaries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_discards_precharged_anchor_objects_when_post_probe_gain_is_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = keyset_scheduler.finalize
+
+    def force_sequential(*args: object, **kwargs: object):
+        return replace(
+            original(*args, **kwargs),
+            kind=KeysetExecutionKind.SEQUENTIAL,
+            reason=KeysetSelectionReason.POST_PROBE_GAIN_LOST,
+        )
+
+    monkeypatch.setattr(keyset_scheduler, "finalize", force_sequential)
+    stream = _stream(
+        KeysetTransport(tuple(range(1, 5_001))),
+        AutoKeysetExecution(StableIntegerKeysetContract(), target_lanes=20),
+    )
+
+    assert (await anext(stream))["id"] == 1
+    scheduler = stream._source._scheduler
+    assert scheduler._selected is KeysetExecutionKind.SEQUENTIAL
+    assert scheduler._anchor_count > 0
+    assert scheduler._anchor_rows == scheduler._anchor_commands == {}
+    assert scheduler._boundary_totals == {}
+    assert scheduler._buffer_balance == PAGE_SIZE
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
 async def test_empty_auto_selection_completes_in_boundary_wave() -> None:
     transport = KeysetTransport(())
     stream = _stream(transport, AutoKeysetExecution(StableIntegerKeysetContract()))
@@ -700,7 +731,11 @@ async def test_partition_anchor_waves_discard_unneeded_rows_before_the_next_wave
             batch_size=1,
         ),
     )
+    scheduler = stream._source._scheduler
+    await scheduler.plan_barrier()
 
+    assert scheduler._boundary_totals == {}
+    assert scheduler._buffer_balance == page_size * 2 + 50
     assert [row["id"] async for row in stream] == list(identities)
     assert stream.report is not None
     assert stream.report.buffered_rows_high_water <= policy.max_buffered_rows

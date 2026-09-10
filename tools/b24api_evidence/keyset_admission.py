@@ -142,11 +142,11 @@ def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
         median_time = lower_median(ratios_time) if ratios_time else None
         p95_time = nearest_rank_p95(ratios_time) if ratios_time else None
         if baseline <= SMALL_MAX_REQUESTS:
-            threshold_req, threshold_time, use_p95 = 1.0, 1.10, True
+            band, threshold_req, threshold_time, use_p95 = "small", 1.0, 1.10, True
         elif baseline <= INTERMEDIATE_MAX_REQUESTS:
-            threshold_req, threshold_time, use_p95 = 1.0, 1.05, True
+            band, threshold_req, threshold_time, use_p95 = "intermediate", 1.0, 1.05, True
         else:
-            threshold_req, threshold_time, use_p95 = 0.60, 0.85, False
+            band, threshold_req, threshold_time, use_p95 = "large", 0.60, 0.85, False
         time_stat = p95_time if use_p95 else median_time
         parity = baseline <= INTERMEDIATE_MAX_REQUESTS
         improved = sum(
@@ -168,6 +168,7 @@ def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
             {
                 "cell": cell,
                 "mode": mode,
+                "band": band,
                 "accepted": len(accepted),
                 "required": required,
                 "exclusions": exclusions,
@@ -249,6 +250,7 @@ def _analyze_combined_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # n
         live_samples[(sample["cell"], sample["mode"])].append(sample)
 
     declared: dict[tuple[str, str], dict[str, Any]] = {}
+    valid_substitutions: dict[tuple[str, str], tuple[str, str]] = {}
     substitution_failures: list[dict[str, str]] = []
     for entry in substitutions:
         if not isinstance(entry, dict):
@@ -283,10 +285,14 @@ def _analyze_combined_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # n
             and isinstance(reasons, list)
             and set(reasons) == expected_reasons
             and fixture_group is not None
+            and fixture_key in set(map(tuple, fixture["manifest"]["performance_scope"]))
+            and live_group["band"] == fixture_group["band"]
             and fixture_group["performance_passed"]
         )
         if not valid:
             substitution_failures.append({"cell": str(live_key[0]), "mode": str(live_key[1])})
+        else:
+            valid_substitutions[live_key] = fixture_key
 
     live_scope = set(map(tuple, live["manifest"]["performance_scope"]))
     unresolved = []
@@ -300,7 +306,13 @@ def _analyze_combined_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # n
     performance_failures = [*substitution_failures, *unresolved]
     if matrix_failed:
         performance_failures.append({"cell": "__live_matrix__", "mode": "all"})
-    material_range = live_result["material_range_speedup"] or fixture_result["material_range_speedup"]
+    substituted_material_range = any(
+        live_key[1] == "range"
+        and fixture_groups[fixture_key]["median_request_ratio"] is not None
+        and fixture_groups[fixture_key]["median_request_ratio"] <= LARGE_REQUEST_RATIO
+        for live_key, fixture_key in valid_substitutions.items()
+    )
+    material_range = live_result["material_range_speedup"] or substituted_material_range
     return {
         "schema_version": SCHEMA_VERSION,
         "correctness_passed": live_result["correctness_passed"] and fixture_result["correctness_passed"],
