@@ -21,6 +21,11 @@ latency admission.
 
 # Read-only live range/partitioned/auto sandwiches (uses BITRIX24_API_WEBHOOK_URL)
 .venv/bin/python tools/b24api_keyset_admission.py live /tmp/keyset-live.json --samples 5
+
+# Release admission: combine same-SHA live and fixture artifacts with an explicit substitution map
+.venv/bin/python tools/b24api_keyset_admission.py combine /tmp/keyset-admission.json \
+  --live-artifact /tmp/keyset-live.json --fixture-artifact /tmp/keyset-fixture.json \
+  --substitutions /tmp/keyset-substitutions.json
 ```
 
 The live matrix records task filters, identity-role geometry, portal-dependent density/size
@@ -28,6 +33,9 @@ shortfalls, and deterministic-fallback reason codes in the artifact manifest. Sa
 requires `B24API_KEYSET_SAME_CASE_CELL` to contain an explicit JSON contract for a read-only
 `*.list` method, parameters, selector/item paths, identity field, and expected auto selection; task
 lists are not used for that cell because their numeric filter and order roles differ.
+Standalone deterministic fixtures verify correctness but cannot pass the release performance gate.
+Fixture performance is admitted only through the combined artifact for a deficient live cell/mode
+whose samples cover all three attempt windows and whose exact shortfall reasons are recorded.
 
 ## Results
 

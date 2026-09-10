@@ -99,6 +99,7 @@ async def test_live_generator_sandwiches_every_declared_mode_without_network(mon
     manifest = artifact["manifest"]
     assert manifest["correctness_scope"] == [["tasks_all", mode] for mode in harness.MODES]
     assert manifest["modes"] == list(harness.MODES)
+    assert manifest["attempt_windows"] == harness.LIVE_ATTEMPT_WINDOWS
     assert manifest["live_matrix"]["complete"] is True
     assert manifest["live_matrix"]["shortfalls"]
     assert manifest["live_matrix"]["fallback"]["kind"] == "deterministic_fixture"

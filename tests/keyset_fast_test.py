@@ -682,6 +682,45 @@ async def test_partition_planning_accounts_for_free_rows_without_a_writable_limi
     assert stream.report.buffered_rows_high_water <= ExecutionPolicy().max_buffered_rows
 
 
+@pytest.mark.asyncio
+async def test_partition_anchor_waves_discard_unneeded_rows_before_the_next_wave() -> None:
+    page_size = 50
+    identities = tuple(range(1, 5_001))
+    policy = ExecutionPolicy(max_buffered_rows=200)
+    transport = KeysetTransport(identities, default_limit=page_size)
+    stream = _client(transport, policy=policy).iter_list_keyset(
+        Request("item.list"),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=page_size,
+        keyset=KeysetSpec(),
+        execution=PartitionedKeysetExecution(
+            StableIntegerKeysetContract(endpoint_page_cap=page_size),
+            target_lanes=50,
+            batch_size=1,
+        ),
+    )
+
+    assert [row["id"] async for row in stream] == list(identities)
+    assert stream.report is not None
+    assert stream.report.buffered_rows_high_water <= policy.max_buffered_rows
+
+
+def test_explicit_partitioned_rejects_policy_that_cannot_retain_anchors_and_a_body_page() -> None:
+    page_size = 5
+    execution = PartitionedKeysetExecution(StableIntegerKeysetContract(), target_lanes=10)
+    transport = KeysetTransport(tuple(range(1, 401)))
+    client = _client(transport, policy=ExecutionPolicy(max_buffered_rows=3 * page_size))
+
+    with pytest.raises(CapabilityError, match="retain boundaries"):
+        client.iter_list_keyset(
+            Request("item.list"), selector=ResultSelector.root(), identity=_identity(), page_size=page_size,
+            keyset=KeysetSpec(limit_path=ParameterPath(("limit",))), execution=execution,
+        )
+
+    assert transport.requests == []
+
+
 @pytest.mark.parametrize("execution", [RangeKeysetExecution(StableIntegerKeysetContract()),
                                         PartitionedKeysetExecution(StableIntegerKeysetContract())])
 def test_explicit_bounded_mode_rejects_policy_without_post_boundary_capacity(

@@ -76,6 +76,62 @@ def test_analyzer_accepts_paired_large_cell_and_material_range_gain() -> None:
     assert result["material_range_speedup"] is True
 
 
+def test_standalone_fixture_cannot_supply_release_performance_evidence() -> None:
+    artifact = _artifact()
+    artifact["source"] = "deterministic_fixture"
+
+    result = analyze_artifact(artifact)
+
+    assert result["performance_passed"] is False
+    assert {tuple(failure.values()) for failure in result["performance_failures"]} >= {
+        ("__live_shortfall__", "all"),
+    }
+
+
+def test_combined_evidence_requires_three_live_windows_and_exact_shortfall_reasons() -> None:
+    fixture = _artifact()
+    fixture.update({"source": "deterministic_fixture", "sha": "candidate"})
+    live = deepcopy(_artifact())
+    live.update({"source": "live_read_only", "sha": "candidate"})
+    live["manifest"]["modes"] = ["range", "partitioned", "auto"]  # type: ignore[index]
+    live["manifest"]["attempt_windows"] = 3  # type: ignore[index]
+    live["manifest"]["live_matrix"] = {  # type: ignore[index]
+        "complete": True,
+        "covered_features": sorted(
+            {
+                "unfiltered", "filtered", "two_large_selections", "small_selection",
+                "density_below_5_percent", "density_5_to_25_percent", "density_above_50_percent",
+                "clustered_or_skewed", "tasks_split_roles", "same_case_endpoint",
+                "total_hint_ignore", "total_hint_advisory",
+            },
+        ),
+    }
+    live["samples"] = live["samples"][:4]  # type: ignore[index]
+    for index, sample in enumerate(live["samples"]):  # type: ignore[index]
+        sample["attempt_window"] = 0 if sample["warmup"] else index
+    combined = {
+        "schema_version": 1,
+        "source": "combined_live_fixture",
+        "sha": "candidate",
+        "live_artifact": live,
+        "fixture_artifact": fixture,
+        "substitutions": [{
+            "live_cell": "large",
+            "fixture_cell": "large",
+            "mode": "range",
+            "reason_codes": ["insufficient_accepted_samples"],
+        }],
+    }
+
+    result = analyze_artifact(combined)
+
+    assert result["correctness_passed"] is True
+    assert result["performance_passed"] is True
+
+    live["samples"][3]["attempt_window"] = 2  # type: ignore[index]
+    assert analyze_artifact(combined)["performance_passed"] is False
+
+
 def test_analyzer_retains_mutation_exclusion_and_blocks_digest_mismatch() -> None:
     mutation = deepcopy(_artifact())
     mutation["samples"][1]["sequential_after"]["digest"] = "changed"  # type: ignore[index]

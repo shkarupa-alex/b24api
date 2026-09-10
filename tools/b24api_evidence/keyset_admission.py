@@ -10,6 +10,7 @@ SMALL_MAX_REQUESTS = 3
 INTERMEDIATE_MAX_REQUESTS = 10
 LARGE_REQUEST_RATIO = 0.60
 MAX_SANDWICH_WINDOW_SECONDS = 120.0
+LIVE_ATTEMPT_WINDOWS = 3
 REQUIRED_LIVE_MATRIX_FEATURES = frozenset(
     {
         "unfiltered",
@@ -76,8 +77,14 @@ def _raw_ceiling(sample: dict[str, Any]) -> int:
     return cast("int", run["admitted"] + overlap)
 
 
-def analyze_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # noqa: C901, PLR0915
+def analyze_artifact(  # noqa: C901, PLR0912, PLR0915
+    artifact: dict[str, Any],
+    *,
+    _fixture_substitution: bool = False,
+) -> dict[str, Any]:
     """Evaluate correctness, stability, sampling, and paired performance gates."""
+    if artifact.get("source") == "combined_live_fixture":
+        return _analyze_combined_artifact(artifact)
     if artifact.get("schema_version") != SCHEMA_VERSION or not isinstance(artifact.get("samples"), list):
         raise ValueError("unsupported keyset admission artifact")
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -206,6 +213,8 @@ def analyze_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # noqa: C901,
             or declared_modes != {"range", "partitioned", "auto"}
         ):
             performance_failures.append({"cell": "__live_matrix__", "mode": "all"})
+    elif artifact.get("source") == "deterministic_fixture" and not _fixture_substitution:
+        performance_failures.append({"cell": "__live_shortfall__", "mode": "all"})
     return {
         "schema_version": SCHEMA_VERSION,
         "correctness_passed": not correctness_failures,
@@ -217,7 +226,97 @@ def analyze_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # noqa: C901,
     }
 
 
+def _analyze_combined_artifact(artifact: dict[str, Any]) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
+    """Admit fixture performance only for proven three-window live shortfalls."""
+    live = artifact.get("live_artifact")
+    fixture = artifact.get("fixture_artifact")
+    substitutions = artifact.get("substitutions")
+    if not isinstance(live, dict) or live.get("source") != "live_read_only":
+        raise ValueError("combined admission requires one live_read_only artifact")
+    if not isinstance(fixture, dict) or fixture.get("source") != "deterministic_fixture":
+        raise ValueError("combined admission requires one deterministic_fixture artifact")
+    if not isinstance(substitutions, list):
+        raise TypeError("combined admission requires a substitutions list")
+    if live.get("sha") != fixture.get("sha") or artifact.get("sha") != live.get("sha"):
+        raise ValueError("combined admission evidence must bind one candidate SHA")
+
+    live_result = analyze_artifact(live)
+    fixture_result = analyze_artifact(fixture, _fixture_substitution=True)
+    live_groups = {(group["cell"], group["mode"]): group for group in live_result["groups"]}
+    fixture_groups = {(group["cell"], group["mode"]): group for group in fixture_result["groups"]}
+    live_samples: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for sample in live["samples"]:
+        live_samples[(sample["cell"], sample["mode"])].append(sample)
+
+    declared: dict[tuple[str, str], dict[str, Any]] = {}
+    substitution_failures: list[dict[str, str]] = []
+    for entry in substitutions:
+        if not isinstance(entry, dict):
+            raise TypeError("each substitution must be an object")
+        live_key = (entry.get("live_cell"), entry.get("mode"))
+        fixture_key = (entry.get("fixture_cell"), entry.get("mode"))
+        if not all(isinstance(value, str) for value in (*live_key, fixture_key[0])):
+            raise ValueError("substitution cells and mode must be strings")
+        if live_key in declared:
+            raise ValueError("duplicate live substitution")
+        declared[live_key] = entry
+        live_group = live_groups.get(live_key)
+        fixture_group = fixture_groups.get(fixture_key)
+        windows = {
+            sample.get("attempt_window")
+            for sample in live_samples.get(live_key, ())
+            if not sample.get("warmup")
+        }
+        reasons = entry.get("reason_codes")
+        deficient = live_group is not None and (
+            live_group["accepted"] < live_group["required"] or live_group["unstable"]
+        )
+        expected_reasons = set()
+        if live_group is not None and live_group["accepted"] < live_group["required"]:
+            expected_reasons.add("insufficient_accepted_samples")
+        if live_group is not None and live_group["unstable"]:
+            expected_reasons.add("unstable")
+        valid = (
+            deficient
+            and live["manifest"].get("attempt_windows") == LIVE_ATTEMPT_WINDOWS
+            and windows == set(range(1, LIVE_ATTEMPT_WINDOWS + 1))
+            and isinstance(reasons, list)
+            and set(reasons) == expected_reasons
+            and fixture_group is not None
+            and fixture_group["performance_passed"]
+        )
+        if not valid:
+            substitution_failures.append({"cell": str(live_key[0]), "mode": str(live_key[1])})
+
+    live_scope = set(map(tuple, live["manifest"]["performance_scope"]))
+    unresolved = []
+    for key in sorted(live_scope):
+        group = live_groups.get(key)
+        if (group is None or not group["performance_passed"]) and key not in declared:
+            unresolved.append({"cell": key[0], "mode": key[1]})
+    matrix_failed = any(
+        failure["cell"] == "__live_matrix__" for failure in live_result["performance_failures"]
+    )
+    performance_failures = [*substitution_failures, *unresolved]
+    if matrix_failed:
+        performance_failures.append({"cell": "__live_matrix__", "mode": "all"})
+    material_range = live_result["material_range_speedup"] or fixture_result["material_range_speedup"]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "correctness_passed": live_result["correctness_passed"] and fixture_result["correctness_passed"],
+        "performance_passed": not performance_failures and material_range,
+        "material_range_speedup": material_range,
+        "correctness_failures": [
+            *live_result["correctness_failures"],
+            *fixture_result["correctness_failures"],
+        ],
+        "performance_failures": performance_failures,
+        "groups": {"live": live_result["groups"], "fixture": fixture_result["groups"]},
+    }
+
+
 __all__ = [
+    "LIVE_ATTEMPT_WINDOWS",
     "REQUIRED_LIVE_MATRIX_FEATURES",
     "SCHEMA_VERSION",
     "analyze_artifact",

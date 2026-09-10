@@ -20,6 +20,7 @@ from urllib.parse import parse_qs
 
 if TYPE_CHECKING or __package__:
     from tools.b24api_evidence.keyset_admission import (
+        LIVE_ATTEMPT_WINDOWS,
         REQUIRED_LIVE_MATRIX_FEATURES,
         SCHEMA_VERSION,
         analyze_artifact,
@@ -27,6 +28,7 @@ if TYPE_CHECKING or __package__:
     )
 else:
     from b24api_evidence.keyset_admission import (
+        LIVE_ATTEMPT_WINDOWS,
         REQUIRED_LIVE_MATRIX_FEATURES,
         SCHEMA_VERSION,
         analyze_artifact,
@@ -527,6 +529,12 @@ async def generate_live_range(
                         "cell": cell.name,
                         "mode": mode,
                         "warmup": round_index == 0,
+                        "attempt_window": (
+                            0 if round_index == 0 else min(
+                                LIVE_ATTEMPT_WINDOWS,
+                                1 + ((round_index - 1) * LIVE_ATTEMPT_WINDOWS // max(samples, 1)),
+                            )
+                        ),
                         "rotation_offset": rotation,
                         "window_seconds": time.monotonic() - sample_started,
                         "page_size": PAGE_SIZE,
@@ -582,6 +590,7 @@ async def generate_live_range(
                 if "auto" in modes
             },
             "modes": list(modes),
+            "attempt_windows": LIVE_ATTEMPT_WINDOWS,
             "live_matrix": {
                 "complete": True,
                 "covered_features": sorted(covered_features),
@@ -660,9 +669,12 @@ def _live_execution(mode: str, *, total_hint: TotalHintMode = TotalHintMode.IGNO
 def main() -> int:
     """Run the single generator/analyzer entry point."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("fixture", "live", "live-range", "analyze"))
+    parser.add_argument("command", choices=("fixture", "live", "live-range", "analyze", "combine"))
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--samples", type=int, default=20)
+    parser.add_argument("--live-artifact", type=Path)
+    parser.add_argument("--fixture-artifact", type=Path)
+    parser.add_argument("--substitutions", type=Path)
     args = parser.parse_args()
     if args.command in {"fixture", "live", "live-range"}:
         git = shutil.which("git")
@@ -680,10 +692,23 @@ def main() -> int:
             artifact = asyncio.run(generate_live_range(args.samples, sha=sha, modes=("range",)))
         else:
             artifact = asyncio.run(generate_live_range(args.samples, sha=sha))
-    else:
+    elif args.command == "analyze":
         artifact = json.loads(args.artifact.read_text(encoding="utf-8"))
+    else:
+        if args.live_artifact is None or args.fixture_artifact is None or args.substitutions is None:
+            parser.error("combine requires --live-artifact, --fixture-artifact, and --substitutions")
+        live = json.loads(args.live_artifact.read_text(encoding="utf-8"))
+        fixture = json.loads(args.fixture_artifact.read_text(encoding="utf-8"))
+        artifact = {
+            "schema_version": SCHEMA_VERSION,
+            "source": "combined_live_fixture",
+            "sha": live.get("sha"),
+            "live_artifact": live,
+            "fixture_artifact": fixture,
+            "substitutions": json.loads(args.substitutions.read_text(encoding="utf-8")),
+        }
     result = analyze_artifact(artifact)
-    if args.command in {"fixture", "live", "live-range"}:
+    if args.command in {"fixture", "live", "live-range", "combine"}:
         artifact["analysis"] = result
         args.artifact.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")

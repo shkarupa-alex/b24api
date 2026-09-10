@@ -222,6 +222,23 @@ def normalize_anchor_receipts(
     )
 
 
+def compact_anchor_receipts(
+    receipts: tuple[LaneReceipt, ...],
+) -> tuple[tuple[LaneReceipt, ...], int, int]:
+    """Keep only each probe's usable first row and report discarded raw rows."""
+    compact = tuple(
+        replace(
+            receipt,
+            rows=receipt.rows[:1],
+            identities=receipt.identities[:1],
+            last_identity=receipt.identities[0] if receipt.identities else None,
+        )
+        for receipt in receipts
+    )
+    retained = sum(bool(receipt.rows) for receipt in receipts)
+    return compact, sum(len(receipt.rows) for receipt in receipts) - retained, retained
+
+
 def selected_lane_geometry(  # noqa: PLR0913
     *,
     selected: KeysetExecutionKind,
