@@ -150,10 +150,25 @@ class OrderedAdmissionState:
         """Return a detached mutable-counter snapshot."""
         return FastCounters(**{name: getattr(self._counters, name) for name in FastCounters.__dataclass_fields__})
 
+    def discard_unadmitted_raw(self) -> None:
+        """Classify raw rows still retained when traversal ends early."""
+        accounted = (
+            self._counters.admitted_rows + self._counters.probe_rows_discarded + self._counters.boundary_overlap_rows
+        )
+        remaining = self._counters.raw_rows - accounted
+        if remaining < 0:
+            raise RuntimeError("fast keyset row provenance is over-accounted")
+        self._counters.probe_rows_discarded += remaining
+
     def assert_clean(self) -> None:
         """Validate counter relationships at terminal cleanup."""
         if self._counters.emitted_rows > self._counters.admitted_rows:
             raise RuntimeError("fast keyset emitted rows exceed admitted rows")
+        accounted = (
+            self._counters.admitted_rows + self._counters.probe_rows_discarded + self._counters.boundary_overlap_rows
+        )
+        if self._counters.raw_rows != accounted:
+            raise RuntimeError("fast keyset raw-row provenance is not conserved")
 
     def close(self) -> None:
         """Release identity state after terminal evidence has been frozen."""

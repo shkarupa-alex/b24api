@@ -8,7 +8,7 @@ from collections import defaultdict
 from typing import Any, cast
 
 SCHEMA_VERSION = 1
-SHA256_HEX_LENGTH = 40
+GIT_SHA_HEX_LENGTH = 40
 PORTAL_FINGERPRINT_LENGTH = 64
 SMALL_MAX_REQUESTS = 3
 INTERMEDIATE_MAX_REQUESTS = 10
@@ -57,7 +57,7 @@ def _validate_artifact_binding(artifact: dict[str, Any], candidate_sha: str) -> 
         raise ValueError("keyset admission artifact source is missing or unsupported")
     if (
         not isinstance(sha, str)
-        or len(sha) != SHA256_HEX_LENGTH
+        or len(sha) != GIT_SHA_HEX_LENGTH
         or any(character not in "0123456789abcdef" for character in sha)
     ):
         raise ValueError("keyset admission artifact requires an exact lowercase candidate SHA")

@@ -7,7 +7,6 @@ from collections import deque
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     KeysetExecutionKind,
@@ -32,8 +31,10 @@ from b24api.traversal.keyset_partition import anchor_guesses, normalize_anchors
 from b24api.traversal.keyset_range import range_window_width
 
 if TYPE_CHECKING:
-    from b24api.batch.outcome import BatchOutcome
+    from collections.abc import Callable
+
     from b24api.contracts.json import JsonValue
+    from b24api.contracts.request import Request
     from b24api.contracts.traversal import KeysetSpec
     from b24api.traversal.page_validation import LaneCommandPlan, LaneReceipt
 
@@ -48,6 +49,54 @@ class CapabilityCommand:
     reserve: int
     expects_single_row: bool = False
     expected: tuple[int, ...] | None = None
+
+
+def build_capability_plans(  # noqa: PLR0913
+    commands: tuple[CapabilityCommand, ...],
+    phase: KeysetPhase,
+    controls: Callable[..., Request],
+    lane_plan: Callable[..., LaneCommandPlan],
+    page_cap: int,
+    planning_bounds: dict[str, LaneBounds],
+    planning_descending: dict[str, bool],
+) -> tuple[LaneCommandPlan, ...]:
+    """Create capability commands and their validation lookup state."""
+    plans = []
+    for command in commands:
+        bounds = command.bounds
+        request = controls(
+            direction="DESC" if command.descending else "ASC",
+            lower=bounds.lower_exclusive,
+            upper=bounds.upper_exclusive,
+            limit=1 if command.expects_single_row else page_cap,
+        )
+        lane = LaneState(
+            LaneSpec(
+                ordinal=command.ordinal,
+                kind=LaneKind.LANE,
+                bounds=bounds,
+                descending=command.descending,
+                owns_output=False,
+                retained_upper_anchor=None,
+            ),
+            bounds.upper_exclusive if command.descending else bounds.lower_exclusive,
+            LaneStatus.OPEN,
+            None,
+            0,
+            command.reserve,
+            deque(),
+        )
+        plan = lane_plan(
+            lane,
+            phase=phase,
+            request=request,
+            reserve=command.reserve,
+            single=command.expects_single_row,
+        )
+        planning_bounds[plan.command_id] = bounds
+        planning_descending[plan.command_id] = command.descending
+        plans.append(plan)
+    return tuple(plans)
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,20 +290,6 @@ def compact_anchor_receipts(
     )
     retained = sum(bool(receipt.rows) for receipt in receipts)
     return compact, sum(len(receipt.rows) for receipt in receipts) - retained, retained
-
-
-def boundary_totals(
-    plans: tuple[LaneCommandPlan, ...],
-    outcomes: tuple[BatchOutcome, ...],
-) -> dict[str, int | None]:
-    """Retain boundary scalar totals without retaining response row payloads."""
-    if not all(plan.phase is KeysetPhase.BOUNDARY for plan in plans):
-        return {}
-    return {
-        plan.command_id: outcome.response.total
-        for plan, outcome in zip(plans, outcomes, strict=True)
-        if isinstance(outcome, BatchSuccess) and outcome.response is not None
-    }
 
 
 def anchor_capable_batch_capacity(*, current: int, available_rows: int, page_cap: int, target_lanes: int) -> int:

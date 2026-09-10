@@ -7,16 +7,12 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from b24api.contracts.json import JsonValue
-    from b24api.contracts.keyset_execution import ClosureWitness, KeysetExecutionKind, KeysetPageCompletion, KeysetPhase
-    from b24api.contracts.request import IdentitySpec, Request
+    from b24api.contracts.keyset_execution import ClosureWitness, KeysetExecutionKind, KeysetPageCompletion
+    from b24api.contracts.request import IdentitySpec
     from b24api.contracts.response import ResultCollectionShape
     from b24api.contracts.traversal import KeysetSpec
     from b24api.traversal.keyset_auto import FinalSelection, Preselection
-    from b24api.traversal.keyset_capability import CapabilityCommand
-    from b24api.traversal.page_validation import LaneCommandPlan
 
 type Identity = int
 MIN_WINDOW_WIDTH = 2
@@ -139,48 +135,6 @@ class LazyRangePlan:
         """Fill one bounded sliding group without materializing the full range."""
         while len(lanes) < capacity and self.next_ordinal < self.count:
             self.append_next(lanes, rows, identities, commands)
-
-
-def build_capability_plans(  # noqa: PLR0913
-    commands: tuple[CapabilityCommand, ...],
-    phase: KeysetPhase,
-    controls: Callable[..., Request],
-    lane_plan: Callable[..., LaneCommandPlan],
-    page_cap: int,
-    planning_bounds: dict[str, LaneBounds],
-    planning_descending: dict[str, bool],
-) -> tuple[LaneCommandPlan, ...]:
-    """Create capability commands and their validation lookup state."""
-    plans = []
-    for command in commands:
-        bounds = command.bounds
-        request = controls(
-            direction="DESC" if command.descending else "ASC",
-            lower=bounds.lower_exclusive,
-            upper=bounds.upper_exclusive,
-            limit=1 if command.expects_single_row else page_cap,
-        )
-        lane = LaneState(
-            LaneSpec(
-                ordinal=command.ordinal,
-                kind=LaneKind.LANE,
-                bounds=bounds,
-                descending=command.descending,
-                owns_output=False,
-                retained_upper_anchor=None,
-            ),
-            bounds.upper_exclusive if command.descending else bounds.lower_exclusive,
-            LaneStatus.OPEN,
-            None,
-            0,
-            command.reserve,
-            deque(),
-        )
-        plan = lane_plan(lane, phase=phase, request=request, reserve=command.reserve, single=command.expects_single_row)
-        planning_bounds[plan.command_id] = bounds
-        planning_descending[plan.command_id] = command.descending
-        plans.append(plan)
-    return tuple(plans)
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,7 +280,6 @@ __all__ = [
     "LaneStatus",
     "LazyRangePlan",
     "PlanOutcome",
-    "build_capability_plans",
     "fit_wave",
     "plan_lanes_from_anchors",
     "plan_windows",

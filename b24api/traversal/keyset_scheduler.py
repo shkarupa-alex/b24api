@@ -58,6 +58,7 @@ from b24api.traversal.keyset_costs import selected_range_geometry
 from b24api.traversal.ordered_admission import FastCounters, OrderedAdmissionState, drain_complete_lanes
 from b24api.traversal.keyset_observation import (
     abort_staged_observations,
+    close_scheduler,
     flush_staged_observations,
     raise_boundary_cap_contradiction,
     record_scheduler_observation,
@@ -68,7 +69,6 @@ from b24api.traversal.keyset_reporting import build_scheduler_report, initial_re
 from b24api.traversal.keyset_transactions import (
     build_anchor_plans,
     build_canary_plans,
-    close_scheduler,
     execute_body_wave,
     execute_finish_page,
     execute_wave,
@@ -321,6 +321,7 @@ class KeysetFastScheduler:
 
     async def _partition_planning(self, asc: LaneReceipt, desc: LaneReceipt, target: int) -> tuple[int, ...]:
         precharged = 0
+        canaries_validated = False
         try:
             canaries, expected = build_canary_plans(self, asc, desc)
             anchors = build_anchor_plans(self, asc, desc, target)
@@ -336,12 +337,16 @@ class KeysetFastScheduler:
                 receipts = await self._wave(co_scheduled)
                 canary_receipts, anchor_receipts = receipts[: len(canaries)], receipts[len(canaries) :]
                 self._validate_canaries(canary_receipts, expected)
+                canaries_validated = True
             else:
                 canary_receipts = await self._chunked_waves(canaries)
                 self._validate_canaries(canary_receipts, expected)
+                canaries_validated = True
                 anchor_receipts = await self._chunked_waves(anchors, compact_anchors=True) if anchors else ()
                 precharged = sum(bool(receipt.rows) for receipt in anchor_receipts)
         except BaseException:
+            if canaries_validated:
+                self.admission.record_discarded(len(asc.rows) + len(desc.rows))
             abort_staged_observations(self._staged_observations, self._record, self.admission, self.violations)
             raise
         result = self._consume_anchors(anchor_receipts, lo=max(asc.identities), hi=min(desc.identities))

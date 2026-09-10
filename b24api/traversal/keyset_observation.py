@@ -226,10 +226,45 @@ def validate_canary_observations(  # noqa: PLR0913
             "bounded keyset capability canary failed",
         )
         violations.append(violation)
-        admission.record_discarded(sum(item[2] for item in staged if item[0].phase.value == "boundary"))
+        boundary_rows = sum(item[2] for item in staged if item[0].phase.value == "boundary")
+        anchor_rows = sum(item[2] for item in staged if item[0].phase.value == "anchor_probe")
+        admission.record_discarded(boundary_rows)
+        admission.record_raw(anchor_rows, discarded=True)
         flush_staged_observations(staged, record, violation=violation, offending=offending)
         raise PaginationError("bounded keyset capability canary failed")
     flush_staged_observations(staged, record)
+
+
+async def close_scheduler(scheduler: KeysetFastScheduler) -> None:
+    """Release all state retained by the scheduler owner exactly once."""
+    if scheduler._closed:
+        return
+    scheduler.admission.discard_unadmitted_raw()
+    scheduler._frozen_report = scheduler.report_fragment()
+    if scheduler._buffer_balance:
+        await scheduler._adjust_buffer(-scheduler._buffer_balance)
+    if scheduler._buffer_balance != 0:
+        raise RuntimeError("fast scheduler buffer balance survived cleanup")
+    for retained in (
+        scheduler._pending,
+        scheduler._lane_rows,
+        scheduler._lane_identities,
+        scheduler._lane_commands,
+        scheduler._lanes,
+    ):
+        retained.clear()
+    scheduler._tail = None
+    scheduler._anchor_rows.clear()
+    scheduler._anchor_commands.clear()
+    scheduler._planning_bounds.clear()
+    scheduler._planning_descending.clear()
+    scheduler._boundary_totals.clear()
+    scheduler._staged_observations.clear()
+    scheduler._plan_outcome = None
+    scheduler._range_geometry = None
+    scheduler.admission.assert_clean()
+    scheduler.admission.close()
+    scheduler._closed = True
 
 
 __all__: list[str] = []

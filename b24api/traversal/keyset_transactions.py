@@ -13,7 +13,7 @@ from b24api.errors import BudgetExceededError, PaginationError
 from b24api.traversal import keyset_step
 from b24api.traversal.keyset_capability import (
     anchor_commands,
-    boundary_totals,
+    build_capability_plans,
     canary_commands,
     lane_for_command,
 )
@@ -23,7 +23,6 @@ from b24api.traversal.keyset_fast_plan import (
     LaneSpec,
     LaneState,
     LaneStatus,
-    build_capability_plans,
     fit_wave,
 )
 from b24api.traversal.keyset_observation import stage_or_record_observation
@@ -31,10 +30,25 @@ from b24api.traversal.keyset_range import descending_closure_witness
 from b24api.traversal.page_validation import ReceiptRejection, classify_rejection, validate_lane_receipt
 
 if TYPE_CHECKING:
+    from b24api.batch.outcome import BatchOutcome
     from b24api.contracts.request import Request
     from b24api.traversal.keyset_scheduler import KeysetFastScheduler
     from b24api.traversal.page_validation import LaneCommandPlan, LaneReceipt
     from b24api.traversal.plans import KeysetPlan
+
+
+def boundary_totals(
+    plans: tuple[LaneCommandPlan, ...],
+    outcomes: tuple[BatchOutcome, ...],
+) -> dict[str, int | None]:
+    """Retain boundary scalar totals without retaining response row payloads."""
+    if not all(plan.phase is KeysetPhase.BOUNDARY for plan in plans):
+        return {}
+    return {
+        plan.command_id: outcome.response.total
+        for plan, outcome in zip(plans, outcomes, strict=True)
+        if isinstance(outcome, BatchSuccess) and outcome.response is not None
+    }
 
 
 def build_canary_plans(
@@ -316,10 +330,11 @@ async def execute_finish_page(
         )
         if isinstance(receipt, ReceiptRejection):
             scheduler.violations.append(receipt.violation)
+            scheduler.admission.record_raw(receipt.selected_rows, discarded=True)
             scheduler._record(
                 plan,
                 index=None,
-                selected=0,
+                selected=receipt.selected_rows,
                 admitted=0,
                 outcome=PageOutcome.REJECTED,
                 rejection=PageRejectionCode.RANGE_CONTRADICTION,
@@ -330,7 +345,22 @@ async def execute_finish_page(
         terminal = keyset_step.keyset_page_terminal(finish_plan, len(receipt.rows))
         await scheduler._adjust_buffer(-scheduler.effective_page_cap + len(receipt.rows))
         scheduler.admission.record_raw(len(receipt.rows))
-        commit = scheduler.admission.validate_and_commit(receipt)
+        try:
+            commit = scheduler.admission.validate_and_commit(receipt)
+        except PaginationError:
+            scheduler.admission.record_discarded(len(receipt.rows))
+            scheduler._record(
+                plan,
+                index=None,
+                selected=len(receipt.rows),
+                admitted=0,
+                outcome=PageOutcome.REJECTED,
+                rejection=PageRejectionCode.RANGE_CONTRADICTION,
+                response=response,
+                witness=receipt.witness,
+                dispatch=PageDispatch.DIRECT,
+            )
+            raise
         scheduler._record(
             plan,
             index=None,
@@ -358,41 +388,9 @@ async def execute_finish_page(
         raise RuntimeError("fast scheduler buffer accounting escaped policy")
 
 
-async def close_scheduler(scheduler: KeysetFastScheduler) -> None:
-    """Release all scheduler-owned retained state exactly once."""
-    if scheduler._closed:
-        return
-    scheduler._frozen_report = scheduler.report_fragment()
-    if scheduler._buffer_balance:
-        await scheduler._adjust_buffer(-scheduler._buffer_balance)
-    if scheduler._buffer_balance != 0:
-        raise RuntimeError("fast scheduler buffer balance survived cleanup")
-    for retained in (
-        scheduler._pending,
-        scheduler._lane_rows,
-        scheduler._lane_identities,
-        scheduler._lane_commands,
-        scheduler._lanes,
-    ):
-        retained.clear()
-    scheduler._tail = None
-    scheduler._anchor_rows.clear()
-    scheduler._anchor_commands.clear()
-    scheduler._planning_bounds.clear()
-    scheduler._planning_descending.clear()
-    scheduler._boundary_totals.clear()
-    scheduler._staged_observations.clear()
-    scheduler._plan_outcome = None
-    scheduler._range_geometry = None
-    scheduler.admission.assert_clean()
-    scheduler.admission.close()
-    scheduler._closed = True
-
-
 __all__ = [
     "build_anchor_plans",
     "build_canary_plans",
-    "close_scheduler",
     "execute_body_wave",
     "execute_finish_page",
     "execute_wave",

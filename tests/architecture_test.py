@@ -210,8 +210,12 @@ def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
     ceilings = {
         PACKAGE / "contracts" / "keyset_execution.py": 250,
         PACKAGE / "traversal" / "keyset_auto.py": 250,
+        PACKAGE / "traversal" / "keyset_fast_plan.py": 300,
         PACKAGE / "traversal" / "keyset_fast_stream.py": 400,
         PACKAGE / "traversal" / "keyset_scheduler.py": 700,
     }
     for path, ceiling in ceilings.items():
         assert len(path.read_text(encoding="utf-8").splitlines()) <= ceiling
+
+    transactions = ast.parse((PACKAGE / "traversal" / "keyset_transactions.py").read_text(encoding="utf-8"))
+    assert not any(isinstance(node, ast.ClassDef) for node in transactions.body)

@@ -222,6 +222,47 @@ class ShortBoundaryTransport(KeysetTransport):
         return rows if bounded else rows[:2]
 
 
+class AsymmetricBoundaryTransport(KeysetTransport):
+    """Return one ascending boundary row and a full descending prefix."""
+
+    def _rows(self, parameters: dict[str, JsonValue]) -> list[dict[str, int]]:
+        rows = super()._rows(parameters)
+        filters = parameters.get("filter", {})
+        order = parameters.get("order", {})
+        bounded = isinstance(filters, dict) and any(key in filters for key in (">ID", "<ID"))
+        descending = isinstance(order, dict) and order.get("id") == "DESC"
+        return rows[:1] if not bounded and not descending else rows
+
+
+class NthBatchMissingResultTransport(KeysetTransport):
+    """Drop one result only from a selected batch request."""
+
+    def __init__(self, identities: tuple[int, ...], *, batch_ordinal: int) -> None:
+        super().__init__(identities)
+        self.batch_ordinal = batch_ordinal
+        self.batch_count = 0
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        response = await super().send(
+            request,
+            attempt_timeout=attempt_timeout,
+            max_response_bytes=max_response_bytes,
+        )
+        if request.method != "batch":
+            return response
+        self.batch_count += 1
+        if self.batch_count != self.batch_ordinal:
+            return response
+        payload = json.loads(response.body)
+        results = payload["result"]["result"]
+        results.pop(next(iter(results)))
+        return WireResponse(
+            response.status_code,
+            response.headers,
+            json.dumps(payload, separators=(",", ":")).encode(),
+        )
+
+
 def _client(transport: KeysetTransport, *, policy: ExecutionPolicy | None = None) -> Bitrix24:
     return Bitrix24._from_executor(Executor(transport), policy=policy)
 
@@ -1388,6 +1429,73 @@ async def test_dense_multi_round_range_keeps_grouped_continuations() -> None:
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.RANGE
     assert stream.report.physical_requests == 5
+
+
+@pytest.mark.asyncio
+async def test_auto_uses_available_canary_pair_from_asymmetric_boundary() -> None:
+    identities = tuple(range(1, 1_001))
+    stream = _client(AsymmetricBoundaryTransport(identities, default_limit=5)).iter_list_keyset(
+        Request("item.list"),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=5,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        execution=AutoKeysetExecution(StableIntegerKeysetContract(), target_lanes=2),
+    )
+
+    assert [row["id"] async for row in stream] == list(identities)
+    assert stream.report.keyset_execution is not None
+    assert stream.report.keyset_execution.selected_kind is not KeysetExecutionKind.SEQUENTIAL
+    assert stream.report.keyset_execution.canary_commands == 5
+
+
+@pytest.mark.asyncio
+async def test_coscheduled_canary_failure_accounts_for_every_staged_probe_row() -> None:
+    stream = _stream(
+        KeysetTransport(tuple(range(1, 101)), ignore_bounds=True),
+        PartitionedKeysetExecution(StableIntegerKeysetContract(), target_lanes=3),
+    )
+
+    with pytest.raises(IncompleteTraversalError):
+        await anext(stream)
+    assert stream.report.keyset_execution is not None
+    selected = sum(record.rows_selected for record in stream.report.page_trace)
+    assert stream.report.keyset_execution.probe_rows_discarded == selected
+
+
+@pytest.mark.asyncio
+async def test_separate_anchor_failure_discards_previously_validated_boundaries() -> None:
+    stream = _stream(
+        NthBatchMissingResultTransport(tuple(range(1, 101)), batch_ordinal=3),
+        PartitionedKeysetExecution(StableIntegerKeysetContract(), batch_size=5, target_lanes=3),
+    )
+
+    with pytest.raises(IncompleteTraversalError):
+        await anext(stream)
+    assert stream.report.keyset_execution is not None
+    selected = sum(record.rows_selected for record in stream.report.page_trace)
+    assert stream.report.keyset_execution.probe_rows_discarded == selected
+
+
+@pytest.mark.asyncio
+async def test_rejected_finish_page_records_selected_and_discarded_rows() -> None:
+    stream = _client(KeysetTransport((1, 2, 3), ignore_bounds=True, default_limit=1)).iter_list_keyset(
+        Request("item.list"),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=1,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        execution=AutoKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    with pytest.raises(IncompleteTraversalError):
+        _ = [row async for row in stream]
+    finish = [record for record in stream.report.page_trace if record.phase is KeysetPhase.FINISH]
+    assert len(finish) == 1
+    assert finish[0].rows_selected == 1
+    assert finish[0].outcome is PageOutcome.REJECTED
+    assert stream.report.keyset_execution is not None
+    assert stream.report.keyset_execution.probe_rows_discarded == 2
 
 
 @pytest.mark.asyncio

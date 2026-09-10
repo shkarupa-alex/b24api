@@ -107,10 +107,8 @@ def preselect(inputs: SelectorInputs) -> Preselection:  # noqa: PLR0911
         return selected(Preselected.BOUNDARY_ONLY, KeysetSelectionReason.BOUNDARY_OVERLAP)
     if boundary.adjacent:
         return selected(Preselected.BOUNDARY_ONLY, KeysetSelectionReason.ADJACENT_BOUNDARIES)
-    if (
-        inputs.effective_page_cap < MIN_CANARY_PREFIX
-        or boundary.head_rows < MIN_CANARY_PREFIX
-        or boundary.tail_rows < MIN_CANARY_PREFIX
+    if inputs.effective_page_cap < MIN_CANARY_PREFIX or (
+        boundary.head_rows < MIN_CANARY_PREFIX and boundary.tail_rows < MIN_CANARY_PREFIX
     ):
         return selected(Preselected.SEQUENTIAL, KeysetSelectionReason.SMALL_SELECTION)
     if inputs.batch_capacity < 1 or sequential.requests <= SEQ_FLOOR_REQUESTS:
