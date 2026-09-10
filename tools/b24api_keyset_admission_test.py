@@ -46,6 +46,12 @@ async def test_fixture_artifact_discloses_the_controlled_latency_model(monkeypat
     assert artifact["samples"] == []
 
 
+def test_fixture_uses_contractual_sample_counts_without_oversampling() -> None:
+    cases = (("small", 20, 20), ("dense_large", 20, 5), ("dense_large", 3, 3))
+    for name, requested, expected in cases:
+        assert harness._fixture_sample_count(harness.Cell(name, (1,)), requested) == expected
+
+
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [

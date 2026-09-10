@@ -60,7 +60,7 @@ if TYPE_CHECKING:
 PAGE_SIZE = 50
 TARGET_LANES = 20
 MODES = ("range", "partitioned", "auto")
-FIXTURE_REQUEST_LATENCY_SECONDS = 0.020
+FIXTURE_REQUEST_LATENCY_SECONDS = 0.050
 MIN_LARGE_LIVE_SELECTIONS = 2
 LOW_DENSITY_LIMIT = 0.05
 MID_DENSITY_LIMIT = 0.25
@@ -190,6 +190,11 @@ def _cells() -> tuple[Cell, ...]:
             tuple(value for block in range(5) for value in range(1 + block * 1_000, 201 + block * 1_000)),
         ),
     )
+
+
+def _fixture_sample_count(cell: Cell, requested: int) -> int:
+    """Run the contractual minimum without oversampling non-small fixture cells."""
+    return min(requested, 20 if cell.name == "small" else 5)
 
 
 def _live_cells() -> tuple[LiveCell, ...]:
@@ -400,7 +405,7 @@ async def generate(samples: int, *, sha: str) -> dict[str, Any]:
     """Generate frozen credential-free read-only sandwiches."""
     observations: list[dict[str, Any]] = []
     for cell in _cells():
-        for round_index in range(samples + 1):
+        for round_index in range(_fixture_sample_count(cell, samples) + 1):
             rotation = round_index % len(MODES)
             for mode in (*MODES[rotation:], *MODES[:rotation]):
                 before_run = await _run(cell, None)
@@ -443,7 +448,7 @@ async def generate(samples: int, *, sha: str) -> dict[str, Any]:
         "source": "deterministic_fixture",
         "sha": sha,
         "python_version": platform.python_version(),
-        "portal_fingerprint": hashlib.sha256(b"b24api-keyset-deterministic-fixture-v3").hexdigest(),
+        "portal_fingerprint": hashlib.sha256(b"b24api-keyset-deterministic-fixture-v4").hexdigest(),
         "wall_clock_unix": time.time(),
         "manifest": {
             "performance_scope": scope,
