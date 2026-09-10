@@ -45,6 +45,16 @@ def test_standalone_entrypoint_prefers_its_repository_over_environment_checkout(
     assert result.stdout.startswith("usage: b24api_keyset_admission.py")
 
 
+def test_candidate_sha_is_bound_to_repository_when_caller_cwd_is_elsewhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = harness._candidate_sha()
+    monkeypatch.chdir(tmp_path)
+
+    assert harness._candidate_sha() == expected
+
+
 @pytest.mark.asyncio
 async def test_fixture_latency_is_paid_inside_the_measured_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     delays: list[float] = []

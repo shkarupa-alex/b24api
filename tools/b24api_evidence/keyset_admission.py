@@ -5,8 +5,10 @@ import math
 import shutil
 import subprocess
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, cast
 
+ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_VERSION = 1
 GIT_SHA_HEX_LENGTH = 40
 PORTAL_FINGERPRINT_LENGTH = 64
@@ -45,6 +47,7 @@ def _current_candidate_sha() -> str:
         raise RuntimeError("git is required to bind keyset admission evidence")
     return subprocess.run(  # noqa: S603 - resolved executable and fixed arguments
         [git, "rev-parse", "HEAD"],
+        cwd=ROOT,
         check=True,
         capture_output=True,
         text=True,

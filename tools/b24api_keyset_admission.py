@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs
 
+ROOT = Path(__file__).resolve().parents[1]
+
 if TYPE_CHECKING or __package__:
     from tools.b24api_evidence.keyset_admission import (
         LIVE_ATTEMPT_WINDOWS,
@@ -27,7 +29,7 @@ if TYPE_CHECKING or __package__:
         lower_median,
     )
 else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(0, str(ROOT))
     from tools.b24api_evidence.keyset_admission import (
         LIVE_ATTEMPT_WINDOWS,
         REQUIRED_LIVE_MATRIX_FEATURES,
@@ -36,7 +38,7 @@ else:
         lower_median,
     )
 
-from b24api import (
+from b24api import (  # noqa: E402 - direct execution binds imports to this checkout first
     AutoKeysetExecution,
     Bitrix24,
     ExecutionPolicy,
@@ -55,7 +57,7 @@ from b24api import (
     StableIntegerKeysetContract,
     TotalHintMode,
 )
-from b24api.execution import Executor, WireResponse
+from b24api.execution import Executor, WireResponse  # noqa: E402
 
 if TYPE_CHECKING:
     from b24api.contracts import KeysetExecution
@@ -691,6 +693,19 @@ def _live_execution(mode: str, *, total_hint: TotalHintMode = TotalHintMode.IGNO
     raise ValueError(f"unsupported live keyset mode: {mode}")
 
 
+def _candidate_sha() -> str:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("git is required to bind evidence to a candidate")
+    return subprocess.run(  # noqa: S603 - resolved fixed git executable and arguments
+        [git, "rev-parse", "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def main() -> int:
     """Run the single generator/analyzer entry point."""
     parser = argparse.ArgumentParser()
@@ -702,15 +717,7 @@ def main() -> int:
     parser.add_argument("--substitutions", type=Path)
     args = parser.parse_args()
     if args.command in {"fixture", "live", "live-range"}:
-        git = shutil.which("git")
-        if git is None:
-            raise RuntimeError("git is required to bind evidence to a candidate")
-        sha = subprocess.run(  # noqa: S603 - resolved fixed git executable and arguments
-            [git, "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
+        sha = _candidate_sha()
         if args.command == "fixture":
             artifact = asyncio.run(generate(args.samples, sha=sha))
         elif args.command == "live-range":

@@ -3001,3 +3001,45 @@ def test_standalone_entrypoint_prefers_its_repository_over_environment_checkout(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("usage: b24api_evidence.py")
+
+
+def test_profile_entrypoint_prefers_its_repository_over_environment_checkout(tmp_path: Path) -> None:
+    stale_package = tmp_path / "b24api"
+    stale_package.mkdir()
+    (stale_package / "__init__.py").write_text('raise RuntimeError("stale checkout imported")\n', encoding="utf-8")
+
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and repository entrypoint
+        [sys.executable, str(PROFILE_ENTRYPOINT), "--help"],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("usage: profile_runtime.py")
+
+
+def test_profile_entrypoint_binds_sha_to_repository_when_cwd_is_elsewhere(tmp_path: Path) -> None:
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and repository entrypoint
+        [
+            sys.executable,
+            str(PROFILE_ENTRYPOINT),
+            "--case",
+            "nineteen",
+            "--plan",
+            "fixed_1x_batch",
+            "--samples",
+            "1",
+            "--warmups",
+            "0",
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["candidate_sha"] == SHA

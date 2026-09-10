@@ -16,12 +16,15 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+ROOT = Path(__file__).resolve().parents[2]
+
 if TYPE_CHECKING or __package__:
     from .harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
     from .harness.runtime_profile import run_capability_profile
 else:
-    from harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
-    from harness.runtime_profile import run_capability_profile
+    sys.path.insert(0, str(ROOT))
+    from tools.b24api_evidence.harness.model import ModelCase, ModelRun, exact_model_cases, run_model_case
+    from tools.b24api_evidence.harness.runtime_profile import run_capability_profile
 
 _PLANS = ("fixed_1x_batch", "counted_batch")
 _DEFAULT_CASES = (
@@ -157,6 +160,7 @@ def _main() -> None:
         raise SystemExit("git is required to bind profiling output to a candidate")
     candidate_sha = subprocess.run(  # noqa: S603 - resolved git binary, fixed arguments
         (git, "rev-parse", "HEAD"),
+        cwd=ROOT,
         check=True,
         capture_output=True,
         text=True,
