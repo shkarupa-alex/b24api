@@ -52,7 +52,7 @@ observed.
 On 2026-09-10, the committed keyset admission harness ran five accepted read-only range sandwiches
 after one warm-up on a 934-row list. Every ordered digest matched both sequential controls, with no
 exclusions, omissions, duplicates, or output over-fetch. Range used 5 physical requests versus 20;
-the paired median request ratio was 0.25 and the paired median wall-time ratio was 0.571. These are
+the paired median request ratio was 0.25 and the paired median wall-time ratio was 0.318. These are
 harness-produced observations for that portal cell, not general latency promises.
 
 ## Boundaries
