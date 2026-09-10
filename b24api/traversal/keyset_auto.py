@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from b24api.contracts.keyset_execution import (
@@ -121,6 +121,27 @@ def preselect(inputs: SelectorInputs) -> Preselection:  # noqa: PLR0911
     return selected(Preselected.PROBE_ANCHORS, KeysetSelectionReason.WIDE_SPAN_PARTITIONING)
 
 
+def constrain_anchor_preselection(selection: Preselection, *, anchor_capacity: int) -> Preselection:
+    """Keep a feasible range candidate when only anchor retention is unavailable."""
+    if selection.plan is not Preselected.PROBE_ANCHORS or anchor_capacity > 0:
+        return selection
+    estimate = selection.range_estimate
+    range_wins = (
+        estimate is not None
+        and estimate.eligible
+        and FAST_GAIN_DEN * estimate.requests <= FAST_GAIN_NUM * selection.sequential_estimate.requests
+    )
+    return replace(
+        selection,
+        plan=Preselected.RANGE if range_wins else Preselected.SEQUENTIAL,
+        reason=(
+            KeysetSelectionReason.RANGE_WITHIN_WAVE_BUDGET
+            if range_wins
+            else KeysetSelectionReason.INSUFFICIENT_PREDICTED_GAIN
+        ),
+    )
+
+
 def finalize(inputs: SelectorInputs, preselection: Preselection, anchors: AnchorFacts) -> FinalSelection:
     """Select a final plan after occupied-anchor observations."""
     if preselection.plan is not Preselected.PROBE_ANCHORS:
@@ -208,6 +229,7 @@ __all__ = [
     "Preselection",
     "SelectorInputs",
     "TotalHintState",
+    "constrain_anchor_preselection",
     "finalize",
     "normalize_total_hint",
     "preselect",

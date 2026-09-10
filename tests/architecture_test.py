@@ -200,9 +200,12 @@ def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
     assert "keyset_page_request(" in sequential
     assert "keyset_step.keyset_page_request(" in scheduler
 
-    selector = (PACKAGE / "traversal" / "keyset_auto.py").read_text(encoding="utf-8")
-    for forbidden in ("random", "time.", "os.environ", "float("):
-        assert forbidden not in selector
+    for name in ("keyset_auto.py", "keyset_costs.py"):
+        selector = (PACKAGE / "traversal" / name).read_text(encoding="utf-8")
+        for forbidden in ("random", "time.", "os.environ", "float("):
+            assert forbidden not in selector
+        tree = ast.parse(selector)
+        assert not any(isinstance(node, ast.Constant) and isinstance(node.value, float) for node in ast.walk(tree))
 
     ceilings = {
         PACKAGE / "contracts" / "keyset_execution.py": 250,

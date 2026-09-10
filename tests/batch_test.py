@@ -28,7 +28,6 @@ from b24api.contracts.request import ReplaySafety, Request
 from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
-    EnvelopeContractError,
     FailurePhase,
     ProtocolError,
     TransportError,
@@ -241,7 +240,7 @@ async def test_primary_batch_failure_survives_secondary_source_cleanup_failure()
     stream = BatchExecutor(Executor(CallbackTransport(malformed)))._outcomes(source(), batch_size=1)
     outcome = await anext(stream)
     assert isinstance(outcome, BatchFailure)
-    assert isinstance(outcome.error, ProtocolError | EnvelopeContractError)
+    assert isinstance(outcome.error, ProtocolError)
 
     with pytest.raises(RuntimeError, match="batch source close boom"):
         await stream.aclose()
@@ -686,6 +685,29 @@ async def test_php_empty_result_array_preserves_all_command_errors() -> None:
     assert [outcome.error.normalized_code for outcome in failures if isinstance(outcome.error, BatchCommandError)] == [
         "error_not_found",
     ] * 3
+
+
+@pytest.mark.asyncio
+async def test_default_batch_preserves_unknown_total_sentinel() -> None:
+    def unknown_total(request: Request) -> WireResponse:
+        keys = _batch_keys(request)
+        body = json.dumps({
+            "result": {
+                "result": {key: [] for key in keys},
+                "result_error": [],
+                "result_total": dict.fromkeys(keys, -1),
+            },
+        }).encode()
+        return WireResponse(200, (("content-type", "application/json"),), body)
+
+    stream = BatchExecutor(Executor(CallbackTransport(unknown_total)))._outcomes(
+        [Request("profile", replay_safety=ReplaySafety.SAFE)],
+    )
+    outcome = await anext(stream)
+
+    assert isinstance(outcome, BatchSuccess)
+    assert outcome.response is not None
+    assert outcome.response.total == -1
 
 
 @pytest.mark.asyncio

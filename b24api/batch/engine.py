@@ -378,9 +378,10 @@ def _optional_batch_integer(
             return None
         raise TypeError(f"batch {field} must be an integer")
     if field == "total" and value < 0:
-        if malformed_as_none or value == -1:
+        if malformed_as_none:
             return None
-        raise ValueError("batch total must be -1 or non-negative")
+        if value < -1:
+            raise ValueError("batch total must be -1 or non-negative")
     if field == "next" and value == -1:
         return None
     return value

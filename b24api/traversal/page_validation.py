@@ -3,7 +3,7 @@
 # ruff: noqa: BLE001, C901, PLR0912, PLR2004, TRY301
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from b24api.batch.outcome import BatchFailure, BatchSuccess
@@ -15,6 +15,8 @@ from b24api.traversal.keyset_range import closure_witness
 from b24api.traversal.values import _coerce_identity, _extract_path, _response_items, _validate_order
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from b24api.batch.outcome import BatchOutcome
     from b24api.contracts.json import JsonValue
     from b24api.contracts.request import IdentitySpec, Request
@@ -56,14 +58,22 @@ class ReceiptRejection:
     command_id: str
     violation: Violation
     detail: str
+    selected_rows: int = 0
 
 
-def _rejection(plan: LaneCommandPlan, message: str, *, code: str = "keyset_receipt") -> ReceiptRejection:
+def _rejection(
+    plan: LaneCommandPlan,
+    message: str,
+    *,
+    code: str = "keyset_receipt",
+    selected_rows: int = 0,
+) -> ReceiptRejection:
     return ReceiptRejection(
         plan.lane_ordinal,
         plan.command_id,
         Violation(ViolationSeverity.BLOCKING, code, message),
         message,
+        selected_rows,
     )
 
 
@@ -106,6 +116,7 @@ def validate_lane_receipt(  # noqa: PLR0913
         return _rejection(plan, "keyset batch command failed", code="command_failure")
     if not isinstance(outcome, BatchSuccess) or outcome.response is None:
         return _rejection(plan, "keyset batch outcome is not a correlated success", code="command_failure")
+    rows: tuple[JsonValue, ...] = ()
     try:
         rows = tuple(_response_items(outcome.response, selector or ResultSelector.root()))
         if len(rows) > effective_page_cap or len(rows) > plan.reserved_rows:
@@ -151,7 +162,7 @@ def validate_lane_receipt(  # noqa: PLR0913
             (),
         )
     except Exception as error:
-        return _rejection(plan, str(error), code="range_contradiction")
+        return _rejection(plan, str(error), code="range_contradiction", selected_rows=len(rows))
 
 
 def validate_boundary_direction(
@@ -160,6 +171,17 @@ def validate_boundary_direction(
     descending: LaneReceipt,
 ) -> ReceiptRejection | None:
     """Reject an ignored descending direction before boundary admission."""
+    if bool(ascending.identities) != bool(descending.identities):
+        return ReceiptRejection(
+            descending.lane_ordinal,
+            descending.command_id,
+            Violation(
+                ViolationSeverity.BLOCKING,
+                "direction_contradiction",
+                "boundary directions disagree on whether the selection is empty",
+            ),
+            "boundary directions disagree on whether the selection is empty",
+        )
     if len(descending.identities) >= 2 and any(
         current >= previous for previous, current in zip(descending.identities, descending.identities[1:], strict=False)
     ):
@@ -177,6 +199,23 @@ def validate_boundary_direction(
             "descending boundary precedes head",
         )
     return None
+
+
+def normalize_tail_receipt(
+    tail: LaneReceipt,
+    *,
+    already_seen: Callable[[int], bool],
+) -> tuple[LaneReceipt, int]:
+    """Remove boundary overlap while preserving traversal-order tail ownership."""
+    rows_ids = tuple(reversed(tuple(zip(tail.rows, tail.identities, strict=True))))
+    filtered = tuple((row, identity) for row, identity in rows_ids if not already_seen(identity))
+    overlap = len(rows_ids) - len(filtered)
+    return replace(
+        tail,
+        rows=tuple(row for row, _ in filtered),
+        identities=tuple(identity for _, identity in filtered),
+        last_identity=filtered[-1][1] if filtered else None,
+    ), overlap
 
 
 __all__ = [

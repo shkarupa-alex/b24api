@@ -16,7 +16,8 @@ from b24api.contracts.report import (
     Violation,
     ViolationSeverity,
 )
-from b24api.errors import IncompleteTraversalError, PaginationError
+from b24api.errors import BudgetExceededError, IncompleteTraversalError, PaginationError
+from b24api.execution.context import await_cancellation_resistant, await_cleanup_resistant, rearm_cancellation
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.keyset_observation import PageObservation
@@ -179,7 +180,7 @@ class KeysetFastStream:
                 rows = await self._scheduler.next_rows()
                 if not rows:
                     await self._terminate(KernelState.COMPLETED, "fast keyset traversal completed")
-                    self._closed = True
+                    self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
                     raise StopAsyncIteration
                 self._buffer.extend(rows)
             item = self._buffer.popleft()
@@ -190,40 +191,49 @@ class KeysetFastStream:
         except asyncio.CancelledError as error:
             await self._terminate(KernelState.CANCELLED, "iteration cancelled", primary=error)
             _attach_report(error, self.report)
-            self._closed = True
+            self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
             raise
-        except PaginationError as error:
+        except (PaginationError, BudgetExceededError) as error:
             await self._terminate(KernelState.INCOMPLETE, type(error).__name__, primary=error)
             incomplete = IncompleteTraversalError(report=self.report)
-            self._closed = True
+            self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
             raise incomplete from error
         except BaseException as error:
             await self._terminate(KernelState.FAILED, type(error).__name__, primary=error)
             _attach_report(error, self.report)
-            self._closed = True
+            self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
             raise
 
     async def aclose(self) -> None:
         """Close early, release scheduler resources, and freeze the report."""
         if self._closed:
             return
-        self._closed = True
         await self._terminate(KernelState.CANCELLED, "stream closed before exhaustion")
 
     async def _terminate(self, state: KernelState, reason: str, *, primary: BaseException | None = None) -> None:
-        cleanup: BaseException | None = None
-        try:
-            await self._scheduler.aclose()
-        except BaseException as error:  # noqa: BLE001 - cleanup is secondary to traversal outcome
-            cleanup = error
+        self._buffer.clear()
+        outcome = await await_cleanup_resistant(self._scheduler.aclose())
+        cleanup = outcome.error
+        if cleanup is not None:
             self._scheduler.violations.append(
-                Violation(ViolationSeverity.BLOCKING, "cleanup_failure", type(error).__name__),
+                Violation(ViolationSeverity.BLOCKING, "cleanup_failure", type(cleanup).__name__),
             )
         if cleanup is not None and state is KernelState.COMPLETED:
             state, reason = KernelState.FAILED, "fast keyset cleanup failed"
-        await self._finalize(state, reason)
+        finalize_cancellation = await await_cancellation_resistant(self._finalize(state, reason))
+        cancellation = finalize_cancellation or outcome.cancellation
+        self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
         if cleanup is not None and primary is not None:
             primary.add_note(f"fast keyset cleanup also failed ({type(cleanup).__name__})")
+        if cleanup is not None and primary is None:
+            _attach_report(cleanup, self.report)
+            rearm_cancellation(cancellation)
+            raise cleanup
+        if cancellation is not None and primary is None:
+            _attach_report(cancellation, self.report)
+            raise cancellation
+        if cancellation is not None and not isinstance(primary, asyncio.CancelledError):
+            rearm_cancellation(cancellation)
 
     async def _finalize(self, state: KernelState, reason: str) -> None:
         if self.report.state is not KernelState.NOT_STARTED:
