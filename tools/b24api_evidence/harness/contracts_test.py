@@ -45,6 +45,7 @@ from .contracts import (
     append_manifest_record,
     atomic_write_json,
     build_manifest_record,
+    clean_candidate_sha,
     content_sha256,
     derive_drift_controls,
     git_sha,
@@ -96,6 +97,29 @@ PROFILE_BATCH_BUFFER = 7
 SECOND_CALL = 2
 BUNDLE_OVERFLOW_FILES = 513
 LEAK_FIXTURE = b"https://example.invalid/rest/1/realisticToken123/"
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_clean_candidate_sha_rejects_uncommitted_tracked_content(tmp_path: Path, *, staged: bool) -> None:
+    git = shutil.which("git")
+    assert git is not None
+
+    def run_git(*arguments: str) -> None:
+        subprocess.run([git, *arguments], cwd=tmp_path, check=True)  # noqa: S603 - disposable local repository
+
+    run_git("init", "--quiet")
+    run_git("config", "user.email", "test@example.invalid")
+    run_git("config", "user.name", "Test")
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("reviewed\n", encoding="utf-8")
+    run_git("add", "tracked.txt")
+    run_git("commit", "--quiet", "-m", "initial")
+    tracked.write_text("changed\n", encoding="utf-8")
+    if staged:
+        run_git("add", "tracked.txt")
+
+    with pytest.raises(ContractError, match="clean tracked tree"):
+        clean_candidate_sha(tmp_path)
 
 
 def _plan(*, count: int = 5) -> dict[str, Any]:

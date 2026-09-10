@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 import math
-import shutil
-import subprocess
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
+
+from .harness.contracts import clean_candidate_sha
 
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_VERSION = 1
@@ -42,16 +42,7 @@ _SOURCES = frozenset({"deterministic_fixture", "live_read_only", "combined_live_
 
 
 def _current_candidate_sha() -> str:
-    git = shutil.which("git")
-    if git is None:
-        raise RuntimeError("git is required to bind keyset admission evidence")
-    return subprocess.run(  # noqa: S603 - resolved executable and fixed arguments
-        [git, "rev-parse", "HEAD"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    return clean_candidate_sha(ROOT)
 
 
 def _validate_artifact_binding(artifact: dict[str, Any], candidate_sha: str) -> None:

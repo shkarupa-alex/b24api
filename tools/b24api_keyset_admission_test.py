@@ -21,7 +21,7 @@ from b24api import (
     TotalHintMode,
 )
 from tools import b24api_keyset_admission as harness
-from tools.b24api_evidence.keyset_admission import LIVE_ATTEMPT_WINDOWS
+from tools.b24api_evidence.keyset_admission import LIVE_ATTEMPT_WINDOWS, _current_candidate_sha
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT / "tools/b24api_keyset_admission.py"
@@ -52,7 +52,7 @@ def test_candidate_sha_is_bound_to_repository_when_caller_cwd_is_elsewhere(
     expected = harness._candidate_sha()
     monkeypatch.chdir(tmp_path)
 
-    assert harness._candidate_sha() == expected
+    assert harness._candidate_sha() == _current_candidate_sha() == expected
 
 
 @pytest.mark.asyncio

@@ -1025,7 +1025,7 @@ def tracked_repository_paths(root: Path) -> list[Path]:
 
 
 def git_sha(root: Path) -> str:
-    """Resolve the exact candidate commit without accepting dirty content as evidence."""
+    """Resolve the repository's exact candidate commit."""
     git = shutil.which("git")
     if git is None:
         raise ContractError("git executable is unavailable")
@@ -1059,6 +1059,12 @@ def require_clean_tracked_tree(root: Path) -> None:
             raise ContractError("evidence requires a clean tracked tree at the exact candidate SHA")
         if result.returncode != 0:
             raise ContractError("cannot verify tracked-tree cleanliness")
+
+
+def clean_candidate_sha(root: Path) -> str:
+    """Bind evidence to HEAD only when all tracked content still matches it."""
+    require_clean_tracked_tree(root)
+    return git_sha(root)
 
 
 def manifest_content_hash(path: Path) -> str:

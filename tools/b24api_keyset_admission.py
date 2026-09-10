@@ -9,8 +9,6 @@ import itertools
 import json
 import os
 import platform
-import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -58,6 +56,7 @@ from b24api import (  # noqa: E402 - direct execution binds imports to this chec
     TotalHintMode,
 )
 from b24api.execution import Executor, WireResponse  # noqa: E402
+from tools.b24api_evidence.harness.contracts import clean_candidate_sha  # noqa: E402
 
 if TYPE_CHECKING:
     from b24api.contracts import KeysetExecution
@@ -694,16 +693,7 @@ def _live_execution(mode: str, *, total_hint: TotalHintMode = TotalHintMode.IGNO
 
 
 def _candidate_sha() -> str:
-    git = shutil.which("git")
-    if git is None:
-        raise RuntimeError("git is required to bind evidence to a candidate")
-    return subprocess.run(  # noqa: S603 - resolved fixed git executable and arguments
-        [git, "rev-parse", "HEAD"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    return clean_candidate_sha(ROOT)
 
 
 def main() -> int:
