@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
+from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.report import PageOutcome, PageRejectionCode, Violation, ViolationSeverity
 from b24api.contracts.request import ResultSelector
 from b24api.errors import (
@@ -18,16 +19,19 @@ from b24api.errors import (
     ProtocolError,
 )
 from b24api.traversal.keyset_range import closure_witness
+from b24api.traversal.page_adaptation import adapt_page
 from b24api.traversal.values import _coerce_identity, _extract_path, _response_items, _validate_order
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from b24api.batch.outcome import BatchOutcome
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson
     from b24api.contracts.request import IdentitySpec, Request
     from b24api.contracts.response import ResultCollectionShape
     from b24api.traversal.keyset_fast_plan import LaneState
+
+_IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +52,7 @@ class LaneReceipt:
 
     lane_ordinal: int
     command_id: str
-    rows: tuple[JsonValue, ...]
+    rows: tuple[FrozenJson, ...]
     identities: tuple[int, ...]
     page_full: bool
     last_identity: int | None
@@ -65,6 +69,7 @@ class ReceiptRejection:
     violation: Violation
     detail: str
     selected_rows: int = 0
+    error: BaseException | None = None
 
 
 def _rejection(
@@ -73,6 +78,7 @@ def _rejection(
     *,
     code: str = "keyset_receipt",
     selected_rows: int = 0,
+    error: BaseException | None = None,
 ) -> ReceiptRejection:
     return ReceiptRejection(
         plan.lane_ordinal,
@@ -80,10 +86,11 @@ def _rejection(
         Violation(ViolationSeverity.BLOCKING, code, message),
         message,
         selected_rows,
+        error,
     )
 
 
-def select_rows(*, outcome: BatchSuccess, selector: ResultSelector) -> tuple[JsonValue, ...]:
+def select_rows(*, outcome: BatchSuccess, selector: ResultSelector) -> tuple[FrozenJson, ...]:
     """Select rows from one correlated successful command response."""
     if outcome.response is None:
         raise PaginationError("batch command lacks correlated response evidence")
@@ -115,6 +122,7 @@ def validate_lane_receipt(  # noqa: PLR0913
     effective_page_cap: int,
     completion: KeysetPageCompletion,
     selector: ResultSelector | None = None,
+    page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
 ) -> LaneReceipt | ReceiptRejection:
     """Validate one outcome without mutating global or lane state."""
     del collection_shape  # selection shape is represented by the prepared selector
@@ -122,9 +130,18 @@ def validate_lane_receipt(  # noqa: PLR0913
         return _rejection(plan, "keyset batch command failed", code="command_failure")
     if not isinstance(outcome, BatchSuccess) or outcome.response is None:
         return _rejection(plan, "keyset batch outcome is not a correlated success", code="command_failure")
-    rows: tuple[JsonValue, ...] = ()
+    rows: tuple[FrozenJson, ...] = ()
     try:
-        rows = tuple(_response_items(outcome.response, selector or ResultSelector.root()))
+        rows = _response_items(outcome.response, selector or ResultSelector.root())
+        if plan.phase not in {KeysetPhase.ANCHOR_PROBE, KeysetPhase.CANARY}:
+            rows = adapt_page(
+                outcome.response,
+                rows,
+                adapter=page_adapter,
+                identities=((identity.item_path, identity.coercion),),
+                request_summary=plan.request.summary,
+                page_offset=lane.rounds,
+            )
         if len(rows) > effective_page_cap or len(rows) > plan.reserved_rows:
             raise PaginationError("response exceeded the declared keyset page cap")
         if plan.expects_single_row and len(rows) > 1:
@@ -168,7 +185,7 @@ def validate_lane_receipt(  # noqa: PLR0913
             (),
         )
     except (CapabilityError, PaginationError) as error:
-        return _rejection(plan, str(error), code="range_contradiction", selected_rows=len(rows))
+        return _rejection(plan, str(error), code="range_contradiction", selected_rows=len(rows), error=error)
 
 
 def validate_boundary_direction(

@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from b24api.contracts.json import _freeze_json, _thaw_json
+from b24api.contracts.json import FrozenJson, _freeze_json, _thaw_json
 from b24api.contracts.policy import (
     ConfirmationPolicy,
     DuplicatePolicy,
@@ -123,7 +123,7 @@ class _MonotonicIdentityStore:
 
 @dataclass(frozen=True, slots=True)
 class _Page:
-    items: tuple[JsonValue, ...]
+    items: tuple[FrozenJson, ...]
     response: Response
     item_weights: tuple[int, ...]
 

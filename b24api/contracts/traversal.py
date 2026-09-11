@@ -12,6 +12,7 @@ from b24api.contracts.keyset_execution import (
     RangeKeysetExecution,
     SequentialKeysetExecution,
 )
+from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.request import IdentitySpec, ParameterPath, ResultSelector, TraversalIdentity
 
@@ -20,6 +21,7 @@ _FILTER = ParameterPath(("filter",))
 _ORDER = ParameterPath(("order",))
 _ROOT_SELECTOR = ResultSelector.root()
 _SEQUENTIAL_KEYSET_EXECUTION = SequentialKeysetExecution()
+_IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 
 class OffsetContinuation(StrEnum):
@@ -160,6 +162,7 @@ class SequentialTraversal:
     identity: TraversalIdentity | None = None
     page_size: int = 50
     offset: OffsetSpec = OffsetSpec()
+    page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER
 
     def __post_init__(self) -> None:
         """Validate page cap."""
@@ -176,6 +179,7 @@ class CountedTraversal:
     selector: ResultSelector = _ROOT_SELECTOR
     page_size: int = 50
     offset: OffsetSpec = _COUNTED_OFFSET
+    page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER
 
     def __post_init__(self) -> None:
         """Validate required identity and page cap."""
@@ -195,6 +199,7 @@ class KeysetTraversal:
     page_size: int = 50
     keyset: KeysetSpec = KeysetSpec()
     execution: KeysetExecution = _SEQUENTIAL_KEYSET_EXECUTION
+    page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER
 
     def __post_init__(self) -> None:
         """Validate page cap."""
@@ -214,6 +219,7 @@ class CursorTraversal:
     cursor: CursorSpec
     identity: IdentitySpec | None = None
     page_size: int = 50
+    page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER
 
     def __post_init__(self) -> None:
         """Validate page cap."""

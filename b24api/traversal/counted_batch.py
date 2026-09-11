@@ -23,7 +23,7 @@ from b24api.traversal.plans import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson
     from b24api.contracts.request import ParameterPath
     from b24api.contracts.response import Response
     from b24api.execution.snapshot import KernelReport
@@ -76,7 +76,7 @@ class _CountedBatchMixin:
                 raise
             self.context.commit_page(head_reservation)
             trace_count = self.page_trace_count
-            head_items: list[JsonValue] = []
+            head_items: tuple[FrozenJson, ...] = ()
             try:
                 head_items = self.select_page(head)
                 await self.context.set_buffered_rows(len(head_items))
@@ -166,7 +166,7 @@ class _CountedBatchMixin:
                 logical_page_per_command=True,
             )
 
-            def validated_outcome(outcome: object) -> tuple[Response, list[JsonValue]]:
+            def validated_outcome(outcome: object) -> tuple[Response, tuple[FrozenJson, ...]]:
                 if isinstance(outcome, BatchFailure):
                     error = (
                         outcome.error
@@ -197,7 +197,7 @@ class _CountedBatchMixin:
                     batch_index=outcome.command_index,
                 )
                 trace_count = self.page_trace_count
-                items: list[JsonValue] = []
+                items: tuple[FrozenJson, ...] = ()
                 try:
                     items = self.select_page(response)
                     expected_rows = min(stride, total - start)

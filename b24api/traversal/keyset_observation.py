@@ -235,6 +235,14 @@ def validate_canary_observations(  # noqa: PLR0913
     flush_staged_observations(staged, record)
 
 
+def finalize_boundary_observations(
+    staged: list[tuple[LaneCommandPlan, int, int, Response | None, ClosureWitness | None]],
+    record: Callable[..., None],
+) -> None:
+    """Commit validated boundary observations without capability assertions."""
+    flush_staged_observations(staged, record)
+
+
 async def close_scheduler(scheduler: KeysetFastScheduler) -> None:
     """Release all state retained by the scheduler owner exactly once."""
     if scheduler._closed:

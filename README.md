@@ -129,8 +129,9 @@ more specialized mechanics have explicit names and explicit preconditions.
 |---|---|---|---|
 | `iter_list` | The method supports ordinary offset pagination. | Sequential requests follow server `next` (the next offset). Ordinary counted Bitrix list endpoints do server-side COUNT for `total` plus LIMIT/OFFSET page retrieval. | Continuation and empty terminal page; add identity for duplicate detection. |
 | `iter_list_counted` | The first response provides an exact filtered `total` and stable offset pages. | Head page is direct; all known tail offsets are grouped into physical Bitrix batches. | Exact total, ranges and identities. |
-| `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique integer identity. | Auto by default: it plans first, then selects boundary-only, sequential, range, or partitioned execution. | Caller-asserted keyset contract, strict monotonic identity, bounded-plan canaries, and terminal empty confirmation. |
+| `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique integer identity. | Auto by default: it plans first, then selects boundary-only, sequential, range, or partitioned execution; runtime sends no diagnostic canaries. | Caller-asserted keyset contract, strict monotonic identity, active bound validation, and terminal empty confirmation. |
 | `iter_list_cursor` | Each next request depends on a cursor from the previous response. | Sequential dependent cursor requests. | Strict unique monotonic cursor and empty terminal page. |
+| `iter_cursors` | One or many parent-bound cursor traversals need correlation and shared batching. | Lazy per-parent drivers share the reference batch queue; each binding may have `start_cursor`. | Isolated strict cursor progress and terminal event per binding. |
 | `iter_references` | The same list method must run for many parent parameter sets, such as comments per owner or messages per chat. | Bindings are scheduled with direct or physical-batch dispatch; each binding has its own traversal state. | Per-binding rows, completion/failure and caller correlation. |
 
 `page_size` is a local decoded-page cap. It is sent to Bitrix only when you provide the endpoint's
@@ -239,10 +240,20 @@ operation silently. `KeysetTraversal` inside reference traversal remains sequent
 terminal report now includes `keyset_execution` for omitted-execution keyset calls so consumers can
 see the requested and selected plan.
 
+Use `await client.verify_keyset_capability(...)` as a development/CI/staging guard on a stable
+representative fixture. It performs five strict-bound checks and returns only a `VERIFIED` report;
+unsupported and inconclusive verdicts raise `KeysetCapabilityError`. The ordinary
+`iter_list_keyset()` remains a separate caller-asserted operation with zero verifier canaries and
+may emit a partial prefix before a late endpoint contradiction is detected.
+
+Every list operation also accepts an immutable `PageAdapter` strategy. The adapter synchronously
+maps selected frozen items using sibling result metadata while preserving cardinality, order and
+configured identities. The identity adapter is the default and preserves existing JSON output.
+
 An advisory `total` may only raise an automatic cost estimate and never proves completion. Reports
 record the selected strategy and reason: unbounded auto continuation has the same
 `ordered_prefix_only` assurance as sequential traversal, while bounded plans additionally report
-`canary_verified_bounds`.
+`caller_asserted_bounds`. Runtime traversal does not perform verifier canaries.
 
 <!-- tested: tests/keyset_fast_test.py::test_omitted_execution_defaults_to_auto -->
 ```python

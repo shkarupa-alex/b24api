@@ -4,9 +4,10 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
-from b24api.contracts.json import _json_type_name
+from b24api.contracts.json import FrozenJson, FrozenMapping, _json_type_name
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.request import ResultSelector
 from b24api.contracts.response import ResultCollectionShape
@@ -31,7 +32,7 @@ class _TolerantMappingValuesResultSelector(_MappingValuesResultSelector):
     pass
 
 
-def _mapping_values(response: Response, selector: ResultSelector) -> list[JsonValue]:
+def _mapping_values(response: Response, selector: ResultSelector) -> tuple[FrozenJson, ...]:
     selected = _selected_value(response, selector)
 
     if (
@@ -39,8 +40,8 @@ def _mapping_values(response: Response, selector: ResultSelector) -> list[JsonVa
         and isinstance(selected, list | tuple)
         and not selected
     ):
-        return []
-    if not isinstance(selected, dict):
+        return ()
+    if not isinstance(selected, Mapping):
         raise ResultShapeError(
             selector=ResultSelector(selector.path),
             expected_shape=(
@@ -50,31 +51,32 @@ def _mapping_values(response: Response, selector: ResultSelector) -> list[JsonVa
             ),
             observed_type=_json_type_name(selected),
         )
-    return list(selected.values())
+    return tuple(selected.values())
 
 
-def _selected_value(response: Response, selector: ResultSelector) -> JsonValue:
+def _selected_value(response: Response, selector: ResultSelector) -> FrozenJson:
     """Resolve a declared selector or fail without exposing response values."""
-    selected: JsonValue = response.result
+    selected = response._frozen_result()  # noqa: SLF001 - validate the immutable transport snapshot
     for part in selector.path:
         if isinstance(part, str):
-            if not isinstance(selected, dict) or part not in selected:
+            if not isinstance(selected, Mapping) or part not in selected:
                 raise CapabilityError("response result does not satisfy the declared selector")
             selected = selected[part]
         else:
-            if not isinstance(selected, list) or part >= len(selected):
+            if not isinstance(selected, tuple) or part >= len(selected):
                 raise CapabilityError("response result does not satisfy the declared selector")
             selected = selected[part]
     return selected
 
 
-def _response_items(response: Response, selector: ResultSelector, *, single: bool = False) -> list[JsonValue]:
+def _response_items(response: Response, selector: ResultSelector, *, single: bool = False) -> tuple[FrozenJson, ...]:
     if isinstance(selector, _MappingValuesResultSelector):
         return _mapping_values(response, selector)
-    if single and selector.path == () and not isinstance(response.result, list):
-        return [response.result]
+    frozen_result = response._frozen_result()  # noqa: SLF001 - avoid whole-result thaw
+    if single and selector.path == () and not isinstance(frozen_result, tuple):
+        return (frozen_result,)
     selected = _selected_value(response, selector)
-    if not isinstance(selected, list):
+    if not isinstance(selected, tuple):
         raise ResultShapeError(
             selector=selector,
             expected_shape=ResultCollectionShape.SEQUENCE,
@@ -86,22 +88,31 @@ def _response_items(response: Response, selector: ResultSelector, *, single: boo
 def _mapping_shape_degraded(response: Response, selector: ResultSelector) -> bool:
     if not isinstance(selector, _TolerantMappingValuesResultSelector):
         return False
-    selected: JsonValue = response.result
+    selected = response._frozen_result()  # noqa: SLF001 - avoid a second whole-result thaw
     for part in selector.path:
         if isinstance(part, str):
-            if not isinstance(selected, dict) or part not in selected:
+            if not isinstance(selected, Mapping) or part not in selected:
                 return False
             selected = selected[part]
         else:
-            if not isinstance(selected, list) or part >= len(selected):
+            if not isinstance(selected, tuple) or part >= len(selected):
                 return False
             selected = selected[part]
     return isinstance(selected, list | tuple) and not selected
 
 
-def _page_fingerprint(items: Iterable[JsonValue]) -> str:
+def _plain_json(value: FrozenJson) -> JsonValue:
+    """Convert frozen rows for the legacy canonical JSON encoder."""
+    if isinstance(value, FrozenMapping):
+        return {key: _plain_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_plain_json(item) for item in value]
+    return value
+
+
+def _page_fingerprint(items: Iterable[FrozenJson]) -> str:
     canonical = json.dumps(
-        list(items),
+        [_plain_json(item) for item in items],
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -109,21 +120,21 @@ def _page_fingerprint(items: Iterable[JsonValue]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def _extract_path(value: JsonValue, path: tuple[str | int, ...]) -> JsonValue:
+def _extract_path(value: FrozenJson, path: tuple[str | int, ...]) -> FrozenJson:
     current = value
     for part in path:
         if isinstance(part, int):
-            if not isinstance(current, list) or part >= len(current):
+            if not isinstance(current, tuple) or part >= len(current):
                 raise PaginationError(f"identity path is missing: {path!r}")
             current = current[part]
         else:
-            if not isinstance(current, dict) or part not in current:
+            if not isinstance(current, Mapping) or part not in current:
                 raise PaginationError(f"identity path is missing: {path!r}")
             current = current[part]
     return current
 
 
-def _coerce_identity(value: JsonValue, coercion: IdentityCoercion) -> IdentityValue:
+def _coerce_identity(value: FrozenJson, coercion: IdentityCoercion) -> IdentityValue:
     if coercion is IdentityCoercion.EXACT_STRING:
         if not isinstance(value, str):
             raise PaginationError("identity must be an exact string")
@@ -140,7 +151,7 @@ def _coerce_identity(value: JsonValue, coercion: IdentityCoercion) -> IdentityVa
         raise PaginationError("identity is not a decimal integer") from error
 
 
-def _validate_order(values: list[IdentityValue], direction: str | None) -> None:
+def _validate_order(values: Sequence[IdentityValue], direction: str | None) -> None:
     for previous, current in itertools.pairwise(values):
         comparison = _compare_identities(current, previous)
         if direction == "asc" and comparison <= 0:
@@ -161,29 +172,29 @@ def _compare_identities(left: IdentityValue, right: IdentityValue) -> int:
     raise PaginationError("identity values are not mutually orderable")
 
 
-def _cursor_values(items: list[JsonValue], plan: ItemCursorPlan) -> list[IdentityValue]:
+def _cursor_values(items: Sequence[FrozenJson], plan: ItemCursorPlan) -> list[IdentityValue]:
     raw_values = [_extract_optional_path(item, plan.cursor_item_path) for item in items]
     exhausted = [value is _MISSING or value is None for value in raw_values]
     if any(exhausted):
         raise PaginationError(f"cursor path is missing: {plan.cursor_item_path!r}")
-    return [_coerce_cursor(cast("JsonValue", value), plan.cursor_coercion) for value in raw_values]
+    return [_coerce_cursor(cast("FrozenJson", value), plan.cursor_coercion) for value in raw_values]
 
 
-def _extract_optional_path(value: JsonValue, path: tuple[str | int, ...]) -> JsonValue | object:
+def _extract_optional_path(value: FrozenJson, path: tuple[str | int, ...]) -> FrozenJson | object:
     current = value
     for part in path:
         if isinstance(part, int):
-            if not isinstance(current, list) or part >= len(current):
+            if not isinstance(current, tuple) or part >= len(current):
                 return _MISSING
             current = current[part]
         else:
-            if not isinstance(current, dict) or part not in current:
+            if not isinstance(current, Mapping) or part not in current:
                 return _MISSING
             current = current[part]
     return current
 
 
-def _coerce_cursor(value: JsonValue, coercion: IdentityCoercion) -> IdentityValue:
+def _coerce_cursor(value: FrozenJson, coercion: IdentityCoercion) -> IdentityValue:
     try:
         return _coerce_identity(value, coercion)
     except PaginationError as error:

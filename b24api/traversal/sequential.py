@@ -22,7 +22,7 @@ from b24api.traversal.identity import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson, JsonValue
     from b24api.contracts.request import ParameterPath, Request
     from b24api.contracts.response import Response
     from b24api.traversal.plans import (
@@ -39,15 +39,16 @@ class _SequentialMixin:
     async def _single(self: Any, plan: SingleResponsePlan) -> AsyncGenerator[_Page]:
         response = await self._fetch(self.request)
         trace_count = self.page_trace_count
-        items: list[JsonValue] = []
+        items: tuple[FrozenJson, ...] = ()
         try:
+            frozen_result = response._frozen_result()  # noqa: SLF001 - whole-result fan-out stays immutable internally
             qualified_count = (
-                len(response.result)
-                if self._single_result_as_item and self.selector.path == () and isinstance(response.result, list)
+                len(frozen_result)
+                if self._single_result_as_item and self.selector.path == () and isinstance(frozen_result, tuple)
                 else None
             )
             items = (
-                [response.result]
+                (frozen_result,)
                 if self._single_result_as_item and self.selector.path == ()
                 else self.select_page(response, single=True)
             )
@@ -91,7 +92,7 @@ class _SequentialMixin:
                 ),
             )
             trace_count = self.page_trace_count
-            items: list[JsonValue] = []
+            items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
                 terminal = _offset_terminal(
@@ -141,7 +142,7 @@ class _SequentialMixin:
                 ),
             )
             trace_count = self.page_trace_count
-            items: list[JsonValue] = []
+            items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
                 prospective_rows = self.validated_rows + len(items)

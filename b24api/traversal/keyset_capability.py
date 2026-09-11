@@ -33,7 +33,7 @@ from b24api.traversal.keyset_range import range_window_width
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson
     from b24api.contracts.request import Request
     from b24api.contracts.traversal import KeysetSpec
     from b24api.traversal.page_validation import LaneCommandPlan, LaneReceipt
@@ -104,7 +104,7 @@ class AnchorResult:
     """Return normalized anchor evidence without mutating scheduler state."""
 
     anchors: tuple[int, ...]
-    rows: dict[int, JsonValue]
+    rows: dict[int, FrozenJson]
     commands: dict[int, str]
     empty_probes: int
     raw_rows: int
@@ -252,7 +252,7 @@ def normalize_anchor_receipts(
 ) -> AnchorResult:
     """Normalize probe receipts into retained anchor values and provenance."""
     anchors: list[int] = []
-    rows: dict[int, JsonValue] = {}
+    rows: dict[int, FrozenJson] = {}
     commands: dict[int, str] = {}
     empty = discarded = 0
     for receipt in receipts:

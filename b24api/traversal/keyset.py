@@ -14,7 +14,7 @@ from b24api.traversal.keyset_step import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson, JsonValue
     from b24api.traversal.plans import (
         KeysetPlan,
     )
@@ -38,7 +38,7 @@ class _KeysetMixin:
                 ),
             )
             trace_count = self.page_trace_count
-            items: list[JsonValue] = []
+            items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
                 candidate_identities = self._extract_identities(items)

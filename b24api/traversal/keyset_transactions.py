@@ -91,7 +91,7 @@ def build_anchor_plans(
     )
 
 
-async def execute_wave(
+async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation transaction
     scheduler: KeysetFastScheduler,
     plans: tuple[LaneCommandPlan, ...],
 ) -> tuple[LaneReceipt, ...]:
@@ -126,6 +126,7 @@ async def execute_wave(
         for phase in phases & planning:
             scheduler.transactions.planning_requests[phase] += 1
         receipts: list[LaneReceipt] = []
+        rejections: list[ReceiptRejection] = []
         failed, selected_rows = False, 0
         for index, (plan, outcome, reservation) in enumerate(zip(plans, outcomes, reservations, strict=True)):
             commit = (
@@ -148,9 +149,11 @@ async def execute_wave(
                 effective_page_cap=plan.reserved_rows if plan.expects_single_row else scheduler.effective_page_cap,
                 completion=scheduler.completion,
                 selector=scheduler.selector,
+                page_adapter=scheduler.page_adapter,
             )
             selected_rows += receipt.selected_rows if isinstance(receipt, ReceiptRejection) else len(receipt.rows)
             if isinstance(receipt, ReceiptRejection):
+                rejections.append(receipt)
                 failed = True
                 scheduler.violations.append(receipt.violation)
                 page_outcome, rejection_code = classify_rejection(outcome)
@@ -178,6 +181,12 @@ async def execute_wave(
                         rejection=PageRejectionCode.TRANSACTION_ABORTED,
                     )
             scheduler.admission.record_raw(selected_rows, discarded=True)
+            cause = next(
+                (receipt.error for receipt in rejections if receipt.error is not None),
+                None,
+            )
+            if cause is not None:
+                raise cause
             raise PaginationError("fast keyset wave validation failed")
         stage_semantics = bool(phases & {KeysetPhase.BOUNDARY, KeysetPhase.CANARY})
         for index, (plan, receipt) in enumerate(zip(plans, receipts, strict=True)):
@@ -323,6 +332,7 @@ async def execute_finish_page(
             effective_page_cap=scheduler.effective_page_cap,
             completion=KeysetPageCompletion.EMPTY_CONFIRMATION,
             selector=scheduler.selector,
+            page_adapter=scheduler.page_adapter,
         )
         if isinstance(receipt, ReceiptRejection):
             scheduler.violations.append(receipt.violation)
@@ -337,6 +347,8 @@ async def execute_finish_page(
                 violation=receipt.violation,
                 dispatch=PageDispatch.DIRECT,
             )
+            if receipt.error is not None:
+                raise receipt.error
             raise PaginationError(receipt.detail)
         terminal = keyset_step.keyset_page_terminal(finish_plan, len(receipt.rows))
         await scheduler.adjust_buffer(-scheduler.effective_page_cap + len(receipt.rows))

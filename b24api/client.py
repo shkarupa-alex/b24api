@@ -12,6 +12,7 @@ from b24api._audit import audit_command_source
 from b24api._client_traversal import _TraversalFacade
 from b24api.batch.facade import batch_outcome_stream, batch_stream
 from b24api.contracts.dispatch import BatchDispatch, DirectDispatch, DispatchSpec
+from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import ExecutionPolicy, UnknownRequestAudit
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.request import (
@@ -20,12 +21,16 @@ from b24api.contracts.request import (
     RequestLike,
     canonical_request,
 )
+from b24api.contracts.response import ResultCollectionShape
+from b24api.contracts.traversal import KeysetSpec
 from b24api.execution import Executor, HttpxTransport, Transport, await_cleanup_resistant, rearm_cancellation
 from b24api.execution.cleanup import CloseableResource, close_owned_resources
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
 from b24api.references.fanout import fanout_stream
 from b24api.settings import Settings, api_settings
+from b24api.traversal.facade import _collection_selector
+from b24api.traversal.keyset_verifier import verify_keyset_capability as _verify_keyset_capability
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterable, Iterable
@@ -33,14 +38,18 @@ if TYPE_CHECKING:
 
     from b24api.contracts.command import Command, CommandOutcome, CommandSuccess
     from b24api.contracts.json import JsonValue
+    from b24api.contracts.keyset_capability import KeysetCapabilityReport
     from b24api.contracts.reference import ReferenceEvent, ReferenceOutcome
+    from b24api.contracts.request import IdentitySpec, ResultSelector
     from b24api.contracts.response import BinaryResponse, Response
     from b24api.contracts.stream import OperationStream
-    from b24api.contracts.traversal import TraversalSpec
+    from b24api.contracts.traversal import CursorSpec, TraversalSpec
     from b24api.references.binding import BindingSource
 
 _DEFAULT_REFERENCE_DISPATCH = BatchDispatch()
 _DEFAULT_FANOUT_DISPATCH = DirectDispatch()
+_IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
+_DEFAULT_KEYSET = KeysetSpec()
 
 
 def _normalized_host(host: str) -> str:
@@ -169,6 +178,33 @@ class Bitrix24(_TraversalFacade):
         self._audit_unknown(canonical)
         return await self._executor.execute_bytes(canonical, policy=policy or self._default_policy)
 
+    async def verify_keyset_capability(  # noqa: PLR0913
+        self,
+        request: RequestLike,
+        *,
+        selector: ResultSelector,
+        identity: IdentitySpec,
+        collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
+        page_size: int = 50,
+        keyset: KeysetSpec = _DEFAULT_KEYSET,
+        policy: ExecutionPolicy | None = None,
+    ) -> KeysetCapabilityReport:
+        """Verify strict keyset bounds for this exact portal and request shape."""
+        self._require_open()
+        canonical = canonical_request(request)
+        self._audit_unknown(canonical)
+        self._executor._preflight_request(canonical)
+        return await _verify_keyset_capability(
+            self._executor,
+            canonical,
+            selector=selector,
+            identity=identity,
+            collection_shape=collection_shape,
+            page_size=page_size,
+            keyset=keyset,
+            policy=policy or self._default_policy,
+        )
+
     def batch[C](
         self,
         commands: Iterable[Command[C]] | AsyncIterable[Command[C]],
@@ -269,6 +305,37 @@ class Bitrix24(_TraversalFacade):
             deregister=self._discard_stream,
         )
         return cast("OperationStream[ReferenceEvent[C]]", self._register_stream(stream))
+
+    def iter_cursors[C](  # noqa: PLR0913
+        self,
+        request: RequestLike,
+        bindings: BindingSource[C],
+        *,
+        selector: ResultSelector,
+        cursor: CursorSpec,
+        identity: IdentitySpec | None = None,
+        collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
+        page_size: int = 50,
+        page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+        dispatch: DispatchSpec = _DEFAULT_REFERENCE_DISPATCH,
+        policy: ExecutionPolicy | None = None,
+    ) -> OperationStream[ReferenceEvent[C]]:
+        """Traverse one or many independently seeded cursor bindings fail-fast."""
+        from b24api.contracts.traversal import CursorTraversal  # noqa: PLC0415 - facade composition only
+
+        return self.iter_references(
+            request,
+            bindings,
+            traversal=CursorTraversal(
+                selector=_collection_selector(selector, collection_shape),
+                cursor=cursor,
+                identity=identity,
+                page_size=page_size,
+                page_adapter=page_adapter,
+            ),
+            dispatch=dispatch,
+            policy=policy,
+        )
 
     def iter_reference_outcomes[C](
         self,

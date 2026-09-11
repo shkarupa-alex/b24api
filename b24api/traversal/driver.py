@@ -5,11 +5,13 @@ import contextlib
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
-from b24api.contracts.json import _json_type_name
+from b24api.contracts.json import FrozenJson, _json_type_name
+from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import (
     ConfirmationPolicy,
     DuplicatePolicy,
     ExecutionPolicy,
+    IdentityCoercion,
     IdentityRequirement,
     TotalSemantics,
 )
@@ -58,6 +60,7 @@ from b24api.traversal.identity import (
     _validate_confirmation_policy,
 )
 from b24api.traversal.keyset import _KeysetMixin
+from b24api.traversal.page_adaptation import adapt_page
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     ItemCursorPlan,
@@ -90,6 +93,8 @@ if TYPE_CHECKING:
     )
     from b24api.execution.snapshot import KernelReport
 
+_IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
+
 
 class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _CursorMixin):
     """One operation-local state machine over an explicit immutable plan."""
@@ -106,6 +111,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         fetch: PageFetch | None = None,
         single_result_as_item: bool = False,
         page_cap_hint: int | None = None,
+        page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+        initial_cursor: IdentityValue | None = None,
     ) -> None:
         """Initialize instance state."""
         self.executor = executor
@@ -121,8 +128,10 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         ):
             raise ValueError("page cap hint must be a positive integer")
         self._page_cap_hint = page_cap_hint
+        self.page_adapter = page_adapter
         self.terminal_reason: str | None = None
-        self.cursor_state: JsonValue = None
+        self.initial_cursor = initial_cursor
+        self.cursor_state: JsonValue = cast("JsonValue", initial_cursor)
         self.violations: list[Violation] = []
         self.validated_rows = 0
         self._fingerprints: set[str] = set()
@@ -182,16 +191,23 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._validate_capabilities()
         self._identity_store = _identity_store(self.context.policy, self.plan, self.identity)
 
-    def validate_external_page(self, items: list[JsonValue], response: Response, *, terminal: bool = False) -> None:
+    def validate_external_page(
+        self,
+        items: tuple[FrozenJson, ...],
+        response: Response,
+        *,
+        terminal: bool = False,
+    ) -> None:
         """Validate one externally dispatched page with the canonical traversal state machine."""
         if self._identity_store is None:
             raise RuntimeError("page validation is not active")
         self._validate_page(items, response=response, terminal=terminal)
 
-    def select_page(self, response: Response, *, single: bool = False) -> list[JsonValue]:
+    def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:
         """Select one scheduled page and retain value-free evidence on shape rejection."""
         try:
-            return _response_items(response, self.selector, single=single)
+            source = _response_items(response, self.selector, single=single)
+            return self._adapt_page(response, source)
         except ResultShapeError as error:
             enriched = ResultShapeError(
                 selector=error.selector,
@@ -200,15 +216,38 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                 request_summary=self.request.summary,
                 page_offset=self._page_offset,
             )
-            self._record_rejected_page([], response, enriched)
+            self._record_rejected_page((), response, enriched)
             raise enriched from error
         except BaseException as error:
-            self._record_rejected_page([], response, error)
+            self._record_rejected_page((), response, error)
             raise
 
-    def reject_external_page(self, items: list[JsonValue], response: Response, error: BaseException) -> None:
+    def reject_external_page(self, items: tuple[FrozenJson, ...], response: Response, error: BaseException) -> None:
         """Record a pre-commit external range or capability rejection exactly once."""
         self._record_rejected_page(items, response, error)
+
+    def _adapt_page(self, response: Response, source: tuple[FrozenJson, ...]) -> tuple[FrozenJson, ...]:
+        """Apply one page strategy and enforce its value-free structural contract."""
+        return adapt_page(
+            response,
+            source,
+            adapter=self.page_adapter,
+            identities=self._adaptation_specs(),
+            request_summary=self.request.summary,
+            page_offset=self.page_trace_count,
+        )
+
+    def _adaptation_specs(self) -> tuple[tuple[tuple[str | int, ...], IdentityCoercion], ...]:
+        specs: list[tuple[tuple[str | int, ...], IdentityCoercion]] = []
+        if isinstance(self.identity, CompositeIdentitySpec):
+            specs.extend((component.item_path, component.coercion) for component in self.identity.components)
+        elif isinstance(self.identity, IdentitySpec):
+            specs.append((self.identity.item_path, self.identity.coercion))
+        if isinstance(self.plan, ItemCursorPlan):
+            cursor_spec = (self.plan.cursor_item_path, self.plan.cursor_coercion)
+            if cursor_spec not in specs:
+                specs.append(cursor_spec)
+        return tuple(specs)
 
     def close_external_validation(self) -> None:
         """Release the canonical identity store retained by external page validation."""
@@ -341,13 +380,19 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             first[self.plan.limit_path] = self.plan.requested_page_size
             second[self.plan.limit_path] = self.plan.requested_page_size
         if first:
-            replace = frozenset({self.plan.offset_path}) if isinstance(self.plan, OffsetSequentialPlan) else frozenset()
+            replace = (
+                frozenset({self.plan.offset_path})
+                if isinstance(self.plan, OffsetSequentialPlan)
+                else frozenset({self.plan.cursor_request_path})
+                if isinstance(self.plan, ItemCursorPlan) and self.initial_cursor is not None
+                else frozenset()
+            )
             _request_with_controls(self.request, first, allow_create=allow_create, replace=replace)
             _request_with_controls(self.request, second, allow_create=allow_create, replace=replace)
 
     def _validate_page(
         self,
-        items: list[JsonValue],
+        items: tuple[FrozenJson, ...],
         *,
         response: Response,
         qualified_count: int | None = None,
@@ -391,7 +436,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
 
     def _validate_page_impl(  # noqa: C901, PLR0912, PLR0915
         self,
-        items: list[JsonValue],
+        items: tuple[FrozenJson, ...],
         *,
         response: Response,
         qualified_count: int | None = None,
@@ -474,7 +519,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._record_committed_page(items, response)
         return identities
 
-    def _record_committed_page(self, items: list[JsonValue], response: Response) -> None:
+    def _record_committed_page(self, items: tuple[FrozenJson, ...], response: Response) -> None:
         self._append_page_record(
             PageRecord(
                 sequence=0,
@@ -538,7 +583,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
 
     def _record_rejected_page(
         self,
-        items: list[JsonValue],
+        items: tuple[FrozenJson, ...],
         response: Response,
         error: BaseException,
     ) -> None:
@@ -565,7 +610,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             ),
         )
 
-    def _extract_identities(self, items: list[JsonValue]) -> list[IdentityValue]:
+    def _extract_identities(self, items: tuple[FrozenJson, ...]) -> list[IdentityValue]:
         if self.identity is None:
             return []
         composite = isinstance(self.identity, CompositeIdentitySpec)

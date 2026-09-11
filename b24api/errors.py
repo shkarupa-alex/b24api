@@ -1,9 +1,11 @@
 """Redacted Bitrix24 error hierarchy."""
 
 from __future__ import annotations
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from b24api._error_types import ErrorOrigin, FailurePhase
+from b24api.contracts.keyset_capability import KeysetCapabilityReport, KeysetCapabilityVerdict, KeysetInconclusiveReason
 from b24api.contracts.policy import AmbiguityReason, IdentityCoercion
 from b24api.contracts.response import ResponseEvidence, ResultCollectionShape
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
@@ -302,6 +304,114 @@ class ResultShapeError(CapabilityError):
         return safe
 
 
+class PageAdaptationViolation(StrEnum):
+    """Closed reasons a page adapter can violate its public contract."""
+
+    NOT_ADAPTED_PAGE = "not_adapted_page"
+    CARDINALITY_CHANGED = "cardinality_changed"
+    ORDER_OR_IDENTITY_CHANGED = "order_or_identity_changed"
+    NON_JSON_VALUE = "non_json_value"
+    ADAPTER_RAISED = "adapter_raised"
+
+
+class PageAdaptationError(CapabilityError):
+    """A page adapter violated the immutable adaptation contract."""
+
+    def __init__(  # noqa: PLR0913
+        self,
+        *,
+        violation: PageAdaptationViolation,
+        adapter: str,
+        row_offset: int | None = None,
+        page_offset: int | None = None,
+        request_summary: RequestSummary | None = None,
+        redactor: Redactor = DEFAULT_REDACTOR,
+    ) -> None:
+        """Build value-free adapter failure diagnostics."""
+        if not isinstance(violation, PageAdaptationViolation):
+            raise TypeError("violation must be a PageAdaptationViolation")
+        self.violation = violation
+        self.adapter = redactor.redact_text(adapter)
+        self.row_offset = row_offset
+        self.page_offset = page_offset
+        messages = {
+            PageAdaptationViolation.NOT_ADAPTED_PAGE: "page adapter did not return AdaptedPage",
+            PageAdaptationViolation.CARDINALITY_CHANGED: "page adapter changed row cardinality",
+            PageAdaptationViolation.ORDER_OR_IDENTITY_CHANGED: "page adapter changed row order or identity",
+            PageAdaptationViolation.NON_JSON_VALUE: "page adapter returned a non-JSON value",
+            PageAdaptationViolation.ADAPTER_RAISED: "page adapter raised an exception",
+        }
+        message = f"{messages[violation]} ({self.adapter})"
+        if row_offset is not None:
+            message += f" (row {row_offset})"
+        if page_offset is not None:
+            message += f" (page {page_offset})"
+        super().__init__(message, request_summary=request_summary, retryable=False, redactor=redactor)
+
+    def to_safe_dict(self) -> dict[str, object]:
+        """Return structured value-free adaptation evidence."""
+        safe = super().to_safe_dict()
+        safe.update(
+            {
+                "violation": self.violation.value,
+                "adapter": self.adapter,
+                "row_offset": self.row_offset,
+                "page_offset": self.page_offset,
+            },
+        )
+        return safe
+
+
+class KeysetCapabilityError(CapabilityError):
+    """A keyset capability verdict that is not verified, with its full report."""
+
+    def __init__(self, *, report: KeysetCapabilityReport, redactor: Redactor = DEFAULT_REDACTOR) -> None:
+        """Retain the one canonical verifier report."""
+        if not isinstance(report, KeysetCapabilityReport):
+            raise TypeError("report must be a KeysetCapabilityReport")
+        if report.verdict is KeysetCapabilityVerdict.VERIFIED:
+            raise ValueError("verified capability reports are returned, not raised")
+        self.report = report
+        message = (
+            "keyset capability is unsupported"
+            if report.verdict is KeysetCapabilityVerdict.UNSUPPORTED
+            else "keyset capability verdict is inconclusive"
+        )
+        if report.inconclusive_reason is not None:
+            message += f" ({report.inconclusive_reason.value})"
+        super().__init__(message, retryable=False, redactor=redactor)
+
+    @property
+    def verdict(self) -> KeysetCapabilityVerdict:
+        """Return the report verdict."""
+        return self.report.verdict
+
+    @property
+    def inconclusive_reason(self) -> KeysetInconclusiveReason | None:
+        """Return the report's actionable inconclusive reason."""
+        return self.report.inconclusive_reason
+
+    def to_safe_dict(self) -> dict[str, object]:
+        """Serialize counters and outcomes without identity evidence."""
+        safe = super().to_safe_dict()
+        safe.update(
+            {
+                "verdict": self.verdict.value,
+                "inconclusive_reason": (
+                    self.inconclusive_reason.value if self.inconclusive_reason is not None else None
+                ),
+                "logical_commands": self.report.logical_commands,
+                "batch_waves": self.report.batch_waves,
+                "physical_requests": self.report.physical_requests,
+                "cross_digit_pair_exercised": self.report.cross_digit_pair_exercised,
+                "checks": [
+                    {"name": check.name.value, "outcome": check.outcome.value} for check in self.report.checks
+                ],
+            },
+        )
+        return safe
+
+
 class BudgetExceededError(B24ApiError):
     """Execution would exceed an explicit operational budget."""
 
@@ -394,6 +504,6 @@ _PUBLIC_ERROR_NAMES = (
     "AmbiguousExecutionError ApiResponseError B24ApiError BatchCommandError BatchFailed BudgetExceededError "
     "CapabilityError EnvelopeContractError ErrorOrigin FailurePhase HTTPGatewayError IdentityContractError "
     "IncompleteTraversalError InputSourceError PaginationError ProtocolError ReferenceFailed ResponseTooLargeError "
-    "ResultShapeError TransportError"
+    "KeysetCapabilityError PageAdaptationError PageAdaptationViolation ResultShapeError TransportError"
 )
 __all__ = tuple(_PUBLIC_ERROR_NAMES.split())

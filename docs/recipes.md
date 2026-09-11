@@ -77,6 +77,52 @@ stream = client.iter_list_keyset(
 )
 ```
 
+Run the explicit development guard before relying on strict bounds:
+
+```python
+from b24api import ResultSelector
+
+report = await client.verify_keyset_capability(
+    request,
+    selector=ResultSelector.root(),
+    identity=identity,
+    keyset=keyset,
+)
+```
+
+The guard returns only `VERIFIED`; unsupported and inconclusive observations raise
+`KeysetCapabilityError` with the complete immutable report. Normal traversal sends no canaries and
+does not remember that the guard ran.
+
+## Correlated cursor traversal
+
+Use one lazy binding source for one or many parents. Each binding may resume from an independent
+strict cursor and keeps its caller-owned correlation off wire:
+
+```python
+from b24api import BatchDispatch, Binding, ParameterPath, ParameterUpdate, ResultSelector
+
+bindings = (
+    Binding(
+        summary=f"parent {parent_id}",
+        updates=(ParameterUpdate(ParameterPath(("PARENT_ID",)), parent_id),),
+        correlation=parent_id,
+        start_cursor=checkpoints.get(parent_id),
+    )
+    for parent_id in parent_ids
+)
+
+stream = client.iter_cursors(
+    request,
+    bindings,
+    selector=ResultSelector(("items",)),
+    cursor=cursor,
+    dispatch=BatchDispatch(coalesce_wait=0.020),
+)
+```
+
+Use `coalesce_wait=0` when per-wave latency matters more than physical batch density.
+
 ## Mapping-backed collections
 
 Use strict mapping values when the selected collection is always an ID-keyed object:

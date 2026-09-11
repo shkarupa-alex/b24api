@@ -11,7 +11,16 @@ from b24api.contracts.command import (
     partition_command_outcomes,
 )
 from b24api.contracts.dispatch import BatchDispatch, DeliveryOrder, DirectDispatch, DispatchSpec
-from b24api.contracts.json import JsonScalar, JsonValue
+from b24api.contracts.json import FrozenJson, FrozenMapping, JsonScalar, JsonValue
+from b24api.contracts.keyset_capability import (
+    KeysetCapabilityCheckName,
+    KeysetCapabilityCheckOutcome,
+    KeysetCapabilityCheckResult,
+    KeysetCapabilityReport,
+    KeysetCapabilityVerdict,
+    KeysetInconclusiveReason,
+    MembershipRecheck,
+)
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     ClosureWitness,
@@ -28,6 +37,7 @@ from b24api.contracts.keyset_execution import (
     TotalHintMode,
     TraceClass,
 )
+from b24api.contracts.page import AdaptedPage, IdentityPageAdapter, PageAdapter, PageView
 from b24api.contracts.policy import (
     AmbiguityPolicy,
     AmbiguityReason,
@@ -96,6 +106,7 @@ from b24api.contracts.traversal import (
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 
 __all__ = [
+    "AdaptedPage",
     "AmbiguityPolicy",
     "AmbiguityReason",
     "AutoKeysetExecution",
@@ -120,29 +131,41 @@ __all__ = [
     "DirectDispatch",
     "DispatchSpec",
     "ExecutionPolicy",
+    "FrozenJson",
+    "FrozenMapping",
     "IdentityCoercion",
     "IdentityComponent",
+    "IdentityPageAdapter",
     "IdentitySpec",
     "JsonScalar",
     "JsonValue",
     "KeysetAssuranceSource",
+    "KeysetCapabilityCheckName",
+    "KeysetCapabilityCheckOutcome",
+    "KeysetCapabilityCheckResult",
+    "KeysetCapabilityReport",
+    "KeysetCapabilityVerdict",
     "KeysetExecution",
     "KeysetExecutionKind",
     "KeysetExecutionReport",
+    "KeysetInconclusiveReason",
     "KeysetPageCompletion",
     "KeysetPhase",
     "KeysetSelectionReason",
     "KeysetSpec",
     "KeysetTraversal",
+    "MembershipRecheck",
     "NotExecutedReason",
     "OffsetContinuation",
     "OffsetSpec",
     "OperationReport",
     "OperationStream",
+    "PageAdapter",
     "PageDispatch",
     "PageOutcome",
     "PageRecord",
     "PageRejectionCode",
+    "PageView",
     "ParameterPath",
     "ParameterUpdate",
     "PartialResult",

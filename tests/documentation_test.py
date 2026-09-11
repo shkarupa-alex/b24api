@@ -3,8 +3,12 @@
 from __future__ import annotations
 import ast
 import re
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Self, cast
+
+import pytest
 
 import b24api
 
@@ -59,19 +63,59 @@ def test_architecture_document_names_the_complete_public_capability_family() -> 
         assert operation in text
 
 
-def test_migration_python_examples_execute_without_io() -> None:
+class _EmptyStream(AsyncIterator[object]):
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> object:
+        raise StopAsyncIteration
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+
+class _MigrationClient:
+    def iter_list_keyset(self, *_args: object, **kwargs: object) -> dict[str, object]:
+        return kwargs
+
+    def iter_cursors(self, *_args: object, **_kwargs: object) -> _EmptyStream:
+        return _EmptyStream()
+
+    async def verify_keyset_capability(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(verdict="verified")
+
+
+@pytest.mark.asyncio
+async def test_migration_python_examples_execute_without_io() -> None:
     blocks = PYTHON_BLOCK.findall(MIGRATION.read_text(encoding="utf-8"))
     assert blocks
     for source in blocks:
+        client = _MigrationClient()
         namespace: dict[str, object] = {
-            "client": SimpleNamespace(iter_list_keyset=lambda *_args, **kwargs: kwargs),
+            "AdaptedPage": b24api.AdaptedPage,
+            "Binding": b24api.Binding,
+            "PageView": b24api.PageView,
+            "ParameterPath": b24api.ParameterPath,
+            "ParameterUpdate": b24api.ParameterUpdate,
+            "ResultSelector": b24api.ResultSelector,
+            "api": client,
+            "bindings": (),
+            "checkpoints": {42: 7300},
+            "client": client,
+            "consume": lambda *_args: None,
+            "cursor": object(),
             "identity": object(),
             "keyset": object(),
             "request": object(),
             "selector": object(),
         }
         code = compile(source, str(MIGRATION), "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-        exec(code, namespace)  # noqa: S102 - exact trusted repository documentation source
-        stream = namespace["stream"]
-        assert isinstance(stream, dict)
-        assert isinstance(stream["execution"], b24api.SequentialKeysetExecution)
+        result = eval(code, namespace)  # noqa: S307 - exact trusted repository documentation source
+        if result is not None:
+            await cast("object", result)
+        stream = namespace.get("stream")
+        if isinstance(stream, dict) and "execution" in stream:
+            assert isinstance(stream["execution"], b24api.SequentialKeysetExecution)

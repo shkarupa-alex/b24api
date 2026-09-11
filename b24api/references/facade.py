@@ -55,9 +55,7 @@ from b24api.references.dispatch import (
 )
 from b24api.references.outcome import ReferenceFailure as KernelFailure
 from b24api.references.outcome import ReferenceItem as KernelItem
-from b24api.references.stream import (
-    iter_references as _iter_references,
-)
+from b24api.references.stream import iter_references as _iter_references
 from b24api.traversal.driver import PaginationDriver
 from b24api.traversal.plans import BatchDispatch as KernelBatchDispatch
 from b24api.traversal.plans import (
@@ -220,6 +218,7 @@ def _kernel_dispatch(dispatch: DispatchSpec, policy: ExecutionPolicy) -> Dispatc
         batch_size=min(dispatch.batch_size, policy.max_buffered_commands),
         concurrency=min(dispatch.concurrency, policy.max_active_references),
         output_order=_output_order(dispatch.output_order),
+        coalesce_wait=dispatch.coalesce_wait,
     )
 
 
@@ -323,6 +322,7 @@ def kernel_reference_stream[C](
         selector=selector,
         identity=identity,
         context=executor.context(policy),
+        page_adapter=traversal.page_adapter,
     )
     preflight._validate_capabilities()  # noqa: SLF001 - reject base controls before consuming caller input
     executor._preflight_request(base)  # noqa: SLF001 - reject transport representation before caller input
@@ -340,6 +340,7 @@ def kernel_reference_stream[C](
         _emit_complete=True,
         _capture_fail_fast=not tolerant,
         _page_cap_hint=traversal.page_size,
+        _page_adapter=traversal.page_adapter,
     )
     return cast("ReferenceKernelStream", stream)
 

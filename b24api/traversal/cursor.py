@@ -22,7 +22,7 @@ from b24api.traversal.values import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson, JsonValue
     from b24api.contracts.request import ParameterPath
     from b24api.traversal.plans import (
         ItemCursorPlan,
@@ -32,13 +32,15 @@ if TYPE_CHECKING:
 class _CursorMixin:
     terminal_reason: str | None
     cursor_state: JsonValue
+    initial_cursor: IdentityValue | None
 
     async def _cursor(self: Any, plan: ItemCursorPlan) -> AsyncGenerator[_Page]:  # noqa: C901, PLR0912
         self._require_identity("item cursor")
-        cursor: IdentityValue | None = None
+        cursor = self.initial_cursor
+        first_page = True
         while True:
             updates: dict[ParameterPath, object] = {}
-            if cursor is not None:
+            if not first_page and cursor is not None:
                 updates[plan.cursor_request_path] = cursor
             if plan.limit_path is not None and plan.requested_page_size is not None:
                 updates[plan.limit_path] = plan.requested_page_size
@@ -49,11 +51,13 @@ class _CursorMixin:
                     self.request,
                     updates,
                     allow_create=plan.allow_create_controls,
+                    replace=frozenset({plan.cursor_request_path}),
                 )
             )
             response = await self._fetch(request)
+            first_page = False
             trace_count = self.page_trace_count
-            items: list[JsonValue] = []
+            items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
                 cursor_values = _cursor_values(items, plan)

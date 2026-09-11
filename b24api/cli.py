@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, NoReturn, TextIO
 from b24api import (
     B24ApiError,
     Bitrix24,
+    KeysetCapabilityError,
     ReplaySafety,
     Request,
     Response,
@@ -20,10 +21,12 @@ from b24api import (
 from b24api.cli_contract import (
     CliUsageError,
     ListContractRoute,
+    VerifyKeysetContractRoute,
     cli_request,
     default_contract,
     list_stream,
     parse_list_contract,
+    parse_verify_keyset_contract,
     read_json_source,
 )
 
@@ -37,6 +40,8 @@ _USAGE = 2
 _UNAVAILABLE = 3
 _CORRECTNESS = 4
 _OUTPUT_CLOSED = 5
+_KEYSET_UNSUPPORTED = 6
+_KEYSET_INCONCLUSIVE = 7
 _INTERRUPTED = 130
 
 
@@ -119,6 +124,10 @@ def _parser() -> argparse.ArgumentParser:
         help="traversal mechanics (default: sequential)",
     )
     listing.add_argument("--contract", help="closed v1 traversal contract as @file or -")
+    verify = subparsers.add_parser("verify-keyset", help="verify strict keyset bounds for one portal method")
+    verify.add_argument("method", help="Bitrix24 REST method name")
+    verify.add_argument("--params", help="JSON object, @file, or - for stdin")
+    verify.add_argument("--contract", required=True, help="closed v1 verifier contract as @file")
     return parser
 
 
@@ -168,7 +177,20 @@ async def _list(
         raise RuntimeError("list traversal did not complete successfully")
 
 
-def main(  # noqa: PLR0911 - stable process-code boundary
+async def _verify_keyset(request: Request, route: VerifyKeysetContractRoute, stdout: TextIO) -> None:
+    async with Bitrix24() as client:
+        report = await client.verify_keyset_capability(
+            request,
+            selector=route.selector,
+            identity=route.identity,
+            collection_shape=route.collection_shape,
+            page_size=route.page_size,
+            keyset=route.keyset,
+        )
+    _write_json(stdout, report.to_dict())
+
+
+def main(  # noqa: C901, PLR0911 - stable process-code boundary
     argv: Sequence[str] | None = None,
     *,
     stdin: TextIO | None = None,
@@ -185,11 +207,16 @@ def main(  # noqa: PLR0911 - stable process-code boundary
         if args.command == "call":
             request = cli_request(args.method, params, ReplaySafety(args.replay_safety))
             asyncio.run(_call(args, request, output_stream))
-        else:
+        elif args.command == "list":
             contract = default_contract(args.strategy, args.contract, input_stream)
             route = parse_list_contract(args.strategy, contract)
             request = cli_request(args.method, params, ReplaySafety.UNKNOWN)
             asyncio.run(_list(request, route, output_stream, error_stream))
+        else:
+            contract = default_contract("verify-keyset", args.contract, input_stream)
+            verify_route = parse_verify_keyset_contract(contract)
+            request = cli_request(args.method, params, ReplaySafety.UNKNOWN)
+            asyncio.run(_verify_keyset(request, verify_route, output_stream))
     except KeyboardInterrupt:
         return _INTERRUPTED
     except SystemExit as error:
@@ -199,6 +226,9 @@ def main(  # noqa: PLR0911 - stable process-code boundary
         return _USAGE
     except BrokenPipeError:
         return _OUTPUT_CLOSED
+    except KeysetCapabilityError as error:
+        _write_json(output_stream, error.report.to_dict())
+        return _KEYSET_UNSUPPORTED if error.verdict.value == "unsupported" else _KEYSET_INCONCLUSIVE
     except B24ApiError as error:
         _write_json(error_stream, _safe_error(error))
         return _CORRECTNESS
