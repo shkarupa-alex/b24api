@@ -127,7 +127,7 @@ more specialized mechanics have explicit names and explicit preconditions.
 
 | Operation | Use it when | Network mechanics | Completion proof |
 |---|---|---|---|
-| `iter_list` | The method supports ordinary offset pagination. | Pages are requested sequentially using server `next`; no separate count request is made. | Continuation and empty terminal page; add identity for duplicate detection. |
+| `iter_list` | The method supports ordinary offset pagination. | Sequential requests follow server `next` (the next offset). Ordinary counted Bitrix list endpoints do server-side COUNT for `total` plus LIMIT/OFFSET page retrieval. | Continuation and empty terminal page; add identity for duplicate detection. |
 | `iter_list_counted` | The first response provides an exact filtered `total` and stable offset pages. | Head page is direct; all known tail offsets are grouped into physical Bitrix batches. | Exact total, ranges and identities. |
 | `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique integer identity. | Auto by default: it plans first, then selects boundary-only, sequential, range, or partitioned execution. | Caller-asserted keyset contract, strict monotonic identity, bounded-plan canaries, and terminal empty confirmation. |
 | `iter_list_cursor` | Each next request depends on a cursor from the previous response. | Sequential dependent cursor requests. | Strict unique monotonic cursor and empty terminal page. |
@@ -136,11 +136,20 @@ more specialized mechanics have explicit names and explicit preconditions.
 `page_size` is a local decoded-page cap. It is sent to Bitrix only when you provide the endpoint's
 exact `limit_path`; the client never guesses method-specific parameter names.
 
+### List traversal comparison
+
+![List traversal comparison](list-traversal-comparison.svg)
+
 ### Sequential offset
 
 This is the canonical default. It follows the `next` returned by the server and confirms the end
-with an empty page. A `total` present in the response is observational; this strategy does not add
-a separate count request.
+with an empty page. For ordinary counted Bitrix list endpoints, `next` is an offset for the next
+LIMIT/OFFSET page, not a keyset cursor. Producing `total` involves a separate server-side count
+query in addition to retrieving the page. These database operations are performed inside the same
+REST request: the client does not issue an additional HTTP call just for the count. This distinction
+matters for performance: not making a separate HTTP count call does **not** mean avoiding server-side
+COUNT work. `iter_list` does not suppress that work; a returned `total` is observational and does not
+control this strategy's completion. Exact database implementation is endpoint-specific.
 
 <!-- tested: tests/client_v2_test.py::test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup -->
 ```python
@@ -203,6 +212,10 @@ stream = client.iter_list_counted(
 
 Use it only when `total` is exact for the supplied filter and offset pages are stable. Any missing
 range, overlap, duplicate identity or total contradiction raises `IncompleteTraversalError`.
+
+Physical batching reduces HTTP exchanges, but does not suppress server-side COUNT in ordinary
+counted list subrequests. Each command still performs its own offset page retrieval and associated
+total calculation on the server. Do not confuse batching these commands with a no-count traversal.
 
 ### No-count keyset
 
@@ -280,6 +293,8 @@ contracts and selection guidance.
 `Binding` applies exact parameter updates to a base request and carries parent correlation. The
 client remains unaware of entity types: a binding can represent a deal, lead, chat or any other
 caller-defined parent.
+
+![Reference batching across leads and deals](references-batching.svg)
 
 <!-- tested: tests/client_v2_test.py::test_bound_references_apply_nested_updates_off_wire_and_emit_exact_completion -->
 ```python
