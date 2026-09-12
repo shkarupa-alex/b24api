@@ -126,6 +126,7 @@ class _Page:
     items: tuple[FrozenJson, ...]
     response: Response
     item_weights: tuple[int, ...]
+    continuing: bool = False
 
     @property
     def retained_rows(self) -> int:

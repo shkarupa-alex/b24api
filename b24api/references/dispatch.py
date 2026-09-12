@@ -128,6 +128,7 @@ class _ProducerState:
 
     runnable: set[str]
     indexes: dict[str, int]
+    pending_continuations: set[str] = field(default_factory=set)
     next_key: str | None = None
     next_index: int | None = None
     source_pull_in_flight: bool = False
@@ -414,7 +415,7 @@ class _BatchPageDispatcher:
                 self._producer_state.touch()
             raise
 
-    async def _run(self) -> None:  # noqa: C901, PLR0912
+    async def _run(self) -> None:  # noqa: C901, PLR0912, PLR0915
         get_task: asyncio.Task[_PendingBatch] | None = None
         try:
             while not self._closed:
@@ -427,13 +428,24 @@ class _BatchPageDispatcher:
                     continue
                 chunk = [first]
                 self._drain_nowait(chunk)
+                await asyncio.sleep(0)
+                self._drain_nowait(chunk)
                 deadline = asyncio.get_running_loop().time() + self.plan.coalesce_wait
+                immediate_idle_turns = 0
                 while len(chunk) < self.plan.batch_size:
                     self._drain_nowait(chunk)
                     if len(chunk) >= self.plan.batch_size:
                         break
-                    if self.plan.coalesce_wait <= 0 or self._potential({item.reference_id for item in chunk}) == 0:
+                    if self._potential({item.reference_id for item in chunk}) == 0:
                         break
+                    if self.plan.coalesce_wait <= 0:
+                        previous = len(chunk)
+                        await asyncio.sleep(0)
+                        self._drain_nowait(chunk)
+                        immediate_idle_turns = immediate_idle_turns + 1 if len(chunk) == previous else 0
+                        if immediate_idle_turns >= self.plan.batch_size:
+                            break
+                        continue
                     remaining = min(
                         deadline - asyncio.get_running_loop().time(),
                         self.context.policy.max_elapsed - self.context.elapsed,
@@ -485,6 +497,13 @@ class _BatchPageDispatcher:
             for key in state.runnable
             if key in state.indexes
         )
+        continuations = sum(
+            key not in chunk_keys
+            and self.context.can_reserve_page(reference=key)
+            and buffer.can_reserve(state.indexes[key], self._page_cap)
+            for key in state.pending_continuations
+            if key in state.indexes
+        )
         pending_pull = int(
             state.source_pull_in_flight
             and state.next_key is not None
@@ -493,7 +512,8 @@ class _BatchPageDispatcher:
             and self.context.can_reserve_page(reference=state.next_key)
             and buffer.can_reserve(state.next_index, self._page_cap),
         )
-        return admitted + pending_pull
+        unresolved_source = int(not state.source_terminal and self.context.can_reserve_page())
+        return admitted + continuations + max(pending_pull, unresolved_source)
 
     async def _send(self, chunk: list[_PendingBatch]) -> None:
         self.batch_requests += 1

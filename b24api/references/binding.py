@@ -119,6 +119,7 @@ def _bind_request(base: Request, binding: Binding[object], index: int, traversal
                 request,
                 {traversal.cursor.parameter_path: initial_cursor},
                 allow_create=traversal.cursor.allow_create_controls,
+                replace=frozenset({traversal.cursor.parameter_path}),
             )
     except (CapabilityError, KeyError, PaginationError, TypeError, ValueError) as error:
         raise _BindingLocalValidationError from error

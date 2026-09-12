@@ -139,7 +139,7 @@ class _CountedBatchMixin:
             if budget.counters.physical_requests + minimum_tail_requests > self.context.policy.max_requests:
                 raise CapabilityError("parallel counted traversal exceeds the physical request budget")
             self.validate_external_page(head_items, head, terminal=total == len(head_items))
-            yield _Page(tuple(head_items), head, (1,) * len(head_items))
+            yield _Page(tuple(head_items), head, (1,) * len(head_items), total != len(head_items))
             await self.context.set_buffered_rows(0)
             if total == len(head_items):
                 self.terminal_reason = "parallel counted traversal completed"
@@ -166,7 +166,7 @@ class _CountedBatchMixin:
                 logical_page_per_command=True,
             )
 
-            def validated_outcome(outcome: object) -> tuple[Response, tuple[FrozenJson, ...]]:
+            def validated_outcome(outcome: object) -> tuple[Response, tuple[FrozenJson, ...], bool]:
                 if isinstance(outcome, BatchFailure):
                     error = (
                         outcome.error
@@ -219,14 +219,14 @@ class _CountedBatchMixin:
                     if self.page_trace_count == trace_count:
                         self.reject_external_page(items, response, error)
                     raise
-                return response, items
+                return response, items, start + stride < total
 
             primary_error: BaseException | None = None
             pending_cancellation: asyncio.CancelledError | None = None
             try:
                 async for outcome in outcomes:
-                    response, items = validated_outcome(outcome)
-                    yield _Page(tuple(items), response, (1,) * len(items))
+                    response, items, continuing = validated_outcome(outcome)
+                    yield _Page(tuple(items), response, (1,) * len(items), continuing)
             except BaseException as error:
                 primary_error = error
                 raise

@@ -86,9 +86,15 @@ class MembershipRecheck:
 
     def __post_init__(self) -> None:
         """Enforce the finite partition contract."""
+        if not isinstance(self.truncated, bool):
+            raise TypeError("truncated must be a boolean")
+        truncated = self.truncated
         for name in ("identities", "still_observed", "no_longer_observed", "contradictory"):
-            values = tuple(getattr(self, name))[:_EVIDENCE_LIMIT]
+            original = tuple(getattr(self, name))
+            truncated = truncated or len(original) > _EVIDENCE_LIMIT
+            values = original[:_EVIDENCE_LIMIT]
             object.__setattr__(self, name, values)
+        object.__setattr__(self, "truncated", truncated)
         sent = {_freeze_json(value) for value in self.identities}
         still = {_freeze_json(value) for value in self.still_observed}
         gone = {_freeze_json(value) for value in self.no_longer_observed}

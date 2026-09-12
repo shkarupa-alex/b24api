@@ -41,7 +41,8 @@ class _KeysetMixin:
             items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
-                candidate_identities = self._extract_identities(items)
+                source = items if self._selected_source_items is None else self._selected_source_items
+                candidate_identities = self._extract_identities(source)
                 validate_keyset_continuation(plan, cursor, candidate_identities)
                 terminal = keyset_page_terminal(plan, len(items))
                 identities = self._validate_page(
@@ -55,7 +56,7 @@ class _KeysetMixin:
                     self.reject_external_page(items, response, error)
                 raise
             if items:
-                yield _Page(tuple(items), response, (1,) * len(items))
+                yield _Page(tuple(items), response, (1,) * len(items), terminal is None)
             if terminal is not None:
                 self.terminal_reason = terminal
                 return

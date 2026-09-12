@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, cast
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.report import PageDispatch, PageRecord, Violation, ViolationSeverity, retain_page_trace
 from b24api.contracts.request import ReplaySafety, Request, ResultSelector, TraversalIdentity
-from b24api.errors import BudgetExceededError, CapabilityError, PageAdaptationError
+from b24api.errors import BudgetExceededError, CapabilityError
 from b24api.execution import (
     AsyncIteratorController,
     Executor,
@@ -313,7 +313,6 @@ class ReferenceScheduler:
         reservation: _Reservation | None = None
         partial_rows = 0
         page_state = 0
-        committed_pages = 0
         violation_offset = 0
         trace_offset = 0
         scheduled_sequences: list[int] = []
@@ -375,10 +374,11 @@ class ReferenceScheduler:
                     raise RuntimeError("page completed without a buffer reservation")  # noqa: TRY301
                 await self.buffer.accept(reservation, page.retained_rows)
                 acknowledged = asyncio.get_running_loop().create_future()
+                if page.continuing:
+                    self.producer_state.pending_continuations.add(producer_key)
+                    self.producer_state.touch()
                 page_violations = tuple(driver.violations[violation_offset:])
                 violation_offset = len(driver.violations)
-                self.producer_state.runnable.add(producer_key)
-                self.producer_state.touch()
                 await output.put(
                     _PageEvent(
                         work,
@@ -398,7 +398,10 @@ class ReferenceScheduler:
                 )
                 trace_offset = driver.page_trace_count
                 await acknowledged
-                committed_pages += 1
+                self.producer_state.pending_continuations.discard(producer_key)
+                if page.continuing:
+                    self.producer_state.runnable.add(producer_key)
+                    self.producer_state.touch()
                 partial_rows += len(page.items)
                 reservation = None
             if reservation is not None:
@@ -441,7 +444,7 @@ class ReferenceScheduler:
                     work,
                     error,
                     driver.cursor_state,
-                    committed_pages if isinstance(error, PageAdaptationError) else page_state,
+                    page_state,
                     partial_rows,
                     tuple(driver.violations[violation_offset:]),
                     self._annotate_page_records(
@@ -453,6 +456,7 @@ class ReferenceScheduler:
             )
         finally:
             self.producer_state.runnable.discard(producer_key)
+            self.producer_state.pending_continuations.discard(producer_key)
             self.producer_state.indexes.pop(producer_key, None)
             self.producer_state.touch()
             if reservation is not None:

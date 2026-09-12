@@ -17,6 +17,7 @@ from b24api import (
     BatchDispatch,
     Binding,
     Bitrix24,
+    CapabilityError,
     CursorSpec,
     CursorTraversal,
     ExecutionPolicy,
@@ -218,6 +219,31 @@ async def test_cursor_seed_must_advance_on_first_page_and_cursor_update_path_is_
     assert isinstance(raised.value.outcomes[0], ReferenceNotExecuted)
 
 
+@pytest.mark.asyncio
+async def test_cursor_seed_replaces_existing_control_when_creation_is_forbidden() -> None:
+    transport = CursorBatchTransport({"a": (1, 2)})
+    cursor = CursorSpec(
+        ParameterPath(("after",)),
+        ("id",),
+        IdentityCoercion.EXACT_INTEGER,
+        "ascending",
+        "last",
+        ParameterPath(("limit",)),
+        allow_create_controls=False,
+    )
+    stream = _client(transport).iter_cursors(
+        Request("item.list", {"parent": "a", "after": 0, "limit": 1}),
+        [Binding("a", (), None, start_cursor=1)],
+        selector=ResultSelector.root(),
+        cursor=cursor,
+        page_size=1,
+        dispatch=BatchDispatch(coalesce_wait=0),
+    )
+    events = [event async for event in stream]
+    assert [event.item["id"] for event in events if isinstance(event, ReferenceItem)] == [2]
+    assert isinstance(events[-1], ReferenceComplete)
+
+
 class PageTransport:
     host = "test.invalid"
 
@@ -359,10 +385,12 @@ class VerifierTransport:
         *,
         ignore_bounds: bool = False,
         mutation: str | None = None,
+        observed_cap: int | None = None,
     ) -> None:
         self.identities = identities
         self.ignore_bounds = ignore_bounds
         self.mutation = mutation
+        self.observed_cap = observed_cap
         self.batch_ordinal = 0
         self.requests: list[Request] = []
 
@@ -396,6 +424,8 @@ class VerifierTransport:
         ):
             selected = (*selected, 13)
         limit = int(parameters.get("limit", 50))
+        if self.observed_cap is not None:
+            limit = min(limit, self.observed_cap)
         return [{"id": value} for value in sorted(set(selected), reverse=descending)[:limit]]
 
     async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
@@ -428,6 +458,10 @@ async def test_keyset_verifier_verified_and_unsupported_cost_and_safe_error() ->
     assert tuple(check.name for check in verified.checks) == tuple(KeysetCapabilityCheckName)
     assert {check.outcome for check in verified.checks} == {KeysetCapabilityCheckOutcome.PASSED}
     assert (verified.logical_commands, verified.batch_waves, verified.physical_requests) == (7, 2, 2)
+    assert len(verified.page_trace) == 7
+    assert [record.phase for record in verified.page_trace[:2]] == [KeysetPhase.BOUNDARY] * 2
+    assert {record.phase for record in verified.page_trace[2:]} == {KeysetPhase.CANARY}
+    assert verified.violations == ()
 
     with pytest.raises(KeysetCapabilityError) as raised:
         await _verify(VerifierTransport((553, 555, 711, 723), ignore_bounds=True))
@@ -438,6 +472,24 @@ async def test_keyset_verifier_verified_and_unsupported_cost_and_safe_error() ->
     safe = error.to_safe_dict()
     assert safe["logical_commands"] == 7
     assert "553" not in repr(safe)
+    assert len(error.report.violations) == 5
+
+
+@pytest.mark.asyncio
+async def test_keyset_verifier_rejects_owned_controls_before_io_and_detects_hidden_cap() -> None:
+    blocked_transport = VerifierTransport((1, 2, 3, 4))
+    with pytest.raises(CapabilityError, match="control conflicts"):
+        await _client(blocked_transport).verify_keyset_capability(
+            Request("item.list", {"limit": 2}),
+            selector=ResultSelector.root(),
+            identity=_identity(),
+            keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        )
+    assert blocked_transport.requests == []
+
+    with pytest.raises(KeysetCapabilityError) as raised:
+        await _verify(VerifierTransport((1, 2, 3, 4), observed_cap=1))
+    assert raised.value.report.inconclusive_reason is KeysetInconclusiveReason.PAGE_CAP_TOO_SMALL
 
 
 @pytest.mark.asyncio
@@ -472,6 +524,9 @@ def test_membership_recheck_accepts_json_values_and_enforces_partition() -> None
     assert record.still_observed == (value,)
     with pytest.raises(ValueError, match="partition"):
         MembershipRecheck((value,), (), ())
+    bounded = MembershipRecheck(tuple(range(10)), tuple(range(10)), ())
+    assert bounded.identities == tuple(range(8))
+    assert bounded.truncated is True
 
 
 def test_keyset_capability_error_rejects_verified_report_and_exposes_only_safe_summary() -> None:
@@ -579,7 +634,8 @@ def test_fast_keyset_lane_applies_adapter_only_to_publishable_phases() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fast_source_fills_initial_and_continuation_batches() -> None:
+@pytest.mark.parametrize("coalesce_wait", [0, 0.020])
+async def test_fast_source_fills_initial_and_continuation_batches(coalesce_wait: float) -> None:
     count = 50
     transport = CursorBatchTransport({str(index): (index + 1,) for index in range(count)})
     bindings = [
@@ -602,7 +658,7 @@ async def test_fast_source_fills_initial_and_continuation_batches() -> None:
         selector=ResultSelector.root(),
         cursor=_cursor(),
         page_size=1,
-        dispatch=BatchDispatch(batch_size=count),
+        dispatch=BatchDispatch(batch_size=count, coalesce_wait=coalesce_wait),
     )
 
     assert len([event async for event in stream]) == 2 * count

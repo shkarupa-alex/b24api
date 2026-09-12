@@ -16,7 +16,6 @@ from b24api.errors import CapabilityError, PaginationError, ResultShapeError
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from b24api.contracts.json import JsonValue
     from b24api.contracts.response import Response
     from b24api.traversal.plans import ItemCursorPlan
 
@@ -101,23 +100,31 @@ def _mapping_shape_degraded(response: Response, selector: ResultSelector) -> boo
     return isinstance(selected, list | tuple) and not selected
 
 
-def _plain_json(value: FrozenJson) -> JsonValue:
-    """Convert frozen rows for the legacy canonical JSON encoder."""
-    if isinstance(value, FrozenMapping):
-        return {key: _plain_json(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_plain_json(item) for item in value]
-    return value
-
-
 def _page_fingerprint(items: Iterable[FrozenJson]) -> str:
-    canonical = json.dumps(
-        [_plain_json(item) for item in items],
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(canonical.encode()).hexdigest()
+    digest = hashlib.sha256()
+
+    def update(value: FrozenJson) -> None:
+        if isinstance(value, FrozenMapping):
+            digest.update(b"{")
+            for index, key in enumerate(sorted(value)):
+                if index:
+                    digest.update(b",")
+                digest.update(json.dumps(key, ensure_ascii=False).encode())
+                digest.update(b":")
+                update(value[key])
+            digest.update(b"}")
+        elif isinstance(value, tuple):
+            digest.update(b"[")
+            for index, item in enumerate(value):
+                if index:
+                    digest.update(b",")
+                update(item)
+            digest.update(b"]")
+        else:
+            digest.update(json.dumps(value, ensure_ascii=False, allow_nan=False).encode())
+
+    update(tuple(items))
+    return digest.hexdigest()
 
 
 def _extract_path(value: FrozenJson, path: tuple[str | int, ...]) -> FrozenJson:

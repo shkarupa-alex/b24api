@@ -87,10 +87,7 @@ if TYPE_CHECKING:
 
     from b24api.contracts.json import JsonValue
     from b24api.contracts.response import Response
-    from b24api.execution import (
-        ExecutionContext,
-        Executor,
-    )
+    from b24api.execution import ExecutionContext, Executor
     from b24api.execution.snapshot import KernelReport
 
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
@@ -155,6 +152,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._page_dispatch = PageDispatch.DIRECT
         self._page_batch_index: int | None = None
         self._page_offset: int | None = None
+        self._selected_source_items: tuple[FrozenJson, ...] | None = None
 
     async def pages(self) -> AsyncGenerator[_Page]:  # noqa: C901
         """Yield validated traversal pages."""
@@ -192,11 +190,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._identity_store = _identity_store(self.context.policy, self.plan, self.identity)
 
     def validate_external_page(
-        self,
-        items: tuple[FrozenJson, ...],
-        response: Response,
-        *,
-        terminal: bool = False,
+        self, items: tuple[FrozenJson, ...], response: Response, *, terminal: bool = False,
     ) -> None:
         """Validate one externally dispatched page with the canonical traversal state machine."""
         if self._identity_store is None:
@@ -205,9 +199,11 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
 
     def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:
         """Select one scheduled page and retain value-free evidence on shape rejection."""
+        source: tuple[FrozenJson, ...] = ()
         try:
             source = _response_items(response, self.selector, single=single)
-            return self._adapt_page(response, source)
+            adapted = self._adapt_page(response, source)
+            self._selected_source_items = source
         except ResultShapeError as error:
             enriched = ResultShapeError(
                 selector=error.selector,
@@ -219,12 +215,18 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             self._record_rejected_page((), response, enriched)
             raise enriched from error
         except BaseException as error:
-            self._record_rejected_page((), response, error)
+            self._record_rejected_page(source, response, error)
             raise
+        return adapted
 
     def reject_external_page(self, items: tuple[FrozenJson, ...], response: Response, error: BaseException) -> None:
         """Record a pre-commit external range or capability rejection exactly once."""
-        self._record_rejected_page(items, response, error)
+        self._record_rejected_page(self._take_source_page(items), response, error)
+
+    def _take_source_page(self, items: tuple[FrozenJson, ...]) -> tuple[FrozenJson, ...]:
+        source = items if self._selected_source_items is None else self._selected_source_items
+        self._selected_source_items = None
+        return source
 
     def _adapt_page(self, response: Response, source: tuple[FrozenJson, ...]) -> tuple[FrozenJson, ...]:
         """Apply one page strategy and enforce its value-free structural contract."""
@@ -327,6 +329,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._total_semantics = effective.total_semantics
         self._order_direction = effective.order_direction
         self._confirmation_policy = effective.confirmation_policy
+        if not isinstance(self.page_adapter, IdentityPageAdapter) and not self._adaptation_specs():
+            raise CapabilityError("custom page adapter requires a traversal identity to prove row order")
         self._preflight_controls()
 
     def _preflight_controls(self) -> None:
@@ -384,7 +388,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                 frozenset({self.plan.offset_path})
                 if isinstance(self.plan, OffsetSequentialPlan)
                 else frozenset({self.plan.cursor_request_path})
-                if isinstance(self.plan, ItemCursorPlan) and self.initial_cursor is not None
+                if isinstance(self.plan, ItemCursorPlan)
+                and (self.initial_cursor is not None or not self.plan.allow_create_controls)
                 else frozenset()
             )
             _request_with_controls(self.request, first, allow_create=allow_create, replace=replace)
@@ -400,6 +405,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         identities: list[IdentityValue] | None = None,
     ) -> list[IdentityValue]:
         """Evaluate a page transactionally and commit only after all checks pass."""
+        source_items = self._take_source_page(items)
         snapshot = (
             self.validated_rows,
             self._expected_total,
@@ -412,7 +418,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         )
         try:
             return self._validate_page_impl(
-                items,
+                source_items,
                 response=response,
                 qualified_count=qualified_count,
                 terminal=terminal,
@@ -431,7 +437,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             ) = snapshot
             self._advisory_totals = advisory_totals
             del self.violations[violation_count:]
-            self._record_rejected_page(items, response, error)
+            self._record_rejected_page(source_items, response, error)
             raise
 
     def _validate_page_impl(  # noqa: C901, PLR0912, PLR0915

@@ -16,17 +16,26 @@ from b24api.contracts.keyset_capability import (
     KeysetInconclusiveReason,
     MembershipRecheck,
 )
+from b24api.contracts.keyset_execution import KeysetPhase
 from b24api.contracts.policy import IdentityCoercion
+from b24api.contracts.report import (
+    PageDispatch,
+    PageOutcome,
+    PageRecord,
+    Violation,
+    ViolationSeverity,
+    retain_page_trace,
+)
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError, KeysetCapabilityError, PaginationError
 from b24api.traversal import keyset_step
 from b24api.traversal.facade import _collection_selector
 from b24api.traversal.identity import _child_path, _request_with_controls
 from b24api.traversal.keyset_capability import canary_commands
+from b24api.traversal.keyset_eligibility import _reject_owned_controls
 from b24api.traversal.values import _coerce_identity, _extract_path, _response_items, _validate_order
 
 if TYPE_CHECKING:
-
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
     from b24api.contracts.response import Response, ResultCollectionShape
@@ -75,6 +84,9 @@ class _Verifier:
         self.capacity = min(50, policy.max_buffered_commands, max(1, policy.max_buffered_rows // page_size))
         self.batch_waves = 0
         self.logical_commands = 0
+        self.page_trace: tuple[PageRecord, ...] = ()
+        self.page_trace_truncated = False
+        self._trace_sequence = 0
 
     async def run(self) -> KeysetCapabilityReport:
         await self.context.start()
@@ -82,7 +94,7 @@ class _Verifier:
             self._request("ASC", None, None),
             self._request("DESC", None, None),
         )
-        boundary_responses = await self._waves(boundaries)
+        boundary_responses = await self._waves(boundaries, KeysetPhase.BOUNDARY)
         asc = self._identities(boundary_responses[0], direction="asc")
         desc = self._identities(boundary_responses[1], direction="desc")
         reason = self._early_reason(asc, desc)
@@ -105,6 +117,7 @@ class _Verifier:
         plans = self._plans(asc, desc, snapshot)
         responses = await self._waves(
             tuple(self._request("DESC" if plan.descending else "ASC", plan.lower, plan.upper) for plan in plans),
+            KeysetPhase.CANARY,
         )
         checks = tuple(self._check(plan, response) for plan, response in zip(plans, responses, strict=True))
         if any(check.outcome in _PROOF for check in checks):
@@ -150,7 +163,7 @@ class _Verifier:
             limit=self.page_size,
         )
 
-    async def _waves(self, requests: tuple[Request, ...]) -> tuple[Response, ...]:
+    async def _waves(self, requests: tuple[Request, ...], phase: KeysetPhase) -> tuple[Response, ...]:
         responses: list[Response] = []
         for offset in range(0, len(requests), self.capacity):
             wave = requests[offset : offset + self.capacity]
@@ -175,10 +188,39 @@ class _Verifier:
                         raise CapabilityError("keyset verifier lacks correlated response evidence")
                     self.context.commit_page(reservation)
                     responses.append(outcome.response)
+                    self._record_response(outcome.response, outcome.command_index, phase)
             finally:
                 for reservation in reservations:
                     self.context.release_page(reservation)
         return tuple(responses)
+
+    def _record_response(self, response: Response, batch_index: int, phase: KeysetPhase) -> None:
+        try:
+            rows_selected = len(_response_items(response, self.selector))
+        except (CapabilityError, PaginationError):
+            rows_selected = 0
+        total = response.total if isinstance(response.total, int) and response.total >= 0 else None
+        next_value = response.next if isinstance(response.next, int) and response.next >= 0 else None
+        record = PageRecord(
+            sequence=self._trace_sequence,
+            offset=None,
+            dispatch=PageDispatch.BATCH,
+            batch_index=batch_index,
+            rows_selected=rows_selected,
+            rows_admitted=0,
+            reported_total=total,
+            reported_next=next_value,
+            outcome=PageOutcome.COMMITTED,
+            rejection_code=None,
+            phase=phase,
+        )
+        self._trace_sequence += 1
+        retained, truncated = retain_page_trace(
+            (*self.page_trace, record),
+            self.context.policy.page_trace_limit,
+        )
+        self.page_trace = retained
+        self.page_trace_truncated = self.page_trace_truncated or truncated
 
     def _identities(
         self,
@@ -203,6 +245,8 @@ class _Verifier:
     def _early_reason(self, asc: tuple[int, ...], desc: tuple[int, ...]) -> KeysetInconclusiveReason | None:
         if self.page_size < _MINIMUM_PAIR_ROWS:
             return KeysetInconclusiveReason.PAGE_CAP_TOO_SMALL
+        if len(asc) == len(desc) == 1 and asc[0] != desc[0]:
+            return KeysetInconclusiveReason.PAGE_CAP_TOO_SMALL
         if len({*asc, *desc}) < _MINIMUM_PAIR_ROWS:
             return KeysetInconclusiveReason.INSUFFICIENT_ROWS
         return None
@@ -226,9 +270,16 @@ class _Verifier:
         snapshot: tuple[int, ...],
     ) -> tuple[_CheckPlan, ...]:
         commands = {command.ordinal: command for command in canary_commands(ascending, descending, 2)}
+        command_ordinals = {
+            KeysetCapabilityCheckName.LOWER_EMPTY: 1,
+            KeysetCapabilityCheckName.UPPER_EMPTY: 0,
+            KeysetCapabilityCheckName.SINGLETON: 2,
+            KeysetCapabilityCheckName.TWO_ROW_ASC: 3,
+            KeysetCapabilityCheckName.TWO_ROW_DESC: 4,
+        }
         plans: list[_CheckPlan] = []
-        for ordinal, name in enumerate(KeysetCapabilityCheckName):
-            command = commands[ordinal]
+        for name in KeysetCapabilityCheckName:
+            command = commands[command_ordinals[name]]
             lower, upper = command.bounds.lower_exclusive, command.bounds.upper_exclusive
             if lower is None or upper is None:
                 raise RuntimeError("verifier canary geometry must have two strict bounds")
@@ -315,11 +366,9 @@ class _Verifier:
         for group in (contradictory, missing, extras):
             ordered.extend(value for value in group if value not in ordered)
         selected, truncated = tuple(ordered[:_RECHECK_LIMIT]), len(ordered) > _RECHECK_LIMIT
-        responses = await self._waves(tuple(self._exact_request(value) for value in selected))
+        responses = await self._waves(tuple(self._exact_request(value) for value in selected), KeysetPhase.CANARY)
         still = tuple(
-            value
-            for value, response in zip(selected, responses, strict=True)
-            if value in self._identities(response)
+            value for value, response in zip(selected, responses, strict=True) if value in self._identities(response)
         )
         gone = tuple(value for value in selected if value not in still)
         recheck = MembershipRecheck(
@@ -330,9 +379,7 @@ class _Verifier:
             truncated,
         )
         updated = tuple(
-            replace(check, recheck=recheck)
-            if check.outcome is not KeysetCapabilityCheckOutcome.PASSED
-            else check
+            replace(check, recheck=recheck) if check.outcome is not KeysetCapabilityCheckOutcome.PASSED else check
             for check in checks
         )
         if contradictory:
@@ -369,6 +416,19 @@ class _Verifier:
         cross_digit: bool,
     ) -> KeysetCapabilityReport:
         snapshot = await self.context.snapshot()
+        violations = tuple(
+            Violation(
+                ViolationSeverity.BLOCKING if check.outcome in _PROOF else ViolationSeverity.WARNING,
+                f"keyset_capability_{check.outcome.value}",
+                f"keyset capability check {check.name.value} observed {check.outcome.value}",
+            )
+            for check in checks
+            if check.outcome
+            not in {
+                KeysetCapabilityCheckOutcome.PASSED,
+                KeysetCapabilityCheckOutcome.NOT_EXECUTED,
+            }
+        )
         return KeysetCapabilityReport(
             verdict=verdict,
             checks=checks,
@@ -378,9 +438,9 @@ class _Verifier:
             cross_digit_pair_exercised=cross_digit,
             inconclusive_reason=reason,
             inconclusive_detail=None if reason is None else reason.value,
-            violations=(),
-            page_trace=(),
-            page_trace_truncated=False,
+            violations=violations,
+            page_trace=self.page_trace,
+            page_trace_truncated=self.page_trace_truncated,
         )
 
 
@@ -402,6 +462,7 @@ async def verify_keyset_capability(  # noqa: PLR0913
         raise CapabilityError("keyset verifier supports JSON requests without scoped headers")
     if identity.coercion not in {IdentityCoercion.EXACT_INTEGER, IdentityCoercion.DECIMAL_STRING_INTEGER}:
         raise CapabilityError("keyset verifier requires integer identity coercion")
+    _reject_owned_controls(request, identity, keyset)
     verifier = _Verifier(
         executor,
         request,

@@ -190,7 +190,7 @@ async def _verify_keyset(request: Request, route: VerifyKeysetContractRoute, std
     _write_json(stdout, report.to_dict())
 
 
-def main(  # noqa: C901, PLR0911 - stable process-code boundary
+def main(  # noqa: C901, PLR0911, PLR0912 - stable process-code boundary
     argv: Sequence[str] | None = None,
     *,
     stdin: TextIO | None = None,
@@ -227,7 +227,10 @@ def main(  # noqa: C901, PLR0911 - stable process-code boundary
     except BrokenPipeError:
         return _OUTPUT_CLOSED
     except KeysetCapabilityError as error:
-        _write_json(output_stream, error.report.to_dict())
+        try:
+            _write_json(output_stream, error.report.to_dict())
+        except BrokenPipeError:
+            return _OUTPUT_CLOSED
         return _KEYSET_UNSUPPORTED if error.verdict.value == "unsupported" else _KEYSET_INCONCLUSIVE
     except B24ApiError as error:
         _write_json(error_stream, _safe_error(error))

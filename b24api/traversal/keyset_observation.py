@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from b24api.contracts.response import Response
     from b24api.traversal.keyset_scheduler import KeysetFastScheduler
     from b24api.traversal.ordered_admission import OrderedAdmissionState
-    from b24api.traversal.page_validation import LaneCommandPlan, LaneReceipt
+    from b24api.traversal.page_validation import LaneCommandPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,34 +205,6 @@ def raise_boundary_cap_contradiction(
     violations.append(violation)
     reject_boundary_observations(staged, record, admission, rows=rows, violation=violation, raw=False)
     raise PaginationError(message)
-
-
-def validate_canary_observations(  # noqa: PLR0913
-    receipts: tuple[LaneReceipt, ...],
-    expected: dict[str, tuple[int, ...]],
-    staged: list[tuple[LaneCommandPlan, int, int, Response | None, ClosureWitness | None]],
-    record: Callable[..., None],
-    admission: OrderedAdmissionState,
-    violations: list[Violation],
-) -> None:
-    """Finalize all phase-owned observations after semantic canary validation."""
-    by_id = {receipt.command_id: receipt for receipt in receipts}
-    offending = {command_id for command_id, values in expected.items() if by_id[command_id].identities != values}
-    admission.record_raw(sum(len(receipt.rows) for receipt in receipts), discarded=True)
-    if offending:
-        violation = Violation(
-            ViolationSeverity.BLOCKING,
-            "canary_contradiction",
-            "bounded keyset capability canary failed",
-        )
-        violations.append(violation)
-        boundary_rows = sum(item[2] for item in staged if item[0].phase.value == "boundary")
-        anchor_rows = sum(item[2] for item in staged if item[0].phase.value == "anchor_probe")
-        admission.record_discarded(boundary_rows)
-        admission.record_raw(anchor_rows, discarded=True)
-        flush_staged_observations(staged, record, violation=violation, offending=offending)
-        raise PaginationError("bounded keyset capability canary failed")
-    flush_staged_observations(staged, record)
 
 
 def finalize_boundary_observations(

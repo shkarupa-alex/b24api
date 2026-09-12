@@ -9,12 +9,11 @@ from typing import TYPE_CHECKING
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
-from b24api.errors import BudgetExceededError, PaginationError
+from b24api.errors import BudgetExceededError, PageAdaptationError, PaginationError
 from b24api.traversal import keyset_step
 from b24api.traversal.keyset_capability import (
     anchor_commands,
     build_capability_plans,
-    canary_commands,
     lane_for_command,
 )
 from b24api.traversal.keyset_fast_plan import (
@@ -40,30 +39,6 @@ if TYPE_CHECKING:
     from b24api.traversal.keyset_scheduler import KeysetFastScheduler
     from b24api.traversal.page_validation import LaneReceipt
     from b24api.traversal.plans import KeysetPlan
-
-
-def build_canary_plans(
-    scheduler: KeysetFastScheduler,
-    asc: LaneReceipt,
-    desc: LaneReceipt,
-) -> tuple[tuple[LaneCommandPlan, ...], dict[str, tuple[int, ...]]]:
-    """Build canary requests and their expected identity sequences."""
-    commands = canary_commands(asc.identities, desc.identities, scheduler.effective_page_cap)
-    plans = build_capability_plans(
-        commands,
-        KeysetPhase.CANARY,
-        lambda **kwargs: build_controlled_request(scheduler, **kwargs),
-        lambda lane, **kwargs: build_lane_plan(scheduler, lane, **kwargs),
-        scheduler.effective_page_cap,
-        scheduler.transactions.planning_bounds,
-        scheduler.transactions.planning_descending,
-    )
-    expected = {
-        plan.command_id: command.expected
-        for plan, command in zip(plans, commands, strict=True)
-        if command.expected is not None
-    }
-    return plans, expected
 
 
 def build_anchor_plans(
@@ -182,7 +157,7 @@ async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation tran
                     )
             scheduler.admission.record_raw(selected_rows, discarded=True)
             cause = next(
-                (receipt.error for receipt in rejections if receipt.error is not None),
+                (receipt.error for receipt in rejections if isinstance(receipt.error, PageAdaptationError)),
                 None,
             )
             if cause is not None:
@@ -398,7 +373,6 @@ async def execute_finish_page(
 
 __all__ = [
     "build_anchor_plans",
-    "build_canary_plans",
     "execute_body_wave",
     "execute_finish_page",
     "execute_wave",

@@ -45,6 +45,7 @@ from b24api.errors import (
     CapabilityError,
     IncompleteTraversalError,
     InputSourceError,
+    PageAdaptationError,
     PaginationError,
     ReferenceFailed,
 )
@@ -245,7 +246,10 @@ class _ReferenceEventMapper:
         if event.not_executed_reason is not None:
             return ReferenceNotExecuted(context.index, context.correlation, event.not_executed_reason)
         error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("reference failed")
-        if isinstance(error, PaginationError) or (isinstance(error, CapabilityError) and event.page_state > 0):
+        application_failure = isinstance(error, PageAdaptationError) and event.partial_rows == 0
+        if isinstance(error, PaginationError) or (
+            isinstance(error, CapabilityError) and event.page_state > 0 and not application_failure
+        ):
             incomplete_cause = error
             error = IncompleteTraversalError(
                 report=OperationReport(
@@ -390,11 +394,6 @@ __all__ = [
     "BindingSource",
     "KernelReferenceEvent",
     "ReferenceKernelStream",
-    "_ReferenceEventMapper",
-    "_reference_error",
-    "_reference_error_items",
-    "_reference_terminal",
-    "_reference_variant",
     "kernel_reference_stream",
     "reference_stream",
 ]

@@ -69,7 +69,7 @@ class _SequentialMixin:
             raise
         self.terminal_reason = "single response complete"
         item_weights = (qualified_count,) if self._single_result_as_item else (1,) * len(items)
-        yield _Page(tuple(items), response, item_weights)
+        yield _Page(tuple(items), response, item_weights, continuing=False)
 
     async def _offset(self: Any, plan: OffsetSequentialPlan) -> AsyncGenerator[_Page]:
         offset = _initial_offset(self.request, plan.offset_path)
@@ -113,7 +113,7 @@ class _SequentialMixin:
                     self.reject_external_page(items, response, error)
                 raise
             if items:
-                yield _Page(tuple(items), response, (1,) * len(items))
+                yield _Page(tuple(items), response, (1,) * len(items), terminal is None)
             if terminal is not None:
                 self.terminal_reason = terminal
                 return
@@ -164,7 +164,7 @@ class _SequentialMixin:
                     self.reject_external_page(items, response, error)
                 raise
             if items:
-                yield _Page(tuple(items), response, (1,) * len(items))
+                yield _Page(tuple(items), response, (1,) * len(items), not terminal)
             if self._expected_total is not None and self.validated_rows == self._expected_total:
                 self.terminal_reason = "qualified total reached"
                 return
