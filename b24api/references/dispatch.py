@@ -560,7 +560,7 @@ class _BatchPageDispatcher:
             and state.next_key is not None
             and state.next_index is not None
             and state.next_key not in chunk_keys
-            and (state.source_pull_in_flight or len(state.indexes) < self.context.policy.max_active_references)
+            and state.source_pull_in_flight
             and self.context.can_reserve_page(reference=state.next_key)
             and buffer.can_reserve(state.next_index, self._page_cap),
         )

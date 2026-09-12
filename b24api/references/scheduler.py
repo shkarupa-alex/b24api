@@ -252,10 +252,9 @@ class ReferenceScheduler:
         next_index = 0
         try:
             while True:
+                await admission.slots.acquire()
                 self.producer_state.next_key = f"r{next_index}"
                 self.producer_state.next_index = next_index
-                self.producer_state.touch()
-                await admission.slots.acquire()
                 self.producer_state.source_pull_in_flight = True
                 self.producer_state.touch()
                 try:

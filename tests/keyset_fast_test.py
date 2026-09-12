@@ -33,6 +33,7 @@ from b24api import (
     RangeKeysetExecution,
     Request,
     ResultSelector,
+    SequentialKeysetExecution,
     StableIntegerKeysetContract,
     TerminalState,
     TotalHintMode,
@@ -45,6 +46,7 @@ from b24api.errors import CapabilityError, IncompleteTraversalError, ResultShape
 from b24api.execution import Executor, WireResponse
 from b24api.traversal import keyset_scheduler, page_validation
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
+from b24api.traversal.keyset_costs import estimates
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
 from b24api.traversal.keyset_fast_stream import FastTraceRecorder
 from b24api.traversal.keyset_observation import PageObservation
@@ -352,6 +354,44 @@ def test_window_algebra_fixed_seed_property_tier() -> None:
         ]
         assert owned == list(range(lo + 1, upper))
         assert len(owned) == len(set(owned))
+
+
+@pytest.mark.parametrize("capacity", range(1, 11))
+@pytest.mark.parametrize("target_lanes", range(2, 21))
+def test_zero_canary_partition_planning_always_has_a_positive_exact_wave_count(
+    capacity: int,
+    target_lanes: int,
+) -> None:
+    inputs = SelectorInputs(
+        BoundaryFacts(5, 5, 1, 5, 996, 1000, False, False),
+        effective_page_cap=5,
+        batch_capacity=capacity,
+        target_lanes=target_lanes,
+        max_range_waves=20,
+        range_window_width=None,
+        completion=KeysetPageCompletion.EMPTY_CONFIRMATION,
+        advisory_total=None,
+    )
+    _sequential, range_estimate, partition, _geometry = estimates(inputs, canary_commands=0, finish_requests=1)
+    assert range_estimate.planning_waves == 0
+    expected = 1 if target_lanes <= capacity else (target_lanes + capacity - 1) // capacity
+    assert partition.planning_waves == expected
+
+
+@pytest.mark.asyncio
+async def test_sequential_keyset_deep_pagination_stays_on_the_direct_no_coalescer_path() -> None:
+    transport = KeysetTransport(tuple(range(1, 121)))
+    stream = _client(transport).iter_list_keyset(
+        Request("item.list", parameters={"filter": {"STATUS": "open"}}),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=1,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        execution=SequentialKeysetExecution(),
+    )
+    assert len([row async for row in stream]) == 120
+    assert len(transport.requests) == 121
+    assert all(request.method == "item.list" for request in transport.requests)
 
 
 @pytest.mark.parametrize(
@@ -1261,6 +1301,12 @@ async def test_keyset_report_rejects_boolean_total_hint_observation() -> None:
 
     with pytest.raises(ValueError, match="optional keyset report counters"):
         replace(stream.report.keyset_execution, total_hint_observed=True)
+    with pytest.warns(DeprecationWarning, match="legacy report compatibility"):
+        legacy = replace(
+            stream.report.keyset_execution,
+            assurance_source=KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS,
+        )
+    assert legacy.assurance_source is KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS
     nested = _report_json(stream.report)["keyset_execution"]
     assert isinstance(nested, dict)
     assert nested["selected_kind"] == stream.report.keyset_execution.selected_kind

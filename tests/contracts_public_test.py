@@ -270,6 +270,23 @@ def test_keyset_cursor_streams_add_only_the_declared_fields_and_methods() -> Non
         assert tuple(field.name for field in fields(traversal))[-1] == "page_adapter"
     for traversal in (b24api.KeysetTraversal, b24api.CursorTraversal):
         assert tuple(field.name for field in fields(traversal))[-1] == "page_adapter"
+    assert tuple(field.name for field in fields(b24api.MembershipRecheck)) == (
+        "identities",
+        "still_observed",
+        "no_longer_observed",
+        "contradictory",
+        "truncated",
+    )
+    assert tuple(field.name for field in fields(b24api.KeysetCapabilityCheckResult)) == (
+        "name",
+        "outcome",
+        "rows_selected",
+        "out_of_interval_identities",
+        "missing_in_interval_identities",
+        "extra_in_interval_identities",
+        "contradictory_identities",
+        "recheck",
+    )
     assert hasattr(b24api.Bitrix24, "iter_cursors")
     assert hasattr(b24api.Bitrix24, "verify_keyset_capability")
     assert not hasattr(b24api.Bitrix24, "iter_cursor_outcomes")

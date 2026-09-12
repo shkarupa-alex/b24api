@@ -54,6 +54,7 @@ from b24api import (
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.json import FrozenMapping
 from b24api.contracts.keyset_execution import KeysetPageCompletion, KeysetPhase
+from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.response import Response, ResultCollectionShape
 from b24api.execution import Executor, WireResponse
 from b24api.references.dispatch import _BatchPageDispatcher, _ProducerState, _RowBuffer
@@ -330,16 +331,17 @@ async def test_page_adapter_enriches_from_frozen_siblings_and_runs_on_empty_conf
 
 
 @pytest.mark.asyncio
-async def test_identity_adapter_subclass_is_custom_and_requires_provable_order() -> None:
+async def test_custom_adapter_without_configured_identity_preserves_generic_list_support() -> None:
     transport = PageTransport()
+    adapter = EnrichMessages()
     stream = _client(transport).iter_list(
         Request("item.list"),
         selector=ResultSelector(("messages",)),
-        page_adapter=ReorderingIdentityAdapter(),
+        page_adapter=adapter,
     )
-    with pytest.raises(CapabilityError, match="requires a traversal identity"):
-        await anext(stream)
-    assert transport.requests == []
+    assert await anext(stream) == {"id": 1, "author_id": 7, "author": "Ada"}
+    assert adapter.calls == 1
+    await stream.aclose()
 
 
 class BrokenAdapter:
@@ -562,7 +564,11 @@ async def test_keyset_verifier_drift_is_never_misclassified_as_unsupported(
 def test_membership_recheck_accepts_json_values_and_enforces_partition() -> None:
     value = {"id": [1]}
     record = MembershipRecheck((value,), (value,), ())
-    assert record.still_observed == (value,)
+    assert isinstance(record.still_observed[0], FrozenMapping)
+    value["id"].append(2)
+    assert record.identities[0]["id"] == (1,)  # type: ignore[index]
+    with pytest.raises(TypeError):
+        record.still_observed[0]["id"] = ()  # type: ignore[index]
     with pytest.raises(ValueError, match="partition"):
         MembershipRecheck((value,), (), ())
     bounded = MembershipRecheck(tuple(range(10)), tuple(range(10)), ())
@@ -602,6 +608,55 @@ def test_keyset_capability_error_rejects_verified_report_and_exposes_only_safe_s
             (),
             False,
         )
+    blocking = Violation(ViolationSeverity.BLOCKING, "keyset_capability_shape_invalid", "shape invalid")
+    with pytest.raises(ValueError, match="no blocking violations"):
+        KeysetCapabilityReport(
+            KeysetCapabilityVerdict.VERIFIED,
+            report.checks,
+            2,
+            2,
+            7,
+            False,
+            None,
+            None,
+            (blocking,),
+            (),
+            False,
+        )
+
+
+def test_keyset_capability_check_evidence_is_deeply_immutable_and_json_safe() -> None:
+    value = {"id": [1]}
+    check = KeysetCapabilityCheckResult(
+        KeysetCapabilityCheckName.LOWER_EMPTY,
+        KeysetCapabilityCheckOutcome.OUT_OF_INTERVAL_ROWS,
+        out_of_interval_identities=(value,),
+    )
+    value["id"].append(2)
+    assert isinstance(check.out_of_interval_identities[0], FrozenMapping)
+    assert check.out_of_interval_identities[0]["id"] == (1,)  # type: ignore[index]
+    with pytest.raises(TypeError):
+        check.out_of_interval_identities[0]["id"] = ()  # type: ignore[index]
+    checks = tuple(
+        check
+        if name is KeysetCapabilityCheckName.LOWER_EMPTY
+        else KeysetCapabilityCheckResult(name, KeysetCapabilityCheckOutcome.PASSED)
+        for name in KeysetCapabilityCheckName
+    )
+    report = KeysetCapabilityReport(
+        KeysetCapabilityVerdict.UNSUPPORTED,
+        checks,
+        1,
+        1,
+        1,
+        False,
+        None,
+        None,
+        (Violation(ViolationSeverity.BLOCKING, "keyset_capability_out_of_interval_rows", "outside"),),
+        (),
+        False,
+    )
+    assert json.loads(json.dumps(report.to_dict()))["checks"][0]["out_of_interval_identities"] == [{"id": [1]}]
 
 
 def test_batch_dispatch_coalesce_wait_is_closed() -> None:
@@ -671,6 +726,7 @@ def test_fast_keyset_lane_applies_adapter_only_to_publishable_phases() -> None:
     rejected = validate(KeysetPhase.BODY)
     assert isinstance(rejected, ReceiptRejection)
     assert isinstance(rejected.error, PageAdaptationError)
+    assert rejected.violation.code == "page_adaptation"
 
 
 @pytest.mark.asyncio
@@ -901,6 +957,98 @@ async def test_zero_coalesce_never_subscribes_to_producer_waits(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+async def test_exhausted_single_producer_skips_wait_for_one_hundred_sequential_waves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_wait(_state: _ProducerState, _seen: int) -> object:
+        raise AssertionError("an exhausted producer must not arm a coalescing wait")
+
+    delays: list[float] = []
+
+    def observe_wave(_dispatcher: _BatchPageDispatcher, _commands: int, delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(_ProducerState, "changed", reject_wait)
+    monkeypatch.setattr(_BatchPageDispatcher, "_observe_wave", observe_wave)
+    executor = Executor(CursorBatchTransport({"a": ()}))
+    context = executor.context(
+        ExecutionPolicy(max_pages=150, max_pages_per_reference=150, max_buffered_rows=2),
+    )
+    await context.start()
+    state = _ProducerState({"r0"}, {"r0": 0}, source_terminal=True)
+    buffer = _RowBuffer(2, context, producer_state=state)
+    dispatcher = _BatchPageDispatcher(
+        executor,
+        context,
+        BatchDispatch(batch_size=50, concurrency=1, coalesce_wait=0.020),
+        producer_state=state,
+        buffer=buffer,
+        page_cap=1,
+    )
+    for _ in range(101):
+        page = await dispatcher.fetch(Request("item.list", {"parent": "a"}), "r0")
+        assert page.admission is not None
+        assert page.settlement is not None
+        page.admission.set_result(None)
+        page.settlement.set_result(None)
+    assert len(delays) == 101
+    assert all(delay == 0 for delay in delays)
+    await dispatcher.aclose()
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_singular_cursor_deep_pagination_stays_on_the_direct_no_coalescer_path() -> None:
+    transport = CursorBatchTransport({"a": tuple(range(1, 121))})
+    stream = _client(transport).iter_list_cursor(
+        Request("item.list", {"parent": "a"}),
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=1,
+    )
+    assert len([row async for row in stream]) == 120
+    assert len(transport.requests) == 121
+    assert all(request.method == "item.list" for request in transport.requests)
+
+
+@pytest.mark.asyncio
+async def test_exhausted_ten_parent_deep_pagination_fills_every_wave_without_deadline_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations: list[tuple[int, float]] = []
+
+    def observe_wave(_dispatcher: _BatchPageDispatcher, commands: int, delay: float) -> None:
+        observations.append((commands, delay))
+
+    monkeypatch.setattr(_BatchPageDispatcher, "_observe_wave", observe_wave)
+    rows = {str(index): tuple(range(index * 1000 + 1, index * 1000 + 101)) for index in range(10)}
+    transport = CursorBatchTransport(rows)
+    stream = _client(
+        transport,
+        policy=ExecutionPolicy(
+            max_active_references=10,
+            max_buffered_rows=20,
+            max_pages=1200,
+            max_pages_per_reference=120,
+        ),
+    ).iter_cursors(
+        Request("item.list", {"parent": "base"}),
+        [Binding(key, (ParameterUpdate(ParameterPath(("parent",)), key),), key) for key in rows],
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=1,
+        dispatch=BatchDispatch(batch_size=10, concurrency=1, coalesce_wait=0.020),
+    )
+
+    events = [event async for event in stream]
+    assert len(events) == 1010
+    assert len(observations) >= 100
+    assert sum(commands for commands, _delay in observations) == 1010
+    assert all(commands == 10 for commands, _delay in observations)
+    assert all(delay < 0.020 for _commands, delay in observations)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("seed", range(4))
 async def test_capacity_saturated_jitter_preserves_every_page_and_releases_state(seed: int) -> None:
     count = 12
@@ -994,3 +1142,18 @@ async def test_producer_state_broadcast_and_capacity_predicate_parity() -> None:
     assert dispatcher._potential({"r0"}) == 0
     await blocked_buffer.abort(held)
     await blocked_buffer.close()
+
+    queued_pull = _ProducerState(set(), {"r0": 0}, next_key="r1", next_index=1)
+    pull_buffer = _RowBuffer(2, context, producer_state=queued_pull)
+    pull_dispatcher = _BatchPageDispatcher(
+        executor,
+        context,
+        BatchDispatch(batch_size=2, coalesce_wait=1),
+        producer_state=queued_pull,
+        buffer=pull_buffer,
+        page_cap=1,
+    )
+    assert pull_dispatcher._potential({"r0"}) == 0
+    queued_pull.source_pull_in_flight = True
+    assert pull_dispatcher._potential({"r0"}) == 1
+    await pull_buffer.close()

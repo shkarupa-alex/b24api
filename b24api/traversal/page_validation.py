@@ -15,6 +15,7 @@ from b24api.errors import (
     AmbiguousExecutionError,
     CapabilityError,
     EnvelopeContractError,
+    PageAdaptationError,
     PaginationError,
     ProtocolError,
 )
@@ -184,6 +185,8 @@ def validate_lane_receipt(  # noqa: PLR0913
             witness,
             (),
         )
+    except PageAdaptationError as error:
+        return _rejection(plan, str(error), code="page_adaptation", selected_rows=len(rows), error=error)
     except (CapabilityError, PaginationError) as error:
         return _rejection(plan, str(error), code="range_contradiction", selected_rows=len(rows), error=error)
 

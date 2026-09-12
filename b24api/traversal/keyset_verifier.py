@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import itertools
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from b24api.batch.engine import BatchExecutor
@@ -343,14 +343,19 @@ class _Verifier:
                     contradictory[left].add(value)
                     contradictory[right].add(value)
         return tuple(
-            replace(
-                check,
-                outcome=(
+            KeysetCapabilityCheckResult(
+                check.name,
+                (
                     KeysetCapabilityCheckOutcome.CROSS_CANARY_CONTRADICTION
                     if values and check.outcome not in _PROOF
                     else check.outcome
                 ),
-                contradictory_identities=tuple(sorted(values)),
+                check.rows_selected,
+                check.out_of_interval_identities,
+                check.missing_in_interval_identities,
+                check.extra_in_interval_identities,
+                tuple(sorted(values)),
+                check.recheck,
             )
             for check, values in zip(checks, contradictory, strict=True)
         )
@@ -376,10 +381,21 @@ class _Verifier:
             still,
             gone,
             tuple(value for value in contradictory if value in selected),
-            truncated,
+            truncated=truncated,
         )
         updated = tuple(
-            replace(check, recheck=recheck) if check.outcome is not KeysetCapabilityCheckOutcome.PASSED else check
+            KeysetCapabilityCheckResult(
+                check.name,
+                check.outcome,
+                check.rows_selected,
+                check.out_of_interval_identities,
+                check.missing_in_interval_identities,
+                check.extra_in_interval_identities,
+                check.contradictory_identities,
+                recheck,
+            )
+            if check.outcome is not KeysetCapabilityCheckOutcome.PASSED
+            else check
             for check in checks
         )
         if contradictory:

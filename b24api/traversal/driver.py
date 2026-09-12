@@ -328,8 +328,6 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._total_semantics = effective.total_semantics
         self._order_direction = effective.order_direction
         self._confirmation_policy = effective.confirmation_policy
-        if type(self.page_adapter) is not IdentityPageAdapter and not self._adaptation_specs():
-            raise CapabilityError("custom page adapter requires a traversal identity to prove row order")
         self._preflight_controls()
 
     def _preflight_controls(self) -> None:

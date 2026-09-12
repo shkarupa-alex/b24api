@@ -59,6 +59,29 @@ def _imports(path: Path) -> set[str]:
     return result
 
 
+class _ResponseItemsVisitor(ast.NodeVisitor):
+    def __init__(self, relative: str, call_sites: set[tuple[str, str]]) -> None:
+        self.relative = relative
+        self.call_sites = call_sites
+        self.stack: list[str] = []
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self.stack.append(node.name)
+        self.generic_visit(node)
+        self.stack.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Name) and node.func.id == "_response_items":
+            self.call_sites.add((self.relative, self.stack[-1]))
+        self.generic_visit(node)
+
+
 def test_runtime_layer_import_boundaries_are_acyclic_and_evidence_free() -> None:
     for path in _sources():
         imports = _imports(path)
@@ -165,6 +188,42 @@ def test_removed_modules_symbols_and_storage_backends_are_absent() -> None:
     ):
         assert removed not in runtime
     assert "sqlite" not in runtime.casefold()
+    forbidden_imports = ("sqlalchemy", "django.db", "peewee", "sqlmodel", "tortoise")
+    assert not any(
+        name == forbidden or name.startswith(f"{forbidden}.")
+        for path in _sources()
+        for name in _imports(path)
+        for forbidden in forbidden_imports
+    )
+    assert "im.dialog.messages.get" not in runtime
+    assert "ImMessagePageAdapter" not in runtime
+
+
+def test_response_selection_funnels_and_dead_batch_sentinel_stay_closed() -> None:
+    call_sites: set[tuple[str, str]] = set()
+    for path in _sources():
+        relative = path.relative_to(PACKAGE).as_posix()
+        _ResponseItemsVisitor(relative, call_sites).visit(ast.parse(path.read_text(encoding="utf-8")))
+
+    assert call_sites == {
+        ("traversal/driver.py", "select_page"),
+        ("traversal/keyset_verifier.py", "_identities"),
+        ("traversal/keyset_verifier.py", "_record_response"),
+        ("traversal/page_validation.py", "select_rows"),
+        ("traversal/page_validation.py", "validate_lane_receipt"),
+    }
+    dispatch = (PACKAGE / "references" / "dispatch.py").read_text(encoding="utf-8")
+    assert "self._queue: asyncio.Queue[_PendingBatch]" in dispatch
+    tree = ast.parse(dispatch)
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"put", "put_nowait"}
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value is None
+        for node in ast.walk(tree)
+    )
 
 
 def test_project_configuration_has_no_removed_v1_runtime_or_test_knobs() -> None:
