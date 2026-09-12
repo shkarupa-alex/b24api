@@ -40,6 +40,7 @@ from b24api import (
     PageAdaptationError,
     PageAdaptationViolation,
     PageAdapter,
+    PageRejectionCode,
     ParameterPath,
     ParameterUpdate,
     ReferenceComplete,
@@ -379,6 +380,7 @@ async def test_page_adapter_violations_are_typed_atomic_and_value_free(violation
     assert error.retryable is False
     assert error.page_offset == 0
     assert stream.report.emitted == 0
+    assert stream.report.page_trace[-1].rejection_code is PageRejectionCode.PAGE_ADAPTATION
     safe = repr(error.to_safe_dict())
     assert "author_id" not in safe
     assert "sensitive application detail" not in safe
@@ -1173,3 +1175,31 @@ async def test_producer_state_broadcast_and_capacity_predicate_parity() -> None:
     queued_pull.source_pull_in_flight = True
     assert pull_dispatcher._potential({"r0"}) == 1
     await pull_buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_settling_wave_counts_only_a_concrete_capacity_blocked_admission() -> None:
+    executor = Executor(CursorBatchTransport({"a": ()}))
+    context = executor.context(
+        ExecutionPolicy(max_pages=2, max_pages_per_reference=2, max_buffered_rows=1),
+    )
+    await context.start()
+    state = _ProducerState(set(), {"r0": 0}, admitting={"r0"}, source_terminal=True)
+    buffer = _RowBuffer(1, context, producer_state=state)
+    held = await buffer.reserve(0, 1)
+    dispatcher = _BatchPageDispatcher(
+        executor,
+        context,
+        BatchDispatch(batch_size=2, coalesce_wait=1),
+        producer_state=state,
+        buffer=buffer,
+        page_cap=1,
+    )
+    assert dispatcher._potential({"other"}) == 0
+    dispatcher._settling_waves = 1
+    assert dispatcher._potential({"other"}) == 1
+    state.admitting.clear()
+    state.source_terminal = False
+    assert dispatcher._potential({"other"}) == 0
+    await buffer.abort(held)
+    await buffer.close()

@@ -38,6 +38,7 @@ from b24api.errors import (
     AmbiguousExecutionError,
     CapabilityError,
     IdentityContractError,
+    PageAdaptationError,
     PaginationError,
     ResultShapeError,
 )
@@ -592,6 +593,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
     ) -> None:
         if isinstance(error, IdentityContractError):
             code = PageRejectionCode.IDENTITY_CONTRACT
+        elif isinstance(error, PageAdaptationError):
+            code = PageRejectionCode.PAGE_ADAPTATION
         elif isinstance(error, ResultShapeError):
             code = PageRejectionCode.SHAPE_CONTRACT
         elif isinstance(error, _PageRejectionError):

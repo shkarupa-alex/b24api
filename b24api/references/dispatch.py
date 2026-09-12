@@ -568,8 +568,7 @@ class _BatchPageDispatcher:
             key not in chunk_keys
             and key in state.indexes
             and not (
-                self.context.can_reserve_page(reference=key)
-                and buffer.can_reserve(state.indexes[key], self._page_cap)
+                self.context.can_reserve_page(reference=key) and buffer.can_reserve(state.indexes[key], self._page_cap)
             )
             for key in state.admitting
             if self._pending_continuations_can_progress and (self._active_sends > 0 or self._settling_waves > 0)
