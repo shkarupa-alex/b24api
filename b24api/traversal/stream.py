@@ -8,7 +8,8 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
 from typing import TYPE_CHECKING, Self, cast
 
-from b24api.contracts.json import JsonValue
+from b24api.contracts.json import JsonValue, _thaw_json
+from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import (
     CompletionAssurance,
     ExecutionPolicy,
@@ -35,6 +36,8 @@ if TYPE_CHECKING:
         ListPlan,
     )
 
+_IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
+
 
 class ItemStream(AsyncIterator[JsonValue]):
     """Lazy item traversal stream with deterministic cleanup and final report."""
@@ -50,6 +53,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         policy: ExecutionPolicy | None = None,
         page_cap_hint: int | None = None,
         assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
+        page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
     ) -> None:
         """Initialize instance state."""
         PaginationDriver.validate_plan(plan)
@@ -62,6 +66,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             identity=identity,
             context=self._context,
             page_cap_hint=page_cap_hint,
+            page_adapter=page_adapter,
         )
         self._assurance = assurance
         self._runner: AsyncGenerator[tuple[JsonValue, bool]] | None = None
@@ -144,7 +149,7 @@ class ItemStream(AsyncIterator[JsonValue]):
                 while buffered:
                     item, is_unique = buffered.popleft()
                     await self._context.set_buffered_rows(len(buffered) + 1)
-                    yield item, is_unique
+                    yield _thaw_json(item), is_unique
                     await self._context.set_buffered_rows(len(buffered))
             naturally_exhausted = True
             await self._finalize(KernelState.COMPLETED, self._driver.terminal_reason or "terminal confirmed")
@@ -304,6 +309,7 @@ def iter_list(  # noqa: PLR0913
     policy: ExecutionPolicy | None = None,
     _page_cap_hint: int | None = None,
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
+    _page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
 ) -> ItemStream:
     """Construct a lazy canonical item stream without performing I/O."""
     return ItemStream(
@@ -315,4 +321,5 @@ def iter_list(  # noqa: PLR0913
         policy=policy,
         page_cap_hint=_page_cap_hint,
         assurance=_assurance,
+        page_adapter=_page_adapter,
     )

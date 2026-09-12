@@ -12,7 +12,7 @@ from b24api.traversal.page_validation import LaneCommandPlan
 
 if TYPE_CHECKING:
     from b24api.batch.outcome import BatchOutcome
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson
     from b24api.contracts.keyset_execution import ClosureWitness
     from b24api.contracts.request import Request
     from b24api.contracts.response import Response
@@ -32,13 +32,13 @@ class KeysetTransactionState:
     terminal: bool = False
     finishing: bool = False
     lanes: list[LaneState] = field(default_factory=list)
-    lane_rows: dict[int, list[JsonValue]] = field(default_factory=dict)
+    lane_rows: dict[int, list[FrozenJson]] = field(default_factory=dict)
     lane_identities: dict[int, list[int]] = field(default_factory=dict)
     lane_commands: dict[int, list[tuple[str, int]]] = field(default_factory=dict)
     lane_index: int = 0
-    anchor_rows: dict[int, JsonValue] = field(default_factory=dict)
+    anchor_rows: dict[int, FrozenJson] = field(default_factory=dict)
     anchor_commands: dict[int, str] = field(default_factory=dict)
-    pending: deque[tuple[JsonValue, ...]] = field(default_factory=deque)
+    pending: deque[tuple[FrozenJson, ...]] = field(default_factory=deque)
     buffer_balance: int = 0
     finish_cursor: int | None = None
     finish_lane: LaneState | None = None

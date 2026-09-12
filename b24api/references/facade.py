@@ -45,6 +45,7 @@ from b24api.errors import (
     CapabilityError,
     IncompleteTraversalError,
     InputSourceError,
+    PageAdaptationError,
     PaginationError,
     ReferenceFailed,
 )
@@ -55,9 +56,7 @@ from b24api.references.dispatch import (
 )
 from b24api.references.outcome import ReferenceFailure as KernelFailure
 from b24api.references.outcome import ReferenceItem as KernelItem
-from b24api.references.stream import (
-    iter_references as _iter_references,
-)
+from b24api.references.stream import iter_references as _iter_references
 from b24api.traversal.driver import PaginationDriver
 from b24api.traversal.plans import BatchDispatch as KernelBatchDispatch
 from b24api.traversal.plans import (
@@ -220,6 +219,7 @@ def _kernel_dispatch(dispatch: DispatchSpec, policy: ExecutionPolicy) -> Dispatc
         batch_size=min(dispatch.batch_size, policy.max_buffered_commands),
         concurrency=min(dispatch.concurrency, policy.max_active_references),
         output_order=_output_order(dispatch.output_order),
+        coalesce_wait=dispatch.coalesce_wait,
     )
 
 
@@ -246,7 +246,10 @@ class _ReferenceEventMapper:
         if event.not_executed_reason is not None:
             return ReferenceNotExecuted(context.index, context.correlation, event.not_executed_reason)
         error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("reference failed")
-        if isinstance(error, PaginationError) or (isinstance(error, CapabilityError) and event.page_state > 0):
+        application_failure = isinstance(error, PageAdaptationError) and event.partial_rows == 0
+        if isinstance(error, PaginationError) or (
+            isinstance(error, CapabilityError) and event.page_state > 0 and not application_failure
+        ):
             incomplete_cause = error
             error = IncompleteTraversalError(
                 report=OperationReport(
@@ -323,6 +326,7 @@ def kernel_reference_stream[C](
         selector=selector,
         identity=identity,
         context=executor.context(policy),
+        page_adapter=traversal.page_adapter,
     )
     preflight._validate_capabilities()  # noqa: SLF001 - reject base controls before consuming caller input
     executor._preflight_request(base)  # noqa: SLF001 - reject transport representation before caller input
@@ -340,6 +344,7 @@ def kernel_reference_stream[C](
         _emit_complete=True,
         _capture_fail_fast=not tolerant,
         _page_cap_hint=traversal.page_size,
+        _page_adapter=traversal.page_adapter,
     )
     return cast("ReferenceKernelStream", stream)
 
@@ -389,11 +394,6 @@ __all__ = [
     "BindingSource",
     "KernelReferenceEvent",
     "ReferenceKernelStream",
-    "_ReferenceEventMapper",
-    "_reference_error",
-    "_reference_error_items",
-    "_reference_terminal",
-    "_reference_variant",
     "kernel_reference_stream",
     "reference_stream",
 ]

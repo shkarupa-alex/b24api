@@ -13,6 +13,13 @@ from b24api import (
     AutoKeysetExecution,
     CursorSpec,
     IdentitySpec,
+    KeysetCapabilityCheckName,
+    KeysetCapabilityCheckOutcome,
+    KeysetCapabilityCheckResult,
+    KeysetCapabilityError,
+    KeysetCapabilityReport,
+    KeysetCapabilityVerdict,
+    KeysetInconclusiveReason,
     KeysetSpec,
     OffsetSpec,
     OperationReport,
@@ -22,12 +29,19 @@ from b24api import (
     ReplaySafety,
     Request,
     Response,
+    ResultCollectionShape,
     ResultSelector,
     TerminalState,
     TraversalAssurance,
     cli,
 )
-from b24api.cli_contract import CliUsageError, parse_keyset_execution
+from b24api.cli_contract import (
+    CliUsageError,
+    ListContractRoute,
+    parse_keyset_execution,
+    parse_list_contract,
+    parse_verify_keyset_contract,
+)
 from b24api.contracts import IdentityCoercion
 from b24api.errors import CapabilityError, IncompleteTraversalError, ProtocolError
 
@@ -38,10 +52,23 @@ _USAGE = 2
 _UNAVAILABLE = 3
 _CORRECTNESS = 4
 _OUTPUT_CLOSED = 5
+_KEYSET_UNSUPPORTED = 6
+_KEYSET_INCONCLUSIVE = 7
 _INTERRUPTED = 130
+_DEFAULT_PAGE_SIZE = 50
 
 
 def test_keyset_execution_json_is_closed_and_routes_all_fast_modes() -> None:
+    assert isinstance(parse_keyset_execution(None), AutoKeysetExecution)
+    assert isinstance(parse_keyset_execution({}), AutoKeysetExecution)
+    route = ListContractRoute(
+        "keyset",
+        ResultSelector.root(),
+        IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER),
+        50,
+        KeysetSpec(),
+    )
+    assert isinstance(route.execution, AutoKeysetExecution)
     range_execution = parse_keyset_execution(
         {"kind": "range", "page_completion": "short_page_exhausts", "window_width": 2, "batch_size": 7},
     )
@@ -176,6 +203,33 @@ def _contract(tmp_path: Path, value: dict[str, object]) -> str:
     return f"@{path}"
 
 
+def _capability_report(
+    verdict: KeysetCapabilityVerdict,
+    *,
+    reason: KeysetInconclusiveReason | None = None,
+) -> KeysetCapabilityReport:
+    outcome = (
+        KeysetCapabilityCheckOutcome.PASSED
+        if verdict is KeysetCapabilityVerdict.VERIFIED
+        else KeysetCapabilityCheckOutcome.OUT_OF_INTERVAL_ROWS
+        if verdict is KeysetCapabilityVerdict.UNSUPPORTED
+        else KeysetCapabilityCheckOutcome.NOT_EXECUTED
+    )
+    return KeysetCapabilityReport(
+        verdict=verdict,
+        checks=tuple(KeysetCapabilityCheckResult(name, outcome) for name in KeysetCapabilityCheckName),
+        physical_requests=2,
+        batch_waves=2,
+        logical_commands=7,
+        cross_digit_pair_exercised=False,
+        inconclusive_reason=reason,
+        inconclusive_detail=reason.value if reason is not None else None,
+        violations=(),
+        page_trace=(),
+        page_trace_truncated=False,
+    )
+
+
 @pytest.mark.parametrize("safety", list(ReplaySafety))
 def test_call_routes_replay_safety_and_keeps_success_data_on_stdout(
     monkeypatch: pytest.MonkeyPatch,
@@ -253,6 +307,93 @@ def test_parameter_file_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     code, _, _ = _run(monkeypatch, client, ["call", "test.get", "--params", f"@{path}"])
     assert code == 0
     assert client.calls[0].request.copy_parameters() == {"ID": 1}
+
+
+def test_verify_keyset_contract_golden_and_collection_shape_is_route_local() -> None:
+    contract = {
+        "version": 1,
+        "selector": ["items"],
+        "identity": {
+            "item_path": ["ID"],
+            "filter_key": "ID",
+            "order_key": "ID",
+            "coercion": "decimal_string_integer",
+        },
+        "keyset": {
+            "filter_path": ["filter"],
+            "order_path": ["order"],
+            "limit_path": ["limit"],
+            "direction": "ascending",
+            "allow_create_controls": True,
+        },
+        "collection_shape": "mapping_values_or_empty",
+        "page_size": 50,
+    }
+    route = parse_verify_keyset_contract(contract)
+    assert route.selector == ResultSelector(("items",))
+    assert route.collection_shape is ResultCollectionShape.MAPPING_VALUES_OR_EMPTY
+    assert route.page_size == _DEFAULT_PAGE_SIZE
+    with pytest.raises(CliUsageError, match="unknown fields"):
+        parse_verify_keyset_contract({**contract, "dispatch": {}})
+    with pytest.raises(CliUsageError, match="collection_shape"):
+        parse_verify_keyset_contract({**contract, "collection_shape": "unknown"})
+    with pytest.raises(CliUsageError, match="unknown fields"):
+        parse_list_contract("keyset", {**contract, "collection_shape": "sequence"})
+
+
+@pytest.mark.parametrize(
+    ("report", "exit_code"),
+    [
+        (_capability_report(KeysetCapabilityVerdict.VERIFIED), 0),
+        (_capability_report(KeysetCapabilityVerdict.UNSUPPORTED), _KEYSET_UNSUPPORTED),
+        *(
+            (
+                _capability_report(KeysetCapabilityVerdict.INCONCLUSIVE, reason=reason),
+                _KEYSET_INCONCLUSIVE,
+            )
+            for reason in KeysetInconclusiveReason
+        ),
+    ],
+)
+def test_verify_keyset_cli_prints_one_report_for_every_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    report: KeysetCapabilityReport,
+    exit_code: int,
+) -> None:
+    contract = _contract(
+        tmp_path,
+        {
+            "version": 1,
+            "selector": [],
+            "identity": {
+                "item_path": ["ID"],
+                "filter_key": "ID",
+                "order_key": "ID",
+                "coercion": "exact_integer",
+            },
+            "keyset": {"filter_path": ["filter"], "order_path": ["order"]},
+        },
+    )
+
+    async def fake_verify(_request: Request, _route: object, stdout: io.StringIO) -> None:
+        if report.verdict is KeysetCapabilityVerdict.VERIFIED:
+            stdout.write(json.dumps(report.to_dict()) + "\n")
+            return
+        raise KeysetCapabilityError(report=report)
+
+    monkeypatch.setattr(cli, "_verify_keyset", fake_verify)
+    stdout, stderr = io.StringIO(), io.StringIO()
+    code = cli.main(
+        ["verify-keyset", "test.list", "--contract", contract],
+        stdin=io.StringIO(),
+        stdout=stdout,
+        stderr=stderr,
+    )
+    assert code == exit_code
+    assert json.loads(stdout.getvalue())["verdict"] == report.verdict.value
+    assert len(stdout.getvalue().splitlines()) == 1
+    assert stderr.getvalue() == ""
 
 
 @pytest.mark.parametrize(

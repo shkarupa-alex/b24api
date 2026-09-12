@@ -191,6 +191,10 @@ class Response:
         """Return the result."""
         return _thaw_json(self._result)
 
+    def _frozen_result(self) -> FrozenJson:
+        """Return the operation-internal immutable result snapshot."""
+        return self._result
+
     def list_items(self, selector: ResultSelector | None = None) -> list[JsonValue]:
         """Return list items selected from the response result."""
         selector = selector or ResultSelector.root()

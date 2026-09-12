@@ -119,6 +119,17 @@ class _ExampleClient:
     def iter_list_cursor(self, request: Request, **kwargs: object) -> _ExampleStream[object]:
         return self.iter_list(request, **kwargs)
 
+    def iter_cursors(
+        self,
+        request: Request,
+        bindings: Iterable[object],
+        **kwargs: object,
+    ) -> _ExampleStream[object]:
+        return self.iter_references(request, bindings, **kwargs)
+
+    async def verify_keyset_capability(self, _request: Request, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(verdict="verified")
+
     def iter_references(
         self,
         _request: Request,
@@ -201,6 +212,11 @@ async def test_every_recipe_python_example_executes_exactly_without_io() -> None
     for source in PYTHON_BLOCK.findall(RECIPES.read_text(encoding="utf-8")):
         namespace: dict[str, object] = {
             "client": client,
+            "checkpoints": {1: 0, 2: 10},
+            "cursor": object(),
+            "identity": IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
+            "keyset": object(),
+            "parent_ids": (1, 2),
             "request": Request("example.item.list", replay_safety=ReplaySafety.SAFE),
             "write_file": lambda *_args, **_kwargs: None,
         }

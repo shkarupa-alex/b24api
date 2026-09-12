@@ -3,7 +3,8 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from b24api.contracts.keyset_execution import KeysetExecution, SequentialKeysetExecution
+from b24api.contracts.keyset_execution import AutoKeysetExecution, KeysetExecution, StableIntegerKeysetContract
+from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.request import IdentitySpec, RequestLike, ResultSelector, TraversalIdentity, canonical_request
 from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import CursorSpec, KeysetSpec, OffsetSpec, TotalTermination
@@ -21,7 +22,8 @@ _ROOT_SELECTOR = ResultSelector.root()
 _DEFAULT_OFFSET = OffsetSpec()
 _DEFAULT_COUNTED_OFFSET = OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED)
 _DEFAULT_KEYSET = KeysetSpec()
-_DEFAULT_SEQUENTIAL_KEYSET_EXECUTION = SequentialKeysetExecution()
+_DEFAULT_AUTO_KEYSET_EXECUTION = AutoKeysetExecution(StableIntegerKeysetContract())
+_IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 
 class _TraversalFacade:
@@ -51,6 +53,7 @@ class _TraversalFacade:
         collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
         page_size: int = 50,
         offset: OffsetSpec = _DEFAULT_OFFSET,
+        page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         policy: ExecutionPolicy | None = None,
     ) -> OperationStream[JsonValue]:
         """Return conservative sequential offset/server-next traversal."""
@@ -66,6 +69,7 @@ class _TraversalFacade:
                 collection_shape=collection_shape,
                 page_size=page_size,
                 offset=offset,
+                page_adapter=page_adapter,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
                 audit_violations=(() if audit_violation is None else (audit_violation,)),
@@ -82,6 +86,7 @@ class _TraversalFacade:
         page_size: int = 50,
         batch_size: int | None = None,
         offset: OffsetSpec = _DEFAULT_COUNTED_OFFSET,
+        page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         policy: ExecutionPolicy | None = None,
     ) -> OperationStream[JsonValue]:
         """Return exact direct-head plus physically batched counted traversal."""
@@ -98,6 +103,7 @@ class _TraversalFacade:
                 page_size=page_size,
                 batch_size=batch_size,
                 offset=offset,
+                page_adapter=page_adapter,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
                 audit_violations=(() if audit_violation is None else (audit_violation,)),
@@ -113,10 +119,11 @@ class _TraversalFacade:
         collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
         page_size: int = 50,
         keyset: KeysetSpec = _DEFAULT_KEYSET,
-        execution: KeysetExecution = _DEFAULT_SEQUENTIAL_KEYSET_EXECUTION,
+        execution: KeysetExecution = _DEFAULT_AUTO_KEYSET_EXECUTION,
+        page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         policy: ExecutionPolicy | None = None,
     ) -> OperationStream[JsonValue]:
-        """Return exact sequential no-count keyset traversal."""
+        """Return automatic no-count keyset traversal with explicit execution override."""
         self._require_open()
         canonical = canonical_request(request)
         audit_violation = self._audit_unknown(canonical)
@@ -130,6 +137,7 @@ class _TraversalFacade:
                 page_size=page_size,
                 keyset=keyset,
                 execution=execution,
+                page_adapter=page_adapter,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
                 audit_violations=(() if audit_violation is None else (audit_violation,)),
@@ -145,6 +153,7 @@ class _TraversalFacade:
         identity: IdentitySpec | None = None,
         collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
         page_size: int = 50,
+        page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         policy: ExecutionPolicy | None = None,
     ) -> OperationStream[JsonValue]:
         """Return strict dependent cursor traversal with empty confirmation."""
@@ -160,6 +169,7 @@ class _TraversalFacade:
                 identity=identity,
                 collection_shape=collection_shape,
                 page_size=page_size,
+                page_adapter=page_adapter,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
                 audit_violations=(() if audit_violation is None else (audit_violation,)),

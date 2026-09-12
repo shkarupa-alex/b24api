@@ -15,8 +15,10 @@ client does not contain endpoint catalogs, persistence, business reconciliation 
 | Independent command fan-out | `fan_out()` / `fan_out_outcomes()` | Explicit dispatch mode, concurrency and delivery order. |
 | Sequential offset list | `iter_list()` | Server-continuation validation and terminal empty-page confirmation. |
 | Counted list | `iter_list_counted()` | Direct head, batched tail and exact total/range/identity validation. |
-| No-count keyset | `iter_list_keyset()` | Compatible sequential default plus explicit range, partitioned, or deterministic auto execution for caller-asserted stable integer keysets. |
+| No-count keyset | `iter_list_keyset()` | Deterministic auto default plus explicit sequential, range, or partitioned execution for caller-asserted stable integer keysets. |
 | Dependent cursor | `iter_list_cursor()` | Strict unique monotonic cursor progress. |
+| Correlated cursor set | `iter_cursors()` | Lazy one/many-parent cursor traversal with isolated seeds and shared batching. |
+| Keyset qualification | `verify_keyset_capability()` | Explicit fail-closed strict-bound report for one portal and request shape. |
 | Per-parent traversal | `iter_references()` / `iter_reference_outcomes()` | Isolated traversal state and correlation for every accepted binding. |
 | Shell access | `b24api call` / `b24api list` | JSON/JSONL stdout and diagnostics on stderr. |
 
@@ -78,8 +80,15 @@ Page evidence contains only bounded counters and enum classifications—never ro
 parameters, headers, URLs, or body fragments.
 
 Fast keyset execution has a planning barrier before emission. Boundary-only and automatic
-sequential continuation rely on the same ordered-prefix assurance as the default; numeric range and
-partition plans must first pass bounded capability canaries. Advisory totals are isolated from
+sequential continuation rely on the same ordered-prefix assurance as sequential traversal; numeric
+range and partition plans are caller-asserted and retain positive bound validation on every page.
+The separate verifier owns diagnostic canaries and never changes runtime mode. Advisory totals are isolated from
 completion and admission. One scheduler owns wave correlation, ordered admission, row-buffer deltas,
 finishing continuation, cleanup, and the immutable selection report. Stateless transaction functions
 execute its batch/body/finish I/O but define no scheduler class or persistent state of their own.
+
+Selection and validation operate on the response's existing frozen tree. A synchronous `PageAdapter`
+is invoked once at the two canonical row funnels (driver and fast-keyset receipt) before commit;
+published rows alone are thawed. Reference cursor drivers share a capacity-aware dispatcher whose
+absolute per-wave coalescing deadline defaults to 20 ms and is skipped when no eligible producer can
+add a command.

@@ -27,6 +27,7 @@ from b24api import (
     ReplaySafety,
     Request,
     ResultSelector,
+    SequentialKeysetExecution,
     SequentialTraversal,
     Settings,
     TerminalState,
@@ -284,6 +285,7 @@ async def test_distinct_item_filter_order_paths_are_exact() -> None:
         selector=ResultSelector.root(),
         identity=_identity(item_path=("id",), filter_key="ID", order_key="id"),
         page_size=1,
+        execution=SequentialKeysetExecution(),
     )
 
     assert [row async for row in stream] == [{"id": 1}, {"id": 2}]

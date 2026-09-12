@@ -71,12 +71,17 @@ harness-produced observations for that portal cell, not general latency promises
 
 ## Boundaries
 
-- Sequential no-count traversal remains the conservative default. Explicit range, partitioned, and
-  auto keyset modes recover physical batching only under a caller-asserted stable integer-keyset
-  contract; they pay a planning barrier even when the consumer stops early.
+- Auto is the default for direct no-count keyset traversal and may select boundary-only,
+  sequential, range, or partitioned execution under the caller-asserted stable integer-keyset
+  contract. It pays a planning barrier even when the consumer stops early; pass
+  `SequentialKeysetExecution()` explicitly to retain request-by-request traversal.
 - A returned `total` is advisory only and may raise an auto cost estimate. It never closes a lane or
-  strengthens correctness evidence. The terminal report records both the selected plan and whether
-  assurance came from the ordered prefix alone or from validated numeric-bound canaries.
+  strengthens correctness evidence. Normal range/partition reports use caller-asserted bounds and
+  retain zero-valued legacy canary counters; explicit verification is a separate operation.
+- Reference `BatchDispatch` uses an absolute, capacity-aware coalescing deadline of 20 ms per
+  underfilled wave. Full waves and waves with no eligible producers leave immediately;
+  `coalesce_wait=0` is the low-latency opt-out. With multiple workers, only aggregate work
+  conservation—not an exact command split per physical batch—is guaranteed.
 - Real portal latency, server work and network variance require a separately controlled live A/B.
 - Exact counted traversal retains identities for the operation lifetime; large exact traversals may
   therefore use substantial memory and emit a warning above 100,000 identities.

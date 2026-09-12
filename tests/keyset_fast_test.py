@@ -33,6 +33,7 @@ from b24api import (
     RangeKeysetExecution,
     Request,
     ResultSelector,
+    SequentialKeysetExecution,
     StableIntegerKeysetContract,
     TerminalState,
     TotalHintMode,
@@ -41,10 +42,11 @@ from b24api import (
 from b24api.cli import _report_json
 from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.contracts.report import PageDispatch
-from b24api.errors import CapabilityError, IncompleteTraversalError
+from b24api.errors import CapabilityError, IncompleteTraversalError, ResultShapeError
 from b24api.execution import Executor, WireResponse
 from b24api.traversal import keyset_scheduler, page_validation
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
+from b24api.traversal.keyset_costs import estimates
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
 from b24api.traversal.keyset_fast_stream import FastTraceRecorder
 from b24api.traversal.keyset_observation import PageObservation
@@ -169,6 +171,27 @@ class MalformedBatchEnvelopeTransport(KeysetTransport):
                 response.headers,
                 encoded.replace(key_prefix, f"{key_prefix}[],{key_prefix}", 1).encode(),
             )
+        return WireResponse(
+            response.status_code,
+            response.headers,
+            json.dumps(payload, separators=(",", ":")).encode(),
+        )
+
+
+class MalformedCommandResultTransport(KeysetTransport):
+    """Replace one correlated command result with a non-collection value."""
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        response = await super().send(
+            request,
+            attempt_timeout=attempt_timeout,
+            max_response_bytes=max_response_bytes,
+        )
+        if request.method != "batch":
+            return response
+        payload = json.loads(response.body)
+        results = payload["result"]["result"]
+        results[next(iter(results))] = {"not": "a sequence"}
         return WireResponse(
             response.status_code,
             response.headers,
@@ -333,6 +356,44 @@ def test_window_algebra_fixed_seed_property_tier() -> None:
         assert len(owned) == len(set(owned))
 
 
+@pytest.mark.parametrize("capacity", range(1, 11))
+@pytest.mark.parametrize("target_lanes", range(2, 21))
+def test_zero_canary_partition_planning_always_has_a_positive_exact_wave_count(
+    capacity: int,
+    target_lanes: int,
+) -> None:
+    inputs = SelectorInputs(
+        BoundaryFacts(5, 5, 1, 5, 996, 1000, False, False),
+        effective_page_cap=5,
+        batch_capacity=capacity,
+        target_lanes=target_lanes,
+        max_range_waves=20,
+        range_window_width=None,
+        completion=KeysetPageCompletion.EMPTY_CONFIRMATION,
+        advisory_total=None,
+    )
+    _sequential, range_estimate, partition, _geometry = estimates(inputs, canary_commands=0, finish_requests=1)
+    assert range_estimate.planning_waves == 0
+    expected = 1 if target_lanes <= capacity else (target_lanes + capacity - 1) // capacity
+    assert partition.planning_waves == expected
+
+
+@pytest.mark.asyncio
+async def test_sequential_keyset_deep_pagination_stays_on_the_direct_no_coalescer_path() -> None:
+    transport = KeysetTransport(tuple(range(1, 121)))
+    stream = _client(transport).iter_list_keyset(
+        Request("item.list", parameters={"filter": {"STATUS": "open"}}),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=1,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        execution=SequentialKeysetExecution(),
+    )
+    assert len([row async for row in stream]) == 120
+    assert len(transport.requests) == 121
+    assert all(request.method == "item.list" for request in transport.requests)
+
+
 @pytest.mark.parametrize(
     ("boundary", "completion", "capacity", "expected"),
     [
@@ -352,49 +413,49 @@ def test_window_algebra_fixed_seed_property_tier() -> None:
             BoundaryFacts(50, 50, 3, 300, 4400, 4600, False, False),
             KeysetPageCompletion.SHORT_PAGE_EXHAUSTS,
             50,
-            (Preselected.RANGE, KeysetSelectionReason.RANGE_WITHIN_WAVE_BUDGET, 4099, 822, 922, 19, 3, 249, 17),
+            (Preselected.RANGE, KeysetSelectionReason.RANGE_WITHIN_WAVE_BUDGET, 4099, 822, 922, 19, 2, 249, 17),
         ),
         (
             BoundaryFacts(50, 50, 3, 300, 4400, 4600, False, False),
             KeysetPageCompletion.EMPTY_CONFIRMATION,
             50,
-            (Preselected.PROBE_ANCHORS, KeysetSelectionReason.WIDE_SPAN_PARTITIONING, 4099, 822, 922, 19, 6, 50, 84),
+            (Preselected.PROBE_ANCHORS, KeysetSelectionReason.WIDE_SPAN_PARTITIONING, 4099, 822, 922, 19, 5, 50, 84),
         ),
         (
             BoundaryFacts(50, 50, 1, 50, 71, 120, False, False),
             KeysetPageCompletion.EMPTY_CONFIRMATION,
             50,
-            (Preselected.SEQUENTIAL, KeysetSelectionReason.SMALL_SELECTION, 20, 20, 120, 3, 4, 21, 1),
+            (Preselected.SEQUENTIAL, KeysetSelectionReason.SMALL_SELECTION, 20, 20, 120, 3, 3, 21, 1),
         ),
         (
             BoundaryFacts(50, 50, 1, 50, 151, 200, False, False),
             KeysetPageCompletion.EMPTY_CONFIRMATION,
-            50,
-            (Preselected.SEQUENTIAL, KeysetSelectionReason.INSUFFICIENT_PREDICTED_GAIN, 100, 100, 200, 4, 4, 50, 3),
-        ),
-        (
-            BoundaryFacts(50, 50, 1, 50, 151, 200, False, False),
-            KeysetPageCompletion.SHORT_PAGE_EXHAUSTS,
             50,
             (Preselected.SEQUENTIAL, KeysetSelectionReason.INSUFFICIENT_PREDICTED_GAIN, 100, 100, 200, 4, 3, 50, 3),
         ),
         (
+            BoundaryFacts(50, 50, 1, 50, 151, 200, False, False),
+            KeysetPageCompletion.SHORT_PAGE_EXHAUSTS,
+            50,
+            (Preselected.RANGE, KeysetSelectionReason.RANGE_WITHIN_WAVE_BUDGET, 100, 100, 200, 4, 2, 50, 3),
+        ),
+        (
             BoundaryFacts(50, 50, 1, 50, 301, 350, False, False),
             KeysetPageCompletion.SHORT_PAGE_EXHAUSTS,
             50,
-            (Preselected.RANGE, KeysetSelectionReason.RANGE_WITHIN_WAVE_BUDGET, 250, 250, 350, 7, 3, 50, 6),
+            (Preselected.RANGE, KeysetSelectionReason.RANGE_WITHIN_WAVE_BUDGET, 250, 250, 350, 7, 2, 50, 6),
         ),
         (
             BoundaryFacts(50, 50, 1, 50, 301, 350, False, False),
             KeysetPageCompletion.EMPTY_CONFIRMATION,
             50,
-            (Preselected.PROBE_ANCHORS, KeysetSelectionReason.WIDE_SPAN_PARTITIONING, 250, 250, 350, 7, 4, 50, 6),
+            (Preselected.RANGE, KeysetSelectionReason.RANGE_WITHIN_WAVE_BUDGET, 250, 250, 350, 7, 3, 50, 6),
         ),
         (
             BoundaryFacts(50, 50, 1, 50, 510000, 1000000, False, False),
             KeysetPageCompletion.SHORT_PAGE_EXHAUSTS,
             50,
-            (Preselected.RANGE, KeysetSelectionReason.RANGE_WITHIN_WAVE_BUDGET, 509949, 105, 205, 5, 3, 245025, 3),
+            (Preselected.RANGE, KeysetSelectionReason.RANGE_WITHIN_WAVE_BUDGET, 509949, 105, 205, 5, 2, 245025, 3),
         ),
         (
             BoundaryFacts(50, 50, 3, 300, 4400, 4600, False, False),
@@ -407,7 +468,7 @@ def test_window_algebra_fixed_seed_property_tier() -> None:
                 822,
                 922,
                 19,
-                23,
+                18,
                 249,
                 17,
             ),
@@ -440,48 +501,48 @@ def test_frozen_selector_decision_table(
     ) == expected
     expected_details = {
         (BoundaryFacts(0, 0, None, None, None, None, False, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
-            (0, 2, 0, 1, True),
+            (0, 2, 0, 0, True),
             (3, 1, 1, 1, 1),
         ),
         (BoundaryFacts(42, 42, 1, 42, 1, 42, True, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
-            (1, 2, 0, 1, True),
+            (1, 2, 0, 0, True),
             (3, 1, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 3, 300, 4400, 4600, False, False), KeysetPageCompletion.SHORT_PAGE_EXHAUSTS, 50): (
-            (50, 1, 1, 1, True),
+            (50, 1, 1, 0, True),
             (3, 17, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 3, 300, 4400, 4600, False, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
-            (10, 2, 2, 1, False),
+            (10, 2, 2, 0, False),
             (3, 17, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 71, 120, False, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
-            (20, 2, 1, 1, True),
+            (20, 2, 1, 0, True),
             (3, 1, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 151, 200, False, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
-            (49, 2, 1, 1, True),
+            (49, 2, 1, 0, True),
             (3, 2, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 151, 200, False, False), KeysetPageCompletion.SHORT_PAGE_EXHAUSTS, 50): (
-            (49, 1, 1, 1, True),
+            (49, 1, 1, 0, True),
             (3, 2, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 301, 350, False, False), KeysetPageCompletion.SHORT_PAGE_EXHAUSTS, 50): (
-            (49, 1, 1, 1, True),
+            (49, 1, 1, 0, True),
             (3, 5, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 301, 350, False, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
-            (49, 2, 1, 1, True),
+            (49, 2, 1, 0, True),
             (3, 5, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 510000, 1000000, False, False), KeysetPageCompletion.SHORT_PAGE_EXHAUSTS, 50): (
-            (50, 1, 1, 1, True),
+            (50, 1, 1, 0, True),
             (3, 3, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 3, 300, 4400, 4600, False, False), KeysetPageCompletion.SHORT_PAGE_EXHAUSTS, 1): (
-            (50, 1, 17, 5, False),
-            (43, 17, 1, 17, 25),
+            (50, 1, 17, 0, False),
+            (38, 17, 1, 17, 20),
         ),
     }
     expected_range, expected_partition = expected_details[(boundary, completion, capacity)]
@@ -518,8 +579,9 @@ async def test_explicit_modes_match_sparse_ordered_oracle(direction: str, kind: 
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind(kind)
-    assert stream.report.keyset_execution.canary_commands == 5
-    assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS
+    assert stream.report.keyset_execution.canary_commands == 0
+    assert stream.report.keyset_execution.canary_requests == 0
+    assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS
     assert all(
         record.rows_admitted == record.rows_selected
         for record in stream.report.page_trace
@@ -662,6 +724,54 @@ async def test_auto_sequential_has_request_parity_and_no_canaries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_omitted_execution_defaults_to_auto() -> None:
+    identities = tuple(range(1, 80))
+    stream = _client(KeysetTransport(identities)).iter_list_keyset(
+        Request("item.list"),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=PAGE_SIZE,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+    )
+
+    assert [row["id"] async for row in stream] == list(identities)
+    assert stream.report.keyset_execution is not None
+    assert stream.report.keyset_execution.requested_kind is KeysetExecutionKind.AUTO
+
+
+def test_omitted_execution_rejects_fast_ineligible_request_synchronously() -> None:
+    transport = KeysetTransport((1, 2, 3))
+    client = _client(transport)
+
+    with pytest.raises(CapabilityError):
+        client.iter_list_keyset(
+            Request("item.list", parameters={"filter": {">id": 1}}),
+            selector=ResultSelector.root(),
+            identity=_identity(),
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_omitted_execution_fails_closed_on_direction_contradiction() -> None:
+    transport = KeysetTransport(tuple(range(1, 31)), ignore_direction=True)
+    stream = _client(transport).iter_list_keyset(
+        Request("item.list", parameters={"filter": {"STATUS": "open"}}),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=PAGE_SIZE,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+    )
+
+    with pytest.raises(IncompleteTraversalError, match="range_contradiction"):
+        await anext(stream)
+
+    assert stream.report.emitted == 0
+    assert stream.report.state is TerminalState.INCOMPLETE
+
+
+@pytest.mark.asyncio
 async def test_boundary_only_estimate_excludes_the_spent_boundary_wave() -> None:
     empty = _stream(KeysetTransport(()), AutoKeysetExecution(StableIntegerKeysetContract()))
     assert [row async for row in empty] == []
@@ -692,11 +802,11 @@ async def test_adjacent_boundaries_select_prefix_assured_boundary_only() -> None
 
 def test_post_probe_range_preferred_transition_is_pinned() -> None:
     inputs = SelectorInputs(
-        BoundaryFacts(50, 50, 1, 50, 301, 350, False, False),
+        BoundaryFacts(50, 50, 1, 50, 551, 600, False, False),
         50,
-        50,
+        10,
         20,
-        2,
+        5,
         None,
         KeysetPageCompletion.EMPTY_CONFIRMATION,
         None,
@@ -879,6 +989,17 @@ async def test_fast_wave_missing_correlation_rejects_command_and_aborts_decoded_
 
 
 @pytest.mark.asyncio
+async def test_fast_wave_preserves_typed_result_shape_failure() -> None:
+    stream = _stream(
+        MalformedCommandResultTransport(tuple(range(1, 21))),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    with pytest.raises(ResultShapeError):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
 async def test_fast_wave_tolerates_duplicate_non_correlation_row_member() -> None:
     identities = tuple(range(1, 21))
     stream = _stream(
@@ -955,41 +1076,42 @@ async def test_asymmetric_empty_boundary_is_classified_incomplete(
 
 
 @pytest.mark.asyncio
-async def test_ignored_numeric_bounds_fail_canaries_before_emission() -> None:
+async def test_ignored_numeric_bounds_fail_late_without_runtime_canaries() -> None:
     transport = KeysetTransport(tuple(range(1, 31)), ignore_bounds=True)
     stream = _stream(transport, RangeKeysetExecution(StableIntegerKeysetContract()))
 
+    async def consume() -> list[int]:
+        return [row["id"] async for row in stream]
+
     with pytest.raises(IncompleteTraversalError):
-        await anext(stream)
+        await consume()
     assert stream.report is not None
-    assert stream.report.emitted == 0
+    assert stream.report.emitted > 0
     assert stream.report.state is TerminalState.INCOMPLETE
     assert stream.report.keyset_execution is not None
-    assert stream.report.keyset_execution.canary_rows > 0
-    assert stream.report.keyset_execution.probe_rows_discarded > 0
+    assert stream.report.keyset_execution.canary_rows == 0
+    assert stream.report.keyset_execution.canary_commands == 0
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.RANGE
     assert stream.report.keyset_execution.preselection_reason is KeysetSelectionReason.EXPLICIT_RANGE
-    assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.ORDERED_PREFIX_ONLY
+    assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS
     canaries = [record for record in stream.report.page_trace if record.phase is KeysetPhase.CANARY]
-    assert canaries
-    assert all(record.outcome is PageOutcome.REJECTED for record in canaries)
+    assert canaries == []
 
 
 @pytest.mark.asyncio
-async def test_chunked_canary_failure_finalizes_prior_staged_evidence() -> None:
+async def test_small_batch_runtime_still_emits_no_canary_observations() -> None:
     stream = _stream(
         KeysetTransport(tuple(range(1, 31)), ignore_bounds=True),
         RangeKeysetExecution(StableIntegerKeysetContract(), batch_size=2),
     )
 
     with pytest.raises(IncompleteTraversalError):
-        await anext(stream)
+        _ = [row async for row in stream]
 
     canaries = [record for record in stream.report.page_trace if record.phase is KeysetPhase.CANARY]
-    assert canaries
-    assert all(record.outcome is not PageOutcome.COMMITTED for record in canaries)
+    assert canaries == []
     assert stream.report.keyset_execution is not None
-    assert stream.report.keyset_execution.probe_rows_discarded > 0
+    assert stream.report.keyset_execution.canary_commands == 0
 
 
 @pytest.mark.asyncio
@@ -1006,7 +1128,7 @@ async def test_short_boundary_cap_contradiction_never_records_committed_planning
     assert len(boundaries) == 2
     assert all(record.outcome is PageOutcome.REJECTED for record in boundaries)
     assert stream.report.keyset_execution is not None
-    assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.ORDERED_PREFIX_ONLY
+    assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS
 
 
 def test_fast_ineligible_requests_fail_synchronously_without_io() -> None:
@@ -1108,10 +1230,10 @@ async def test_fast_runtime_budget_is_loud_incomplete(policy: ExecutionPolicy) -
     )
 
     with pytest.raises(IncompleteTraversalError):
-        await anext(stream)
+        _ = [row async for row in stream]
 
     assert stream.report.state is TerminalState.INCOMPLETE
-    assert stream.report.emitted == 0
+    assert stream.report.emitted > 0
 
 
 @pytest.mark.asyncio
@@ -1179,6 +1301,12 @@ async def test_keyset_report_rejects_boolean_total_hint_observation() -> None:
 
     with pytest.raises(ValueError, match="optional keyset report counters"):
         replace(stream.report.keyset_execution, total_hint_observed=True)
+    with pytest.warns(DeprecationWarning, match="legacy report compatibility"):
+        legacy = replace(
+            stream.report.keyset_execution,
+            assurance_source=KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS,
+        )
+    assert legacy.assurance_source is KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS
     nested = _report_json(stream.report)["keyset_execution"]
     assert isinstance(nested, dict)
     assert nested["selected_kind"] == stream.report.keyset_execution.selected_kind
@@ -1347,10 +1475,10 @@ async def test_partial_page_budget_rejects_a_wave_without_waiting_for_elapsed_bu
 
     with pytest.raises(IncompleteTraversalError):
         async with asyncio.timeout(0.5):
-            await anext(stream)
+            _ = [row async for row in stream]
 
     assert stream.report.state is TerminalState.INCOMPLETE
-    assert stream.report.emitted == 0
+    assert stream.report.emitted > 0
 
 
 @pytest.mark.asyncio
@@ -1385,14 +1513,14 @@ async def test_short_page_range_preserves_grouped_wave_cost() -> None:
     )
 
     assert [row["id"] async for row in stream] == list(identities)
-    assert stream.report.physical_requests == 4
+    assert stream.report.physical_requests == 3
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.RANGE
-    assert stream.report.keyset_execution.selected_requests_estimate == 3
+    assert stream.report.keyset_execution.selected_requests_estimate == 2
 
 
 @pytest.mark.asyncio
-async def test_auto_reports_sequential_when_boundary_cannot_supply_canaries() -> None:
+async def test_page_cap_one_can_select_range_without_canary_prefix_requirement() -> None:
     identities = tuple(range(1, 41))
     stream = _client(KeysetTransport(identities, default_limit=1)).iter_list_keyset(
         Request("item.list"),
@@ -1405,12 +1533,12 @@ async def test_auto_reports_sequential_when_boundary_cannot_supply_canaries() ->
 
     assert [row["id"] async for row in stream] == list(identities)
     assert stream.report.keyset_execution is not None
-    assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.SEQUENTIAL
+    assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.RANGE
     assert stream.report.keyset_execution.canary_commands == 0
 
 
 @pytest.mark.asyncio
-async def test_failed_canary_construction_finalizes_boundary_evidence() -> None:
+async def test_explicit_range_with_page_cap_one_needs_no_canary_pair() -> None:
     stream = _client(KeysetTransport(tuple(range(1, 41)), default_limit=1)).iter_list_keyset(
         Request("item.list"),
         selector=ResultSelector.root(),
@@ -1420,13 +1548,9 @@ async def test_failed_canary_construction_finalizes_boundary_evidence() -> None:
         execution=RangeKeysetExecution(StableIntegerKeysetContract()),
     )
 
-    with pytest.raises(IncompleteTraversalError):
-        await anext(stream)
-    assert stream.report.logical_pages == 2
-    assert len(stream.report.page_trace) == 2
-    assert all(record.outcome is PageOutcome.REJECTED for record in stream.report.page_trace)
+    assert [row["id"] async for row in stream] == list(range(1, 41))
     assert stream.report.keyset_execution is not None
-    assert stream.report.keyset_execution.probe_rows_discarded == 2
+    assert stream.report.keyset_execution.canary_commands == 0
 
 
 @pytest.mark.asyncio
@@ -1448,11 +1572,11 @@ async def test_dense_multi_round_range_keeps_grouped_continuations() -> None:
     assert [row["id"] async for row in stream] == list(identities)
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.RANGE
-    assert stream.report.physical_requests == 5
+    assert stream.report.physical_requests == 4
 
 
 @pytest.mark.asyncio
-async def test_auto_uses_available_canary_pair_from_asymmetric_boundary() -> None:
+async def test_auto_uses_asymmetric_boundary_without_runtime_canaries() -> None:
     identities = tuple(range(1, 1_001))
     stream = _client(AsymmetricBoundaryTransport(identities, default_limit=5)).iter_list_keyset(
         Request("item.list"),
@@ -1466,11 +1590,11 @@ async def test_auto_uses_available_canary_pair_from_asymmetric_boundary() -> Non
     assert [row["id"] async for row in stream] == list(identities)
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is not KeysetExecutionKind.SEQUENTIAL
-    assert stream.report.keyset_execution.canary_commands == 5
+    assert stream.report.keyset_execution.canary_commands == 0
 
 
 @pytest.mark.asyncio
-async def test_coscheduled_canary_failure_accounts_for_every_staged_probe_row() -> None:
+async def test_anchor_failure_accounts_for_every_staged_probe_row() -> None:
     stream = _stream(
         KeysetTransport(tuple(range(1, 101)), ignore_bounds=True),
         PartitionedKeysetExecution(StableIntegerKeysetContract(), target_lanes=3),
@@ -1486,7 +1610,7 @@ async def test_coscheduled_canary_failure_accounts_for_every_staged_probe_row() 
 @pytest.mark.asyncio
 async def test_separate_anchor_failure_discards_previously_validated_boundaries() -> None:
     stream = _stream(
-        NthBatchMissingResultTransport(tuple(range(1, 101)), batch_ordinal=3),
+        NthBatchMissingResultTransport(tuple(range(1, 101)), batch_ordinal=2),
         PartitionedKeysetExecution(StableIntegerKeysetContract(), batch_size=5, target_lanes=3),
     )
 
@@ -1500,15 +1624,15 @@ async def test_separate_anchor_failure_discards_previously_validated_boundaries(
 @pytest.mark.asyncio
 async def test_later_anchor_wave_failure_accounts_for_prior_compacted_rows() -> None:
     stream = _stream(
-        NthBatchMissingResultTransport(tuple(range(1, 101)), batch_ordinal=6),
+        NthBatchMissingResultTransport(tuple(range(1, 101)), batch_ordinal=3),
         PartitionedKeysetExecution(StableIntegerKeysetContract(), batch_size=2, target_lanes=5),
     )
 
     with pytest.raises(IncompleteTraversalError):
         await anext(stream)
     assert stream.report.keyset_execution is not None
-    assert stream._source._scheduler.counters.raw_rows == 18
-    assert stream.report.keyset_execution.probe_rows_discarded == 18
+    assert stream._source._scheduler.counters.raw_rows == 13
+    assert stream.report.keyset_execution.probe_rows_discarded == 13
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,115 @@
 # Migrating within b24api 2.x
 
-This 2.x release keeps the established defaults but makes wire representation, traversal completion, and failure
-evidence explicit. Existing JSON requests and the `Transport.send()` protocol remain supported.
+This release keeps the established wire representation and transport compatibility, but changes
+the default execution of direct no-count keyset traversal from sequential to auto. Existing JSON
+requests and the `Transport.send()` protocol remain supported.
+
+## Keyset verification, cursor fan-out, and page adaptation
+
+Normal `iter_list_keyset()` no longer sends the five diagnostic canary commands. Range and
+partitioned reports use `KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS`; the legacy
+`CANARY_VERIFIED_BOUNDS`, `KeysetPhase.CANARY`, and canary report counters remain readable for
+compatibility, but normal traversal never produces that assurance and its canary counters are zero.
+This reduces every bounded runtime estimate by the former canary waves, but a broken endpoint can
+now emit a partial prefix before later bound validation raises typed `IncompleteTraversalError`.
+
+Capability-report identity evidence is recursively immutable (`FrozenJson`) in Python. Consumers
+that need mutable or directly serializable containers should use `KeysetCapabilityReport.to_dict()`,
+which returns a detached ordinary JSON tree. Fast-keyset adapter failures are identified in page
+traces by the additive `PageRejectionCode.PAGE_ADAPTATION` enum member.
+
+Qualify the exact portal, credentials, request/filter, identity, ordering representation and page
+cap on a stable development or staging fixture. Keep the guard immediately beside the production
+call; verification does not switch runtime mode and is not cached:
+
+```python
+import os
+
+if not os.environ.get("PROD"):
+    await api.verify_keyset_capability(
+        request,
+        selector=selector,
+        identity=identity,
+        keyset=keyset,
+    )
+
+stream = api.iter_list_keyset(
+    request,
+    selector=selector,
+    identity=identity,
+    keyset=keyset,
+)
+```
+
+`UNSUPPORTED` proves a shape, order, cap, or out-of-interval defect. `INCONCLUSIVE` is also
+fail-closed, but means the fixture is sparse or changed during verification. Re-run after portal,
+permission, request shape, filter, or server changes. Do not use fast keyset for
+`crm.contact.userfield.list` or deprecated `crm.productsection.list`, which were observed to ignore
+strict ID bounds; use `iter_list()` / `iter_list_counted()` instead. Prefer
+`catalog.section.list` over the deprecated product-section method. These observations are guidance,
+not a built-in endpoint registry or a guarantee for other portals.
+
+For one or many independent parents, replace manual cursor batching or the verbose
+`iter_references(..., traversal=CursorTraversal(...))` form with `iter_cursors()`:
+
+```python
+bindings = [
+    Binding(
+        "chat 42",
+        (ParameterUpdate(ParameterPath(("DIALOG_ID",)), "chat42"),),
+        correlation={"chat_id": 42},
+        start_cursor=7300,
+    ),
+]
+
+async with api.iter_cursors(
+    request,
+    bindings,
+    selector=ResultSelector(("messages",)),
+    cursor=cursor,
+) as stream:
+    async for event in stream:
+        consume(event)
+```
+
+A one-element binding source is the canonical single-parent correlated form. The existing
+`iter_list_cursor()` is not removed or renamed: it remains the simpler raw-row API for one request.
+`iter_cursors()` is finite and fail-fast; tolerant processing remains
+`iter_reference_outcomes(..., traversal=CursorTraversal(...))`. The application owns the sync/async
+binding source and any database/session lifetime; `b24api` never owns or imports storage machinery.
+
+`Binding.start_cursor` is an application-owned checkpoint. Persist the identity of the last item
+successfully committed downstream, then recreate the binding after restart. Delivery is
+at-least-once across the gap between stream delivery and durable commit, so downstream writes must
+be idempotent. Each parent advances independently and still requires an empty confirmation page.
+When `CursorSpec.allow_create_controls=False`, the request must already contain the complete cursor
+control path including its leaf. `start_cursor` may replace that leaf, but never creates it.
+
+All list APIs now accept a synchronous object strategy `page_adapter`. It sees one immutable
+`PageView` containing the full frozen result and the selected frozen items, and returns an
+`AdaptedPage` with the same cardinality, order and configured identity/cursor values. For example,
+an application-owned adapter may enrich `messages` from sibling `users` and `files` nodes:
+
+```python
+class ImMessagePageAdapter:
+    def adapt(self, page: PageView, /) -> AdaptedPage:
+        users = page.result["users"]
+        return AdaptedPage(
+            {**message, "author": users[str(message["author_id"])]}
+            for message in page.items
+        )
+```
+
+Adapters must be pure, reentrant and synchronous: no I/O, `await`, filtering, fan-out, aggregation
+or reordering. Violations raise `PageAdaptationError`; inspect its closed
+`PageAdaptationViolation`, while raw rows, sibling metadata, correlation and application exception
+text remain absent from safe diagnostics.
+
+`BatchDispatch` now defaults to `coalesce_wait=0.020`: an underfilled physical wave may wait up to
+20 ms for another capacity-eligible producer. A full batch or zero producer potential is sent
+immediately, and the absolute deadline is per wave, not per operation. Set `coalesce_wait=0` for
+latency-oriented workloads. The dispatcher shutdown remains cancellation-based; the old unreachable
+`None` queue sentinel has been removed.
 
 ## Important semantic corrections
 
@@ -51,8 +159,8 @@ preserving names or return-shaping flags.
 | Tolerant batch | `batch_outcomes()` | Handle the closed success/failure/not-executed/unknown union. |
 | Sequential offset list | `iter_list()` | Conservative default; follows server continuation sequentially. |
 | Counted batched list | `iter_list_counted()` | Direct head plus physically batched tail; requires an exact total; identity is optional but strengthens assurance. |
-| No-count/keyset list | `iter_list_keyset()` | Sequential remains the default; opt into range, partitioned, or auto only for a caller-asserted stable unique integer key and writable strict bounds/order controls. |
-| Cursor wrappers | `iter_list_cursor()` | Requires a strict unique monotonic cursor. |
+| No-count/keyset list | `iter_list_keyset()` | Auto is now the default and may select boundary-only, sequential, range, or partitioned execution after a planning barrier. |
+| Cursor wrappers | `iter_list_cursor()` / `iter_cursors()` | Raw single traversal, or correlated one/many-parent scheduling with optional per-binding seed. |
 | Independent request wrappers | `fan_out()` / `fan_out_outcomes()` | Explicit direct or batch dispatch and delivery order. |
 | Per-parent/reference wrappers | `Binding` + `iter_references()` / `iter_reference_outcomes()` | Parent correlation and traversal state are explicit and isolated. |
 
@@ -65,11 +173,42 @@ preserving names or return-shaping flags.
 - automatic unsafe direct fallback;
 - public low-level execution plans and compatibility data models.
 
-There is no assumption-free fast no-count shortcut. Existing calls stay sequential. For a verified
-integer keyset, pass an explicit execution contract and account for its pre-emission planning cost;
-otherwise keep exact sequential keyset/cursor traversal. Use `iter_list_counted()` only when an
-endpoint supplies an exact filtered total. Fast keyset totals remain advisory, and the application
-still owns mutation and business-filter reconciliation.
+There is no assumption-free fast no-count shortcut. Direct `Bitrix24.iter_list_keyset()` calls and
+CLI keyset contracts that omit `execution` now assert the default `StableIntegerKeysetContract` and
+use auto planning, so verify that the endpoint honors a unique integer identity, strict numeric
+bounds, ordering, and empty-confirmation completion. `KeysetTraversal` used by reference traversal
+remains explicitly sequential because reference keysets do not support fast execution. Account for
+the pre-emission planning cost. Fast keyset totals remain advisory, and the application still owns
+mutation and business-filter reconciliation.
+
+Static ineligibility raises `CapabilityError` synchronously from the `iter_list_keyset(...)` call,
+before iteration starts. Typical causes include a non-integer identity, caller-supplied order,
+start, or strict-bound controls, incompatible consistency requirements, and insufficient policy
+capacity. If the endpoint accepts the controls but violates the declared ordering or bounds, the
+traversal fails closed with `IncompleteTraversalError` (for example, `range_contradiction`), possibly
+after a partial prefix. Auto never restarts such a failed traversal as sequential.
+
+If auto is ineligible for an endpoint, exposes a portal incompatibility, or the old request-by-request
+behavior is required, opt out per call. This performs the original sequential keyset traversal and
+does not run the auto planning barrier:
+
+```python
+from b24api import SequentialKeysetExecution
+
+stream = client.iter_list_keyset(
+    request,
+    selector=selector,
+    identity=identity,
+    keyset=keyset,
+    execution=SequentialKeysetExecution(),
+)
+```
+
+For CLI keyset contracts, use `"execution": {"kind": "sequential"}`. Omitting `execution` (or
+passing an empty execution object) selects auto. Use `iter_list_counted()` only when an endpoint
+supplies an exact filtered total. CLI reports now include a `keyset_execution` object for default
+keyset traversal; report consumers should treat that additive field as part of the selected-plan
+evidence.
 
 ## Practical migration order
 

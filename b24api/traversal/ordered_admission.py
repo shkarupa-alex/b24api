@@ -11,14 +11,14 @@ from b24api.traversal.page_validation import LaneReceipt
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson
     from b24api.contracts.request import IdentitySpec
 
 
 def drain_complete_lanes(  # noqa: PLR0913
     lane_index: int,
     lanes: list[LaneState],
-    rows_by_lane: dict[int, list[JsonValue]],
+    rows_by_lane: dict[int, list[FrozenJson]],
     identities_by_lane: dict[int, list[int]],
     commands_by_lane: dict[int, list[tuple[str, int]]],
     admit: Callable[[LaneReceipt], None],
@@ -69,7 +69,7 @@ def drain_complete_lanes(  # noqa: PLR0913
 class AdmissionCommit:
     """Rows atomically accepted into global output order."""
 
-    rows: tuple[JsonValue, ...]
+    rows: tuple[FrozenJson, ...]
     identities: tuple[int, ...]
     unique_rows: int
 

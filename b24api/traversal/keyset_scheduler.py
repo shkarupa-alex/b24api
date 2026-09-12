@@ -53,11 +53,10 @@ from b24api.traversal.keyset_fast_plan import (
 from b24api.traversal.keyset_observation import (
     abort_staged_observations,
     close_scheduler,
-    flush_staged_observations,
+    finalize_boundary_observations,
     raise_boundary_cap_contradiction,
     record_scheduler_observation,
     reject_boundary_observations,
-    validate_canary_observations,
 )
 from b24api.traversal.keyset_reporting import build_scheduler_report, initial_report_selection
 from b24api.traversal.keyset_transaction_contract import (
@@ -67,7 +66,6 @@ from b24api.traversal.keyset_transaction_contract import (
 )
 from b24api.traversal.keyset_transactions import (
     build_anchor_plans,
-    build_canary_plans,
     execute_body_wave,
     execute_finish_page,
     execute_wave,
@@ -82,7 +80,8 @@ from b24api.traversal.page_validation import (
 
 if TYPE_CHECKING:
     from b24api.batch.engine import BatchExecutor
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson
+    from b24api.contracts.page import PageAdapter
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
     from b24api.contracts.response import Response, ResultCollectionShape
     from b24api.contracts.traversal import KeysetSpec
@@ -108,6 +107,7 @@ class KeysetFastScheduler:
         context: ExecutionContext,
         engine: BatchExecutor,
         trace: FastTraceRecorder,
+        page_adapter: PageAdapter,
     ) -> None:
         """Initialize isolated planning, admission, and reporting state."""
         self.executor = executor
@@ -117,6 +117,7 @@ class KeysetFastScheduler:
         self.selector, self.collection_shape = selector, collection_shape
         self.page_size, self.effective_page_cap = page_size, effective_page_cap
         self.execution, self.context, self.engine, self.trace = execution, context, engine, trace
+        self.page_adapter = page_adapter
         self.completion = execution.contract.page_completion
         requested_batch = getattr(execution, "batch_size", None) or 50
         self.batch_capacity = min(
@@ -141,7 +142,6 @@ class KeysetFastScheduler:
         self._tail: LaneReceipt | None = None
         self._head_admitted = False
         self._selected, self._reason = initial_report_selection(execution)
-        self._assured = False
         self._anchor_count, self._anchor_probe_commands, self._empty_anchor_probes = 0, 0, 0
         self._target_lanes: int | None = None
         self._window_width: int | None = None
@@ -217,17 +217,6 @@ class KeysetFastScheduler:
         """Execute one correlated transaction wave."""
         return await execute_wave(self, plans)
 
-    def _validate_canaries(self, receipts: tuple[LaneReceipt, ...], expected: dict[str, tuple[int, ...]]) -> None:
-        validate_canary_observations(
-            receipts,
-            expected,
-            self.transactions.staged_observations,
-            self.record_page,
-            self.admission,
-            self.violations,
-        )
-        self._assured = True
-
     async def _chunked_waves(
         self,
         plans: tuple[LaneCommandPlan, ...],
@@ -255,19 +244,6 @@ class KeysetFastScheduler:
             remaining = remaining[len(wave) :]
         return tuple(receipts)
 
-    async def _canaries(self, asc: LaneReceipt, desc: LaneReceipt) -> None:
-        try:
-            plans, expected = build_canary_plans(self, asc, desc)
-            self._validate_canaries(await self._chunked_waves(plans), expected)
-        except BaseException:
-            abort_staged_observations(
-                self.transactions.staged_observations,
-                self.record_page,
-                self.admission,
-                self.violations,
-            )
-            raise
-
     def _consume_anchors(self, receipts: tuple[LaneReceipt, ...], lo: int, hi: int, charged: int) -> tuple[int, ...]:
         result = normalize_anchor_receipts(receipts, lo=lo, upper_exclusive=hi)
         self.transactions.anchor_rows = result.rows
@@ -280,32 +256,12 @@ class KeysetFastScheduler:
 
     async def _partition_planning(self, asc: LaneReceipt, desc: LaneReceipt, target: int) -> tuple[int, ...]:
         precharged = 0
-        canaries_validated = False
         try:
-            canaries, expected = build_canary_plans(self, asc, desc)
             anchors = build_anchor_plans(self, asc, desc, target)
             self._anchor_probe_commands = len(anchors)
-            planning = (*canaries, *anchors)
-            co_scheduled = fit_wave(
-                planning,
-                reserves=tuple(plan.reserved_rows for plan in planning),
-                commands=self.batch_capacity,
-                rows=self.context.policy.max_buffered_rows - self.transactions.buffer_balance,
-            )
-            if len(co_scheduled) == len(planning):
-                receipts = await self.execute_wave(co_scheduled)
-                canary_receipts, anchor_receipts = receipts[: len(canaries)], receipts[len(canaries) :]
-                self._validate_canaries(canary_receipts, expected)
-                canaries_validated = True
-            else:
-                canary_receipts = await self._chunked_waves(canaries)
-                self._validate_canaries(canary_receipts, expected)
-                canaries_validated = True
-                anchor_receipts = await self._chunked_waves(anchors, compact_anchors=True) if anchors else ()
-                precharged = sum(bool(receipt.rows) for receipt in anchor_receipts)
+            anchor_receipts = await self._chunked_waves(anchors, compact_anchors=True) if anchors else ()
+            precharged = sum(bool(receipt.rows) for receipt in anchor_receipts)
         except BaseException:
-            if canaries_validated:
-                self.admission.record_discarded(len(asc.rows) + len(desc.rows))
             abort_staged_observations(
                 self.transactions.staged_observations,
                 self.record_page,
@@ -446,7 +402,6 @@ class KeysetFastScheduler:
             elif self._preselection.plan is Preselected.SEQUENTIAL:
                 selected = KeysetExecutionKind.SEQUENTIAL
             elif self._preselection.plan is Preselected.RANGE:
-                await self._canaries(asc, desc)
                 selected = KeysetExecutionKind.RANGE
             else:
                 anchors = await self._partition_planning(asc, desc, self.execution.target_lanes)
@@ -487,7 +442,6 @@ class KeysetFastScheduler:
                     len(asc.rows) + len(desc.rows),
                 )
             if isinstance(self.execution, RangeKeysetExecution):
-                await self._canaries(asc, desc)
                 selected = KeysetExecutionKind.RANGE
                 self._reason = KeysetSelectionReason.EXPLICIT_RANGE
             elif isinstance(self.execution, PartitionedKeysetExecution):
@@ -501,7 +455,7 @@ class KeysetFastScheduler:
                 self._target_lanes = self.execution.target_lanes
             else:
                 raise TypeError("unknown fast keyset execution")
-        flush_staged_observations(self.transactions.staged_observations, self.record_page)
+        finalize_boundary_observations(self.transactions.staged_observations, self.record_page)
         self._selected = selected
         if not asc.rows or analysis.facts.overlapping or analysis.facts.adjacent:
             self._density_num = self._density_den = None
@@ -610,7 +564,7 @@ class KeysetFastScheduler:
         await self.adjust_buffer(-overlap)
         self._admit_receipt(normalized)
 
-    async def next_rows(self) -> tuple[JsonValue, ...]:
+    async def next_rows(self) -> tuple[FrozenJson, ...]:
         """Return the next ordered row group, or an empty tuple at completion."""
         if self._closed or self.transactions.terminal:
             return ()

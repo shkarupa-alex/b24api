@@ -59,9 +59,8 @@ def build_scheduler_report(scheduler: KeysetFastScheduler) -> KeysetExecutionRep
         preselection_reason=scheduler._reason,
         final_selection_reason=scheduler._final.reason if scheduler._final is not None else None,
         assurance_source=(
-            KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS
-            if scheduler._assured
-            and scheduler._selected in {KeysetExecutionKind.RANGE, KeysetExecutionKind.PARTITIONED}
+            KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS
+            if scheduler._selected in {KeysetExecutionKind.RANGE, KeysetExecutionKind.PARTITIONED}
             else KeysetAssuranceSource.ORDERED_PREFIX_ONLY
         ),
         planning_requests=scheduler.transactions.planning_physical_requests,

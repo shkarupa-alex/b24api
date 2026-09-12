@@ -127,20 +127,30 @@ more specialized mechanics have explicit names and explicit preconditions.
 
 | Operation | Use it when | Network mechanics | Completion proof |
 |---|---|---|---|
-| `iter_list` | The method supports ordinary offset pagination. | Pages are requested sequentially using server `next`; no separate count request is made. | Continuation and empty terminal page; add identity for duplicate detection. |
+| `iter_list` | The method supports ordinary offset pagination. | Sequential requests follow server `next` (the next offset). Ordinary counted Bitrix list endpoints do server-side COUNT for `total` plus LIMIT/OFFSET page retrieval. | Continuation and empty terminal page; add identity for duplicate detection. |
 | `iter_list_counted` | The first response provides an exact filtered `total` and stable offset pages. | Head page is direct; all known tail offsets are grouped into physical Bitrix batches. | Exact total, ranges and identities. |
-| `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique integer identity. | Sequential by default; explicit range, partitioned, or auto execution may batch bounded work after a planning barrier. | Caller-asserted keyset contract, strict monotonic identity, bounded-plan canaries, and terminal empty confirmation. |
+| `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique integer identity. | Auto by default: it plans first, then selects boundary-only, sequential, range, or partitioned execution; runtime sends no diagnostic canaries. | Caller-asserted keyset contract, strict monotonic identity, active bound validation, and terminal empty confirmation. |
 | `iter_list_cursor` | Each next request depends on a cursor from the previous response. | Sequential dependent cursor requests. | Strict unique monotonic cursor and empty terminal page. |
+| `iter_cursors` | One or many parent-bound cursor traversals need correlation and shared batching. | Lazy per-parent drivers share the reference batch queue; each binding may have `start_cursor`. | Isolated strict cursor progress and terminal event per binding. |
 | `iter_references` | The same list method must run for many parent parameter sets, such as comments per owner or messages per chat. | Bindings are scheduled with direct or physical-batch dispatch; each binding has its own traversal state. | Per-binding rows, completion/failure and caller correlation. |
 
 `page_size` is a local decoded-page cap. It is sent to Bitrix only when you provide the endpoint's
 exact `limit_path`; the client never guesses method-specific parameter names.
 
+### List traversal comparison
+
+![List traversal comparison](list-traversal-comparison.svg)
+
 ### Sequential offset
 
 This is the canonical default. It follows the `next` returned by the server and confirms the end
-with an empty page. A `total` present in the response is observational; this strategy does not add
-a separate count request.
+with an empty page. For ordinary counted Bitrix list endpoints, `next` is an offset for the next
+LIMIT/OFFSET page, not a keyset cursor. Producing `total` involves a separate server-side count
+query in addition to retrieving the page. These database operations are performed inside the same
+REST request: the client does not issue an additional HTTP call just for the count. This distinction
+matters for performance: not making a separate HTTP count call does **not** mean avoiding server-side
+COUNT work. `iter_list` does not suppress that work; a returned `total` is observational and does not
+control this strategy's completion. Exact database implementation is endpoint-specific.
 
 <!-- tested: tests/client_v2_test.py::test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup -->
 ```python
@@ -204,25 +214,50 @@ stream = client.iter_list_counted(
 Use it only when `total` is exact for the supplied filter and offset pages are stable. Any missing
 range, overlap, duplicate identity or total contradiction raises `IncompleteTraversalError`.
 
+Physical batching reduces HTTP exchanges, but does not suppress server-side COUNT in ordinary
+counted list subrequests. Each command still performs its own offset page retrieval and associated
+total calculation on the server. Do not confuse batching these commands with a no-count traversal.
+
 ### No-count keyset
 
-Keyset traversal is sequential by default, preserving the compatible request shape and first-pull
-behavior. An explicit execution contract can instead capture both ordered boundaries, validate five
-capability canaries, and batch numeric ranges or occupied-anchor partitions. Planning completes
-before any row is emitted, so partial consumption still pays that barrier cost. Fast execution fails
-synchronously when its declared controls or policy capacity are ineligible.
+Keyset traversal uses automatic execution by default. Omitting `execution` is equivalent to
+`AutoKeysetExecution(StableIntegerKeysetContract())`: the client captures both ordered boundaries,
+then selects boundary-only, sequential, range, or partitioned execution from the observed geometry
+and available policy capacity. Planning completes before any row is emitted, so partial consumption
+still pays that barrier cost. A sequential selection made by auto is a cost decision; a failed or
+contradictory fast plan is never silently restarted as sequential.
 
-The caller must assert that the endpoint has a stable, unique integer key, honors strict numeric
-bounds and ordering, and satisfies the chosen page-completion rule. Concurrent mutation outside the
-captured middle is handled by the finishing sweep; mutation inside it is outside this assertion.
+By using the default, the caller asserts that the endpoint has a stable, unique integer key, honors
+strict numeric bounds and ordering, and satisfies empty-confirmation completion. Concurrent mutation
+outside the captured middle is handled by the finishing sweep; mutation inside it is outside this
+assertion. Pass `SequentialKeysetExecution()` explicitly when an endpoint cannot satisfy the fast
+contract or when the previous request-by-request behavior is required.
+
+Static incompatibility with the auto contract raises `CapabilityError` from the
+`iter_list_keyset(...)` call before iteration begins. A portal that accepts but contradicts the
+declared controls fails before emission with `IncompleteTraversalError`; auto never restarts that
+operation silently. `KeysetTraversal` inside reference traversal remains sequential-only. The
+terminal report now includes `keyset_execution` for omitted-execution keyset calls so consumers can
+see the requested and selected plan.
+
+Use `await client.verify_keyset_capability(...)` as a development/CI/staging guard on a stable
+representative fixture. It performs five strict-bound checks and returns only a `VERIFIED` report;
+unsupported and inconclusive verdicts raise `KeysetCapabilityError`. The ordinary
+`iter_list_keyset()` remains a separate caller-asserted operation with zero verifier canaries and
+may emit a partial prefix before a late endpoint contradiction is detected.
+
+Every list operation also accepts an immutable `PageAdapter` strategy. The adapter synchronously
+maps selected frozen items using sibling result metadata while preserving cardinality, order and
+configured identities. The identity adapter is the default and preserves existing JSON output.
+
 An advisory `total` may only raise an automatic cost estimate and never proves completion. Reports
 record the selected strategy and reason: unbounded auto continuation has the same
 `ordered_prefix_only` assurance as sequential traversal, while bounded plans additionally report
-`canary_verified_bounds`.
+`caller_asserted_bounds`. Runtime traversal does not perform verifier canaries.
 
-<!-- tested: tests/client_v2_test.py::test_keyset_and_cursor_are_explicit_strict_alternatives -->
+<!-- tested: tests/keyset_fast_test.py::test_omitted_execution_defaults_to_auto -->
 ```python
-from b24api import AutoKeysetExecution, KeysetSpec, ParameterPath, StableIntegerKeysetContract
+from b24api import KeysetSpec, ParameterPath
 
 stream = client.iter_list_keyset(
     Request("example.item.list", replay_safety=ReplaySafety.SAFE),
@@ -232,7 +267,6 @@ stream = client.iter_list_keyset(
         filter_path=ParameterPath(("filter",)),
         order_path=ParameterPath(("order",)),
     ),
-    execution=AutoKeysetExecution(contract=StableIntegerKeysetContract()),
 )
 ```
 
@@ -261,6 +295,11 @@ stream = client.iter_list_cursor(
 Cursor values must be unique and strictly monotonic. If an endpoint exposes only a non-unique
 boundary, use an application-owned direct-call workflow or supply a unique tie-breaker.
 
+For multiple parent-bound cursor chains, `iter_cursors()` keeps cursor progress and correlation
+isolated per binding while ready pages share the physical batch queue.
+
+![Cursor batching across independent chats](cursor-batching.svg)
+
 See [architecture](docs/architecture.md), [migration](docs/migration.md),
 [performance](docs/performance.md), and [endpoint recipes](docs/recipes.md) for the complete
 contracts and selection guidance.
@@ -270,6 +309,8 @@ contracts and selection guidance.
 `Binding` applies exact parameter updates to a base request and carries parent correlation. The
 client remains unaware of entity types: a binding can represent a deal, lead, chat or any other
 caller-defined parent.
+
+![Reference batching across leads and deals](references-batching.svg)
 
 <!-- tested: tests/client_v2_test.py::test_bound_references_apply_nested_updates_off_wire_and_emit_exact_completion -->
 ```python

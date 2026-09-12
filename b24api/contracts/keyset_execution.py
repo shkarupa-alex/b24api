@@ -56,6 +56,7 @@ class KeysetAssuranceSource(StrEnum):
 
     ORDERED_PREFIX_ONLY = "ordered_prefix_only"
     CANARY_VERIFIED_BOUNDS = "canary_verified_bounds"
+    CALLER_ASSERTED_BOUNDS = "caller_asserted_bounds"
 
 
 class KeysetPhase(StrEnum):

@@ -38,6 +38,7 @@ from b24api.contracts import (
     Request,
     ResultCollectionShape,
     ResultSelector,
+    SequentialKeysetExecution,
     SequentialTraversal,
     TerminalState,
     TraversalAssurance,
@@ -86,15 +87,18 @@ class FunctionTransport:
 
     host = "test.invalid"
 
-    def __init__(self, handler: Callable[[Request], object]) -> None:
+    def __init__(self, handler: Callable[[Request], object], *, delay: float = 0) -> None:
         """Store the response callback and observations."""
         self.handler = handler
+        self.delay = delay
         self.requests: list[Request] = []
         self.closed = False
 
     async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Return one encoded response within the supplied ceilings."""
         assert attempt_timeout > 0
+        if self.delay:
+            await asyncio.sleep(self.delay)
         self.requests.append(request)
         body = json.dumps(self.handler(request), separators=(",", ":")).encode()
         assert len(body) <= max_response_bytes
@@ -326,6 +330,7 @@ async def test_public_keyset_above_100k_uses_monotonic_progression_without_ident
         identity=_identity(),
         page_size=page_size,
         keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        execution=SequentialKeysetExecution(),
         policy=ExecutionPolicy(
             max_requests=100,
             max_pages=100,
@@ -907,7 +912,10 @@ async def test_direct_fanout_preserves_full_response_without_treating_it_as_trav
 
 
 @pytest.mark.asyncio
-async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlation() -> None:
+@pytest.mark.parametrize("concurrency", [1, 2, 3])
+async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlation(
+    concurrency: int,
+) -> None:
     def handler(request: Request) -> object:
         assert request.method == "batch"
         commands = request.copy_parameters()["cmd"]
@@ -919,12 +927,12 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
             },
         }
 
-    transport = FunctionTransport(handler)
+    transport = FunctionTransport(handler, delay=0.005)
     stream = _client(transport).fan_out(
         [Command(Request("test.get", {"value": index}, ReplaySafety.SAFE), index) for index in range(FANOUT_COMMANDS)],
         dispatch=BatchDispatch(
             batch_size=FANOUT_BATCH_SIZE,
-            concurrency=2,
+            concurrency=concurrency,
             output_order=DeliveryOrder.READY,
         ),
     )
@@ -933,9 +941,11 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
 
     assert sorted(outcome.index for outcome in outcomes) == list(range(FANOUT_COMMANDS))
     assert sorted(outcome.correlation for outcome in outcomes) == list(range(FANOUT_COMMANDS))
-    assert len(transport.requests) == FANOUT_BATCH_REQUESTS
+    assert [len(request.copy_parameters()["cmd"]) for request in transport.requests] == [FANOUT_BATCH_SIZE] * (
+        FANOUT_BATCH_REQUESTS
+    )
     assert stream.report is not None
-    assert stream.report.batch_requests == FANOUT_BATCH_REQUESTS
+    assert stream.report.batch_requests == len(transport.requests)
     assert stream.report.batch_commands == FANOUT_COMMANDS
 
 
@@ -1125,6 +1135,7 @@ async def test_keyset_and_cursor_are_explicit_strict_alternatives() -> None:
         selector=ResultSelector.root(),
         identity=_identity(),
         keyset=KeysetSpec(),
+        execution=SequentialKeysetExecution(),
     )
     assert [item async for item in keyset] == [{"ID": 1}, {"ID": 2}, {"ID": 3}]
 

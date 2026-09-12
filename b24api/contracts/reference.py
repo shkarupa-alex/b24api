@@ -44,6 +44,7 @@ class Binding[C]:
     summary: str
     updates: tuple[ParameterUpdate, ...]
     correlation: C = field(repr=False)
+    start_cursor: JsonValue | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Bound and redact diagnostics without touching correlation."""
@@ -65,6 +66,8 @@ class Binding[C]:
                     raise ValueError("binding update paths must be distinct and non-overlapping")
         object.__setattr__(self, "summary", safe)
         object.__setattr__(self, "updates", updates)
+        if self.start_cursor is not None:
+            object.__setattr__(self, "start_cursor", _thaw_json(_freeze_json(self.start_cursor)))
 
 
 @dataclass(frozen=True, slots=True)

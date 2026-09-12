@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Self
 
+from b24api.contracts.json import _thaw_json
 from b24api.contracts.policy import (
     CompletionAssurance,
     ExecutionPolicy,
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from b24api.contracts.json import JsonValue
+    from b24api.contracts.page import PageAdapter
     from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
     from b24api.contracts.response import ResponseEvidence
     from b24api.execution import Executor
@@ -41,6 +43,7 @@ class CountedItemStream:
         page_size: int,
         batch_size: int,
         policy: ExecutionPolicy,
+        page_adapter: PageAdapter,
     ) -> None:
         """Initialize without scheduling work."""
         self._context = executor.context(policy)
@@ -52,6 +55,7 @@ class CountedItemStream:
             identity=identity,
             context=self._context,
             page_cap_hint=page_size,
+            page_adapter=page_adapter,
         )
         self._page_size = page_size
         self._batch_size = batch_size
@@ -95,7 +99,7 @@ class CountedItemStream:
                 for item, is_unique in zip(page.items, self._driver.last_page_unique_mask, strict=True):
                     self._emitted += 1
                     self._unique += int(is_unique)
-                    yield item
+                    yield _thaw_json(item)
             await self._finalize(KernelState.COMPLETED, "counted traversal completed exactly")
         except asyncio.CancelledError as error:
             primary = error

@@ -69,6 +69,9 @@ def test_public_error_module_export_snapshot_is_static_contract_evidence() -> No
         "ProtocolError",
         "ReferenceFailed",
         "ResponseTooLargeError",
+        "KeysetCapabilityError",
+        "PageAdaptationError",
+        "PageAdaptationViolation",
         "ResultShapeError",
         "TransportError",
     )
@@ -128,6 +131,7 @@ def test_keyset_execution_report_declaration_snapshot() -> None:
 
 def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
     assert b24api.__all__ == [
+        "AdaptedPage",
         "AmbiguityPolicy",
         "AmbiguityReason",
         "AmbiguousExecutionError",
@@ -160,31 +164,46 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "DirectDispatch",
         "EnvelopeContractError",
         "ExecutionPolicy",
+        "FrozenJson",
+        "FrozenMapping",
         "HTTPGatewayError",
         "IdentityCoercion",
         "IdentityComponent",
         "IdentityContractError",
+        "IdentityPageAdapter",
         "IdentitySpec",
         "IncompleteTraversalError",
         "InputSourceError",
         "KeysetAssuranceSource",
+        "KeysetCapabilityCheckName",
+        "KeysetCapabilityCheckOutcome",
+        "KeysetCapabilityCheckResult",
+        "KeysetCapabilityError",
+        "KeysetCapabilityReport",
+        "KeysetCapabilityVerdict",
         "KeysetExecution",
         "KeysetExecutionKind",
         "KeysetExecutionReport",
+        "KeysetInconclusiveReason",
         "KeysetPageCompletion",
         "KeysetPhase",
         "KeysetSelectionReason",
         "KeysetSpec",
         "KeysetTraversal",
+        "MembershipRecheck",
         "NotExecutedReason",
         "OffsetContinuation",
         "OffsetSpec",
         "OperationReport",
         "OperationStream",
+        "PageAdaptationError",
+        "PageAdaptationViolation",
+        "PageAdapter",
         "PageDispatch",
         "PageOutcome",
         "PageRecord",
         "PageRejectionCode",
+        "PageView",
         "PaginationError",
         "ParameterPath",
         "ParameterUpdate",
@@ -237,6 +256,55 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "partition_reference_outcomes",
         "traversal_control_paths",
     ]
+
+
+def test_keyset_cursor_streams_add_only_the_declared_fields_and_methods() -> None:
+    assert tuple(field.name for field in fields(Binding)) == ("summary", "updates", "correlation", "start_cursor")
+    assert tuple(field.name for field in fields(BatchDispatch)) == (
+        "batch_size",
+        "concurrency",
+        "output_order",
+        "coalesce_wait",
+    )
+    for traversal in (b24api.SequentialTraversal, b24api.CountedTraversal):
+        assert tuple(field.name for field in fields(traversal))[-1] == "page_adapter"
+    for traversal in (b24api.KeysetTraversal, b24api.CursorTraversal):
+        assert tuple(field.name for field in fields(traversal))[-1] == "page_adapter"
+    assert tuple(field.name for field in fields(b24api.MembershipRecheck)) == (
+        "identities",
+        "still_observed",
+        "no_longer_observed",
+        "contradictory",
+        "truncated",
+    )
+    assert tuple(field.name for field in fields(b24api.KeysetCapabilityCheckResult)) == (
+        "name",
+        "outcome",
+        "rows_selected",
+        "out_of_interval_identities",
+        "missing_in_interval_identities",
+        "extra_in_interval_identities",
+        "contradictory_identities",
+        "recheck",
+    )
+    assert b24api.MembershipRecheck.__annotations__ == {
+        "identities": "tuple[FrozenJson, ...]",
+        "still_observed": "tuple[FrozenJson, ...]",
+        "no_longer_observed": "tuple[FrozenJson, ...]",
+        "contradictory": "tuple[FrozenJson, ...]",
+        "truncated": "bool",
+    }
+    for name in (
+        "out_of_interval_identities",
+        "missing_in_interval_identities",
+        "extra_in_interval_identities",
+        "contradictory_identities",
+    ):
+        assert b24api.KeysetCapabilityCheckResult.__annotations__[name] == "tuple[FrozenJson, ...]"
+    assert b24api.PageRejectionCode.PAGE_ADAPTATION.value == "page_adaptation"
+    assert hasattr(b24api.Bitrix24, "iter_cursors")
+    assert hasattr(b24api.Bitrix24, "verify_keyset_capability")
+    assert not hasattr(b24api.Bitrix24, "iter_cursor_outcomes")
 
 
 def test_request_mapping_contract_is_a_closed_typed_dict() -> None:
