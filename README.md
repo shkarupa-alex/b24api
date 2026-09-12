@@ -295,6 +295,11 @@ stream = client.iter_list_cursor(
 Cursor values must be unique and strictly monotonic. If an endpoint exposes only a non-unique
 boundary, use an application-owned direct-call workflow or supply a unique tie-breaker.
 
+For multiple parent-bound cursor chains, `iter_cursors()` keeps cursor progress and correlation
+isolated per binding while ready pages share the physical batch queue.
+
+![Cursor batching across independent chats](cursor-batching.svg)
+
 See [architecture](docs/architecture.md), [migration](docs/migration.md),
 [performance](docs/performance.md), and [endpoint recipes](docs/recipes.md) for the complete
 contracts and selection guidance.
