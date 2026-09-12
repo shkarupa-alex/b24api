@@ -62,7 +62,7 @@ from b24api.traversal.page_validation import LaneCommandPlan, ReceiptRejection, 
 from b24api.traversal.values import _page_fingerprint, _response_items
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from b24api.contracts import JsonValue
     from b24api.contracts.page import PageView
@@ -763,6 +763,7 @@ async def test_sender_capacity_is_released_before_downstream_acknowledgement(
 @pytest.mark.parametrize("output_order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
 async def test_slow_consumer_records_bounded_per_wave_coalescing_cost(
     monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, object], None],
     output_order: DeliveryOrder,
 ) -> None:
     observations: list[tuple[int, float]] = []
@@ -774,40 +775,111 @@ async def test_slow_consumer_records_bounded_per_wave_coalescing_cost(
     count = 8
     batch_size = 4
     coalesce_wait = 0.005
-    transport = CursorBatchTransport({str(index): (1, 2, 3) for index in range(count)})
-    stream = _client(transport).iter_cursors(
-        Request("item.list", {"parent": "base"}),
-        [Binding(key, (ParameterUpdate(ParameterPath(("parent",)), key),), key) for key in transport.rows],
-        selector=ResultSelector.root(),
-        cursor=_cursor(),
-        page_size=1,
-        dispatch=BatchDispatch(
-            batch_size=batch_size,
-            concurrency=1,
-            coalesce_wait=coalesce_wait,
-            output_order=output_order,
-        ),
-    )
 
-    events = []
-    async for event in stream:
-        events.append(event)
-        await asyncio.sleep(0.001)
+    class TimedCursorBatchTransport(CursorBatchTransport):
+        def __init__(self, rows: Mapping[str, tuple[int, ...]]) -> None:
+            super().__init__(rows)
+            self.first_request_at: float | None = None
+
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            if self.first_request_at is None:
+                self.first_request_at = asyncio.get_running_loop().time()
+            return await super().send(
+                request,
+                attempt_timeout=attempt_timeout,
+                max_response_bytes=max_response_bytes,
+            )
+
+    async def benchmark(wait: float):
+        observations.clear()
+        transport = TimedCursorBatchTransport({str(index): (1, 2, 3) for index in range(count)})
+        stream = _client(transport).iter_cursors(
+            Request("item.list", {"parent": "base"}),
+            [Binding(key, (ParameterUpdate(ParameterPath(("parent",)), key),), key) for key in transport.rows],
+            selector=ResultSelector.root(),
+            cursor=_cursor(),
+            page_size=1,
+            dispatch=BatchDispatch(
+                batch_size=batch_size,
+                concurrency=1,
+                coalesce_wait=wait,
+                output_order=output_order,
+            ),
+        )
+        started = asyncio.get_running_loop().time()
+        events = []
+        async for event in stream:
+            events.append(event)
+            await asyncio.sleep(0.001)
+        elapsed = asyncio.get_running_loop().time() - started
+        assert transport.first_request_at is not None
+        return (
+            events,
+            transport,
+            stream.report,
+            tuple(observations),
+            transport.first_request_at - started,
+            elapsed,
+        )
+
+    baseline = await benchmark(0)
+    measured = await benchmark(coalesce_wait)
+    events, transport, report, waves, first_request_latency, wall_clock = measured
+    _baseline_events, _baseline_transport, _baseline_report, baseline_waves, _, baseline_wall_clock = baseline
 
     assert len([event for event in events if isinstance(event, ReferenceItem)]) == 3 * count
-    wave_count = len(observations)
-    underfilled_waves = sum(commands < batch_size for commands, _delay in observations)
+    wave_count = len(waves)
+    command_counts = sorted(commands for commands, _delay in waves)
+    underfilled_waves = sum(commands < batch_size for commands in command_counts)
     assert wave_count == len(transport.requests)
-    assert 0 <= underfilled_waves <= wave_count
-    assert sum(commands for commands, _delay in observations) == len(transport.commands)
-    delays = [delay for _commands, delay in observations]
-    mean_delay = sum(delays) / len(delays)
-    p95_delay = sorted(delays)[max(0, (95 * len(delays) + 99) // 100 - 1)]
-    total_delay = sum(delays)
-    assert mean_delay >= 0
-    assert p95_delay >= 0
-    assert p95_delay <= coalesce_wait + 0.050
-    assert total_delay <= (coalesce_wait + 0.050) * len(observations)
+    assert sum(command_counts) == len(transport.commands) == 4 * count
+    if output_order is DeliveryOrder.READY:
+        assert underfilled_waves < wave_count
+        assert command_counts[-1] == batch_size
+    else:
+        assert wave_count > 8
+        assert underfilled_waves == wave_count
+        assert command_counts[-1] < batch_size
+
+    delays = sorted(delay for _commands, delay in waves)
+    mean_delay = sum(delays) / wave_count
+    p95_delay = delays[(95 * wave_count + 99) // 100 - 1]
+    underfilled_delay = sum(delay for commands, delay in waves if commands < batch_size)
+    scheduling_slack_per_wave = 0.002
+    assert mean_delay <= 0.020
+    assert p95_delay <= 0.020
+    assert underfilled_delay <= (coalesce_wait + scheduling_slack_per_wave) * underfilled_waves
+    assert all(delay == 0 for _commands, delay in baseline_waves)
+    assert first_request_latency <= 0.020
+    assert report is not None
+    assert report.buffered_rows_high_water == count
+    assert report.active_references_high_water == count
+
+    record_property(
+        "coalescing_benchmark",
+        json.dumps(
+            {
+                "output_order": output_order.value,
+                "physical_waves": wave_count,
+                "physical_requests": len(transport.requests),
+                "underfilled_waves": underfilled_waves,
+                "commands_mean": sum(command_counts) / wave_count,
+                "commands_p50": command_counts[len(command_counts) // 2],
+                "commands_p95": command_counts[(95 * wave_count + 99) // 100 - 1],
+                "time_to_first_request": first_request_latency,
+                "coalescing_mean": mean_delay,
+                "coalescing_p95": p95_delay,
+                "coalescing_total": sum(delays),
+                "coalescing_underfilled_total": underfilled_delay,
+                "wall_clock": wall_clock,
+                "baseline_wall_clock": baseline_wall_clock,
+                "wall_clock_ratio": wall_clock / baseline_wall_clock,
+                "buffered_rows_high_water": report.buffered_rows_high_water,
+                "active_references_high_water": report.active_references_high_water,
+            },
+            sort_keys=True,
+        ),
+    )
 
 
 @pytest.mark.asyncio
