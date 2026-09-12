@@ -120,6 +120,7 @@ class _PendingBatch:
     request: Request
     reference_id: str
     future: asyncio.Future[_DispatchedPage]
+    admitted: asyncio.Future[None]
     settled: asyncio.Future[None]
 
 
@@ -162,6 +163,7 @@ class _DispatchedPage:
     response: Response
     dispatch: PageDispatch
     batch_index: int | None = None
+    admission: asyncio.Future[None] | None = None
     settlement: asyncio.Future[None] | None = None
 
 
@@ -378,18 +380,21 @@ class _BatchPageDispatcher:
         self._assembler: asyncio.Task[None] | None = None
         self._worker: asyncio.Task[None] | None = None
         self._workers: tuple[asyncio.Task[None], ...] = ()
+        self._settlement_workers: set[asyncio.Task[None]] = set()
         self._closed = False
         self._active_sends = 0
+        self._settling_waves = 0
         self.batch_requests = 0
         self.batch_commands = 0
 
-    async def fetch(self, request: Request, reference_id: str) -> _DispatchedPage:  # noqa: C901, PLR0912
+    async def fetch(self, request: Request, reference_id: str) -> _DispatchedPage:  # noqa: C901, PLR0912, PLR0915
         if self._closed:
             raise RuntimeError("batch page dispatcher is closed")
         reservation = await self.context.reserve_page(reference=reference_id)
         future: asyncio.Future[_DispatchedPage] = asyncio.get_running_loop().create_future()
+        admitted: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        pending = _PendingBatch(request, reference_id, future, settled)
+        pending = _PendingBatch(request, reference_id, future, admitted, settled)
         remaining = self.context.policy.max_elapsed - self.context.elapsed
         if remaining <= 0:
             self.context.release_page(reservation)
@@ -409,6 +414,8 @@ class _BatchPageDispatcher:
                 return response
         except asyncio.CancelledError:
             future.cancel()
+            if not admitted.done():
+                admitted.set_result(None)
             if not settled.done():
                 settled.set_result(None)
             self.context.release_page(reservation)
@@ -417,6 +424,8 @@ class _BatchPageDispatcher:
             raise
         except TimeoutError as error:
             future.cancel()
+            if not admitted.done():
+                admitted.set_result(None)
             if not settled.done():
                 settled.set_result(None)
             self.context.release_page(reservation)
@@ -424,6 +433,8 @@ class _BatchPageDispatcher:
                 self._producer_state.touch()
             raise BudgetExceededError("batch scheduler admission exceeded operation time budget") from error
         except BaseException:
+            if not admitted.done():
+                admitted.set_result(None)
             if not settled.done():
                 settled.set_result(None)
             self.context.release_page(reservation)
@@ -458,7 +469,9 @@ class _BatchPageDispatcher:
                     continue
                 chunk = [first]
                 self._drain_nowait(chunk)
-                deadline = asyncio.get_running_loop().time() + self.plan.coalesce_wait
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + self.plan.coalesce_wait
+                coalescing_delay = 0.0
                 while len(chunk) < self.plan.batch_size:
                     self._drain_nowait(chunk)
                     if len(chunk) >= self.plan.batch_size:
@@ -468,7 +481,7 @@ class _BatchPageDispatcher:
                     if self._potential({item.reference_id for item in chunk}) == 0:
                         break
                     remaining = min(
-                        deadline - asyncio.get_running_loop().time(),
+                        deadline - loop.time(),
                         self.context.policy.max_elapsed - self.context.elapsed,
                     )
                     if remaining <= 0:
@@ -480,17 +493,20 @@ class _BatchPageDispatcher:
                     if get_task is None:
                         get_task = asyncio.create_task(self._queue.get())
                     wake = state.changed(seen)
+                    wait_started = loop.time()
                     await asyncio.wait(
                         [cast("asyncio.Future[object]", get_task), cast("asyncio.Future[object]", wake)],
                         timeout=remaining,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
+                    coalescing_delay += loop.time() - wait_started
                     if get_task.done():
                         pending = get_task.result()
                         get_task = None
                         if not pending.future.done():
                             chunk.append(pending)
                         self._drain_nowait(chunk)
+                self._observe_wave(len(chunk), coalescing_delay)
                 await self._send_queue.put(chunk)
                 slot_acquired = False
         finally:
@@ -509,6 +525,10 @@ class _BatchPageDispatcher:
                 return
             if not pending.future.done():
                 chunk.append(pending)
+
+    def _observe_wave(self, command_count: int, coalescing_delay: float) -> None:
+        """Test/benchmark seam for per-wave coalescing-cost accounting."""
+        del command_count, coalescing_delay
 
     def _potential(self, chunk_keys: set[str]) -> int:
         state, buffer = self._producer_state, self._buffer
@@ -545,7 +565,9 @@ class _BatchPageDispatcher:
             and buffer.can_reserve(state.next_index, self._page_cap),
         )
         settling_capacity = int(
-            self._pending_continuations_can_progress and self._active_sends > 0 and bool(state.admitting),
+            self._pending_continuations_can_progress
+            and (self._active_sends > 0 or self._settling_waves > 0)
+            and (bool(state.admitting) or not state.source_terminal),
         )
         return admitted + admitting + continuations + pending_pull + settling_capacity
 
@@ -577,8 +599,22 @@ class _BatchPageDispatcher:
                 item.future.set_exception(CapabilityError("batch page response metadata is unavailable"))
                 continue
             item.future.set_result(
-                _DispatchedPage(success.response, PageDispatch.BATCH, success.command_index, item.settled),
+                _DispatchedPage(
+                    success.response,
+                    PageDispatch.BATCH,
+                    success.command_index,
+                    item.admitted,
+                    item.settled,
+                ),
             )
+
+    async def _wait_for_settlement(self, chunk: list[_PendingBatch]) -> None:
+        try:
+            await asyncio.gather(*(item.settled for item in chunk))
+        finally:
+            self._settling_waves -= 1
+            if self._producer_state is not None:
+                self._producer_state.touch()
 
     async def _send_run(self) -> None:
         while not self._closed:
@@ -588,7 +624,11 @@ class _BatchPageDispatcher:
                 self._producer_state.touch()
             try:
                 await self._send(chunk)
-                await asyncio.gather(*(item.settled for item in chunk))
+                self._settling_waves += 1
+                settlement_worker = asyncio.create_task(self._wait_for_settlement(chunk))
+                self._settlement_workers.add(settlement_worker)
+                settlement_worker.add_done_callback(self._settlement_workers.discard)
+                await asyncio.gather(*(item.admitted for item in chunk))
             finally:
                 self._active_sends -= 1
                 if self._producer_state is not None:
@@ -604,18 +644,19 @@ class _BatchPageDispatcher:
             self._producer_state.touch()
         if self._assembler is None:
             return
-        for worker in self._workers:
+        owned_workers = (*self._workers, *self._settlement_workers)
+        for worker in owned_workers:
             if not worker.done():
                 worker.cancel()
         try:
             await asyncio.sleep(0)
-            active = tuple(worker for worker in self._workers if not worker.done())
+            active = tuple(worker for worker in owned_workers if not worker.done())
             if active:
                 remaining = max(0.0, self.context.policy.max_elapsed - self.context.elapsed)
                 _, pending_workers = await asyncio.wait(active, timeout=remaining)
                 if pending_workers:
                     raise BudgetExceededError("batch dispatcher cleanup exceeded operation time budget")
-            for worker in self._workers:
+            for worker in owned_workers:
                 with contextlib.suppress(asyncio.CancelledError):
                     await worker
         finally:
@@ -627,6 +668,8 @@ class _BatchPageDispatcher:
                 for item in chunk:
                     if not item.future.done():
                         item.future.cancel()
+                    if not item.admitted.done():
+                        item.admitted.set_result(None)
                     if not item.settled.done():
                         item.settled.set_result(None)
             while True:
@@ -636,5 +679,7 @@ class _BatchPageDispatcher:
                     break
                 if not pending.future.done():
                     pending.future.cancel()
+                if not pending.admitted.done():
+                    pending.admitted.set_result(None)
                 if not pending.settled.done():
                     pending.settled.set_result(None)

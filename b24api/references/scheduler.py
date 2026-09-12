@@ -318,7 +318,14 @@ class ReferenceScheduler:
         violation_offset = 0
         trace_offset = 0
         scheduled_sequences: list[int] = []
+        page_admission: asyncio.Future[None] | None = None
         settlement: asyncio.Future[None] | None = None
+
+        def admit_page() -> None:
+            nonlocal page_admission
+            if page_admission is not None and not page_admission.done():
+                page_admission.set_result(None)
+            page_admission = None
 
         def settle_page() -> None:
             nonlocal settlement
@@ -327,7 +334,7 @@ class ReferenceScheduler:
             settlement = None
 
         async def fetch(request: Request) -> Response:
-            nonlocal page_state, reservation, settlement
+            nonlocal page_state, reservation, page_admission, settlement
             self.producer_state.runnable.discard(producer_key)
             self.producer_state.admitting.add(producer_key)
             self.producer_state.touch()
@@ -337,6 +344,7 @@ class ReferenceScheduler:
             try:
                 reservation = await self.buffer.reserve(work.index, self.page_cap)
                 dispatched: _DispatchedPage = await self.dispatcher.fetch(request, f"r{work.index}")
+                page_admission = dispatched.admission
                 settlement = dispatched.settlement
             except BaseException as error:
                 self.producer_state.admitting.discard(producer_key)
@@ -386,6 +394,11 @@ class ReferenceScheduler:
                 if reservation is None:
                     raise RuntimeError("page completed without a buffer reservation")  # noqa: TRY301
                 await self.buffer.accept(reservation, page.retained_rows)
+                # The physical sender owns capacity only until the decoded page is
+                # admitted to the bounded row buffer.  Holding that slot until a
+                # READY consumer acknowledges every row would serialize consumer
+                # work with the next network request.
+                admit_page()
                 if self.output_order is ReferenceOutputOrder.INPUT:
                     settle_page()
                 acknowledged = asyncio.get_running_loop().create_future()
@@ -472,6 +485,7 @@ class ReferenceScheduler:
                 ),
             )
         finally:
+            admit_page()
             settle_page()
             self.producer_state.runnable.discard(producer_key)
             self.producer_state.admitting.discard(producer_key)

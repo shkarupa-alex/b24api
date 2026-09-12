@@ -734,6 +734,83 @@ async def test_input_order_does_not_wait_for_an_unacknowledgeable_continuation()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("output_order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
+async def test_sender_capacity_is_released_before_downstream_acknowledgement(
+    output_order: DeliveryOrder,
+) -> None:
+    transport = CursorBatchTransport({"a": (1,), "b": (2,)})
+    stream = _client(transport).iter_cursors(
+        Request("item.list", {"parent": "base"}),
+        [Binding(key, (ParameterUpdate(ParameterPath(("parent",)), key),), key) for key in transport.rows],
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=1,
+        dispatch=BatchDispatch(batch_size=2, concurrency=1, output_order=output_order),
+    )
+
+    first = await anext(stream)
+    assert isinstance(first, ReferenceItem)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    dispatcher = stream._source._scheduler.dispatcher
+    assert isinstance(dispatcher, _BatchPageDispatcher)
+    assert dispatcher._active_sends == 0
+
+    assert len([event async for event in stream]) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
+async def test_slow_consumer_records_bounded_per_wave_coalescing_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    output_order: DeliveryOrder,
+) -> None:
+    observations: list[tuple[int, float]] = []
+
+    def observe_wave(_dispatcher: _BatchPageDispatcher, commands: int, delay: float) -> None:
+        observations.append((commands, delay))
+
+    monkeypatch.setattr(_BatchPageDispatcher, "_observe_wave", observe_wave)
+    count = 8
+    batch_size = 4
+    coalesce_wait = 0.005
+    transport = CursorBatchTransport({str(index): (1, 2, 3) for index in range(count)})
+    stream = _client(transport).iter_cursors(
+        Request("item.list", {"parent": "base"}),
+        [Binding(key, (ParameterUpdate(ParameterPath(("parent",)), key),), key) for key in transport.rows],
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=1,
+        dispatch=BatchDispatch(
+            batch_size=batch_size,
+            concurrency=1,
+            coalesce_wait=coalesce_wait,
+            output_order=output_order,
+        ),
+    )
+
+    events = []
+    async for event in stream:
+        events.append(event)
+        await asyncio.sleep(0.001)
+
+    assert len([event for event in events if isinstance(event, ReferenceItem)]) == 3 * count
+    wave_count = len(observations)
+    underfilled_waves = sum(commands < batch_size for commands, _delay in observations)
+    assert wave_count == len(transport.requests)
+    assert 0 <= underfilled_waves <= wave_count
+    assert sum(commands for commands, _delay in observations) == len(transport.commands)
+    delays = [delay for _commands, delay in observations]
+    mean_delay = sum(delays) / len(delays)
+    p95_delay = sorted(delays)[max(0, (95 * len(delays) + 99) // 100 - 1)]
+    total_delay = sum(delays)
+    assert mean_delay >= 0
+    assert p95_delay >= 0
+    assert p95_delay <= coalesce_wait + 0.050
+    assert total_delay <= (coalesce_wait + 0.050) * len(observations)
+
+
+@pytest.mark.asyncio
 async def test_zero_coalesce_never_subscribes_to_producer_waits(monkeypatch: pytest.MonkeyPatch) -> None:
     def reject_wait(_state: _ProducerState, _seen: int) -> object:
         raise AssertionError("zero coalesce must not wait for producer changes")
