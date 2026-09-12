@@ -128,6 +128,7 @@ class _ProducerState:
 
     runnable: set[str]
     indexes: dict[str, int]
+    admitting: set[str] = field(default_factory=set)
     pending_continuations: set[str] = field(default_factory=set)
     next_key: str | None = None
     next_index: int | None = None
@@ -357,6 +358,7 @@ class _BatchPageDispatcher:
         producer_state: _ProducerState | None = None,
         buffer: _RowBuffer | None = None,
         page_cap: int = 1,
+        pending_continuations_can_progress: bool = True,
     ) -> None:
         self.context = context
         self.plan = plan
@@ -366,9 +368,11 @@ class _BatchPageDispatcher:
         )
         concurrency = min(self.plan.concurrency, self.context.policy.max_active_references)
         self._send_queue: asyncio.Queue[list[_PendingBatch]] = asyncio.Queue(maxsize=concurrency)
+        self._send_slots = asyncio.Semaphore(concurrency)
         self._producer_state = producer_state
         self._buffer = buffer
         self._page_cap = page_cap
+        self._pending_continuations_can_progress = pending_continuations_can_progress
         self._assembler: asyncio.Task[None] | None = None
         self._worker: asyncio.Task[None] | None = None
         self._workers: tuple[asyncio.Task[None], ...] = ()
@@ -389,6 +393,8 @@ class _BatchPageDispatcher:
         try:
             async with asyncio.timeout(remaining):
                 await self._queue.put(pending)
+                if self._producer_state is not None:
+                    self._producer_state.admitting.discard(reference_id)
                 self._ensure_workers()
                 if self._producer_state is not None:
                     self._producer_state.touch()
@@ -424,16 +430,21 @@ class _BatchPageDispatcher:
         self._worker = senders[0]
         self._workers = (self._assembler, *senders)
 
-    async def _run(self) -> None:  # noqa: C901, PLR0912
+    async def _run(self) -> None:  # noqa: C901, PLR0912, PLR0915
         get_task: asyncio.Task[_PendingBatch] | None = None
+        slot_acquired = False
         try:
             while not self._closed:
+                await self._send_slots.acquire()
+                slot_acquired = True
                 if get_task is None:
                     first = await self._queue.get()
                 else:
                     first = await get_task
                     get_task = None
                 if first.future.done():
+                    self._send_slots.release()
+                    slot_acquired = False
                     continue
                 chunk = [first]
                 self._drain_nowait(chunk)
@@ -471,7 +482,10 @@ class _BatchPageDispatcher:
                             chunk.append(pending)
                         self._drain_nowait(chunk)
                 await self._send_queue.put(chunk)
+                slot_acquired = False
         finally:
+            if slot_acquired:
+                self._send_slots.release()
             if get_task is not None and not get_task.done():
                 get_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -497,22 +511,27 @@ class _BatchPageDispatcher:
             for key in state.runnable
             if key in state.indexes
         )
+        admitting = sum(
+            key not in chunk_keys
+            for key in state.admitting
+            if self._pending_continuations_can_progress and key in state.indexes
+        )
         continuations = sum(
             key not in chunk_keys
             and self.context.can_reserve_page(reference=key)
             and buffer.can_reserve(state.indexes[key], self._page_cap)
             for key in state.pending_continuations
-            if key in state.indexes
+            if self._pending_continuations_can_progress and key in state.indexes
         )
         pending_pull = int(
-            state.source_pull_in_flight
-            and state.next_key is not None
+            state.next_key is not None
             and state.next_index is not None
             and state.next_key not in chunk_keys
+            and (state.source_pull_in_flight or len(state.indexes) < self.context.policy.max_active_references)
             and self.context.can_reserve_page(reference=state.next_key)
             and buffer.can_reserve(state.next_index, self._page_cap),
         )
-        return admitted + continuations + pending_pull
+        return admitted + admitting + continuations + pending_pull
 
     async def _send(self, chunk: list[_PendingBatch]) -> None:
         self.batch_requests += 1
@@ -546,7 +565,10 @@ class _BatchPageDispatcher:
     async def _send_run(self) -> None:
         while not self._closed:
             chunk = await self._send_queue.get()
-            await self._send(chunk)
+            try:
+                await self._send(chunk)
+            finally:
+                asyncio.get_running_loop().call_soon(self._send_slots.release)
 
     async def aclose(self) -> None:  # noqa: C901, PLR0912 - closes every independently owned batch worker
         if self._closed:

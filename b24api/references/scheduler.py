@@ -130,6 +130,7 @@ class ReferenceScheduler:
                 producer_state=self.producer_state,
                 buffer=self.buffer,
                 page_cap=self.page_cap,
+                pending_continuations_can_progress=output_order is ReferenceOutputOrder.READY,
             )
         self.violations: list[Violation] = []
         self.page_trace: list[PageRecord] = []
@@ -251,10 +252,11 @@ class ReferenceScheduler:
         next_index = 0
         try:
             while True:
-                await admission.slots.acquire()
-                self.producer_state.source_pull_in_flight = True
                 self.producer_state.next_key = f"r{next_index}"
                 self.producer_state.next_index = next_index
+                self.producer_state.touch()
+                await admission.slots.acquire()
+                self.producer_state.source_pull_in_flight = True
                 self.producer_state.touch()
                 try:
                     reference = await iterator.get(self.context)
@@ -320,6 +322,7 @@ class ReferenceScheduler:
         async def fetch(request: Request) -> Response:
             nonlocal page_state, reservation
             self.producer_state.runnable.discard(producer_key)
+            self.producer_state.admitting.add(producer_key)
             self.producer_state.touch()
             sequence = self._next_page_sequence
             self._next_page_sequence += 1
@@ -328,6 +331,8 @@ class ReferenceScheduler:
                 reservation = await self.buffer.reserve(work.index, self.page_cap)
                 dispatched: _DispatchedPage = await self.dispatcher.fetch(request, f"r{work.index}")
             except BaseException as error:
+                self.producer_state.admitting.discard(producer_key)
+                self.producer_state.touch()
                 if reservation is not None:
                     await self.buffer.abort(reservation)
                 reservation = None
@@ -456,6 +461,7 @@ class ReferenceScheduler:
             )
         finally:
             self.producer_state.runnable.discard(producer_key)
+            self.producer_state.admitting.discard(producer_key)
             self.producer_state.pending_continuations.discard(producer_key)
             self.producer_state.indexes.pop(producer_key, None)
             self.producer_state.touch()

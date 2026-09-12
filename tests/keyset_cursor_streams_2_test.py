@@ -3,6 +3,7 @@
 # ruff: noqa: ANN202, D101, D102, D107, FBT003, PLR2004, SLF001
 
 from __future__ import annotations
+import asyncio
 import hashlib
 import json
 from collections import deque
@@ -20,6 +21,7 @@ from b24api import (
     CapabilityError,
     CursorSpec,
     CursorTraversal,
+    DeliveryOrder,
     ExecutionPolicy,
     IdentityCoercion,
     IdentityPageAdapter,
@@ -685,6 +687,53 @@ async def test_fast_source_fills_initial_and_continuation_batches() -> None:
 
     assert len([event async for event in stream]) == 2 * count
     assert [len(request.copy_parameters()["cmd"]) for request in transport.requests] == [count, count]
+    state = stream._source._scheduler.producer_state
+    assert state.runnable == state.admitting == state.pending_continuations == set()
+    assert not state.source_pull_in_flight
+    assert state.source_terminal
+
+
+@pytest.mark.asyncio
+async def test_input_order_does_not_wait_for_an_unacknowledgeable_continuation() -> None:
+    transport = CursorBatchTransport({"slow": tuple(range(1, 11)), "fast": (100,)})
+    bindings = [
+        Binding(
+            parent,
+            (ParameterUpdate(ParameterPath(("parent",)), parent),),
+            parent,
+        )
+        for parent in ("slow", "fast")
+    ]
+    stream = _client(transport).iter_cursors(
+        Request("item.list", {"parent": "base"}),
+        bindings,
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=1,
+        dispatch=BatchDispatch(batch_size=2, concurrency=1, coalesce_wait=1, output_order=DeliveryOrder.INPUT),
+    )
+
+    async with asyncio.timeout(0.2):
+        events = [event async for event in stream]
+    assert len(events) == 13
+
+
+@pytest.mark.asyncio
+async def test_zero_coalesce_never_subscribes_to_producer_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    def reject_wait(_state: _ProducerState, _seen: int) -> object:
+        raise AssertionError("zero coalesce must not wait for producer changes")
+
+    monkeypatch.setattr(_ProducerState, "changed", reject_wait)
+    stream = _client(CursorBatchTransport({"a": (1, 2)})).iter_cursors(
+        Request("item.list", {"parent": "a"}),
+        [Binding("a", (), "a")],
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=1,
+        dispatch=BatchDispatch(coalesce_wait=0),
+    )
+
+    assert len([event async for event in stream]) == 3
 
 
 @pytest.mark.asyncio

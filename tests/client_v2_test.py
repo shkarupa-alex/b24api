@@ -87,15 +87,18 @@ class FunctionTransport:
 
     host = "test.invalid"
 
-    def __init__(self, handler: Callable[[Request], object]) -> None:
+    def __init__(self, handler: Callable[[Request], object], *, delay: float = 0) -> None:
         """Store the response callback and observations."""
         self.handler = handler
+        self.delay = delay
         self.requests: list[Request] = []
         self.closed = False
 
     async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Return one encoded response within the supplied ceilings."""
         assert attempt_timeout > 0
+        if self.delay:
+            await asyncio.sleep(self.delay)
         self.requests.append(request)
         body = json.dumps(self.handler(request), separators=(",", ":")).encode()
         assert len(body) <= max_response_bytes
@@ -924,7 +927,7 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
             },
         }
 
-    transport = FunctionTransport(handler)
+    transport = FunctionTransport(handler, delay=0.005)
     stream = _client(transport).fan_out(
         [Command(Request("test.get", {"value": index}, ReplaySafety.SAFE), index) for index in range(FANOUT_COMMANDS)],
         dispatch=BatchDispatch(
@@ -938,7 +941,9 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
 
     assert sorted(outcome.index for outcome in outcomes) == list(range(FANOUT_COMMANDS))
     assert sorted(outcome.correlation for outcome in outcomes) == list(range(FANOUT_COMMANDS))
-    assert len(transport.requests) == FANOUT_BATCH_REQUESTS
+    assert [len(request.copy_parameters()["cmd"]) for request in transport.requests] == [FANOUT_BATCH_SIZE] * (
+        FANOUT_BATCH_REQUESTS
+    )
     assert stream.report is not None
     assert stream.report.batch_requests == len(transport.requests)
     assert stream.report.batch_commands == FANOUT_COMMANDS
