@@ -9,12 +9,11 @@ from typing import TYPE_CHECKING
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
-from b24api.errors import BudgetExceededError, PaginationError
+from b24api.errors import BudgetExceededError, PageAdaptationError, PaginationError
 from b24api.traversal import keyset_step
 from b24api.traversal.keyset_capability import (
     anchor_commands,
     build_capability_plans,
-    canary_commands,
     lane_for_command,
 )
 from b24api.traversal.keyset_fast_plan import (
@@ -42,30 +41,6 @@ if TYPE_CHECKING:
     from b24api.traversal.plans import KeysetPlan
 
 
-def build_canary_plans(
-    scheduler: KeysetFastScheduler,
-    asc: LaneReceipt,
-    desc: LaneReceipt,
-) -> tuple[tuple[LaneCommandPlan, ...], dict[str, tuple[int, ...]]]:
-    """Build canary requests and their expected identity sequences."""
-    commands = canary_commands(asc.identities, desc.identities, scheduler.effective_page_cap)
-    plans = build_capability_plans(
-        commands,
-        KeysetPhase.CANARY,
-        lambda **kwargs: build_controlled_request(scheduler, **kwargs),
-        lambda lane, **kwargs: build_lane_plan(scheduler, lane, **kwargs),
-        scheduler.effective_page_cap,
-        scheduler.transactions.planning_bounds,
-        scheduler.transactions.planning_descending,
-    )
-    expected = {
-        plan.command_id: command.expected
-        for plan, command in zip(plans, commands, strict=True)
-        if command.expected is not None
-    }
-    return plans, expected
-
-
 def build_anchor_plans(
     scheduler: KeysetFastScheduler,
     asc: LaneReceipt,
@@ -91,7 +66,7 @@ def build_anchor_plans(
     )
 
 
-async def execute_wave(
+async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation transaction
     scheduler: KeysetFastScheduler,
     plans: tuple[LaneCommandPlan, ...],
 ) -> tuple[LaneReceipt, ...]:
@@ -126,6 +101,7 @@ async def execute_wave(
         for phase in phases & planning:
             scheduler.transactions.planning_requests[phase] += 1
         receipts: list[LaneReceipt] = []
+        rejections: list[ReceiptRejection] = []
         failed, selected_rows = False, 0
         for index, (plan, outcome, reservation) in enumerate(zip(plans, outcomes, reservations, strict=True)):
             commit = (
@@ -148,12 +124,16 @@ async def execute_wave(
                 effective_page_cap=plan.reserved_rows if plan.expects_single_row else scheduler.effective_page_cap,
                 completion=scheduler.completion,
                 selector=scheduler.selector,
+                page_adapter=scheduler.page_adapter,
             )
             selected_rows += receipt.selected_rows if isinstance(receipt, ReceiptRejection) else len(receipt.rows)
             if isinstance(receipt, ReceiptRejection):
+                rejections.append(receipt)
                 failed = True
                 scheduler.violations.append(receipt.violation)
                 page_outcome, rejection_code = classify_rejection(outcome)
+                if isinstance(receipt.error, PageAdaptationError):
+                    rejection_code = PageRejectionCode.PAGE_ADAPTATION
                 scheduler.record_page(
                     plan,
                     index=index,
@@ -178,6 +158,12 @@ async def execute_wave(
                         rejection=PageRejectionCode.TRANSACTION_ABORTED,
                     )
             scheduler.admission.record_raw(selected_rows, discarded=True)
+            cause = next(
+                (receipt.error for receipt in rejections if receipt.error is not None),
+                None,
+            )
+            if cause is not None:
+                raise cause
             raise PaginationError("fast keyset wave validation failed")
         stage_semantics = bool(phases & {KeysetPhase.BOUNDARY, KeysetPhase.CANARY})
         for index, (plan, receipt) in enumerate(zip(plans, receipts, strict=True)):
@@ -323,6 +309,7 @@ async def execute_finish_page(
             effective_page_cap=scheduler.effective_page_cap,
             completion=KeysetPageCompletion.EMPTY_CONFIRMATION,
             selector=scheduler.selector,
+            page_adapter=scheduler.page_adapter,
         )
         if isinstance(receipt, ReceiptRejection):
             scheduler.violations.append(receipt.violation)
@@ -333,10 +320,16 @@ async def execute_finish_page(
                 selected=receipt.selected_rows,
                 admitted=0,
                 outcome=PageOutcome.REJECTED,
-                rejection=PageRejectionCode.RANGE_CONTRADICTION,
+                rejection=(
+                    PageRejectionCode.PAGE_ADAPTATION
+                    if isinstance(receipt.error, PageAdaptationError)
+                    else PageRejectionCode.RANGE_CONTRADICTION
+                ),
                 violation=receipt.violation,
                 dispatch=PageDispatch.DIRECT,
             )
+            if receipt.error is not None:
+                raise receipt.error
             raise PaginationError(receipt.detail)
         terminal = keyset_step.keyset_page_terminal(finish_plan, len(receipt.rows))
         await scheduler.adjust_buffer(-scheduler.effective_page_cap + len(receipt.rows))
@@ -386,7 +379,6 @@ async def execute_finish_page(
 
 __all__ = [
     "build_anchor_plans",
-    "build_canary_plans",
     "execute_body_wave",
     "execute_finish_page",
     "execute_wave",

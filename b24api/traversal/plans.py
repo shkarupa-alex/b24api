@@ -1,6 +1,7 @@
 """Internal frozen traversal plans with pre-I/O validation."""
 
 from __future__ import annotations
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
@@ -248,6 +249,7 @@ class BatchDispatch:
     batch_size: int = 50
     concurrency: int = 1
     output_order: ReferenceOutputOrder = ReferenceOutputOrder.READY
+    coalesce_wait: float = 0.020
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -257,6 +259,11 @@ class BatchDispatch:
             raise ValueError("batch concurrency must be positive")
         if not isinstance(self.output_order, ReferenceOutputOrder):
             raise TypeError("output_order must be a ReferenceOutputOrder")
+        if not isinstance(self.coalesce_wait, int | float) or isinstance(self.coalesce_wait, bool):
+            raise TypeError("coalesce_wait must be a finite number")
+        if not math.isfinite(self.coalesce_wait) or not 0 <= self.coalesce_wait <= 1:
+            raise ValueError("coalesce_wait must be between 0 and 1 second")
+        object.__setattr__(self, "coalesce_wait", float(self.coalesce_wait))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

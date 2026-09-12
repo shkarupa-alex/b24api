@@ -19,6 +19,7 @@ from b24api import (
     RangeKeysetExecution,
     ReplaySafety,
     Request,
+    ResultCollectionShape,
     ResultSelector,
     SequentialKeysetExecution,
     StableIntegerKeysetContract,
@@ -312,6 +313,41 @@ class ListContractRoute:
     execution: KeysetExecution = _DEFAULT_AUTO_KEYSET_EXECUTION
 
 
+@dataclass(frozen=True, slots=True)
+class VerifyKeysetContractRoute:
+    """Fully validated explicit keyset-verifier contract."""
+
+    selector: ResultSelector
+    identity: IdentitySpec
+    keyset: KeysetSpec
+    collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE
+    page_size: int = _PORTAL_BATCH_CAP
+
+
+def parse_verify_keyset_contract(contract: dict[str, object]) -> VerifyKeysetContractRoute:
+    """Validate the closed v1 verifier wire contract."""
+    _closed(
+        contract,
+        {"version", "selector", "identity", "keyset", "collection_shape", "page_size"},
+        label="verify-keyset contract",
+    )
+    selector, page_size = _common(contract, selector_required=True)
+    identity = _identity(contract.get("identity"), required=True)
+    try:
+        shape = ResultCollectionShape(
+            cast("str", contract.get("collection_shape", ResultCollectionShape.SEQUENCE.value)),
+        )
+    except (TypeError, ValueError) as error:
+        raise CliUsageError("collection_shape is invalid") from error
+    return VerifyKeysetContractRoute(
+        selector,
+        cast("IdentitySpec", identity),
+        _keyset(contract.get("keyset")),
+        shape,
+        page_size,
+    )
+
+
 def parse_list_contract(strategy: str, contract: dict[str, object]) -> ListContractRoute:
     """Validate a closed list contract without constructing a client or performing I/O."""
     allowed_common = {"version", "selector", "page_size"}
@@ -390,11 +426,13 @@ __all__ = [
     "CliUsageError",
     "KeysetExecutionJson",
     "ListContractRoute",
+    "VerifyKeysetContractRoute",
     "cli_request",
     "decode_one_object",
     "default_contract",
     "list_stream",
     "parse_keyset_execution",
     "parse_list_contract",
+    "parse_verify_keyset_contract",
     "read_json_source",
 ]

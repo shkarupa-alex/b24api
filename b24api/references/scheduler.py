@@ -5,6 +5,7 @@ import asyncio
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
+from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.report import PageDispatch, PageRecord, Violation, ViolationSeverity, retain_page_trace
 from b24api.contracts.request import ReplaySafety, Request, ResultSelector, TraversalIdentity
 from b24api.errors import BudgetExceededError, CapabilityError
@@ -28,6 +29,7 @@ from b24api.references.dispatch import (
     _KernelFanOutSuccess,
     _KernelReferenceComplete,
     _PageEvent,
+    _ProducerState,
     _ReferenceWindowError,
     _Reservation,
     _RowBuffer,
@@ -63,6 +65,7 @@ if TYPE_CHECKING:
     from b24api.contracts.response import Response
 
 type _PageDispatcher = _DirectPageDispatcher | _BatchPageDispatcher
+_IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 
 class ReferenceScheduler:
@@ -84,6 +87,7 @@ class ReferenceScheduler:
         emit_response: bool = False,
         capture_fail_fast: bool = False,
         page_cap_hint: int | None = None,
+        page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
     ) -> None:
         """Initialize instance state."""
         self.executor = executor
@@ -97,6 +101,7 @@ class ReferenceScheduler:
         self.emit_complete = emit_complete
         self.emit_response = emit_response
         self.capture_fail_fast = capture_fail_fast
+        self.page_adapter = page_adapter
         self.context = executor.context(policy)
         self.page_cap = _page_cap(
             plan,
@@ -106,13 +111,27 @@ class ReferenceScheduler:
             page_cap_hint=page_cap_hint,
         )
         self.active_limit = _active_limit(output_order, policy, self.page_cap)
+        self.producer_state = _ProducerState(set(), {})
+        head_reserve = self.page_cap if output_order is ReferenceOutputOrder.INPUT else 0
+        self.buffer = _RowBuffer(
+            policy.max_buffered_rows,
+            self.context,
+            head_reserve=head_reserve,
+            producer_state=self.producer_state,
+        )
         self.dispatcher: _PageDispatcher
         if isinstance(dispatch, DirectDispatch):
             self.dispatcher = _DirectPageDispatcher(executor, self.context, dispatch)
         else:
-            self.dispatcher = _BatchPageDispatcher(executor, self.context, dispatch)
-        head_reserve = self.page_cap if output_order is ReferenceOutputOrder.INPUT else 0
-        self.buffer = _RowBuffer(policy.max_buffered_rows, self.context, head_reserve=head_reserve)
+            self.dispatcher = _BatchPageDispatcher(
+                executor,
+                self.context,
+                dispatch,
+                producer_state=self.producer_state,
+                buffer=self.buffer,
+                page_cap=self.page_cap,
+                pending_continuations_can_progress=output_order is ReferenceOutputOrder.READY,
+            )
         self.violations: list[Violation] = []
         self.page_trace: list[PageRecord] = []
         self.page_trace_truncated = False
@@ -190,6 +209,8 @@ class ReferenceScheduler:
         producer: asyncio.Task[None],
         primary_error: BaseException | None,
     ) -> None:
+        self.producer_state.closing = True
+        self.producer_state.touch()
         producer.cancel()
         for task in admission.tasks.values():
             task.cancel()
@@ -232,14 +253,31 @@ class ReferenceScheduler:
         try:
             while True:
                 await admission.slots.acquire()
+                self.producer_state.next_key = f"r{next_index}"
+                self.producer_state.next_index = next_index
+                self.producer_state.source_pull_in_flight = True
+                self.producer_state.touch()
                 try:
                     reference = await iterator.get(self.context)
                 except StopAsyncIteration:
+                    self.producer_state.source_pull_in_flight = False
+                    self.producer_state.source_terminal = True
+                    self.producer_state.next_key = None
+                    self.producer_state.next_index = None
+                    self.producer_state.touch()
                     admission.slots.release()
                     return
                 except BaseException:
+                    self.producer_state.source_pull_in_flight = False
+                    self.producer_state.next_key = None
+                    self.producer_state.next_index = None
+                    self.producer_state.touch()
                     admission.slots.release()
                     raise
+                self.producer_state.source_pull_in_flight = False
+                self.producer_state.next_key = None
+                self.producer_state.next_index = None
+                self.producer_state.touch()
                 if not isinstance(reference, ReferenceRequest):
                     admission.slots.release()
                     raise TypeError("reference source must yield ReferenceRequest values")
@@ -256,6 +294,11 @@ class ReferenceScheduler:
                 self.active_references_high_water = max(self.active_references_high_water, len(admission.tasks))
                 admission.changed.set()
         finally:
+            self.producer_state.source_pull_in_flight = False
+            self.producer_state.source_terminal = True
+            self.producer_state.next_key = None
+            self.producer_state.next_index = None
+            self.producer_state.touch()
             admission.changed.set()
 
     async def _run_reference(  # noqa: C901, PLR0915 - owns the per-reference transaction boundary
@@ -263,22 +306,48 @@ class ReferenceScheduler:
         work: _Work,
         output: asyncio.Queue[_Event],
     ) -> None:
+        producer_key = f"r{work.index}"
+        self.producer_state.runnable.add(producer_key)
+        self.producer_state.indexes[producer_key] = work.index
+        self.producer_state.touch()
+        await asyncio.sleep(0)
         reservation: _Reservation | None = None
         partial_rows = 0
         page_state = 0
         violation_offset = 0
         trace_offset = 0
         scheduled_sequences: list[int] = []
+        page_admission: asyncio.Future[None] | None = None
+        settlement: asyncio.Future[None] | None = None
+
+        def admit_page() -> None:
+            nonlocal page_admission
+            if page_admission is not None and not page_admission.done():
+                page_admission.set_result(None)
+            page_admission = None
+
+        def settle_page() -> None:
+            nonlocal settlement
+            if settlement is not None and not settlement.done():
+                settlement.set_result(None)
+            settlement = None
 
         async def fetch(request: Request) -> Response:
-            nonlocal page_state, reservation
+            nonlocal page_state, reservation, page_admission, settlement
+            self.producer_state.runnable.discard(producer_key)
+            self.producer_state.admitting.add(producer_key)
+            self.producer_state.touch()
             sequence = self._next_page_sequence
             self._next_page_sequence += 1
             scheduled_sequences.append(sequence)
             try:
                 reservation = await self.buffer.reserve(work.index, self.page_cap)
                 dispatched: _DispatchedPage = await self.dispatcher.fetch(request, f"r{work.index}")
+                page_admission = dispatched.admission
+                settlement = dispatched.settlement
             except BaseException as error:
+                self.producer_state.admitting.discard(producer_key)
+                self.producer_state.touch()
                 if reservation is not None:
                     await self.buffer.abort(reservation)
                 reservation = None
@@ -316,13 +385,25 @@ class ReferenceScheduler:
             fetch=fetch,
             single_result_as_item=self.whole_result,
             page_cap_hint=self.page_cap,
+            page_adapter=self.page_adapter,
+            initial_cursor=work.reference.initial_cursor,
         )
         try:
             async for page in driver.pages():
                 if reservation is None:
                     raise RuntimeError("page completed without a buffer reservation")  # noqa: TRY301
                 await self.buffer.accept(reservation, page.retained_rows)
+                # The physical sender owns capacity only until the decoded page is
+                # admitted to the bounded row buffer.  Holding that slot until a
+                # READY consumer acknowledges every row would serialize consumer
+                # work with the next network request.
+                admit_page()
+                if self.output_order is ReferenceOutputOrder.INPUT:
+                    settle_page()
                 acknowledged = asyncio.get_running_loop().create_future()
+                if page.continuing:
+                    self.producer_state.pending_continuations.add(producer_key)
+                    self.producer_state.touch()
                 page_violations = tuple(driver.violations[violation_offset:])
                 violation_offset = len(driver.violations)
                 await output.put(
@@ -344,6 +425,12 @@ class ReferenceScheduler:
                 )
                 trace_offset = driver.page_trace_count
                 await acknowledged
+                if self.output_order is ReferenceOutputOrder.READY:
+                    settle_page()
+                self.producer_state.pending_continuations.discard(producer_key)
+                if page.continuing:
+                    self.producer_state.runnable.add(producer_key)
+                    self.producer_state.touch()
                 partial_rows += len(page.items)
                 reservation = None
             if reservation is not None:
@@ -397,6 +484,13 @@ class ReferenceScheduler:
                 ),
             )
         finally:
+            admit_page()
+            settle_page()
+            self.producer_state.runnable.discard(producer_key)
+            self.producer_state.admitting.discard(producer_key)
+            self.producer_state.pending_continuations.discard(producer_key)
+            self.producer_state.indexes.pop(producer_key, None)
+            self.producer_state.touch()
             if reservation is not None:
                 await self.buffer.abort(reservation)
 
@@ -513,7 +607,7 @@ class ReferenceScheduler:
                     event.unique_mask,
                     strict=True,
                 ):
-                    outcome = ReferenceItem(
+                    outcome = ReferenceItem._from_frozen(  # noqa: SLF001 - trusted frozen traversal row
                         event.work.reference.reference_key,
                         item,
                         event.work.reference.correlation,

@@ -9,6 +9,19 @@ from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ReplaySafety, Request
 
 STABLE_KEY_MAXIMUM = 100
+type IdentityValue = str | int | tuple[str | int, ...]
+
+
+def _valid_identity(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, str | int):
+        return True
+    return (
+        isinstance(value, tuple)
+        and bool(value)
+        and all(isinstance(part, str | int) and not isinstance(part, bool) for part in value)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +32,7 @@ class ReferenceRequest:
     reference_key: str = field(repr=False)
     correlation: object = field(default=None, repr=False)
     not_executed_reason: NotExecutedReason | None = None
+    initial_cursor: IdentityValue | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -28,6 +42,8 @@ class ReferenceRequest:
             raise ValueError("reference_key must be 1..100 characters")
         if self.not_executed_reason is not None and not isinstance(self.not_executed_reason, NotExecutedReason):
             raise TypeError("not_executed_reason must be a NotExecutedReason or None")
+        if self.initial_cursor is not None and not _valid_identity(self.initial_cursor):
+            raise TypeError("initial_cursor must be a normalized identity value or None")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -45,6 +61,17 @@ class ReferenceItem:
         object.__setattr__(self, "reference_key", reference_key)
         object.__setattr__(self, "_item", _freeze_json(item))
         object.__setattr__(self, "correlation", correlation)
+
+    @classmethod
+    def _from_frozen(cls, reference_key: str, item: FrozenJson, correlation: object = None) -> ReferenceItem:
+        """Build one trusted internal item without thawing and freezing it again."""
+        if not reference_key or len(reference_key) > STABLE_KEY_MAXIMUM:
+            raise ValueError("reference_key must be 1..100 characters")
+        value = object.__new__(cls)
+        object.__setattr__(value, "reference_key", reference_key)
+        object.__setattr__(value, "_item", item)
+        object.__setattr__(value, "correlation", correlation)
+        return value
 
     @property
     def item(self) -> JsonValue:

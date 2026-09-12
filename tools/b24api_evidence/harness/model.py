@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
+from b24api.contracts.json import _thaw_json
 from b24api.contracts.policy import (
     DuplicatePolicy,
     ExecutionPolicy,
@@ -412,9 +413,10 @@ async def _run_counted_batch_case(
     rows: list[dict[str, Any]] = []
     async for page in driver.counted_batch_pages(batch_size=50, page_size=PAGE_SIZE):
         for item in page.items:
-            if not isinstance(item, dict) or not isinstance(item.get("ID"), int):
+            published = _thaw_json(item)
+            if not isinstance(published, dict) or not isinstance(published.get("ID"), int):
                 raise TypeError("model counted traversal emitted malformed row")
-            rows.append(item)
+            rows.append(published)
     snapshot = await context.snapshot()
     identities = tuple(int(row["ID"]) for row in rows)
     actual_hash = content_sha256(list(identities))

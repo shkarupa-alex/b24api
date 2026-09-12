@@ -104,14 +104,7 @@ class ExecutionContext:
                         )
                         if reference is not None and committed >= self.policy.max_pages_per_reference:
                             raise BudgetExceededError("per-reference page budget exhausted")
-                        pending_for_reference = sum(item.reference == reference for item in self._page_reservations)
-                        global_available = (
-                            self._counters.logical_pages + len(self._page_reservations) < self.policy.max_pages
-                        )
-                        reference_available = (
-                            reference is None or committed + pending_for_reference < self.policy.max_pages_per_reference
-                        )
-                        if global_available and reference_available:
+                        if self.can_reserve_page(reference=reference):
                             reservation = _PageReservation(self._page_sequence, reference)
                             self._page_sequence += 1
                             self._page_reservations[reservation] = None
@@ -120,6 +113,18 @@ class ExecutionContext:
                     await self._page_changed.wait()
         except TimeoutError as error:
             raise BudgetExceededError("page reservation exceeded operation time budget") from error
+
+    def can_reserve_page(self, *, reference: str | None = None) -> bool:
+        """Return whether one page reservation can be admitted immediately."""
+        if self._counters.logical_pages >= self.policy.max_pages:
+            return False
+        committed = dict(self._counters.pages_per_reference).get(reference, 0) if reference is not None else 0
+        pending_for_reference = sum(item.reference == reference for item in self._page_reservations)
+        global_available = self._counters.logical_pages + len(self._page_reservations) < self.policy.max_pages
+        reference_available = (
+            reference is None or committed + pending_for_reference < self.policy.max_pages_per_reference
+        )
+        return global_available and reference_available
 
     async def reserve_pages(self, count: int) -> tuple[_PageReservation, ...]:
         """Atomically reserve a fixed operation-local page wave or fail immediately."""

@@ -14,7 +14,7 @@ from b24api.traversal.keyset_step import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson, JsonValue
     from b24api.traversal.plans import (
         KeysetPlan,
     )
@@ -38,10 +38,11 @@ class _KeysetMixin:
                 ),
             )
             trace_count = self.page_trace_count
-            items: list[JsonValue] = []
+            items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
-                candidate_identities = self._extract_identities(items)
+                source = self.source_page.current(items)
+                candidate_identities = self._extract_identities(source)
                 validate_keyset_continuation(plan, cursor, candidate_identities)
                 terminal = keyset_page_terminal(plan, len(items))
                 identities = self._validate_page(
@@ -55,7 +56,7 @@ class _KeysetMixin:
                     self.reject_external_page(items, response, error)
                 raise
             if items:
-                yield _Page(tuple(items), response, (1,) * len(items))
+                yield _Page(tuple(items), response, (1,) * len(items), terminal is None)
             if terminal is not None:
                 self.terminal_reason = terminal
                 return

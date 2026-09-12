@@ -11,7 +11,7 @@ _MAX_JSON_DEPTH = 256
 
 
 class FrozenMapping(Mapping[str, FrozenJson]):
-    """Private immutable mapping used for canonical JSON storage."""
+    """Immutable mapping used for canonical JSON storage and page views."""
 
     __slots__ = ("_key", "_values")
 

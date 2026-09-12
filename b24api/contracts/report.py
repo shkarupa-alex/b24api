@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import math
+import warnings
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -98,6 +99,7 @@ class PageRejectionCode(StrEnum):
     BATCH_ENVELOPE = "batch_envelope"
     NOT_EXECUTED = "not_executed"
     TRANSACTION_ABORTED = "transaction_aborted"
+    PAGE_ADAPTATION = "page_adaptation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +193,12 @@ class KeysetExecutionReport:
 
     def __post_init__(self) -> None:
         """Validate closed aggregate report fields."""
+        if self.assurance_source is KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS:
+            warnings.warn(
+                "CANARY_VERIFIED_BOUNDS is retained only for legacy report compatibility",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         enum_values = (
             (self.requested_kind, KeysetExecutionKind),
             (self.selected_kind, KeysetExecutionKind),

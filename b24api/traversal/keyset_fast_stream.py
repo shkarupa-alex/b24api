@@ -1,6 +1,6 @@
 """Fast-keyset lifecycle adapter, deterministic trace, and report construction."""
 
-# ruff: noqa: TRY300, TRY301
+# ruff: noqa: TRY301
 
 from __future__ import annotations
 import asyncio
@@ -8,6 +8,7 @@ from collections import Counter, deque
 from dataclasses import replace
 from typing import TYPE_CHECKING, Self
 
+from b24api.contracts.json import FrozenJson, JsonValue, _thaw_json
 from b24api.contracts.keyset_execution import KeysetPhase, TraceClass
 from b24api.contracts.policy import CompletionAssurance, KernelState, SnapshotRequirement, SnapshotState
 from b24api.contracts.report import (
@@ -25,7 +26,6 @@ from b24api.traversal.keyset_observation import PageObservation
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from b24api.contracts.json import JsonValue
     from b24api.traversal.keyset_scheduler import KeysetFastScheduler
 
 
@@ -163,7 +163,7 @@ class KeysetFastStream:
     def __init__(self, scheduler: KeysetFastScheduler) -> None:
         """Initialize without starting planning or I/O."""
         self._scheduler = scheduler
-        self._buffer: deque[JsonValue] = deque()
+        self._buffer: deque[FrozenJson] = deque()
         self._closed = False
         self.report = KernelReport()
 
@@ -185,7 +185,7 @@ class KeysetFastStream:
                 self._buffer.extend(rows)
             item = self._buffer.popleft()
             self._scheduler.mark_emitted(1)
-            return item
+            return _thaw_json(item)
         except StopAsyncIteration:
             raise
         except asyncio.CancelledError as error:

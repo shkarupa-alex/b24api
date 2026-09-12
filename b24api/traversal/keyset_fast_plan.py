@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson
     from b24api.contracts.keyset_execution import ClosureWitness, KeysetExecutionKind, KeysetPageCompletion
     from b24api.contracts.request import IdentitySpec
     from b24api.contracts.response import ResultCollectionShape
@@ -78,7 +78,7 @@ class LaneState:
     witness: ClosureWitness | None
     rounds: int
     reserved_rows: int
-    retained: deque[JsonValue]
+    retained: deque[FrozenJson]
 
 
 @dataclass(slots=True)
@@ -95,7 +95,7 @@ class LazyRangePlan:
     def append_next(
         self,
         lanes: list[LaneState],
-        rows: dict[int, list[JsonValue]],
+        rows: dict[int, list[FrozenJson]],
         identities: dict[int, list[int]],
         commands: dict[int, list[tuple[str, int]]],
     ) -> None:
@@ -128,7 +128,7 @@ class LazyRangePlan:
         self,
         capacity: int,
         lanes: list[LaneState],
-        rows: dict[int, list[JsonValue]],
+        rows: dict[int, list[FrozenJson]],
         identities: dict[int, list[int]],
         commands: dict[int, list[tuple[str, int]]],
     ) -> None:

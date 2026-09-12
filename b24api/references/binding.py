@@ -8,9 +8,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, Self, cast, runtime_checkable
 
 from b24api.contracts.command import NotExecutedReason
+from b24api.contracts.json import _freeze_json
 from b24api.contracts.reference import Binding
-from b24api.contracts.traversal import TraversalSpec, traversal_control_paths
+from b24api.contracts.traversal import CursorTraversal, TraversalSpec, traversal_control_paths
+from b24api.errors import CapabilityError, PaginationError
 from b24api.references.outcome import ReferenceRequest
+from b24api.traversal.identity import _request_with_controls
+from b24api.traversal.values import _coerce_identity
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
@@ -105,12 +109,25 @@ def _bind_request(base: Request, binding: Binding[object], index: int, traversal
         parameters = base.copy_parameters()
         for update in binding.updates:
             _replace_path(parameters, update.path.path, update.value)
-    except (KeyError, TypeError, ValueError) as error:
+        request = base.with_parameters(parameters)
+        initial_cursor = None
+        if binding.start_cursor is not None:
+            if not isinstance(traversal, CursorTraversal):
+                raise ValueError("start_cursor is valid only for CursorTraversal")
+            initial_cursor = _coerce_identity(_freeze_json(binding.start_cursor), traversal.cursor.coercion)
+            request = _request_with_controls(
+                request,
+                {traversal.cursor.parameter_path: initial_cursor},
+                allow_create=traversal.cursor.allow_create_controls,
+                replace=frozenset({traversal.cursor.parameter_path}),
+            )
+    except (CapabilityError, KeyError, PaginationError, TypeError, ValueError) as error:
         raise _BindingLocalValidationError from error
     return ReferenceRequest(
-        base.with_parameters(parameters),
+        request,
         f"r{index:012d}",
         _BindingContext(index, binding.correlation),
+        initial_cursor=initial_cursor,
     )
 
 

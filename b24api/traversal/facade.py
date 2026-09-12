@@ -52,6 +52,7 @@ from b24api.traversal.values import _MappingValuesResultSelector, _TolerantMappi
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
+    from b24api.contracts.page import PageAdapter
     from b24api.contracts.stream import OperationStream
     from b24api.contracts.traversal import CursorSpec, KeysetSpec, OffsetSpec
     from b24api.execution.executor import Executor
@@ -101,6 +102,7 @@ def sequential_stream(  # noqa: PLR0913
     collection_shape: ResultCollectionShape,
     page_size: int,
     offset: OffsetSpec,
+    page_adapter: PageAdapter,
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
@@ -142,6 +144,7 @@ def sequential_stream(  # noqa: PLR0913
         identity=identity,
         collection_shape=collection_shape,
         page_size=page_size,
+        page_adapter=page_adapter,
         policy=policy,
         operation="iter_list",
         assurance=assurance,
@@ -160,6 +163,7 @@ def keyset_stream(  # noqa: PLR0913
     page_size: int,
     keyset: KeysetSpec,
     execution: KeysetExecution,
+    page_adapter: PageAdapter,
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
@@ -196,6 +200,7 @@ def keyset_stream(  # noqa: PLR0913
             context=context,
             engine=BatchExecutor(executor),
             trace=trace,
+            page_adapter=page_adapter,
         )
         return _mapped_stream(
             KeysetFastStream(scheduler),
@@ -213,6 +218,7 @@ def keyset_stream(  # noqa: PLR0913
         identity=identity,
         collection_shape=collection_shape,
         page_size=page_size,
+        page_adapter=page_adapter,
         policy=policy,
         operation="iter_list_keyset",
         assurance=TraversalAssurance.IDENTITY_EXACT,
@@ -231,6 +237,7 @@ def counted_stream(  # noqa: PLR0913
     page_size: int,
     batch_size: int | None,
     offset: OffsetSpec,
+    page_adapter: PageAdapter,
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
@@ -272,6 +279,7 @@ def counted_stream(  # noqa: PLR0913
         page_size=page_size,
         batch_size=resolve_batch_size(batch_size, policy),
         policy=policy,
+        page_adapter=page_adapter,
     )
     return _mapped_stream(
         source,
@@ -293,6 +301,7 @@ def cursor_stream(  # noqa: PLR0913
     identity: IdentitySpec | None,
     collection_shape: ResultCollectionShape,
     page_size: int,
+    page_adapter: PageAdapter,
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
@@ -327,6 +336,7 @@ def cursor_stream(  # noqa: PLR0913
         identity=cursor_identity,
         collection_shape=collection_shape,
         page_size=page_size,
+        page_adapter=page_adapter,
         policy=policy,
         operation="iter_list_cursor",
         assurance=TraversalAssurance.IDENTITY_EXACT,
@@ -344,6 +354,7 @@ def _plan_stream(  # noqa: PLR0913
     identity: TraversalIdentity | None,
     collection_shape: ResultCollectionShape,
     page_size: int,
+    page_adapter: PageAdapter,
     policy: ExecutionPolicy,
     operation: str,
     assurance: TraversalAssurance,
@@ -358,6 +369,7 @@ def _plan_stream(  # noqa: PLR0913
         identity=identity,
         policy=policy,
         _page_cap_hint=page_size,
+        _page_adapter=page_adapter,
     )
     return _mapped_stream(
         source,
