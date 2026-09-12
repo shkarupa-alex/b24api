@@ -7,9 +7,11 @@
   fail-fast/tolerant reference semantics. When cursor-control creation is disabled, the complete
   control path including its leaf must already exist; a seed authorizes replacement, not creation.
 - Added immutable `PageView` / `AdaptedPage` and the synchronous `PageAdapter` strategy to every
-  list traversal. Contract violations now raise value-free `PageAdaptationError`.
+  list traversal. Contract violations now raise value-free `PageAdaptationError`; rejected fast
+  keyset pages use the additive `PageRejectionCode.PAGE_ADAPTATION` trace category.
 - Added the strict, standalone `verify_keyset_capability()` Python API and `b24api verify-keyset`
-  CLI. Unsupported and inconclusive reports use distinct CLI exit codes 6 and 7.
+  CLI. Unsupported and inconclusive reports use distinct CLI exit codes 6 and 7. Capability
+  evidence is stored as deeply immutable `FrozenJson`; `to_dict()` returns detached ordinary JSON.
 - Normal range and partitioned `iter_list_keyset()` execution no longer sends runtime canaries.
   It reports the new `KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS`; consumers using exhaustive enum
   matching must handle that additive member. A broken endpoint may now yield a partial prefix before

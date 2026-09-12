@@ -13,6 +13,11 @@ compatibility, but normal traversal never produces that assurance and its canary
 This reduces every bounded runtime estimate by the former canary waves, but a broken endpoint can
 now emit a partial prefix before later bound validation raises typed `IncompleteTraversalError`.
 
+Capability-report identity evidence is recursively immutable (`FrozenJson`) in Python. Consumers
+that need mutable or directly serializable containers should use `KeysetCapabilityReport.to_dict()`,
+which returns a detached ordinary JSON tree. Fast-keyset adapter failures are identified in page
+traces by the additive `PageRejectionCode.PAGE_ADAPTATION` enum member.
+
 Qualify the exact portal, credentials, request/filter, identity, ordering representation and page
 cap on a stable development or staging fixture. Keep the guard immediately beside the production
 call; verification does not switch runtime mode and is not cached:

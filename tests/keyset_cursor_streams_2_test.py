@@ -1143,6 +1143,22 @@ async def test_producer_state_broadcast_and_capacity_predicate_parity() -> None:
     await blocked_buffer.abort(held)
     await blocked_buffer.close()
 
+    settling_state = _ProducerState(set(), {"r0": 0}, source_terminal=False)
+    settling_buffer = _RowBuffer(1, context, producer_state=settling_state)
+    settling_dispatcher = _BatchPageDispatcher(
+        executor,
+        context,
+        BatchDispatch(batch_size=2, coalesce_wait=1),
+        producer_state=settling_state,
+        buffer=settling_buffer,
+        page_cap=1,
+    )
+    settling_dispatcher._settling_waves = 1
+    assert settling_dispatcher._potential({"r0"}) == 0
+    settling_state.admitting.add("r0")
+    assert settling_dispatcher._potential({"other"}) == 1
+    await settling_buffer.close()
+
     queued_pull = _ProducerState(set(), {"r0": 0}, next_key="r1", next_index=1)
     pull_buffer = _RowBuffer(2, context, producer_state=queued_pull)
     pull_dispatcher = _BatchPageDispatcher(

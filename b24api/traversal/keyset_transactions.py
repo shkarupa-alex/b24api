@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
-from b24api.errors import BudgetExceededError, PaginationError
+from b24api.errors import BudgetExceededError, PageAdaptationError, PaginationError
 from b24api.traversal import keyset_step
 from b24api.traversal.keyset_capability import (
     anchor_commands,
@@ -132,6 +132,8 @@ async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation tran
                 failed = True
                 scheduler.violations.append(receipt.violation)
                 page_outcome, rejection_code = classify_rejection(outcome)
+                if isinstance(receipt.error, PageAdaptationError):
+                    rejection_code = PageRejectionCode.PAGE_ADAPTATION
                 scheduler.record_page(
                     plan,
                     index=index,
@@ -318,7 +320,11 @@ async def execute_finish_page(
                 selected=receipt.selected_rows,
                 admitted=0,
                 outcome=PageOutcome.REJECTED,
-                rejection=PageRejectionCode.RANGE_CONTRADICTION,
+                rejection=(
+                    PageRejectionCode.PAGE_ADAPTATION
+                    if isinstance(receipt.error, PageAdaptationError)
+                    else PageRejectionCode.RANGE_CONTRADICTION
+                ),
                 violation=receipt.violation,
                 dispatch=PageDispatch.DIRECT,
             )

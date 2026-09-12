@@ -564,12 +564,17 @@ class _BatchPageDispatcher:
             and self.context.can_reserve_page(reference=state.next_key)
             and buffer.can_reserve(state.next_index, self._page_cap),
         )
-        settling_capacity = int(
-            self._pending_continuations_can_progress
-            and (self._active_sends > 0 or self._settling_waves > 0)
-            and (bool(state.admitting) or not state.source_terminal),
+        settling_admission = sum(
+            key not in chunk_keys
+            and key in state.indexes
+            and not (
+                self.context.can_reserve_page(reference=key)
+                and buffer.can_reserve(state.indexes[key], self._page_cap)
+            )
+            for key in state.admitting
+            if self._pending_continuations_can_progress and (self._active_sends > 0 or self._settling_waves > 0)
         )
-        return admitted + admitting + continuations + pending_pull + settling_capacity
+        return admitted + admitting + continuations + pending_pull + settling_admission
 
     async def _send(self, chunk: list[_PendingBatch]) -> None:
         self.batch_requests += 1

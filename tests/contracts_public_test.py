@@ -287,6 +287,21 @@ def test_keyset_cursor_streams_add_only_the_declared_fields_and_methods() -> Non
         "contradictory_identities",
         "recheck",
     )
+    assert b24api.MembershipRecheck.__annotations__ == {
+        "identities": "tuple[FrozenJson, ...]",
+        "still_observed": "tuple[FrozenJson, ...]",
+        "no_longer_observed": "tuple[FrozenJson, ...]",
+        "contradictory": "tuple[FrozenJson, ...]",
+        "truncated": "bool",
+    }
+    for name in (
+        "out_of_interval_identities",
+        "missing_in_interval_identities",
+        "extra_in_interval_identities",
+        "contradictory_identities",
+    ):
+        assert b24api.KeysetCapabilityCheckResult.__annotations__[name] == "tuple[FrozenJson, ...]"
+    assert b24api.PageRejectionCode.PAGE_ADAPTATION.value == "page_adaptation"
     assert hasattr(b24api.Bitrix24, "iter_cursors")
     assert hasattr(b24api.Bitrix24, "verify_keyset_capability")
     assert not hasattr(b24api.Bitrix24, "iter_cursor_outcomes")

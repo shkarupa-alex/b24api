@@ -99,6 +99,7 @@ class PageRejectionCode(StrEnum):
     BATCH_ENVELOPE = "batch_envelope"
     NOT_EXECUTED = "not_executed"
     TRANSACTION_ABORTED = "transaction_aborted"
+    PAGE_ADAPTATION = "page_adaptation"
 
 
 @dataclass(frozen=True, slots=True)
