@@ -909,7 +909,11 @@ async def test_direct_fanout_preserves_full_response_without_treating_it_as_trav
 
 
 @pytest.mark.asyncio
-async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlation() -> None:
+@pytest.mark.parametrize(("concurrency", "coalesce_wait"), [(1, 0), (1, 0.020), (2, 0), (2, 0.020), (3, 0.020)])
+async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlation(
+    concurrency: int,
+    coalesce_wait: float,
+) -> None:
     def handler(request: Request) -> object:
         assert request.method == "batch"
         commands = request.copy_parameters()["cmd"]
@@ -926,7 +930,8 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
         [Command(Request("test.get", {"value": index}, ReplaySafety.SAFE), index) for index in range(FANOUT_COMMANDS)],
         dispatch=BatchDispatch(
             batch_size=FANOUT_BATCH_SIZE,
-            concurrency=2,
+            concurrency=concurrency,
+            coalesce_wait=coalesce_wait,
             output_order=DeliveryOrder.READY,
         ),
     )
@@ -935,7 +940,7 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
 
     assert sorted(outcome.index for outcome in outcomes) == list(range(FANOUT_COMMANDS))
     assert sorted(outcome.correlation for outcome in outcomes) == list(range(FANOUT_COMMANDS))
-    assert FANOUT_BATCH_REQUESTS <= len(transport.requests) <= FANOUT_COMMANDS
+    assert len(transport.requests) == FANOUT_BATCH_REQUESTS
     assert stream.report is not None
     assert stream.report.batch_requests == len(transport.requests)
     assert stream.report.batch_commands == FANOUT_COMMANDS

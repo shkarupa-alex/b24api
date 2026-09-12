@@ -243,6 +243,14 @@ async def test_cursor_seed_replaces_existing_control_when_creation_is_forbidden(
     assert [event.item["id"] for event in events if isinstance(event, ReferenceItem)] == [2]
     assert isinstance(events[-1], ReferenceComplete)
 
+    singular = _client(CursorBatchTransport({"a": (1, 2)})).iter_list_cursor(
+        Request("item.list", {"parent": "a", "after": 0, "limit": 1}),
+        selector=ResultSelector.root(),
+        cursor=cursor,
+        page_size=1,
+    )
+    assert [row["id"] async for row in singular] == [1, 2]
+
 
 class PageTransport:
     host = "test.invalid"
@@ -279,6 +287,11 @@ class EnrichMessages:
         return AdaptedPage(output)
 
 
+class ReorderingIdentityAdapter(IdentityPageAdapter):
+    def adapt(self, page: PageView, /) -> AdaptedPage:
+        return AdaptedPage(tuple(reversed(page.items)))
+
+
 @pytest.mark.asyncio
 async def test_page_adapter_enriches_from_frozen_siblings_and_runs_on_empty_confirmation() -> None:
     adapter = EnrichMessages()
@@ -297,6 +310,19 @@ async def test_page_adapter_enriches_from_frozen_siblings_and_runs_on_empty_conf
     assert adapter.calls == 2
     with pytest.raises((FrozenInstanceError, TypeError)):
         IdentityPageAdapter().unexpected = True  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_identity_adapter_subclass_is_custom_and_requires_provable_order() -> None:
+    transport = PageTransport()
+    stream = _client(transport).iter_list(
+        Request("item.list"),
+        selector=ResultSelector(("messages",)),
+        page_adapter=ReorderingIdentityAdapter(),
+    )
+    with pytest.raises(CapabilityError, match="requires a traversal identity"):
+        await anext(stream)
+    assert transport.requests == []
 
 
 class BrokenAdapter:
@@ -435,9 +461,7 @@ class VerifierTransport:
         self.batch_ordinal += 1
         commands = request.copy_parameters()["cmd"]
         assert isinstance(commands, dict)
-        results = {
-            key: self._rows(_decode_command(value)) for key, value in commands.items() if isinstance(value, str)
-        }
+        results = {key: self._rows(_decode_command(value)) for key, value in commands.items() if isinstance(value, str)}
         payload = {"result": {"result": results, "result_error": []}}
         return WireResponse(200, (("content-type", "application/json"),), json.dumps(payload).encode())
 
@@ -533,8 +557,7 @@ def test_keyset_capability_error_rejects_verified_report_and_exposes_only_safe_s
     report = KeysetCapabilityReport(
         KeysetCapabilityVerdict.VERIFIED,
         tuple(
-            KeysetCapabilityCheckResult(name, KeysetCapabilityCheckOutcome.PASSED)
-            for name in KeysetCapabilityCheckName
+            KeysetCapabilityCheckResult(name, KeysetCapabilityCheckOutcome.PASSED) for name in KeysetCapabilityCheckName
         ),
         2,
         2,

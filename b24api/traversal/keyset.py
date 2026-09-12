@@ -41,7 +41,7 @@ class _KeysetMixin:
             items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
-                source = items if self._selected_source_items is None else self._selected_source_items
+                source = self.source_page.current(items)
                 candidate_identities = self._extract_identities(source)
                 validate_keyset_continuation(plan, cursor, candidate_identities)
                 terminal = keyset_page_terminal(plan, len(items))

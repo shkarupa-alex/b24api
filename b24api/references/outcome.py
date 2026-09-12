@@ -17,8 +17,10 @@ def _valid_identity(value: object) -> bool:
         return False
     if isinstance(value, str | int):
         return True
-    return isinstance(value, tuple) and bool(value) and all(
-        isinstance(part, str | int) and not isinstance(part, bool) for part in value
+    return (
+        isinstance(value, tuple)
+        and bool(value)
+        and all(isinstance(part, str | int) and not isinstance(part, bool) for part in value)
     )
 
 

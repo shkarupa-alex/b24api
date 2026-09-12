@@ -41,7 +41,7 @@ from b24api import (
 from b24api.cli import _report_json
 from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.contracts.report import PageDispatch
-from b24api.errors import CapabilityError, IncompleteTraversalError
+from b24api.errors import CapabilityError, IncompleteTraversalError, ResultShapeError
 from b24api.execution import Executor, WireResponse
 from b24api.traversal import keyset_scheduler, page_validation
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
@@ -169,6 +169,27 @@ class MalformedBatchEnvelopeTransport(KeysetTransport):
                 response.headers,
                 encoded.replace(key_prefix, f"{key_prefix}[],{key_prefix}", 1).encode(),
             )
+        return WireResponse(
+            response.status_code,
+            response.headers,
+            json.dumps(payload, separators=(",", ":")).encode(),
+        )
+
+
+class MalformedCommandResultTransport(KeysetTransport):
+    """Replace one correlated command result with a non-collection value."""
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        response = await super().send(
+            request,
+            attempt_timeout=attempt_timeout,
+            max_response_bytes=max_response_bytes,
+        )
+        if request.method != "batch":
+            return response
+        payload = json.loads(response.body)
+        results = payload["result"]["result"]
+        results[next(iter(results))] = {"not": "a sequence"}
         return WireResponse(
             response.status_code,
             response.headers,
@@ -925,6 +946,17 @@ async def test_fast_wave_missing_correlation_rejects_command_and_aborts_decoded_
         (PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE),
         (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED),
     }
+
+
+@pytest.mark.asyncio
+async def test_fast_wave_preserves_typed_result_shape_failure() -> None:
+    stream = _stream(
+        MalformedCommandResultTransport(tuple(range(1, 21))),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    with pytest.raises(ResultShapeError):
+        await anext(stream)
 
 
 @pytest.mark.asyncio

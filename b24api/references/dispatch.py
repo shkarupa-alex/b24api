@@ -364,9 +364,12 @@ class _BatchPageDispatcher:
         self._queue: asyncio.Queue[_PendingBatch] = asyncio.Queue(
             maxsize=context.policy.max_active_references,
         )
+        concurrency = min(self.plan.concurrency, self.context.policy.max_active_references)
+        self._send_queue: asyncio.Queue[list[_PendingBatch]] = asyncio.Queue(maxsize=concurrency)
         self._producer_state = producer_state
         self._buffer = buffer
         self._page_cap = page_cap
+        self._assembler: asyncio.Task[None] | None = None
         self._worker: asyncio.Task[None] | None = None
         self._workers: tuple[asyncio.Task[None], ...] = ()
         self._closed = False
@@ -376,10 +379,12 @@ class _BatchPageDispatcher:
     async def fetch(self, request: Request, reference_id: str) -> _DispatchedPage:  # noqa: C901
         if self._closed:
             raise RuntimeError("batch page dispatcher is closed")
-        if self._worker is None:
+        if self._assembler is None:
             concurrency = min(self.plan.concurrency, self.context.policy.max_active_references)
-            self._workers = tuple(asyncio.create_task(self._run()) for _index in range(concurrency))
-            self._worker = self._workers[0]
+            self._assembler = asyncio.create_task(self._run())
+            senders = tuple(asyncio.create_task(self._send_run()) for _index in range(concurrency))
+            self._worker = senders[0]
+            self._workers = (self._assembler, *senders)
         reservation = await self.context.reserve_page(reference=reference_id)
         future: asyncio.Future[_DispatchedPage] = asyncio.get_running_loop().create_future()
         pending = _PendingBatch(request, reference_id, future)
@@ -428,17 +433,15 @@ class _BatchPageDispatcher:
                     continue
                 chunk = [first]
                 self._drain_nowait(chunk)
-                await asyncio.sleep(0)
-                self._drain_nowait(chunk)
                 deadline = asyncio.get_running_loop().time() + self.plan.coalesce_wait
                 immediate_idle_turns = 0
                 while len(chunk) < self.plan.batch_size:
                     self._drain_nowait(chunk)
                     if len(chunk) >= self.plan.batch_size:
                         break
-                    if self._potential({item.reference_id for item in chunk}) == 0:
-                        break
                     if self.plan.coalesce_wait <= 0:
+                        if self._immediate_potential({item.reference_id for item in chunk}) == 0:
+                            break
                         previous = len(chunk)
                         await asyncio.sleep(0)
                         self._drain_nowait(chunk)
@@ -446,6 +449,8 @@ class _BatchPageDispatcher:
                         if immediate_idle_turns >= self.plan.batch_size:
                             break
                         continue
+                    if self._potential({item.reference_id for item in chunk}) == 0:
+                        break
                     remaining = min(
                         deadline - asyncio.get_running_loop().time(),
                         self.context.policy.max_elapsed - self.context.elapsed,
@@ -470,7 +475,7 @@ class _BatchPageDispatcher:
                         if not pending.future.done():
                             chunk.append(pending)
                         self._drain_nowait(chunk)
-                await self._send(chunk)
+                await self._send_queue.put(chunk)
         finally:
             if get_task is not None and not get_task.done():
                 get_task.cancel()
@@ -512,8 +517,15 @@ class _BatchPageDispatcher:
             and self.context.can_reserve_page(reference=state.next_key)
             and buffer.can_reserve(state.next_index, self._page_cap),
         )
+        return admitted + continuations + pending_pull
+
+    def _immediate_potential(self, chunk_keys: set[str]) -> int:
+        state, buffer = self._producer_state, self._buffer
+        base = self._potential(chunk_keys)
+        if state is None or buffer is None or state.closing:
+            return base
         unresolved_source = int(not state.source_terminal and self.context.can_reserve_page())
-        return admitted + continuations + max(pending_pull, unresolved_source)
+        return base + unresolved_source
 
     async def _send(self, chunk: list[_PendingBatch]) -> None:
         self.batch_requests += 1
@@ -544,14 +556,19 @@ class _BatchPageDispatcher:
                 continue
             item.future.set_result(_DispatchedPage(success.response, PageDispatch.BATCH, success.command_index))
 
-    async def aclose(self) -> None:  # noqa: C901 - closes every independently owned batch worker
+    async def _send_run(self) -> None:
+        while not self._closed:
+            chunk = await self._send_queue.get()
+            await self._send(chunk)
+
+    async def aclose(self) -> None:  # noqa: C901, PLR0912 - closes every independently owned batch worker
         if self._closed:
             return
         self._closed = True
         if self._producer_state is not None:
             self._producer_state.closing = True
             self._producer_state.touch()
-        if self._worker is None:
+        if self._assembler is None:
             return
         for worker in self._workers:
             if not worker.done():
@@ -568,6 +585,14 @@ class _BatchPageDispatcher:
                 with contextlib.suppress(asyncio.CancelledError):
                     await worker
         finally:
+            while True:
+                try:
+                    chunk = self._send_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                for item in chunk:
+                    if not item.future.done():
+                        item.future.cancel()
             while True:
                 try:
                     pending = self._queue.get_nowait()

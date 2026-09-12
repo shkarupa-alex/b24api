@@ -51,7 +51,11 @@ class _CursorMixin:
                     self.request,
                     updates,
                     allow_create=plan.allow_create_controls,
-                    replace=(frozenset({plan.cursor_request_path}) if self.initial_cursor is not None else frozenset()),
+                    replace=(
+                        frozenset({plan.cursor_request_path})
+                        if self.initial_cursor is not None or not plan.allow_create_controls
+                        else frozenset()
+                    ),
                 )
             )
             response = await self._fetch(request)
@@ -60,7 +64,7 @@ class _CursorMixin:
             items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
-                source = items if self._selected_source_items is None else self._selected_source_items
+                source = self.source_page.current(items)
                 cursor_values = _cursor_values(source, plan)
                 _validate_order(cursor_values, plan.direction)
                 if cursor is not None and cursor_values:

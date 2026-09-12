@@ -18,6 +18,23 @@ if TYPE_CHECKING:
 type _IdentityTokenSpec = tuple[tuple[str | int, ...], IdentityCoercion]
 
 
+class _SourcePageState:
+    """Retain source rows until the adapted page transaction settles."""
+
+    def __init__(self) -> None:
+        self.selected: tuple[FrozenJson, ...] | None = None
+
+    def remember(self, source: tuple[FrozenJson, ...]) -> None:
+        self.selected = source
+
+    def current(self, fallback: tuple[FrozenJson, ...]) -> tuple[FrozenJson, ...]:
+        return fallback if self.selected is None else self.selected
+
+    def take(self, fallback: tuple[FrozenJson, ...]) -> tuple[FrozenJson, ...]:
+        source, self.selected = self.current(fallback), None
+        return source
+
+
 def adapt_page(  # noqa: PLR0913 - explicit public-contract evidence at the shared seam
     response: Response,
     source: tuple[FrozenJson, ...],
@@ -66,8 +83,7 @@ def _tokens(
     identities: Sequence[_IdentityTokenSpec],
 ) -> tuple[tuple[IdentityValue, ...], ...]:
     return tuple(
-        tuple(_coerce_identity(_extract_path(item, path), coercion) for path, coercion in identities)
-        for item in items
+        tuple(_coerce_identity(_extract_path(item, path), coercion) for path, coercion in identities) for item in items
     )
 
 

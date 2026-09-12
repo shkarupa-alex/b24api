@@ -404,9 +404,7 @@ class KeysetCapabilityError(CapabilityError):
                 "batch_waves": self.report.batch_waves,
                 "physical_requests": self.report.physical_requests,
                 "cross_digit_pair_exercised": self.report.cross_digit_pair_exercised,
-                "checks": [
-                    {"name": check.name.value, "outcome": check.outcome.value} for check in self.report.checks
-                ],
+                "checks": [{"name": check.name.value, "outcome": check.outcome.value} for check in self.report.checks],
             },
         )
         return safe

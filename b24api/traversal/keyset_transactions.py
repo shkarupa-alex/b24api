@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
-from b24api.errors import BudgetExceededError, PageAdaptationError, PaginationError
+from b24api.errors import BudgetExceededError, PaginationError
 from b24api.traversal import keyset_step
 from b24api.traversal.keyset_capability import (
     anchor_commands,
@@ -157,7 +157,7 @@ async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation tran
                     )
             scheduler.admission.record_raw(selected_rows, discarded=True)
             cause = next(
-                (receipt.error for receipt in rejections if isinstance(receipt.error, PageAdaptationError)),
+                (receipt.error for receipt in rejections if receipt.error is not None),
                 None,
             )
             if cause is not None:
