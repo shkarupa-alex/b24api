@@ -657,8 +657,7 @@ def test_fast_keyset_lane_applies_adapter_only_to_publishable_phases() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("coalesce_wait", [0, 0.020])
-async def test_fast_source_fills_initial_and_continuation_batches(coalesce_wait: float) -> None:
+async def test_fast_source_fills_initial_and_continuation_batches() -> None:
     count = 50
     transport = CursorBatchTransport({str(index): (index + 1,) for index in range(count)})
     bindings = [
@@ -681,7 +680,7 @@ async def test_fast_source_fills_initial_and_continuation_batches(coalesce_wait:
         selector=ResultSelector.root(),
         cursor=_cursor(),
         page_size=1,
-        dispatch=BatchDispatch(batch_size=count, coalesce_wait=coalesce_wait),
+        dispatch=BatchDispatch(batch_size=count),
     )
 
     assert len([event async for event in stream]) == 2 * count

@@ -909,10 +909,9 @@ async def test_direct_fanout_preserves_full_response_without_treating_it_as_trav
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("concurrency", "coalesce_wait"), [(1, 0), (1, 0.020), (2, 0), (2, 0.020), (3, 0.020)])
+@pytest.mark.parametrize("concurrency", [1, 2, 3])
 async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlation(
     concurrency: int,
-    coalesce_wait: float,
 ) -> None:
     def handler(request: Request) -> object:
         assert request.method == "batch"
@@ -931,7 +930,6 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
         dispatch=BatchDispatch(
             batch_size=FANOUT_BATCH_SIZE,
             concurrency=concurrency,
-            coalesce_wait=coalesce_wait,
             output_order=DeliveryOrder.READY,
         ),
     )
