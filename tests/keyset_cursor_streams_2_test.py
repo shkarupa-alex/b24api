@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import random
 from collections import deque
 from dataclasses import FrozenInstanceError
 from typing import TYPE_CHECKING
@@ -55,7 +56,7 @@ from b24api.contracts.json import FrozenMapping
 from b24api.contracts.keyset_execution import KeysetPageCompletion, KeysetPhase
 from b24api.contracts.response import Response, ResultCollectionShape
 from b24api.execution import Executor, WireResponse
-from b24api.references.dispatch import _ProducerState, _RowBuffer
+from b24api.references.dispatch import _BatchPageDispatcher, _ProducerState, _RowBuffer
 from b24api.traversal.keyset_fast_plan import LaneBounds, LaneKind, LaneSpec, LaneState, LaneStatus
 from b24api.traversal.page_validation import LaneCommandPlan, ReceiptRejection, validate_lane_receipt
 from b24api.traversal.values import _page_fingerprint, _response_items
@@ -134,6 +135,20 @@ class CursorBatchTransport:
 
     async def aclose(self) -> None:
         return
+
+
+class JitterCursorBatchTransport(CursorBatchTransport):
+    def __init__(self, rows: Mapping[str, tuple[int, ...]], seed: int) -> None:
+        super().__init__(rows)
+        self._random = random.Random(seed)
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        await asyncio.sleep(self._random.choice((0, 0.0005, 0.001)))
+        return await super().send(
+            request,
+            attempt_timeout=attempt_timeout,
+            max_response_bytes=max_response_bytes,
+        )
 
 
 @pytest.mark.asyncio
@@ -737,6 +752,51 @@ async def test_zero_coalesce_never_subscribes_to_producer_waits(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("seed", range(4))
+async def test_capacity_saturated_jitter_preserves_every_page_and_releases_state(seed: int) -> None:
+    count = 12
+    rows = {str(index): tuple(range(index * 10 + 1, index * 10 + 5)) for index in range(count)}
+    transport = JitterCursorBatchTransport(rows, seed)
+    bindings = [
+        Binding(
+            key,
+            (ParameterUpdate(ParameterPath(("parent",)), key),),
+            key,
+        )
+        for key in rows
+    ]
+    stream = _client(
+        transport,
+        policy=ExecutionPolicy(
+            max_active_references=count,
+            max_buffered_rows=8,
+            max_pages=80,
+            max_pages_per_reference=6,
+        ),
+    ).iter_cursors(
+        Request("item.list", {"parent": "base"}),
+        bindings,
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=1,
+        dispatch=BatchDispatch(batch_size=4, concurrency=3, coalesce_wait=0.005),
+    )
+
+    async with asyncio.timeout(2):
+        events = [event async for event in stream]
+    items = [event for event in events if isinstance(event, ReferenceItem)]
+    assert sorted((event.correlation, event.item["id"]) for event in items) == sorted(
+        (key, value) for key, values in rows.items() for value in values
+    )
+    scheduler = stream._source._scheduler
+    state = scheduler.producer_state
+    assert state.runnable == state.admitting == state.pending_continuations == set()
+    assert not state.source_pull_in_flight
+    assert scheduler.buffer._reservations == []
+    assert scheduler.context._page_reservations == {}
+
+
+@pytest.mark.asyncio
 async def test_producer_state_broadcast_and_capacity_predicate_parity() -> None:
     state = _ProducerState(set(), {})
     seen = state.revision
@@ -751,7 +811,8 @@ async def test_producer_state_broadcast_and_capacity_predicate_parity() -> None:
     state.closing = True
     assert state.changed(state.revision).done()
 
-    context = Executor(CursorBatchTransport({"a": ()})).context(
+    executor = Executor(CursorBatchTransport({"a": ()}))
+    context = executor.context(
         ExecutionPolicy(max_pages=1, max_pages_per_reference=1, max_buffered_rows=2),
     )
     await context.start()
@@ -769,3 +830,18 @@ async def test_producer_state_broadcast_and_capacity_predicate_parity() -> None:
     assert buffer.can_reserve(1, 1)
     await buffer.close()
     assert not buffer.can_reserve(0, 1)
+
+    blocked_state = _ProducerState(set(), {"r0": 0, "r1": 1}, admitting={"r1"}, source_terminal=True)
+    blocked_buffer = _RowBuffer(1, context, producer_state=blocked_state)
+    held = await blocked_buffer.reserve(1, 1)
+    dispatcher = _BatchPageDispatcher(
+        executor,
+        context,
+        BatchDispatch(batch_size=2, coalesce_wait=1),
+        producer_state=blocked_state,
+        buffer=blocked_buffer,
+        page_cap=1,
+    )
+    assert dispatcher._potential({"r0"}) == 0
+    await blocked_buffer.abort(held)
+    await blocked_buffer.close()

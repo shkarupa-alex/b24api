@@ -4,7 +4,8 @@
 
 - Added `Bitrix24.iter_cursors()` with lazy one/many-parent scheduling, per-binding
   `Binding.start_cursor`, strict seed progression, shared physical batching and existing
-  fail-fast/tolerant reference semantics.
+  fail-fast/tolerant reference semantics. When cursor-control creation is disabled, the complete
+  control path including its leaf must already exist; a seed authorizes replacement, not creation.
 - Added immutable `PageView` / `AdaptedPage` and the synchronous `PageAdapter` strategy to every
   list traversal. Contract violations now raise value-free `PageAdaptationError`.
 - Added the strict, standalone `verify_keyset_capability()` Python API and `b24api verify-keyset`

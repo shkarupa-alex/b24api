@@ -77,6 +77,8 @@ binding source and any database/session lifetime; `b24api` never owns or imports
 successfully committed downstream, then recreate the binding after restart. Delivery is
 at-least-once across the gap between stream delivery and durable commit, so downstream writes must
 be idempotent. Each parent advances independently and still requires an empty confirmation page.
+When `CursorSpec.allow_create_controls=False`, the request must already contain the complete cursor
+control path including its leaf. `start_cursor` may replace that leaf, but never creates it.
 
 All list APIs now accept a synchronous object strategy `page_adapter`. It sees one immutable
 `PageView` containing the full frozen result and the selected frozen items, and returns an

@@ -318,9 +318,16 @@ class ReferenceScheduler:
         violation_offset = 0
         trace_offset = 0
         scheduled_sequences: list[int] = []
+        settlement: asyncio.Future[None] | None = None
+
+        def settle_page() -> None:
+            nonlocal settlement
+            if settlement is not None and not settlement.done():
+                settlement.set_result(None)
+            settlement = None
 
         async def fetch(request: Request) -> Response:
-            nonlocal page_state, reservation
+            nonlocal page_state, reservation, settlement
             self.producer_state.runnable.discard(producer_key)
             self.producer_state.admitting.add(producer_key)
             self.producer_state.touch()
@@ -330,6 +337,7 @@ class ReferenceScheduler:
             try:
                 reservation = await self.buffer.reserve(work.index, self.page_cap)
                 dispatched: _DispatchedPage = await self.dispatcher.fetch(request, f"r{work.index}")
+                settlement = dispatched.settlement
             except BaseException as error:
                 self.producer_state.admitting.discard(producer_key)
                 self.producer_state.touch()
@@ -378,6 +386,8 @@ class ReferenceScheduler:
                 if reservation is None:
                     raise RuntimeError("page completed without a buffer reservation")  # noqa: TRY301
                 await self.buffer.accept(reservation, page.retained_rows)
+                if self.output_order is ReferenceOutputOrder.INPUT:
+                    settle_page()
                 acknowledged = asyncio.get_running_loop().create_future()
                 if page.continuing:
                     self.producer_state.pending_continuations.add(producer_key)
@@ -403,6 +413,8 @@ class ReferenceScheduler:
                 )
                 trace_offset = driver.page_trace_count
                 await acknowledged
+                if self.output_order is ReferenceOutputOrder.READY:
+                    settle_page()
                 self.producer_state.pending_continuations.discard(producer_key)
                 if page.continuing:
                     self.producer_state.runnable.add(producer_key)
@@ -460,6 +472,7 @@ class ReferenceScheduler:
                 ),
             )
         finally:
+            settle_page()
             self.producer_state.runnable.discard(producer_key)
             self.producer_state.admitting.discard(producer_key)
             self.producer_state.pending_continuations.discard(producer_key)
