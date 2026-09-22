@@ -12,6 +12,7 @@ requests.
 | 7 | `chat_resume` | supported offline | SQLite page commit, global early close, one-row overlap, eight exact keyed IDs |
 | 11 | `sparse_user_search` | supported offline | Mapping values at 0/100 despite selected-empty 50; raw bound 150 |
 | 12 | `page_index_members` | supported offline | Both one-based controls advance 1/2/3 and return 13 exact user IDs |
+| 13 | `elapsed_task_items` | supported offline | Five exact JSON slots, task-scoped 50/3/empty pages and 53 IDs |
 | 16 | `binary_download` | supported offline | Exact PDF/file bytes and media types; denied JSON remains `ApiResponseError` |
 | 19 | `v3_task_results` | supported offline | Exact task result ID, object-valued validation error, unchanged failed-parent checkpoint |
 

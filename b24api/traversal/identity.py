@@ -148,6 +148,18 @@ def _request_with_controls(
     allow_create: bool,
     replace: frozenset[ParameterPath] = frozenset(),
 ) -> Request:
+    if request.positional is not None:
+        try:
+            positional = request.positional
+            for path, value in updates.items():
+                positional = positional.write_control(path.path, value)
+        except (KeyError, TypeError, ValueError) as error:
+            raise CapabilityError("positional request conflicts with declared traversal controls") from error
+        return Request(
+            request.method, parameters=positional, replay_safety=request.replay_safety,
+            encoding=request.encoding, headers=request.headers,
+            result_error=request.result_error, route=request.route,
+        )
     try:
         parameters = request.copy_parameters()
         for path in replace:
@@ -208,12 +220,17 @@ def _replace_owned_control(  # noqa: C901, PLR0912 - exact nested path replaceme
 
 def _initial_offset(request: Request, path: ParameterPath, *, default: int = 0) -> int:
     """Return a caller-supplied lexical control or its qualified default."""
-    current: object = request.copy_parameters()
+    positional = request.positional is not None
+    current: object = (
+        request.positional.to_wire_slots() if request.positional is not None else request.copy_parameters()
+    )
     for part in path.path:
         if isinstance(part, str):
             if not isinstance(current, dict):
                 return default
-            matches = [key for key in current if key.casefold() == part.casefold()]
+            matches = [part] if positional and part in current else (
+                [] if positional else [key for key in current if key.casefold() == part.casefold()]
+            )
             if len(matches) > 1:
                 raise CapabilityError("request contains an ambiguous initial offset path")
             if not matches:

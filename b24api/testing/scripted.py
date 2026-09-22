@@ -3,12 +3,9 @@
 from __future__ import annotations
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
-from b24api.transport.base import WireResponse
-
-if TYPE_CHECKING:
-    from b24api.contracts.request import Request
+from b24api.contracts.request import Request
+from b24api.transport.base import TransportCapabilities, WireRequest, WireResponse
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +24,8 @@ class ScriptedExchange:
 
 class ScriptedTransport:
     """Match a finite frozen exchange table by complete canonical Request value."""
+
+    capabilities = TransportCapabilities(positional_json=True)
 
     def __init__(self, exchanges: tuple[ScriptedExchange, ...], *, host: str = "fixture.invalid") -> None:
         """Copy fixture entries without reading credentials or opening a socket."""
@@ -65,6 +64,19 @@ class ScriptedTransport:
                     raise AssertionError("scripted response exceeds the caller's byte ceiling")
                 return response
         raise AssertionError(f"unexpected scripted request: {request.method}")
+
+    async def send_wire(
+        self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int,
+    ) -> WireResponse:
+        """Match advanced JSON requests, including exact positional slot values."""
+        canonical = Request(
+            request.method,
+            parameters=request.positional if request.positional is not None else request.copy_parameters(),
+            replay_safety=request.replay_safety,
+            encoding=request.encoding, headers=request.headers,
+            result_error=request.result_error, route=request.route,
+        )
+        return await self.send(canonical, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
 
     def assert_exhausted(self) -> None:
         """Fail when a recipe did not issue every expected fixture request."""
