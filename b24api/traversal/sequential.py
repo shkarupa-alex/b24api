@@ -5,6 +5,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
+from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch, PageRejectionCode
 from b24api.errors import BudgetExceededError, CapabilityError, PaginationError
 from b24api.execution import (
@@ -187,6 +188,9 @@ class _SequentialMixin:
     async def _fetch(self: Any, request: Request) -> Response:
         if self._fetch_override is not None:
             return cast("Response", await self._fetch_override(request))
+        recorder = self.completion_recorder
+        if recorder is not None:
+            recorder.scheduled()
         reservation = None
         try:
             reservation = await self.context.reserve_page()
@@ -196,7 +200,15 @@ class _SequentialMixin:
                 work_class=WorkClass.TRAVERSAL_DIRECT,
             )
             self.context.commit_page(reservation)
+            if recorder is not None:
+                recorder.settled(CommandSettlement.SUCCESS)
         except BaseException as error:
+            if recorder is not None:
+                recorder.settled(
+                    CommandSettlement.UNKNOWN
+                    if bool(getattr(error, "_b24api_dispatch_started", False))
+                    else CommandSettlement.NOT_EXECUTED,
+                )
             if reservation is not None:
                 self.context.release_page(reservation)
             if bool(getattr(error, "_b24api_dispatch_started", False)):

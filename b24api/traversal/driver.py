@@ -81,8 +81,9 @@ from b24api.traversal.values import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Sequence
 
+    from b24api.completion.recorder import CompletionRecorder
     from b24api.contracts.json import JsonValue
     from b24api.contracts.response import Response
     from b24api.execution import ExecutionContext, Executor
@@ -108,6 +109,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         page_cap_hint: int | None = None,
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         initial_cursor: IdentityValue | None = None,
+        completion_recorder: CompletionRecorder | None = None,
     ) -> None:
         """Initialize instance state."""
         self.executor = executor
@@ -117,6 +119,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self.identity = identity
         self.context = context
         self._fetch_override = fetch
+        self.completion_recorder = completion_recorder
         self._single_result_as_item = single_result_as_item
         if page_cap_hint is not None and (
             not isinstance(page_cap_hint, int) or isinstance(page_cap_hint, bool) or page_cap_hint < 1
@@ -455,10 +458,12 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         if identities:
             self._last_identity = identities[-1]
         self._fingerprints.update((fingerprint,) if track_fingerprint else ())
-        self._record_committed_page(items, response)
+        self._record_committed_page(items, response, identities)
         return identities
 
-    def _record_committed_page(self, items: tuple[FrozenJson, ...], response: Response) -> None:
+    def _record_committed_page(
+        self, items: tuple[FrozenJson, ...], response: Response, identities: Sequence[IdentityValue] = (),
+    ) -> None:
         self._append_page_record(
             PageRecord(
                 sequence=0,
@@ -473,6 +478,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                 rejection_code=None,
             ),
         )
+        if self.completion_recorder is not None:
+            self.completion_recorder.validated(identities, len(items))
 
     def schedule_page(
         self,
@@ -550,6 +557,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                 rejection_code=code,
             ),
         )
+        if self.completion_recorder is not None:
+            self.completion_recorder.rejected(code.value)
 
     def _extract_identities(self, items: tuple[FrozenJson, ...]) -> list[IdentityValue]:
         if self.identity is None:

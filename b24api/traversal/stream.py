@@ -11,6 +11,8 @@ from dataclasses import replace
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Self, cast
 
+from b24api.completion.recorder import CompletionRecorder
+from b24api.contracts.completion import CleanupState
 from b24api.contracts.json import JsonValue, _thaw_json
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.page_stop import CallerStop, ContinuePage, PageBoundary, PageStopPolicy
@@ -33,6 +35,7 @@ from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
 from b24api.traversal.identity import _MISSING, _Page
+from b24api.traversal.plans import ItemCursorPlan, KeysetPlan, OffsetSequentialPlan
 
 if TYPE_CHECKING:
     from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
@@ -63,6 +66,10 @@ class ItemStream(AsyncIterator[JsonValue]):
         """Initialize instance state."""
         PaginationDriver.validate_plan(plan)
         self._context = executor.context(policy)
+        self._completion = CompletionRecorder() if isinstance(
+            plan, OffsetSequentialPlan | KeysetPlan | ItemCursorPlan,
+        ) else None
+        self._completion_cleanup_done = False
         self._driver = PaginationDriver(
             executor,
             request,
@@ -72,6 +79,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             context=self._context,
             page_cap_hint=page_cap_hint,
             page_adapter=page_adapter,
+            completion_recorder=self._completion,
         )
         self._assurance = assurance
         if page_stop is not None and not callable(getattr(page_stop, "on_page", None)):
@@ -90,6 +98,11 @@ class ItemStream(AsyncIterator[JsonValue]):
         """Return this asynchronous iterator."""
         return self
 
+    @property
+    def completion_gate(self) -> object:
+        """Return live bounded evidence for the sequential traversal family."""
+        return None if self._completion is None else self._completion.gate
+
     async def __anext__(self) -> JsonValue:
         """Return the next asynchronous item."""
         if self._closed:
@@ -101,9 +114,21 @@ class ItemStream(AsyncIterator[JsonValue]):
             return item
         if self._runner is None:
             self._runner = self._run()
-        item, is_unique = await anext(self._runner)
+        try:
+            item, is_unique = await anext(self._runner)
+        except BaseException:
+            self._finish_completion_cleanup()
+            raise
         self._record_delivery(is_unique=is_unique)
         return item
+
+    def _finish_completion_cleanup(self) -> None:
+        recorder = self._completion
+        if recorder is None or self._completion_cleanup_done or self.report.state is KernelState.NOT_STARTED:
+            return
+        failed = any(item.code == "cleanup_failure" for item in self.report.violations)
+        recorder.cleanup(CleanupState.FAILURE if failed else CleanupState.SUCCESS)
+        self._completion_cleanup_done = True
 
     def _record_delivery(self, *, is_unique: bool) -> None:
         self._emitted += 1
@@ -144,8 +169,10 @@ class ItemStream(AsyncIterator[JsonValue]):
             raise
         finally:
             self._prefetched = _MISSING
+            self._finish_completion_cleanup()
         if self.report.state is KernelState.NOT_STARTED and self._runner is not None:
             await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
+            self._finish_completion_cleanup()
 
     async def _run(self) -> AsyncGenerator[tuple[JsonValue, bool]]:  # noqa: C901, PLR0912, PLR0915
         pages = self._driver.pages()
@@ -161,6 +188,8 @@ class ItemStream(AsyncIterator[JsonValue]):
                     await self._context.set_buffered_rows(len(buffered) + 1)
                     yield _thaw_json(item), is_unique
                     await self._context.set_buffered_rows(len(buffered))
+                if page.items and self._completion is not None:
+                    self._completion.delivered()
                 if self._page_stop is not None:
                     record = self._driver.last_page_record
                     if record is None:
@@ -170,10 +199,14 @@ class ItemStream(AsyncIterator[JsonValue]):
                         decision = await decision
                     if not isinstance(decision, ContinuePage | CallerStop):
                         raise TypeError("page stop policy returned an invalid decision")
+                    if page.items and self._completion is not None:
+                        self._completion.acknowledged()
                     if isinstance(decision, CallerStop) and page.continuing:
                         self._caller_stopped = True
                         self._stop_reason = decision.reason
                         break
+                elif page.items and self._completion is not None:
+                    self._completion.acknowledged()
             naturally_exhausted = True
             await self._finalize(
                 KernelState.COMPLETED,
@@ -324,6 +357,8 @@ class ItemStream(AsyncIterator[JsonValue]):
             page_trace=page_trace,
             page_trace_truncated=page_trace_truncated,
         )
+        if self._completion is not None:
+            self._completion.terminal_from_plan(self._driver.plan, state, caller_stopped=self._caller_stopped)
 
 
 def iter_list(  # noqa: PLR0913

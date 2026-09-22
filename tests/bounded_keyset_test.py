@@ -82,7 +82,8 @@ async def test_exact_admitted_upper_id_closes_without_empty_confirmation() -> No
     assert transport.requests[1]["filter"][">ID"] == 2
     assert stream.report is not None
     assert stream.report.assurance is TraversalAssurance.BOUNDED_RANGE_OBSERVED
-    assert stream.report.exhausted
+    assert not stream.report.exhausted
+    assert stream.report.partial
 
 
 @pytest.mark.asyncio

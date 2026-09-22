@@ -1,6 +1,7 @@
 """One explicit, method-agnostic b24api v2 public surface."""
 
 from b24api.client import Bitrix24
+from b24api.completion import CompletionGate
 from b24api.contracts import (
     AdaptedPage,
     AmbiguityPolicy,
@@ -194,6 +195,7 @@ __all__ = [
     "CommandSettlement",
     "CommandSuccess",
     "CompletionEvent",
+    "CompletionGate",
     "CompositeIdentitySpec",
     "ConsistencyPolicy",
     "ContinuePage",

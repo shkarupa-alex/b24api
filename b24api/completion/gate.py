@@ -3,6 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import TYPE_CHECKING
 
 from b24api.contracts.completion import (
     BindingAdmitted,
@@ -21,7 +22,17 @@ from b24api.contracts.completion import (
     StreamClosure,
     StreamTerminal,
 )
-from b24api.contracts.report import TerminalState, Violation, ViolationSeverity
+from b24api.contracts.policy import KernelState
+from b24api.contracts.report import (
+    OperationReport,
+    TerminalState,
+    TraversalAssurance,
+    Violation,
+    ViolationSeverity,
+)
+
+if TYPE_CHECKING:
+    from b24api.execution.snapshot import KernelReport
 
 _MAX_ID_LENGTH = 128
 _MAX_VIOLATIONS = 128
@@ -60,6 +71,26 @@ class CompletionDecision:
     pages_acknowledged: int
 
 
+@dataclass(frozen=True, slots=True)
+class CompletionReportFacts:
+    """Post-cleanup source snapshot and bounded public delivery counters."""
+
+    source: KernelReport
+    operation: str
+    assurance: TraversalAssurance | None
+    admitted: int
+    emitted: int
+    successes: int
+    failures: int
+    not_executed: int
+    unknown: int
+    buffered_commands_high_water: int
+    active_references_high_water: int
+    early_closed: bool = False
+    forced_state: TerminalState | None = None
+    extra_violations: tuple[Violation, ...] = ()
+
+
 class CompletionGate:
     """Accept ordered evidence with O(active bindings + in-flight pages) memory."""
 
@@ -84,6 +115,7 @@ class CompletionGate:
         self._stream: StreamClosure | None = None
         self._cleanup: CleanupState | None = None
         self._violations: list[Violation] = []
+        self._report_facts: CompletionReportFacts | None = None
 
     def _violate(self, code: str) -> None:
         if len(self._violations) < _MAX_VIOLATIONS:
@@ -196,10 +228,9 @@ class CompletionGate:
             if binding.unknown_pages and event.closure is not BindingClosure.UNKNOWN:
                 self._violate("completion_unknown_binding_claimed_known")
                 return
-            if not binding.negative_pages and event.closure in {BindingClosure.FAILURE, BindingClosure.UNKNOWN}:
-                self._violate("completion_negative_terminal_lacks_evidence")
-                return
-            if binding.last_page_id < 0 and event.closure != BindingClosure.CALLER_STOP:
+            if binding.last_page_id < 0 and event.closure not in {
+                BindingClosure.CALLER_STOP, BindingClosure.FAILURE, BindingClosure.UNKNOWN,
+            }:
                 self._violate("completion_terminal_lacks_page_witness")
                 return
             if event.closure in {BindingClosure.FAILURE, BindingClosure.UNKNOWN}:
@@ -229,7 +260,7 @@ class CompletionGate:
         del self._pages[binding_id, page_id]
         self._bindings[binding_id].open_pages -= 1
 
-    def finish(self) -> CompletionDecision:
+    def decision(self) -> CompletionDecision:
         """Decide only after terminal and cleanup evidence is available."""
         if self._stream is None or self._cleanup is None:
             raise RuntimeError("completion gate requires stream terminal and cleanup outcome")
@@ -259,4 +290,65 @@ class CompletionGate:
             self._terminal,
             self._scheduled,
             self._acknowledged,
+        )
+
+    def attach_report(self, facts: CompletionReportFacts) -> None:
+        """Bind exactly one post-cleanup source snapshot for final report creation."""
+        if not isinstance(facts, CompletionReportFacts) or self._report_facts is not None:
+            raise RuntimeError("completion report facts must be attached once")
+        self._report_facts = facts
+
+    def finish(self) -> OperationReport:
+        """Build the sole strong frozen report after correlated cleanup evidence."""
+        decision = self.decision()
+        facts = self._report_facts
+        if facts is None:
+            raise RuntimeError("completion report facts were not attached")
+        source = facts.source
+        if facts.early_closed:
+            state = TerminalState.EARLY_CLOSED
+        elif source.state is KernelState.COMPLETED:
+            state = TerminalState.COMPLETED_WITH_FAILURES if (
+                facts.failures + facts.not_executed + facts.unknown
+            ) else TerminalState.COMPLETED
+        elif source.state is KernelState.INCOMPLETE:
+            state = TerminalState.INCOMPLETE
+        elif source.state is KernelState.CANCELLED:
+            state = TerminalState.CANCELLED
+        else:
+            state = TerminalState.FAILED
+        violations = (*source.violations, *decision.violations, *facts.extra_violations)
+        if state is TerminalState.COMPLETED and (
+            decision.state is not TerminalState.COMPLETED
+            or any(item.severity is ViolationSeverity.BLOCKING for item in violations)
+        ):
+            state = TerminalState.INCOMPLETE
+        if facts.forced_state is not None:
+            state = facts.forced_state
+        return OperationReport(
+            state=state,
+            operation=facts.operation,
+            terminal_reason=source.terminal_reason or state.value,
+            exhausted=state is TerminalState.COMPLETED and decision.exhausted,
+            assurance=TraversalAssurance.BOUNDED_PREFIX if source.caller_stopped else facts.assurance,
+            admitted=facts.admitted,
+            emitted=facts.emitted,
+            successes=facts.successes,
+            failures=facts.failures,
+            not_executed=facts.not_executed,
+            unknown=facts.unknown,
+            unique_rows=source.unique_rows,
+            physical_requests=source.physical_requests,
+            logical_pages=source.logical_pages,
+            batch_requests=source.batch_requests,
+            batch_commands=source.batch_commands,
+            retries=source.retries,
+            cooldown_seconds=source.cooldown_seconds,
+            buffered_commands_high_water=facts.buffered_commands_high_water,
+            buffered_rows_high_water=source.buffered_rows_high_water,
+            active_references_high_water=facts.active_references_high_water,
+            violations=violations,
+            page_trace=source.page_trace,
+            page_trace_truncated=source.page_trace_truncated,
+            keyset_execution=source.keyset_execution,
         )

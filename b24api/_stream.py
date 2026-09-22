@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
+from b24api.completion.gate import CompletionGate, CompletionReportFacts
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import OperationReport, TerminalState, TraversalAssurance, Violation
 from b24api.contracts.stream import PartialResult
@@ -277,25 +278,48 @@ class MappedOperationStream[S, T]:
     def _finalize(self, *, forced_state: TerminalState | None = None) -> None:
         if self._report is not None:
             return
-        report = _public_report(
-            self._source.report,
-            operation=self._operation,
-            assurance=self._assurance,
-            admitted=max(self._admitted, _read_source_counter(self._source_admitted)),
-            emitted=self._emitted,
-            successes=self._successes,
-            failures=self._failures,
-            not_executed=self._not_executed,
-            unknown=self._unknown,
-            buffered_commands_high_water=_read_source_counter(self._source_buffered_commands),
-            active_references_high_water=_read_source_counter(self._source_active_references),
-            early_closed=self._early_closed,
-        )
+        gate = getattr(self._source, "completion_gate", None)
         extra_violations = (*self._initial_violations, *(_read_violations(self._source_violations)))
-        if extra_violations:
-            report = replace(report, violations=(*report.violations, *extra_violations))
-        if forced_state is not None and report.state is not forced_state:
-            report = replace(report, state=forced_state)
+        admitted = max(self._admitted, _read_source_counter(self._source_admitted))
+        buffered_commands = _read_source_counter(self._source_buffered_commands)
+        active_references = _read_source_counter(self._source_active_references)
+        if isinstance(gate, CompletionGate) and self._source.report.state is not KernelState.NOT_STARTED:
+            gate.attach_report(CompletionReportFacts(
+                source=self._source.report,
+                operation=self._operation,
+                assurance=self._assurance,
+                admitted=admitted,
+                emitted=self._emitted,
+                successes=self._successes,
+                failures=self._failures,
+                not_executed=self._not_executed,
+                unknown=self._unknown,
+                buffered_commands_high_water=buffered_commands,
+                active_references_high_water=active_references,
+                early_closed=self._early_closed,
+                forced_state=forced_state,
+                extra_violations=extra_violations,
+            ))
+            report = gate.finish()
+        else:
+            report = _public_report(
+                self._source.report,
+                operation=self._operation,
+                assurance=self._assurance,
+                admitted=admitted,
+                emitted=self._emitted,
+                successes=self._successes,
+                failures=self._failures,
+                not_executed=self._not_executed,
+                unknown=self._unknown,
+                buffered_commands_high_water=buffered_commands,
+                active_references_high_water=active_references,
+                early_closed=self._early_closed,
+            )
+            if extra_violations:
+                report = replace(report, violations=(*report.violations, *extra_violations))
+            if forced_state is not None and report.state is not forced_state:
+                report = replace(report, state=forced_state)
         self._report = report
         self._terminated = True
         if self._deregister is not None:
