@@ -13,6 +13,7 @@ requests.
 | 3 | `recent_dialogs` | supported offline | Envelope next, total=-1, five emitted rows, duplicate warning and four keyed chats |
 | 4 | `search_chat_messages` | supported offline | Two-page chat, empty chat, typed ACCESS_ERROR and three correlated terminals |
 | 5 | `task_role_union` | supported offline | Four role traversals, 932 exact IDs, 900/932 repeat hazard and aligned 950 empty page |
+| 6 | `task_comments` | supported offline | Correlated TASKS_TASK batch, modern/legacy/empty/denied outcomes and exact three-slot legacy wire |
 | 7 | `chat_resume` | supported offline | SQLite page commit, global early close, one-row overlap, eight exact keyed IDs |
 | 8 | `crm_item_delta` | supported offline | Discovered smart-process type, edited old ID and new ID reconciled by time-window replay |
 | 9 | `calendar_delta` | supported offline | Inclusive timezone border, recurring tombstones, atomic keyed deletion and checkpoint |
@@ -27,7 +28,6 @@ requests.
 | 18 | `content_viewers` | supported offline | Direct nested `params`, paged `items`, ordinary user mapping and guarded empty success |
 | 19 | `v3_task_results` | supported offline | Exact task result ID, object-valued validation error, unchanged failed-parent checkpoint |
 
-The remaining scenarios in `spec/2026-09-22-b24api-issues-architecture/examples-contracts.md`
-are still under implementation. An offline pass does not assert that a live
-portal has the same method semantics; those claims require the specified
-opt-in disposable-portal fixture.
+All 19 scenarios have offline recipes. An offline pass does not assert that a
+live portal has the same method semantics; those claims require the specified
+opt-in disposable-portal fixtures and have not been recorded here.

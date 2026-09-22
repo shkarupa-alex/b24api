@@ -1,0 +1,203 @@
+"""Scenario 6: resolve modern task chats and traverse legacy comments.
+
+One physical batch resolves four task IDs: a modern chat with messages, a
+legacy task without a chat, an empty modern chat, and a chat whose messages
+are inaccessible. The legacy fallback uses the exact TASKID/ORDER/FILTER
+positional ABI and public keyset traversal; the stub tasks.task.comment.list
+is never used. Run: `uv run python -m examples.task_comments`.
+"""
+
+from __future__ import annotations
+import asyncio
+
+from b24api import (
+    ApiResponseError,
+    Binding,
+    Bitrix24,
+    Command,
+    CommandSuccess,
+    CursorDomain,
+    CursorSpec,
+    CursorTraversal,
+    DirectDispatch,
+    IdentityCoercion,
+    IdentitySpec,
+    KeysetSpec,
+    ParameterPath,
+    ParameterUpdate,
+    PositionalArguments,
+    PositionalLayout,
+    Present,
+    ReferenceComplete,
+    ReferenceFailure,
+    ReferenceItem,
+    ReplaySafety,
+    Request,
+    ResultSelector,
+    RouteKind,
+    SequentialKeysetExecution,
+    Settings,
+    SlotContract,
+    SlotShape,
+    TerminalState,
+)
+from b24api.testing import ScriptedExchange, ScriptedTransport
+
+CHAT_METHOD = "im.chat.get"
+MESSAGE_METHOD = "im.dialog.messages.get"
+LEGACY_METHOD = "task.commentitem.getlist"
+TASKS = (42, 43, 44, 45)
+CHAT_IDS = {42: 900, 44: 901, 45: 902}
+HEAD = 9999
+EXPECTED_MODERN = (9, 8)
+EXPECTED_LEGACY = (1, 2)
+LAYOUT = PositionalLayout(
+    "task.commentitem.getlist.three.v1",
+    (SlotContract("TASKID", SlotShape.SCALAR, fixed=True),
+     SlotContract("ORDER", SlotShape.OBJECT), SlotContract("FILTER", SlotShape.OBJECT)),
+    control_paths=frozenset({(1, "ID"), (2, ">ID")}),
+)
+
+
+def _chat_request(task_id: int) -> Request:
+    return Request(
+        CHAT_METHOD, {"ENTITY_TYPE": "TASKS_TASK", "ENTITY_ID": str(task_id)},
+        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+    )
+
+
+def _message_request(chat_id: int, cursor: int) -> Request:
+    return Request(
+        MESSAGE_METHOD, {"DIALOG_ID": f"chat{chat_id}", "LAST_ID": cursor, "LIMIT": 2},
+        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+    )
+
+
+def _legacy_request(cursor: int) -> Request:
+    arguments = PositionalArguments(
+        (Present(43), Present({"ID": "ASC"}), Present({">ID": cursor})),
+        LAYOUT.layout_id, layout=LAYOUT,
+    )
+    return Request(LEGACY_METHOD, arguments, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+
+
+def _fixture() -> ScriptedTransport:
+    return ScriptedTransport((
+        ScriptedExchange.batch(
+            tuple(_chat_request(task_id) for task_id in TASKS),
+            ({"ID": 900}, None, {"ID": 901}, {"ID": 902}), total=0,
+        ),
+        ScriptedExchange.json(
+            _message_request(900, HEAD),
+            {"result": {"messages": [{"id": value} for value in EXPECTED_MODERN]}},
+        ),
+        ScriptedExchange.json(_message_request(900, 8), {"result": {"messages": []}}),
+        ScriptedExchange.json(_message_request(901, HEAD), {"result": {"messages": []}}),
+        ScriptedExchange.json(
+            _message_request(902, HEAD), {"error": "ACCESS_ERROR", "error_description": "denied"},
+        ),
+        ScriptedExchange.json(
+            _legacy_request(0), {"result": [{"ID": str(value)} for value in EXPECTED_LEGACY]},
+        ),
+        ScriptedExchange.json(_legacy_request(2), {"result": []}),
+    ))
+
+
+def _id(row: object, key: str) -> int:
+    if not isinstance(row, dict):
+        raise TypeError("comment row must be an object")
+    value = row.get(key)
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise TypeError("comment ID must be a string or integer")
+    return int(value)
+
+
+async def _resolve_chats(client: Bitrix24) -> dict[int, int | None]:
+    stream = client.batch_outcomes(tuple(Command(_chat_request(task_id), task_id) for task_id in TASKS))
+    resolved: dict[int, int | None] = {}
+    async for outcome in stream:
+        if not isinstance(outcome, CommandSuccess):
+            raise TypeError("scenario 6 chat-resolution batch lost a task outcome")
+        result = outcome.result
+        resolved[outcome.correlation] = _id(result, "ID") if result is not None else None
+    if resolved != {42: 900, 43: None, 44: 901, 45: 902}:
+        raise AssertionError("scenario 6 batch chat correlation differed from oracle")
+    if stream.report is None or stream.report.state is not TerminalState.COMPLETED:
+        raise AssertionError("scenario 6 chat batch lacked completion")
+    return resolved
+
+
+async def _read_modern(client: Bitrix24, resolved: dict[int, int | None]) -> None:
+    bindings = tuple(
+        Binding(
+            f"task:{task_id}",
+            (ParameterUpdate(ParameterPath(("DIALOG_ID",)), f"chat{chat_id}"),), task_id,
+        )
+        for task_id, chat_id in resolved.items() if chat_id is not None
+    )
+    stream = client.iter_reference_outcomes(
+        _message_request(900, HEAD), bindings,
+        traversal=CursorTraversal(
+            selector=ResultSelector(("messages",)),
+            cursor=CursorSpec(
+                ParameterPath(("LAST_ID",)), ("id",), IdentityCoercion.EXACT_INTEGER,
+                "descending", "last", domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
+                limit_path=ParameterPath(("LIMIT",)),
+            ), page_size=2,
+        ),
+        dispatch=DirectDispatch(concurrency=1),
+    )
+    messages: dict[int, list[int]] = {task_id: [] for task_id in CHAT_IDS}
+    completed: set[int] = set()
+    denied: set[int] = set()
+    async for outcome in stream:
+        if isinstance(outcome, ReferenceItem):
+            messages[outcome.correlation].append(_id(outcome.item, "id"))
+        elif isinstance(outcome, ReferenceComplete):
+            completed.add(outcome.correlation)
+        elif isinstance(outcome, ReferenceFailure):
+            if not isinstance(outcome.error, ApiResponseError) or outcome.error.original_code != "ACCESS_ERROR":
+                raise AssertionError("scenario 6 inaccessible chat lost typed ACCESS_ERROR")
+            denied.add(outcome.correlation)
+    if messages != {42: [9, 8], 44: [], 45: []} or completed != {42, 44} or denied != {45}:
+        raise AssertionError("scenario 6 modern empty/inaccessible outcomes collapsed")
+    if stream.report is None or stream.report.state is not TerminalState.COMPLETED_WITH_FAILURES:
+        raise AssertionError("scenario 6 modern failure falsely claimed global completion")
+
+
+async def _read_legacy(client: Bitrix24) -> None:
+    stream = client.iter_list_keyset(
+        _legacy_request(0),
+        selector=ResultSelector.root(),
+        identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
+        page_size=2,
+        keyset=KeysetSpec(
+            filter_path=ParameterPath((2,)), order_path=ParameterPath((1,)),
+            start_suppression_path=None,
+        ),
+        execution=SequentialKeysetExecution(),
+    )
+    observed = tuple([_id(row, "ID") async for row in stream])
+    if observed != EXPECTED_LEGACY or stream.report is None or not stream.report.exhausted:
+        raise AssertionError("scenario 6 legacy positional keyset differed from oracle")
+
+
+async def run() -> None:
+    """Retain modern and legacy outcomes through public traversal APIs."""
+    transport = _fixture()
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    async with Bitrix24(settings, transport=transport) as client:
+        resolved = await _resolve_chats(client)
+        await _read_modern(client, resolved)
+        await _read_legacy(client)
+    transport.assert_exhausted()
+    legacy_slots = tuple(
+        request.positional.to_wire_slots()
+        for request in transport.calls if request.method == LEGACY_METHOD and request.positional is not None
+    )
+    if legacy_slots != ([43, {"ID": "ASC"}, {">ID": 0}], [43, {"ID": "ASC"}, {">ID": 2}]):
+        raise AssertionError("scenario 6 legacy TASKID/ORDER/FILTER wire order changed")
+
+
+if __name__ == "__main__":
+    asyncio.run(run())
