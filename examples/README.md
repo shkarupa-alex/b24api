@@ -10,6 +10,7 @@ requests.
 | --- | --- | --- | --- |
 | 1 | `chat_bounded_mirror` | supported offline | Three chats, 11 exact IDs, two per-binding stops and one natural exhaustion |
 | 2 | `message_cursor_direction` | supported offline | FIRST_ID false clean end versus LAST_ID 5/5 at limits 1, 3 and 50 |
+| 5 | `task_role_union` | supported offline | Four role traversals, 932 exact IDs, 900/932 repeat hazard and aligned 950 empty page |
 | 7 | `chat_resume` | supported offline | SQLite page commit, global early close, one-row overlap, eight exact keyed IDs |
 | 9 | `calendar_delta` | supported offline | Inclusive timezone border, recurring tombstones, atomic keyed deletion and checkpoint |
 | 11 | `sparse_user_search` | supported offline | Mapping values at 0/100 despite selected-empty 50; raw bound 150 |
