@@ -43,6 +43,7 @@ from b24api.contracts import (
     TerminalState,
     TraversalAssurance,
 )
+from b24api.contracts.completion import PageAcknowledged, PageScheduled
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
@@ -1183,6 +1184,8 @@ async def test_counted_traversal_preserves_frozen_request_shape_and_exact_identi
         return rows, next_offset
 
     def handler(request: Request) -> object:
+        assert events
+        assert events[-1] is PageScheduled
         if request.method == "test.list":
             raw_start = request.copy_parameters().get("start", 0)
             assert isinstance(raw_start, int)
@@ -1217,6 +1220,15 @@ async def test_counted_traversal_preserves_frozen_request_shape_and_exact_identi
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
+    gate = stream._source.completion_gate  # noqa: SLF001 - inspect counted lifecycle seam
+    events: list[type[object]] = []
+    original_emit = gate.emit
+
+    def observe(event: object) -> None:
+        events.append(type(event))
+        original_emit(event)
+
+    gate.emit = observe
 
     rows = [item async for item in stream]
 
@@ -1226,6 +1238,10 @@ async def test_counted_traversal_preserves_frozen_request_shape_and_exact_identi
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.physical_requests == EXPECTED_COUNTED_REQUESTS
     assert stream.report.batch_requests == 1
+    assert gate.decision().pages_scheduled == gate.decision().pages_acknowledged
+    assert gate.decision().exhausted
+    assert gate.finish() == stream.report
+    assert events.count(PageScheduled) == events.count(PageAcknowledged) == COUNTED_ROWS // PAGE_SIZE
 
 
 @pytest.mark.asyncio

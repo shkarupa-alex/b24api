@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Self
 
+from b24api.completion.recorder import CountedCompletionRecorder
+from b24api.contracts.completion import BindingClosure, CleanupState, StreamClosure
 from b24api.contracts.json import _thaw_json
 from b24api.contracts.policy import (
     CompletionAssurance,
@@ -47,6 +49,8 @@ class CountedItemStream:
     ) -> None:
         """Initialize without scheduling work."""
         self._context = executor.context(policy)
+        self._completion = CountedCompletionRecorder()
+        self._completion_cleanup_done = False
         self._driver = PaginationDriver(
             executor,
             request,
@@ -56,6 +60,7 @@ class CountedItemStream:
             context=self._context,
             page_cap_hint=page_size,
             page_adapter=page_adapter,
+            completion_recorder=self._completion,
         )
         self._page_size = page_size
         self._batch_size = batch_size
@@ -69,6 +74,17 @@ class CountedItemStream:
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
         return self
+
+    @property
+    def completion_gate(self) -> object:
+        """Expose live counted completion evidence to the operation wrapper."""
+        return self._completion.gate
+
+    def _finish_completion_cleanup(self) -> None:
+        if self._completion_cleanup_done or self.report.state is KernelState.NOT_STARTED:
+            return
+        self._completion.cleanup(CleanupState.SUCCESS)
+        self._completion_cleanup_done = True
 
     async def __anext__(self) -> JsonValue:
         """Return the next validated item."""
@@ -87,6 +103,7 @@ class CountedItemStream:
             await self._runner.aclose()
         if self.report.state is KernelState.NOT_STARTED:
             await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
+        self._finish_completion_cleanup()
 
     async def _run(self) -> AsyncGenerator[JsonValue]:
         primary: BaseException | None = None
@@ -100,6 +117,9 @@ class CountedItemStream:
                     self._emitted += 1
                     self._unique += int(is_unique)
                     yield _thaw_json(item)
+                if page.items:
+                    self._completion.delivered()
+                    self._completion.acknowledged()
             await self._finalize(KernelState.COMPLETED, "counted traversal completed exactly")
         except asyncio.CancelledError as error:
             primary = error
@@ -125,6 +145,7 @@ class CountedItemStream:
             self._closed = True
             if primary is not None and self.report.state is KernelState.NOT_STARTED:
                 await self._finalize(KernelState.FAILED, type(primary).__name__)
+            self._finish_completion_cleanup()
 
     async def _finalize(self, state: KernelState, reason: str) -> None:
         if self.report.state is not KernelState.NOT_STARTED:
@@ -165,6 +186,13 @@ class CountedItemStream:
             page_trace=page_trace,
             page_trace_truncated=page_trace_truncated,
         )
+        closure = BindingClosure.QUALIFIED_TOTAL if state is KernelState.COMPLETED else BindingClosure.FAILURE
+        stream = (
+            StreamClosure.NATURAL if state is KernelState.COMPLETED
+            else StreamClosure.CANCELLED if state is KernelState.CANCELLED
+            else StreamClosure.EARLY_CLOSE
+        )
+        self._completion.terminal(closure, stream)
 
 
 __all__ = ["CountedItemStream"]

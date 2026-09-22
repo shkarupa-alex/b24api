@@ -140,3 +140,22 @@ class CompletionRecorder:
         if page_id is None:
             raise RuntimeError("completion event lacks an active logical page")
         return page_id
+
+
+class CountedCompletionRecorder(CompletionRecorder):
+    """Correlate bounded in-flight counted batch pages by command index."""
+
+    def reserve(self) -> int:
+        """Schedule a page before its physical command can be dispatched."""
+        page_id = self._next_page
+        self._next_page += 1
+        self.gate.emit(PageScheduled(
+            operation_id=self.gate.operation_id, sequence=self._take(), binding_id=0, page_id=page_id,
+        ))
+        return page_id
+
+    def activate(self, page_id: int) -> None:
+        """Select one returned logical page for settlement and validation."""
+        if self._current is not None or page_id < 0 or page_id >= self._next_page:
+            raise RuntimeError("counted outcome lacks a scheduled page")
+        self._current = page_id
