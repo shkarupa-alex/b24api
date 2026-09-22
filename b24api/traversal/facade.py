@@ -174,6 +174,8 @@ def keyset_stream(  # noqa: PLR0913
         SequentialKeysetExecution | RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
     ):
         raise TypeError("execution must be a supported KeysetExecution")
+    if page_stop is not None and isinstance(execution, AutoKeysetExecution):
+        execution = SequentialKeysetExecution()
     if page_stop is not None and not isinstance(execution, SequentialKeysetExecution):
         raise CapabilityError("page stop requires sequential keyset execution")
     if not isinstance(execution, SequentialKeysetExecution):

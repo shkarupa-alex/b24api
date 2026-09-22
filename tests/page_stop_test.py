@@ -143,3 +143,17 @@ async def test_continue_policy_preserves_natural_exhaustion() -> None:
     assert [row["id"] async for row in stream] == [1, 2, 3, 4, 5]
     assert stream.report is not None
     assert stream.report.exhausted
+
+
+@pytest.mark.asyncio
+async def test_default_auto_keyset_uses_sequential_path_for_page_stop() -> None:
+    transport = ListTransport()
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    stream = client.iter_list_keyset(
+        Request("keyset.list", route=RouteKind.BARE), selector=ResultSelector.root(),
+        identity=_identity(), page_size=2, page_stop=StopAfterCommit(),
+    )
+    assert [row["id"] async for row in stream] == [1, 2]
+    assert len(transport.requests) == 1
+    assert stream.report is not None
+    assert not stream.report.exhausted
