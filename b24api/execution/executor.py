@@ -421,6 +421,11 @@ def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: Execution
 
 def _preflight_transport(transport: WireTransport | None, request: Request) -> None:
     """Reject unsupported request representation before budget reservation or I/O."""
+    if request.positional is not None and (
+        transport is None or not isinstance(transport.capabilities, TransportCapabilities)
+        or not transport.capabilities.positional_json
+    ):
+        raise CapabilityError("transport does not support positional JSON arguments", request_summary=request.summary)
     advanced = request.encoding.value != "json" or bool(request.headers.items)
     if transport is None:
         if not advanced:

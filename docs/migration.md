@@ -29,6 +29,13 @@ different hosts. An unsafe request or batch failure records the throttle without
 replaying the request. Callers can pass an absolute monotonic `DeadlineBudget` to bound permit
 waits and handle typed budget, closed, and capacity errors.
 
+Qualified PHP methods that take positional arguments now use `PositionalArguments` with an
+explicit `PositionalLayout`. Pass that value as the second argument to `Request`. Slots are
+represented by `Present`, `EmptyObject`, `EmptyArray`, `Null`, or a trailing `Omitted`. A layout
+declares exact arity, each slot's shape, fixed slots, and case-sensitive writable control paths.
+`write_control()` returns a new value and rejects an undeclared or missing path. Positional
+requests use a top-level JSON array; form encoding and physical batch reject them before I/O.
+
 The earlier 2.x keyset migration notes below remain as historical guidance for that API.
 
 ## Keyset verification, cursor fan-out, and page adaptation

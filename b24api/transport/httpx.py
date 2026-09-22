@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import json
 import secrets
 import uuid
 import weakref
@@ -142,6 +143,7 @@ class HttpxTransport:
     capabilities = TransportCapabilities(
         encodings=frozenset({BodyEncoding.JSON, BodyEncoding.FORM_URLENCODED}),
         scoped_headers=True,
+        positional_json=True,
     )
 
     def __init__(self, webhook_url: str, *, client: httpx.AsyncClient | None = None) -> None:
@@ -230,18 +232,22 @@ class HttpxTransport:
         http_request: httpx.Request | None = None
         try:
             request_headers = dict(_validate_headers(request.headers.items))
-            parameters = request.copy_parameters()
             if request.encoding is BodyEncoding.JSON:
                 request_headers["content-type"] = "application/json"
-                http_request = self._client.build_request(
-                    "POST",
-                    method_url,
-                    headers=request_headers,
-                    json=parameters,
-                )
+                if request.positional is not None:
+                    content = json.dumps(
+                        request.positional.to_wire_slots(), ensure_ascii=False, separators=(",", ":"),
+                    ).encode()
+                    http_request = self._client.build_request(
+                        "POST", method_url, headers=request_headers, content=content,
+                    )
+                else:
+                    http_request = self._client.build_request(
+                        "POST", method_url, headers=request_headers, json=request.copy_parameters(),
+                    )
             elif request.encoding is BodyEncoding.FORM_URLENCODED:
                 request_headers["content-type"] = "application/x-www-form-urlencoded"
-                content = encode_php_query(cast("Mapping[str | int, object]", parameters)).encode()
+                content = encode_php_query(cast("Mapping[str | int, object]", request.copy_parameters())).encode()
                 http_request = self._client.build_request(
                     "POST",
                     method_url,

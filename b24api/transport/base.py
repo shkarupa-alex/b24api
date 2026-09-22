@@ -3,12 +3,15 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from b24api.contracts.json import FrozenMapping, JsonValue, _thaw_json
 from b24api.contracts.request import ReplaySafety, Request, RequestSummary, ResultErrorSpec, RouteKind
 from b24api.contracts.response import _safe_media_type
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
+
+if TYPE_CHECKING:
+    from b24api.contracts.positional import PositionalArguments
 
 _HTTP_STATUS_MINIMUM = 100
 _HTTP_STATUS_MAXIMUM = 599
@@ -59,6 +62,7 @@ class TransportCapabilities:
 
     encodings: frozenset[BodyEncoding] = frozenset({BodyEncoding.JSON})
     scoped_headers: bool = False
+    positional_json: bool = False
 
     def __post_init__(self) -> None:
         """Validate and freeze advertised capabilities."""
@@ -69,6 +73,8 @@ class TransportCapabilities:
             raise TypeError("transport encodings must be BodyEncoding values")
         if not isinstance(self.scoped_headers, bool):
             raise TypeError("scoped_headers must be a bool")
+        if not isinstance(self.positional_json, bool):
+            raise TypeError("positional_json must be a bool")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -82,6 +88,7 @@ class WireRequest:
     headers: RequestHeaders
     result_error: ResultErrorSpec | None
     _parameters: FrozenMapping = field(repr=False)
+    _positional: PositionalArguments | None = field(repr=False)
 
     def __init__(self, request: Request) -> None:
         """Build from an already-canonical request."""
@@ -94,6 +101,12 @@ class WireRequest:
         object.__setattr__(self, "headers", request.headers)
         object.__setattr__(self, "result_error", request.result_error)
         object.__setattr__(self, "_parameters", request._parameters)  # noqa: SLF001 - canonical immutable handoff
+        object.__setattr__(self, "_positional", request.positional)
+
+    @property
+    def positional(self) -> PositionalArguments | None:
+        """Return exact positional arguments, if present."""
+        return self._positional
 
     @property
     def parameters(self) -> MappingProxyType[str, JsonValue]:
@@ -102,6 +115,8 @@ class WireRequest:
 
     def copy_parameters(self) -> dict[str, JsonValue]:
         """Return a detached mutable parameter tree."""
+        if self._positional is not None:
+            raise ValueError("positional arguments have no named parameter mapping")
         return cast("dict[str, JsonValue]", _thaw_json(self._parameters))
 
     @property
@@ -109,7 +124,7 @@ class WireRequest:
         """Return bounded value-free request evidence."""
         return RequestSummary(
             method=self.method,
-            parameter_keys=tuple(sorted(self._parameters)),
+            parameter_keys=(f"@{self._positional.layout_id}",) if self._positional else tuple(sorted(self._parameters)),
             encoding=self.encoding,
             header_names=self.headers.names,
             route=self.route,

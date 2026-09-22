@@ -312,6 +312,7 @@ def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
     if any(
         command.request.route is not RouteKind.BARE
         or command.request.encoding.value != "json"
+        or command.request.positional is not None
         or command.request.headers.items
         for command in commands
     ):
@@ -437,6 +438,7 @@ def _partition_capabilities(
         if (
             command.request.route is RouteKind.BARE
             and command.request.encoding.value == "json"
+            and command.request.positional is None
             and not command.request.headers.items
         ):
             eligible.append(command)

@@ -10,6 +10,7 @@ from typing import TypedDict, cast
 
 from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, _thaw_json
 from b24api.contracts.policy import IdentityCoercion
+from b24api.contracts.positional import PositionalArguments
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
@@ -104,7 +105,7 @@ class ReplaySafety(StrEnum):
 
 
 class _OptionalRequestSpec(TypedDict, total=False):
-    parameters: Mapping[str, object]
+    parameters: Mapping[str, object] | PositionalArguments
     replay_safety: ReplaySafety
     encoding: BodyEncoding
     headers: RequestHeaders
@@ -258,11 +259,12 @@ class Request:
     headers: RequestHeaders
     result_error: ResultErrorSpec | None
     _parameters: FrozenMapping = field(repr=False)
+    _positional: PositionalArguments | None = field(repr=False)
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: C901, PLR0913 - canonical request boundary validates each declared contract
         self,
         method: str,
-        parameters: Mapping[str, object] | None = None,
+        parameters: Mapping[str, object] | PositionalArguments | None = None,
         replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
         *,
         encoding: BodyEncoding = BodyEncoding.JSON,
@@ -285,7 +287,12 @@ class Request:
             raise TypeError("encoding and headers must use their declared contract types")
         if result_error is not None and not isinstance(result_error, ResultErrorSpec):
             raise TypeError("result_error must be a ResultErrorSpec")
-        frozen = _freeze_json(parameters or {})
+        positional = parameters if isinstance(parameters, PositionalArguments) else None
+        if positional is not None and encoding is not BodyEncoding.JSON:
+            raise ValueError("positional arguments require JSON body encoding")
+        if positional is not None and route is RouteKind.API_V3:
+            raise ValueError("PHP positional arguments cannot use the API_V3 route")
+        frozen = _freeze_json({} if positional is not None else parameters or {})
         if not isinstance(frozen, FrozenMapping):
             raise TypeError("request parameters must be a mapping")
         object.__setattr__(self, "method", method)
@@ -295,6 +302,12 @@ class Request:
         object.__setattr__(self, "headers", headers)
         object.__setattr__(self, "result_error", result_error)
         object.__setattr__(self, "_parameters", frozen)
+        object.__setattr__(self, "_positional", positional)
+
+    @property
+    def positional(self) -> PositionalArguments | None:
+        """Return immutable positional arguments, if this request uses them."""
+        return self._positional
 
     @property
     def parameters(self) -> Mapping[str, JsonValue]:
@@ -303,6 +316,8 @@ class Request:
 
     def copy_parameters(self) -> dict[str, JsonValue]:
         """Return a mutable copy of the immutable request parameters."""
+        if self._positional is not None:
+            raise ValueError("positional arguments have no named parameter mapping")
         return cast("dict[str, JsonValue]", _thaw_json(self._parameters))
 
     def to_wire_parameters(self) -> dict[str, JsonValue]:
@@ -311,6 +326,8 @@ class Request:
 
     def with_parameters(self, parameters: Mapping[str, object]) -> Request:
         """Replace parameters while preserving every other request contract."""
+        if self._positional is not None:
+            raise ValueError("with_parameters cannot replace positional arguments")
         return Request(
             self.method,
             parameters,
@@ -326,7 +343,7 @@ class Request:
         """Return the summary."""
         return summarize_request(
             self.method,
-            self._parameters,
+            {f"@{self._positional.layout_id}": None} if self._positional else self._parameters,
             encoding=self.encoding,
             header_names=self.headers.names,
             route=self.route,
@@ -358,8 +375,8 @@ def canonical_request(raw: RequestLike) -> Request:
     route = raw.get("route")
     if not isinstance(method, str):
         raise TypeError("request mapping requires a string method")
-    if parameters is not None and not isinstance(parameters, Mapping):
-        raise TypeError("request mapping parameters must be a mapping")
+    if parameters is not None and not isinstance(parameters, Mapping | PositionalArguments):
+        raise TypeError("request mapping parameters must be a mapping or PositionalArguments")
     if not isinstance(safety, ReplaySafety):
         raise TypeError("request replay_safety must be a ReplaySafety")
     if not isinstance(encoding, BodyEncoding) or not isinstance(headers, RequestHeaders):
