@@ -11,10 +11,11 @@ width instead of the number of decoded rows. If `total` is stable and exact for 
 snapshot, qualify it explicitly:
 
 ```python
+from b24api import RouteKind
 from b24api import OffsetContinuation, OffsetSpec, ReplaySafety, Request, TotalTermination
 
 stream = client.iter_list(
-    Request("log.blogpost.get", replay_safety=ReplaySafety.SAFE),
+    Request("log.blogpost.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     page_size=50,
     offset=OffsetSpec(
         continuation=OffsetContinuation.FIXED_STEP,
@@ -161,20 +162,23 @@ Composite identities are intentionally unavailable for keyset and cursor travers
 ## Form bodies, scoped headers, and binary responses
 
 ```python
+from b24api import RouteKind
 from b24api import BodyEncoding, Request, RequestHeaders
 
 form_request = Request(
     "socialnetwork.workgroup.creategroup",
     {"groupName": "Example", "viewMode": "closed", "avatarColor": "29AD49"},
     encoding=BodyEncoding.FORM_URLENCODED,
+    route=RouteKind.BARE,
 )
 
 header_request = Request(
     "baas.serverport.lead.verificationack",
     headers=RequestHeaders({"X-Domain-Ack": "caller-owned-value"}),
+    route=RouteKind.BARE,
 )
 
-download = await client.call_bytes(Request("crm.item.import.downloadexample"))
+download = await client.call_bytes(Request("crm.item.import.downloadexample", route=RouteKind.BARE))
 write_file(download.body, media_type=download.content_type)
 ```
 

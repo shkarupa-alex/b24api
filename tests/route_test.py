@@ -40,7 +40,14 @@ async def test_route_resolves_at_transport_and_survives_request_copy(route: Rout
 
 
 def test_json_route_rejects_double_suffix_and_v3_form() -> None:
+    with pytest.raises(TypeError, match="route"):
+        Request("profile")  # type: ignore[call-arg]
     with pytest.raises(ValueError, match="suffix"):
         Request("crm.item.list.json", route=RouteKind.JSON)
     with pytest.raises(ValueError, match="JSON"):
         Request("tasks.task.list", route=RouteKind.API_V3, encoding=BodyEncoding.FORM_URLENCODED)
+
+
+def test_transport_rejects_nonclassic_webhook_base() -> None:
+    with pytest.raises(ValueError, match="classic"):
+        HttpxTransport("https://portal.invalid/rest/api/1/token/")

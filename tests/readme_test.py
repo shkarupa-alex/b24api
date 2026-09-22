@@ -23,6 +23,7 @@ from b24api import (
     ResultSelector,
 )
 from b24api.contracts import IdentityCoercion
+from b24api.contracts.request import RouteKind
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
@@ -181,7 +182,10 @@ async def test_every_readme_python_example_executes_exactly_without_io(monkeypat
     monkeypatch.setattr(b24api, "Bitrix24", _ExampleClient)
 
     for source in PYTHON_BLOCK.findall(README.read_text(encoding="utf-8")):
-        commands = (Command(Request("example.item.get", {"id": value}, ReplaySafety.SAFE), value) for value in (1, 2))
+        commands = (
+            Command(Request("example.item.get", {"id": value}, ReplaySafety.SAFE, route=RouteKind.BARE), value)
+            for value in (1, 2)
+        )
         namespace: dict[str, object] = {
             "client": client,
             "chat_ids": ("chat-1", "chat-2"),
@@ -191,7 +195,7 @@ async def test_every_readme_python_example_executes_exactly_without_io(monkeypat
             "identity": IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
             "parent_ids": (1, 2),
             "record_completion": lambda *_args: None,
-            "request": Request("example.item.list", replay_safety=ReplaySafety.SAFE),
+            "request": Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             "CommandSuccess": CommandSuccess,
             "IdentityCoercion": IdentityCoercion,
             "ReplaySafety": ReplaySafety,
@@ -217,7 +221,7 @@ async def test_every_recipe_python_example_executes_exactly_without_io() -> None
             "identity": IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
             "keyset": object(),
             "parent_ids": (1, 2),
-            "request": Request("example.item.list", replay_safety=ReplaySafety.SAFE),
+            "request": Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             "write_file": lambda *_args, **_kwargs: None,
         }
         code = compile(source, str(RECIPES), "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)

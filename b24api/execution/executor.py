@@ -453,8 +453,8 @@ async def _send_transport(  # noqa: PLR0913 - keeps legacy and wire boundaries e
         capabilities = wire_transport.capabilities
         if not isinstance(capabilities, TransportCapabilities):
             raise CapabilityError("transport exposes malformed capabilities")
-        if wire_request is None:
-            raise RuntimeError("wire transport request was not prepared")
+        if wire_request is None or wire_request.route is not request.route or wire_request.method != request.method:
+            raise CapabilityError("wire request differs from canonical request", request_summary=request.summary)
         return await wire_transport.send_wire(
             wire_request,
             attempt_timeout=attempt_timeout,

@@ -16,7 +16,7 @@ from b24api.contracts.policy import (
     OrderSemantics,
     TotalSemantics,
 )
-from b24api.contracts.request import IdentitySpec, ReplaySafety, Request, ResultSelector
+from b24api.contracts.request import IdentitySpec, ReplaySafety, Request, ResultSelector, RouteKind
 from b24api.execution import Executor, Transport, WireResponse
 from b24api.traversal import PaginationDriver, iter_list
 from b24api.traversal.plans import (
@@ -249,7 +249,7 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
         )
     else:
         raise ValueError(f"unknown model plan: {plan_name}")
-    request = Request(MODEL_METHOD, replay_safety=ReplaySafety.SAFE)
+    request = Request(MODEL_METHOD, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
     policy = ExecutionPolicy(
         max_requests=1_000,
         max_pages=1_000,
@@ -325,7 +325,7 @@ async def _run_fixed_1x_batch_case(case: ModelCase, *, portal: DeterministicPort
     """Replay the frozen 1.0.1 direct-head plus 50-command batched-tail algorithm."""
     pre_hash = portal.oracle_snapshot()
     head_wire = await portal.send(
-        Request(MODEL_METHOD, {"start": 0}, ReplaySafety.SAFE),
+        Request(MODEL_METHOD, {"start": 0}, ReplaySafety.SAFE, route=RouteKind.BARE),
         attempt_timeout=120,
         max_response_bytes=16 * 1024 * 1024,
     )
@@ -339,7 +339,7 @@ async def _run_fixed_1x_batch_case(case: ModelCase, *, portal: DeterministicPort
         starts = tail_starts[chunk_start : chunk_start + 50]
         commands = {f"_{index:02d}": f"{MODEL_METHOD}?start={start}" for index, start in enumerate(starts)}
         batch_wire = await portal.send(
-            Request("batch", {"halt": True, "cmd": commands}, ReplaySafety.SAFE),
+            Request("batch", {"halt": True, "cmd": commands}, ReplaySafety.SAFE, route=RouteKind.BARE),
             attempt_timeout=120,
             max_response_bytes=16 * 1024 * 1024,
         )
@@ -402,7 +402,7 @@ async def _run_counted_batch_case(
     context = executor.context(policy)
     driver = PaginationDriver(
         executor,
-        Request(MODEL_METHOD, replay_safety=ReplaySafety.SAFE),
+        Request(MODEL_METHOD, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         plan,
         selector=ResultSelector.root(),
         identity=identity,

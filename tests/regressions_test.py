@@ -34,6 +34,7 @@ from b24api import (
     TraversalAssurance,
 )
 from b24api.contracts import IdentityCoercion
+from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
     B24ApiError,
@@ -116,14 +117,18 @@ async def test_tolerant_batch_preserves_all_correlated_states() -> None:
 
     mixed = _client(FixtureTransport(mixed_handler)).batch_outcomes(
         [
-            Command(Request("sample.get", replay_safety=ReplaySafety.SAFE), correlations["success"]),
-            Command(Request("sample.get", replay_safety=ReplaySafety.SAFE), correlations["failure"]),
+            Command(
+                Request("sample.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), correlations["success"],
+            ),
+            Command(
+                Request("sample.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), correlations["failure"],
+            ),
         ],
     )
     mixed_outcomes = [outcome async for outcome in mixed]
 
     async def broken_source() -> AsyncGenerator[Command[list[str]]]:
-        yield Command(Request("sample.get", replay_safety=ReplaySafety.SAFE), correlations["not"])
+        yield Command(Request("sample.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), correlations["not"])
         raise RuntimeError("source failed")
 
     not_executed = _client(
@@ -139,7 +144,12 @@ async def test_tolerant_batch_preserves_all_correlated_states() -> None:
     ambiguous = TransportError("response lost", phase=FailurePhase.DISPATCH_STARTED)
     unknown_transport = FixtureTransport(lambda _request: ambiguous)
     unknown_stream = _client(unknown_transport).batch_outcomes(
-        [Command(Request("sample.add", replay_safety=ReplaySafety.UNKNOWN), correlations["unknown"])],
+        [
+            Command(
+                Request("sample.add", replay_safety=ReplaySafety.UNKNOWN, route=RouteKind.BARE),
+                correlations["unknown"],
+            ),
+        ],
     )
     unknown_outcomes = [outcome async for outcome in unknown_stream]
 
@@ -160,7 +170,7 @@ async def test_unknown_write_is_not_replayed_after_dispatch() -> None:
     )
 
     with pytest.raises(AmbiguousExecutionError):
-        await _client(transport).call(Request("sample.add", replay_safety=ReplaySafety.UNKNOWN))
+        await _client(transport).call(Request("sample.add", replay_safety=ReplaySafety.UNKNOWN, route=RouteKind.BARE))
 
     assert len(transport.requests) == 1
 
@@ -169,7 +179,7 @@ async def test_unknown_write_is_not_replayed_after_dispatch() -> None:
 async def test_limit_conflict_rejects_before_network() -> None:
     transport = FixtureTransport(lambda _request: {"result": []})
     stream = _client(transport).iter_list(
-        Request("sample.list", {"LIMIT": 99}, ReplaySafety.SAFE),
+        Request("sample.list", {"LIMIT": 99}, ReplaySafety.SAFE, route=RouteKind.BARE),
         page_size=_PAGE,
         offset=OffsetSpec(limit_path=ParameterPath(("LIMIT",))),
     )
@@ -209,7 +219,7 @@ async def test_async_binding_correlation_and_selector() -> None:
 
     transport = FixtureTransport(handler)
     stream = _client(transport).iter_references(
-        Request("sample.list", {"filter": {"OWNER": 0}}, ReplaySafety.SAFE),
+        Request("sample.list", {"filter": {"OWNER": 0}}, ReplaySafety.SAFE, route=RouteKind.BARE),
         bindings(),
         traversal=SequentialTraversal(selector=ResultSelector(("items",)), identity=_identity()),
         dispatch=DirectDispatch(concurrency=2, output_order=DeliveryOrder.INPUT),
@@ -255,7 +265,7 @@ async def test_counted_stride_uses_observed_head_width() -> None:
         }
 
     stream = _client(FixtureTransport(handler)).iter_list_counted(
-        Request("sample.list", replay_safety=ReplaySafety.SAFE),
+        Request("sample.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
         page_size=_PAGE,
     )
@@ -281,7 +291,7 @@ async def test_distinct_item_filter_order_paths_are_exact() -> None:
         return {"result": rows[:1]}
 
     stream = _client(FixtureTransport(handler)).iter_list_keyset(
-        Request("sample.list", replay_safety=ReplaySafety.SAFE),
+        Request("sample.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(item_path=("id",), filter_key="ID", order_key="id"),
         page_size=1,
@@ -297,7 +307,7 @@ async def test_distinct_item_filter_order_paths_are_exact() -> None:
 async def test_repeated_cursor_boundary_is_not_reported_complete() -> None:
     transport = FixtureTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 1}]})
     stream = _client(transport).iter_list_cursor(
-        Request("sample.list", replay_safety=ReplaySafety.SAFE),
+        Request("sample.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         cursor=CursorSpec(
             ParameterPath(("LAST_ID",)),
@@ -319,7 +329,7 @@ async def test_repeated_cursor_boundary_is_not_reported_complete() -> None:
 async def test_ignored_filter_requires_application_reconciliation() -> None:
     pages = [[{"ID": 1, "owner": 10}, {"ID": 2, "owner": 20}], []]
     stream = _client(FixtureTransport(lambda _request: {"result": pages.pop(0)})).iter_list(
-        Request("sample.list", {"filter": {"owner": 10}}, ReplaySafety.SAFE),
+        Request("sample.list", {"filter": {"owner": 10}}, ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
     rows = [row async for row in stream]
@@ -335,7 +345,9 @@ async def test_ignored_filter_requires_application_reconciliation() -> None:
 async def test_overmatched_multifield_is_not_claimed_verified() -> None:
     pages = [[{"ID": 1, "email": "a@example.invalid"}, {"ID": 2, "phone": "100"}], []]
     stream = _client(FixtureTransport(lambda _request: {"result": pages.pop(0)})).iter_list(
-        Request("sample.list", {"filter": {"has_email": True, "has_phone": True}}, ReplaySafety.SAFE),
+        Request(
+            "sample.list", {"filter": {"has_email": True, "has_phone": True}}, ReplaySafety.SAFE, route=RouteKind.BARE,
+        ),
         identity=_identity(),
     )
     rows = [row async for row in stream]

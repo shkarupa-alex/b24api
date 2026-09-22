@@ -109,6 +109,16 @@ def _normalized_webhook_host(webhook_url: str) -> str:
     parsed = httpx.URL(webhook_url)
     if parsed.host is None:
         raise ValueError("webhook URL must contain a host")
+    parts = parsed.path.strip("/").split("/")
+    if (
+        len(parts) != _CLASSIC_WEBHOOK_PARTS
+        or parts[0] != "rest"
+        or not all(parts[1:])
+        or not parsed.path.endswith("/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("webhook URL must be a classic /rest/user/token/ base")
     return parsed.host
 
 

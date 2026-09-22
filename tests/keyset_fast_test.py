@@ -42,6 +42,7 @@ from b24api import (
 from b24api.cli import _report_json
 from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.contracts.report import PageDispatch
+from b24api.contracts.request import RouteKind
 from b24api.errors import CapabilityError, IncompleteTraversalError, ResultShapeError
 from b24api.execution import Executor, WireResponse
 from b24api.traversal import keyset_scheduler, page_validation
@@ -302,7 +303,7 @@ def _stream(
     writable_limit: bool = True,
 ):
     return _client(transport).iter_list_keyset(
-        Request("item.list", parameters={"filter": {"STATUS": "open"}}),
+        Request("item.list", parameters={"filter": {"STATUS": "open"}}, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=PAGE_SIZE,
@@ -382,7 +383,7 @@ def test_zero_canary_partition_planning_always_has_a_positive_exact_wave_count(
 async def test_sequential_keyset_deep_pagination_stays_on_the_direct_no_coalescer_path() -> None:
     transport = KeysetTransport(tuple(range(1, 121)))
     stream = _client(transport).iter_list_keyset(
-        Request("item.list", parameters={"filter": {"STATUS": "open"}}),
+        Request("item.list", parameters={"filter": {"STATUS": "open"}}, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=1,
@@ -727,7 +728,7 @@ async def test_auto_sequential_has_request_parity_and_no_canaries() -> None:
 async def test_omitted_execution_defaults_to_auto() -> None:
     identities = tuple(range(1, 80))
     stream = _client(KeysetTransport(identities)).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=PAGE_SIZE,
@@ -745,7 +746,7 @@ def test_omitted_execution_rejects_fast_ineligible_request_synchronously() -> No
 
     with pytest.raises(CapabilityError):
         client.iter_list_keyset(
-            Request("item.list", parameters={"filter": {">id": 1}}),
+            Request("item.list", parameters={"filter": {">id": 1}}, route=RouteKind.BARE),
             selector=ResultSelector.root(),
             identity=_identity(),
         )
@@ -757,7 +758,7 @@ def test_omitted_execution_rejects_fast_ineligible_request_synchronously() -> No
 async def test_omitted_execution_fails_closed_on_direction_contradiction() -> None:
     transport = KeysetTransport(tuple(range(1, 31)), ignore_direction=True)
     stream = _client(transport).iter_list_keyset(
-        Request("item.list", parameters={"filter": {"STATUS": "open"}}),
+        Request("item.list", parameters={"filter": {"STATUS": "open"}}, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=PAGE_SIZE,
@@ -856,7 +857,7 @@ async def test_auto_keeps_feasible_range_when_anchor_retention_does_not_fit() ->
     transport = KeysetTransport(identities)
     policy = ExecutionPolicy(max_buffered_rows=30)
     stream = _client(transport, policy=policy).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=PAGE_SIZE,
@@ -1136,14 +1137,14 @@ def test_fast_ineligible_requests_fail_synchronously_without_io() -> None:
     client = _client(transport)
     with pytest.raises(CapabilityError):
         client.iter_list_keyset(
-            Request("item.list", parameters={"filter": {">id": 1}}),
+            Request("item.list", parameters={"filter": {">id": 1}}, route=RouteKind.BARE),
             selector=ResultSelector.root(),
             identity=_identity(),
             execution=RangeKeysetExecution(StableIntegerKeysetContract()),
         )
     with pytest.raises(CapabilityError):
         client.iter_list_keyset(
-            Request("item.list"),
+            Request("item.list", route=RouteKind.BARE),
             selector=ResultSelector.root(),
             identity=_identity(),
             execution=RangeKeysetExecution(
@@ -1169,7 +1170,7 @@ def test_fast_rejects_incompatible_universal_consistency_without_io(
 
     with pytest.raises(CapabilityError):
         client.iter_list_keyset(
-            Request("item.list"),
+            Request("item.list", route=RouteKind.BARE),
             selector=ResultSelector.root(),
             identity=_identity(),
             page_size=PAGE_SIZE,
@@ -1183,7 +1184,7 @@ def test_fast_rejects_incompatible_universal_consistency_without_io(
 @pytest.mark.asyncio
 async def test_fast_context_enter_is_io_free_and_request_is_immutable() -> None:
     transport = KeysetTransport(tuple(range(1, 8)))
-    request = Request("item.list", parameters={"filter": {"STATUS": "open"}})
+    request = Request("item.list", parameters={"filter": {"STATUS": "open"}}, route=RouteKind.BARE)
     stream = _client(transport).iter_list_keyset(
         request,
         selector=ResultSelector.root(),
@@ -1221,7 +1222,7 @@ async def test_fast_bounded_consumption_freezes_an_early_close_report(operation:
 async def test_fast_runtime_budget_is_loud_incomplete(policy: ExecutionPolicy) -> None:
     transport = KeysetTransport(tuple(range(1, 80)))
     stream = _client(transport, policy=policy).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=PAGE_SIZE,
@@ -1318,7 +1319,7 @@ async def test_partition_body_wave_accounts_for_pinned_tail_and_anchors() -> Non
     identities = tuple(range(1, 5_001))
     transport = KeysetTransport(identities)
     stream = _client(transport).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=page_size,
@@ -1337,7 +1338,7 @@ async def test_partition_planning_accounts_for_free_rows_without_a_writable_limi
     identities = tuple(range(1, 5_001))
     transport = KeysetTransport(identities, default_limit=page_size)
     stream = _client(transport).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=page_size,
@@ -1360,7 +1361,7 @@ async def test_partition_anchor_waves_discard_unneeded_rows_before_the_next_wave
     policy = ExecutionPolicy(max_buffered_rows=200)
     transport = KeysetTransport(identities, default_limit=page_size)
     stream = _client(transport, policy=policy).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=page_size,
@@ -1389,7 +1390,7 @@ def test_explicit_partitioned_rejects_policy_that_cannot_retain_anchors_and_a_bo
 
     with pytest.raises(CapabilityError, match="retain boundaries"):
         client.iter_list_keyset(
-            Request("item.list"),
+            Request("item.list", route=RouteKind.BARE),
             selector=ResultSelector.root(),
             identity=_identity(),
             page_size=page_size,
@@ -1412,7 +1413,7 @@ def test_explicit_bounded_mode_rejects_policy_without_post_boundary_capacity(
 
     with pytest.raises(CapabilityError, match="retain boundaries"):
         client.iter_list_keyset(
-            Request("item.list"),
+            Request("item.list", route=RouteKind.BARE),
             selector=ResultSelector.root(),
             identity=_identity(),
             page_size=PAGE_SIZE,
@@ -1428,7 +1429,7 @@ async def test_auto_uses_post_boundary_capacity_and_selects_sequential_when_none
     identities = (*range(1, 6), *range(1_006, 1_011))
     transport = KeysetTransport(identities)
     stream = _client(transport, policy=ExecutionPolicy(max_buffered_rows=2 * PAGE_SIZE)).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=PAGE_SIZE,
@@ -1465,7 +1466,7 @@ async def test_partial_page_budget_rejects_a_wave_without_waiting_for_elapsed_bu
     policy = ExecutionPolicy(max_pages=3, max_elapsed=20.0)
     transport = KeysetTransport(tuple(range(1, 80)))
     stream = _client(transport, policy=policy).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=PAGE_SIZE,
@@ -1502,7 +1503,7 @@ async def test_range_windows_are_materialized_one_bounded_group_at_a_time() -> N
 async def test_short_page_range_preserves_grouped_wave_cost() -> None:
     identities = tuple(range(1, 351))
     stream = _client(KeysetTransport(identities, default_limit=50)).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=50,
@@ -1523,7 +1524,7 @@ async def test_short_page_range_preserves_grouped_wave_cost() -> None:
 async def test_page_cap_one_can_select_range_without_canary_prefix_requirement() -> None:
     identities = tuple(range(1, 41))
     stream = _client(KeysetTransport(identities, default_limit=1)).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=1,
@@ -1540,7 +1541,7 @@ async def test_page_cap_one_can_select_range_without_canary_prefix_requirement()
 @pytest.mark.asyncio
 async def test_explicit_range_with_page_cap_one_needs_no_canary_pair() -> None:
     stream = _client(KeysetTransport(tuple(range(1, 41)), default_limit=1)).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=1,
@@ -1557,7 +1558,7 @@ async def test_explicit_range_with_page_cap_one_needs_no_canary_pair() -> None:
 async def test_dense_multi_round_range_keeps_grouped_continuations() -> None:
     identities = tuple(range(1, 126))
     stream = _client(KeysetTransport(identities, default_limit=5)).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=5,
@@ -1579,7 +1580,7 @@ async def test_dense_multi_round_range_keeps_grouped_continuations() -> None:
 async def test_auto_uses_asymmetric_boundary_without_runtime_canaries() -> None:
     identities = tuple(range(1, 1_001))
     stream = _client(AsymmetricBoundaryTransport(identities, default_limit=5)).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=5,
@@ -1638,7 +1639,7 @@ async def test_later_anchor_wave_failure_accounts_for_prior_compacted_rows() -> 
 @pytest.mark.asyncio
 async def test_rejected_finish_page_records_selected_and_discarded_rows() -> None:
     stream = _client(KeysetTransport((1, 2, 3), ignore_bounds=True, default_limit=1)).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=1,
@@ -1660,7 +1661,7 @@ async def test_rejected_finish_page_records_selected_and_discarded_rows() -> Non
 async def test_default_partitioned_streams_selection_larger_than_row_buffer() -> None:
     identities = tuple(range(1, 50_001))
     stream = _client(KeysetTransport(identities, default_limit=50)).iter_list_keyset(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=50,

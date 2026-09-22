@@ -23,7 +23,7 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode, ViolationSeverity
-from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request
+from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request, RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
@@ -98,7 +98,7 @@ class BlockingTransport:
 
 
 def _reference(key: str) -> ReferenceRequest:
-    return ReferenceRequest(Request("crm.item.list", {"ref": key}), key)
+    return ReferenceRequest(Request("crm.item.list", {"ref": key}, route=RouteKind.BARE), key)
 
 
 def _one_page_plan() -> SingleResponsePlan:
@@ -512,7 +512,7 @@ async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
             return WireResponse(200, (), b'{"result":{"ID":1}}')
 
     transport = TransientThenSuccessTransport()
-    request = Request("tasks.task.add")
+    request = Request("tasks.task.add", route=RouteKind.BARE)
     stream = fan_out(
         Executor(transport),
         [ReferenceRequest(request, "write")],
@@ -1410,7 +1410,10 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
 
     stream = fan_out(
         Executor(CancellationResistantTransport()),
-        [ReferenceRequest(Request("bad"), "bad"), ReferenceRequest(Request("slow"), "slow")],
+        [
+            ReferenceRequest(Request("bad", route=RouteKind.BARE), "bad"),
+            ReferenceRequest(Request("slow", route=RouteKind.BARE), "slow"),
+        ],
         dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_elapsed=0.04),
     )
@@ -1567,7 +1570,7 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
         except RuntimeError as error:
             observed.append((str(error), current.cancelling()))
         try:
-            await Executor(independent_transport).execute(Request("independent"))
+            await Executor(independent_transport).execute(Request("independent", route=RouteKind.BARE))
         except asyncio.CancelledError as cancellation:
             observed.append((str(cancellation), current.cancelling()))
         while current.cancelling():

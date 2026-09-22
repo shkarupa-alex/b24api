@@ -17,10 +17,10 @@ work so its HTTP/2 connection pool and rate state are reused.
 
 <!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
 ```python
-from b24api import Bitrix24, Request
+from b24api import Bitrix24, Request, RouteKind
 
 async with Bitrix24() as client:
-    profile = await client.call(Request("profile"))
+    profile = await client.call(Request("profile", route=RouteKind.BARE))
 ```
 
 The client owns its default transport. An injected transport remains caller-owned. `aclose()` is
@@ -36,15 +36,17 @@ The operation is explicit and never hides malformed JSON by falling back to byte
 
 <!-- tested: tests/client_findings_3_test.py::test_binary_call_returns_every_success_byte_without_json_sniffing -->
 ```python
-archive = await client.call_bytes(Request("example.export.download", replay_safety=ReplaySafety.SAFE))
+from b24api import RouteKind
+archive = await client.call_bytes(Request("example.export.download", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
 payload = archive.body
 ```
 
 <!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
 ```python
+from b24api import RouteKind
 from b24api import ReplaySafety
 
-request = Request("example.item.get", {"id": 7}, ReplaySafety.SAFE)
+request = Request("example.item.get", {"id": 7}, ReplaySafety.SAFE, route=RouteKind.BARE)
 decoded = await client.call(request)
 response = await client.call_response(request)
 ```
@@ -85,11 +87,12 @@ matching a result to the object, file, chat or database row that produced its re
 
 <!-- tested: tests/client_v2_test.py::test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_off_wire -->
 ```python
+from b24api import RouteKind
 from b24api import Command, CommandSuccess
 
 commands = (
     Command(
-        Request("example.item.get", {"id": item_id}, ReplaySafety.SAFE),
+        Request("example.item.get", {"id": item_id}, ReplaySafety.SAFE, route=RouteKind.BARE),
         correlation=item_id,
     )
     for item_id in source_ids
@@ -154,6 +157,7 @@ control this strategy's completion. Exact database implementation is endpoint-sp
 
 <!-- tested: tests/client_v2_test.py::test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup -->
 ```python
+from b24api import RouteKind
 from b24api import IdentityCoercion, IdentitySpec, ResultSelector
 
 identity = IdentitySpec(
@@ -164,7 +168,7 @@ identity = IdentitySpec(
 )
 
 stream = client.iter_list(
-    Request("example.item.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     selector=ResultSelector(("items",)),
     identity=identity,
 )
@@ -182,10 +186,11 @@ sequence and records that degradation in the operation report.
 
 <!-- tested: tests/client_findings_3_test.py::test_shape_rejection_is_retained_as_zero_admission_page_evidence -->
 ```python
+from b24api import RouteKind
 from b24api import ResultCollectionShape
 
 stream = client.iter_list(
-    Request("example.dictionary.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.dictionary.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     selector=ResultSelector(("items",)),
     collection_shape=ResultCollectionShape.MAPPING_VALUES,
 )
@@ -202,8 +207,9 @@ bounded physical batches.
 
 <!-- tested: tests/client_v2_test.py::test_counted_traversal_preserves_frozen_request_shape_and_exact_identity -->
 ```python
+from b24api import RouteKind
 stream = client.iter_list_counted(
-    Request("example.item.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     selector=ResultSelector(("items",)),
     identity=identity,
     page_size=50,
@@ -257,10 +263,11 @@ record the selected strategy and reason: unbounded auto continuation has the sam
 
 <!-- tested: tests/keyset_fast_test.py::test_omitted_execution_defaults_to_auto -->
 ```python
+from b24api import RouteKind
 from b24api import KeysetSpec, ParameterPath
 
 stream = client.iter_list_keyset(
-    Request("example.item.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     selector=ResultSelector(("items",)),
     identity=identity,
     keyset=KeysetSpec(
@@ -277,10 +284,11 @@ message-list methods.
 
 <!-- tested: tests/client_v2_test.py::test_keyset_and_cursor_are_explicit_strict_alternatives -->
 ```python
+from b24api import RouteKind
 from b24api import CursorSpec, ParameterPath
 
 stream = client.iter_list_cursor(
-    Request("example.message.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.message.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     selector=ResultSelector(("items",)),
     cursor=CursorSpec(
         parameter_path=ParameterPath(("LAST_ID",)),
@@ -314,6 +322,7 @@ caller-defined parent.
 
 <!-- tested: tests/client_v2_test.py::test_bound_references_apply_nested_updates_off_wire_and_emit_exact_completion -->
 ```python
+from b24api import RouteKind
 from b24api import (
     BatchDispatch,
     Binding,
@@ -334,7 +343,7 @@ bindings = (
 )
 
 stream = client.iter_references(
-    Request("example.comment.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.comment.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     bindings,
     traversal=SequentialTraversal(selector=ResultSelector(("items",)), identity=identity),
     dispatch=BatchDispatch(batch_size=25, concurrency=2),
@@ -354,6 +363,7 @@ under different parents are not conflated.
 
 <!-- tested: tests/client_v2_test.py::test_bound_references_apply_nested_updates_off_wire_and_emit_exact_completion -->
 ```python
+from b24api import RouteKind
 from b24api import (
     Binding,
     CursorSpec,
@@ -375,7 +385,7 @@ chat_bindings = (
 )
 
 messages = client.iter_references(
-    Request("example.message.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.message.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     chat_bindings,
     traversal=CursorTraversal(
         selector=ResultSelector(("items",)),

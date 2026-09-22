@@ -35,6 +35,7 @@ from b24api.contracts import (
     Request,
     RequestSpec,
     Response,
+    RouteKind,
     TerminalState,
     TraversalAssurance,
     partition_command_outcomes,
@@ -312,9 +313,9 @@ def test_keyset_cursor_streams_add_only_the_declared_fields_and_methods() -> Non
 
 def test_request_mapping_contract_is_a_closed_typed_dict() -> None:
     assert is_typeddict(RequestSpec)
-    assert RequestSpec.__required_keys__ == frozenset({"method"})
+    assert RequestSpec.__required_keys__ == frozenset({"method", "route"})
     assert RequestSpec.__optional_keys__ == frozenset(
-        {"parameters", "replay_safety", "encoding", "headers", "result_error", "route"},
+        {"parameters", "replay_safety", "encoding", "headers", "result_error"},
     )
 
 
@@ -333,17 +334,17 @@ def _error() -> ProtocolError:
 
 def test_command_correlation_is_opaque_and_excluded_from_repr() -> None:
     correlation = {"private": object()}
-    command = Command(Request("test.method", {"wire": 1}), correlation)
+    command = Command(Request("test.method", {"wire": 1}, route=RouteKind.BARE), correlation)
 
     assert command.correlation is correlation
     assert "private" not in repr(command)
     assert command.request.copy_parameters() == {"wire": 1}
     with pytest.raises(FrozenInstanceError):
-        command.request = Request("other.method")  # type: ignore[misc]
+        command.request = Request("other.method", route=RouteKind.BARE)  # type: ignore[misc]
 
 
 def test_command_outcome_partition_retains_every_closed_variant() -> None:
-    request = Request("test.method", replay_safety=ReplaySafety.UNKNOWN)
+    request = Request("test.method", replay_safety=ReplaySafety.UNKNOWN, route=RouteKind.BARE)
     correlation = object()
     outcomes = (
         CommandSuccess(0, correlation, request.summary, Response({"ok": True})),

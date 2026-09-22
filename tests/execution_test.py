@@ -10,7 +10,7 @@ import pytest
 
 from b24api import execution as execution_module
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
-from b24api.contracts.request import ReplaySafety, Request
+from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
     BudgetExceededError,
@@ -251,7 +251,7 @@ def _policy(*, attempts: int = 3, delay: float = 0.0, elapsed: float = 10.0) -> 
 async def test_terminal_negative_one_next_is_normalized() -> None:
     transport = SequenceTransport([_success(b'{"result":[],"next":-1}')])
 
-    response = await Executor(transport).execute(Request("mobile.disk.folder.getchildren"))
+    response = await Executor(transport).execute(Request("mobile.disk.folder.getchildren", route=RouteKind.BARE))
 
     assert response.result == []
     assert response.next is None
@@ -262,7 +262,7 @@ async def test_safe_and_unknown_retry_only_when_replay_is_proven() -> None:
     pre_dispatch = TransportError("connect", phase=FailurePhase.NOT_DISPATCHED)
     safe_transport = SequenceTransport([pre_dispatch, _success()])
     safe = await Executor(safe_transport).execute(
-        Request("profile", replay_safety=ReplaySafety.SAFE),
+        Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         policy=_policy(),
     )
     assert safe.result == {"ok": True}
@@ -271,7 +271,7 @@ async def test_safe_and_unknown_retry_only_when_replay_is_proven() -> None:
     unknown_transport = SequenceTransport(
         [TransportError("connect", phase=FailurePhase.CONNECTION_ESTABLISHED), _success()],
     )
-    unknown = await Executor(unknown_transport).execute(Request("profile"), policy=_policy())
+    unknown = await Executor(unknown_transport).execute(Request("profile", route=RouteKind.BARE), policy=_policy())
     assert unknown.result == {"ok": True}
     assert unknown_transport.calls == EXPECTED_RETRIED_CALLS
 
@@ -284,7 +284,9 @@ async def test_ambiguous_dispatch_never_retries_unproven_request(safety: ReplayS
     )
 
     with pytest.raises(AmbiguousExecutionError) as captured:
-        await Executor(transport).execute(Request("crm.deal.add", replay_safety=safety), policy=_policy())
+        await Executor(transport).execute(
+            Request("crm.deal.add", replay_safety=safety, route=RouteKind.BARE), policy=_policy(),
+        )
 
     assert transport.calls == 1
     assert isinstance(captured.value.__cause__, TransportError)
@@ -300,7 +302,7 @@ async def test_safe_ambiguous_transport_retries_with_counted_attempts() -> None:
     context = executor.context(_policy())
 
     response = await executor.execute(
-        Request("profile", replay_safety=ReplaySafety.SAFE),
+        Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         context=context,
     )
     snapshot = await context.snapshot()
@@ -318,7 +320,7 @@ async def test_operation_elapsed_clock_starts_at_first_execution_not_context_con
     context = executor.context(_policy(elapsed=1))
     now[0] = 100.0
 
-    response = await executor.execute(Request("profile"), context=context)
+    response = await executor.execute(Request("profile", route=RouteKind.BARE), context=context)
 
     assert response.result == {"ok": True}
     assert (await context.snapshot()).elapsed == 0
@@ -332,13 +334,13 @@ async def test_retry_attempt_and_delay_budgets_terminate_before_extra_io() -> No
     )
     transport = SequenceTransport(always_connect)
     with pytest.raises(BudgetExceededError, match="attempt"):
-        await Executor(transport).execute(Request("profile"), policy=_policy(attempts=2))
+        await Executor(transport).execute(Request("profile", route=RouteKind.BARE), policy=_policy(attempts=2))
     assert transport.calls == EXPECTED_RETRIED_CALLS
 
     delayed = SequenceTransport([WireResponse(status_code=503, headers=(), body=b"gateway")])
     with pytest.raises(BudgetExceededError, match="delay"):
         await Executor(delayed).execute(
-            Request("profile", replay_safety=ReplaySafety.SAFE),
+            Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             policy=_policy(delay=2, elapsed=1),
         )
     assert delayed.calls == 1
@@ -360,7 +362,7 @@ async def test_structured_throttle_uses_shared_cooldown_and_safe_replay() -> Non
     executor = Executor(transport, coordinator=coordinator)
     context = executor.context(_policy())
 
-    await executor.execute(Request("profile", replay_safety=ReplaySafety.SAFE), context=context)
+    await executor.execute(Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), context=context)
     snapshot = await context.snapshot()
 
     assert snapshot.retries == 1
@@ -445,7 +447,7 @@ async def test_permit_wait_is_bounded_without_counting_or_dispatching_an_attempt
 
     with pytest.raises(BudgetExceededError, match="permit wait"):
         await executor.execute(
-            Request("profile", replay_safety=ReplaySafety.SAFE),
+            Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             context=context,
         )
 
@@ -461,20 +463,22 @@ async def test_socket_connect_and_post_dispatch_failures_have_distinct_phases() 
     socket = server.sockets[0]
     assert socket is not None
     host, port = socket.getsockname()[:2]
-    transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
+    transport = HttpxTransport(f"http://{host}:{port}/rest/1/token/")
     try:
         with pytest.raises(TransportError) as post_dispatch:
-            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
+            await transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024)
         assert post_dispatch.value.phase is FailurePhase.DISPATCH_STARTED
     finally:
         await transport.aclose()
         server.close()
         await server.wait_closed()
 
-    dead_transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
+    dead_transport = HttpxTransport(f"http://{host}:{port}/rest/1/token/")
     try:
         with pytest.raises(TransportError) as not_dispatched:
-            await dead_transport.send(Request("profile"), attempt_timeout=0.2, max_response_bytes=1024)
+            await dead_transport.send(
+                Request("profile", route=RouteKind.BARE), attempt_timeout=0.2, max_response_bytes=1024,
+            )
         assert not_dispatched.value.phase is FailurePhase.NOT_DISPATCHED
     finally:
         await dead_transport.aclose()
@@ -490,11 +494,11 @@ async def test_transport_enforces_decompressed_response_byte_ceiling_and_closes_
         return response
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
+    transport = HttpxTransport("https://example.invalid/rest/1/token/", client=client)
     try:
         with pytest.raises(ResponseTooLargeError, match="byte ceiling"):
             await transport.send(
-                Request("profile", replay_safety=ReplaySafety.SAFE),
+                Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
                 attempt_timeout=1,
                 max_response_bytes=SMALL_RESPONSE_CEILING,
             )
@@ -511,11 +515,11 @@ async def test_oversized_response_after_unknown_dispatch_is_ambiguous() -> None:
         return httpx.Response(HTTP_OK, request=request, content=b'{"result":"too large"}')
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
+    transport = HttpxTransport("https://example.invalid/rest/1/token/", client=client)
     try:
         with pytest.raises(AmbiguousExecutionError, match="oversized response"):
             await Executor(transport).execute(
-                Request("crm.deal.add", replay_safety=ReplaySafety.UNKNOWN),
+                Request("crm.deal.add", replay_safety=ReplaySafety.UNKNOWN, route=RouteKind.BARE),
                 policy=ExecutionPolicy(max_response_bytes=SMALL_RESPONSE_CEILING),
             )
     finally:
@@ -537,11 +541,11 @@ async def test_no_trace_read_failure_is_conservatively_post_dispatch_and_never_r
 
     raw_transport = NoTraceTransport()
     client = httpx.AsyncClient(transport=raw_transport)
-    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
+    transport = HttpxTransport("https://example.invalid/rest/1/token/", client=client)
     try:
         with pytest.raises(AmbiguousExecutionError) as captured:
             await Executor(transport).execute(
-                Request("crm.deal.add", replay_safety=ReplaySafety.UNSAFE),
+                Request("crm.deal.add", replay_safety=ReplaySafety.UNSAFE, route=RouteKind.BARE),
                 policy=_policy(),
             )
         assert raw_transport.calls == 1
@@ -565,10 +569,10 @@ async def test_no_trace_post_dispatch_error_classes_have_conservative_minimum_ph
             raise error_type("no trace evidence", request=request)
 
     client = httpx.AsyncClient(transport=RaisingTransport())
-    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
+    transport = HttpxTransport("https://example.invalid/rest/1/token/", client=client)
     try:
         with pytest.raises(TransportError) as captured:
-            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
+            await transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024)
         assert captured.value.phase is FailurePhase.DISPATCH_STARTED
         assert captured.value.possible_acceptance is True
     finally:
@@ -594,7 +598,7 @@ async def test_transport_error_drops_credentialed_httpx_exception_and_request_lo
     transport = HttpxTransport(f"https://example.invalid/rest/1/{sensitive_fragment}/", client=client)
     try:
         with pytest.raises(TransportError) as captured:
-            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
+            await transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024)
 
         error = captured.value
         assert error.__cause__ is None
@@ -620,7 +624,9 @@ async def test_transport_cancellation_drops_httpx_traceback_and_request_locals()
     blocking = CancellationTransport()
     client = httpx.AsyncClient(transport=blocking)
     transport = HttpxTransport(f"https://example.invalid/rest/1/{sensitive_fragment}/", client=client)
-    task = asyncio.create_task(transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024))
+    task = asyncio.create_task(
+        transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024),
+    )
     try:
         await blocking.entered.wait()
         task.cancel("caller cancelled")
@@ -659,10 +665,10 @@ async def test_socket_partial_body_failure_is_classified_after_headers() -> None
     socket = server.sockets[0]
     assert socket is not None
     host, port = socket.getsockname()[:2]
-    transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
+    transport = HttpxTransport(f"http://{host}:{port}/rest/1/token/")
     try:
         with pytest.raises(TransportError) as captured:
-            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
+            await transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024)
         assert captured.value.phase is FailurePhase.BODY_PARTIALLY_RECEIVED
         assert captured.value.possible_acceptance is True
     finally:
@@ -689,7 +695,7 @@ async def test_out_of_range_socket_status_is_typed_and_drops_webhook_locals() ->
     transport = HttpxTransport(f"http://{host}:{port}/rest/1/{sensitive_fragment}/")
     try:
         with pytest.raises(ProtocolError, match="outside the valid range") as captured:
-            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
+            await transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024)
 
         error = captured.value
         assert error.__cause__ is None
@@ -722,12 +728,12 @@ async def test_socket_cancellation_propagates_and_counts_dispatched_attempt() ->
     socket = server.sockets[0]
     assert socket is not None
     host, port = socket.getsockname()[:2]
-    transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
+    transport = HttpxTransport(f"http://{host}:{port}/rest/1/token/")
     executor = Executor(transport)
     context = executor.context(_policy())
     task = asyncio.create_task(
         executor.execute(
-            Request("profile", replay_safety=ReplaySafety.SAFE),
+            Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             context=context,
         ),
     )
@@ -747,12 +753,12 @@ async def test_socket_cancellation_propagates_and_counts_dispatched_attempt() ->
 @pytest.mark.asyncio
 async def test_negative_one_total_sentinel_is_preserved_but_lower_values_are_typed_errors() -> None:
     sentinel = SequenceTransport([_success(b'{"result":[],"total":-1}')])
-    response = await Executor(sentinel).execute(Request("im.recent.list"), policy=_policy())
+    response = await Executor(sentinel).execute(Request("im.recent.list", route=RouteKind.BARE), policy=_policy())
     assert response.total == -1
 
     invalid = SequenceTransport([_success(b'{"result":[],"total":-2}')])
     with pytest.raises(HTTPGatewayError) as captured:
-        await Executor(invalid).execute(Request("profile"), policy=_policy())
+        await Executor(invalid).execute(Request("profile", route=RouteKind.BARE), policy=_policy())
     assert captured.value.http_status == HTTP_OK
 
 
@@ -768,7 +774,7 @@ async def test_success_model_contract_failures_are_typed_and_keep_http_evidence(
     transport = SequenceTransport([_success(body)])
 
     with pytest.raises(ProtocolError) as captured:
-        await Executor(transport).execute(Request("profile"), policy=_policy())
+        await Executor(transport).execute(Request("profile", route=RouteKind.BARE), policy=_policy())
 
     assert captured.value.http_status == HTTP_OK
     assert captured.value.request_summary is not None

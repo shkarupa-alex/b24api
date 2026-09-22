@@ -2,7 +2,7 @@
 
 from pytest_mock import MockerFixture
 
-from b24api.contracts.request import Request, summarize_request
+from b24api.contracts.request import Request, RouteKind, summarize_request
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
@@ -60,11 +60,13 @@ def test_v3_object_error_keeps_dotted_validation_and_rejects_malformed() -> None
     codec = ProtocolCodec()
     error = codec.error_from_http(
         status_code=400,
-        body={"error": {
-            "code": "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION",
-            "message": "Invalid filter",
-            "validation": [{"field": "filter.taskId", "message": "Required"}],
-        }},
+        body={
+            "error": {
+                "code": "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION",
+                "message": "Invalid filter",
+                "validation": [{"field": "filter.taskId", "message": "Required"}],
+            },
+        },
     )
     assert isinstance(error, ApiResponseError)
     assert error.normalized_code == "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION"
@@ -72,10 +74,13 @@ def test_v3_object_error_keeps_dotted_validation_and_rejects_malformed() -> None
     assert error.retryable is False
     malformed = codec.error_from_http(status_code=200, body={"error": {"code": "", "message": "bad"}})
     assert isinstance(malformed, ProtocolError)
-    assert isinstance(codec.error_from_http(
-        status_code=400,
-        body={"error": {"code": "X", "message": "bad", "validation": [{"field": 3, "message": "bad"}]}},
-    ), ProtocolError)
+    assert isinstance(
+        codec.error_from_http(
+            status_code=400,
+            body={"error": {"code": "X", "message": "bad", "validation": [{"field": 3, "message": "bad"}]}},
+        ),
+        ProtocolError,
+    )
 
 
 def test_gateway_and_protocol_evidence_are_bounded_and_redacted() -> None:
@@ -113,7 +118,7 @@ def test_success_body_does_not_pay_for_recursive_error_preview(mocker: MockerFix
 
 
 def test_structured_description_and_request_context_are_safe() -> None:
-    request = Request(method="profile", parameters={"auth": EXAMPLE_CREDENTIAL, "select": ["ID"]})
+    request = Request(method="profile", parameters={"auth": EXAMPLE_CREDENTIAL, "select": ["ID"]}, route=RouteKind.BARE)
     error = ApiResponseError(
         code="ACCESS_DENIED",
         description=f"Rejected {WEBHOOK}",

@@ -109,13 +109,13 @@ class _OptionalRequestSpec(TypedDict, total=False):
     encoding: BodyEncoding
     headers: RequestHeaders
     result_error: ResultErrorSpec
-    route: RouteKind
 
 
 class RequestSpec(_OptionalRequestSpec):
     """Closed mapping form accepted at public request boundaries."""
 
     method: str
+    route: RouteKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +268,7 @@ class Request:
         encoding: BodyEncoding = BodyEncoding.JSON,
         headers: RequestHeaders = RequestHeaders(),  # noqa: B008 - immutable value singleton
         result_error: ResultErrorSpec | None = None,
-        route: RouteKind = RouteKind.BARE,
+        route: RouteKind,
     ) -> None:
         """Initialize instance state."""
         if not _METHOD_RE.fullmatch(method):
@@ -355,7 +355,7 @@ def canonical_request(raw: RequestLike) -> Request:
     encoding = raw.get("encoding", BodyEncoding.JSON)
     headers = raw.get("headers", RequestHeaders())
     result_error = raw.get("result_error")
-    route = raw.get("route", RouteKind.BARE)
+    route = raw.get("route")
     if not isinstance(method, str):
         raise TypeError("request mapping requires a string method")
     if parameters is not None and not isinstance(parameters, Mapping):
