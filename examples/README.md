@@ -10,6 +10,7 @@ requests.
 | --- | --- | --- | --- |
 | 1 | `chat_bounded_mirror` | supported offline | Three chats, 11 exact IDs, two per-binding stops and one natural exhaustion |
 | 7 | `chat_resume` | supported offline | SQLite page commit, global early close, one-row overlap, eight exact keyed IDs |
+| 12 | `page_index_members` | supported offline | Both one-based controls advance 1/2/3 and return 13 exact user IDs |
 | 16 | `binary_download` | supported offline | Exact PDF/file bytes and media types; denied JSON remains `ApiResponseError` |
 | 19 | `v3_task_results` | supported offline | Exact task result ID, object-valued validation error, unchanged failed-parent checkpoint |
 

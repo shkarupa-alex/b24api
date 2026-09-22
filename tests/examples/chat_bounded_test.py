@@ -15,7 +15,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_recipe_uses_only_public_client_exports() -> None:
-    for recipe in ("chat_bounded_mirror.py", "chat_resume.py", "binary_download.py", "v3_task_results.py"):
+    for recipe in (
+        "chat_bounded_mirror.py", "chat_resume.py", "binary_download.py", "v3_task_results.py",
+        "page_index_members.py",
+    ):
         source = (ROOT / "examples" / recipe).read_text()
         imports = (node.module for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ImportFrom))
         assert all(module in {"b24api", "b24api.testing"}
