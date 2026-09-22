@@ -101,6 +101,8 @@ def validate_fast_keyset(  # noqa: C901, PLR0912, PLR0913
     policy: ExecutionPolicy,
 ) -> int:
     """Prove every static prerequisite before registration and I/O."""
+    if keyset.boundary is not None:
+        raise CapabilityError("exact-boundary completion is not qualified for fast or auto keyset execution")
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         raise ValueError("page_size must be a positive integer")
     if request.encoding is not BodyEncoding.JSON or request.headers.items:

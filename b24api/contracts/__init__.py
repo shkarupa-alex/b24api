@@ -1,5 +1,6 @@
 """Public, I/O-free contracts for the b24api client."""
 
+from b24api.contracts.bounded_range import BoundedIdentityRange
 from b24api.contracts.command import (
     Command,
     CommandFailure,
@@ -130,6 +131,7 @@ __all__ = [
     "BinaryResponse",
     "Binding",
     "BodyEncoding",
+    "BoundedIdentityRange",
     "ClosureWitness",
     "Command",
     "CommandFailure",

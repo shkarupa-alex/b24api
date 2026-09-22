@@ -148,6 +148,7 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "Binding",
         "Bitrix24",
         "BodyEncoding",
+        "BoundedIdentityRange",
         "BudgetExceededError",
         "CapabilityError",
         "ClosureWitness",

@@ -231,7 +231,9 @@ def keyset_stream(  # noqa: PLR0913
         page_adapter=page_adapter,
         policy=policy,
         operation="iter_list_keyset",
-        assurance=TraversalAssurance.IDENTITY_EXACT,
+        assurance=(
+            TraversalAssurance.BOUNDED_RANGE_OBSERVED if keyset.boundary else TraversalAssurance.IDENTITY_EXACT
+        ),
         deregister=deregister,
         audit_violations=audit_violations,
     )

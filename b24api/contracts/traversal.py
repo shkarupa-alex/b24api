@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
+from b24api.contracts.bounded_range import BoundedIdentityRange
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     KeysetExecution,
@@ -200,11 +201,16 @@ class KeysetSpec:
     direction: Literal["ascending", "descending"] = "ascending"
     allow_create_controls: bool = True
     split_order: SplitOrderSpec | None = None
+    boundary: BoundedIdentityRange | None = None
 
     def __post_init__(self) -> None:
         """Validate keyset direction."""
         if self.direction not in {"ascending", "descending"}:
             raise ValueError("direction must be ascending or descending")
+        if self.boundary is not None and (
+            not isinstance(self.boundary, BoundedIdentityRange) or self.direction != self.boundary.order
+        ):
+            raise ValueError("keyset boundary requires a matching ascending direction")
         if (self.order_path is None) == (self.split_order is None):
             raise ValueError("exactly one of order_path and split_order must be set")
         order_paths = (

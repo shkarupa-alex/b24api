@@ -69,6 +69,7 @@ class TraversalAssurance(StrEnum):
     COUNT_MATCHED = "count_matched"
     IDENTITY_AND_COUNT_MATCHED = "identity_and_count_matched"
     RAW_RANGE_COVERED = "raw_range_covered"
+    BOUNDED_RANGE_OBSERVED = "bounded_range_observed"
 
 
 class PageDispatch(StrEnum):

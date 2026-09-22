@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from b24api.contracts.policy import (
     DuplicatePolicy,
@@ -18,6 +18,9 @@ from b24api.contracts.request import (
     ResultSelector,
 )
 from b24api.contracts.traversal import OffsetContinuation, SparseRawBound, SplitOrderSpec
+
+if TYPE_CHECKING:
+    from b24api.contracts.bounded_range import BoundedIdentityRange
 
 PORTAL_BATCH_CAP = 50
 _START_PATH = ParameterPath(("start",))
@@ -187,6 +190,7 @@ class KeysetPlan(PlanContract):
     start_suppression_path: ParameterPath | None = _START_PATH
     terminal: KeysetTerminalRule = KeysetTerminalRule.EMPTY_CONFIRMATION
     allow_create_controls: bool = True
+    boundary: BoundedIdentityRange | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""

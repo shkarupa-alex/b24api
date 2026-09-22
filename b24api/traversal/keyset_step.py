@@ -3,8 +3,15 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
-from b24api.contracts.policy import DuplicatePolicy, IdentityRequirement, OrderSemantics, TotalSemantics
-from b24api.errors import PaginationError
+from b24api.contracts.bounded_range import filter_fingerprint
+from b24api.contracts.policy import (
+    DuplicatePolicy,
+    IdentityCoercion,
+    IdentityRequirement,
+    OrderSemantics,
+    TotalSemantics,
+)
+from b24api.errors import CapabilityError, PaginationError
 from b24api.traversal.identity import _child_path, _request_with_controls
 from b24api.traversal.plans import KeysetPlan, KeysetTerminalRule
 from b24api.traversal.values import IdentityValue, _compare_identities
@@ -28,12 +35,35 @@ def sequential_keyset_plan(keyset: KeysetSpec, page_size: int) -> KeysetPlan:
         limit_path=keyset.limit_path,
         requested_page_size=page_size if keyset.limit_path is not None else None,
         terminal=KeysetTerminalRule.EMPTY_CONFIRMATION,
+        boundary=keyset.boundary,
         allow_create_controls=keyset.allow_create_controls,
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING if direction == "asc" else OrderSemantics.DESCENDING,
         duplicate_policy=DuplicatePolicy.ERROR,
         total_semantics=TotalSemantics.IGNORE,
     )
+
+
+def validate_bounded_keyset(request: Request, plan: KeysetPlan, identity: IdentitySpec) -> None:
+    """Prove a declared exact boundary belongs to this filter before dispatch."""
+    boundary = plan.boundary
+    if boundary is None:
+        return
+    if identity.coercion is not IdentityCoercion.EXACT_INTEGER:
+        raise CapabilityError("bounded keyset requires exact integer identities")
+    expected_fence = _child_path(plan.filter_path, f"<={identity.filter_key}")
+    if boundary.fence_path != expected_fence:
+        raise CapabilityError("bounded keyset fence path does not match the identity filter")
+    if filter_fingerprint(request, plan.filter_path) != boundary.filter_fingerprint:
+        raise CapabilityError("bounded keyset base filter differs from its captured fingerprint")
+
+
+def validate_bounded_keyset_page(plan: KeysetPlan, identities: Sequence[IdentityValue]) -> None:
+    """Require the server to enforce the exact upper fence on every returned row."""
+    if plan.boundary is not None and any(
+        type(value) is not int or value > plan.boundary.upper_id for value in identities
+    ):
+        raise PaginationError("bounded keyset page crossed its enforced upper fence")
 
 
 def keyset_page_request(
@@ -65,6 +95,8 @@ def keyset_page_request(
     if cursor is not None:
         operator = ">" if plan.direction == "asc" else "<"
         updates[_child_path(plan.filter_path, f"{operator}{identity.filter_key}")] = cursor
+    if plan.boundary is not None:
+        updates[plan.boundary.fence_path] = plan.boundary.upper_id
     return _request_with_controls(request, updates, allow_create=plan.allow_create_controls)
 
 
@@ -115,8 +147,16 @@ def validate_keyset_continuation(
         raise PaginationError("keyset page ignored its upper bound")
 
 
-def keyset_page_terminal(plan: KeysetPlan, page_size: int) -> str | None:
+def keyset_page_terminal(
+    plan: KeysetPlan, page_size: int, identities: Sequence[IdentityValue] = (),
+) -> str | None:
     """Return the declared completion reason for one validated keyset page."""
+    if plan.boundary is not None:
+        if plan.boundary.upper_id in identities:
+            return "exact admitted upper boundary reached"
+        if page_size == 0:
+            raise PaginationError("bounded keyset ended before its exact upper boundary")
+        return None
     if plan.terminal is KeysetTerminalRule.EMPTY_CONFIRMATION and page_size == 0:
         return "empty keyset confirmation"
     return None
