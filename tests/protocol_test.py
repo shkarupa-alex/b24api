@@ -1,5 +1,7 @@
 """Tests for structured error precedence and redacted exception evidence."""
 
+import json
+
 from pytest_mock import MockerFixture
 
 from b24api.contracts.request import Request, RouteKind, summarize_request
@@ -21,6 +23,8 @@ EXAMPLE_CREDENTIAL = "n1x2y3z4q5w6e7r8"
 WEBHOOK = "https://portal.invalid/" + "rest/1/" + EXAMPLE_CREDENTIAL + "/"
 HTTP_SERVICE_UNAVAILABLE = 503
 HTTP_TOO_MANY_REQUESTS = 429
+MAX_V3_FIELD_LENGTH = 256
+MAX_SAFE_PREVIEW_LENGTH = 500
 
 
 def test_structured_body_precedes_http_status_and_preserves_codes() -> None:
@@ -67,6 +71,7 @@ def test_v3_object_error_keeps_dotted_validation_and_rejects_malformed() -> None
                 "validation": [{"field": "filter.taskId", "message": "Required"}],
             },
         },
+        retry_codes={"BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION"},
     )
     assert isinstance(error, ApiResponseError)
     assert error.normalized_code == "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION"
@@ -81,6 +86,39 @@ def test_v3_object_error_keeps_dotted_validation_and_rejects_malformed() -> None
         ),
         ProtocolError,
     )
+
+
+def test_v3_error_has_bounded_total_safe_serialization() -> None:
+    error = ProtocolCodec().error_from_http(
+        status_code=400,
+        body={
+            "error": {
+                "code": "X" * 1_000,
+                "message": "é" * 1_000,
+                "validation": [{"field": "f" * 400, "message": "é" * 400} for _ in range(40)],
+            },
+        },
+        request_summary=summarize_request(
+            "method.name",
+            {f"key-{index}-{'x' * 100}": None for index in range(100)},
+        ),
+    )
+    assert isinstance(error, ApiResponseError)
+    assert error.truncated
+    assert len(error.original_code) <= MAX_V3_FIELD_LENGTH
+    assert len(json.dumps(error.to_safe_dict(), ensure_ascii=False).encode("utf-8")) <= 8 * 1024
+
+
+def test_v3_mapping_preview_handles_nested_cycles() -> None:
+    nested: dict[str, object] = {}
+    nested["again"] = nested
+    error = ProtocolCodec().error_from_http(
+        status_code=400,
+        body={"error": {"code": "X", "message": "bad"}, "nested": nested},
+    )
+    assert isinstance(error, ApiResponseError)
+    assert error.evidence.body_preview is not None
+    assert len(error.evidence.body_preview) <= MAX_SAFE_PREVIEW_LENGTH
 
 
 def test_gateway_and_protocol_evidence_are_bounded_and_redacted() -> None:
