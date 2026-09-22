@@ -4,8 +4,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, AsyncIterable, Iterator
+from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
+from b24api.contracts.policy import KernelState
+from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
 from b24api.references.dispatch import (
     _SYNC_EXHAUSTED,
     ReferenceSource,
@@ -24,7 +27,44 @@ from b24api.traversal.plans import (
 
 if TYPE_CHECKING:
     from b24api.contracts.policy import ExecutionPolicy
+    from b24api.execution.snapshot import KernelReport
     from b24api.references.outcome import ReferenceRequest
+    from b24api.traversal.driver import PaginationDriver
+
+
+def _new_page_records(driver: PaginationDriver, previous_count: int) -> tuple[PageRecord, ...]:
+    """Return at most one fresh record for a logical fetch."""
+    if driver.page_trace_count == previous_count:
+        return ()
+    if driver.page_trace_count != previous_count + 1 or driver.last_page_record is None:
+        raise RuntimeError("one logical fetch must produce at most one page record")
+    return (driver.last_page_record,)
+
+
+def _record_cleanup_failure(violations: list[Violation], error: BaseException) -> None:
+    """Retain a bounded safe indication of reference cleanup failure."""
+    violations.append(Violation(
+        severity=ViolationSeverity.BLOCKING,
+        code="cleanup_failure",
+        message=f"reference cleanup also failed ({type(error).__name__})",
+    ))
+
+
+def _cleanup_failed_report(report: KernelReport, error: BaseException) -> KernelReport:
+    """Return a terminal kernel snapshot with safe cleanup failure evidence."""
+    violations = report.violations
+    if not any(item.code == "cleanup_failure" for item in violations):
+        violations = (*violations, Violation(
+            severity=ViolationSeverity.BLOCKING,
+            code="cleanup_failure",
+            message=f"reference cleanup failed ({type(error).__name__})",
+        ))
+    return replace(
+        report,
+        state=KernelState.FAILED,
+        terminal_reason="stream cleanup failed",
+        violations=violations,
+    )
 
 
 @runtime_checkable

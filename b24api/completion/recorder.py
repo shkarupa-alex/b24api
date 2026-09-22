@@ -3,7 +3,7 @@
 from __future__ import annotations
 import hashlib
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 from b24api.completion.gate import CompletionGate
@@ -30,6 +30,26 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from b24api.traversal.values import IdentityValue
+
+
+class CompletionSink(Protocol):
+    """Page lifecycle methods required by the traversal driver."""
+
+    def scheduled(self) -> None:
+        """Register a page before dispatch."""
+        ...
+
+    def settled(self, outcome: CommandSettlement) -> None:
+        """Register a physical outcome."""
+        ...
+
+    def validated(self, identities: Sequence[IdentityValue], row_count: int) -> None:
+        """Register an admitted page."""
+        ...
+
+    def rejected(self, reason: str) -> None:
+        """Retire a rejected page."""
+        ...
 
 
 class CompletionRecorder:

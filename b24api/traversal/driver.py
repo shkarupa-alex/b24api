@@ -83,7 +83,7 @@ from b24api.traversal.values import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Sequence
 
-    from b24api.completion.recorder import CompletionRecorder
+    from b24api.completion.recorder import CompletionSink
     from b24api.contracts.json import JsonValue
     from b24api.contracts.response import Response
     from b24api.execution import ExecutionContext, Executor
@@ -109,7 +109,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         page_cap_hint: int | None = None,
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         initial_cursor: IdentityValue | None = None,
-        completion_recorder: CompletionRecorder | None = None,
+        completion_recorder: CompletionSink | None = None,
     ) -> None:
         """Initialize instance state."""
         self.executor = executor

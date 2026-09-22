@@ -123,7 +123,14 @@ async def test_reference_page_stop_is_per_binding_and_not_source_exhaustion(disp
     assert completions[1].stop_reason is None
     assert {boundary.binding_id for boundary in stop.pages} == {0, 1}
     assert stream.report is not None
-    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.state is TerminalState.COMPLETED, stream.report.violations
+    gate = stream._source.completion_gate  # noqa: SLF001 - observe the active scheduler gate
+    decision = gate.decision()
+    assert decision.state is TerminalState.COMPLETED
+    assert not decision.exhausted
+    assert decision.bindings_admitted == decision.bindings_terminal == len(bindings)
+    assert decision.pages_scheduled == decision.pages_acknowledged
+    assert gate.finish() == stream.report
     assert stream.report.assurance is TraversalAssurance.BOUNDED_PREFIX
     assert not stream.report.exhausted
     assert stream.report.partial
