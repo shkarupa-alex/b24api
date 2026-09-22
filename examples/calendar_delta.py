@@ -43,7 +43,7 @@ async def run() -> None:
         ScriptedExchange.json(_request(INITIAL), {"result": DELETED_ROWS}),
         ScriptedExchange.json(_request(NEXT), {"result": DELETED_ROWS}),
     ))
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     with TemporaryDirectory() as directory:
         sink = CalendarSink(Path(directory) / "calendar.sqlite3")
         try:

@@ -127,7 +127,7 @@ async def _counted_rows(client: Bitrix24, request: Request, *, expected_offsets:
 async def run() -> None:
     """Traverse a bounded folder queue without following link cycles."""
     transport = _fixture()
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         storages = await _counted_rows(client, _storage_request(None), expected_offsets=(0,))
         roots = tuple(_object_id(row, "ROOT_OBJECT_ID") for row in storages)

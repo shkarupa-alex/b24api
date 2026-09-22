@@ -185,7 +185,7 @@ async def _read_legacy(client: Bitrix24) -> None:
 async def run() -> None:
     """Retain modern and legacy outcomes through public traversal APIs."""
     transport = _fixture()
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         resolved = await _resolve_chats(client)
         await _read_modern(client, resolved)

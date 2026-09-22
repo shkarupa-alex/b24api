@@ -56,7 +56,7 @@ def _descending_fixture(limit: int) -> ScriptedTransport:
 
 async def run() -> None:
     """Compare a false clean ASC end with three complete DESC traversals."""
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     asc = ScriptedTransport((
         ScriptedExchange.json(
             _request("FIRST_ID", 0, 3),

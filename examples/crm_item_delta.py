@@ -94,7 +94,7 @@ async def _scan_window(client: Bitrix24, border: str, expected: tuple[dict[str, 
 async def run() -> None:
     """Compare an ID-only cursor with a public time-filtered keyset replay."""
     transport = _fixture()
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     sink: dict[int, str] = {}
     async with Bitrix24(settings, transport=transport) as client:
         types = await client.call(Request("crm.type.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))

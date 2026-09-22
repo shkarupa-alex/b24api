@@ -111,7 +111,7 @@ def _key(row: object) -> tuple[int, int]:
 
 
 async def _run_complete(transport: ScriptedTransport, *, counted: bool) -> tuple[tuple[int, int], ...]:
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         stream = (
             client.iter_list_counted(
@@ -137,7 +137,7 @@ async def _run_complete(transport: ScriptedTransport, *, counted: bool) -> tuple
 
 async def _reject_truncated_tail() -> None:
     transport = _batch_fixture(truncated=True)
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_list_counted(
             _request(None), selector=ResultSelector(("REQUISITE_LINKS",)),

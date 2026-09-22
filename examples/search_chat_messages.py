@@ -74,7 +74,7 @@ def _fixture() -> ScriptedTransport:
 async def run() -> None:
     """Retain successful rows and all three correlated terminal outcomes."""
     transport = _fixture()
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_reference_outcomes(
             _request(101, HEAD),

@@ -626,6 +626,20 @@ async def test_fast_page_is_acknowledged_only_after_its_last_row_is_yielded() ->
 
 
 @pytest.mark.asyncio
+async def test_fast_partial_page_close_retires_gate_pages_without_protocol_violation() -> None:
+    stream = _stream(KeysetTransport(tuple(range(1, 18))), RangeKeysetExecution(StableIntegerKeysetContract()))
+    assert (await anext(stream))["id"] == 1
+    await stream.aclose()
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.EARLY_CLOSED
+    gate = stream._source.completion_gate
+    decision = gate.decision()
+    assert decision.pages_scheduled > decision.pages_acknowledged
+    assert not decision.violations
+    assert gate.finish() == stream.report
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("direction", ["ascending", "descending"])
 @pytest.mark.parametrize("kind", ["range", "partitioned"])
 async def test_explicit_modes_match_sparse_ordered_oracle(direction: str, kind: str) -> None:

@@ -86,7 +86,7 @@ async def run() -> None:
     """Execute the frozen fixture and verify the independent per-chat oracle."""
     transport = _fixture()
     stop = _Cutoff()
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_cursors(
             _request("", HEAD),

@@ -97,7 +97,7 @@ class _Commit:
 
 
 async def _run_once(sink: SqliteMirror, transport: ScriptedTransport, *, pause_a: bool) -> OperationReport:
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     commit = _Commit(sink, pause_a=pause_a)
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_cursors(

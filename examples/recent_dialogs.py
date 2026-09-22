@@ -67,7 +67,7 @@ def _fixture() -> ScriptedTransport:
 async def run() -> None:
     """Record a duplicate warning while reconciling chat identities."""
     transport = _fixture()
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_list(
             _request(0),

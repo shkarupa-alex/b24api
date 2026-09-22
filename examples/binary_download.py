@@ -41,7 +41,7 @@ def _fixture() -> ScriptedTransport:
 async def run() -> None:
     """Check exact payload, media type, and failure classification offline."""
     transport = _fixture()
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         pdf = await client.call_bytes(_request("crm.documentgenerator.document.getpdf", "fixture-doc"))
         file = await client.call_bytes(_request("rest.file.get", "fixture-file"))

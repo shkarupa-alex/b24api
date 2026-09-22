@@ -60,7 +60,7 @@ async def run() -> None:
             ResultSelector(("rawTotal",)), stride, 3, "qualified stable raw ID order",
         ),
     )
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_list(
             Request(METHOD, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),

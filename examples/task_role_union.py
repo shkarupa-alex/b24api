@@ -94,7 +94,7 @@ def _assert_responsible_offsets(transport: ScriptedTransport) -> None:
 async def run() -> None:
     """Compare a naive 932 offset with four completed public role traversals."""
     transport = _fixture()
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     union: dict[int, set[str]] = {}
     async with Bitrix24(settings, transport=transport) as client:
         for role, expected_role_ids in ROLE_IDS.items():

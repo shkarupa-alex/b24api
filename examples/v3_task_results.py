@@ -44,7 +44,7 @@ async def run() -> None:
     """Verify independent IDs, typed validation, and unchanged failed checkpoint."""
     transport = _fixture()
     checkpoint = {11: 0, -1: 0}
-    settings = Settings(webhook_url="https://fixture.invalid/rest/1/offline/")
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         response = await client.call(_request(11))
         if not isinstance(response, dict) or not isinstance(response.get("items"), list):

@@ -45,6 +45,7 @@ class FastCompletionRecorder:
         self._sequence = 0
         self._page_id = 0
         self._active: dict[str, _CommandPage] = {}
+        self._negative = False
         self._terminal = False
         self._emit(BindingAdmitted, binding_id=0)
 
@@ -71,6 +72,7 @@ class FastCompletionRecorder:
         page.settled = True
         self._emit(PageCommandOutcome, binding_id=0, page_id=page.page_id, outcome=outcome)
         if outcome is not CommandSettlement.SUCCESS:
+            self._negative = True
             del self._active[command_id]
 
     def validated(self, command_id: str, identities: tuple[int, ...]) -> None:
@@ -93,6 +95,7 @@ class FastCompletionRecorder:
             page.recorded = True
         else:
             self._emit(PageRejected, binding_id=0, page_id=page.page_id, reason=outcome.value)
+            self._negative = True
             del self._active[command_id]
 
     def admit(self, command_id: str, count: int) -> None:
@@ -141,10 +144,15 @@ class FastCompletionRecorder:
         self._terminal = True
         if state is KernelState.COMPLETED and rows_emitted == rows_admitted:
             self.discard_unadmitted()
+        else:
+            for command_id, page in tuple(self._active.items()):
+                self._emit(PageRejected, binding_id=0, page_id=page.page_id, reason=state.value)
+                self._negative = True
+                del self._active[command_id]
         closure = (
             BindingClosure.SOURCE_EMPTY
             if state is KernelState.COMPLETED and rows_emitted == rows_admitted
-            else BindingClosure.CALLER_STOP if state is KernelState.CANCELLED
+            else BindingClosure.CALLER_STOP if state is KernelState.CANCELLED and not self._negative
             else BindingClosure.FAILURE
         )
         stream = (
