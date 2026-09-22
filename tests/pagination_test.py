@@ -688,7 +688,7 @@ async def test_direct_fetch_failure_records_unknown_scheduled_page() -> None:
 @pytest.mark.asyncio
 async def test_cancellation_while_waiting_for_dispatch_records_no_unknown_page() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
-    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT)
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
     stream = iter_list(
         Executor(FunctionTransport(lambda _request: {"result": []}), coordinator=coordinator),
         Request("crm.item.list", route=RouteKind.BARE),

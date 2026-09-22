@@ -13,6 +13,7 @@ from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
+    ApiResponseError,
     BudgetExceededError,
     FailurePhase,
     HTTPGatewayError,
@@ -28,6 +29,12 @@ from b24api.execution import (
     WireResponse,
     WorkClass,
     rearm_cancellation,
+)
+from b24api.execution.rate import (
+    CoordinatorBudgetError,
+    CoordinatorClosedError,
+    DeadlineBudget,
+    RatePolicyCapacityError,
 )
 from b24api.transport import httpx as httpx_transport_module
 
@@ -373,11 +380,11 @@ async def test_structured_throttle_uses_shared_cooldown_and_safe_replay() -> Non
 @pytest.mark.asyncio
 async def test_coordinator_merges_cooldowns_and_does_not_let_retries_starve_interactive() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
-    first = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT)
+    first = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
 
-    retry_one = asyncio.create_task(coordinator.acquire(WorkClass.RETRY))
-    retry_two = asyncio.create_task(coordinator.acquire(WorkClass.RETRY))
-    interactive = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT))
+    retry_one = asyncio.create_task(coordinator.acquire(WorkClass.RETRY, methods=frozenset({"profile"})))
+    retry_two = asyncio.create_task(coordinator.acquire(WorkClass.RETRY, methods=frozenset({"profile"})))
+    interactive = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"})))
     await asyncio.sleep(0)
     await first.release()
 
@@ -395,7 +402,7 @@ async def test_coordinator_merges_cooldowns_and_does_not_let_retries_starve_inte
     snapshot = await coordinator.snapshot()
     assert snapshot.state is CoordinatorState.COOLDOWN
     assert snapshot.cooldown_reason == "latest"
-    permit = await asyncio.wait_for(coordinator.acquire(WorkClass.BATCH), timeout=1)
+    permit = await asyncio.wait_for(coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"})), timeout=1)
     await permit.release()
     assert (await coordinator.snapshot()).state is CoordinatorState.OPEN
     await coordinator.close()
@@ -404,8 +411,8 @@ async def test_coordinator_merges_cooldowns_and_does_not_let_retries_starve_inte
 @pytest.mark.asyncio
 async def test_cancelled_waiter_is_removed_without_leaking_permit() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
-    first = await coordinator.acquire(WorkClass.BATCH)
-    waiter = asyncio.create_task(coordinator.acquire(WorkClass.TRAVERSAL_DIRECT))
+    first = await coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"}))
+    waiter = asyncio.create_task(coordinator.acquire(WorkClass.TRAVERSAL_DIRECT, methods=frozenset({"profile"})))
     await asyncio.sleep(0)
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -420,8 +427,8 @@ async def test_cancelled_waiter_is_removed_without_leaking_permit() -> None:
 @pytest.mark.asyncio
 async def test_cancellation_after_grant_returns_capacity() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
-    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT)
-    waiter = asyncio.create_task(coordinator.acquire(WorkClass.TRAVERSAL_DIRECT))
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
+    waiter = asyncio.create_task(coordinator.acquire(WorkClass.TRAVERSAL_DIRECT, methods=frozenset({"profile"})))
     await asyncio.sleep(0)
 
     await held.release()
@@ -430,7 +437,9 @@ async def test_cancellation_after_grant_returns_capacity() -> None:
         await waiter
 
     assert (await coordinator.snapshot()).active_permits == 0
-    replacement = await asyncio.wait_for(coordinator.acquire(WorkClass.BATCH), timeout=1)
+    replacement = await asyncio.wait_for(
+        coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"})), timeout=1,
+    )
     await replacement.release()
     await coordinator.close()
 
@@ -438,7 +447,7 @@ async def test_cancellation_after_grant_returns_capacity() -> None:
 @pytest.mark.asyncio
 async def test_permit_wait_is_bounded_without_counting_or_dispatching_an_attempt() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
-    held = await coordinator.acquire(WorkClass.BATCH)
+    held = await coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"}))
     transport = SequenceTransport([_success()])
     executor = Executor(transport, coordinator=coordinator)
     context = executor.context(
@@ -454,6 +463,93 @@ async def test_permit_wait_is_bounded_without_counting_or_dispatching_an_attempt
     assert transport.calls == 0
     assert (await context.snapshot()).counters.physical_requests == 0
     await held.release()
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_method_limit_blocks_only_affected_method_and_whole_batch() -> None:
+    coordinator = RateCoordinator(max_concurrency=1, operation_time_limit_delay=0.03)
+    await coordinator.observe_operation_time_limit("crm.item.list")
+    blocked = asyncio.create_task(
+        coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.list"})),
+    )
+    batch = asyncio.create_task(
+        coordinator.acquire(WorkClass.BATCH, methods=frozenset({"crm.item.list", "profile"})),
+    )
+    await asyncio.sleep(0)
+    unrelated = await asyncio.wait_for(
+        coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"})), timeout=1,
+    )
+    assert not blocked.done()
+    assert not batch.done()
+    await unrelated.release()
+    pending = {blocked, batch}
+    while pending:
+        done, pending = await asyncio.wait(pending, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+        assert done
+        for task in done:
+            await task.result().release()
+    assert (await coordinator.snapshot()).method_cooldowns == 0
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_method_limit_admission_budget_and_closed_error_are_typed() -> None:
+    coordinator = RateCoordinator(operation_time_limit_delay=1)
+    await coordinator.observe_operation_time_limit("profile")
+    with pytest.raises(CoordinatorBudgetError):
+        await coordinator.acquire(
+            WorkClass.INTERACTIVE_DIRECT,
+            methods=frozenset({"profile"}),
+            budget=DeadlineBudget(asyncio.get_running_loop().time() + 0.01),
+        )
+    assert dict((await coordinator.snapshot()).queued)[WorkClass.INTERACTIVE_DIRECT] == 0
+    await coordinator.close()
+    with pytest.raises(CoordinatorClosedError):
+        await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
+
+
+@pytest.mark.asyncio
+async def test_unsafe_operation_time_limit_observes_method_without_replay() -> None:
+    transport = SequenceTransport(
+        [
+            WireResponse(
+                status_code=200,
+                headers=(),
+                body=b'{"error":"OPERATION_TIME_LIMIT","error_description":"wait"}',
+            ),
+        ],
+    )
+    coordinator = RateCoordinator(operation_time_limit_delay=0.1)
+    with pytest.raises(ApiResponseError):
+        await Executor(transport, coordinator=coordinator).execute(
+            Request("crm.item.add", route=RouteKind.BARE, replay_safety=ReplaySafety.UNSAFE),
+        )
+    assert transport.calls == 1
+    assert (await coordinator.snapshot()).method_cooldowns == 1
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_method_limit_repeated_signal_extends_deadline_and_capacity_is_explicit() -> None:
+    now = 100.0
+    default_delay = 120.0
+
+    def clock() -> float:
+        return now
+
+    coordinator = RateCoordinator(clock=clock)
+    assert await coordinator.observe_api_throttle("profile", "OPERATION_TIME_LIMIT") == default_delay
+    now += 30.0
+    assert await coordinator.observe_api_throttle("profile", "OPERATION_TIME_LIMIT") == default_delay
+    assert await coordinator.observe_api_throttle("profile", "SOME_OTHER_ERROR") == 0.0
+    for index in range(1_023):
+        await coordinator.observe_api_throttle(f"method.{index}", "OPERATION_TIME_LIMIT")
+    with pytest.raises(RatePolicyCapacityError):
+        await coordinator.observe_api_throttle("overflow", "OPERATION_TIME_LIMIT")
+    now += 121.0
+    assert (await coordinator.snapshot()).method_cooldowns == 0
+    await coordinator.observe_api_throttle("overflow", "OPERATION_TIME_LIMIT")
     await coordinator.close()
 
 

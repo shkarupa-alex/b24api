@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 import asyncio
-import contextlib
-import email.utils
 import hashlib
 import json
 import math
@@ -41,8 +39,10 @@ from b24api.execution.context import (
     _checkpoint_pending_cancellation,
     _raise_for_pending_cancellation,
 )
-from b24api.execution.rate import RateCoordinator, WorkClass
+from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
+from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
 from b24api.transport.base import TransportCapabilities, WireRequest, WireTransport
+from b24api.transport.httpx import HttpxTransport
 from b24api.transport.protocol import ProtocolCodec
 
 if TYPE_CHECKING:
@@ -75,7 +75,6 @@ _HTTP_SUCCESS_MINIMUM = 200
 _HTTP_SUCCESS_MAXIMUM = 299
 _HTTP_REDIRECTION_MINIMUM = 300
 _HTTP_CLIENT_ERROR_MINIMUM = 400
-_RETRY_AFTER_CAP_SECONDS = 3_600.0
 
 
 def _mark_dispatch_started(error: BaseException) -> None:
@@ -100,6 +99,8 @@ class Executor:
         self.transport = transport
         self._wire_transport = transport if isinstance(transport, WireTransport) else None
         self.coordinator = coordinator or RateCoordinator(clock=clock)
+        if isinstance(transport, HttpxTransport):
+            self.coordinator.bind_host(transport.host)
         self.codec = codec or ProtocolCodec()
         self._clock = clock
         self._sleep = sleep
@@ -121,6 +122,7 @@ class Executor:
         policy: ExecutionPolicy | None = None,
         work_class: WorkClass = WorkClass.INTERACTIVE_DIRECT,
         strict_json_members: bool = False,
+        _admission_methods: frozenset[str] | None = None,
     ) -> Response:
         """Execute one canonical request."""
         if context is not None and policy is not None:
@@ -130,7 +132,13 @@ class Executor:
         if not isinstance(strict_json_members, bool):
             raise TypeError("strict_json_members must be a boolean")
         context = context or self.context(policy)
-        wire = await self._execute_wire(request, context=context, work_class=work_class, binary=False)
+        wire = await self._execute_wire(
+            request,
+            context=context,
+            work_class=work_class,
+            binary=False,
+            methods=_admission_methods or frozenset({request.method}),
+        )
         try:
             response = _decode_success(
                 wire,
@@ -162,7 +170,13 @@ class Executor:
         if not isinstance(request, Request):
             raise TypeError("request must be canonical Request")
         context = context or self.context(policy)
-        wire = await self._execute_wire(request, context=context, work_class=work_class, binary=True)
+        wire = await self._execute_wire(
+            request,
+            context=context,
+            work_class=work_class,
+            binary=True,
+            methods=frozenset({request.method}),
+        )
         content_type = wire.content_type
         digest = hashlib.sha256(wire.body).hexdigest() if context.policy.binary_digest else None
         evidence = BinaryEvidence(wire.status_code, content_type, wire.byte_length, digest)
@@ -175,6 +189,7 @@ class Executor:
         context: ExecutionContext,
         work_class: WorkClass,
         binary: bool,
+        methods: frozenset[str],
     ) -> WireResponse:
         """Attach request-local dispatch evidence to every escaping failure."""
         dispatch_started = False
@@ -189,6 +204,7 @@ class Executor:
                 context=context,
                 work_class=work_class,
                 binary=binary,
+                methods=methods,
                 on_dispatch=mark_dispatch_started,
             )
         except BaseException as error:
@@ -196,13 +212,14 @@ class Executor:
                 _mark_dispatch_started(error)
             raise
 
-    async def _execute_wire_attempts(  # noqa: C901, PLR0912, PLR0915
+    async def _execute_wire_attempts(  # noqa: C901, PLR0912, PLR0913, PLR0915
         self,
         request: Request,
         *,
         context: ExecutionContext,
         work_class: WorkClass,
         binary: bool,
+        methods: frozenset[str],
         on_dispatch: Callable[[], None],
     ) -> WireResponse:
         """Run the shared attempt loop and return one conclusive raw response."""
@@ -219,7 +236,11 @@ class Executor:
             scheduled_class = work_class if attempts == 0 else WorkClass.RETRY
             try:
                 async with asyncio.timeout(remaining):
-                    permit = await context.coordinator.acquire(scheduled_class)
+                    permit = await context.coordinator.acquire(
+                        scheduled_class,
+                        methods=methods,
+                        budget=DeadlineBudget(self._clock() + remaining),
+                    )
             except TimeoutError as error:
                 raise BudgetExceededError("permit wait exhausted execution time budget") from error
             try:
@@ -291,6 +312,17 @@ class Executor:
                 if context.remaining_time(retry_started=retry_started) <= 0:
                     raise BudgetExceededError("transport completed after execution time budget")
                 return wire
+            if (
+                isinstance(response_error, ApiResponseError)
+                and response_error.normalized_code == "operation_time_limit"
+            ):
+                await context.coordinator.observe_api_throttle(request.method, response_error.normalized_code)
+            throttle_delay = _retry_after_seconds(wire)
+            if throttle_delay is not None:
+                merged = await context.coordinator.observe_throttle(
+                    throttle_delay, reason=_throttle_reason(response_error),
+                )
+                await context.record_cooldown(merged)
             _raise_for_pending_cancellation()
             if context.remaining_time(retry_started=retry_started) <= 0:
                 raise BudgetExceededError("transport completed after execution time budget")
@@ -363,8 +395,6 @@ class Executor:
         throttle_delay = _retry_after_seconds(wire) if wire is not None else None
         if throttle_delay is not None:
             delay = max(delay, throttle_delay)
-            merged = await context.coordinator.observe_throttle(delay, reason=_throttle_reason(error))
-            await context.record_cooldown(merged)
         remaining = context.remaining_time(retry_started=retry_started)
         if delay >= remaining:
             raise BudgetExceededError("retry delay would exceed elapsed budget") from error
@@ -387,41 +417,6 @@ def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: Execution
         and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
         and error.http_status in policy.retry.transient_http_statuses
     )
-
-
-def _retry_delay(
-    policy: ExecutionPolicy,
-    *,
-    retry_number: int,
-    random_source: Callable[[], float],
-) -> float:
-    retry = policy.retry
-    base = min(retry.maximum_delay, retry.initial_delay * retry.backoff ** max(0, retry_number - 1))
-    if retry.jitter == 0 or base == 0:
-        return base
-    factor = 1 - retry.jitter + (2 * retry.jitter * random_source())
-    return max(0.0, base * factor)
-
-
-def _retry_after_seconds(wire: WireResponse) -> float | None:
-    headers = wire.header_map
-    raw = headers.get("retry-after") or headers.get("x-bitrix-ratelimit-reset")
-    if raw is None:
-        return None
-    with contextlib.suppress(ValueError):
-        value = float(raw)
-        if math.isfinite(value) and value >= 0:
-            return min(value, _RETRY_AFTER_CAP_SECONDS)
-    with contextlib.suppress(TypeError, ValueError, OverflowError):
-        parsed = email.utils.parsedate_to_datetime(raw)
-        return min(max(0.0, parsed.timestamp() - time.time()), _RETRY_AFTER_CAP_SECONDS)
-    return None
-
-
-def _throttle_reason(error: B24ApiError) -> str:
-    if isinstance(error, ApiResponseError):
-        return error.normalized_code
-    return f"http_{error.http_status}"
 
 
 def _preflight_transport(transport: WireTransport | None, request: Request) -> None:

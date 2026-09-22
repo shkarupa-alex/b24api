@@ -9,18 +9,31 @@ from b24api.execution.context import (
     rearm_cancellation,
 )
 from b24api.execution.executor import Executor
-from b24api.execution.rate import CoordinatorSnapshot, CoordinatorState, RateCoordinator, WorkClass
+from b24api.execution.rate import (
+    CoordinatorBudgetError,
+    CoordinatorClosedError,
+    CoordinatorSnapshot,
+    CoordinatorState,
+    DeadlineBudget,
+    RateCoordinator,
+    RatePolicyCapacityError,
+    WorkClass,
+)
 from b24api.transport import HttpxTransport, Transport, WireResponse
 
 __all__ = [
     "AsyncIteratorController",
+    "CoordinatorBudgetError",
+    "CoordinatorClosedError",
     "CoordinatorSnapshot",
     "CoordinatorState",
+    "DeadlineBudget",
     "ExecutionContext",
     "ExecutionSnapshot",
     "Executor",
     "HttpxTransport",
     "RateCoordinator",
+    "RatePolicyCapacityError",
     "Transport",
     "WireResponse",
     "WorkClass",

@@ -128,6 +128,7 @@ class BatchExecutor:
                 context=context,
                 work_class=WorkClass.BATCH,
                 strict_json_members=strict_json_members,
+                _admission_methods=frozenset(command.request.method for command in eligible),
             )
             envelope = _decode_batch_envelope(
                 response.result,
@@ -161,6 +162,13 @@ class BatchExecutor:
             )
             for command in eligible
         )
+        for command, outcome in zip(eligible, outcomes, strict=True):
+            if (
+                isinstance(outcome, BatchFailure)
+                and isinstance(outcome.error, BatchCommandError)
+                and outcome.error.normalized_code == "operation_time_limit"
+            ):
+                await context.coordinator.observe_api_throttle(command.request.method, outcome.error.normalized_code)
         return _merge_outcomes(commands, outcomes, rejected)
 
     def _decode_command(

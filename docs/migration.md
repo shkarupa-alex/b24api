@@ -21,6 +21,14 @@ it is used through that transport. Direct use of a caller-owned client after the
 is outside that shield. An application enabling the separate `httpcore` DEBUG logger needs its own
 logging policy and test; this guarantee covers the emitting `httpx` INFO logger.
 
+Direct access to `RateCoordinator.acquire()` now requires a non-empty `methods` frozenset. A
+physical batch passes every inner method as one admission unit. `Retry-After` pauses the portal
+host; `OPERATION_TIME_LIMIT` pauses only its method, with a configurable 120-second default.
+The coordinator uses one portal host per `HttpxTransport` and rejects attempts to share it across
+different hosts. An unsafe request or batch failure records the throttle without automatically
+replaying the request. Callers can pass an absolute monotonic `DeadlineBudget` to bound permit
+waits and handle typed budget, closed, and capacity errors.
+
 The earlier 2.x keyset migration notes below remain as historical guidance for that API.
 
 ## Keyset verification, cursor fan-out, and page adaptation

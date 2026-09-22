@@ -32,7 +32,7 @@ from b24api.errors import (
     ProtocolError,
     TransportError,
 )
-from b24api.execution import ExecutionContext, Executor, WireResponse
+from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterator
@@ -144,6 +144,31 @@ async def test_non_bare_inner_command_is_correlated_rejection_before_batch_dispa
     assert isinstance(outcomes[1], BatchSuccess)
     assert len(transport.requests) == 1
     assert transport.requests[0].route is RouteKind.BARE
+
+
+@pytest.mark.asyncio
+async def test_batch_method_limit_observes_only_failing_command_without_replay() -> None:
+    def callback(request: Request) -> WireResponse:
+        keys = _batch_keys(request)
+        return _wire_batch(keys, errors={keys[0]: {"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}})
+
+    transport = CallbackTransport(callback)
+    coordinator = RateCoordinator(operation_time_limit_delay=0.1)
+    executor = BatchExecutor(Executor(transport, coordinator=coordinator))
+    context = executor.executor.context(_one_attempt_policy())
+    outcomes = await executor.execute_requests(
+        (
+            Request("crm.item.add", route=RouteKind.BARE, replay_safety=ReplaySafety.UNSAFE),
+            Request("profile", route=RouteKind.BARE),
+        ),
+        context=context,
+    )
+    assert isinstance(outcomes[0], BatchFailure)
+    assert isinstance(outcomes[0].error, BatchCommandError)
+    assert outcomes[0].error.normalized_code == "operation_time_limit"
+    assert len(transport.requests) == 1
+    assert (await coordinator.snapshot()).method_cooldowns == 1
+    await coordinator.close()
 
 
 @pytest.mark.asyncio
