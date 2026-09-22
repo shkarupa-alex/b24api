@@ -29,7 +29,7 @@ from b24api.contracts.report import (
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError, KeysetCapabilityError, PaginationError
 from b24api.traversal import keyset_step
-from b24api.traversal.facade import _collection_selector
+from b24api.traversal.facade_support import _collection_selector
 from b24api.traversal.identity import _child_path, _request_with_controls
 from b24api.traversal.keyset_capability import canary_commands
 from b24api.traversal.keyset_eligibility import _reject_owned_controls

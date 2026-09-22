@@ -29,7 +29,7 @@ from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
 from b24api.references.fanout import fanout_stream
 from b24api.settings import Settings, api_settings
-from b24api.traversal.facade import _collection_selector
+from b24api.traversal.facade_support import _collection_selector
 from b24api.traversal.keyset_verifier import verify_keyset_capability as _verify_keyset_capability
 
 if TYPE_CHECKING:

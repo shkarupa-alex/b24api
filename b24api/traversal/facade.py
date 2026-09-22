@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, cast
 
 from b24api._stream import MappedOperationStream, _ClosableIterator
 from b24api.batch.engine import BatchExecutor
@@ -29,11 +29,11 @@ from b24api.contracts.request import (
     TraversalIdentity,
     canonical_request,
 )
-from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import OffsetContinuation, TotalTermination
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.counted import CountedItemStream
+from b24api.traversal.facade_support import _collection_selector, _direction
 from b24api.traversal.keyset_eligibility import validate_fast_keyset
 from b24api.traversal.keyset_fast_stream import FastTraceRecorder, KeysetFastStream
 from b24api.traversal.keyset_scheduler import KeysetFastScheduler
@@ -48,30 +48,17 @@ from b24api.traversal.plans import (
     OffsetSequentialPlan,
 )
 from b24api.traversal.stream import iter_list as _iter_list
-from b24api.traversal.values import _MappingValuesResultSelector, _TolerantMappingValuesResultSelector
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
     from b24api.contracts.page import PageAdapter
+    from b24api.contracts.page_stop import PageStopPolicy
+    from b24api.contracts.response import ResultCollectionShape
     from b24api.contracts.stream import OperationStream
     from b24api.contracts.traversal import CursorSpec, KeysetSpec, OffsetSpec
     from b24api.execution.executor import Executor
 
 type Deregister = Callable[[object], None]
-
-
-def _direction(value: str) -> Literal["asc", "desc"]:
-    return "asc" if value == "ascending" else "desc"
-
-
-def _collection_selector(selector: ResultSelector, shape: ResultCollectionShape) -> ResultSelector:
-    if not isinstance(shape, ResultCollectionShape):
-        raise TypeError("collection_shape must be a ResultCollectionShape")
-    if shape is ResultCollectionShape.SEQUENCE:
-        return selector
-    if shape is ResultCollectionShape.MAPPING_VALUES_OR_EMPTY:
-        return _TolerantMappingValuesResultSelector(selector.path)
-    return _MappingValuesResultSelector(selector.path)
 
 
 def _mapped_stream(
@@ -103,6 +90,7 @@ def sequential_stream(  # noqa: PLR0913
     page_size: int,
     offset: OffsetSpec,
     page_adapter: PageAdapter,
+    page_stop: PageStopPolicy | None,
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
@@ -155,6 +143,7 @@ def sequential_stream(  # noqa: PLR0913
         collection_shape=collection_shape,
         page_size=page_size,
         page_adapter=page_adapter,
+        page_stop=page_stop,
         policy=policy,
         operation="iter_list",
         assurance=assurance,
@@ -174,6 +163,7 @@ def keyset_stream(  # noqa: PLR0913
     keyset: KeysetSpec,
     execution: KeysetExecution,
     page_adapter: PageAdapter,
+    page_stop: PageStopPolicy | None,
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
@@ -184,6 +174,8 @@ def keyset_stream(  # noqa: PLR0913
         SequentialKeysetExecution | RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
     ):
         raise TypeError("execution must be a supported KeysetExecution")
+    if page_stop is not None and not isinstance(execution, SequentialKeysetExecution):
+        raise CapabilityError("page stop requires sequential keyset execution")
     if not isinstance(execution, SequentialKeysetExecution):
         canonical = canonical_request(request)
         effective_cap = validate_fast_keyset(
@@ -229,6 +221,7 @@ def keyset_stream(  # noqa: PLR0913
         collection_shape=collection_shape,
         page_size=page_size,
         page_adapter=page_adapter,
+        page_stop=page_stop,
         policy=policy,
         operation="iter_list_keyset",
         assurance=(
@@ -316,6 +309,7 @@ def cursor_stream(  # noqa: PLR0913
     collection_shape: ResultCollectionShape,
     page_size: int,
     page_adapter: PageAdapter,
+    page_stop: PageStopPolicy | None,
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
@@ -352,6 +346,7 @@ def cursor_stream(  # noqa: PLR0913
         collection_shape=collection_shape,
         page_size=page_size,
         page_adapter=page_adapter,
+        page_stop=page_stop,
         policy=policy,
         operation="iter_list_cursor",
         assurance=TraversalAssurance.IDENTITY_EXACT,
@@ -370,6 +365,7 @@ def _plan_stream(  # noqa: PLR0913
     collection_shape: ResultCollectionShape,
     page_size: int,
     page_adapter: PageAdapter,
+    page_stop: PageStopPolicy | None,
     policy: ExecutionPolicy,
     operation: str,
     assurance: TraversalAssurance,
@@ -385,6 +381,7 @@ def _plan_stream(  # noqa: PLR0913
         policy=policy,
         _page_cap_hint=page_size,
         _page_adapter=page_adapter,
+        _page_stop=page_stop,
     )
     return _mapped_stream(
         source,

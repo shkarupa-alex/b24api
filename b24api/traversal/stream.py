@@ -1,15 +1,19 @@
 """Lazy correctness-first sequential traversal streams and state machines."""
 
+# ruff: noqa: TRY301 - source error provenance is recorded at the lifecycle boundary
+
 from __future__ import annotations
 import asyncio
 import contextlib
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
+from inspect import isawaitable
 from typing import TYPE_CHECKING, Self, cast
 
 from b24api.contracts.json import JsonValue, _thaw_json
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
+from b24api.contracts.page_stop import CallerStop, ContinuePage, PageBoundary, PageStopPolicy
 from b24api.contracts.policy import (
     CompletionAssurance,
     ExecutionPolicy,
@@ -54,6 +58,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         page_cap_hint: int | None = None,
         assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+        page_stop: PageStopPolicy | None = None,
     ) -> None:
         """Initialize instance state."""
         PaginationDriver.validate_plan(plan)
@@ -69,6 +74,11 @@ class ItemStream(AsyncIterator[JsonValue]):
             page_adapter=page_adapter,
         )
         self._assurance = assurance
+        if page_stop is not None and not callable(getattr(page_stop, "on_page", None)):
+            raise TypeError("page_stop must implement on_page")
+        self._page_stop = page_stop
+        self._caller_stopped = False
+        self._stop_reason: str | None = None
         self._runner: AsyncGenerator[tuple[JsonValue, bool]] | None = None
         self._prefetched: tuple[JsonValue, bool] | object = _MISSING
         self._closed = False
@@ -151,8 +161,24 @@ class ItemStream(AsyncIterator[JsonValue]):
                     await self._context.set_buffered_rows(len(buffered) + 1)
                     yield _thaw_json(item), is_unique
                     await self._context.set_buffered_rows(len(buffered))
+                if self._page_stop is not None:
+                    record = self._driver.last_page_record
+                    if record is None:
+                        raise RuntimeError("validated page lacks completion provenance")
+                    decision = self._page_stop.on_page(PageBoundary(0, record, tuple(page.items)))
+                    if isawaitable(decision):
+                        decision = await decision
+                    if not isinstance(decision, ContinuePage | CallerStop):
+                        raise TypeError("page stop policy returned an invalid decision")
+                    if isinstance(decision, CallerStop) and page.continuing:
+                        self._caller_stopped = True
+                        self._stop_reason = decision.reason
+                        break
             naturally_exhausted = True
-            await self._finalize(KernelState.COMPLETED, self._driver.terminal_reason or "terminal confirmed")
+            await self._finalize(
+                KernelState.COMPLETED,
+                self._stop_reason or self._driver.terminal_reason or "terminal confirmed",
+            )
         except asyncio.CancelledError as error:
             primary_error = error
             repeated = await await_cancellation_resistant(
@@ -294,6 +320,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
             violations=violations,
             terminal_reason=reason,
+            caller_stopped=self._caller_stopped,
             page_trace=page_trace,
             page_trace_truncated=page_trace_truncated,
         )
@@ -310,6 +337,7 @@ def iter_list(  # noqa: PLR0913
     _page_cap_hint: int | None = None,
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
     _page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+    _page_stop: PageStopPolicy | None = None,
 ) -> ItemStream:
     """Construct a lazy canonical item stream without performing I/O."""
     return ItemStream(
@@ -322,4 +350,5 @@ def iter_list(  # noqa: PLR0913
         page_cap_hint=_page_cap_hint,
         assurance=_assurance,
         page_adapter=_page_adapter,
+        page_stop=_page_stop,
     )

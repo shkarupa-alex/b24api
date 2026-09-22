@@ -33,6 +33,7 @@ class KernelReport:
     buffered_rows_high_water: int = 0
     violations: tuple[Violation, ...] = ()
     terminal_reason: str | None = None
+    caller_stopped: bool = False
     evidence: tuple[ResponseEvidence, ...] = ()
     page_trace: tuple[PageRecord, ...] = ()
     page_trace_truncated: bool = False
@@ -51,6 +52,8 @@ class KernelReport:
         object.__setattr__(self, "page_trace", tuple(self.page_trace))
         if self.terminal_reason is not None:
             object.__setattr__(self, "terminal_reason", DEFAULT_REDACTOR.redact_text(self.terminal_reason))
+        if not isinstance(self.caller_stopped, bool):
+            raise TypeError("caller_stopped must be a bool")
         counters = (
             self.emitted_rows,
             self.unique_rows,

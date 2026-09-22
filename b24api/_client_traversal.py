@@ -12,6 +12,7 @@ from b24api.traversal.facade import counted_stream, cursor_stream, keyset_stream
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
+    from b24api.contracts.page_stop import PageStopPolicy
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.report import Violation
     from b24api.contracts.request import Request
@@ -54,6 +55,7 @@ class _TraversalFacade:
         page_size: int = 50,
         offset: OffsetSpec = _DEFAULT_OFFSET,
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+        page_stop: PageStopPolicy | None = None,
         policy: ExecutionPolicy | None = None,
     ) -> OperationStream[JsonValue]:
         """Return conservative sequential offset/server-next traversal."""
@@ -70,6 +72,7 @@ class _TraversalFacade:
                 page_size=page_size,
                 offset=offset,
                 page_adapter=page_adapter,
+                page_stop=page_stop,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
                 audit_violations=(() if audit_violation is None else (audit_violation,)),
@@ -87,9 +90,12 @@ class _TraversalFacade:
         batch_size: int | None = None,
         offset: OffsetSpec = _DEFAULT_COUNTED_OFFSET,
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+        page_stop: PageStopPolicy | None = None,
         policy: ExecutionPolicy | None = None,
     ) -> OperationStream[JsonValue]:
         """Return exact direct-head plus physically batched counted traversal."""
+        if page_stop is not None:
+            raise ValueError("counted physical batch tail does not support page stop")
         self._require_open()
         canonical = canonical_request(request)
         audit_violation = self._audit_unknown(canonical)
@@ -121,6 +127,7 @@ class _TraversalFacade:
         keyset: KeysetSpec = _DEFAULT_KEYSET,
         execution: KeysetExecution = _DEFAULT_AUTO_KEYSET_EXECUTION,
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+        page_stop: PageStopPolicy | None = None,
         policy: ExecutionPolicy | None = None,
     ) -> OperationStream[JsonValue]:
         """Return automatic no-count keyset traversal with explicit execution override."""
@@ -138,6 +145,7 @@ class _TraversalFacade:
                 keyset=keyset,
                 execution=execution,
                 page_adapter=page_adapter,
+                page_stop=page_stop,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
                 audit_violations=(() if audit_violation is None else (audit_violation,)),
@@ -154,6 +162,7 @@ class _TraversalFacade:
         collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE,
         page_size: int = 50,
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+        page_stop: PageStopPolicy | None = None,
         policy: ExecutionPolicy | None = None,
     ) -> OperationStream[JsonValue]:
         """Return strict dependent cursor traversal with empty confirmation."""
@@ -170,6 +179,7 @@ class _TraversalFacade:
                 collection_shape=collection_shape,
                 page_size=page_size,
                 page_adapter=page_adapter,
+                page_stop=page_stop,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
                 audit_violations=(() if audit_violation is None else (audit_violation,)),
