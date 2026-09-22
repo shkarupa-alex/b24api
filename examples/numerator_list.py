@@ -15,6 +15,7 @@ from b24api import (
     OffsetSpec,
     ReplaySafety,
     Request,
+    ResultSelector,
     RouteKind,
     Settings,
     TraversalAssurance,
@@ -34,7 +35,7 @@ def _fixture() -> ScriptedTransport:
     pages = ((0, EXPECTED_IDS[:50]), (50, EXPECTED_IDS[50:]), (100, ()))
     return ScriptedTransport(tuple(
         ScriptedExchange.json(
-            _request(offset), {"result": [{"id": value} for value in ids], "total": len(ids)},
+            _request(offset), {"result": {"numerators": [{"id": str(value)} for value in ids]}, "total": len(ids)},
         )
         for offset, ids in pages
     ))
@@ -47,6 +48,7 @@ async def run() -> None:
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_list(
             Request(METHOD, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+            selector=ResultSelector(("numerators",)),
             page_size=STEP,
             offset=OffsetSpec(continuation=OffsetContinuation.FIXED_STEP, step=STEP),
         )
