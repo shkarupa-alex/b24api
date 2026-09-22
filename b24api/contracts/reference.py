@@ -82,11 +82,13 @@ class ReferenceItem[C]:
 
 @dataclass(frozen=True, slots=True)
 class ReferenceComplete[C]:
-    """Successful binding terminal event, including zero-row results."""
+    """Successful binding terminal, with source-exhaustion evidence distinguished."""
 
     binding_index: int
     correlation: C = field(repr=False)
     row_count: int
+    exhausted: bool = True
+    stop_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

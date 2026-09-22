@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from b24api.contracts.command import Command, CommandOutcome, CommandSuccess
     from b24api.contracts.json import JsonValue
     from b24api.contracts.keyset_capability import KeysetCapabilityReport
+    from b24api.contracts.page_stop import PageStopPolicy
     from b24api.contracts.reference import ReferenceEvent, ReferenceOutcome
     from b24api.contracts.request import IdentitySpec, ResultSelector
     from b24api.contracts.response import BinaryResponse, Response
@@ -282,7 +283,7 @@ class Bitrix24(_TraversalFacade):
             ),
         )
 
-    def iter_references[C](
+    def iter_references[C](  # noqa: PLR0913 - page stop is an independent traversal policy
         self,
         request: RequestLike,
         bindings: BindingSource[C],
@@ -290,6 +291,7 @@ class Bitrix24(_TraversalFacade):
         traversal: TraversalSpec,
         dispatch: DispatchSpec = _DEFAULT_REFERENCE_DISPATCH,
         policy: ExecutionPolicy | None = None,
+        page_stop: PageStopPolicy | None = None,
     ) -> OperationStream[ReferenceEvent[C]]:
         """Traverse bound references fail-fast with explicit completion events."""
         self._require_open()
@@ -300,6 +302,7 @@ class Bitrix24(_TraversalFacade):
             traversal=traversal,
             dispatch=dispatch,
             policy=policy or self._default_policy,
+            page_stop=page_stop,
             tolerant=False,
             audit=self._audit_unknown,
             deregister=self._discard_stream,
@@ -319,6 +322,7 @@ class Bitrix24(_TraversalFacade):
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         dispatch: DispatchSpec = _DEFAULT_REFERENCE_DISPATCH,
         policy: ExecutionPolicy | None = None,
+        page_stop: PageStopPolicy | None = None,
     ) -> OperationStream[ReferenceEvent[C]]:
         """Traverse one or many independently seeded cursor bindings fail-fast."""
         from b24api.contracts.traversal import CursorTraversal  # noqa: PLC0415 - facade composition only
@@ -335,9 +339,10 @@ class Bitrix24(_TraversalFacade):
             ),
             dispatch=dispatch,
             policy=policy,
+            page_stop=page_stop,
         )
 
-    def iter_reference_outcomes[C](
+    def iter_reference_outcomes[C](  # noqa: PLR0913 - page stop is an independent traversal policy
         self,
         request: RequestLike,
         bindings: BindingSource[C],
@@ -345,6 +350,7 @@ class Bitrix24(_TraversalFacade):
         traversal: TraversalSpec,
         dispatch: DispatchSpec = _DEFAULT_REFERENCE_DISPATCH,
         policy: ExecutionPolicy | None = None,
+        page_stop: PageStopPolicy | None = None,
     ) -> OperationStream[ReferenceOutcome[C]]:
         """Traverse bound references while retaining each correlated terminal state."""
         self._require_open()
@@ -356,6 +362,7 @@ class Bitrix24(_TraversalFacade):
                 traversal=traversal,
                 dispatch=dispatch,
                 policy=policy or self._default_policy,
+                page_stop=page_stop,
                 tolerant=True,
                 audit=self._audit_unknown,
                 deregister=self._discard_stream,

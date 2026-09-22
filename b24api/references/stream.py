@@ -44,6 +44,7 @@ from b24api.traversal.plans import (
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 if TYPE_CHECKING:
+    from b24api.contracts.page_stop import PageStopPolicy
     from b24api.contracts.request import ResultSelector, TraversalIdentity
 
 
@@ -295,6 +296,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
             violations=violations,
             terminal_reason=reason,
+            caller_stopped=bool(self._scheduler.stopped_bindings),
             page_trace=page_trace,
             page_trace_truncated=page_trace_truncated,
         )
@@ -340,6 +342,7 @@ def iter_references(  # noqa: PLR0913
     _page_cap_hint: int | None = None,
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
     _page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+    _page_stop: PageStopPolicy | None = None,
 ) -> ReferenceStream:
     """Construct a lazy bounded reference traversal stream without I/O."""
     PaginationDriver.validate_plan(plan)
@@ -368,6 +371,7 @@ def iter_references(  # noqa: PLR0913
         capture_fail_fast=_capture_fail_fast,
         page_cap_hint=_page_cap_hint,
         page_adapter=_page_adapter,
+        page_stop=_page_stop,
     )
     return ReferenceStream(
         scheduler,

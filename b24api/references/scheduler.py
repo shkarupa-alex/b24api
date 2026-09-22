@@ -3,9 +3,11 @@
 from __future__ import annotations
 import asyncio
 from dataclasses import replace
+from inspect import isawaitable
 from typing import TYPE_CHECKING, cast
 
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
+from b24api.contracts.page_stop import CallerStop, ContinuePage, PageBoundary, PageStopPolicy
 from b24api.contracts.report import PageDispatch, PageRecord, Violation, ViolationSeverity, retain_page_trace
 from b24api.contracts.request import ReplaySafety, Request, ResultSelector, TraversalIdentity
 from b24api.errors import BudgetExceededError, CapabilityError
@@ -88,6 +90,7 @@ class ReferenceScheduler:
         capture_fail_fast: bool = False,
         page_cap_hint: int | None = None,
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+        page_stop: PageStopPolicy | None = None,
     ) -> None:
         """Initialize instance state."""
         self.executor = executor
@@ -102,6 +105,8 @@ class ReferenceScheduler:
         self.emit_response = emit_response
         self.capture_fail_fast = capture_fail_fast
         self.page_adapter = page_adapter
+        self.page_stop = page_stop
+        self.stopped_bindings = 0
         self.context = executor.context(policy)
         self.page_cap = _page_cap(
             plan,
@@ -301,7 +306,7 @@ class ReferenceScheduler:
             self.producer_state.touch()
             admission.changed.set()
 
-    async def _run_reference(  # noqa: C901, PLR0915 - owns the per-reference transaction boundary
+    async def _run_reference(  # noqa: C901, PLR0912, PLR0915 - owns the per-reference transaction boundary
         self,
         work: _Work,
         output: asyncio.Queue[_Event],
@@ -317,6 +322,7 @@ class ReferenceScheduler:
         violation_offset = 0
         trace_offset = 0
         scheduled_sequences: list[int] = []
+        stopped_reason: str | None = None
         page_admission: asyncio.Future[None] | None = None
         settlement: asyncio.Future[None] | None = None
 
@@ -388,8 +394,9 @@ class ReferenceScheduler:
             page_adapter=self.page_adapter,
             initial_cursor=work.reference.initial_cursor,
         )
+        pages = driver.pages()
         try:
-            async for page in driver.pages():
+            async for page in pages:
                 if reservation is None:
                     raise RuntimeError("page completed without a buffer reservation")  # noqa: TRY301
                 await self.buffer.accept(reservation, page.retained_rows)
@@ -406,6 +413,9 @@ class ReferenceScheduler:
                     self.producer_state.touch()
                 page_violations = tuple(driver.violations[violation_offset:])
                 violation_offset = len(driver.violations)
+                page_records = self._annotate_page_records(
+                    work, self._new_page_records(driver, trace_offset), scheduled_sequences,
+                )
                 await output.put(
                     _PageEvent(
                         work,
@@ -414,11 +424,7 @@ class ReferenceScheduler:
                         page.item_weights,
                         driver.last_page_unique_mask,
                         page_violations,
-                        self._annotate_page_records(
-                            work,
-                            self._new_page_records(driver, trace_offset),
-                            scheduled_sequences,
-                        ),
+                        page_records,
                         reservation,
                         acknowledged,
                     ),
@@ -428,11 +434,23 @@ class ReferenceScheduler:
                 if self.output_order is ReferenceOutputOrder.READY:
                     settle_page()
                 self.producer_state.pending_continuations.discard(producer_key)
+                partial_rows += len(page.items)
+                reservation = None
+                if self.page_stop is not None:
+                    if len(page_records) != 1:
+                        raise RuntimeError("validated reference page lacks completion provenance")  # noqa: TRY301
+                    decision = self.page_stop.on_page(PageBoundary(work.index, page_records[0], tuple(page.items)))
+                    if isawaitable(decision):
+                        decision = await decision
+                    if not isinstance(decision, ContinuePage | CallerStop):
+                        raise TypeError("reference page stop policy returned an invalid decision")  # noqa: TRY301
+                    if isinstance(decision, CallerStop) and page.continuing:
+                        stopped_reason = decision.reason
+                        self.stopped_bindings += 1
+                        break
                 if page.continuing:
                     self.producer_state.runnable.add(producer_key)
                     self.producer_state.touch()
-                partial_rows += len(page.items)
-                reservation = None
             if reservation is not None:
                 await self.buffer.abort(reservation)
                 reservation = None
@@ -446,6 +464,7 @@ class ReferenceScheduler:
                         self._new_page_records(driver, trace_offset),
                         scheduled_sequences,
                     ),
+                    stopped_reason,
                 ),
             )
         except asyncio.CancelledError:
@@ -484,6 +503,7 @@ class ReferenceScheduler:
                 ),
             )
         finally:
+            await pages.aclose()
             admit_page()
             settle_page()
             self.producer_state.runnable.discard(producer_key)
@@ -621,7 +641,9 @@ class ReferenceScheduler:
             return
         if isinstance(event, _DoneEvent):
             if self.emit_complete:
-                yield _KernelReferenceComplete(event.work.index, event.work.reference, event.row_count)
+                yield _KernelReferenceComplete(
+                    event.work.index, event.work.reference, event.row_count, event.stopped_reason,
+                )
             return
         request = event.work.reference.request
         failure = ReferenceFailure(

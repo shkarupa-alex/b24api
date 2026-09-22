@@ -71,6 +71,7 @@ class _DoneEvent:
     row_count: int
     violations: tuple[Violation, ...]
     page_records: tuple[PageRecord, ...]
+    stopped_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +95,7 @@ class _KernelReferenceComplete:
     work_index: int
     reference: ReferenceRequest
     row_count: int
+    stopped_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

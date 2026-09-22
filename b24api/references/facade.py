@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from b24api._stream import MappedOperationStream
-from b24api.contracts.dispatch import DeliveryOrder, DirectDispatch, DispatchSpec
+from b24api.contracts.dispatch import DirectDispatch, DispatchSpec
 from b24api.contracts.keyset_execution import SequentialKeysetExecution
 from b24api.contracts.policy import (
     DuplicatePolicy,
@@ -54,16 +54,15 @@ from b24api.references.dispatch import (
     _KernelReferenceComplete,
     _ReferenceWindowError,
 )
+from b24api.references.dispatch_plan import kernel_dispatch
 from b24api.references.outcome import ReferenceFailure as KernelFailure
 from b24api.references.outcome import ReferenceItem as KernelItem
 from b24api.references.stream import iter_references as _iter_references
 from b24api.traversal.driver import PaginationDriver
-from b24api.traversal.plans import BatchDispatch as KernelBatchDispatch
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
     CursorTerminalRule,
-    DispatchPlan,
     ItemCursorPlan,
     KeysetPlan,
     KeysetTerminalRule,
@@ -71,13 +70,10 @@ from b24api.traversal.plans import (
     OffsetContinuation,
     OffsetSequentialPlan,
     OffsetTerminalRule,
-    ReferenceOutputOrder,
-)
-from b24api.traversal.plans import (
-    DirectDispatch as KernelDirectDispatch,
 )
 
 if TYPE_CHECKING:
+    from b24api.contracts.page_stop import PageStopPolicy
     from b24api.contracts.stream import OperationStream
     from b24api.execution.snapshot import KernelReport
 
@@ -196,30 +192,13 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
             requested_page_size=traversal.page_size if cursor_mechanics.limit_path is not None else None,
             terminal=CursorTerminalRule.EMPTY_CONFIRMATION,
             allow_create_controls=cursor_mechanics.allow_create_controls,
+            domain=cursor_mechanics.domain,
             identity_requirement=IdentityRequirement.REQUIRED,
             order_semantics=OrderSemantics.ASCENDING if direction == "asc" else OrderSemantics.DESCENDING,
             duplicate_policy=DuplicatePolicy.ERROR,
         ),
         traversal.selector,
         identity,
-    )
-
-
-def _output_order(value: DeliveryOrder) -> ReferenceOutputOrder:
-    return ReferenceOutputOrder.READY if value is DeliveryOrder.READY else ReferenceOutputOrder.INPUT
-
-
-def _kernel_dispatch(dispatch: DispatchSpec, policy: ExecutionPolicy) -> DispatchPlan:
-    if isinstance(dispatch, DirectDispatch):
-        return KernelDirectDispatch(
-            concurrency=min(dispatch.concurrency, policy.max_direct_concurrency, policy.max_active_references),
-            output_order=_output_order(dispatch.output_order),
-        )
-    return KernelBatchDispatch(
-        batch_size=min(dispatch.batch_size, policy.max_buffered_commands),
-        concurrency=min(dispatch.concurrency, policy.max_active_references),
-        output_order=_output_order(dispatch.output_order),
-        coalesce_wait=dispatch.coalesce_wait,
     )
 
 
@@ -240,7 +219,10 @@ class _ReferenceEventMapper:
         if isinstance(event, _KernelReferenceComplete):
             context = cast("_BindingContext", event.reference.correlation)
             self._item_indexes.pop(context.index, None)
-            return ReferenceComplete(context.index, context.correlation, event.row_count)
+            return ReferenceComplete(
+                context.index, context.correlation, event.row_count,
+                exhausted=event.stopped_reason is None, stop_reason=event.stopped_reason,
+            )
         context = cast("_BindingContext", event.correlation)
         self._item_indexes.pop(context.index, None)
         if event.not_executed_reason is not None:
@@ -310,6 +292,7 @@ def kernel_reference_stream[C](
     policy: ExecutionPolicy,
     tolerant: bool,
     audit: Callable[[Request], Violation | None] | None = None,
+    page_stop: PageStopPolicy | None = None,
 ) -> ReferenceKernelStream:
     """Build the internal owned stream after all base controls are validated."""
     from b24api.execution import Executor  # noqa: PLC0415 - narrow internal composition import
@@ -318,6 +301,8 @@ def kernel_reference_stream[C](
         raise TypeError("executor must be an Executor")
     if isinstance(traversal, CountedTraversal) and isinstance(dispatch, DirectDispatch):
         raise CapabilityError("counted reference traversal requires BatchDispatch")
+    if isinstance(traversal, CountedTraversal) and page_stop is not None:
+        raise CapabilityError("counted physical batch tail does not support page stop")
     plan, selector, identity = _kernel_plan(traversal)
     preflight = PaginationDriver(
         executor,
@@ -330,21 +315,22 @@ def kernel_reference_stream[C](
     )
     preflight._validate_capabilities()  # noqa: SLF001 - reject base controls before consuming caller input
     executor._preflight_request(base)  # noqa: SLF001 - reject transport representation before caller input
-    kernel_dispatch = _kernel_dispatch(dispatch, policy)
+    dispatch_plan = kernel_dispatch(dispatch, policy)
     stream = _iter_references(
         executor,
         binding_source(base, bindings, traversal, audit),
         plan=plan,
-        dispatch=kernel_dispatch,
+        dispatch=dispatch_plan,
         selector=selector,
         identity=identity,
-        output_order=kernel_dispatch.output_order,
+        output_order=dispatch_plan.output_order,
         tolerant=tolerant,
         policy=policy,
         _emit_complete=True,
         _capture_fail_fast=not tolerant,
         _page_cap_hint=traversal.page_size,
         _page_adapter=traversal.page_adapter,
+        _page_stop=page_stop,
     )
     return cast("ReferenceKernelStream", stream)
 
@@ -359,6 +345,7 @@ def reference_stream[C](
     policy: ExecutionPolicy,
     tolerant: bool,
     audit: Callable[[Request], Violation | None] | None = None,
+    page_stop: PageStopPolicy | None = None,
     deregister: Deregister,
 ) -> OperationStream[ReferenceOutcome[C]]:
     """Compose the public bound-reference stream over the scheduler kernel."""
@@ -374,6 +361,7 @@ def reference_stream[C](
         policy=policy,
         tolerant=tolerant,
         audit=audit,
+        page_stop=page_stop,
     )
     mapper = _ReferenceEventMapper()
     stream = MappedOperationStream(
