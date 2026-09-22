@@ -3,9 +3,16 @@
 from __future__ import annotations
 import json
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, cast
 
-from b24api.contracts.request import Request
+from b24api.contracts.request import ReplaySafety, Request, RouteKind
+from b24api.encoding import encode_php_query
 from b24api.transport.base import TransportCapabilities, WireRequest, WireResponse
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+_PORTAL_BATCH_CAP = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +27,47 @@ class ScriptedExchange:
         """Build a normal JSON REST response from deterministic fixture data."""
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return cls(request, WireResponse(200, (("content-type", "application/json"),), body))
+
+    @classmethod
+    def batch(
+        cls,
+        commands: tuple[Request, ...],
+        results: tuple[object, ...],
+        *,
+        total: int,
+        continuations: tuple[int | None, ...] | None = None,
+    ) -> ScriptedExchange:
+        """Freeze an exact physical batch request and correlated result envelope."""
+        if not commands or len(commands) > _PORTAL_BATCH_CAP or len(results) != len(commands):
+            raise ValueError("batch fixture requires 1..50 commands and matching results")
+        if continuations is None:
+            continuations = (None,) * len(commands)
+        if len(continuations) != len(commands):
+            raise ValueError("batch fixture continuations must match commands")
+        if any(command.route is not RouteKind.BARE or command.replay_safety is not ReplaySafety.SAFE
+               or command.positional is not None or command.headers.items for command in commands):
+            raise ValueError("batch fixture requires safe BARE commands without positional slots or headers")
+        keys = tuple(f"c{index:012d}" for index in range(len(commands)))
+        queries = tuple(
+            encode_php_query(cast("Mapping[str | int, object]", command.to_wire_parameters()))
+            for command in commands
+        )
+        encoded = {
+            key: command.method if not query else f"{command.method}?{query}"
+            for key, command, query in zip(keys, commands, queries, strict=True)
+        }
+        request = Request(
+            "batch", parameters={"halt": 0, "cmd": encoded},
+            replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        )
+        payload = {"result": {
+            "result": dict(zip(keys, results, strict=True)),
+            "result_error": {},
+            "result_total": dict.fromkeys(keys, total),
+            "result_next": {key: value for key, value in zip(keys, continuations, strict=True)
+                            if value is not None},
+        }}
+        return cls.json(request, payload)
 
 
 class ScriptedTransport:
