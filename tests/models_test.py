@@ -74,6 +74,12 @@ def test_request_rejects_non_json_nonfinite_and_cycles() -> None:
         Request("profile", replay_safety="safe", route=RouteKind.BARE)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("route", list(RouteKind))
+def test_request_rejects_route_suffixed_logical_methods(route: RouteKind) -> None:
+    with pytest.raises(ValueError, match="logical names"):
+        Request("crm.item.list.json", route=route)
+
+
 def test_request_repr_contains_shape_not_values() -> None:
     request = Request("profile", {"auth": EXAMPLE_CREDENTIAL, "select": ["ID"]}, route=RouteKind.BARE)
 

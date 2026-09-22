@@ -7,17 +7,26 @@ import pytest
 
 from b24api import Bitrix24, Request, RouteKind, TerminalState
 from b24api.completion import CompletionGate
+from b24api.completion.recorder import CompletionRecorder, CountedCompletionRecorder
 from b24api.contracts.completion import (
+    BindingClosure,
     BindingTerminal,
     CleanupOutcome,
+    CleanupState,
+    CommandSettlement,
     PageAcknowledged,
     PageCommandOutcome,
     PageDelivered,
     PageScheduled,
     PageValidated,
+    StreamClosure,
     StreamTerminal,
 )
+from b24api.contracts.policy import KernelState
 from b24api.execution import Executor, WireResponse
+from b24api.traversal.plans import OffsetSequentialPlan
+
+RESERVED_PAGE_COUNT = 3
 
 
 class GateProbeTransport:
@@ -84,3 +93,32 @@ async def test_public_offset_traversal_emits_ordered_page_and_cleanup_evidence()
     assert stream.report is not None
     assert stream.report.exhausted
     assert gate.finish() == stream.report
+
+
+def test_sequential_recorder_preserves_ambiguous_dispatch_as_unknown_terminal() -> None:
+    recorder = CompletionRecorder()
+    recorder.scheduled()
+    recorder.settled(CommandSettlement.UNKNOWN)
+    recorder.terminal_from_plan(OffsetSequentialPlan(), KernelState.INCOMPLETE, caller_stopped=False)
+    recorder.cleanup(CleanupState.SUCCESS)
+
+    decision = recorder.gate.decision()
+    assert decision.state is TerminalState.EARLY_CLOSED
+    assert not decision.exhausted
+    assert "completion_unknown_binding_claimed_known" not in {item.code for item in decision.violations}
+
+
+def test_counted_recorder_retires_unexecuted_reserved_pages_before_terminal() -> None:
+    recorder = CountedCompletionRecorder()
+    recorder.activate(recorder.reserve())
+    recorder.settled(CommandSettlement.UNKNOWN)
+    recorder.reserve()
+    recorder.reserve()
+    recorder.settle_unobserved()
+    recorder.terminal(BindingClosure.UNKNOWN, StreamClosure.EARLY_CLOSE)
+    recorder.cleanup(CleanupState.SUCCESS)
+
+    decision = recorder.gate.decision()
+    assert decision.state is TerminalState.EARLY_CLOSED
+    assert decision.pages_scheduled == RESERVED_PAGE_COUNT
+    assert "completion_invalid_binding_terminal" not in {item.code for item in decision.violations}

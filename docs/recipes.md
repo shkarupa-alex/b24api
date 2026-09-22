@@ -1,5 +1,9 @@
 # Endpoint recipes for b24api 2.x
 
+The complete executable scenario index is in [examples/README.md](../examples/README.md). It links
+the 19 frozen public-API recipes to their independent offline oracles and records the evidence
+boundary for the separate opt-in live fixtures.
+
 The runtime remains method-agnostic. These recipes are caller-owned configurations for endpoint
 contracts that have been verified separately; revalidate them against the portal and filter used by
 your application.

@@ -33,8 +33,30 @@ Qualified PHP methods that take positional arguments now use `PositionalArgument
 explicit `PositionalLayout`. Pass that value as the second argument to `Request`. Slots are
 represented by `Present`, `EmptyObject`, `EmptyArray`, `Null`, or a trailing `Omitted`. A layout
 declares exact arity, each slot's shape, fixed slots, and case-sensitive writable control paths.
-`write_control()` returns a new value and rejects an undeclared or missing path. Positional
-requests use a top-level JSON array; form encoding and physical batch reject them before I/O.
+`write_control()` returns a new value and rejects an undeclared or missing parent path. A declared
+final mapping leaf may be created when every parent container already exists. Positional requests
+use a top-level JSON array; form encoding and physical batch reject them before I/O.
+
+`OperationReport.exhausted` now records whether every binding reached qualified full-source
+closure. A successful page-boundary stop therefore has `state=COMPLETED`, `exhausted=false`, and
+`partial=true`. Failures, unknown outcomes, early close, and cleanup failure also cannot claim
+exhaustion. Applications that previously treated successful state as a complete checkpoint must
+gate that checkpoint on `report.exhausted`.
+
+The public `page_stop` callback runs after the validated page has been delivered. Return only after
+the page and its checkpoint are durably committed; the client emits `PageAcknowledged` after the
+callback succeeds and before scheduling the next page. A callback exception is a traversal failure.
+Counted physical-batch tails reject page-stop construction because already scheduled sibling pages
+cannot be withdrawn safely.
+
+Bounded keyset execution now needs a qualified admitted upper boundary, an enforced fence, and the
+declared method contract in `BoundedIdentityRange`. `RangeKeysetExecution` and
+`PartitionedKeysetExecution` use those bounds;
+`SequentialKeysetExecution` retains empty confirmation. `CALLER_ASSERTED_BOUNDS` describes the
+source of the bounds and does not assert a stable snapshot of a mutating source.
+
+Logical batch `CommandFailure` now exposes the kernel's `replay_disposition`. Retry only when it is
+`ReplayDisposition.ELIGIBLE`; replay safety and retryability remain inputs to that closed decision.
 
 For one-based page controls, pass `OffsetSpec(parameter_path=path, page_index=PageIndex(path,
 initial=1, increment=1, max_rows=10))` to `iter_list(..., page_size=10)`. The wire control

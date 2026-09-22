@@ -16,6 +16,7 @@ from b24api.contracts.completion import (
     PageAcknowledged,
     PageCommandOutcome,
     PageDelivered,
+    PageRejected,
     PageScheduled,
     PageValidated,
     StreamClosure,
@@ -198,6 +199,85 @@ def test_gate_accounts_for_typed_unknown_without_claiming_exhaustion() -> None:
     decision = gate.decision()
     assert decision.state is TerminalState.COMPLETED_WITH_FAILURES
     assert not decision.exhausted
+
+
+@pytest.mark.parametrize("settlement", [CommandSettlement.FAILURE, CommandSettlement.NOT_EXECUTED])
+def test_gate_accounts_for_each_known_negative_command_settlement(settlement: CommandSettlement) -> None:
+    gate = CompletionGate("run")
+    gate.emit(BindingAdmitted(operation_id="run", sequence=0, binding_id=0))
+    gate.emit(PageScheduled(operation_id="run", sequence=1, binding_id=0, page_id=0))
+    gate.emit(
+        PageCommandOutcome(
+            operation_id="run",
+            sequence=2,
+            binding_id=0,
+            page_id=0,
+            outcome=settlement,
+        )
+    )
+    _close(gate, 3, BindingClosure.FAILURE)
+    decision = gate.decision()
+    assert decision.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert not decision.exhausted
+
+
+def test_gate_accounts_for_page_rejection_and_cleanup_failure() -> None:
+    rejected = CompletionGate("run")
+    rejected.emit(BindingAdmitted(operation_id="run", sequence=0, binding_id=0))
+    rejected.emit(PageScheduled(operation_id="run", sequence=1, binding_id=0, page_id=0))
+    rejected.emit(
+        PageCommandOutcome(
+            operation_id="run",
+            sequence=2,
+            binding_id=0,
+            page_id=0,
+            outcome=CommandSettlement.SUCCESS,
+        )
+    )
+    rejected.emit(PageRejected(operation_id="run", sequence=3, binding_id=0, page_id=0, reason="invalid"))
+    _close(rejected, 4, BindingClosure.FAILURE)
+    assert rejected.decision().state is TerminalState.COMPLETED_WITH_FAILURES
+
+    cleanup_failed = CompletionGate("run")
+    sequence = _page(cleanup_failed, row_count=0)
+    cleanup_failed.emit(
+        BindingTerminal(
+            operation_id="run",
+            sequence=sequence,
+            binding_id=0,
+            closure=BindingClosure.SOURCE_EMPTY,
+        )
+    )
+    cleanup_failed.emit(
+        StreamTerminal(operation_id="run", sequence=sequence + 1, closure=StreamClosure.NATURAL),
+    )
+    cleanup_failed.emit(
+        CleanupOutcome(operation_id="run", sequence=sequence + 2, state=CleanupState.FAILURE),
+    )
+    assert cleanup_failed.decision().state is TerminalState.INCOMPLETE
+
+
+def test_gate_retains_protocol_violations_for_rejection_order_and_terminal_order() -> None:
+    gate = CompletionGate("run")
+    sequence = _page(gate, acknowledged=False)
+    gate.emit(PageRejected(operation_id="run", sequence=sequence, binding_id=0, page_id=0, reason="late"))
+    gate.emit(StreamTerminal(operation_id="run", sequence=sequence + 1, closure=StreamClosure.NATURAL))
+    gate.emit(BindingTerminal(operation_id="run", sequence=sequence + 2, binding_id=0, closure=BindingClosure.FAILURE))
+    gate.emit(CleanupOutcome(operation_id="run", sequence=sequence + 3, state=CleanupState.SUCCESS))
+    violations = {item.code for item in gate.decision().violations}
+    assert "completion_rejection_after_delivery" in violations
+    assert "completion_after_terminal" in violations
+
+
+def test_gate_retains_non_monotonic_sequence_and_invalid_cleanup_order() -> None:
+    gate = CompletionGate("run")
+    gate.emit(CleanupOutcome(operation_id="run", sequence=1, state=CleanupState.SUCCESS))
+    gate.emit(StreamTerminal(operation_id="run", sequence=0, closure=StreamClosure.NATURAL, empty_source=True))
+    gate.emit(StreamTerminal(operation_id="run", sequence=2, closure=StreamClosure.NATURAL, empty_source=True))
+    gate.emit(CleanupOutcome(operation_id="run", sequence=3, state=CleanupState.SUCCESS))
+    violations = {item.code for item in gate.decision().violations}
+    assert "completion_invalid_cleanup" in violations
+    assert "completion_event_order" in violations
 
 
 def test_gate_rejects_public_success_counts_that_omit_a_failed_binding() -> None:

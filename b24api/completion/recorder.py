@@ -61,12 +61,18 @@ class CompletionRecorder:
         self._sequence = 0
         self._next_page = 0
         self._current: int | None = None
+        self._unknown = False
         self.gate.emit(BindingAdmitted(operation_id=self.gate.operation_id, sequence=self._take(), binding_id=0))
 
     def _take(self) -> int:
         sequence = self._sequence
         self._sequence += 1
         return sequence
+
+    @property
+    def has_unknown(self) -> bool:
+        """Report whether any physical dispatch remained ambiguous."""
+        return self._unknown
 
     def scheduled(self) -> None:
         """Record a unique page before reserving or dispatching it."""
@@ -97,6 +103,7 @@ class CompletionRecorder:
             )
         )
         if outcome is not CommandSettlement.SUCCESS:
+            self._unknown = self._unknown or outcome is CommandSettlement.UNKNOWN
             self._current = None
 
     def validated(self, identities: Sequence[IdentityValue], row_count: int) -> None:
@@ -185,7 +192,9 @@ class CompletionRecorder:
     ) -> None:
         """Preserve the driver's qualified closure distinction in gate evidence."""
         closure = (
-            BindingClosure.CALLER_STOP
+            BindingClosure.UNKNOWN
+            if self._unknown
+            else BindingClosure.CALLER_STOP
             if caller_stopped
             else BindingClosure.BOUNDARY_SEEN
             if isinstance(plan, KeysetPlan) and plan.boundary
@@ -226,6 +235,11 @@ class CompletionRecorder:
 class CountedCompletionRecorder(CompletionRecorder):
     """Correlate bounded in-flight counted batch pages by command index."""
 
+    def __init__(self) -> None:
+        """Initialize the base gate and bounded open-reservation ledger."""
+        super().__init__()
+        self._reserved: set[int] = set()
+
     def reserve(self) -> int:
         """Schedule a page before its physical command can be dispatched."""
         page_id = self._next_page
@@ -238,10 +252,36 @@ class CountedCompletionRecorder(CompletionRecorder):
                 page_id=page_id,
             )
         )
+        self._reserved.add(page_id)
         return page_id
+
+    def settle_unobserved(self) -> None:
+        """Retire scheduled tail pages whose dispatch outcome was not observed."""
+        for page_id in tuple(sorted(self._reserved - {self._current})):
+            self.activate(page_id)
+            self.settled(CommandSettlement.UNKNOWN)
 
     def activate(self, page_id: int) -> None:
         """Select one returned logical page for settlement and validation."""
-        if self._current is not None or page_id < 0 or page_id >= self._next_page:
+        if self._current is not None or page_id not in self._reserved:
             raise RuntimeError("counted outcome lacks a scheduled page")
         self._current = page_id
+
+    def settled(self, outcome: CommandSettlement) -> None:
+        """Settle an active reservation and forget negative terminal pages."""
+        page_id = self._require_page()
+        super().settled(outcome)
+        if outcome is not CommandSettlement.SUCCESS:
+            self._reserved.discard(page_id)
+
+    def rejected(self, reason: str) -> None:
+        """Reject and forget an active reservation."""
+        page_id = self._require_page()
+        super().rejected(reason)
+        self._reserved.discard(page_id)
+
+    def acknowledged(self) -> None:
+        """Acknowledge and forget an active reservation."""
+        page_id = self._require_page()
+        super().acknowledged()
+        self._reserved.discard(page_id)

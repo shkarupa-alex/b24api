@@ -23,6 +23,7 @@ from b24api import (
     TerminalState,
     TraversalAssurance,
 )
+from b24api.contracts.completion import PageAcknowledged, PageDelivered, PageScheduled
 from b24api.execution import Executor, WireResponse
 
 
@@ -156,6 +157,56 @@ async def test_continue_policy_preserves_natural_exhaustion() -> None:
     assert [row["id"] async for row in stream] == [1, 2, 3, 4, 5]
     assert stream.report is not None
     assert stream.report.exhausted
+
+
+@pytest.mark.asyncio
+async def test_page_stop_callback_runs_between_delivery_and_acknowledgement() -> None:
+    order: list[str] = []
+
+    class OrderedStop:
+        def on_page(self, _boundary: PageBoundary) -> CallerStop:
+            order.append("callback")
+            return CallerStop("committed")
+
+    client = Bitrix24._from_executor(Executor(ListTransport()))  # noqa: SLF001 - deterministic facade seam
+    stream = client.iter_list(Request("offset.list", route=RouteKind.BARE), page_size=2, page_stop=OrderedStop())
+    gate = stream._source.completion_gate  # noqa: SLF001 - observe the actual kernel gate
+    original_emit = gate.emit
+
+    def observe(event: object) -> None:
+        if isinstance(event, PageDelivered):
+            order.append("delivered")
+        elif isinstance(event, PageAcknowledged):
+            order.append("acknowledged")
+        original_emit(event)
+
+    gate.emit = observe
+    assert [row["id"] async for row in stream] == [1, 2]
+    assert order == ["delivered", "callback", "acknowledged"]
+
+
+@pytest.mark.asyncio
+async def test_page_stop_callback_failure_does_not_acknowledge_or_schedule_next_page() -> None:
+    class FailingStop:
+        def on_page(self, _boundary: PageBoundary) -> ContinuePage:
+            raise RuntimeError("commit failed")
+
+    client = Bitrix24._from_executor(Executor(ListTransport()))  # noqa: SLF001 - deterministic facade seam
+    stream = client.iter_list(Request("offset.list", route=RouteKind.BARE), page_size=2, page_stop=FailingStop())
+    gate = stream._source.completion_gate  # noqa: SLF001 - observe the actual kernel gate
+    events: list[type[object]] = []
+    original_emit = gate.emit
+
+    def observe(event: object) -> None:
+        events.append(type(event))
+        original_emit(event)
+
+    gate.emit = observe
+    with pytest.raises(RuntimeError, match="commit failed"):
+        _ = [row async for row in stream]
+    assert events.count(PageScheduled) == 1
+    assert PageDelivered in events
+    assert PageAcknowledged not in events
 
 
 @pytest.mark.asyncio

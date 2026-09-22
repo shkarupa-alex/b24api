@@ -157,7 +157,7 @@ class PositionalArguments:
         return values
 
     def write_control(self, path: tuple[SlotPathPart, ...], value: object) -> PositionalArguments:
-        """Return a new value only when the exact declared control already exists."""
+        """Return a new value when its declared parent path already exists."""
         path = tuple(path)
         if path not in self.layout.control_paths:
             raise ValueError("control path is not declared by this positional layout")
@@ -210,7 +210,7 @@ def _existing_child(parent: JsonValue, part: SlotPathPart) -> JsonValue:
 
 
 def _set_existing_child(parent: JsonValue, part: SlotPathPart, value: JsonValue) -> None:
-    if type(part) is str and isinstance(parent, dict) and part in parent:
+    if type(part) is str and isinstance(parent, dict):
         parent[part] = value
         return
     if type(part) is int and isinstance(parent, list) and 0 <= part < len(parent):

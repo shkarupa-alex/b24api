@@ -68,6 +68,26 @@ def test_positional_control_writer_is_atomic_and_preserves_exact_slots() -> None
     assert "42" not in repr(original)
 
 
+def test_positional_control_writer_can_create_only_the_declared_final_mapping_leaf() -> None:
+    layout = _elapsed_layout()
+    original = PositionalArguments(
+        (Present(42), EmptyObject(), EmptyObject(), EmptyArray(), Present({"NAV_PARAMS": {}})),
+        layout.layout_id,
+        layout=layout,
+    )
+    updated = original.write_control((4, "NAV_PARAMS", "iNumPage"), 2)
+    assert original.to_wire_slots()[-1] == {"NAV_PARAMS": {}}
+    assert updated.to_wire_slots()[-1] == {"NAV_PARAMS": {"iNumPage": 2}}
+
+    missing_parent = PositionalArguments(
+        (Present(42), EmptyObject(), EmptyObject(), EmptyArray(), Present({})),
+        layout.layout_id,
+        layout=layout,
+    )
+    with pytest.raises(ValueError, match="does not exist"):
+        missing_parent.write_control((4, "NAV_PARAMS", "iNumPage"), 2)
+
+
 def test_positional_rejects_wrong_arity_shape_and_internal_omission() -> None:
     layout = _elapsed_layout()
     with pytest.raises(ValueError, match="arity"):

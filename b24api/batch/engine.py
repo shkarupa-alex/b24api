@@ -437,6 +437,7 @@ def _partition_capabilities(
     for command in commands:
         if (
             command.request.route is RouteKind.BARE
+            and not command.request.method.endswith(".json")
             and command.request.encoding.value == "json"
             and command.request.positional is None
             and not command.request.headers.items

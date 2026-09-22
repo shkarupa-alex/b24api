@@ -27,6 +27,13 @@ def test_docs_are_flat_compact_and_linked_from_readme() -> None:
         "docs/migration.md",
         "docs/performance.md",
         "docs/recipes.md",
+        "docs/specifications/b24api-issues-architecture/decision-ledger.md",
+        "docs/specifications/b24api-issues-architecture/examples-contracts.md",
+        "docs/specifications/b24api-issues-architecture/registry-contracts.md",
+        "docs/specifications/b24api-issues-architecture/specification.md",
+        "docs/specifications/b24api-issues-architecture/synthesis.md",
+        "docs/specifications/b24api-issues-architecture/transport-and-errors.md",
+        "docs/specifications/b24api-issues-architecture/traversal-contracts.md",
     ]
     text = README.read_text(encoding="utf-8")
     assert "docs/architecture.md" in text
@@ -43,6 +50,12 @@ def test_user_documentation_contains_no_internal_issue_identifiers() -> None:
     )
 
     assert re.search(r"\b[BC]\d+[a-z]?\b", text) is None
+
+
+def test_migration_covers_changed_completion_stop_keyset_and_replay_contracts() -> None:
+    text = MIGRATION.read_text(encoding="utf-8")
+    for public_contract in ("exhausted", "partial", "page_stop", "BoundedIdentityRange", "ReplayDisposition"):
+        assert public_contract in text
 
 
 def test_architecture_document_names_the_complete_public_capability_family() -> None:

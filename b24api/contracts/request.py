@@ -275,8 +275,8 @@ class Request:
         """Initialize instance state."""
         if not _METHOD_RE.fullmatch(method):
             raise ValueError("method must contain only letters, digits, dots, and underscores")
-        if route is RouteKind.JSON and method.endswith(".json"):
-            raise ValueError("JSON route adds its own .json suffix")
+        if method.endswith(".json"):
+            raise ValueError("request methods are logical names and cannot include a .json route suffix")
         if not isinstance(route, RouteKind):
             raise TypeError("route must be a RouteKind")
         if route is RouteKind.API_V3 and encoding is not BodyEncoding.JSON:

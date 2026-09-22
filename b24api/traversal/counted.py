@@ -150,6 +150,7 @@ class CountedItemStream:
     async def _finalize(self, state: KernelState, reason: str) -> None:
         if self.report.state is not KernelState.NOT_STARTED:
             return
+        self._completion.settle_unobserved()
         snapshot = await self._context.snapshot()
         batch = self._driver.batch_report
         snapshot_state = (
@@ -186,7 +187,13 @@ class CountedItemStream:
             page_trace=page_trace,
             page_trace_truncated=page_trace_truncated,
         )
-        closure = BindingClosure.QUALIFIED_TOTAL if state is KernelState.COMPLETED else BindingClosure.FAILURE
+        closure = (
+            BindingClosure.QUALIFIED_TOTAL
+            if state is KernelState.COMPLETED
+            else BindingClosure.UNKNOWN
+            if self._completion.has_unknown
+            else BindingClosure.FAILURE
+        )
         stream = (
             StreamClosure.NATURAL
             if state is KernelState.COMPLETED

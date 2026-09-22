@@ -43,6 +43,7 @@ from b24api import (
     PageRejectionCode,
     ParameterPath,
     ReferenceItem,
+    ReplayDisposition,
     ReplaySafety,
     Request,
     RequestHeaders,
@@ -850,6 +851,7 @@ async def test_batch_isolates_embedded_shape_failure_and_normalizes_terminal_nex
 
     assert isinstance(outcomes[0], CommandFailure)
     assert isinstance(outcomes[0].error, ProtocolError)
+    assert outcomes[0].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
     assert isinstance(outcomes[1], CommandSuccess)
     assert outcomes[1].response.next is None
 
@@ -872,13 +874,14 @@ async def test_tolerant_batch_rejects_unsupported_representation_per_command() -
                 ),
                 "form",
             ),
-            Command(Request("example.json", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), "json"),
+            Command(Request("example.good", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), "json"),
         ],
     )
     outcomes = [outcome async for outcome in stream]
 
     assert isinstance(outcomes[0], CommandFailure)
     assert isinstance(outcomes[0].error, CapabilityError)
+    assert outcomes[0].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
     assert isinstance(outcomes[1], CommandSuccess)
 
 

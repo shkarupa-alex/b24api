@@ -34,6 +34,7 @@ from b24api.contracts import (
     ReferenceItem,
     ReferenceNotExecuted,
     ReferenceOutcomeUnknown,
+    ReplayDisposition,
     ReplaySafety,
     Request,
     ResultCollectionShape,
@@ -415,6 +416,7 @@ async def test_batch_outcomes_retains_typed_failure_without_halting_later_comman
     outcomes = [outcome async for outcome in stream]
 
     assert isinstance(outcomes[failed_index], CommandFailure)
+    assert outcomes[failed_index].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
     assert all(isinstance(outcome, CommandSuccess) for index, outcome in enumerate(outcomes) if index != failed_index)
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
@@ -428,6 +430,36 @@ async def test_batch_outcomes_retains_typed_failure_without_halting_later_comman
     assert decision.pages_scheduled == SMALL_BATCH_COMMANDS
     assert decision.pages_acknowledged == SMALL_BATCH_COMMANDS - 1
     assert gate.finish() == stream.report
+
+
+@pytest.mark.asyncio
+async def test_logical_batch_preserves_kernel_replay_disposition() -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {},
+                "result_error": {
+                    key: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "retry later"} for key in commands
+                },
+            },
+        }
+
+    outcomes = [
+        outcome
+        async for outcome in _client(FunctionTransport(handler)).batch_outcomes(
+            (
+                Command(Request("safe.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), "safe"),
+                Command(Request("unsafe.add", replay_safety=ReplaySafety.UNSAFE, route=RouteKind.BARE), "unsafe"),
+                Command(Request("unknown.get", route=RouteKind.BARE), "unknown"),
+            ),
+        )
+    ]
+    assert all(isinstance(outcome, CommandFailure) for outcome in outcomes)
+    failures = cast("list[CommandFailure[str]]", outcomes)
+    assert failures[0].replay_disposition is ReplayDisposition.ELIGIBLE
+    assert all(outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE for outcome in failures[1:])
 
 
 @pytest.mark.asyncio
@@ -457,6 +489,7 @@ async def test_fail_fast_batch_raises_bounded_window_after_preceding_successes()
 
     assert isinstance(first, CommandSuccess)
     assert isinstance(captured.value.outcomes[0], CommandFailure)
+    assert captured.value.outcomes[0].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
     assert all(isinstance(outcome, CommandNotExecuted) for outcome in captured.value.outcomes[1:])
     assert len(captured.value.outcomes) == FAIL_FAST_WINDOW
     assert stream.report is captured.value.report

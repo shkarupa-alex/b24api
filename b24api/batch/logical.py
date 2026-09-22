@@ -146,7 +146,15 @@ def _public_outcomes(
                 CommandOutcomeUnknown(outcome.command_index, outcome.correlation, outcome.request.summary, error),
             )
         else:
-            converted.append(CommandFailure(outcome.command_index, outcome.correlation, outcome.request.summary, error))
+            converted.append(
+                CommandFailure(
+                    outcome.command_index,
+                    outcome.correlation,
+                    outcome.request.summary,
+                    error,
+                    outcome.replay_disposition,
+                ),
+            )
     return tuple(converted)
 
 

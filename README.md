@@ -443,10 +443,10 @@ errors go to stderr. Credentials come only from `Settings` and cannot be passed 
 
 <!-- tested-console: tests/cli_test.py::test_call_routes_replay_safety_and_keeps_success_data_on_stdout -->
 ```console
-b24api call profile
-b24api call example.item.get --params '{"id":7}' --raw --replay-safety safe
-b24api list example.item.list --params @params.json
-b24api list example.item.list --strategy counted --contract @counted-contract.json
+b24api call profile --route bare
+b24api call example.item.get --route bare --params '{"id":7}' --raw --replay-safety safe
+b24api list example.item.list --route bare --params @params.json
+b24api list example.item.list --route bare --strategy counted --contract @counted-contract.json
 ```
 
 The `--raw` CLI option selects the response envelope; it does not alter the Python API. Advanced

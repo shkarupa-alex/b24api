@@ -28,6 +28,7 @@ from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
+    CapabilityError,
     FailurePhase,
     ProtocolError,
     TransportError,
@@ -846,6 +847,24 @@ async def test_mixed_chunk_ambiguous_dispatch_is_not_replayed_and_keeps_total_co
     assert all(isinstance(outcome, BatchFailure) for outcome in outcomes)
     failures = [outcome for outcome in outcomes if isinstance(outcome, BatchFailure)]
     assert all(outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE for outcome in failures)
+
+
+@pytest.mark.asyncio
+async def test_batch_defensively_rejects_a_route_suffixed_inner_method_without_io() -> None:
+    request = Request("crm.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    object.__setattr__(request, "method", "crm.item.list.json")
+
+    def unexpected(_request: Request) -> WireResponse:
+        raise AssertionError("route-suffixed inner command reached transport")
+
+    transport = CallbackTransport(unexpected)
+    stream = BatchExecutor(Executor(transport))._outcomes([request])
+    outcomes = cast("list[BatchOutcome]", [outcome async for outcome in stream])
+
+    assert len(transport.requests) == 0
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], BatchFailure)
+    assert isinstance(outcomes[0].error, CapabilityError)
 
 
 @pytest.mark.asyncio
