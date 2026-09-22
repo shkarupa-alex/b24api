@@ -14,6 +14,7 @@ requests.
 | 4 | `search_chat_messages` | supported offline | Two-page chat, empty chat, typed ACCESS_ERROR and three correlated terminals |
 | 5 | `task_role_union` | supported offline | Four role traversals, 932 exact IDs, 900/932 repeat hazard and aligned 950 empty page |
 | 7 | `chat_resume` | supported offline | SQLite page commit, global early close, one-row overlap, eight exact keyed IDs |
+| 8 | `crm_item_delta` | supported offline | Discovered smart-process type, edited old ID and new ID reconciled by time-window replay |
 | 9 | `calendar_delta` | supported offline | Inclusive timezone border, recurring tombstones, atomic keyed deletion and checkpoint |
 | 11 | `sparse_user_search` | supported offline | Mapping values at 0/100 despite selected-empty 50; raw bound 150 |
 | 12 | `page_index_members` | supported offline | Both one-based controls advance 1/2/3 and return 13 exact user IDs |
