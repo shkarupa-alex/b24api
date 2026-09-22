@@ -28,7 +28,6 @@ from b24api.contracts.request import (
     CompositeIdentitySpec,
     IdentityComponent,
     IdentitySpec,
-    ParameterPath,
     Request,
     ResultSelector,
     TraversalIdentity,
@@ -42,23 +41,20 @@ from b24api.errors import (
     PaginationError,
     ResultShapeError,
 )
+from b24api.traversal.control_preflight import preflight_controls
 from b24api.traversal.counted_batch import _CountedBatchMixin
 from b24api.traversal.cursor import _CursorMixin
-from b24api.traversal.cursor_domain import cursor_controls_replace, cursor_probe_updates
 from b24api.traversal.identity import (
     _PLAN_TYPES,
     PageFetch,
-    _child_path,
     _effective_duplicate_policy,
     _effective_order_direction,
     _effective_total_semantics,
     _EffectiveConsistency,
     _identity_store,
     _IdentityStore,
-    _initial_offset,
     _Page,
     _PageRejectionError,
-    _request_with_controls,
     _validate_confirmation_policy,
 )
 from b24api.traversal.keyset import _KeysetMixin
@@ -330,70 +326,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._total_semantics = effective.total_semantics
         self._order_direction = effective.order_direction
         self._confirmation_policy = effective.confirmation_policy
-        self._preflight_controls()
-
-    def _preflight_controls(self) -> None:
-        """Prove every current and future injected control is writable before I/O."""
-        first: dict[ParameterPath, object] = {}
-        second: dict[ParameterPath, object] = {}
-        allow_create = getattr(self.plan, "allow_create_controls", True)
-        if isinstance(self.plan, OffsetSequentialPlan):
-            initial_offset = _initial_offset(
-                self.request, self.plan.offset_path, default=self.plan.initial_control,
-            )
-            first[self.plan.offset_path] = initial_offset
-            second[self.plan.offset_path] = initial_offset + 1
-        elif isinstance(self.plan, CountedOffsetPlan):
-            first[self.plan.offset_path] = 0
-            second[self.plan.offset_path] = 1
-        elif isinstance(self.plan, KeysetPlan):
-            identity = self._require_identity("keyset")
-            if self.plan.split_order is None:
-                if self.plan.order_path is None:
-                    raise RuntimeError("keyset plan lacks ordering controls")
-                order_updates: dict[ParameterPath, object] = {
-                    _child_path(self.plan.order_path, identity.order_key): (
-                        "ASC" if self.plan.direction == "asc" else "DESC"
-                    ),
-                }
-            else:
-                order_updates = {
-                    self.plan.split_order.field_path: self.plan.split_order.field_value or identity.order_key,
-                    self.plan.split_order.direction_path: (
-                        self.plan.split_order.ascending
-                        if self.plan.direction == "asc"
-                        else self.plan.split_order.descending
-                    ),
-                }
-            operator = ">" if self.plan.direction == "asc" else "<"
-            filter_path = _child_path(self.plan.filter_path, f"{operator}{identity.filter_key}")
-            first.update(order_updates)
-            second.update(order_updates)
-            first[filter_path] = 0
-            second[filter_path] = 1
-            if self.plan.start_suppression_path is not None:
-                first[self.plan.start_suppression_path] = -1
-                second[self.plan.start_suppression_path] = -1
-        elif isinstance(self.plan, ItemCursorPlan):
-            first, second = cursor_probe_updates(self.request, self.plan)
-        if (
-            isinstance(self.plan, OffsetSequentialPlan | CountedOffsetPlan | KeysetPlan | ItemCursorPlan)
-            and self.plan.limit_path is not None
-            and self.plan.requested_page_size is not None
-        ):
-            first[self.plan.limit_path] = self.plan.requested_page_size
-            second[self.plan.limit_path] = self.plan.requested_page_size
-        if first:
-            replace = (
-                frozenset({self.plan.offset_path})
-                if isinstance(self.plan, OffsetSequentialPlan)
-                else frozenset({self.plan.cursor_request_path})
-                if isinstance(self.plan, ItemCursorPlan)
-                and cursor_controls_replace(self.plan, self.initial_cursor)
-                else frozenset()
-            )
-            _request_with_controls(self.request, first, allow_create=allow_create, replace=replace)
-            _request_with_controls(self.request, second, allow_create=allow_create, replace=replace)
+        preflight_controls(self)
 
     def _validate_page(
         self,
