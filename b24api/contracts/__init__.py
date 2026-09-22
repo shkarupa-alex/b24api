@@ -121,6 +121,7 @@ from b24api.contracts.response import BinaryEvidence, BinaryResponse, Response, 
 from b24api.contracts.stream import OperationStream, PartialResult
 from b24api.contracts.traversal import (
     CountedTraversal,
+    CursorDomain,
     CursorSpec,
     CursorTraversal,
     KeysetSpec,
@@ -166,6 +167,7 @@ __all__ = [
     "CompositeIdentitySpec",
     "ConsistencyPolicy",
     "CountedTraversal",
+    "CursorDomain",
     "CursorSpec",
     "CursorTraversal",
     "DeliveryOrder",

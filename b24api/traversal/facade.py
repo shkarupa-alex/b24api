@@ -338,6 +338,7 @@ def cursor_stream(  # noqa: PLR0913
         requested_page_size=page_size if cursor.limit_path is not None else None,
         terminal=CursorTerminalRule.EMPTY_CONFIRMATION,
         allow_create_controls=cursor.allow_create_controls,
+        domain=cursor.domain,
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING if direction == "asc" else OrderSemantics.DESCENDING,
         duplicate_policy=DuplicatePolicy.ERROR,

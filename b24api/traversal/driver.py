@@ -44,6 +44,7 @@ from b24api.errors import (
 )
 from b24api.traversal.counted_batch import _CountedBatchMixin
 from b24api.traversal.cursor import _CursorMixin
+from b24api.traversal.cursor_domain import cursor_controls_replace, cursor_probe_updates
 from b24api.traversal.identity import (
     _PLAN_TYPES,
     PageFetch,
@@ -374,8 +375,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                 first[self.plan.start_suppression_path] = -1
                 second[self.plan.start_suppression_path] = -1
         elif isinstance(self.plan, ItemCursorPlan):
-            first[self.plan.cursor_request_path] = 0
-            second[self.plan.cursor_request_path] = 1
+            first, second = cursor_probe_updates(self.request, self.plan)
         if (
             isinstance(self.plan, OffsetSequentialPlan | CountedOffsetPlan | KeysetPlan | ItemCursorPlan)
             and self.plan.limit_path is not None
@@ -389,7 +389,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                 if isinstance(self.plan, OffsetSequentialPlan)
                 else frozenset({self.plan.cursor_request_path})
                 if isinstance(self.plan, ItemCursorPlan)
-                and (self.initial_cursor is not None or not self.plan.allow_create_controls)
+                and cursor_controls_replace(self.plan, self.initial_cursor)
                 else frozenset()
             )
             _request_with_controls(self.request, first, allow_create=allow_create, replace=replace)

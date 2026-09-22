@@ -13,6 +13,7 @@ from b24api.contracts.reference import Binding
 from b24api.contracts.traversal import CursorTraversal, TraversalSpec, traversal_control_paths
 from b24api.errors import CapabilityError, PaginationError
 from b24api.references.outcome import ReferenceRequest
+from b24api.traversal.cursor_domain import validate_cursor_value
 from b24api.traversal.identity import _request_with_controls
 from b24api.traversal.values import _coerce_identity
 
@@ -115,6 +116,7 @@ def _bind_request(base: Request, binding: Binding[object], index: int, traversal
             if not isinstance(traversal, CursorTraversal):
                 raise ValueError("start_cursor is valid only for CursorTraversal")
             initial_cursor = _coerce_identity(_freeze_json(binding.start_cursor), traversal.cursor.coercion)
+            validate_cursor_value(initial_cursor, traversal.cursor.domain)
             request = _request_with_controls(
                 request,
                 {traversal.cursor.parameter_path: initial_cursor},

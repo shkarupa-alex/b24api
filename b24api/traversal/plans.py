@@ -17,7 +17,7 @@ from b24api.contracts.request import (
     ParameterPath,
     ResultSelector,
 )
-from b24api.contracts.traversal import OffsetContinuation, SparseRawBound, SplitOrderSpec
+from b24api.contracts.traversal import CursorDomain, OffsetContinuation, SparseRawBound, SplitOrderSpec
 
 if TYPE_CHECKING:
     from b24api.contracts.bounded_range import BoundedIdentityRange
@@ -235,6 +235,7 @@ class ItemCursorPlan(PlanContract):
     requested_page_size: int | None = None
     terminal: CursorTerminalRule = CursorTerminalRule.EMPTY_CONFIRMATION
     allow_create_controls: bool = True
+    domain: CursorDomain = CursorDomain.OPAQUE
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -245,6 +246,8 @@ class ItemCursorPlan(PlanContract):
         ParameterPath(self.cursor_item_path)
         if not isinstance(self.cursor_coercion, IdentityCoercion):
             raise TypeError("cursor_coercion must be an IdentityCoercion")
+        if not isinstance(self.domain, CursorDomain):
+            raise TypeError("domain must be a CursorDomain")
         if self.direction not in {"asc", "desc"}:
             raise ValueError("cursor direction must be asc or desc")
         if self.cursor_take not in {"first", "last"}:

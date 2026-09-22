@@ -41,6 +41,13 @@ class TotalTermination(StrEnum):
     EXACT_QUALIFIED = "exact_qualified"
 
 
+class CursorDomain(StrEnum):
+    """How a cursor control is interpreted by its qualified endpoint."""
+
+    OPAQUE = "opaque"
+    EXCLUSIVE_POSITIVE_INTEGER = "exclusive_positive_integer"
+
+
 @dataclass(frozen=True, slots=True)
 class PageIndex:
     """One-based or arbitrary page control independent of decoded row count."""
@@ -234,6 +241,7 @@ class CursorSpec:
     take: Literal["first", "last"]
     limit_path: ParameterPath | None = None
     allow_create_controls: bool = True
+    domain: CursorDomain = CursorDomain.OPAQUE
 
     def __post_init__(self) -> None:
         """Validate and freeze cursor mechanics."""
@@ -245,6 +253,12 @@ class CursorSpec:
             raise ValueError("direction must be ascending or descending")
         if self.take not in {"first", "last"}:
             raise ValueError("take must be first or last")
+        if not isinstance(self.domain, CursorDomain):
+            raise TypeError("domain must be a CursorDomain")
+        if self.domain is CursorDomain.EXCLUSIVE_POSITIVE_INTEGER and self.coercion not in {
+            IdentityCoercion.EXACT_INTEGER, IdentityCoercion.DECIMAL_STRING_INTEGER,
+        }:
+            raise ValueError("exclusive positive range requires integer cursor coercion")
 
 
 @dataclass(frozen=True, slots=True)
