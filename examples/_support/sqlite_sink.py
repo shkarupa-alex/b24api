@@ -37,15 +37,18 @@ class SqliteMirror:
     def checkpoint(self, parent: str) -> int | None:
         """Read the last durable exclusive cursor with one-row overlap."""
         row = self._db.execute(
-            "SELECT overlap_cursor FROM checkpoints WHERE parent=?", (parent,),
+            "SELECT overlap_cursor FROM checkpoints WHERE parent=?",
+            (parent,),
         ).fetchone()
         return int(row[0]) if row is not None else None
 
     def ids(self, parent: str) -> tuple[int, ...]:
         """Read the keyed final oracle in descending identity order."""
         return tuple(
-            int(row[0]) for row in self._db.execute(
-                "SELECT id FROM rows WHERE parent=? ORDER BY id DESC", (parent,),
+            int(row[0])
+            for row in self._db.execute(
+                "SELECT id FROM rows WHERE parent=? ORDER BY id DESC",
+                (parent,),
             )
         )
 

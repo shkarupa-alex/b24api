@@ -66,9 +66,14 @@ class ItemStream(AsyncIterator[JsonValue]):
         """Initialize instance state."""
         PaginationDriver.validate_plan(plan)
         self._context = executor.context(policy)
-        self._completion = CompletionRecorder() if isinstance(
-            plan, OffsetSequentialPlan | KeysetPlan | ItemCursorPlan,
-        ) else None
+        self._completion = (
+            CompletionRecorder()
+            if isinstance(
+                plan,
+                OffsetSequentialPlan | KeysetPlan | ItemCursorPlan,
+            )
+            else None
+        )
         self._completion_cleanup_done = False
         self._driver = PaginationDriver(
             executor,
@@ -358,7 +363,13 @@ class ItemStream(AsyncIterator[JsonValue]):
             page_trace_truncated=page_trace_truncated,
         )
         if self._completion is not None:
-            self._completion.terminal_from_plan(self._driver.plan, state, caller_stopped=self._caller_stopped)
+            self._completion.terminal_from_plan(
+                self._driver.plan,
+                state,
+                caller_stopped=self._caller_stopped,
+                terminal_reason=self._driver.terminal_reason,
+                qualified_total=self._driver._expected_total,  # noqa: SLF001 - driver qualified-total witness
+            )
 
 
 def iter_list(  # noqa: PLR0913

@@ -53,54 +53,67 @@ EXPECTED_MODERN = (9, 8)
 EXPECTED_LEGACY = (1, 2)
 LAYOUT = PositionalLayout(
     "task.commentitem.getlist.three.v1",
-    (SlotContract("TASKID", SlotShape.SCALAR, fixed=True),
-     SlotContract("ORDER", SlotShape.OBJECT), SlotContract("FILTER", SlotShape.OBJECT)),
+    (
+        SlotContract("TASKID", SlotShape.SCALAR, fixed=True),
+        SlotContract("ORDER", SlotShape.OBJECT),
+        SlotContract("FILTER", SlotShape.OBJECT),
+    ),
     control_paths=frozenset({(1, "ID"), (2, ">ID")}),
 )
 
 
 def _chat_request(task_id: int) -> Request:
     return Request(
-        CHAT_METHOD, {"ENTITY_TYPE": "TASKS_TASK", "ENTITY_ID": str(task_id)},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        CHAT_METHOD,
+        {"ENTITY_TYPE": "TASKS_TASK", "ENTITY_ID": str(task_id)},
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
 def _message_request(chat_id: int, cursor: int) -> Request:
     return Request(
-        MESSAGE_METHOD, {"DIALOG_ID": f"chat{chat_id}", "LAST_ID": cursor, "LIMIT": 2},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        MESSAGE_METHOD,
+        {"DIALOG_ID": f"chat{chat_id}", "LAST_ID": cursor, "LIMIT": 2},
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
 def _legacy_request(cursor: int) -> Request:
     arguments = PositionalArguments(
         (Present(43), Present({"ID": "ASC"}), Present({">ID": cursor})),
-        LAYOUT.layout_id, layout=LAYOUT,
+        LAYOUT.layout_id,
+        layout=LAYOUT,
     )
     return Request(LEGACY_METHOD, arguments, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
 
 
 def _fixture() -> ScriptedTransport:
-    return ScriptedTransport((
-        ScriptedExchange.batch(
-            tuple(_chat_request(task_id) for task_id in TASKS),
-            ({"ID": 900}, None, {"ID": 901}, {"ID": 902}), total=0,
-        ),
-        ScriptedExchange.json(
-            _message_request(900, HEAD),
-            {"result": {"messages": [{"id": value} for value in EXPECTED_MODERN]}},
-        ),
-        ScriptedExchange.json(_message_request(900, 8), {"result": {"messages": []}}),
-        ScriptedExchange.json(_message_request(901, HEAD), {"result": {"messages": []}}),
-        ScriptedExchange.json(
-            _message_request(902, HEAD), {"error": "ACCESS_ERROR", "error_description": "denied"},
-        ),
-        ScriptedExchange.json(
-            _legacy_request(0), {"result": [{"ID": str(value)} for value in EXPECTED_LEGACY]},
-        ),
-        ScriptedExchange.json(_legacy_request(2), {"result": []}),
-    ))
+    return ScriptedTransport(
+        (
+            ScriptedExchange.batch(
+                tuple(_chat_request(task_id) for task_id in TASKS),
+                ({"ID": 900}, None, {"ID": 901}, {"ID": 902}),
+                total=0,
+            ),
+            ScriptedExchange.json(
+                _message_request(900, HEAD),
+                {"result": {"messages": [{"id": value} for value in EXPECTED_MODERN]}},
+            ),
+            ScriptedExchange.json(_message_request(900, 8), {"result": {"messages": []}}),
+            ScriptedExchange.json(_message_request(901, HEAD), {"result": {"messages": []}}),
+            ScriptedExchange.json(
+                _message_request(902, HEAD),
+                {"error": "ACCESS_ERROR", "error_description": "denied"},
+            ),
+            ScriptedExchange.json(
+                _legacy_request(0),
+                {"result": [{"ID": str(value)} for value in EXPECTED_LEGACY]},
+            ),
+            ScriptedExchange.json(_legacy_request(2), {"result": []}),
+        )
+    )
 
 
 def _id(row: object, key: str) -> int:
@@ -131,19 +144,27 @@ async def _read_modern(client: Bitrix24, resolved: dict[int, int | None]) -> Non
     bindings = tuple(
         Binding(
             f"task:{task_id}",
-            (ParameterUpdate(ParameterPath(("DIALOG_ID",)), f"chat{chat_id}"),), task_id,
+            (ParameterUpdate(ParameterPath(("DIALOG_ID",)), f"chat{chat_id}"),),
+            task_id,
         )
-        for task_id, chat_id in resolved.items() if chat_id is not None
+        for task_id, chat_id in resolved.items()
+        if chat_id is not None
     )
     stream = client.iter_reference_outcomes(
-        _message_request(900, HEAD), bindings,
+        _message_request(900, HEAD),
+        bindings,
         traversal=CursorTraversal(
             selector=ResultSelector(("messages",)),
             cursor=CursorSpec(
-                ParameterPath(("LAST_ID",)), ("id",), IdentityCoercion.EXACT_INTEGER,
-                "descending", "last", domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
+                ParameterPath(("LAST_ID",)),
+                ("id",),
+                IdentityCoercion.EXACT_INTEGER,
+                "descending",
+                "last",
+                domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
                 limit_path=ParameterPath(("LIMIT",)),
-            ), page_size=2,
+            ),
+            page_size=2,
         ),
         dispatch=DirectDispatch(concurrency=1),
     )
@@ -172,7 +193,8 @@ async def _read_legacy(client: Bitrix24) -> None:
         identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
         page_size=2,
         keyset=KeysetSpec(
-            filter_path=ParameterPath((2,)), order_path=ParameterPath((1,)),
+            filter_path=ParameterPath((2,)),
+            order_path=ParameterPath((1,)),
             start_suppression_path=None,
         ),
         execution=SequentialKeysetExecution(),
@@ -193,7 +215,8 @@ async def run() -> None:
     transport.assert_exhausted()
     legacy_slots = tuple(
         request.positional.to_wire_slots()
-        for request in transport.calls if request.method == LEGACY_METHOD and request.positional is not None
+        for request in transport.calls
+        if request.method == LEGACY_METHOD and request.positional is not None
     )
     if legacy_slots != ([43, {"ID": "ASC"}, {">ID": 0}], [43, {"ID": "ASC"}, {">ID": 2}]):
         raise AssertionError("scenario 6 legacy TASKID/ORDER/FILTER wire order changed")

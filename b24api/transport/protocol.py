@@ -34,10 +34,12 @@ HTTP_ERROR_MINIMUM = 400
 _MAX_VALIDATION_ITEMS = 32
 _MAX_VALIDATION_TEXT = 256
 _MAX_V3_SAFE_BYTES = 8 * 1024
-_NON_RETRYABLE_V3_CODES = frozenset({
-    "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION",
-    "BITRIX_REST_V3_EXCEPTION_METHODNOTFOUNDEXCEPTION",
-})
+_NON_RETRYABLE_V3_CODES = frozenset(
+    {
+        "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION",
+        "BITRIX_REST_V3_EXCEPTION_METHODNOTFOUNDEXCEPTION",
+    }
+)
 
 
 class ProtocolCodec:
@@ -217,10 +219,12 @@ class ProtocolCodec:
             if not isinstance(field, str) or not isinstance(detail, str):
                 raise TypeError("V3 validation field and message must be strings")
             truncated |= len(field) > _MAX_VALIDATION_TEXT or len(detail) > _MAX_VALIDATION_TEXT
-            bounded.append(ValidationIssue(
-                self._redactor.redact_text(field[:_MAX_VALIDATION_TEXT]),
-                self._redactor.redact_text(detail[:_MAX_VALIDATION_TEXT]),
-            ))
+            bounded.append(
+                ValidationIssue(
+                    self._redactor.redact_text(field[:_MAX_VALIDATION_TEXT]),
+                    self._redactor.redact_text(detail[:_MAX_VALIDATION_TEXT]),
+                )
+            )
         return code[:_MAX_VALIDATION_TEXT], message[:_MAX_VALIDATION_TEXT], tuple(bounded), truncated
 
     @staticmethod

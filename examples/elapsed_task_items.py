@@ -53,22 +53,29 @@ LAYOUT = PositionalLayout(
 def _request(page: int) -> Request:
     arguments = PositionalArguments(
         (
-            Present(TASK_ID), EmptyObject(), EmptyObject(), EmptyArray(),
+            Present(TASK_ID),
+            EmptyObject(),
+            EmptyObject(),
+            EmptyArray(),
             Present({"NAV_PARAMS": {"nPageSize": PAGE_SIZE, "iNumPage": page}}),
         ),
-        LAYOUT.layout_id, layout=LAYOUT,
+        LAYOUT.layout_id,
+        layout=LAYOUT,
     )
     return Request(METHOD, arguments, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
 
 
 def _fixture() -> ScriptedTransport:
     pages = ((1, EXPECTED_IDS[:50]), (2, EXPECTED_IDS[50:]), (3, ()))
-    return ScriptedTransport(tuple(
-        ScriptedExchange.json(
-            _request(page), {"result": [{"id": identity, "taskId": TASK_ID} for identity in ids], "total": 53},
+    return ScriptedTransport(
+        tuple(
+            ScriptedExchange.json(
+                _request(page),
+                {"result": [{"id": identity, "taskId": TASK_ID} for identity in ids], "total": 53},
+            )
+            for page, ids in pages
         )
-        for page, ids in pages
-    ))
+    )
 
 
 async def run() -> None:

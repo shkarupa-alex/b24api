@@ -10,6 +10,9 @@ def test_search_chat_messages_recipe_retains_access_failure() -> None:
     root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
         [sys.executable, "-m", "examples.search_chat_messages"],
-        cwd=root, check=False, capture_output=True, text=True,
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr

@@ -212,7 +212,7 @@ class LogicalBatchKernelStream[C]:
         if isinstance(outcome, CommandSuccess):
             binding.delivered()
             binding.acknowledged()
-            closure = BindingClosure.SOURCE_EMPTY
+            closure = BindingClosure.SINGLE_RESPONSE
         elif isinstance(outcome, CommandOutcomeUnknown):
             closure = BindingClosure.UNKNOWN
         else:
@@ -397,8 +397,10 @@ class LogicalBatchKernelStream[C]:
             terminal_reason=reason,
         )
         self._completion.stream_terminal(
-            StreamClosure.NATURAL if state is KernelState.COMPLETED
-            else StreamClosure.CANCELLED if state is KernelState.CANCELLED
+            StreamClosure.NATURAL
+            if state is KernelState.COMPLETED
+            else StreamClosure.CANCELLED
+            if state is KernelState.CANCELLED
             else StreamClosure.EARLY_CLOSE,
         )
 

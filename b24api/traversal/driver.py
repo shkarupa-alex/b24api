@@ -462,7 +462,10 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         return identities
 
     def _record_committed_page(
-        self, items: tuple[FrozenJson, ...], response: Response, identities: Sequence[IdentityValue] = (),
+        self,
+        items: tuple[FrozenJson, ...],
+        response: Response,
+        identities: Sequence[IdentityValue] = (),
     ) -> None:
         self._append_page_record(
             PageRecord(

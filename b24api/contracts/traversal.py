@@ -256,7 +256,8 @@ class CursorSpec:
         if not isinstance(self.domain, CursorDomain):
             raise TypeError("domain must be a CursorDomain")
         if self.domain is CursorDomain.EXCLUSIVE_POSITIVE_INTEGER and self.coercion not in {
-            IdentityCoercion.EXACT_INTEGER, IdentityCoercion.DECIMAL_STRING_INTEGER,
+            IdentityCoercion.EXACT_INTEGER,
+            IdentityCoercion.DECIMAL_STRING_INTEGER,
         }:
             raise ValueError("exclusive positive range requires integer cursor coercion")
 

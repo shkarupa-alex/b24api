@@ -34,8 +34,10 @@ LIMITS = (1, 3, 50)
 
 def _request(control: str, cursor: int, limit: int) -> Request:
     return Request(
-        METHOD, {"DIALOG_ID": "chat-1", control: cursor, "LIMIT": limit},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        METHOD,
+        {"DIALOG_ID": "chat-1", control: cursor, "LIMIT": limit},
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
@@ -45,10 +47,12 @@ def _descending_fixture(limit: int) -> ScriptedTransport:
     exchanges: list[ScriptedExchange] = []
     while True:
         page = tuple(value for value in remaining if value < cursor)[:limit]
-        exchanges.append(ScriptedExchange.json(
-            _request("LAST_ID", cursor, limit),
-            {"result": {"messages": [{"id": value} for value in page]}},
-        ))
+        exchanges.append(
+            ScriptedExchange.json(
+                _request("LAST_ID", cursor, limit),
+                {"result": {"messages": [{"id": value} for value in page]}},
+            )
+        )
         if not page:
             return ScriptedTransport(tuple(exchanges))
         cursor = page[-1]
@@ -57,13 +61,15 @@ def _descending_fixture(limit: int) -> ScriptedTransport:
 async def run() -> None:
     """Compare a false clean ASC end with three complete DESC traversals."""
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
-    asc = ScriptedTransport((
-        ScriptedExchange.json(
-            _request("FIRST_ID", 0, 3),
-            {"result": {"messages": [{"id": value} for value in ASC_IDS]}},
-        ),
-        ScriptedExchange.json(_request("FIRST_ID", 30211, 3), {"result": {"messages": []}}),
-    ))
+    asc = ScriptedTransport(
+        (
+            ScriptedExchange.json(
+                _request("FIRST_ID", 0, 3),
+                {"result": {"messages": [{"id": value} for value in ASC_IDS]}},
+            ),
+            ScriptedExchange.json(_request("FIRST_ID", 30211, 3), {"result": {"messages": []}}),
+        )
+    )
     async with Bitrix24(settings, transport=asc) as client:
         first = await client.call(_request("FIRST_ID", 0, 3))
         second = await client.call(_request("FIRST_ID", 30211, 3))
@@ -78,8 +84,12 @@ async def run() -> None:
                 _request("LAST_ID", HEAD, limit),
                 selector=ResultSelector(("messages",)),
                 cursor=CursorSpec(
-                    ParameterPath(("LAST_ID",)), ("id",), IdentityCoercion.EXACT_INTEGER,
-                    "descending", "last", domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
+                    ParameterPath(("LAST_ID",)),
+                    ("id",),
+                    IdentityCoercion.EXACT_INTEGER,
+                    "descending",
+                    "last",
+                    domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
                     limit_path=ParameterPath(("LIMIT",)),
                 ),
                 page_size=limit,

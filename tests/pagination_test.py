@@ -717,7 +717,10 @@ async def test_boundary_keyset_strategy_refuses_before_io() -> None:
     )
 
     stream = iter_list(
-        Executor(transport), Request("crm.item.list", route=RouteKind.BARE), plan=boundary, identity=_identity(),
+        Executor(transport),
+        Request("crm.item.list", route=RouteKind.BARE),
+        plan=boundary,
+        identity=_identity(),
     )
     with pytest.raises(CapabilityError):
         await _collect(stream)

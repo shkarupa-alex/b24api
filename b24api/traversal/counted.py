@@ -188,11 +188,17 @@ class CountedItemStream:
         )
         closure = BindingClosure.QUALIFIED_TOTAL if state is KernelState.COMPLETED else BindingClosure.FAILURE
         stream = (
-            StreamClosure.NATURAL if state is KernelState.COMPLETED
-            else StreamClosure.CANCELLED if state is KernelState.CANCELLED
+            StreamClosure.NATURAL
+            if state is KernelState.COMPLETED
+            else StreamClosure.CANCELLED
+            if state is KernelState.CANCELLED
             else StreamClosure.EARLY_CLOSE
         )
-        self._completion.terminal(closure, stream)
+        self._completion.terminal(
+            closure,
+            stream,
+            qualified_total=self._driver._expected_total if closure is BindingClosure.QUALIFIED_TOTAL else None,  # noqa: SLF001
+        )
 
 
 __all__ = ["CountedItemStream"]

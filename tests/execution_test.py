@@ -292,7 +292,8 @@ async def test_ambiguous_dispatch_never_retries_unproven_request(safety: ReplayS
 
     with pytest.raises(AmbiguousExecutionError) as captured:
         await Executor(transport).execute(
-            Request("crm.deal.add", replay_safety=safety, route=RouteKind.BARE), policy=_policy(),
+            Request("crm.deal.add", replay_safety=safety, route=RouteKind.BARE),
+            policy=_policy(),
         )
 
     assert transport.calls == 1
@@ -438,7 +439,8 @@ async def test_cancellation_after_grant_returns_capacity() -> None:
 
     assert (await coordinator.snapshot()).active_permits == 0
     replacement = await asyncio.wait_for(
-        coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"})), timeout=1,
+        coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"})),
+        timeout=1,
     )
     await replacement.release()
     await coordinator.close()
@@ -478,7 +480,8 @@ async def test_method_limit_blocks_only_affected_method_and_whole_batch() -> Non
     )
     await asyncio.sleep(0)
     unrelated = await asyncio.wait_for(
-        coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"})), timeout=1,
+        coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"})),
+        timeout=1,
     )
     assert not blocked.done()
     assert not batch.done()
@@ -573,7 +576,9 @@ async def test_socket_connect_and_post_dispatch_failures_have_distinct_phases() 
     try:
         with pytest.raises(TransportError) as not_dispatched:
             await dead_transport.send(
-                Request("profile", route=RouteKind.BARE), attempt_timeout=0.2, max_response_bytes=1024,
+                Request("profile", route=RouteKind.BARE),
+                attempt_timeout=0.2,
+                max_response_bytes=1024,
             )
         assert not_dispatched.value.phase is FailurePhase.NOT_DISPATCHED
     finally:

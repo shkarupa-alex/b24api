@@ -53,7 +53,7 @@ docstring-code-format = true
 
 [tool.ruff.lint]
 select = ["ALL"]
-ignore = ["EM", "TRY003"]
+ignore = ["COM812", "EM", "TRY003"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

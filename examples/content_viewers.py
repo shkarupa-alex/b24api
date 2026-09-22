@@ -31,21 +31,28 @@ PAGE_SIZE = 10
 
 def _request(content_id: str, page: int) -> Request:
     return Request(
-        METHOD, {"params": {"contentId": content_id, "page": page}},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        METHOD,
+        {"params": {"contentId": content_id, "page": page}},
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
 def _fixture() -> ScriptedTransport:
     pages = ((1, EXPECTED_EXTRANET_IDS[:10]), (2, EXPECTED_EXTRANET_IDS[10:]), (3, ()))
-    return ScriptedTransport((
-        *(ScriptedExchange.json(
-            _request("TASK-42", page),
-            {"result": {"items": [{"ID": str(value)} for value in ids], "itemsCount": len(ids)}},
-        ) for page, ids in pages),
-        ScriptedExchange.json(_request("TASK-7", 1), {"result": {"42": {"ID": "42"}}}),
-        ScriptedExchange.json(_request("TASK-999", 1), {"result": {"items": [], "itemsCount": 0}}),
-    ))
+    return ScriptedTransport(
+        (
+            *(
+                ScriptedExchange.json(
+                    _request("TASK-42", page),
+                    {"result": {"items": [{"ID": str(value)} for value in ids], "itemsCount": len(ids)}},
+                )
+                for page, ids in pages
+            ),
+            ScriptedExchange.json(_request("TASK-7", 1), {"result": {"42": {"ID": "42"}}}),
+            ScriptedExchange.json(_request("TASK-999", 1), {"result": {"items": [], "itemsCount": 0}}),
+        )
+    )
 
 
 async def run() -> None:
@@ -74,8 +81,11 @@ async def run() -> None:
     transport.assert_exhausted()
     if any(not isinstance(request.copy_parameters().get("params"), dict) for request in transport.calls):
         raise AssertionError("scenario 18 lost the required direct JSON params object")
-    pages = tuple(request.copy_parameters()["params"]["page"] for request in transport.calls
-                  if request.copy_parameters()["params"]["contentId"] == "TASK-42")
+    pages = tuple(
+        request.copy_parameters()["params"]["page"]
+        for request in transport.calls
+        if request.copy_parameters()["params"]["contentId"] == "TASK-42"
+    )
     if pages != (1, 2, 3):
         raise AssertionError("scenario 18 nested page index did not advance")
 

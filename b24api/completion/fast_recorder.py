@@ -50,9 +50,13 @@ class FastCompletionRecorder:
         self._emit(BindingAdmitted, binding_id=0)
 
     def _emit(self, event_type: type, **fields: object) -> None:
-        self.gate.emit(event_type(
-            operation_id=self.gate.operation_id, sequence=self._sequence, **fields,
-        ))
+        self.gate.emit(
+            event_type(
+                operation_id=self.gate.operation_id,
+                sequence=self._sequence,
+                **fields,
+            )
+        )
         self._sequence += 1
 
     def schedule(self, command_id: str) -> None:
@@ -110,8 +114,11 @@ class FastCompletionRecorder:
         if digest is None:
             raise RuntimeError("fast admitted page lacks an identity digest")
         self._emit(
-            PageValidated, binding_id=0, page_id=page.page_id,
-            identity_digest=digest, row_count=count,
+            PageValidated,
+            binding_id=0,
+            page_id=page.page_id,
+            identity_digest=digest,
+            row_count=count,
         )
         if count == 0:
             self._acknowledge(command_id)
@@ -152,12 +159,15 @@ class FastCompletionRecorder:
         closure = (
             BindingClosure.SOURCE_EMPTY
             if state is KernelState.COMPLETED and rows_emitted == rows_admitted
-            else BindingClosure.CALLER_STOP if state is KernelState.CANCELLED and not self._negative
+            else BindingClosure.CALLER_STOP
+            if state is KernelState.CANCELLED and not self._negative
             else BindingClosure.FAILURE
         )
         stream = (
-            StreamClosure.NATURAL if state is KernelState.COMPLETED
-            else StreamClosure.CANCELLED if state is KernelState.CANCELLED
+            StreamClosure.NATURAL
+            if state is KernelState.COMPLETED
+            else StreamClosure.CANCELLED
+            if state is KernelState.CANCELLED
             else StreamClosure.EARLY_CLOSE
         )
         self._emit(BindingTerminal, binding_id=0, closure=closure)

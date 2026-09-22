@@ -20,24 +20,30 @@ EXPECTED_RESULT_IDS = (71,)
 
 def _request(task_id: int) -> Request:
     return Request(
-        METHOD, {"filter": {"taskId": task_id}},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.API_V3,
+        METHOD,
+        {"filter": {"taskId": task_id}},
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.API_V3,
     )
 
 
 def _fixture() -> ScriptedTransport:
-    error = {"error": {
-        "code": ERROR_CODE,
-        "message": "Invalid task",
-        "validation": [{"field": "filter.taskId", "message": "Task is required"}],
-    }}
-    return ScriptedTransport((
-        ScriptedExchange.json(_request(11), {"result": {"items": [{"id": 71}]}}),
-        ScriptedExchange(
-            _request(-1),
-            WireResponse(400, (("content-type", "application/json"),), json.dumps(error).encode()),
-        ),
-    ))
+    error = {
+        "error": {
+            "code": ERROR_CODE,
+            "message": "Invalid task",
+            "validation": [{"field": "filter.taskId", "message": "Task is required"}],
+        }
+    }
+    return ScriptedTransport(
+        (
+            ScriptedExchange.json(_request(11), {"result": {"items": [{"id": 71}]}}),
+            ScriptedExchange(
+                _request(-1),
+                WireResponse(400, (("content-type", "application/json"),), json.dumps(error).encode()),
+            ),
+        )
+    )
 
 
 async def run() -> None:

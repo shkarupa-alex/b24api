@@ -17,8 +17,7 @@ class CalendarSink:
         with self._db:
             self._db.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
             self._db.execute(
-                "CREATE TABLE IF NOT EXISTS cursor "
-                "(slot INTEGER PRIMARY KEY CHECK(slot=1), stamp TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS cursor (slot INTEGER PRIMARY KEY CHECK(slot=1), stamp TEXT NOT NULL)",
             )
 
     def apply_delta(self, response: object) -> None:
@@ -42,14 +41,15 @@ class CalendarSink:
                     self._db.execute("DELETE FROM events WHERE id=?", (event_id,))
                 else:
                     self._db.execute(
-                        "INSERT INTO events(id, name) VALUES (?, ?) "
-                        "ON CONFLICT(id) DO UPDATE SET name=excluded.name", (event_id, name),
+                        "INSERT INTO events(id, name) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+                        (event_id, name),
                     )
             if prepared:
                 latest = max(prepared, key=lambda item: datetime.fromisoformat(item[3]))[3]
                 self._db.execute(
                     "INSERT INTO cursor(slot, stamp) VALUES (1, ?) "
-                    "ON CONFLICT(slot) DO UPDATE SET stamp=excluded.stamp", (latest,),
+                    "ON CONFLICT(slot) DO UPDATE SET stamp=excluded.stamp",
+                    (latest,),
                 )
 
     def checkpoint(self) -> str | None:

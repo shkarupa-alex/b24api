@@ -156,9 +156,13 @@ def _request_with_controls(
         except (KeyError, TypeError, ValueError) as error:
             raise CapabilityError("positional request conflicts with declared traversal controls") from error
         return Request(
-            request.method, parameters=positional, replay_safety=request.replay_safety,
-            encoding=request.encoding, headers=request.headers,
-            result_error=request.result_error, route=request.route,
+            request.method,
+            parameters=positional,
+            replay_safety=request.replay_safety,
+            encoding=request.encoding,
+            headers=request.headers,
+            result_error=request.result_error,
+            route=request.route,
         )
     try:
         parameters = request.copy_parameters()
@@ -228,8 +232,10 @@ def _initial_offset(request: Request, path: ParameterPath, *, default: int = 0) 
         if isinstance(part, str):
             if not isinstance(current, dict):
                 return default
-            matches = [part] if positional and part in current else (
-                [] if positional else [key for key in current if key.casefold() == part.casefold()]
+            matches = (
+                [part]
+                if positional and part in current
+                else ([] if positional else [key for key in current if key.casefold() == part.casefold()])
             )
             if len(matches) > 1:
                 raise CapabilityError("request contains an ambiguous initial offset path")

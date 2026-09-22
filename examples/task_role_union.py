@@ -57,9 +57,12 @@ def _request(role: str, offset: int) -> Request:
         METHOD,
         {
             "filter": {role: 7, ">=CHANGED_DATE": CHANGED_SINCE},
-            "order": {"ID": "ASC"}, "select": ["ID", "CHANGED_DATE"], "start": offset,
+            "order": {"ID": "ASC"},
+            "select": ["ID", "CHANGED_DATE"],
+            "start": offset,
         },
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
@@ -67,16 +70,20 @@ def _fixture() -> ScriptedTransport:
     exchanges: list[ScriptedExchange] = []
     for role, ids in ROLE_IDS.items():
         for offset in range(0, len(ids) + PAGE_SIZE, PAGE_SIZE):
-            page = ids[offset:offset + PAGE_SIZE]
-            exchanges.append(ScriptedExchange.json(
-                _request(role, offset),
-                {"result": {"tasks": [{"id": str(task_id)} for task_id in page]}},
-            ))
+            page = ids[offset : offset + PAGE_SIZE]
+            exchanges.append(
+                ScriptedExchange.json(
+                    _request(role, offset),
+                    {"result": {"tasks": [{"id": str(task_id)} for task_id in page]}},
+                )
+            )
     # A separate negative control proves the endpoint's rounded offset hazard.
-    exchanges.append(ScriptedExchange.json(
-        _request("RESPONSIBLE_ID", 932),
-        {"result": {"tasks": [{"id": str(task_id)} for task_id in ROLE_IDS["RESPONSIBLE_ID"][900:]]}},
-    ))
+    exchanges.append(
+        ScriptedExchange.json(
+            _request("RESPONSIBLE_ID", 932),
+            {"result": {"tasks": [{"id": str(task_id)} for task_id in ROLE_IDS["RESPONSIBLE_ID"][900:]]}},
+        )
+    )
     return ScriptedTransport(tuple(exchanges))
 
 

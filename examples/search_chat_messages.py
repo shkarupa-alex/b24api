@@ -50,9 +50,16 @@ def _message_id(row: object) -> int:
 def _request(chat_id: int, cursor: int) -> Request:
     return Request(
         METHOD,
-        {"CHAT_ID": chat_id, "DATE_FROM": START, "DATE_TO": END,
-         "ORDER": {"ID": "DESC"}, "LAST_ID": cursor, "LIMIT": 2},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        {
+            "CHAT_ID": chat_id,
+            "DATE_FROM": START,
+            "DATE_TO": END,
+            "ORDER": {"ID": "DESC"},
+            "LAST_ID": cursor,
+            "LIMIT": 2,
+        },
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
@@ -65,9 +72,12 @@ def _fixture() -> ScriptedTransport:
         )
         for chat_id, cursor, ids in pages
     ]
-    exchanges.append(ScriptedExchange.json(
-        _request(103, HEAD), {"error": "ACCESS_ERROR", "error_description": "chat denied"},
-    ))
+    exchanges.append(
+        ScriptedExchange.json(
+            _request(103, HEAD),
+            {"error": "ACCESS_ERROR", "error_description": "chat denied"},
+        )
+    )
     return ScriptedTransport(tuple(exchanges))
 
 
@@ -78,13 +88,19 @@ async def run() -> None:
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_reference_outcomes(
             _request(101, HEAD),
-            tuple(Binding(str(chat_id), (ParameterUpdate(ParameterPath(("CHAT_ID",)), chat_id),), chat_id)
-                  for chat_id in (101, 102, 103)),
+            tuple(
+                Binding(str(chat_id), (ParameterUpdate(ParameterPath(("CHAT_ID",)), chat_id),), chat_id)
+                for chat_id in (101, 102, 103)
+            ),
             traversal=CursorTraversal(
                 selector=ResultSelector(("messages",)),
                 cursor=CursorSpec(
-                    ParameterPath(("LAST_ID",)), ("id",), IdentityCoercion.EXACT_INTEGER,
-                    "descending", "last", domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
+                    ParameterPath(("LAST_ID",)),
+                    ("id",),
+                    IdentityCoercion.EXACT_INTEGER,
+                    "descending",
+                    "last",
+                    domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
                     limit_path=ParameterPath(("LIMIT",)),
                 ),
                 page_size=2,

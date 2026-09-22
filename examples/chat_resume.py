@@ -46,24 +46,31 @@ FIRST_OVERLAP = 5
 
 def _request(parent: str, cursor: int) -> Request:
     return Request(
-        METHOD, {"DIALOG_ID": parent, "LAST_ID": cursor, "LIMIT": 2},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        METHOD,
+        {"DIALOG_ID": parent, "LAST_ID": cursor, "LIMIT": 2},
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
 def _transport(pages: tuple[tuple[str, int, tuple[int, ...]], ...]) -> ScriptedTransport:
-    return ScriptedTransport(tuple(
-        ScriptedExchange.json(
-            _request(parent, cursor), {"result": {"messages": [{"id": value} for value in ids]}},
+    return ScriptedTransport(
+        tuple(
+            ScriptedExchange.json(
+                _request(parent, cursor),
+                {"result": {"messages": [{"id": value} for value in ids]}},
+            )
+            for parent, cursor, ids in pages
         )
-        for parent, cursor, ids in pages
-    ))
+    )
 
 
 def _bindings(sink: SqliteMirror) -> tuple[Binding[str], ...]:
     return tuple(
         Binding(
-            parent, (ParameterUpdate(ParameterPath(("DIALOG_ID",)), parent),), parent,
+            parent,
+            (ParameterUpdate(ParameterPath(("DIALOG_ID",)), parent),),
+            parent,
             start_cursor=sink.checkpoint(parent) or HEAD,
         )
         for parent in EXPECTED
@@ -77,9 +84,7 @@ class _Commit:
         self.sink = sink
         self.pause_a = pause_a
         self.expected_overlap = {
-            parent: checkpoint - 1
-            for parent in EXPECTED
-            if (checkpoint := sink.checkpoint(parent)) is not None
+            parent: checkpoint - 1 for parent in EXPECTED if (checkpoint := sink.checkpoint(parent)) is not None
         }
         self.checked_overlap: set[str] = set()
 
@@ -101,11 +106,16 @@ async def _run_once(sink: SqliteMirror, transport: ScriptedTransport, *, pause_a
     commit = _Commit(sink, pause_a=pause_a)
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_cursors(
-            _request("", HEAD), _bindings(sink),
+            _request("", HEAD),
+            _bindings(sink),
             selector=ResultSelector(("messages",)),
             cursor=CursorSpec(
-                ParameterPath(("LAST_ID",)), ("id",), IdentityCoercion.EXACT_INTEGER,
-                "descending", "last", domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
+                ParameterPath(("LAST_ID",)),
+                ("id",),
+                IdentityCoercion.EXACT_INTEGER,
+                "descending",
+                "last",
+                domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
                 limit_path=ParameterPath(("LIMIT",)),
             ),
             page_size=2,
@@ -138,10 +148,16 @@ async def run() -> None:
                 or sink.checkpoint("A") != FIRST_OVERLAP
             ):
                 raise AssertionError("scenario 7 did not preserve the committed early-close checkpoint")
-            second = _transport((
-                ("A", 5, (4, 3)), ("A", 3, (2, 1)), ("A", 1, ()),
-                ("B", 100, (15, 14)), ("B", 14, (13,)), ("B", 13, ()),
-            ))
+            second = _transport(
+                (
+                    ("A", 5, (4, 3)),
+                    ("A", 3, (2, 1)),
+                    ("A", 1, ()),
+                    ("B", 100, (15, 14)),
+                    ("B", 14, (13,)),
+                    ("B", 13, ()),
+                )
+            )
             second_report = await _run_once(sink, second, pause_a=False)
             if second_report.state is not TerminalState.COMPLETED or not second_report.exhausted:
                 raise AssertionError("scenario 7 resume did not complete")

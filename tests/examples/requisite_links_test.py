@@ -10,6 +10,9 @@ def test_requisite_links_recipe_checks_complete_windows() -> None:
     root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
         [sys.executable, "-m", "examples.requisite_links"],
-        cwd=root, check=False, capture_output=True, text=True,
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr

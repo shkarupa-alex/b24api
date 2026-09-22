@@ -72,6 +72,10 @@ class BoundedIdentityRange:
     ) -> Self:
         """Bind a qualified boundary to the exact caller base filter."""
         return cls(
-            filter_fingerprint(request, filter_path), upper_id, lower_exclusive,
-            "ascending", fence_path, source_version,
+            filter_fingerprint(request, filter_path),
+            upper_id,
+            lower_exclusive,
+            "ascending",
+            fence_path,
+            source_version,
         )

@@ -148,7 +148,9 @@ def validate_keyset_continuation(
 
 
 def keyset_page_terminal(
-    plan: KeysetPlan, page_size: int, identities: Sequence[IdentityValue] = (),
+    plan: KeysetPlan,
+    page_size: int,
+    identities: Sequence[IdentityValue] = (),
 ) -> str | None:
     """Return the declared completion reason for one validated keyset page."""
     if plan.boundary is not None:

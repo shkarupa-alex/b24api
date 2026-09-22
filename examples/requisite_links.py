@@ -42,17 +42,21 @@ OFFSETS = tuple(range(0, TOTAL, PAGE_SIZE))
 def _request(offset: int | None) -> Request:
     return Request(
         METHOD,
-        {"select": ["ENTITY_TYPE_ID", "ENTITY_ID"],
-         "filter": {"ENTITY_TYPE_ID": 2}, "order": {"ENTITY_ID": "ASC"},
-         **({"start": offset} if offset is not None else {})},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        {
+            "select": ["ENTITY_TYPE_ID", "ENTITY_ID"],
+            "filter": {"ENTITY_TYPE_ID": 2},
+            "order": {"ENTITY_ID": "ASC"},
+            **({"start": offset} if offset is not None else {}),
+        },
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
 def _rows(offset: int) -> list[dict[str, int]]:
     return [
         {"ENTITY_TYPE_ID": entity_type, "ENTITY_ID": entity_id}
-        for entity_type, entity_id in EXPECTED_KEYS[offset:offset + PAGE_SIZE]
+        for entity_type, entity_id in EXPECTED_KEYS[offset : offset + PAGE_SIZE]
     ]
 
 
@@ -62,34 +66,39 @@ def _result(offset: int, *, truncated: bool = False) -> dict[str, object]:
 
 
 def _envelope(offset: int) -> dict[str, object]:
-    return {"result": _result(offset), "total": TOTAL,
-            **({"next": offset + PAGE_SIZE} if offset + PAGE_SIZE < TOTAL else {})}
+    return {
+        "result": _result(offset),
+        "total": TOTAL,
+        **({"next": offset + PAGE_SIZE} if offset + PAGE_SIZE < TOTAL else {}),
+    }
 
 
 def _direct_fixture() -> ScriptedTransport:
-    return ScriptedTransport(tuple(
-        ScriptedExchange.json(_request(offset), _envelope(offset)) for offset in OFFSETS
-    ))
+    return ScriptedTransport(tuple(ScriptedExchange.json(_request(offset), _envelope(offset)) for offset in OFFSETS))
 
 
 def _batch_fixture(*, truncated: bool = False) -> ScriptedTransport:
     tail = OFFSETS[1:]
-    return ScriptedTransport((
-        ScriptedExchange.json(_request(0), _envelope(0)),
-        ScriptedExchange.batch(
-            tuple(_request(offset) for offset in tail),
-            tuple(_result(offset, truncated=truncated) for offset in tail),
-            total=TOTAL,
-            continuations=tuple(offset + PAGE_SIZE if offset + PAGE_SIZE < TOTAL else None for offset in tail),
-        ),
-    ))
+    return ScriptedTransport(
+        (
+            ScriptedExchange.json(_request(0), _envelope(0)),
+            ScriptedExchange.batch(
+                tuple(_request(offset) for offset in tail),
+                tuple(_result(offset, truncated=truncated) for offset in tail),
+                total=TOTAL,
+                continuations=tuple(offset + PAGE_SIZE if offset + PAGE_SIZE < TOTAL else None for offset in tail),
+            ),
+        )
+    )
 
 
 def _identity() -> CompositeIdentitySpec:
-    return CompositeIdentitySpec((
-        IdentityComponent(("ENTITY_TYPE_ID",), IdentityCoercion.EXACT_INTEGER, "entityTypeId"),
-        IdentityComponent(("ENTITY_ID",), IdentityCoercion.EXACT_INTEGER, "entityId"),
-    ))
+    return CompositeIdentitySpec(
+        (
+            IdentityComponent(("ENTITY_TYPE_ID",), IdentityCoercion.EXACT_INTEGER, "entityTypeId"),
+            IdentityComponent(("ENTITY_ID",), IdentityCoercion.EXACT_INTEGER, "entityId"),
+        )
+    )
 
 
 def _offset() -> OffsetSpec:
@@ -115,12 +124,19 @@ async def _run_complete(transport: ScriptedTransport, *, counted: bool) -> tuple
     async with Bitrix24(settings, transport=transport) as client:
         stream = (
             client.iter_list_counted(
-                _request(None), selector=ResultSelector(("REQUISITE_LINKS",)),
-                identity=_identity(), page_size=PAGE_SIZE, offset=_offset(),
+                _request(None),
+                selector=ResultSelector(("REQUISITE_LINKS",)),
+                identity=_identity(),
+                page_size=PAGE_SIZE,
+                offset=_offset(),
             )
-            if counted else client.iter_list(
-                _request(None), selector=ResultSelector(("REQUISITE_LINKS",)),
-                identity=_identity(), page_size=PAGE_SIZE, offset=_offset(),
+            if counted
+            else client.iter_list(
+                _request(None),
+                selector=ResultSelector(("REQUISITE_LINKS",)),
+                identity=_identity(),
+                page_size=PAGE_SIZE,
+                offset=_offset(),
             )
         )
         keys = tuple([_key(row) async for row in stream])
@@ -140,8 +156,11 @@ async def _reject_truncated_tail() -> None:
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_list_counted(
-            _request(None), selector=ResultSelector(("REQUISITE_LINKS",)),
-            identity=_identity(), page_size=PAGE_SIZE, offset=_offset(),
+            _request(None),
+            selector=ResultSelector(("REQUISITE_LINKS",)),
+            identity=_identity(),
+            page_size=PAGE_SIZE,
+            offset=_offset(),
         )
         try:
             _ = [row async for row in stream]
@@ -151,8 +170,10 @@ async def _reject_truncated_tail() -> None:
             raise AssertionError("scenario 14 accepted a truncated batch tail")
         if stream.report is None or stream.report.state is not TerminalState.INCOMPLETE:
             raise AssertionError("scenario 14 promoted an incomplete tail to checkpoint")
-        if not any(record.offset == TRUNCATED_OFFSET and record.outcome is PageOutcome.REJECTED
-                   for record in stream.report.page_trace):
+        if not any(
+            record.offset == TRUNCATED_OFFSET and record.outcome is PageOutcome.REJECTED
+            for record in stream.report.page_trace
+        ):
             raise AssertionError("scenario 14 did not identify the first divergent raw offset")
     transport.assert_exhausted()
 

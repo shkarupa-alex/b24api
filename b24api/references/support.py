@@ -7,11 +7,13 @@ from collections.abc import AsyncGenerator, AsyncIterable, Iterator
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
+from b24api.contracts.completion import BindingClosure
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
 from b24api.references.dispatch import (
     _SYNC_EXHAUSTED,
     ReferenceSource,
+    _DoneEvent,
     _Event,
 )
 from b24api.traversal.plans import (
@@ -26,10 +28,36 @@ from b24api.traversal.plans import (
 )
 
 if TYPE_CHECKING:
+    from b24api.completion.reference_recorder import ReferenceCompletionRecorder
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.execution.snapshot import KernelReport
     from b24api.references.outcome import ReferenceRequest
     from b24api.traversal.driver import PaginationDriver
+
+
+def _done_closure(event: _DoneEvent) -> BindingClosure:
+    """Translate the validated source termination into its gate witness class."""
+    if event.stopped_reason:
+        return BindingClosure.CALLER_STOP
+    if event.terminal_reason is None:
+        return BindingClosure.SOURCE_EMPTY
+    return {
+        "single response complete": BindingClosure.SINGLE_RESPONSE,
+        "qualified total reached": BindingClosure.QUALIFIED_TOTAL,
+        "qualified sparse raw range covered": BindingClosure.RAW_RANGE_COVERED,
+        "exact admitted upper boundary reached": BindingClosure.BOUNDARY_SEEN,
+    }.get(event.terminal_reason, BindingClosure.SOURCE_EMPTY)
+
+
+def _finish_done_completion(completion: ReferenceCompletionRecorder, event: _DoneEvent) -> None:
+    """Retire an acknowledged reference with its qualified closure evidence."""
+    completion.binding(event.work.index).complete_omitted_empty()
+    closure = _done_closure(event)
+    completion.terminal(
+        event.work.index,
+        closure,
+        qualified_total=event.qualified_total if closure is BindingClosure.QUALIFIED_TOTAL else None,
+    )
 
 
 def _new_page_records(driver: PaginationDriver, previous_count: int) -> tuple[PageRecord, ...]:
@@ -43,22 +71,27 @@ def _new_page_records(driver: PaginationDriver, previous_count: int) -> tuple[Pa
 
 def _record_cleanup_failure(violations: list[Violation], error: BaseException) -> None:
     """Retain a bounded safe indication of reference cleanup failure."""
-    violations.append(Violation(
-        severity=ViolationSeverity.BLOCKING,
-        code="cleanup_failure",
-        message=f"reference cleanup also failed ({type(error).__name__})",
-    ))
+    violations.append(
+        Violation(
+            severity=ViolationSeverity.BLOCKING,
+            code="cleanup_failure",
+            message=f"reference cleanup also failed ({type(error).__name__})",
+        )
+    )
 
 
 def _cleanup_failed_report(report: KernelReport, error: BaseException) -> KernelReport:
     """Return a terminal kernel snapshot with safe cleanup failure evidence."""
     violations = report.violations
     if not any(item.code == "cleanup_failure" for item in violations):
-        violations = (*violations, Violation(
-            severity=ViolationSeverity.BLOCKING,
-            code="cleanup_failure",
-            message=f"reference cleanup failed ({type(error).__name__})",
-        ))
+        violations = (
+            *violations,
+            Violation(
+                severity=ViolationSeverity.BLOCKING,
+                code="cleanup_failure",
+                message=f"reference cleanup failed ({type(error).__name__})",
+            ),
+        )
     return replace(
         report,
         state=KernelState.FAILED,

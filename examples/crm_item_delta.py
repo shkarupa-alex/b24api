@@ -38,25 +38,32 @@ EXPECTED_IDS = (1, 2, 3)
 def _request(border: str, cursor: int | None = None) -> Request:
     return Request(
         METHOD,
-        {"entityTypeId": ENTITY_TYPE_ID, "select": ["id", "updatedTime"],
-         "filter": {">=updatedTime": border, **({">id": cursor} if cursor is not None else {})},
-         "order": {"id": "ASC"}, "start": -1},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        {
+            "entityTypeId": ENTITY_TYPE_ID,
+            "select": ["id", "updatedTime"],
+            "filter": {">=updatedTime": border, **({">id": cursor} if cursor is not None else {})},
+            "order": {"id": "ASC"},
+            "start": -1,
+        },
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
 def _fixture() -> ScriptedTransport:
-    return ScriptedTransport((
-        ScriptedExchange.json(
-            Request("crm.type.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
-            {"result": {"types": [{"title": "Mirror fixture", "entityTypeId": ENTITY_TYPE_ID}]}},
-        ),
-        ScriptedExchange.json(_request(INITIAL_BORDER), {"result": {"items": list(INITIAL)}}),
-        ScriptedExchange.json(_request(INITIAL_BORDER, 2), {"result": {"items": []}}),
-        ScriptedExchange.json(_request(INITIAL_BORDER, 2), {"result": {"items": [DELTA[1]]}}),
-        ScriptedExchange.json(_request(REPLAY_BORDER), {"result": {"items": list(DELTA)}}),
-        ScriptedExchange.json(_request(REPLAY_BORDER, 3), {"result": {"items": []}}),
-    ))
+    return ScriptedTransport(
+        (
+            ScriptedExchange.json(
+                Request("crm.type.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+                {"result": {"types": [{"title": "Mirror fixture", "entityTypeId": ENTITY_TYPE_ID}]}},
+            ),
+            ScriptedExchange.json(_request(INITIAL_BORDER), {"result": {"items": list(INITIAL)}}),
+            ScriptedExchange.json(_request(INITIAL_BORDER, 2), {"result": {"items": []}}),
+            ScriptedExchange.json(_request(INITIAL_BORDER, 2), {"result": {"items": [DELTA[1]]}}),
+            ScriptedExchange.json(_request(REPLAY_BORDER), {"result": {"items": list(DELTA)}}),
+            ScriptedExchange.json(_request(REPLAY_BORDER, 3), {"result": {"items": []}}),
+        )
+    )
 
 
 def _item(row: object) -> tuple[int, str]:
@@ -72,9 +79,9 @@ async def _scan_window(client: Bitrix24, border: str, expected: tuple[dict[str, 
     stream = client.iter_list_keyset(
         Request(
             METHOD,
-            {"entityTypeId": ENTITY_TYPE_ID, "select": ["id", "updatedTime"],
-             "filter": {">=updatedTime": border}},
-            replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+            {"entityTypeId": ENTITY_TYPE_ID, "select": ["id", "updatedTime"], "filter": {">=updatedTime": border}},
+            replay_safety=ReplaySafety.SAFE,
+            route=RouteKind.BARE,
         ),
         selector=ResultSelector(("items",)),
         identity=IdentitySpec(("id",), "id", "id", IdentityCoercion.EXACT_INTEGER),

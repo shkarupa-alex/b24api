@@ -10,6 +10,9 @@ def test_disk_mirror_recipe_reconciles_all_objects_without_cycle() -> None:
     root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
         [sys.executable, "-m", "examples.disk_mirror"],
-        cwd=root, check=False, capture_output=True, text=True,
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr

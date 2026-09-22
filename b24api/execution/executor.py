@@ -320,7 +320,8 @@ class Executor:
             throttle_delay = _retry_after_seconds(wire)
             if throttle_delay is not None:
                 merged = await context.coordinator.observe_throttle(
-                    throttle_delay, reason=_throttle_reason(response_error),
+                    throttle_delay,
+                    reason=_throttle_reason(response_error),
                 )
                 await context.record_cooldown(merged)
             _raise_for_pending_cancellation()
@@ -422,7 +423,8 @@ def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: Execution
 def _preflight_transport(transport: WireTransport | None, request: Request) -> None:
     """Reject unsupported request representation before budget reservation or I/O."""
     if request.positional is not None and (
-        transport is None or not isinstance(transport.capabilities, TransportCapabilities)
+        transport is None
+        or not isinstance(transport.capabilities, TransportCapabilities)
         or not transport.capabilities.positional_json
     ):
         raise CapabilityError("transport does not support positional JSON arguments", request_summary=request.summary)

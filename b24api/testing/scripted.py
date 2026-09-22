@@ -44,29 +44,38 @@ class ScriptedExchange:
             continuations = (None,) * len(commands)
         if len(continuations) != len(commands):
             raise ValueError("batch fixture continuations must match commands")
-        if any(command.route is not RouteKind.BARE or command.replay_safety is not ReplaySafety.SAFE
-               or command.positional is not None or command.headers.items for command in commands):
+        if any(
+            command.route is not RouteKind.BARE
+            or command.replay_safety is not ReplaySafety.SAFE
+            or command.positional is not None
+            or command.headers.items
+            for command in commands
+        ):
             raise ValueError("batch fixture requires safe BARE commands without positional slots or headers")
         keys = tuple(f"c{index:012d}" for index in range(len(commands)))
         queries = tuple(
-            encode_php_query(cast("Mapping[str | int, object]", command.to_wire_parameters()))
-            for command in commands
+            encode_php_query(cast("Mapping[str | int, object]", command.to_wire_parameters())) for command in commands
         )
         encoded = {
             key: command.method if not query else f"{command.method}?{query}"
             for key, command, query in zip(keys, commands, queries, strict=True)
         }
         request = Request(
-            "batch", parameters={"halt": 0, "cmd": encoded},
-            replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+            "batch",
+            parameters={"halt": 0, "cmd": encoded},
+            replay_safety=ReplaySafety.SAFE,
+            route=RouteKind.BARE,
         )
-        payload = {"result": {
-            "result": dict(zip(keys, results, strict=True)),
-            "result_error": {},
-            "result_total": dict.fromkeys(keys, total),
-            "result_next": {key: value for key, value in zip(keys, continuations, strict=True)
-                            if value is not None},
-        }}
+        payload = {
+            "result": {
+                "result": dict(zip(keys, results, strict=True)),
+                "result_error": {},
+                "result_total": dict.fromkeys(keys, total),
+                "result_next": {
+                    key: value for key, value in zip(keys, continuations, strict=True) if value is not None
+                },
+            }
+        }
         return cls.json(request, payload)
 
 
@@ -114,15 +123,21 @@ class ScriptedTransport:
         raise AssertionError(f"unexpected scripted request: {request.method}")
 
     async def send_wire(
-        self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int,
+        self,
+        request: WireRequest,
+        *,
+        attempt_timeout: float,
+        max_response_bytes: int,
     ) -> WireResponse:
         """Match advanced JSON requests, including exact positional slot values."""
         canonical = Request(
             request.method,
             parameters=request.positional if request.positional is not None else request.copy_parameters(),
             replay_safety=request.replay_safety,
-            encoding=request.encoding, headers=request.headers,
-            result_error=request.result_error, route=request.route,
+            encoding=request.encoding,
+            headers=request.headers,
+            result_error=request.result_error,
+            route=request.route,
         )
         return await self.send(canonical, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
 

@@ -42,10 +42,12 @@ def _fixture() -> ScriptedTransport:
         (50, {}),
         (100, {"83": {"id": 83}}),
     )
-    return ScriptedTransport(tuple(
-        ScriptedExchange.json(_request(offset), {"result": {"items": users, "rawTotal": RAW_TOTAL}})
-        for offset, users in pages
-    ))
+    return ScriptedTransport(
+        tuple(
+            ScriptedExchange.json(_request(offset), {"result": {"items": users, "rawTotal": RAW_TOTAL}})
+            for offset, users in pages
+        )
+    )
 
 
 async def run() -> None:
@@ -57,7 +59,10 @@ async def run() -> None:
         step=STRIDE,
         page_stride=stride,
         sparse_raw_bound=SparseRawBound(
-            ResultSelector(("rawTotal",)), stride, 3, "qualified stable raw ID order",
+            ResultSelector(("rawTotal",)),
+            stride,
+            3,
+            "qualified stable raw ID order",
         ),
     )
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")

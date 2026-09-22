@@ -31,18 +31,22 @@ DELETED_ROWS = [
 
 def _request(stamp: str) -> Request:
     return Request(
-        METHOD, {**WINDOW, "modified_since": stamp},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        METHOD,
+        {**WINDOW, "modified_since": stamp},
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
 async def run() -> None:
     """Replay an inclusive deletion border and compare the keyed oracle."""
-    transport = ScriptedTransport((
-        ScriptedExchange.json(_request(INITIAL), {"result": LIVE_ROWS}),
-        ScriptedExchange.json(_request(INITIAL), {"result": DELETED_ROWS}),
-        ScriptedExchange.json(_request(NEXT), {"result": DELETED_ROWS}),
-    ))
+    transport = ScriptedTransport(
+        (
+            ScriptedExchange.json(_request(INITIAL), {"result": LIVE_ROWS}),
+            ScriptedExchange.json(_request(INITIAL), {"result": DELETED_ROWS}),
+            ScriptedExchange.json(_request(NEXT), {"result": DELETED_ROWS}),
+        )
+    )
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     with TemporaryDirectory() as directory:
         sink = CalendarSink(Path(directory) / "calendar.sqlite3")

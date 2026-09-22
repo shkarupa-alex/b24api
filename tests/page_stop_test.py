@@ -89,19 +89,30 @@ async def test_page_stop_prevents_next_request_and_reports_bounded_prefix(family
         expected = [1, 2]
     elif family == "keyset":
         stream = client.iter_list_keyset(
-            Request("keyset.list", route=RouteKind.BARE), selector=ResultSelector.root(),
-            identity=_identity(), page_size=2, keyset=KeysetSpec(),
-            execution=SequentialKeysetExecution(), page_stop=policy,
+            Request("keyset.list", route=RouteKind.BARE),
+            selector=ResultSelector.root(),
+            identity=_identity(),
+            page_size=2,
+            keyset=KeysetSpec(),
+            execution=SequentialKeysetExecution(),
+            page_stop=policy,
         )
         expected = [1, 2]
     else:
         cursor = CursorSpec(
-            ParameterPath(("LAST_ID",)), ("id",), IdentityCoercion.EXACT_INTEGER,
-            "descending", "last", domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
+            ParameterPath(("LAST_ID",)),
+            ("id",),
+            IdentityCoercion.EXACT_INTEGER,
+            "descending",
+            "last",
+            domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
         )
         stream = client.iter_list_cursor(
             Request("cursor.list", {"LAST_ID": 6}, route=RouteKind.BARE),
-            selector=ResultSelector.root(), cursor=cursor, page_size=2, page_stop=policy,
+            selector=ResultSelector.root(),
+            cursor=cursor,
+            page_size=2,
+            page_stop=policy,
         )
         expected = [5, 4]
     assert [row["id"] async for row in stream] == expected
@@ -138,7 +149,9 @@ async def test_continue_policy_preserves_natural_exhaustion() -> None:
     transport = ListTransport()
     client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
     stream = client.iter_list(
-        Request("offset.list", route=RouteKind.BARE), page_size=2, page_stop=ContinueAfterCommit(),
+        Request("offset.list", route=RouteKind.BARE),
+        page_size=2,
+        page_stop=ContinueAfterCommit(),
     )
     assert [row["id"] async for row in stream] == [1, 2, 3, 4, 5]
     assert stream.report is not None
@@ -150,8 +163,11 @@ async def test_default_auto_keyset_uses_sequential_path_for_page_stop() -> None:
     transport = ListTransport()
     client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
     stream = client.iter_list_keyset(
-        Request("keyset.list", route=RouteKind.BARE), selector=ResultSelector.root(),
-        identity=_identity(), page_size=2, page_stop=StopAfterCommit(),
+        Request("keyset.list", route=RouteKind.BARE),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=2,
+        page_stop=StopAfterCommit(),
     )
     assert [row["id"] async for row in stream] == [1, 2]
     assert len(transport.requests) == 1

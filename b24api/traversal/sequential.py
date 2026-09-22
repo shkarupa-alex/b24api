@@ -74,7 +74,8 @@ class _SequentialMixin:
         yield _Page(tuple(items), response, item_weights, continuing=False)
 
     async def _offset(  # noqa: C901, PLR0912 - one ordered page transaction with two closure variants
-        self: Any, plan: OffsetSequentialPlan,
+        self: Any,
+        plan: OffsetSequentialPlan,
     ) -> AsyncGenerator[_Page]:
         offset = _initial_offset(self.request, plan.offset_path, default=plan.initial_control)
         sparse = plan.sparse_raw_bound
@@ -107,12 +108,18 @@ class _SequentialMixin:
                 items = self.select_page(response)
                 if sparse is None:
                     terminal = _offset_terminal(
-                        plan, response, page_size=len(items), accepted=self.validated_rows + len(items),
+                        plan,
+                        response,
+                        page_size=len(items),
+                        accepted=self.validated_rows + len(items),
                         confirmation=self._confirmation_policy,
                     )
                 else:
                     terminal, expected_raw_total = sparse_page_terminal(
-                        sparse, response, offset=offset, previous_total=expected_raw_total,
+                        sparse,
+                        response,
+                        offset=offset,
+                        previous_total=expected_raw_total,
                     )
                 next_offset = (
                     None if terminal is not None else _next_offset(plan, response, current=offset, observed=len(items))

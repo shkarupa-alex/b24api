@@ -46,6 +46,7 @@ from b24api.references.outcome import (
 )
 from b24api.references.support import (
     _active_limit,
+    _finish_done_completion,
     _finish_task,
     _iterate_references,
     _new_page_records,
@@ -361,11 +362,16 @@ class ReferenceScheduler:
                 settlement = dispatched.settlement
             except BaseException as error:
                 completion.settled(
-                    CommandSettlement.UNKNOWN if isinstance(error, _BatchPageError) and isinstance(
-                        error.failure.error, AmbiguousExecutionError,
+                    CommandSettlement.UNKNOWN
+                    if isinstance(error, _BatchPageError)
+                    and isinstance(
+                        error.failure.error,
+                        AmbiguousExecutionError,
                     )
-                    else CommandSettlement.FAILURE if isinstance(error, _BatchPageError | ApiResponseError)
-                    else CommandSettlement.UNKNOWN if bool(getattr(error, "_b24api_dispatch_started", False))
+                    else CommandSettlement.FAILURE
+                    if isinstance(error, _BatchPageError | ApiResponseError)
+                    else CommandSettlement.UNKNOWN
+                    if bool(getattr(error, "_b24api_dispatch_started", False))
                     else CommandSettlement.NOT_EXECUTED,
                 )
                 self.producer_state.admitting.discard(producer_key)
@@ -432,7 +438,9 @@ class ReferenceScheduler:
                 page_violations = tuple(driver.violations[violation_offset:])
                 violation_offset = len(driver.violations)
                 page_records = self._annotate_page_records(
-                    work, _new_page_records(driver, trace_offset), scheduled_sequences,
+                    work,
+                    _new_page_records(driver, trace_offset),
+                    scheduled_sequences,
                 )
                 await output.put(
                     _PageEvent(
@@ -485,6 +493,8 @@ class ReferenceScheduler:
                         scheduled_sequences,
                     ),
                     stopped_reason,
+                    driver.terminal_reason,
+                    driver._expected_total,  # noqa: SLF001 - source driver owns qualified-total witness
                 ),
             )
         except asyncio.CancelledError:
@@ -645,14 +655,13 @@ class ReferenceScheduler:
                     event.acknowledged.set_result(None)
             return
         if isinstance(event, _DoneEvent):
-            self.completion.binding(event.work.index).complete_omitted_empty()
-            self.completion.terminal(
-                event.work.index,
-                BindingClosure.CALLER_STOP if event.stopped_reason else BindingClosure.SOURCE_EMPTY,
-            )
+            _finish_done_completion(self.completion, event)
             if self.emit_complete:
                 yield _KernelReferenceComplete(
-                    event.work.index, event.work.reference, event.row_count, event.stopped_reason,
+                    event.work.index,
+                    event.work.reference,
+                    event.row_count,
+                    event.stopped_reason,
                 )
             return
         request = event.work.reference.request

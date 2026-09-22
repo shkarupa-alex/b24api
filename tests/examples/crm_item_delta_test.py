@@ -10,6 +10,9 @@ def test_crm_item_delta_recipe_reconciles_old_and_new_ids() -> None:
     root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
         [sys.executable, "-m", "examples.crm_item_delta"],
-        cwd=root, check=False, capture_output=True, text=True,
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr

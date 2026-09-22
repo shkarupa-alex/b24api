@@ -227,22 +227,24 @@ class MappedOperationStream[S, T]:
             raise TypeError("public operation source lacks completion evidence")
         if self._source.report.state is KernelState.NOT_STARTED:
             gate.abort_unstarted()
-        gate.attach_report(CompletionReportFacts(
-            source=self._source.report,
-            operation=self._operation,
-            assurance=self._assurance,
-            admitted=admitted,
-            emitted=self._emitted,
-            successes=self._successes,
-            failures=self._failures,
-            not_executed=self._not_executed,
-            unknown=self._unknown,
-            buffered_commands_high_water=buffered_commands,
-            active_references_high_water=active_references,
-            early_closed=self._early_closed,
-            forced_state=forced_state,
-            extra_violations=extra_violations,
-        ))
+        gate.attach_report(
+            CompletionReportFacts(
+                source=self._source.report,
+                operation=self._operation,
+                assurance=self._assurance,
+                admitted=admitted,
+                emitted=self._emitted,
+                successes=self._successes,
+                failures=self._failures,
+                not_executed=self._not_executed,
+                unknown=self._unknown,
+                buffered_commands_high_water=buffered_commands,
+                active_references_high_water=active_references,
+                early_closed=self._early_closed,
+                forced_state=forced_state,
+                extra_violations=extra_violations,
+            )
+        )
         report = gate.finish()
         self._report = report
         self._terminated = True

@@ -29,9 +29,12 @@ def _fixture() -> ScriptedTransport:
     exchanges = []
     for method, control in METHODS:
         for index, ids in ((1, EXPECTED_IDS[:10]), (2, EXPECTED_IDS[10:]), (3, ())):
-            exchanges.append(ScriptedExchange.json(
-                _request(method, control, index), {"result": [{"id": value} for value in ids]},
-            ))
+            exchanges.append(
+                ScriptedExchange.json(
+                    _request(method, control, index),
+                    {"result": [{"id": value} for value in ids]},
+                )
+            )
     return ScriptedTransport(tuple(exchanges))
 
 
@@ -56,8 +59,7 @@ async def run() -> None:
             if stream.report is None or not stream.report.exhausted:
                 raise AssertionError("scenario 12 page-index traversal lacked exhaustion evidence")
             controls = tuple(
-                request.copy_parameters()[control]
-                for request in transport.calls if request.method == method
+                request.copy_parameters()[control] for request in transport.calls if request.method == method
             )
             if controls != (1, 2, 3):
                 raise AssertionError("scenario 12 wire page indexes did not advance 1/2/3")

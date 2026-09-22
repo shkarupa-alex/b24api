@@ -72,6 +72,8 @@ class _DoneEvent:
     violations: tuple[Violation, ...]
     page_records: tuple[PageRecord, ...]
     stopped_reason: str | None = None
+    terminal_reason: str | None = None
+    qualified_total: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

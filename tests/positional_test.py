@@ -86,7 +86,9 @@ def test_positional_rejects_wrong_arity_shape_and_internal_omission() -> None:
         )
     with pytest.raises(ValueError, match="JSON"):
         Request(
-            "task.elapseditem.getlist", _arguments(), route=RouteKind.BARE,
+            "task.elapseditem.getlist",
+            _arguments(),
+            route=RouteKind.BARE,
             encoding=BodyEncoding.FORM_URLENCODED,
         )
     with pytest.raises(ValueError, match="API_V3"):
@@ -108,7 +110,11 @@ async def test_positional_requires_advertised_wire_capability_before_io() -> Non
         calls = 0
 
         async def send(
-            self, request: Request, *, attempt_timeout: float, max_response_bytes: int,
+            self,
+            request: Request,
+            *,
+            attempt_timeout: float,
+            max_response_bytes: int,
         ) -> WireResponse:
             assert request.method
             assert attempt_timeout > 0

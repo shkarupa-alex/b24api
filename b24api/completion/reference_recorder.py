@@ -46,6 +46,7 @@ class ReferenceCompletionRecorder:
         self.gate = CompletionGate(uuid4().hex)
         self._sequence = 0
         self._bindings: dict[int, ReferenceBindingRecorder] = {}
+        self._admitted_count = 0
 
     def _take(self) -> int:
         sequence = self._sequence
@@ -55,35 +56,54 @@ class ReferenceCompletionRecorder:
     def admit(self, binding_id: int) -> ReferenceBindingRecorder:
         """Register a binding before its worker can schedule a page."""
         recorder = ReferenceBindingRecorder(self, binding_id)
-        self.gate.emit(BindingAdmitted(
-            operation_id=self.gate.operation_id, sequence=self._take(), binding_id=binding_id,
-        ))
+        self.gate.emit(
+            BindingAdmitted(
+                operation_id=self.gate.operation_id,
+                sequence=self._take(),
+                binding_id=binding_id,
+            )
+        )
         self._bindings[binding_id] = recorder
+        self._admitted_count += 1
         return recorder
 
     def binding(self, binding_id: int) -> ReferenceBindingRecorder:
         """Return the active adapter for one admitted binding."""
         return self._bindings[binding_id]
 
-    def terminal(self, binding_id: int, closure: BindingClosure) -> None:
+    def terminal(self, binding_id: int, closure: BindingClosure, *, qualified_total: int | None = None) -> None:
         """Retire one accounted binding after its final outcome is delivered."""
-        self.gate.emit(BindingTerminal(
-            operation_id=self.gate.operation_id, sequence=self._take(),
-            binding_id=binding_id, closure=closure,
-        ))
+        self.gate.emit(
+            BindingTerminal(
+                operation_id=self.gate.operation_id,
+                sequence=self._take(),
+                binding_id=binding_id,
+                closure=closure,
+                qualified_total=qualified_total,
+            )
+        )
         del self._bindings[binding_id]
 
     def stream_terminal(self, closure: StreamClosure) -> None:
         """Record producer termination before cleanup evidence."""
-        self.gate.emit(StreamTerminal(
-            operation_id=self.gate.operation_id, sequence=self._take(), closure=closure,
-        ))
+        self.gate.emit(
+            StreamTerminal(
+                operation_id=self.gate.operation_id,
+                sequence=self._take(),
+                closure=closure,
+                empty_source=closure is StreamClosure.NATURAL and self._admitted_count == 0,
+            )
+        )
 
     def cleanup(self, state: CleanupState) -> None:
         """Record the final cleanup outcome once."""
-        self.gate.emit(CleanupOutcome(
-            operation_id=self.gate.operation_id, sequence=self._take(), state=state,
-        ))
+        self.gate.emit(
+            CleanupOutcome(
+                operation_id=self.gate.operation_id,
+                sequence=self._take(),
+                state=state,
+            )
+        )
 
 
 class ReferenceBindingRecorder:

@@ -616,8 +616,7 @@ async def test_fast_page_is_acknowledged_only_after_its_last_row_is_yielded() ->
     assert (await anext(iterator))["id"] == 1
     first_page = next(event.page_id for event in events if isinstance(event, PageValidated) and event.row_count == 5)
     assert not any(
-        isinstance(event, PageDelivered | PageAcknowledged) and event.page_id == first_page
-        for event in events
+        isinstance(event, PageDelivered | PageAcknowledged) and event.page_id == first_page for event in events
     )
     for expected in range(2, 6):
         assert (await anext(iterator))["id"] == expected

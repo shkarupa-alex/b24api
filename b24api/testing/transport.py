@@ -340,7 +340,9 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         expected_body = b"outer%5Bitems%5D%5B0%5D=x"
     elif case is ConformanceCase.SCOPED_HEADERS_FORWARDED:
         request = Request(
-            "conformance.test", headers=RequestHeaders({"X-Conformance": "present"}), route=RouteKind.BARE,
+            "conformance.test",
+            headers=RequestHeaders({"X-Conformance": "present"}),
+            route=RouteKind.BARE,
         )
         expected_header = ("x-conformance", "present")
     response = (

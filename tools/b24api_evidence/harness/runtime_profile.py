@@ -357,7 +357,9 @@ async def _oversized_response_case() -> dict[str, Any]:
     try:
         try:
             await transport.send(
-                Request("profile.get", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=ceiling,
+                Request("profile.get", route=RouteKind.BARE),
+                attempt_timeout=1,
+                max_response_bytes=ceiling,
             )
         except ResponseTooLargeError:
             refused = True

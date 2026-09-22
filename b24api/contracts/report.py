@@ -386,6 +386,7 @@ def retain_page_trace(records: tuple[PageRecord, ...], limit: int) -> tuple[tupl
         kept = (*anomalies, *normal[:early], *recent)
     return tuple(sorted(set(kept), key=lambda record: record.sequence)), True
 
+
 __all__ = [
     "KeysetExecutionReport",
     "OperationReport",

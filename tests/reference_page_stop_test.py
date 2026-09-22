@@ -92,18 +92,23 @@ async def test_reference_page_stop_is_per_binding_and_not_source_exhaustion(disp
         Binding("chat b", (ParameterUpdate(path, "b"),), "b"),
     )
     cursor = CursorSpec(
-        ParameterPath(("LAST_ID",)), ("id",), IdentityCoercion.EXACT_INTEGER,
-        "descending", "last", domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
+        ParameterPath(("LAST_ID",)),
+        ("id",),
+        IdentityCoercion.EXACT_INTEGER,
+        "descending",
+        "last",
+        domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
     )
     stop = StopFirstChat()
     dispatch = (
-        BatchDispatch(batch_size=2, coalesce_wait=0)
-        if dispatch_kind == "batch"
-        else DirectDispatch(concurrency=2)
+        BatchDispatch(batch_size=2, coalesce_wait=0) if dispatch_kind == "batch" else DirectDispatch(concurrency=2)
     )
     stream = client.iter_cursors(
         Request("messages.get", {"parent": "", "LAST_ID": 100}, route=RouteKind.BARE),
-        bindings, selector=ResultSelector.root(), cursor=cursor, page_size=2,
+        bindings,
+        selector=ResultSelector.root(),
+        cursor=cursor,
+        page_size=2,
         dispatch=dispatch,
         page_stop=stop,
     )
@@ -112,7 +117,9 @@ async def test_reference_page_stop_is_per_binding_and_not_source_exhaustion(disp
     completions = {event.binding_index: event for event in events if isinstance(event, ReferenceComplete)}
     assert [(item.binding_index, item.item["id"]) for item in items if item.binding_index == 0] == [(0, 5), (0, 4)]
     assert [(item.binding_index, item.item["id"]) for item in items if item.binding_index == 1] == [
-        (1, 15), (1, 14), (1, 13),
+        (1, 15),
+        (1, 14),
+        (1, 13),
     ]
     assert [control for parent, control in transport.requests if parent == "a"] == [100]
     assert [control for parent, control in transport.requests if parent == "b"] == [100, 14, 13]

@@ -16,7 +16,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_recipe_uses_only_public_client_exports() -> None:
     for recipe in (
-        "chat_bounded_mirror.py", "chat_resume.py", "binary_download.py", "v3_task_results.py",
+        "chat_bounded_mirror.py",
+        "chat_resume.py",
+        "binary_download.py",
+        "v3_task_results.py",
         "page_index_members.py",
         "sparse_user_search.py",
         "elapsed_task_items.py",
@@ -26,14 +29,20 @@ def test_recipe_uses_only_public_client_exports() -> None:
     ):
         source = (ROOT / "examples" / recipe).read_text()
         imports = (node.module for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ImportFrom))
-        assert all(module in {"b24api", "b24api.testing"}
-                   for module in imports if module is not None and module.startswith("b24api"))
+        assert all(
+            module in {"b24api", "b24api.testing"}
+            for module in imports
+            if module is not None and module.startswith("b24api")
+        )
 
 
 def test_chat_bounded_recipe_matches_its_independent_oracle() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "examples.chat_bounded_mirror"],
-        cwd=ROOT, check=False, capture_output=True, text=True,
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr
 

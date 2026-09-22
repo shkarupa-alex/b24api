@@ -42,8 +42,12 @@ class MessageTransport:
 
 def _cursor() -> CursorSpec:
     return CursorSpec(
-        ParameterPath(("LAST_ID",)), ("id",), IdentityCoercion.EXACT_INTEGER,
-        "descending", "last", domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
+        ParameterPath(("LAST_ID",)),
+        ("id",),
+        IdentityCoercion.EXACT_INTEGER,
+        "descending",
+        "last",
+        domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
     )
 
 
@@ -53,7 +57,9 @@ async def test_exclusive_cursor_allows_nonexistent_positive_boundary_and_one_emp
     client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
     stream = client.iter_list_cursor(
         Request("messages.get", {"LAST_ID": 10}, route=RouteKind.BARE),
-        selector=ResultSelector.root(), cursor=_cursor(), page_size=2,
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=2,
     )
     assert [row["id"] async for row in stream] == [3, 2, 1]
     assert transport.controls == [10, 2, 1]
@@ -67,7 +73,9 @@ async def test_exclusive_boundary_one_exhausts_the_range_below_one() -> None:
     client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
     stream = client.iter_list_cursor(
         Request("messages.get", {"LAST_ID": 1}, route=RouteKind.BARE),
-        selector=ResultSelector.root(), cursor=_cursor(), page_size=2,
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=2,
     )
     assert [row async for row in stream] == []
     assert transport.controls == [1]
@@ -81,7 +89,9 @@ async def test_server_emitted_zero_cursor_is_incomplete() -> None:
     client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
     stream = client.iter_list_cursor(
         Request("messages.get", {"LAST_ID": 1}, route=RouteKind.BARE),
-        selector=ResultSelector.root(), cursor=_cursor(), page_size=2,
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=2,
     )
     with pytest.raises(IncompleteTraversalError):
         _ = [row async for row in stream]
@@ -95,7 +105,9 @@ async def test_ignored_or_invalid_initial_cursor_rejects_before_io(ignored: obje
     client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
     stream = client.iter_list_cursor(
         Request("messages.get", {"LAST_ID": ignored}, route=RouteKind.BARE),
-        selector=ResultSelector.root(), cursor=_cursor(), page_size=2,
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=2,
     )
     with pytest.raises(CapabilityError, match="exclusive range cursor"):
         _ = [row async for row in stream]

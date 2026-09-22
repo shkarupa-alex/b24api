@@ -10,6 +10,9 @@ def test_recent_dialogs_recipe_reconciles_cross_page_duplicate() -> None:
     root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
         [sys.executable, "-m", "examples.recent_dialogs"],
-        cwd=root, check=False, capture_output=True, text=True,
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr

@@ -21,6 +21,8 @@ class BindingClosure(StrEnum):
 
     SOURCE_EMPTY = "source_empty"
     QUALIFIED_TOTAL = "qualified_total"
+    RAW_RANGE_COVERED = "raw_range_covered"
+    SINGLE_RESPONSE = "single_response"
     BOUNDARY_SEEN = "boundary_seen"
     CALLER_STOP = "caller_stop"
     FAILURE = "failure"
@@ -122,6 +124,7 @@ class BindingTerminal(CompletionEvent):
 
     binding_id: int
     closure: BindingClosure
+    qualified_total: int | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -129,6 +132,7 @@ class StreamTerminal(CompletionEvent):
     """Settle the operation producer once."""
 
     closure: StreamClosure
+    empty_source: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

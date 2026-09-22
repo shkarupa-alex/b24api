@@ -41,16 +41,17 @@ def _storage_request(offset: int | None) -> Request:
     return Request(
         STORAGE_METHOD,
         {"order": {"ID": "ASC"}, **({"start": offset} if offset is not None else {})},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
 def _children_request(folder_id: int, offset: int | None) -> Request:
     return Request(
         CHILDREN_METHOD,
-        {"id": folder_id, "order": {"ID": "ASC"},
-         **({"start": offset} if offset is not None else {})},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        {"id": folder_id, "order": {"ID": "ASC"}, **({"start": offset} if offset is not None else {})},
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
@@ -65,33 +66,41 @@ def _file(object_id: int) -> dict[str, str]:
 def _fixture() -> ScriptedTransport:
     root_children = [*(_file(value) for value in range(1001, 1051))]
     root_children.extend((_folder(120, 120), _folder(301, 120), _file(1051)))
-    return ScriptedTransport((
-        ScriptedExchange.json(
-            _storage_request(0),
-            {"result": [{"ID": "1", "ROOT_OBJECT_ID": "100"},
-                        {"ID": "2", "ROOT_OBJECT_ID": "200"}], "total": 2},
-        ),
-        ScriptedExchange.json(
-            _children_request(100, 0), {"result": root_children[:PAGE_SIZE], "total": len(root_children)},
-        ),
-        ScriptedExchange.batch(
-            (_children_request(100, 50),), (root_children[PAGE_SIZE:],), total=len(root_children),
-        ),
-        ScriptedExchange.json(
-            _children_request(200, 0), {"result": [_file(2001)], "total": 1},
-        ),
-        ScriptedExchange.json(
-            _children_request(120, 0), {"result": [_folder(130, 130), _file(1052)], "total": 2},
-        ),
-        ScriptedExchange.json(
-            _children_request(130, 0), {"result": [_folder(302, 100), _file(1053)], "total": 2},
-        ),
-    ))
+    return ScriptedTransport(
+        (
+            ScriptedExchange.json(
+                _storage_request(0),
+                {"result": [{"ID": "1", "ROOT_OBJECT_ID": "100"}, {"ID": "2", "ROOT_OBJECT_ID": "200"}], "total": 2},
+            ),
+            ScriptedExchange.json(
+                _children_request(100, 0),
+                {"result": root_children[:PAGE_SIZE], "total": len(root_children)},
+            ),
+            ScriptedExchange.batch(
+                (_children_request(100, 50),),
+                (root_children[PAGE_SIZE:],),
+                total=len(root_children),
+            ),
+            ScriptedExchange.json(
+                _children_request(200, 0),
+                {"result": [_file(2001)], "total": 1},
+            ),
+            ScriptedExchange.json(
+                _children_request(120, 0),
+                {"result": [_folder(130, 130), _file(1052)], "total": 2},
+            ),
+            ScriptedExchange.json(
+                _children_request(130, 0),
+                {"result": [_folder(302, 100), _file(1053)], "total": 2},
+            ),
+        )
+    )
 
 
 def _offset() -> OffsetSpec:
     return OffsetSpec(
-        continuation=OffsetContinuation.FIXED_STEP, step=PAGE_SIZE,
+        continuation=OffsetContinuation.FIXED_STEP,
+        step=PAGE_SIZE,
         total_termination=TotalTermination.EXACT_QUALIFIED,
         page_stride=PageStride(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE),
     )
@@ -110,7 +119,8 @@ async def _counted_rows(client: Bitrix24, request: Request, *, expected_offsets:
     stream = client.iter_list_counted(
         request,
         identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
-        page_size=PAGE_SIZE, offset=_offset(),
+        page_size=PAGE_SIZE,
+        offset=_offset(),
     )
     rows: list[object] = [row async for row in stream]
     report = stream.report

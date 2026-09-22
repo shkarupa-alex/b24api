@@ -41,6 +41,7 @@ async def test_httpx_info_record_is_emitted_and_rewritten_before_handler_formatt
     handler = _CollectingHandler()
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+
     def respond(request: httpx.Request) -> httpx.Response:
         status = _SUCCESS_STATUS if request.headers.get("content-type") == "application/json" else _RESPONSE_STATUS
         return httpx.Response(status, request=request)
@@ -49,14 +50,16 @@ async def test_httpx_info_record_is_emitted_and_rewritten_before_handler_formatt
     first = HttpxTransport(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/", client=client)
     second = HttpxTransport(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/", client=client)
     try:
-        responses = await asyncio.gather(*(
-            first.send(
-                Request("profile", route=RouteKind.JSON, encoding=encoding),
-                attempt_timeout=1,
-                max_response_bytes=1024,
+        responses = await asyncio.gather(
+            *(
+                first.send(
+                    Request("profile", route=RouteKind.JSON, encoding=encoding),
+                    attempt_timeout=1,
+                    max_response_bytes=1024,
+                )
+                for encoding in (BodyEncoding.JSON, BodyEncoding.FORM_URLENCODED)
             )
-            for encoding in (BodyEncoding.JSON, BodyEncoding.FORM_URLENCODED)
-        ))
+        )
         assert {response.status_code for response in responses} == {_SUCCESS_STATUS, _RESPONSE_STATUS}
         assert len(handler.records) == _OWNED_RECORDS
         for record in handler.records:

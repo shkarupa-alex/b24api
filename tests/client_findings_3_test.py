@@ -353,7 +353,8 @@ async def test_malformed_nonempty_2xx_remains_protocol_error_under_broad_ambigui
 
     with pytest.raises(ProtocolError) as captured:
         await Executor(transport).execute(
-            Request("example.list", replay_safety=safety, route=RouteKind.BARE), policy=policy,
+            Request("example.list", replay_safety=safety, route=RouteKind.BARE),
+            policy=policy,
         )
 
     assert type(captured.value).__name__ == "ProtocolError"

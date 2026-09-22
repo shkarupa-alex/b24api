@@ -229,8 +229,11 @@ class _ReferenceEventMapper:
             context = cast("_BindingContext", event.reference.correlation)
             self._item_indexes.pop(context.index, None)
             return ReferenceComplete(
-                context.index, context.correlation, event.row_count,
-                exhausted=event.stopped_reason is None, stop_reason=event.stopped_reason,
+                context.index,
+                context.correlation,
+                event.row_count,
+                exhausted=event.stopped_reason is None,
+                stop_reason=event.stopped_reason,
             )
         context = cast("_BindingContext", event.correlation)
         self._item_indexes.pop(context.index, None)

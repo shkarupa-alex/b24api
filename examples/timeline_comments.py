@@ -48,40 +48,52 @@ ENTITIES = (("deal", 71), ("contact", 22), ("lead", 999))
 def _request(entity_type: str, entity_id: int, offset: int, *, cursor_probe: bool = False) -> Request:
     return Request(
         METHOD,
-        {"filter": {"ENTITY_TYPE": entity_type, "ENTITY_ID": entity_id,
-                    **({">ID": 1052} if cursor_probe else {})},
-         "select": SELECT, "order": {"ID": "ASC"}, "start": offset},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        {
+            "filter": {"ENTITY_TYPE": entity_type, "ENTITY_ID": entity_id, **({">ID": 1052} if cursor_probe else {})},
+            "select": SELECT,
+            "order": {"ID": "ASC"},
+            "start": offset,
+        },
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
 def _row(comment_id: int, entity_type: str, entity_id: int) -> dict[str, str]:
-    return {"ID": str(comment_id), "ENTITY_TYPE": entity_type, "ENTITY_ID": str(entity_id),
-            "CREATED": "2026-09-22T10:00:00+03:00", "COMMENT": "fixture"}
+    return {
+        "ID": str(comment_id),
+        "ENTITY_TYPE": entity_type,
+        "ENTITY_ID": str(entity_id),
+        "CREATED": "2026-09-22T10:00:00+03:00",
+        "COMMENT": "fixture",
+    }
 
 
 def _fixture() -> ScriptedTransport:
-    return ScriptedTransport((
-        ScriptedExchange.json(
-            _request("deal", 71, 0),
-            {"result": [_row(value, "deal", 71) for value in DEAL_IDS[:PAGE_SIZE]], "total": len(DEAL_IDS)},
-        ),
-        ScriptedExchange.json(
-            _request("deal", 71, 50),
-            {"result": [_row(value, "deal", 71) for value in DEAL_IDS[PAGE_SIZE:]], "total": len(DEAL_IDS)},
-        ),
-        ScriptedExchange.json(
-            _request("contact", 22, 0),
-            {"result": [_row(1000, "contact", 22)], "total": 1},
-        ),
-        ScriptedExchange.json(
-            _request("lead", 999, 0), {"error": "", "error_description": "Access denied."},
-        ),
-        ScriptedExchange.json(
-            _request("deal", 71, 0, cursor_probe=True),
-            {"result": [_row(value, "deal", 71) for value in DEAL_IDS[:PAGE_SIZE]], "total": len(DEAL_IDS)},
-        ),
-    ))
+    return ScriptedTransport(
+        (
+            ScriptedExchange.json(
+                _request("deal", 71, 0),
+                {"result": [_row(value, "deal", 71) for value in DEAL_IDS[:PAGE_SIZE]], "total": len(DEAL_IDS)},
+            ),
+            ScriptedExchange.json(
+                _request("deal", 71, 50),
+                {"result": [_row(value, "deal", 71) for value in DEAL_IDS[PAGE_SIZE:]], "total": len(DEAL_IDS)},
+            ),
+            ScriptedExchange.json(
+                _request("contact", 22, 0),
+                {"result": [_row(1000, "contact", 22)], "total": 1},
+            ),
+            ScriptedExchange.json(
+                _request("lead", 999, 0),
+                {"error": "", "error_description": "Access denied."},
+            ),
+            ScriptedExchange.json(
+                _request("deal", 71, 0, cursor_probe=True),
+                {"result": [_row(value, "deal", 71) for value in DEAL_IDS[:PAGE_SIZE]], "total": len(DEAL_IDS)},
+            ),
+        )
+    )
 
 
 def _id(row: object) -> int:
@@ -119,27 +131,31 @@ async def run() -> None:
     async with Bitrix24(settings, transport=transport) as client:
         base = Request(
             METHOD,
-            {"filter": {"ENTITY_TYPE": "deal", "ENTITY_ID": 71},
-             "select": SELECT, "order": {"ID": "ASC"}},
-            replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+            {"filter": {"ENTITY_TYPE": "deal", "ENTITY_ID": 71}, "select": SELECT, "order": {"ID": "ASC"}},
+            replay_safety=ReplaySafety.SAFE,
+            route=RouteKind.BARE,
         )
         bindings = tuple(
             Binding(
                 f"{entity_type}:{entity_id}",
-                (ParameterUpdate(ParameterPath(("filter", "ENTITY_TYPE")), entity_type),
-                 ParameterUpdate(ParameterPath(("filter", "ENTITY_ID")), entity_id)),
+                (
+                    ParameterUpdate(ParameterPath(("filter", "ENTITY_TYPE")), entity_type),
+                    ParameterUpdate(ParameterPath(("filter", "ENTITY_ID")), entity_id),
+                ),
                 (entity_type, entity_id),
             )
             for entity_type, entity_id in ENTITIES
         )
         stream = client.iter_reference_outcomes(
-            base, bindings,
+            base,
+            bindings,
             traversal=SequentialTraversal(
                 selector=ResultSelector.root(),
                 identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
                 page_size=PAGE_SIZE,
                 offset=OffsetSpec(
-                    continuation=OffsetContinuation.FIXED_STEP, step=PAGE_SIZE,
+                    continuation=OffsetContinuation.FIXED_STEP,
+                    step=PAGE_SIZE,
                     total_termination=TotalTermination.EXACT_QUALIFIED,
                     page_stride=PageStride(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE),
                 ),

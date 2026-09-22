@@ -33,12 +33,15 @@ def _request(offset: int) -> Request:
 
 def _fixture() -> ScriptedTransport:
     pages = ((0, EXPECTED_IDS[:50]), (50, EXPECTED_IDS[50:]), (100, ()))
-    return ScriptedTransport(tuple(
-        ScriptedExchange.json(
-            _request(offset), {"result": {"numerators": [{"id": str(value)} for value in ids]}, "total": len(ids)},
+    return ScriptedTransport(
+        tuple(
+            ScriptedExchange.json(
+                _request(offset),
+                {"result": {"numerators": [{"id": str(value)} for value in ids]}, "total": len(ids)},
+            )
+            for offset, ids in pages
         )
-        for offset, ids in pages
-    ))
+    )
 
 
 async def run() -> None:

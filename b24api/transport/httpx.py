@@ -236,14 +236,22 @@ class HttpxTransport:
                 request_headers["content-type"] = "application/json"
                 if request.positional is not None:
                     content = json.dumps(
-                        request.positional.to_wire_slots(), ensure_ascii=False, separators=(",", ":"),
+                        request.positional.to_wire_slots(),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ).encode()
                     http_request = self._client.build_request(
-                        "POST", method_url, headers=request_headers, content=content,
+                        "POST",
+                        method_url,
+                        headers=request_headers,
+                        content=content,
                     )
                 else:
                     http_request = self._client.build_request(
-                        "POST", method_url, headers=request_headers, json=request.copy_parameters(),
+                        "POST",
+                        method_url,
+                        headers=request_headers,
+                        json=request.copy_parameters(),
                     )
             elif request.encoding is BodyEncoding.FORM_URLENCODED:
                 request_headers["content-type"] = "application/x-www-form-urlencoded"

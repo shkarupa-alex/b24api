@@ -52,14 +52,20 @@ def _request(chat: str, cursor: int) -> Request:
 
 def _fixture() -> ScriptedTransport:
     pages = (
-        ("A", 100, (9, 8)), ("A", 8, (3, 2)),
-        ("B", 100, (15, 14)), ("B", 14, (13, 12)), ("B", 12, (1,)),
-        ("C", 100, (20, 19)), ("C", 19, ()),
+        ("A", 100, (9, 8)),
+        ("A", 8, (3, 2)),
+        ("B", 100, (15, 14)),
+        ("B", 14, (13, 12)),
+        ("B", 12, (1,)),
+        ("C", 100, (20, 19)),
+        ("C", 19, ()),
     )
-    return ScriptedTransport(tuple(
-        ScriptedExchange.json(_request(chat, cursor), {"result": {"messages": [{"id": value} for value in ids]}})
-        for chat, cursor, ids in pages
-    ))
+    return ScriptedTransport(
+        tuple(
+            ScriptedExchange.json(_request(chat, cursor), {"result": {"messages": [{"id": value} for value in ids]}})
+            for chat, cursor, ids in pages
+        )
+    )
 
 
 class _Cutoff:
@@ -90,12 +96,17 @@ async def run() -> None:
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_cursors(
             _request("", HEAD),
-            tuple(Binding(chat, (ParameterUpdate(ParameterPath(("DIALOG_ID",)), chat),), chat)
-                  for chat in EXPECTED_IDS),
+            tuple(
+                Binding(chat, (ParameterUpdate(ParameterPath(("DIALOG_ID",)), chat),), chat) for chat in EXPECTED_IDS
+            ),
             selector=ResultSelector(("messages",)),
             cursor=CursorSpec(
-                ParameterPath(("LAST_ID",)), ("id",), IdentityCoercion.EXACT_INTEGER,
-                "descending", "last", domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
+                ParameterPath(("LAST_ID",)),
+                ("id",),
+                IdentityCoercion.EXACT_INTEGER,
+                "descending",
+                "last",
+                domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
                 limit_path=ParameterPath(("LIMIT",)),
             ),
             page_size=2,

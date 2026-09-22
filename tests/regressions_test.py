@@ -118,10 +118,12 @@ async def test_tolerant_batch_preserves_all_correlated_states() -> None:
     mixed = _client(FixtureTransport(mixed_handler)).batch_outcomes(
         [
             Command(
-                Request("sample.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), correlations["success"],
+                Request("sample.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+                correlations["success"],
             ),
             Command(
-                Request("sample.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), correlations["failure"],
+                Request("sample.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+                correlations["failure"],
             ),
         ],
     )
@@ -346,7 +348,10 @@ async def test_overmatched_multifield_is_not_claimed_verified() -> None:
     pages = [[{"ID": 1, "email": "a@example.invalid"}, {"ID": 2, "phone": "100"}], []]
     stream = _client(FixtureTransport(lambda _request: {"result": pages.pop(0)})).iter_list(
         Request(
-            "sample.list", {"filter": {"has_email": True, "has_phone": True}}, ReplaySafety.SAFE, route=RouteKind.BARE,
+            "sample.list",
+            {"filter": {"has_email": True, "has_phone": True}},
+            ReplaySafety.SAFE,
+            route=RouteKind.BARE,
         ),
         identity=_identity(),
     )

@@ -44,9 +44,9 @@ class BoundaryTransport:
         controls = parameters["filter"]
         assert isinstance(controls, dict)
         selected = (
-            value for value in self.ids
-            if value > controls.get(">ID", 0)
-            and (self.ignore_fence or value <= controls["<=ID"])
+            value
+            for value in self.ids
+            if value > controls.get(">ID", 0) and (self.ignore_fence or value <= controls["<=ID"])
         )
         rows = [{"id": value} for value in list(selected)[: parameters["limit"]]]
         return WireResponse(200, (), json.dumps({"result": rows}).encode())
@@ -73,8 +73,12 @@ def _setup(ids: tuple[int, ...], *, upper: int = 3, ignore_fence: bool = False):
 async def test_exact_admitted_upper_id_closes_without_empty_confirmation() -> None:
     transport, client, request, spec, identity = _setup((1, 2, 3, 4))
     stream = client.iter_list_keyset(
-        request, selector=ResultSelector.root(), identity=identity, page_size=2,
-        keyset=spec, execution=SequentialKeysetExecution(),
+        request,
+        selector=ResultSelector.root(),
+        identity=identity,
+        page_size=2,
+        keyset=spec,
+        execution=SequentialKeysetExecution(),
     )
     assert [row["id"] async for row in stream] == [1, 2, 3]
     assert len(transport.requests) == 2
@@ -90,8 +94,12 @@ async def test_exact_admitted_upper_id_closes_without_empty_confirmation() -> No
 async def test_missing_boundary_cannot_claim_completion() -> None:
     transport, client, request, spec, identity = _setup((1, 2, 4))
     stream = client.iter_list_keyset(
-        request, selector=ResultSelector.root(), identity=identity, page_size=2,
-        keyset=spec, execution=SequentialKeysetExecution(),
+        request,
+        selector=ResultSelector.root(),
+        identity=identity,
+        page_size=2,
+        keyset=spec,
+        execution=SequentialKeysetExecution(),
     )
     with pytest.raises(IncompleteTraversalError) as captured:
         _ = [row async for row in stream]
@@ -105,8 +113,12 @@ async def test_missing_boundary_cannot_claim_completion() -> None:
 async def test_ignored_server_fence_is_rejected() -> None:
     transport, client, request, spec, identity = _setup((1, 2, 3, 4), upper=2, ignore_fence=True)
     stream = client.iter_list_keyset(
-        request, selector=ResultSelector.root(), identity=identity, page_size=3,
-        keyset=spec, execution=SequentialKeysetExecution(),
+        request,
+        selector=ResultSelector.root(),
+        identity=identity,
+        page_size=3,
+        keyset=spec,
+        execution=SequentialKeysetExecution(),
     )
     with pytest.raises(IncompleteTraversalError) as captured:
         _ = [row async for row in stream]
@@ -119,14 +131,20 @@ async def test_mismatched_filter_and_auto_execution_reject_before_io() -> None:
     transport, client, request, spec, identity = _setup((1, 2, 3))
     changed = Request("item.list", {"filter": {"STATUS": "closed"}}, route=RouteKind.BARE)
     stream = client.iter_list_keyset(
-        changed, selector=ResultSelector.root(), identity=identity,
-        keyset=spec, execution=SequentialKeysetExecution(),
+        changed,
+        selector=ResultSelector.root(),
+        identity=identity,
+        keyset=spec,
+        execution=SequentialKeysetExecution(),
     )
     with pytest.raises(CapabilityError, match="fingerprint"):
         _ = [row async for row in stream]
     with pytest.raises(CapabilityError, match="not qualified"):
         client.iter_list_keyset(
-            request, selector=ResultSelector.root(), identity=identity,
-            keyset=spec, execution=AutoKeysetExecution(StableIntegerKeysetContract()),
+            request,
+            selector=ResultSelector.root(),
+            identity=identity,
+            keyset=spec,
+            execution=AutoKeysetExecution(StableIntegerKeysetContract()),
         )
     assert transport.requests == []

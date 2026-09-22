@@ -305,8 +305,10 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             page_trace_truncated=page_trace_truncated,
         )
         self._scheduler.completion.stream_terminal(
-            StreamClosure.NATURAL if state is KernelState.COMPLETED
-            else StreamClosure.CANCELLED if state is KernelState.CANCELLED
+            StreamClosure.NATURAL
+            if state is KernelState.COMPLETED
+            else StreamClosure.CANCELLED
+            if state is KernelState.CANCELLED
             else StreamClosure.EARLY_CLOSE,
         )
 

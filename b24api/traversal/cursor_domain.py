@@ -43,7 +43,8 @@ def validate_initial_cursor(request: Request, plan: ItemCursorPlan) -> IdentityV
 
 
 def cursor_probe_updates(
-    request: Request, plan: ItemCursorPlan,
+    request: Request,
+    plan: ItemCursorPlan,
 ) -> tuple[dict[ParameterPath, object], dict[ParameterPath, object]]:
     """Return two structurally valid future control updates for preflight."""
     validate_initial_cursor(request, plan)

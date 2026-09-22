@@ -53,7 +53,10 @@ def _sparse_spec(*, max_pages: int = 4) -> OffsetSpec:
         step=50,
         page_stride=stride,
         sparse_raw_bound=SparseRawBound(
-            ResultSelector(("rawTotal",)), stride, max_pages, "qualified stable raw ID order",
+            ResultSelector(("rawTotal",)),
+            stride,
+            max_pages,
+            "qualified stable raw ID order",
         ),
     )
 
@@ -100,7 +103,9 @@ async def test_sparse_raw_total_missing_invalid_or_changed_never_completes(
     client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
     stream = client.iter_list(
         Request("example.search", route=RouteKind.BARE),
-        selector=ResultSelector(("items",)), page_size=50, offset=_sparse_spec(),
+        selector=ResultSelector(("items",)),
+        page_size=50,
+        offset=_sparse_spec(),
     )
     with pytest.raises(IncompleteTraversalError) as captured:
         _ = [row async for row in stream]
@@ -115,7 +120,9 @@ async def test_sparse_raw_page_budget_prevents_unbounded_holes() -> None:
     client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
     stream = client.iter_list(
         Request("example.search", route=RouteKind.BARE),
-        selector=ResultSelector(("items",)), page_size=50, offset=_sparse_spec(max_pages=2),
+        selector=ResultSelector(("items",)),
+        page_size=50,
+        offset=_sparse_spec(max_pages=2),
     )
     with pytest.raises(BudgetExceededError):
         _ = [row async for row in stream]

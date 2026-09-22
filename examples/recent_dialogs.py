@@ -44,24 +44,28 @@ def _chat_id(row: object) -> int:
 
 def _request(offset: int) -> Request:
     return Request(
-        METHOD, {"OFFSET": offset, "LIMIT": PAGE_SIZE},
-        replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE,
+        METHOD,
+        {"OFFSET": offset, "LIMIT": PAGE_SIZE},
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
     )
 
 
 def _fixture() -> ScriptedTransport:
     pages = ((0, (10, 20), 2), (2, (20, 30), 4), (4, (40,), None), (5, (), None))
-    return ScriptedTransport(tuple(
-        ScriptedExchange.json(
-            _request(offset),
-            {
-                "result": {"items": [{"chat_id": chat_id} for chat_id in ids]},
-                "total": -1,
-                **({"next": next_offset} if next_offset is not None else {}),
-            },
+    return ScriptedTransport(
+        tuple(
+            ScriptedExchange.json(
+                _request(offset),
+                {
+                    "result": {"items": [{"chat_id": chat_id} for chat_id in ids]},
+                    "total": -1,
+                    **({"next": next_offset} if next_offset is not None else {}),
+                },
+            )
+            for offset, ids, next_offset in pages
         )
-        for offset, ids, next_offset in pages
-    ))
+    )
 
 
 async def run() -> None:

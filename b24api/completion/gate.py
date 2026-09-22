@@ -48,6 +48,7 @@ class _Stage(IntEnum):
 @dataclass(slots=True)
 class _Page:
     stage: _Stage = _Stage.SCHEDULED
+    row_count: int | None = None
 
 
 @dataclass(slots=True)
@@ -56,6 +57,9 @@ class _Binding:
     open_pages: int = 0
     negative_pages: int = 0
     unknown_pages: int = 0
+    acknowledged_pages: int = 0
+    acknowledged_rows: int = 0
+    last_acknowledged_rows: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +118,7 @@ class CompletionGate:
         self._caller_stops = 0
         self._bounded = 0
         self._stream: StreamClosure | None = None
+        self._empty_source = False
         self._cleanup: CleanupState | None = None
         self._violations: list[Violation] = []
         self._report_facts: CompletionReportFacts | None = None
@@ -127,7 +132,8 @@ class CompletionGate:
         return type(value) is int and value >= 0
 
     def _page(
-        self, event: PageCommandOutcome | PageValidated | PageDelivered | PageAcknowledged | PageRejected,
+        self,
+        event: PageCommandOutcome | PageValidated | PageDelivered | PageAcknowledged | PageRejected,
     ) -> _Page | None:
         if not self._id(event.binding_id) or not self._id(event.page_id):
             self._violate("completion_invalid_page_id")
@@ -191,6 +197,7 @@ class CompletionGate:
                 self._violate("completion_invalid_validation")
                 return
             page.stage = _Stage.VALIDATED
+            page.row_count = event.row_count
         elif isinstance(event, PageDelivered):
             page = self._page(event)
             if page is None:
@@ -207,6 +214,12 @@ class CompletionGate:
                 self._violate("completion_ack_before_delivery")
                 return
             self._acknowledged += 1
+            binding = self._bindings[event.binding_id]
+            if page.row_count is None:
+                raise RuntimeError("acknowledged page lost validated row count")
+            binding.acknowledged_pages += 1
+            binding.acknowledged_rows += page.row_count
+            binding.last_acknowledged_rows = page.row_count
             self._retire_page(event.binding_id, event.page_id)
         elif isinstance(event, PageRejected):
             page = self._page(event)
@@ -230,9 +243,30 @@ class CompletionGate:
                 self._violate("completion_unknown_binding_claimed_known")
                 return
             if binding.last_page_id < 0 and event.closure not in {
-                BindingClosure.CALLER_STOP, BindingClosure.FAILURE, BindingClosure.UNKNOWN,
+                BindingClosure.CALLER_STOP,
+                BindingClosure.FAILURE,
+                BindingClosure.UNKNOWN,
             }:
                 self._violate("completion_terminal_lacks_page_witness")
+                return
+            if event.closure is BindingClosure.SOURCE_EMPTY and binding.last_acknowledged_rows != 0:
+                self._violate("completion_missing_empty_witness")
+                return
+            if event.closure is BindingClosure.QUALIFIED_TOTAL and (
+                type(event.qualified_total) is not int
+                or event.qualified_total < 0
+                or binding.acknowledged_pages == 0
+                or binding.acknowledged_rows != event.qualified_total
+            ):
+                self._violate("completion_invalid_total_witness")
+                return
+            if event.closure is BindingClosure.SINGLE_RESPONSE and binding.acknowledged_pages != 1:
+                self._violate("completion_invalid_single_response_witness")
+                return
+            if event.closure in {BindingClosure.RAW_RANGE_COVERED, BindingClosure.BOUNDARY_SEEN} and (
+                binding.acknowledged_pages == 0
+            ):
+                self._violate("completion_missing_range_witness")
                 return
             if event.closure in {BindingClosure.FAILURE, BindingClosure.UNKNOWN}:
                 self._negative_bindings += 1
@@ -248,7 +282,13 @@ class CompletionGate:
             if not isinstance(event.closure, StreamClosure):
                 self._violate("completion_invalid_stream_terminal")
                 return
+            if type(event.empty_source) is not bool or (
+                event.empty_source and (event.closure is not StreamClosure.NATURAL or self._admitted != 0)
+            ):
+                self._violate("completion_invalid_empty_source_witness")
+                return
             self._stream = event.closure
+            self._empty_source = event.empty_source
         elif isinstance(event, CleanupOutcome):
             if self._stream is None or not isinstance(event.state, CleanupState):
                 self._violate("completion_invalid_cleanup")
@@ -270,6 +310,7 @@ class CompletionGate:
             or self._bindings
             or self._pages
             or self._scheduled != self._acknowledged + self._negative_pages
+            or (self._stream is StreamClosure.NATURAL and self._admitted == 0 and not self._empty_source)
             or self._cleanup is CleanupState.FAILURE,
         )
         if self._stream is StreamClosure.CANCELLED:
@@ -305,17 +346,29 @@ class CompletionGate:
             raise RuntimeError("only an unstarted gate can be aborted")
         sequence = self._sequence + 1
         for binding_id in tuple(self._bindings):
-            self.emit(BindingTerminal(
-                operation_id=self.operation_id, sequence=sequence,
-                binding_id=binding_id, closure=BindingClosure.CALLER_STOP,
-            ))
+            self.emit(
+                BindingTerminal(
+                    operation_id=self.operation_id,
+                    sequence=sequence,
+                    binding_id=binding_id,
+                    closure=BindingClosure.CALLER_STOP,
+                )
+            )
             sequence += 1
-        self.emit(StreamTerminal(
-            operation_id=self.operation_id, sequence=sequence, closure=StreamClosure.CANCELLED,
-        ))
-        self.emit(CleanupOutcome(
-            operation_id=self.operation_id, sequence=sequence + 1, state=CleanupState.SUCCESS,
-        ))
+        self.emit(
+            StreamTerminal(
+                operation_id=self.operation_id,
+                sequence=sequence,
+                closure=StreamClosure.CANCELLED,
+            )
+        )
+        self.emit(
+            CleanupOutcome(
+                operation_id=self.operation_id,
+                sequence=sequence + 1,
+                state=CleanupState.SUCCESS,
+            )
+        )
 
     def finish(self) -> OperationReport:
         """Build the sole strong frozen report after correlated cleanup evidence."""
@@ -338,11 +391,14 @@ class CompletionGate:
         violations = (*source.violations, *decision.violations, *facts.extra_violations)
         gate_negative = decision.state is TerminalState.COMPLETED_WITH_FAILURES
         if source.state is KernelState.COMPLETED and gate_negative != bool(negative_outcomes):
-            violations = (*violations, Violation(
-                ViolationSeverity.BLOCKING,
-                "completion_outcome_count_mismatch",
-                "public negative outcome counts disagree with completion evidence",
-            ))
+            violations = (
+                *violations,
+                Violation(
+                    ViolationSeverity.BLOCKING,
+                    "completion_outcome_count_mismatch",
+                    "public negative outcome counts disagree with completion evidence",
+                ),
+            )
             state = TerminalState.INCOMPLETE
         if state is TerminalState.COMPLETED and (
             decision.state is not TerminalState.COMPLETED

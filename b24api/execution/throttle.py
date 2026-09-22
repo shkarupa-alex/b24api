@@ -51,5 +51,3 @@ def _throttle_reason(error: B24ApiError) -> str:
     if isinstance(error, ApiResponseError):
         return error.normalized_code
     return f"http_{error.http_status}"
-
-

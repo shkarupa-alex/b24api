@@ -56,15 +56,30 @@ async def test_public_offset_traversal_emits_ordered_page_and_cleanup_evidence()
     gate.emit = observe
     assert [row["id"] async for row in stream] == [1, 2]
     assert transport.events == [
-        PageScheduled, PageCommandOutcome, PageValidated, PageDelivered, PageAcknowledged,
-        PageScheduled, PageCommandOutcome, PageValidated, PageDelivered, PageAcknowledged,
-        BindingTerminal, StreamTerminal, CleanupOutcome,
+        PageScheduled,
+        PageCommandOutcome,
+        PageValidated,
+        PageDelivered,
+        PageAcknowledged,
+        PageScheduled,
+        PageCommandOutcome,
+        PageValidated,
+        PageDelivered,
+        PageAcknowledged,
+        BindingTerminal,
+        StreamTerminal,
+        CleanupOutcome,
     ]
     decision = gate.decision()
     assert decision.state is TerminalState.COMPLETED
     assert decision.exhausted
-    assert decision.pages_scheduled == decision.pages_acknowledged == transport.calls == len(
-        [event for event in transport.events if event is PageScheduled],
+    assert (
+        decision.pages_scheduled
+        == decision.pages_acknowledged
+        == transport.calls
+        == len(
+            [event for event in transport.events if event is PageScheduled],
+        )
     )
     assert stream.report is not None
     assert stream.report.exhausted

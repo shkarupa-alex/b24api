@@ -25,17 +25,20 @@ def _fixture() -> ScriptedTransport:
     pdf = _request("crm.documentgenerator.document.getpdf", "fixture-doc")
     file = _request("rest.file.get", "fixture-file")
     denied = _request("rest.file.get", "denied-file")
-    return ScriptedTransport((
-        ScriptedExchange(pdf, WireResponse(200, (("content-type", "application/pdf"),), EXPECTED_PDF)),
-        ScriptedExchange(file, WireResponse(200, (("content-type", "application/octet-stream"),), EXPECTED_FILE)),
-        ScriptedExchange(
-            denied,
-            WireResponse(
-                403, (("content-type", "application/json"),),
-                json.dumps({"error": "ACCESS_DENIED", "error_description": "fixture denied"}).encode(),
+    return ScriptedTransport(
+        (
+            ScriptedExchange(pdf, WireResponse(200, (("content-type", "application/pdf"),), EXPECTED_PDF)),
+            ScriptedExchange(file, WireResponse(200, (("content-type", "application/octet-stream"),), EXPECTED_FILE)),
+            ScriptedExchange(
+                denied,
+                WireResponse(
+                    403,
+                    (("content-type", "application/json"),),
+                    json.dumps({"error": "ACCESS_DENIED", "error_description": "fixture denied"}).encode(),
+                ),
             ),
-        ),
-    ))
+        )
+    )
 
 
 async def run() -> None:

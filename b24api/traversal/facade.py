@@ -131,8 +131,11 @@ def sequential_stream(  # noqa: PLR0913
         )
     else:
         assurance = (
-            TraversalAssurance.RAW_RANGE_COVERED if offset.sparse_raw_bound is not None
-            else TraversalAssurance.IDENTITY_EXACT if identity is not None else TraversalAssurance.MECHANICS_ONLY
+            TraversalAssurance.RAW_RANGE_COVERED
+            if offset.sparse_raw_bound is not None
+            else TraversalAssurance.IDENTITY_EXACT
+            if identity is not None
+            else TraversalAssurance.MECHANICS_ONLY
         )
     return _plan_stream(
         executor,
@@ -226,9 +229,7 @@ def keyset_stream(  # noqa: PLR0913
         page_stop=page_stop,
         policy=policy,
         operation="iter_list_keyset",
-        assurance=(
-            TraversalAssurance.BOUNDED_RANGE_OBSERVED if keyset.boundary else TraversalAssurance.IDENTITY_EXACT
-        ),
+        assurance=(TraversalAssurance.BOUNDED_RANGE_OBSERVED if keyset.boundary else TraversalAssurance.IDENTITY_EXACT),
         deregister=deregister,
         audit_violations=audit_violations,
     )
