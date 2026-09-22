@@ -39,21 +39,23 @@ from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.sqlite_sink import SqliteMirror
 
 METHOD = "im.dialog.messages.get"
-EXPECTED = {"A": (5, 4, 3, 2, 1), "B": (15, 14, 13)}
-HEAD = 100
-FIRST_OVERLAP = 5
+EXPECTED = {"A": (105, 104, 103, 102, 101), "B": (115, 114, 113)}
+FIRST_OVERLAP = 105
 
 
-def _request(parent: str, cursor: int) -> Request:
+def _request(parent: str, cursor: int | None) -> Request:
+    params = {"DIALOG_ID": parent, "LIMIT": 2}
+    if cursor is not None:
+        params["LAST_ID"] = cursor
     return Request(
         METHOD,
-        {"DIALOG_ID": parent, "LAST_ID": cursor, "LIMIT": 2},
+        params,
         replay_safety=ReplaySafety.SAFE,
         route=RouteKind.BARE,
     )
 
 
-def _transport(pages: tuple[tuple[str, int, tuple[int, ...]], ...]) -> ScriptedTransport:
+def _transport(pages: tuple[tuple[str, int | None, tuple[int, ...]], ...]) -> ScriptedTransport:
     return ScriptedTransport(
         tuple(
             ScriptedExchange.json(
@@ -71,7 +73,7 @@ def _bindings(sink: SqliteMirror) -> tuple[Binding[str], ...]:
             parent,
             (ParameterUpdate(ParameterPath(("DIALOG_ID",)), parent),),
             parent,
-            start_cursor=sink.checkpoint(parent) or HEAD,
+            start_cursor=sink.checkpoint(parent),
         )
         for parent in EXPECTED
     )
@@ -106,7 +108,7 @@ async def _run_once(sink: SqliteMirror, transport: ScriptedTransport, *, pause_a
     commit = _Commit(sink, pause_a=pause_a)
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_cursors(
-            _request("", HEAD),
+            _request("", None),
             _bindings(sink),
             selector=ResultSelector(("messages",)),
             cursor=CursorSpec(
@@ -140,7 +142,7 @@ async def run() -> None:
     with tempfile.TemporaryDirectory(prefix="b24api-example-") as temporary:
         sink = SqliteMirror(Path(temporary) / "mirror.sqlite3")
         try:
-            first = _transport((("A", 100, (5, 4)),))
+            first = _transport((("A", None, (105, 104)),))
             first_report = await _run_once(sink, first, pause_a=True)
             if (
                 first_report.state is not TerminalState.EARLY_CLOSED
@@ -150,12 +152,12 @@ async def run() -> None:
                 raise AssertionError("scenario 7 did not preserve the committed early-close checkpoint")
             second = _transport(
                 (
-                    ("A", 5, (4, 3)),
-                    ("A", 3, (2, 1)),
-                    ("A", 1, ()),
-                    ("B", 100, (15, 14)),
-                    ("B", 14, (13,)),
-                    ("B", 13, ()),
+                    ("A", 105, (104, 103)),
+                    ("A", 103, (102, 101)),
+                    ("A", 101, ()),
+                    ("B", None, (115, 114)),
+                    ("B", 114, (113,)),
+                    ("B", 113, ()),
                 )
             )
             second_report = await _run_once(sink, second, pause_a=False)

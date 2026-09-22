@@ -28,14 +28,16 @@ from b24api.testing import ScriptedExchange, ScriptedTransport
 METHOD = "im.dialog.messages.get"
 EXPECTED_IDS = (3573, 3575, 12561, 29991, 30211)
 ASC_IDS = (3573, 3575, 30211)
-HEAD = 99999
 LIMITS = (1, 3, 50)
 
 
-def _request(control: str, cursor: int, limit: int) -> Request:
+def _request(control: str | None, cursor: int | None, limit: int) -> Request:
+    params = {"DIALOG_ID": "chat-1", "LIMIT": limit}
+    if control is not None and cursor is not None:
+        params[control] = cursor
     return Request(
         METHOD,
-        {"DIALOG_ID": "chat-1", control: cursor, "LIMIT": limit},
+        params,
         replay_safety=ReplaySafety.SAFE,
         route=RouteKind.BARE,
     )
@@ -43,13 +45,13 @@ def _request(control: str, cursor: int, limit: int) -> Request:
 
 def _descending_fixture(limit: int) -> ScriptedTransport:
     remaining = tuple(reversed(EXPECTED_IDS))
-    cursor = HEAD
+    cursor: int | None = None
     exchanges: list[ScriptedExchange] = []
     while True:
-        page = tuple(value for value in remaining if value < cursor)[:limit]
+        page = tuple(value for value in remaining if cursor is None or value < cursor)[:limit]
         exchanges.append(
             ScriptedExchange.json(
-                _request("LAST_ID", cursor, limit),
+                _request("LAST_ID" if cursor is not None else None, cursor, limit),
                 {"result": {"messages": [{"id": value} for value in page]}},
             )
         )
@@ -81,7 +83,7 @@ async def run() -> None:
         transport = _descending_fixture(limit)
         async with Bitrix24(settings, transport=transport) as client:
             stream = client.iter_list_cursor(
-                _request("LAST_ID", HEAD, limit),
+                _request(None, None, limit),
                 selector=ResultSelector(("messages",)),
                 cursor=CursorSpec(
                     ParameterPath(("LAST_ID",)),

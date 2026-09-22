@@ -35,16 +35,18 @@ from b24api import (
 from b24api.testing import ScriptedExchange, ScriptedTransport
 
 METHOD = "im.dialog.messages.get"
-EXPECTED_IDS = {"A": (9, 8, 3, 2), "B": (15, 14, 13, 12, 1), "C": (20, 19)}
+EXPECTED_IDS = {"A": (109, 108, 3, 2), "B": (115, 114, 113, 112, 1), "C": (120, 119)}
 EXPECTED_STOPS = {"A": "cutoff reached", "B": "cutoff reached", "C": None}
-HEAD = 100
 CUTOFF_ID = 3
 
 
-def _request(chat: str, cursor: int) -> Request:
+def _request(chat: str, cursor: int | None) -> Request:
+    params = {"DIALOG_ID": chat, "LIMIT": 2}
+    if cursor is not None:
+        params["LAST_ID"] = cursor
     return Request(
         METHOD,
-        {"DIALOG_ID": chat, "LAST_ID": cursor, "LIMIT": 2},
+        params,
         replay_safety=ReplaySafety.SAFE,
         route=RouteKind.BARE,
     )
@@ -52,13 +54,13 @@ def _request(chat: str, cursor: int) -> Request:
 
 def _fixture() -> ScriptedTransport:
     pages = (
-        ("A", 100, (9, 8)),
-        ("A", 8, (3, 2)),
-        ("B", 100, (15, 14)),
-        ("B", 14, (13, 12)),
-        ("B", 12, (1,)),
-        ("C", 100, (20, 19)),
-        ("C", 19, ()),
+        ("A", None, (109, 108)),
+        ("A", 108, (3, 2)),
+        ("B", None, (115, 114)),
+        ("B", 114, (113, 112)),
+        ("B", 112, (1,)),
+        ("C", None, (120, 119)),
+        ("C", 119, ()),
     )
     return ScriptedTransport(
         tuple(
@@ -95,7 +97,7 @@ async def run() -> None:
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_cursors(
-            _request("", HEAD),
+            _request("", None),
             tuple(
                 Binding(chat, (ParameterUpdate(ParameterPath(("DIALOG_ID",)), chat),), chat) for chat in EXPECTED_IDS
             ),

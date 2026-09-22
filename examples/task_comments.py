@@ -48,8 +48,7 @@ MESSAGE_METHOD = "im.dialog.messages.get"
 LEGACY_METHOD = "task.commentitem.getlist"
 TASKS = (42, 43, 44, 45)
 CHAT_IDS = {42: 900, 44: 901, 45: 902}
-HEAD = 9999
-EXPECTED_MODERN = (9, 8)
+EXPECTED_MODERN = (10009, 10008)
 EXPECTED_LEGACY = (1, 2)
 LAYOUT = PositionalLayout(
     "task.commentitem.getlist.three.v1",
@@ -71,10 +70,13 @@ def _chat_request(task_id: int) -> Request:
     )
 
 
-def _message_request(chat_id: int, cursor: int) -> Request:
+def _message_request(chat_id: int, cursor: int | None) -> Request:
+    params = {"DIALOG_ID": f"chat{chat_id}", "LIMIT": 2}
+    if cursor is not None:
+        params["LAST_ID"] = cursor
     return Request(
         MESSAGE_METHOD,
-        {"DIALOG_ID": f"chat{chat_id}", "LAST_ID": cursor, "LIMIT": 2},
+        params,
         replay_safety=ReplaySafety.SAFE,
         route=RouteKind.BARE,
     )
@@ -98,13 +100,13 @@ def _fixture() -> ScriptedTransport:
                 total=0,
             ),
             ScriptedExchange.json(
-                _message_request(900, HEAD),
+                _message_request(900, None),
                 {"result": {"messages": [{"id": value} for value in EXPECTED_MODERN]}},
             ),
-            ScriptedExchange.json(_message_request(900, 8), {"result": {"messages": []}}),
-            ScriptedExchange.json(_message_request(901, HEAD), {"result": {"messages": []}}),
+            ScriptedExchange.json(_message_request(900, 10008), {"result": {"messages": []}}),
+            ScriptedExchange.json(_message_request(901, None), {"result": {"messages": []}}),
             ScriptedExchange.json(
-                _message_request(902, HEAD),
+                _message_request(902, None),
                 {"error": "ACCESS_ERROR", "error_description": "denied"},
             ),
             ScriptedExchange.json(
@@ -151,7 +153,7 @@ async def _read_modern(client: Bitrix24, resolved: dict[int, int | None]) -> Non
         if chat_id is not None
     )
     stream = client.iter_reference_outcomes(
-        _message_request(900, HEAD),
+        _message_request(900, None),
         bindings,
         traversal=CursorTraversal(
             selector=ResultSelector(("messages",)),
@@ -180,7 +182,7 @@ async def _read_modern(client: Bitrix24, resolved: dict[int, int | None]) -> Non
             if not isinstance(outcome.error, ApiResponseError) or outcome.error.original_code != "ACCESS_ERROR":
                 raise AssertionError("scenario 6 inaccessible chat lost typed ACCESS_ERROR")
             denied.add(outcome.correlation)
-    if messages != {42: [9, 8], 44: [], 45: []} or completed != {42, 44} or denied != {45}:
+    if messages != {42: [10009, 10008], 44: [], 45: []} or completed != {42, 44} or denied != {45}:
         raise AssertionError("scenario 6 modern empty/inaccessible outcomes collapsed")
     if stream.report is None or stream.report.state is not TerminalState.COMPLETED_WITH_FAILURES:
         raise AssertionError("scenario 6 modern failure falsely claimed global completion")

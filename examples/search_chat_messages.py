@@ -34,8 +34,7 @@ from b24api.testing import ScriptedExchange, ScriptedTransport
 METHOD = "im.dialog.messages.search"
 START = "2026-09-01T00:00:00+03:00"
 END = "2026-09-22T23:59:59+03:00"
-HEAD = 9999
-EXPECTED_IDS = {101: (9, 8, 3), 102: ()}
+EXPECTED_IDS = {101: (10009, 10008, 3), 102: ()}
 
 
 def _message_id(row: object) -> int:
@@ -47,24 +46,26 @@ def _message_id(row: object) -> int:
     return int(value)
 
 
-def _request(chat_id: int, cursor: int) -> Request:
+def _request(chat_id: int, cursor: int | None) -> Request:
+    params = {
+        "CHAT_ID": chat_id,
+        "DATE_FROM": START,
+        "DATE_TO": END,
+        "ORDER": {"ID": "DESC"},
+        "LIMIT": 2,
+    }
+    if cursor is not None:
+        params["LAST_ID"] = cursor
     return Request(
         METHOD,
-        {
-            "CHAT_ID": chat_id,
-            "DATE_FROM": START,
-            "DATE_TO": END,
-            "ORDER": {"ID": "DESC"},
-            "LAST_ID": cursor,
-            "LIMIT": 2,
-        },
+        params,
         replay_safety=ReplaySafety.SAFE,
         route=RouteKind.BARE,
     )
 
 
 def _fixture() -> ScriptedTransport:
-    pages = ((101, HEAD, (9, 8)), (101, 8, (3,)), (101, 3, ()), (102, HEAD, ()))
+    pages = ((101, None, (10009, 10008)), (101, 10008, (3,)), (101, 3, ()), (102, None, ()))
     exchanges = [
         ScriptedExchange.json(
             _request(chat_id, cursor),
@@ -74,7 +75,7 @@ def _fixture() -> ScriptedTransport:
     ]
     exchanges.append(
         ScriptedExchange.json(
-            _request(103, HEAD),
+            _request(103, None),
             {"error": "ACCESS_ERROR", "error_description": "chat denied"},
         )
     )
@@ -87,7 +88,7 @@ async def run() -> None:
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_reference_outcomes(
-            _request(101, HEAD),
+            _request(101, None),
             tuple(
                 Binding(str(chat_id), (ParameterUpdate(ParameterPath(("CHAT_ID",)), chat_id),), chat_id)
                 for chat_id in (101, 102, 103)
