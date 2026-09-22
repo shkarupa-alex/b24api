@@ -1,8 +1,27 @@
-# Migrating within b24api 2.x
+# Migrating to the issues architecture
 
-This release keeps the established wire representation and transport compatibility, but changes
-the default execution of direct no-count keyset traversal from sequential to auto. Existing JSON
-requests and the `Transport.send()` protocol remain supported.
+The route is now a required part of every `Request` and closed request mapping. Existing callers
+must choose `RouteKind.BARE`, `RouteKind.JSON` or `RouteKind.API_V3`; `with_parameters()` preserves
+that choice. The CLI likewise requires `--route bare|json|api_v3` for `call`, `list` and
+`verify-keyset`. A classic webhook base must have the form `/rest/<user>/<token>/`. The transport
+resolves bare and `.json` suffixes or `/rest/api/<user>/<token>/` at dispatch. Physical batch
+inner commands accept only `BARE`; use explicit direct dispatch for other routes. V3 accepts a JSON
+body and reports object-valued API errors with typed validation details.
+
+```python
+from b24api import Request, RouteKind
+
+request = Request("profile", route=RouteKind.BARE)
+v3_request = Request("tasks.task.result.list", route=RouteKind.API_V3)
+```
+
+HTTPX INFO records for requests owned by `HttpxTransport` have their registered webhook URL
+redacted before logging handlers format them. This applies to an injected `httpx.AsyncClient` while
+it is used through that transport. Direct use of a caller-owned client after the transport closes
+is outside that shield. An application enabling the separate `httpcore` DEBUG logger needs its own
+logging policy and test; this guarantee covers the emitting `httpx` INFO logger.
+
+The earlier 2.x keyset migration notes below remain as historical guidance for that API.
 
 ## Keyset verification, cursor fan-out, and page adaptation
 

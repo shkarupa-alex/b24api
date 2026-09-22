@@ -69,7 +69,7 @@ payload conventions, public low-level execution plans or mutable global registri
 
 ## Wire, traversal, and evidence boundaries
 
-`Request` owns immutable body encoding, scoped headers, replay safety, and an optional declarative
+`Request` owns an explicit route, immutable body encoding, scoped headers, replay safety, and an optional declarative
 embedded-result error contract. Legacy transports continue to support ordinary JSON requests;
 advanced request representations require an advertised `WireTransport` capability and fail before
 I/O otherwise. No ordinary wire value can name an absolute destination.

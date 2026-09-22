@@ -27,6 +27,7 @@ from b24api.transport.base import (
     WireRequest,
     WireResponse,
 )
+from b24api.transport.logging_shield import HTTPX_LOG_SHIELD
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -166,6 +167,8 @@ class HttpxTransport:
         self._owns_client = client is None
         self._closed = False
         self._host = normalized_host
+        HTTPX_LOG_SHIELD.register_transport()
+        self._shield_finalizer = weakref.finalize(self, HTTPX_LOG_SHIELD.release_transport)
 
     @property
     def host(self) -> str:
@@ -186,17 +189,39 @@ class HttpxTransport:
             max_response_bytes=max_response_bytes,
         )
 
-    async def send_wire(  # noqa: C901, PLR0912, PLR0915
+    async def send_wire(
         self,
         request: WireRequest,
         *,
         attempt_timeout: float,
         max_response_bytes: int,
     ) -> WireResponse:
-        """Send one explicitly represented transport request attempt."""
+        """Protect the emitting HTTPX logger for one owned request."""
         if self._closed:
             raise RuntimeError("transport is closed")
         method_url = _method_url(_webhook_for(self._webhook_handle), request)
+        try:
+            with HTTPX_LOG_SHIELD.request(method_url):
+                return await self._send_wire_impl(
+                    request,
+                    method_url=method_url,
+                    attempt_timeout=attempt_timeout,
+                    max_response_bytes=max_response_bytes,
+                )
+        finally:
+            method_url = ""
+
+    async def _send_wire_impl(  # noqa: C901, PLR0912, PLR0915
+        self,
+        request: WireRequest,
+        *,
+        method_url: str,
+        attempt_timeout: float,
+        max_response_bytes: int,
+    ) -> WireResponse:
+        """Send one explicitly represented transport request attempt."""
+        if self._closed:
+            raise RuntimeError("transport is closed")
         if isinstance(max_response_bytes, bool) or max_response_bytes < 1:
             raise ValueError("max_response_bytes must be a positive integer")
         tracker = _PhaseTracker()
@@ -311,7 +336,10 @@ class HttpxTransport:
             if self._owns_client:
                 await self._client.aclose()
         finally:
-            self._webhook_finalizer()
+            try:
+                self._webhook_finalizer()
+            finally:
+                self._shield_finalizer()
 
 
 def _at_least_dispatch_started(phase: FailurePhase) -> FailurePhase:
