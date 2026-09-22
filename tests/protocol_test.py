@@ -56,6 +56,28 @@ def test_numeric_code_and_retry_classification() -> None:
     assert retryable.retryable is True
 
 
+def test_v3_object_error_keeps_dotted_validation_and_rejects_malformed() -> None:
+    codec = ProtocolCodec()
+    error = codec.error_from_http(
+        status_code=400,
+        body={"error": {
+            "code": "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION",
+            "message": "Invalid filter",
+            "validation": [{"field": "filter.taskId", "message": "Required"}],
+        }},
+    )
+    assert isinstance(error, ApiResponseError)
+    assert error.normalized_code == "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION"
+    assert error.validation[0].field == "filter.taskId"
+    assert error.retryable is False
+    malformed = codec.error_from_http(status_code=200, body={"error": {"code": "", "message": "bad"}})
+    assert isinstance(malformed, ProtocolError)
+    assert isinstance(codec.error_from_http(
+        status_code=400,
+        body={"error": {"code": "X", "message": "bad", "validation": [{"field": 3, "message": "bad"}]}},
+    ), ProtocolError)
+
+
 def test_gateway_and_protocol_evidence_are_bounded_and_redacted() -> None:
     gateway = ProtocolCodec().error_from_http(
         status_code=502,

@@ -74,6 +74,7 @@ def test_public_error_module_export_snapshot_is_static_contract_evidence() -> No
         "PageAdaptationViolation",
         "ResultShapeError",
         "TransportError",
+        "ValidationIssue",
     )
 
 
@@ -247,6 +248,7 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "TraversalIdentity",
         "UnknownRequestAudit",
         "UnknownRequestCollector",
+        "ValidationIssue",
         "Violation",
         "ViolationSeverity",
         "WireRequest",

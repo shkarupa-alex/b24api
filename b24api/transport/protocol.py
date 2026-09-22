@@ -12,6 +12,7 @@ from b24api.errors import (
     B24ApiError,
     HTTPGatewayError,
     ProtocolError,
+    ValidationIssue,
 )
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
@@ -29,6 +30,8 @@ _SAFE_HEADER_NAMES = frozenset(
     },
 )
 HTTP_ERROR_MINIMUM = 400
+_MAX_VALIDATION_ITEMS = 32
+_MAX_VALIDATION_TEXT = 256
 
 
 class ProtocolCodec:
@@ -54,6 +57,24 @@ class ProtocolCodec:
             safe_headers = self._safe_headers(headers or {})
             preview = self._body_preview(body)
             original_code = parsed["error"]
+            description: str | None
+            validation: tuple[ValidationIssue, ...] = ()
+            truncated = False
+            code_is_exact = isinstance(original_code, Mapping)
+            if isinstance(original_code, Mapping):
+                try:
+                    original_code, description, validation, truncated = self._v3_error(original_code)
+                except (TypeError, ValueError):
+                    return self._protocol_error(
+                        "Malformed V3 error object",
+                        status_code=status_code,
+                        request_summary=request_summary,
+                        headers=safe_headers,
+                        body_preview=preview,
+                    )
+            else:
+                raw_description = parsed.get("error_description")
+                description = str(raw_description) if raw_description is not None else None
             if not isinstance(original_code, str | int):
                 return self._protocol_error(
                     "Structured error code must be a string or integer",
@@ -62,8 +83,6 @@ class ProtocolCodec:
                     headers=safe_headers,
                     body_preview=preview,
                 )
-            raw_description = parsed.get("error_description")
-            description = str(raw_description) if raw_description is not None else None
             normalized = str(original_code).strip().casefold()
             normalized_retry_codes = {code.casefold() for code in retry_codes}
             return ApiResponseError(
@@ -73,6 +92,9 @@ class ProtocolCodec:
                 http_status=status_code,
                 headers=dict(safe_headers),
                 body_preview=preview,
+                validation=validation,
+                truncated=truncated,
+                code_is_exact=code_is_exact,
                 retryable=normalized in normalized_retry_codes,
                 redactor=self._redactor,
             )
@@ -105,6 +127,30 @@ class ProtocolCodec:
                 body_preview=preview,
             )
         return None
+
+    def _v3_error(self, value: Mapping[str, Any]) -> tuple[str, str, tuple[ValidationIssue, ...], bool]:
+        code = value.get("code")
+        message = value.get("message")
+        issues = value.get("validation", [])
+        if not isinstance(code, str) or not code.strip() or not isinstance(message, str):
+            raise ValueError("V3 code and message must be non-empty strings")
+        if not isinstance(issues, list):
+            raise TypeError("V3 validation must be a list")
+        bounded: list[ValidationIssue] = []
+        truncated = len(issues) > _MAX_VALIDATION_ITEMS or len(message) > _MAX_VALIDATION_TEXT
+        for issue in issues[:_MAX_VALIDATION_ITEMS]:
+            if not isinstance(issue, Mapping):
+                raise TypeError("V3 validation item must be an object")
+            field = issue.get("field")
+            detail = issue.get("message")
+            if not isinstance(field, str) or not isinstance(detail, str):
+                raise TypeError("V3 validation field and message must be strings")
+            truncated |= len(field) > _MAX_VALIDATION_TEXT or len(detail) > _MAX_VALIDATION_TEXT
+            bounded.append(ValidationIssue(
+                self._redactor.redact_text(field[:_MAX_VALIDATION_TEXT]),
+                self._redactor.redact_text(detail[:_MAX_VALIDATION_TEXT]),
+            ))
+        return code, message[:_MAX_VALIDATION_TEXT], tuple(bounded), truncated
 
     @staticmethod
     def _parse_body(body: bytes | str | Mapping[str, Any] | None) -> tuple[object, bool]:

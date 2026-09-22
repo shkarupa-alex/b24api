@@ -121,6 +121,7 @@ from b24api.errors import (
     ResponseTooLargeError,
     ResultShapeError,
     TransportError,
+    ValidationIssue,
 )
 from b24api.settings import Settings
 from b24api.transport import Transport, TransportCapabilities, WireRequest, WireResponse, WireTransport
@@ -242,6 +243,7 @@ __all__ = [
     "TraversalIdentity",
     "UnknownRequestAudit",
     "UnknownRequestCollector",
+    "ValidationIssue",
     "Violation",
     "ViolationSeverity",
     "WireRequest",

@@ -1,6 +1,7 @@
 """Redacted Bitrix24 error hierarchy."""
 
 from __future__ import annotations
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -125,6 +126,14 @@ class ProtocolError(B24ApiError):
     default_origin = ErrorOrigin.PROTOCOL
 
 
+@dataclass(frozen=True, slots=True)
+class ValidationIssue:
+    """One redacted V3 validation location and message."""
+
+    field: str
+    message: str
+
+
 class ApiResponseError(B24ApiError):
     """Structured Bitrix REST error with committed `.code` semantics."""
 
@@ -137,6 +146,9 @@ class ApiResponseError(B24ApiError):
         http_status: int | None = None,
         headers: Mapping[str, str] | None = None,
         body_preview: str | None = None,
+        validation: tuple[ValidationIssue, ...] = (),
+        truncated: bool = False,
+        code_is_exact: bool = False,
         origin: ErrorOrigin = ErrorOrigin.REST_MODULE,
         retryable: bool = False,
         redactor: Redactor = DEFAULT_REDACTOR,
@@ -144,8 +156,10 @@ class ApiResponseError(B24ApiError):
         """Initialize instance state."""
         self.original_code = code
         self.code = str(code).lower()
-        self.normalized_code = str(code).strip().casefold()
+        self.normalized_code = str(code) if code_is_exact else str(code).strip().casefold()
         self.wire_code = redactor.redact_text(str(code))
+        self.validation = tuple(validation)
+        self.truncated = truncated
         summary = request_summary
         safe_description = redactor.redact_text(description) if description is not None else None
         rendered_code = self.wire_code
@@ -187,6 +201,8 @@ class ApiResponseError(B24ApiError):
                 "code": DEFAULT_REDACTOR.redact_text(self.code),
                 "normalized_code": DEFAULT_REDACTOR.redact_text(self.normalized_code),
                 "wire_code": self.wire_code,
+                "validation": [{"field": issue.field, "message": issue.message} for issue in self.validation],
+                "truncated": self.truncated,
             },
         )
         return safe
@@ -503,5 +519,6 @@ _PUBLIC_ERROR_NAMES = (
     "CapabilityError EnvelopeContractError ErrorOrigin FailurePhase HTTPGatewayError IdentityContractError "
     "IncompleteTraversalError InputSourceError PaginationError ProtocolError ReferenceFailed ResponseTooLargeError "
     "KeysetCapabilityError PageAdaptationError PageAdaptationViolation ResultShapeError TransportError"
+    " ValidationIssue"
 )
 __all__ = tuple(_PUBLIC_ERROR_NAMES.split())
