@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 from b24api.contracts.report import PageDispatch, PageRejectionCode
-from b24api.errors import CapabilityError, PaginationError
+from b24api.errors import BudgetExceededError, CapabilityError, PaginationError
 from b24api.execution import (
     WorkClass,
 )
@@ -18,6 +18,7 @@ from b24api.traversal.identity import (
     _PageRejectionError,
     _request_with_controls,
 )
+from b24api.traversal.sparse import sparse_page_terminal
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -71,11 +72,19 @@ class _SequentialMixin:
         item_weights = (qualified_count,) if self._single_result_as_item else (1,) * len(items)
         yield _Page(tuple(items), response, item_weights, continuing=False)
 
-    async def _offset(self: Any, plan: OffsetSequentialPlan) -> AsyncGenerator[_Page]:
-        offset = _initial_offset(self.request, plan.offset_path)
+    async def _offset(  # noqa: C901, PLR0912 - one ordered page transaction with two closure variants
+        self: Any, plan: OffsetSequentialPlan,
+    ) -> AsyncGenerator[_Page]:
+        offset = _initial_offset(self.request, plan.offset_path, default=plan.initial_control)
+        sparse = plan.sparse_raw_bound
+        if sparse is not None and offset != 0:
+            raise CapabilityError("sparse raw traversal requires the complete range from offset zero")
+        expected_raw_total: int | None = None
         self.cursor_state = offset
         visited_offsets: set[int] = set()
         while True:
+            if sparse is not None and len(visited_offsets) >= sparse.max_pages:
+                raise BudgetExceededError("sparse raw page budget exhausted")
             if offset in visited_offsets:
                 raise PaginationError("offset cycle detected")
             visited_offsets.add(offset)
@@ -95,13 +104,15 @@ class _SequentialMixin:
             items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
-                terminal = _offset_terminal(
-                    plan,
-                    response,
-                    page_size=len(items),
-                    accepted=self.validated_rows + len(items),
-                    confirmation=self._confirmation_policy,
-                )
+                if sparse is None:
+                    terminal = _offset_terminal(
+                        plan, response, page_size=len(items), accepted=self.validated_rows + len(items),
+                        confirmation=self._confirmation_policy,
+                    )
+                else:
+                    terminal, expected_raw_total = sparse_page_terminal(
+                        sparse, response, offset=offset, previous_total=expected_raw_total,
+                    )
                 next_offset = (
                     None if terminal is not None else _next_offset(plan, response, current=offset, observed=len(items))
                 )

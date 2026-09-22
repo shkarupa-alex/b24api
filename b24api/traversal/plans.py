@@ -17,7 +17,7 @@ from b24api.contracts.request import (
     ParameterPath,
     ResultSelector,
 )
-from b24api.contracts.traversal import OffsetContinuation, SplitOrderSpec
+from b24api.contracts.traversal import OffsetContinuation, SparseRawBound, SplitOrderSpec
 
 PORTAL_BATCH_CAP = 50
 _START_PATH = ParameterPath(("start",))
@@ -31,6 +31,7 @@ class OffsetTerminalRule(StrEnum):
 
     EMPTY_PAGE = "empty_page"
     QUALIFIED_TOTAL = "qualified_total"
+    SPARSE_RAW_BOUND = "sparse_raw_bound"
 
 
 class CountedOffsetMode(StrEnum):
@@ -107,6 +108,8 @@ class OffsetSequentialPlan(PlanContract):
     terminal: frozenset[OffsetTerminalRule] = frozenset({OffsetTerminalRule.EMPTY_PAGE})
     allow_create_controls: bool = True
     fixed_step: int | None = None
+    initial_control: int = 0
+    sparse_raw_bound: SparseRawBound | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -130,6 +133,14 @@ class OffsetSequentialPlan(PlanContract):
                 raise ValueError("fixed-step continuation requires a positive fixed_step")
         elif self.fixed_step is not None:
             raise ValueError("fixed_step is valid only for fixed-step continuation")
+        if not _is_plain_int(self.initial_control) or self.initial_control < 0:
+            raise ValueError("initial_control must be a non-negative integer")
+        if self.sparse_raw_bound is not None and (
+            self.continuation is not OffsetContinuation.FIXED_STEP
+            or self.fixed_step != self.sparse_raw_bound.stride.wire_increment
+            or self.terminal != frozenset({OffsetTerminalRule.SPARSE_RAW_BOUND})
+        ):
+            raise ValueError("sparse raw bound requires its fixed stride and exclusive closure rule")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

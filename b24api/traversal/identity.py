@@ -206,25 +206,25 @@ def _replace_owned_control(  # noqa: C901, PLR0912 - exact nested path replaceme
         current[final] = replacement
 
 
-def _initial_offset(request: Request, path: ParameterPath) -> int:
-    """Return a caller-supplied lexical offset, or the canonical zero default."""
+def _initial_offset(request: Request, path: ParameterPath, *, default: int = 0) -> int:
+    """Return a caller-supplied lexical control or its qualified default."""
     current: object = request.copy_parameters()
     for part in path.path:
         if isinstance(part, str):
             if not isinstance(current, dict):
-                return 0
+                return default
             matches = [key for key in current if key.casefold() == part.casefold()]
             if len(matches) > 1:
                 raise CapabilityError("request contains an ambiguous initial offset path")
             if not matches:
-                return 0
+                return default
             current = current[matches[0]]
         else:
             if not isinstance(current, list) or part >= len(current):
-                return 0
+                return default
             current = current[part]
-    if not isinstance(current, int) or isinstance(current, bool) or current < 0:
-        raise CapabilityError("initial offset must be a non-negative integer")
+    if not isinstance(current, int) or isinstance(current, bool) or current < default:
+        raise CapabilityError("initial traversal control is outside its admitted range")
     return current
 
 

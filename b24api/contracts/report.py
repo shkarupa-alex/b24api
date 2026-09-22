@@ -68,6 +68,7 @@ class TraversalAssurance(StrEnum):
     IDENTITY_EXACT = "identity_exact"
     COUNT_MATCHED = "count_matched"
     IDENTITY_AND_COUNT_MATCHED = "identity_and_count_matched"
+    RAW_RANGE_COVERED = "raw_range_covered"
 
 
 class PageDispatch(StrEnum):
@@ -274,6 +275,14 @@ class KeysetExecutionReport:
             raise ValueError(f"{field} must contain declared enums and non-negative integer counts")
 
 
+def _validated_exhausted(state: TerminalState, *, value: bool | None) -> bool:
+    if value is None:
+        return state is TerminalState.COMPLETED
+    if not isinstance(value, bool) or (value and state is not TerminalState.COMPLETED):
+        raise ValueError("only a fully completed operation may be exhausted")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class OperationReport:
     """Bounded redacted counters frozen after cleanup."""
@@ -281,6 +290,7 @@ class OperationReport:
     state: TerminalState
     operation: str
     terminal_reason: str
+    exhausted: bool | None = None
     assurance: TraversalAssurance | None = None
     admitted: int = 0
     emitted: int = 0
@@ -311,6 +321,7 @@ class OperationReport:
             raise TypeError("assurance must be a TraversalAssurance or None")
         if not self.operation or not self.terminal_reason:
             raise ValueError("operation and terminal_reason must be non-empty")
+        object.__setattr__(self, "exhausted", _validated_exhausted(self.state, value=self.exhausted))
         counters = (
             self.admitted,
             self.emitted,
@@ -349,14 +360,9 @@ class OperationReport:
         return self.state is TerminalState.COMPLETED
 
     @property
-    def exhausted(self) -> bool:
-        """Whether the declared source was naturally exhausted."""
-        return self.state in {TerminalState.COMPLETED, TerminalState.COMPLETED_WITH_FAILURES}
-
-    @property
     def partial(self) -> bool:
         """Whether the operation ended before complete success/exhaustion."""
-        return not self.exhausted
+        return not self.successful or not self.exhausted
 
 
 def retain_page_trace(records: tuple[PageRecord, ...], limit: int) -> tuple[tuple[PageRecord, ...], bool]:

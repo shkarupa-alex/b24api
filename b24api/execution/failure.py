@@ -109,15 +109,17 @@ def finalize_failure[R](
     state: object = TerminalState.INCOMPLETE if failure.incomplete else TerminalState.FAILED
     if isinstance(getattr(report, "state", None), KernelState):
         state = KernelState.INCOMPLETE if failure.incomplete else KernelState.FAILED
+    changes: dict[str, object] = {
+        "state": state,
+        "terminal_reason": terminal_reason or operation,
+        "violations": violations,
+    }
+    if hasattr(report, "exhausted"):
+        changes["exhausted"] = False
     try:
         frozen = cast(
             "R",
-            replace(
-                cast("Any", report),
-                state=state,
-                terminal_reason=terminal_reason or operation,
-                violations=violations,
-            ),
+            replace(cast("Any", report), **changes),
         )
     except Exception as finalization_error:  # noqa: BLE001
         finalization_error.__context__ = error.__context__

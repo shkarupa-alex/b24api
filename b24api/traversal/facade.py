@@ -38,6 +38,7 @@ from b24api.traversal.keyset_eligibility import validate_fast_keyset
 from b24api.traversal.keyset_fast_stream import FastTraceRecorder, KeysetFastStream
 from b24api.traversal.keyset_scheduler import KeysetFastScheduler
 from b24api.traversal.keyset_step import sequential_keyset_plan
+from b24api.traversal.offset_rules import offset_terminal_rules
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
@@ -45,7 +46,6 @@ from b24api.traversal.plans import (
     ItemCursorPlan,
     KeysetPlan,
     OffsetSequentialPlan,
-    OffsetTerminalRule,
 )
 from b24api.traversal.stream import iter_list as _iter_list
 from b24api.traversal.values import _MappingValuesResultSelector, _TolerantMappingValuesResultSelector
@@ -108,19 +108,26 @@ def sequential_stream(  # noqa: PLR0913
     audit_violations: tuple[Violation, ...] = (),
 ) -> OperationStream[JsonValue]:
     """Compose conservative sequential offset/server-next traversal."""
-    if offset.continuation is OffsetContinuation.FIXED_STEP and offset.step != page_size:
+    if offset.continuation is OffsetContinuation.FIXED_STEP and offset.page_stride is None and offset.step != page_size:
         raise ValueError("fixed-step traversal requires page_size equal to step")
+    stride = offset.page_stride
+    if stride is not None and page_size != stride.max_decoded_rows:
+        raise ValueError("page_size must match page_stride max_decoded_rows")
+    if stride is not None and stride.requested_wire_limit is not None and offset.limit_path is None:
+        raise ValueError("requested wire limit requires a limit_path")
+    page_index = offset.page_index
+    if page_index is not None and page_size != page_index.max_rows:
+        raise ValueError("page_size must match page_index max_rows")
+    wire_limit = stride.requested_wire_limit if stride and stride.requested_wire_limit else page_size
     plan = OffsetSequentialPlan(
         offset_path=offset.parameter_path,
         limit_path=offset.limit_path,
-        requested_page_size=page_size if offset.limit_path is not None else None,
-        continuation=offset.continuation,
-        fixed_step=offset.step,
-        terminal=(
-            frozenset({OffsetTerminalRule.EMPTY_PAGE})
-            if offset.total_termination is TotalTermination.DISABLED
-            else frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL})
-        ),
+        requested_page_size=wire_limit if offset.limit_path is not None else None,
+        continuation=OffsetContinuation.FIXED_STEP if page_index else offset.continuation,
+        fixed_step=page_index.increment if page_index else offset.step,
+        initial_control=page_index.initial if page_index else 0,
+        sparse_raw_bound=offset.sparse_raw_bound,
+        terminal=offset_terminal_rules(offset),
         allow_create_controls=offset.allow_create_controls,
         identity_requirement=IdentityRequirement.OPTIONAL,
         duplicate_policy=DuplicatePolicy.ERROR,
@@ -135,7 +142,10 @@ def sequential_stream(  # noqa: PLR0913
             TraversalAssurance.IDENTITY_AND_COUNT_MATCHED if identity is not None else TraversalAssurance.COUNT_MATCHED
         )
     else:
-        assurance = TraversalAssurance.IDENTITY_EXACT if identity is not None else TraversalAssurance.MECHANICS_ONLY
+        assurance = (
+            TraversalAssurance.RAW_RANGE_COVERED if offset.sparse_raw_bound is not None
+            else TraversalAssurance.IDENTITY_EXACT if identity is not None else TraversalAssurance.MECHANICS_ONLY
+        )
     return _plan_stream(
         executor,
         request,
@@ -245,12 +255,14 @@ def counted_stream(  # noqa: PLR0913
     """Compose exact direct-head plus physically batched counted traversal."""
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         raise ValueError("page_size must be a positive integer")
+    if offset.page_index is not None:
+        raise ValueError("counted physical batch does not support page_index")
     if offset.total_termination is not TotalTermination.EXACT_QUALIFIED:
         raise ValueError("counted traversal requires exact-qualified total termination")
     if offset.continuation is OffsetContinuation.FIXED_STEP and offset.step != page_size:
         raise ValueError("fixed-step traversal requires page_size equal to step")
     canonical = canonical_request(request)
-    if canonical.encoding is not BodyEncoding.JSON or canonical.headers.items:
+    if canonical.encoding is not BodyEncoding.JSON or canonical.headers.items or canonical.positional is not None:
         raise CapabilityError("counted traversal supports JSON requests without scoped headers")
     executor._preflight_request(canonical)  # noqa: SLF001 - operation-wide preflight before stream construction
     plan = CountedOffsetPlan(

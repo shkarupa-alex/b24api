@@ -78,7 +78,7 @@ from b24api.traversal.values import (
     _compare_identities,
     _extract_path,
     _mapping_shape_degraded,
-    _page_fingerprint,
+    _page_fingerprint_policy,
     _response_items,
     _validate_order,
 )
@@ -337,7 +337,9 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         second: dict[ParameterPath, object] = {}
         allow_create = getattr(self.plan, "allow_create_controls", True)
         if isinstance(self.plan, OffsetSequentialPlan):
-            initial_offset = _initial_offset(self.request, self.plan.offset_path)
+            initial_offset = _initial_offset(
+                self.request, self.plan.offset_path, default=self.plan.initial_control,
+            )
             first[self.plan.offset_path] = initial_offset
             second[self.plan.offset_path] = initial_offset + 1
         elif isinstance(self.plan, CountedOffsetPlan):
@@ -465,8 +467,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                     message="mapping collection terminated as an empty sequence",
                 ),
             )
-        fingerprint = _page_fingerprint(items)
-        if fingerprint in self._fingerprints:
+        fingerprint, track_fingerprint = _page_fingerprint_policy(items, self.plan)
+        if fingerprint in self._fingerprints and track_fingerprint:
             raise _PageRejectionError(
                 "repeated page fingerprint detected",
                 PageRejectionCode.REPEATED_FINGERPRINT,
@@ -479,7 +481,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             self._validate_total_not_overshot()
             if terminal:
                 self._validate_terminal_total()
-            self._fingerprints.add(fingerprint)
+            self._fingerprints.update((fingerprint,) if track_fingerprint else ())
             self._record_committed_page(items, response)
             return []
         identities = self._extract_identities(items) if identities is None else identities
@@ -519,7 +521,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             self._store.add(value)
         if identities:
             self._last_identity = identities[-1]
-        self._fingerprints.add(fingerprint)
+        self._fingerprints.update((fingerprint,) if track_fingerprint else ())
         self._record_committed_page(items, response)
         return identities
 

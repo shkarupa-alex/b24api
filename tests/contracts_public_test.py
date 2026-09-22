@@ -206,9 +206,11 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "PageAdaptationViolation",
         "PageAdapter",
         "PageDispatch",
+        "PageIndex",
         "PageOutcome",
         "PageRecord",
         "PageRejectionCode",
+        "PageStride",
         "PageView",
         "PaginationError",
         "ParameterPath",
@@ -246,6 +248,7 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "Settings",
         "SlotContract",
         "SlotShape",
+        "SparseRawBound",
         "SplitOrderSpec",
         "StableIntegerKeysetContract",
         "TerminalState",
@@ -482,3 +485,6 @@ def test_operation_report_terminal_properties_are_explicit() -> None:
     assert not partial.successful
     assert not partial.exhausted
     assert partial.partial
+    with_failures = OperationReport(TerminalState.COMPLETED_WITH_FAILURES, "batch", "some commands failed")
+    assert not with_failures.exhausted
+    assert with_failures.partial

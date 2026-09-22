@@ -36,6 +36,16 @@ declares exact arity, each slot's shape, fixed slots, and case-sensitive writabl
 `write_control()` returns a new value and rejects an undeclared or missing path. Positional
 requests use a top-level JSON array; form encoding and physical batch reject them before I/O.
 
+For one-based page controls, pass `OffsetSpec(parameter_path=path, page_index=PageIndex(path,
+initial=1, increment=1, max_rows=10))` to `iter_list(..., page_size=10)`. The wire control
+advances by one even when a page selects fewer than ten rows. An empty page is the terminal
+witness. `PageStride` records a method's qualified server offset granularity separately from its
+decoded row cap and rejects increments that would alias a rounded server page. For a sparse
+selected result, `SparseRawBound` adds an exact raw total path, fixed stride, finite page budget,
+and stable-order contract; empty selected pages remain traversable until the raw range is covered.
+This is structural coverage, so its report uses `RAW_RANGE_COVERED` rather than claiming a
+snapshot of a mutable source.
+
 The earlier 2.x keyset migration notes below remain as historical guidance for that API.
 
 ## Keyset verification, cursor fan-out, and page adaptation
