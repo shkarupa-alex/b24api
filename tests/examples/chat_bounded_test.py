@@ -20,6 +20,7 @@ def test_recipe_uses_only_public_client_exports() -> None:
         "page_index_members.py",
         "sparse_user_search.py",
         "elapsed_task_items.py",
+        "numerator_list.py",
     ):
         source = (ROOT / "examples" / recipe).read_text()
         imports = (node.module for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ImportFrom))

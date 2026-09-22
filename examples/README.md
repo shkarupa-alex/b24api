@@ -14,6 +14,7 @@ requests.
 | 12 | `page_index_members` | supported offline | Both one-based controls advance 1/2/3 and return 13 exact user IDs |
 | 13 | `elapsed_task_items` | supported offline | Five exact JSON slots, task-scoped 50/3/empty pages and 53 IDs |
 | 16 | `binary_download` | supported offline | Exact PDF/file bytes and media types; denied JSON remains `ApiResponseError` |
+| 17 | `numerator_list` | supported offline | Fixed offsets 0/50/100; 53 IDs despite page-local totals |
 | 19 | `v3_task_results` | supported offline | Exact task result ID, object-valued validation error, unchanged failed-parent checkpoint |
 
 The remaining scenarios in `spec/2026-09-22-b24api-issues-architecture/examples-contracts.md`
