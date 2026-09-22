@@ -86,3 +86,31 @@ def test_gate_rejects_delivery_before_validation() -> None:
     gate.emit(CleanupOutcome(operation_id="run", sequence=4, state=CleanupState.SUCCESS))
     assert gate.finish().state is TerminalState.INCOMPLETE
     assert gate.finish().violations[0].code == "completion_delivery_before_validation"
+
+
+def test_gate_cannot_turn_a_failed_page_into_a_successful_binding() -> None:
+    gate = CompletionGate("run")
+    gate.emit(BindingAdmitted(operation_id="run", sequence=0, binding_id=0))
+    gate.emit(PageScheduled(operation_id="run", sequence=1, binding_id=0, page_id=0))
+    gate.emit(PageCommandOutcome(
+        operation_id="run", sequence=2, binding_id=0, page_id=0, outcome=CommandSettlement.FAILURE,
+    ))
+    gate.emit(BindingTerminal(operation_id="run", sequence=3, binding_id=0, closure=BindingClosure.SOURCE_EMPTY))
+    gate.emit(StreamTerminal(operation_id="run", sequence=4, closure=StreamClosure.NATURAL))
+    gate.emit(CleanupOutcome(operation_id="run", sequence=5, state=CleanupState.SUCCESS))
+    decision = gate.finish()
+    assert decision.state is TerminalState.INCOMPLETE
+    assert decision.violations[0].code == "completion_negative_binding_claimed_success"
+
+
+def test_gate_accounts_for_all_failed_bindings_without_claiming_exhaustion() -> None:
+    gate = CompletionGate("run")
+    gate.emit(BindingAdmitted(operation_id="run", sequence=0, binding_id=0))
+    gate.emit(PageScheduled(operation_id="run", sequence=1, binding_id=0, page_id=0))
+    gate.emit(PageCommandOutcome(
+        operation_id="run", sequence=2, binding_id=0, page_id=0, outcome=CommandSettlement.FAILURE,
+    ))
+    _close(gate, 3, BindingClosure.FAILURE)
+    decision = gate.finish()
+    assert decision.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert not decision.exhausted

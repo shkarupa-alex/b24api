@@ -43,6 +43,8 @@ class _Page:
 class _Binding:
     last_page_id: int = -1
     open_pages: int = 0
+    negative_pages: int = 0
+    unknown_pages: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,8 +140,10 @@ class CompletionGate:
                 page.stage = _Stage.SETTLED
             else:
                 self._negative_pages += 1
+                self._bindings[event.binding_id].negative_pages += 1
                 if event.outcome is CommandSettlement.UNKNOWN:
                     self._unknown += 1
+                    self._bindings[event.binding_id].unknown_pages += 1
                 self._retire_page(event.binding_id, event.page_id)
         elif isinstance(event, PageValidated):
             page = self._page(event)
@@ -179,11 +183,24 @@ class CompletionGate:
                 self._violate("completion_rejection_after_delivery")
                 return
             self._negative_pages += 1
+            self._bindings[event.binding_id].negative_pages += 1
             self._retire_page(event.binding_id, event.page_id)
         elif isinstance(event, BindingTerminal):
             binding = self._bindings.get(event.binding_id)
             if binding is None or binding.open_pages or not isinstance(event.closure, BindingClosure):
                 self._violate("completion_invalid_binding_terminal")
+                return
+            if binding.negative_pages and event.closure not in {BindingClosure.FAILURE, BindingClosure.UNKNOWN}:
+                self._violate("completion_negative_binding_claimed_success")
+                return
+            if binding.unknown_pages and event.closure is not BindingClosure.UNKNOWN:
+                self._violate("completion_unknown_binding_claimed_known")
+                return
+            if not binding.negative_pages and event.closure in {BindingClosure.FAILURE, BindingClosure.UNKNOWN}:
+                self._violate("completion_negative_terminal_lacks_evidence")
+                return
+            if binding.last_page_id < 0 and event.closure != BindingClosure.CALLER_STOP:
+                self._violate("completion_terminal_lacks_page_witness")
                 return
             if event.closure in {BindingClosure.FAILURE, BindingClosure.UNKNOWN}:
                 self._negative_bindings += 1
