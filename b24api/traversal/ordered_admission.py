@@ -46,9 +46,8 @@ def drain_complete_lanes(  # noqa: PLR0913
                     warnings=(),
                 ),
             )
-            anchor = lane.spec.retained_upper_anchor if lane.status is LaneStatus.CLOSED else None
-            for index, (command_id, count) in enumerate(commands):
-                trace_admit(command_id, count + int(anchor is not None and index == len(commands) - 1))
+            for command_id, count in commands:
+                trace_admit(command_id, count)
             rows.clear()
             identities.clear()
             commands.clear()

@@ -1344,6 +1344,7 @@ async def test_client_closes_active_stream_before_owned_transport_but_not_inject
 
     assert stream.report is not None
     assert stream.report.state is TerminalState.EARLY_CLOSED
+    assert stream._source.completion_gate.finish() == stream.report  # noqa: SLF001 - gate ownership assertion
     assert not transport.closed
     with pytest.raises(RuntimeError, match="client is closed"):
         await client.call(Request("test.get", route=RouteKind.BARE))

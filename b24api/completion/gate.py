@@ -299,6 +299,24 @@ class CompletionGate:
             raise RuntimeError("completion report facts must be attached once")
         self._report_facts = facts
 
+    def abort_unstarted(self) -> None:
+        """Close a lazy operation that was never pulled, without claiming exhaustion."""
+        if self._stream is not None or self._pages:
+            raise RuntimeError("only an unstarted gate can be aborted")
+        sequence = self._sequence + 1
+        for binding_id in tuple(self._bindings):
+            self.emit(BindingTerminal(
+                operation_id=self.operation_id, sequence=sequence,
+                binding_id=binding_id, closure=BindingClosure.CALLER_STOP,
+            ))
+            sequence += 1
+        self.emit(StreamTerminal(
+            operation_id=self.operation_id, sequence=sequence, closure=StreamClosure.CANCELLED,
+        ))
+        self.emit(CleanupOutcome(
+            operation_id=self.operation_id, sequence=sequence + 1, state=CleanupState.SUCCESS,
+        ))
+
     def finish(self) -> OperationReport:
         """Build the sole strong frozen report after correlated cleanup evidence."""
         decision = self.decision()

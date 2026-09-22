@@ -297,3 +297,15 @@ def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
         for node in transactions.body
         if isinstance(node, assignments)
     )
+
+
+def test_only_completion_gate_constructs_terminal_operation_reports() -> None:
+    constructors = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in _sources()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "OperationReport"
+    }
+    assert constructors == {"completion/gate.py"}

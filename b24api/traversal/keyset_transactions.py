@@ -7,6 +7,7 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 from b24api.batch.outcome import BatchSuccess
+from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
 from b24api.errors import BudgetExceededError, PageAdaptationError, PaginationError
@@ -81,6 +82,8 @@ async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation tran
     try:
         await scheduler.adjust_buffer(reserved_rows)
         charged_rows = reserved_rows
+        for plan in plans:
+            scheduler.completion_recorder.schedule(plan.command_id)
         advisory = (
             all(plan.phase is KeysetPhase.BOUNDARY for plan in plans)
             and getattr(getattr(scheduler.execution, "total_hint", None), "value", None) == "request_advisory"
@@ -92,6 +95,11 @@ async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation tran
             strict_envelope=True,
             strict_json_members=True,
         )
+        for plan, outcome in zip(plans, outcomes, strict=True):
+            scheduler.completion_recorder.settle(
+                plan.command_id,
+                CommandSettlement.SUCCESS if isinstance(outcome, BatchSuccess) else CommandSettlement.FAILURE,
+            )
         scheduler.transactions.boundary_totals = boundary_totals(plans, outcomes)
         scheduler.batch_requests += 1
         scheduler.batch_commands += len(plans)
@@ -144,6 +152,7 @@ async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation tran
                     violation=receipt.violation,
                 )
             else:
+                scheduler.completion_recorder.validated(plan.command_id, receipt.identities)
                 receipts.append(receipt)
         if failed:
             successful = {receipt.command_id: receipt for receipt in receipts}
@@ -186,7 +195,7 @@ async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation tran
         await scheduler.adjust_buffer(-min(charged_rows, scheduler.transactions.buffer_balance))
 
 
-async def execute_body_wave(scheduler: KeysetFastScheduler) -> None:
+async def execute_body_wave(scheduler: KeysetFastScheduler) -> None:  # noqa: PLR0912
     """Advance one bounded group without letting a later lane outrun the frontier."""
     open_lanes = [
         lane
@@ -258,9 +267,12 @@ async def execute_body_wave(scheduler: KeysetFastScheduler) -> None:
             row = scheduler.transactions.anchor_rows.pop(anchor, None)
             if row is None:
                 raise PaginationError("partition lane lost its retained anchor")
-            scheduler.transactions.anchor_commands.pop(anchor, None)
+            anchor_command = scheduler.transactions.anchor_commands.pop(anchor, None)
+            if anchor_command is None:
+                raise PaginationError("partition lane lost its retained anchor command")
             scheduler.transactions.lane_rows[lane.spec.ordinal].append(row)
             scheduler.transactions.lane_identities[lane.spec.ordinal].append(anchor)
+            scheduler.transactions.lane_commands[lane.spec.ordinal].append((anchor_command, 1))
             lane.witness = ClosureWitness.ANCHOR_FENCE
             scheduler.transactions.closures[ClosureWitness.ANCHOR_FENCE] += 1
         else:
@@ -297,7 +309,9 @@ async def execute_finish_page(
     reservation = await scheduler.context.reserve_page()
     try:
         await scheduler.adjust_buffer(scheduler.effective_page_cap)
+        scheduler.completion_recorder.schedule(plan.command_id)
         response = await scheduler.executor.execute(request, context=scheduler.context)
+        scheduler.completion_recorder.settle(plan.command_id, CommandSettlement.SUCCESS)
         scheduler.context.commit_page(reservation)
         outcome = BatchSuccess(0, "finish", request, response.result, response=response)
         receipt = validate_lane_receipt(
@@ -331,6 +345,7 @@ async def execute_finish_page(
             if receipt.error is not None:
                 raise receipt.error
             raise PaginationError(receipt.detail)
+        scheduler.completion_recorder.validated(plan.command_id, receipt.identities)
         terminal = keyset_step.keyset_page_terminal(finish_plan, len(receipt.rows))
         await scheduler.adjust_buffer(-scheduler.effective_page_cap + len(receipt.rows))
         scheduler.admission.record_raw(len(receipt.rows))
@@ -360,8 +375,10 @@ async def execute_finish_page(
             dispatch=PageDispatch.DIRECT,
         )
         scheduler.trace.admit(receipt.command_id, len(commit.rows))
+        scheduler.completion_recorder.admit(plan.command_id, len(commit.rows))
         if commit.rows:
             scheduler.transactions.pending.append(commit.rows)
+            scheduler._pending_owners.append(((plan.command_id, len(commit.rows)),))  # noqa: SLF001
         if terminal is not None:
             scheduler.transactions.terminal = True
             scheduler.transactions.finishing = False

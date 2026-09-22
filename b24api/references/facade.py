@@ -3,6 +3,7 @@
 # ruff: noqa: PLR0913 - bounded orchestration adapter
 from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from b24api._stream import MappedOperationStream
@@ -202,6 +203,14 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ReferenceIncompleteEvidence:
+    """A per-binding failure fragment, not an operation terminal report."""
+
+    state: TerminalState = TerminalState.INCOMPLETE
+    emitted: int = 0
+
+
 class _ReferenceEventMapper:
     """Stateful bounded converter assigning per-binding item indexes."""
 
@@ -234,12 +243,7 @@ class _ReferenceEventMapper:
         ):
             incomplete_cause = error
             error = IncompleteTraversalError(
-                report=OperationReport(
-                    TerminalState.INCOMPLETE,
-                    "reference",
-                    type(incomplete_cause).__name__,
-                    emitted=event.partial_rows,
-                ),
+                report=_ReferenceIncompleteEvidence(emitted=event.partial_rows),
             )
             error.__cause__ = incomplete_cause
         if isinstance(error, AmbiguousExecutionError):

@@ -8,6 +8,7 @@ from collections import Counter, deque
 from dataclasses import replace
 from typing import TYPE_CHECKING, Self
 
+from b24api.contracts.completion import CleanupState
 from b24api.contracts.json import FrozenJson, JsonValue, _thaw_json
 from b24api.contracts.keyset_execution import KeysetPhase, TraceClass
 from b24api.contracts.policy import CompletionAssurance, KernelState, SnapshotRequirement, SnapshotState
@@ -26,6 +27,7 @@ from b24api.traversal.keyset_observation import PageObservation
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from b24api.completion.gate import CompletionGate
     from b24api.traversal.keyset_scheduler import KeysetFastScheduler
 
 
@@ -171,6 +173,11 @@ class KeysetFastStream:
         """Return this single-use async iterator."""
         return self
 
+    @property
+    def completion_gate(self) -> CompletionGate:
+        """Expose the active fast-keyset completion evidence to the public adapter."""
+        return self._scheduler.completion_recorder.gate
+
     async def __anext__(self) -> JsonValue:
         """Return the next admitted row or finalize terminal evidence."""
         if self._closed:
@@ -268,6 +275,18 @@ class KeysetFastStream:
             page_trace=records,
             page_trace_truncated=any(dropped.values()),
             keyset_execution=self._scheduler.report_fragment(),
+        )
+        counters = self._scheduler.counters
+        cleanup = (
+            CleanupState.FAILURE
+            if any(violation.code == "cleanup_failure" for violation in self._scheduler.violations)
+            else CleanupState.SUCCESS
+        )
+        self._scheduler.completion_recorder.terminal(
+            state,
+            rows_emitted=counters.emitted_rows,
+            rows_admitted=counters.admitted_rows,
+            cleanup=cleanup,
         )
 
 

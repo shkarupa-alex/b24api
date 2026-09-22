@@ -16,6 +16,7 @@ from b24api import (
     AutoKeysetExecution,
     Bitrix24,
     ClosureWitness,
+    CompletionGate,
     ConsistencyPolicy,
     ExecutionPolicy,
     IdentityCoercion,
@@ -26,8 +27,12 @@ from b24api import (
     KeysetPhase,
     KeysetSelectionReason,
     KeysetSpec,
+    PageAcknowledged,
+    PageDelivered,
     PageOutcome,
     PageRejectionCode,
+    PageScheduled,
+    PageValidated,
     ParameterPath,
     PartitionedKeysetExecution,
     RangeKeysetExecution,
@@ -561,6 +566,63 @@ def test_frozen_selector_decision_table(
         partition.groups,
         partition.planning_waves,
     ) == expected_partition
+
+
+@pytest.mark.asyncio
+async def test_fast_keyset_schedules_pages_before_send_and_finishes_through_gate() -> None:
+    class ProbeTransport(KeysetTransport):
+        def __init__(self) -> None:
+            super().__init__(tuple(range(1, 18)))
+            self.events: list[type[object]] = []
+
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            assert self.events
+            assert self.events[-1] is PageScheduled
+            return await super().send(request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
+
+    transport = ProbeTransport()
+    stream = _stream(transport, RangeKeysetExecution(StableIntegerKeysetContract()))
+    gate = stream._source.completion_gate
+    assert isinstance(gate, CompletionGate)
+    original_emit = gate.emit
+
+    def observe(event: object) -> None:
+        transport.events.append(type(event))
+        original_emit(event)
+
+    gate.emit = observe
+    assert [row["id"] async for row in stream] == list(range(1, 18))
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED
+    assert gate.decision().pages_scheduled == gate.decision().pages_acknowledged
+    assert gate.decision().pages_scheduled == len([event for event in transport.events if event is PageScheduled])
+    assert gate.decision().pages_acknowledged == len([event for event in transport.events if event is PageAcknowledged])
+    assert gate.finish() == stream.report
+
+
+@pytest.mark.asyncio
+async def test_fast_page_is_acknowledged_only_after_its_last_row_is_yielded() -> None:
+    stream = _stream(KeysetTransport(tuple(range(1, 18))), RangeKeysetExecution(StableIntegerKeysetContract()))
+    gate = stream._source.completion_gate
+    events: list[object] = []
+    original_emit = gate.emit
+
+    def observe(event: object) -> None:
+        events.append(event)
+        original_emit(event)
+
+    gate.emit = observe
+    iterator = stream.__aiter__()
+    assert (await anext(iterator))["id"] == 1
+    first_page = next(event.page_id for event in events if isinstance(event, PageValidated) and event.row_count == 5)
+    assert not any(
+        isinstance(event, PageDelivered | PageAcknowledged) and event.page_id == first_page
+        for event in events
+    )
+    for expected in range(2, 6):
+        assert (await anext(iterator))["id"] == expected
+    assert any(isinstance(event, PageAcknowledged) and event.page_id == first_page for event in events)
+    await stream.aclose()
 
 
 @pytest.mark.asyncio
