@@ -7,16 +7,21 @@ import httpx
 import pytest
 
 from b24api import (
+    Bitrix24,
     BodyEncoding,
     EmptyArray,
     EmptyObject,
     Null,
+    OffsetSpec,
     Omitted,
+    PageIndex,
+    ParameterPath,
     PositionalArguments,
     PositionalLayout,
     Present,
     Request,
     RouteKind,
+    Settings,
     SlotContract,
     SlotShape,
 )
@@ -142,3 +147,47 @@ async def test_positional_direct_request_sends_exact_json_array_and_batch_reject
     finally:
         await transport.aclose()
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_public_positional_traversal_sends_five_exact_task_scoped_json_slots() -> None:
+    bodies: list[bytes] = []
+    task_id = 42
+    slot_count = len(_elapsed_layout().slots)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.content)
+        slots = json.loads(request.content)
+        if len(slots) != slot_count or slots[0] != task_id:
+            raise AssertionError("positional traversal lost the fixed task scope")
+        page = slots[4]["NAV_PARAMS"]["iNumPage"]
+        ids = {1: (1, 2), 2: (3,), 3: ()}[page]
+        return httpx.Response(
+            200,
+            json={"result": [{"id": identity, "taskId": 42} for identity in ids]},
+            request=request,
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpxTransport("https://example.invalid/rest/1/token/", client=http_client)
+    settings = Settings(webhook_url="https://example.invalid/rest/1/token/")
+    path = ParameterPath((4, "NAV_PARAMS", "iNumPage"))
+    try:
+        async with Bitrix24(settings, transport=transport) as client:
+            stream = client.iter_list(
+                Request("task.elapseditem.getlist", _arguments(), route=RouteKind.BARE),
+                page_size=2,
+                offset=OffsetSpec(parameter_path=path, page_index=PageIndex(path, max_rows=2)),
+            )
+            rows = [row async for row in stream]
+            assert [(row["id"], row["taskId"]) for row in rows] == [(1, 42), (2, 42), (3, 42)]
+            assert stream.report is not None
+            assert stream.report.exhausted
+        assert bodies == [
+            b'[42,{},{},[],{"NAV_PARAMS":{"iNumPage":1}}]',
+            b'[42,{},{},[],{"NAV_PARAMS":{"iNumPage":2}}]',
+            b'[42,{},{},[],{"NAV_PARAMS":{"iNumPage":3}}]',
+        ]
+    finally:
+        await transport.aclose()
+        await http_client.aclose()
