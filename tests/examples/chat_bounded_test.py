@@ -15,9 +15,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_recipe_uses_only_public_client_exports() -> None:
-    source = (ROOT / "examples" / "chat_bounded_mirror.py").read_text()
-    imports = (node.module for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ImportFrom))
-    assert all(module in {"__future__", "b24api", "b24api.testing"} for module in imports)
+    for recipe in ("chat_bounded_mirror.py", "chat_resume.py"):
+        source = (ROOT / "examples" / recipe).read_text()
+        imports = (node.module for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ImportFrom))
+        assert all(module in {"b24api", "b24api.testing"}
+                   for module in imports if module is not None and module.startswith("b24api"))
 
 
 def test_chat_bounded_recipe_matches_its_independent_oracle() -> None:

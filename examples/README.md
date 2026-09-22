@@ -9,6 +9,7 @@ requests.
 | Scenario | Recipe | Status | Offline oracle |
 | --- | --- | --- | --- |
 | 1 | `chat_bounded_mirror` | supported offline | Three chats, 11 exact IDs, two per-binding stops and one natural exhaustion |
+| 7 | `chat_resume` | supported offline | SQLite page commit, global early close, one-row overlap, eight exact keyed IDs |
 
 The remaining scenarios in `spec/2026-09-22-b24api-issues-architecture/examples-contracts.md`
 are still under implementation. An offline pass does not assert that a live
