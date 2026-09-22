@@ -20,6 +20,7 @@ from b24api.contracts.policy import (
     CompletionAssurance,
     ExecutionPolicy,
     KernelState,
+    ReplayDisposition,
     SnapshotRequirement,
     SnapshotState,
 )
@@ -244,7 +245,11 @@ class ItemStream(AsyncIterator[JsonValue]):
             cancellation = await await_cancellation_resistant(
                 self._finalize(KernelState.INCOMPLETE, reason),
             )
-            incomplete = IncompleteTraversalError(report=self.report)
+            incomplete = IncompleteTraversalError(
+                report=self.report,
+                error=error,
+                replay_disposition=getattr(error, "replay_disposition", ReplayDisposition.NOT_ELIGIBLE),
+            )
             primary_error = incomplete
             if cancellation is not None:
                 _attach_report(cancellation, self.report)

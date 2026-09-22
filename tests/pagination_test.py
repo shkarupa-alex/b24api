@@ -1085,7 +1085,7 @@ async def test_early_close_counts_only_unique_rows_delivered_from_later_page() -
 
 
 @pytest.mark.asyncio
-async def test_large_exact_identity_tracking_warns_once_and_continues() -> None:
+async def test_large_exact_identity_tracking_uses_declared_finite_budget() -> None:
     distinct = 100_001
     rows = [{"ID": index} for index in range(distinct)]
     rows.insert(50_000, {"ID": 0})
@@ -1093,6 +1093,7 @@ async def test_large_exact_identity_tracking_warns_once_and_continues() -> None:
     transport = FunctionTransport(lambda _request: {"result": rows})
     policy = ExecutionPolicy(
         max_buffered_rows=len(rows),
+        max_identity_keys=distinct,
         consistency=ConsistencyPolicy(duplicate_policy=DuplicatePolicy.REPORT),
     )
     stream = iter_list(
@@ -1103,11 +1104,7 @@ async def test_large_exact_identity_tracking_warns_once_and_continues() -> None:
         policy=policy,
     )
 
-    with pytest.warns(RuntimeWarning, match="exact duplicate/loss detection") as captured:
-        result = await _collect(stream)
-
-    matching = [warning for warning in captured if "exact duplicate/loss detection" in str(warning.message)]
-    assert len(matching) == 1
+    result = await _collect(stream)
     assert len(result) == len(rows)
     assert stream.report.state is KernelState.COMPLETED
     assert stream.report.unique_rows == distinct

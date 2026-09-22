@@ -60,7 +60,7 @@ def classify_failure(error: BaseException) -> FailureClass:  # noqa: C901, PLR09
     if isinstance(error, AmbiguousExecutionError):
         return FailureClass("ambiguous_execution")
     if isinstance(error, BudgetExceededError):
-        return FailureClass("budget_exhausted")
+        return FailureClass("budget_exhausted", incomplete=True)
     if isinstance(error, ResponseTooLargeError):
         return FailureClass("response_too_large")
     if isinstance(error, TransportError):
@@ -99,6 +99,14 @@ def finalize_failure[R](
         return report, error
     failure = classify_failure(error)
     report_error = getattr(error, "report_cause", error)
+    replay_disposition = getattr(
+        report_error,
+        "replay_disposition",
+        ReplayDisposition.NOT_ELIGIBLE,
+    )
+    if isinstance(error, IncompleteTraversalError):
+        report_error = error.error or report_error
+        replay_disposition = error.replay_disposition
     error_name = str(getattr(report_error, "report_name", type(report_error).__name__))
     reason = terminal_reason if terminal_reason and terminal_reason != error_name else f"{operation} failed"
     violations = tuple(getattr(report, "violations", ()))
@@ -110,11 +118,7 @@ def finalize_failure[R](
                 failure.code,
                 f"{reason} ({error_name})",
                 error=report_error if isinstance(report_error, B24ApiError) else None,
-                replay_disposition=getattr(
-                    report_error,
-                    "replay_disposition",
-                    ReplayDisposition.NOT_ELIGIBLE,
-                ),
+                replay_disposition=replay_disposition,
             ),
         )
     state: object = TerminalState.INCOMPLETE if failure.incomplete else TerminalState.FAILED

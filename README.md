@@ -428,13 +428,14 @@ and publish the same final report where the Python exception type permits it.
 ## Resource boundaries
 
 `ExecutionPolicy` bounds requests, pages, elapsed time, attempts, decompressed response bytes,
-buffered commands and rows, direct concurrency and active references. The default response ceiling
-is 16 MiB and is enforced while streaming, before JSON decoding.
+buffered commands and rows, retained unordered identity keys, direct concurrency and active
+references. The default response ceiling is 16 MiB and is enforced while streaming, before JSON
+decoding.
 
-Sequential and counted exact traversal retain observed identities in memory. There is no database,
-spill file or identity-count refusal. Crossing 100,000 distinct identities emits one
-`RuntimeWarning`; exact tracking continues. Strict keyset and cursor traversal retain only
-monotonic progression state when sufficient.
+Sequential and counted exact traversal retain at most `max_identity_keys` observed identities in
+memory (100,000 by default). A page that would exceed that declared ceiling is rejected atomically
+with typed budget evidence. Set a larger finite ceiling when the expected cardinality is known.
+Strict keyset and cursor traversal retain only monotonic progression state when sufficient.
 
 ## CLI
 

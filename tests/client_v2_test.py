@@ -48,7 +48,9 @@ from b24api.contracts.completion import PageAcknowledged, PageScheduled
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
+    BatchCommandError,
     BatchFailed,
+    BudgetExceededError,
     CapabilityError,
     FailurePhase,
     IncompleteTraversalError,
@@ -253,7 +255,7 @@ async def test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_of
 
 
 @pytest.mark.asyncio
-async def test_public_counted_traversal_above_100k_stays_exact_and_warns_once() -> None:
+async def test_public_counted_traversal_above_100k_uses_declared_identity_budget() -> None:
     def page(start: int) -> list[dict[str, int]]:
         return [{"ID": value} for value in range(start, min(start + PAGE_SIZE, LARGE_COUNTED_ROWS))]
 
@@ -288,6 +290,7 @@ async def test_public_counted_traversal_above_100k_stays_exact_and_warns_once() 
     stream = client.iter_list_counted(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
+        policy=ExecutionPolicy(max_identity_keys=LARGE_COUNTED_ROWS),
     )
 
     async def consume() -> int:
@@ -297,15 +300,47 @@ async def test_public_counted_traversal_above_100k_stays_exact_and_warns_once() 
             count += 1
         return count
 
-    with pytest.warns(RuntimeWarning, match="exact duplicate/loss detection") as captured:
-        count = await consume()
-
-    matching = [warning for warning in captured if "exact duplicate/loss detection" in str(warning.message)]
-    assert len(matching) == 1
+    count = await consume()
     assert count == LARGE_COUNTED_ROWS
     assert stream.report is not None
     assert stream.report.unique_rows == LARGE_COUNTED_ROWS
     assert stream.report.assurance is TraversalAssurance.IDENTITY_AND_COUNT_MATCHED
+
+
+@pytest.mark.asyncio
+async def test_counted_identity_budget_stops_before_admitting_an_overflow_page() -> None:
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {
+                "result": [{"ID": index} for index in range(PAGE_SIZE)],
+                "total": PAGE_SIZE * 2,
+                "next": PAGE_SIZE,
+            }
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        key = next(iter(commands))
+        return {
+            "result": {
+                "result": {key: [{"ID": index} for index in range(PAGE_SIZE, PAGE_SIZE * 2)]},
+                "result_error": {},
+                "result_total": {key: PAGE_SIZE * 2},
+            },
+        }
+
+    stream = _client(FunctionTransport(handler)).iter_list_counted(
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        identity=_identity(),
+        policy=ExecutionPolicy(max_identity_keys=PAGE_SIZE + 1),
+    )
+
+    assert len([await anext(stream) for _index in range(PAGE_SIZE)]) == PAGE_SIZE
+    with pytest.raises(IncompleteTraversalError) as captured:
+        await anext(stream)
+
+    assert isinstance(captured.value.error, BudgetExceededError)
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.INCOMPLETE
+    assert stream.report.emitted == PAGE_SIZE
 
 
 @pytest.mark.asyncio
@@ -690,6 +725,35 @@ async def test_tolerant_local_binding_failure_emits_not_executed_and_continues()
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
     assert stream.report.not_executed == 1
     assert stream.report.successes == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.JSON, RouteKind.API_V3])
+async def test_fail_fast_batch_retains_correlations_for_unsupported_route_without_io(route: RouteKind) -> None:
+    transport = FunctionTransport(lambda _request: pytest.fail("unsupported physical batch must not be sent"))
+    correlations = (object(), object())
+    stream = _client(transport).batch(
+        (
+            Command(Request("test.get", route=route), correlations[0]),
+            Command(Request("test.get", route=RouteKind.BARE), correlations[1]),
+        ),
+        batch_size=2,
+    )
+
+    with pytest.raises(BatchFailed) as captured:
+        _ = [outcome async for outcome in stream]
+
+    outcomes = captured.value.outcomes
+    assert len(outcomes) == len(correlations)
+    assert isinstance(outcomes[0], CommandFailure)
+    assert outcomes[0].correlation is correlations[0]
+    assert isinstance(outcomes[0].error, CapabilityError)
+    assert isinstance(outcomes[1], CommandNotExecuted)
+    assert outcomes[1].correlation is correlations[1]
+    assert transport.requests == []
+    assert stream.report.not_executed == 1
+    assert stream.report.successes == 0
+    assert stream.report.failures == 1
 
 
 @pytest.mark.asyncio
@@ -1332,6 +1396,47 @@ async def test_counted_missing_in_band_stride_fails_incomplete() -> None:
     assert type(captured.value).__name__ == "IncompleteTraversalError"
     assert stream.report is not None
     assert stream.report.state is TerminalState.INCOMPLETE
+
+
+@pytest.mark.asyncio
+async def test_counted_batch_failure_retains_cause_and_kernel_replay_decision() -> None:
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {
+                "result": [{"ID": index} for index in range(PAGE_SIZE)],
+                "total": PAGE_SIZE * 2,
+                "next": PAGE_SIZE,
+            }
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        key = next(iter(commands))
+        return {
+            "result": {
+                "result": {},
+                "result_error": {key: {"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}},
+            },
+        }
+
+    stream = _client(FunctionTransport(handler)).iter_list_counted(
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        identity=_identity(),
+    )
+
+    for _index in range(PAGE_SIZE):
+        await anext(stream)
+    with pytest.raises(IncompleteTraversalError) as captured:
+        await anext(stream)
+
+    error = captured.value
+    assert isinstance(error.error, BatchCommandError)
+    assert error.error.normalized_code == "operation_time_limit"
+    assert error.error.retryable
+    assert error.replay_disposition is ReplayDisposition.ELIGIBLE
+    assert error.to_safe_dict()["cause"]["normalized_code"] == "operation_time_limit"
+    assert stream.report is not None
+    violation = next(item for item in stream.report.violations if item.severity.value == "blocking")
+    assert violation.error is error.error
+    assert violation.replay_disposition is ReplayDisposition.ELIGIBLE
 
 
 @pytest.mark.asyncio

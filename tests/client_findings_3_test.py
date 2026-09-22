@@ -68,6 +68,7 @@ from b24api.errors import (
     ApiResponseError,
     CapabilityError,
     IncompleteTraversalError,
+    PaginationError,
     ProtocolError,
     ReferenceFailed,
     ResultShapeError,
@@ -724,6 +725,12 @@ def test_counted_rejects_unqualified_total_and_non_batchable_request_before_io()
             Request("example.list", headers=RequestHeaders({"X-Test": "present"}), route=RouteKind.BARE),
             offset=OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED),
         )
+    for route in (RouteKind.JSON, RouteKind.API_V3):
+        with pytest.raises(CapabilityError, match="JSON requests without scoped headers"):
+            client.iter_list_counted(
+                Request("example.list", route=route),
+                offset=OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED),
+            )
 
     assert transport.requests == []
     assert transport.wire_requests == []
@@ -761,9 +768,13 @@ async def test_composite_identity_detects_duplicate_tuple() -> None:
     assert stream.report is not None
     assert stream.report.page_trace[0].outcome is PageOutcome.REJECTED
     assert stream.report.page_trace[0].rows_admitted == 0
+    assert isinstance(captured.value.error, PaginationError)
+    assert captured.value.to_safe_dict()["cause"] is not None
     assert [violation.code for violation in stream.report.violations if violation.severity.value == "blocking"] == [
         "pagination_invariant",
     ]
+    violation = next(item for item in stream.report.violations if item.severity.value == "blocking")
+    assert violation.error is captured.value.error
     assert "[pagination_invariant]" in str(captured.value)
 
 

@@ -121,6 +121,13 @@ class _SequentialMixin:
                         offset=offset,
                         previous_total=expected_raw_total,
                     )
+                if (
+                    sparse is None
+                    and plan.page_stride is not None
+                    and terminal is None
+                    and len(items) < plan.page_stride.max_decoded_rows
+                ):
+                    raise PaginationError("fixed-stride traversal observed an unexplained short page")
                 next_offset = (
                     None if terminal is not None else _next_offset(plan, response, current=offset, observed=len(items))
                 )

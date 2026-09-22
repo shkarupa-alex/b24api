@@ -11,11 +11,12 @@ from b24api.contracts.policy import (
     CompletionAssurance,
     ExecutionPolicy,
     KernelState,
+    ReplayDisposition,
     SnapshotRequirement,
     SnapshotState,
 )
 from b24api.contracts.report import retain_page_trace
-from b24api.errors import CapabilityError, IncompleteTraversalError
+from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
@@ -138,9 +139,19 @@ class CountedItemStream:
                 _attach_report(error, self.report)
                 raise
             await self._finalize(KernelState.INCOMPLETE, type(error).__name__)
-            incomplete = IncompleteTraversalError(report=self.report)
-            incomplete.__cause__ = error
-            raise incomplete from error
+            cause = error.error if isinstance(error, IncompleteTraversalError) else error
+            typed_cause = cause if isinstance(cause, B24ApiError) else None
+            replay_disposition = (
+                error.replay_disposition
+                if isinstance(error, IncompleteTraversalError)
+                else getattr(error, "replay_disposition", ReplayDisposition.NOT_ELIGIBLE)
+            )
+            incomplete = IncompleteTraversalError(
+                report=self.report,
+                error=typed_cause,
+                replay_disposition=replay_disposition,
+            )
+            raise incomplete from cause
         finally:
             self._closed = True
             if primary is not None and self.report.state is KernelState.NOT_STARTED:

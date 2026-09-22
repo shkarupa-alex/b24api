@@ -44,7 +44,7 @@ SCENARIOS = (
     Scenario(2, "message_cursor_direction", "EXPECTED_IDS", "completed", "identity_exact"),
     Scenario(3, "recent_dialogs", "EXPECTED_IDS", "completed", "identity_exact"),
     Scenario(4, "search_chat_messages", "EXPECTED_IDS", "completed_with_failures", "not_applicable"),
-    Scenario(5, "task_role_union", "EXPECTED_IDS", "completed", "mechanics_only"),
+    Scenario(5, "task_role_union", "EXPECTED_IDS", "completed", "count_matched"),
     Scenario(6, "task_comments", "EXPECTED_MODERN", "completed_with_failures", "not_applicable"),
     Scenario(7, "chat_resume", "EXPECTED", "completed", "not_applicable"),
     Scenario(8, "crm_item_delta", "EXPECTED_IDS", "completed", "identity_exact"),

@@ -17,7 +17,7 @@ from b24api.contracts.request import (
     ParameterPath,
     ResultSelector,
 )
-from b24api.contracts.traversal import CursorDomain, OffsetContinuation, SparseRawBound, SplitOrderSpec
+from b24api.contracts.traversal import CursorDomain, OffsetContinuation, PageStride, SparseRawBound, SplitOrderSpec
 
 if TYPE_CHECKING:
     from b24api.contracts.bounded_range import BoundedIdentityRange
@@ -113,8 +113,9 @@ class OffsetSequentialPlan(PlanContract):
     fixed_step: int | None = None
     initial_control: int = 0
     sparse_raw_bound: SparseRawBound | None = None
+    page_stride: PageStride | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901
         """Validate and normalize instance state."""
         super(OffsetSequentialPlan, self).__post_init__()
         if not isinstance(self.continuation, OffsetContinuation):
@@ -144,6 +145,10 @@ class OffsetSequentialPlan(PlanContract):
             or self.terminal != frozenset({OffsetTerminalRule.SPARSE_RAW_BOUND})
         ):
             raise ValueError("sparse raw bound requires its fixed stride and exclusive closure rule")
+        if self.page_stride is not None and (
+            self.continuation is not OffsetContinuation.FIXED_STEP or self.fixed_step != self.page_stride.wire_increment
+        ):
+            raise ValueError("page_stride requires its matching fixed-step continuation")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

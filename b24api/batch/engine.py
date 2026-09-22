@@ -37,6 +37,10 @@ _MISSING = object()
 _SYNC_EXHAUSTED = object()
 
 
+class _BatchNotExecutedError(ProtocolError):
+    """Internal correlated marker for a fail-fast window stopped before dispatch."""
+
+
 @dataclass(frozen=True, slots=True)
 class _BatchInput:
     request: Request
@@ -115,12 +119,24 @@ class BatchExecutor:
         strict_envelope: bool = False,
         strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
-        rejected: dict[int, BatchOutcome] = {}
-        eligible = commands
-        if not halt:
-            eligible, rejected = _partition_capabilities(commands)
-            if not eligible:
-                return tuple(rejected[command.index] for command in commands)
+        eligible, rejected = _partition_capabilities(commands)
+        if halt and rejected:
+            first_rejected = next(command.index for command in commands if command.index in rejected)
+            return tuple(
+                rejected[command.index]
+                if command.index == first_rejected
+                else _command_failure(
+                    command,
+                    _BatchNotExecutedError(
+                        "physical batch command was not executed after fail-fast capability rejection",
+                        request_summary=command.request.summary,
+                    ),
+                    evidence=BatchCommandEvidence(command.index, command.stable_key),
+                )
+                for command in commands
+            )
+        if not eligible:
+            return tuple(rejected[command.index] for command in commands)
         request = _batch_request(eligible, halt=halt)
         try:
             response = await self.executor.execute(

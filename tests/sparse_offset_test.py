@@ -7,6 +7,8 @@ import pytest
 
 from b24api import (
     Bitrix24,
+    IdentityCoercion,
+    IdentitySpec,
     OffsetSpec,
     PageStride,
     ParameterPath,
@@ -77,6 +79,40 @@ async def test_sparse_offset_crosses_two_empty_selected_pages() -> None:
     assert stream.report is not None
     assert stream.report.exhausted
     assert stream.report.assurance is TraversalAssurance.RAW_RANGE_COVERED
+
+
+@pytest.mark.asyncio
+async def test_non_sparse_fixed_stride_rejects_an_unexplained_short_window() -> None:
+    short_window_extent = 100
+
+    class ShortWindowTransport:
+        def __init__(self) -> None:
+            self.offsets: list[int] = []
+
+        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            del attempt_timeout, max_response_bytes
+            offset = request.copy_parameters()["start"]
+            assert isinstance(offset, int)
+            self.offsets.append(offset)
+            rows = [{"id": value} for value in range(offset, offset + 25)] if offset < short_window_extent else []
+            return WireResponse(200, (), json.dumps({"result": rows}).encode())
+
+    transport = ShortWindowTransport()
+    stride = PageStride(server_granularity=50, wire_increment=50, max_decoded_rows=50)
+    stream = Bitrix24._from_executor(Executor(transport)).iter_list(  # noqa: SLF001
+        Request("example.search", route=RouteKind.BARE),
+        identity=IdentitySpec(("id",), "ID", "ID", IdentityCoercion.EXACT_INTEGER),
+        page_size=50,
+        offset=OffsetSpec(continuation=OffsetContinuation.FIXED_STEP, step=50, page_stride=stride),
+    )
+
+    with pytest.raises(IncompleteTraversalError) as captured:
+        await anext(stream)
+
+    assert isinstance(captured.value.error, PaginationError)
+    assert transport.offsets == [0]
+    assert stream.report is not None
+    assert not stream.report.exhausted
 
 
 def test_stride_rejects_rounded_alias_and_sparse_budget_is_explicit() -> None:

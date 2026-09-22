@@ -1,7 +1,6 @@
 """Lazy correctness-first sequential traversal streams and state machines."""
 
 from __future__ import annotations
-import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -16,7 +15,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, TraversalIdentity
 from b24api.contracts.response import Response, inject_controls
-from b24api.errors import CapabilityError, PaginationError
+from b24api.errors import BudgetExceededError, CapabilityError, PaginationError
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     CursorTerminalRule,
@@ -64,16 +63,15 @@ class _IdentityStore(Protocol):
 
     def add(self, value: IdentityValue) -> None: ...
 
+    def ensure_capacity(self, additional: int) -> None: ...
+
     def close(self) -> None: ...
 
 
-_LARGE_IDENTITY_WARNING_THRESHOLD = 100_000
-
-
 class _MemoryIdentityStore:
-    def __init__(self) -> None:
+    def __init__(self, capacity: int) -> None:
         self._values: set[IdentityValue] = set()
-        self._warned = False
+        self._capacity = capacity
 
     @property
     def count(self) -> int:
@@ -83,17 +81,11 @@ class _MemoryIdentityStore:
         return value in self._values
 
     def add(self, value: IdentityValue) -> None:
-        if value in self._values:
-            return
         self._values.add(value)
-        if not self._warned and len(self._values) > _LARGE_IDENTITY_WARNING_THRESHOLD:
-            warnings.warn(
-                "exact duplicate/loss detection continues in memory; a very large result may consume "
-                "additional memory or run more slowly",
-                RuntimeWarning,
-                stacklevel=3,
-            )
-            self._warned = True
+
+    def ensure_capacity(self, additional: int) -> None:
+        if len(self._values) + additional > self._capacity:
+            raise BudgetExceededError("identity evidence budget exhausted")
 
     def close(self) -> None:
         self._values.clear()
@@ -116,6 +108,9 @@ class _MonotonicIdentityStore:
             return
         self._last = value
         self._count += 1
+
+    def ensure_capacity(self, additional: int) -> None:
+        del additional
 
     def close(self) -> None:
         self._last = None
@@ -366,7 +361,7 @@ def _cursor_terminal(plan: ItemCursorPlan, page_size: int) -> str | None:
     return None
 
 
-def _identity_store(_policy: ExecutionPolicy, plan: ListPlan, identity: TraversalIdentity | None) -> _IdentityStore:
+def _identity_store(policy: ExecutionPolicy, plan: ListPlan, identity: TraversalIdentity | None) -> _IdentityStore:
     if isinstance(plan, KeysetPlan) or (
         isinstance(plan, ItemCursorPlan)
         and isinstance(identity, IdentitySpec)
@@ -374,4 +369,4 @@ def _identity_store(_policy: ExecutionPolicy, plan: ListPlan, identity: Traversa
         and identity.coercion is plan.cursor_coercion
     ):
         return _MonotonicIdentityStore()
-    return _MemoryIdentityStore()
+    return _MemoryIdentityStore(policy.max_identity_keys)

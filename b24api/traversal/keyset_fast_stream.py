@@ -11,14 +11,20 @@ from typing import TYPE_CHECKING, Self
 from b24api.contracts.completion import CleanupState
 from b24api.contracts.json import FrozenJson, JsonValue, _thaw_json
 from b24api.contracts.keyset_execution import KeysetPhase, TraceClass
-from b24api.contracts.policy import CompletionAssurance, KernelState, SnapshotRequirement, SnapshotState
+from b24api.contracts.policy import (
+    CompletionAssurance,
+    KernelState,
+    ReplayDisposition,
+    SnapshotRequirement,
+    SnapshotState,
+)
 from b24api.contracts.report import (
     PageOutcome,
     PageRecord,
     Violation,
     ViolationSeverity,
 )
-from b24api.errors import BudgetExceededError, IncompleteTraversalError, PaginationError
+from b24api.errors import B24ApiError, BudgetExceededError, IncompleteTraversalError, PaginationError
 from b24api.execution.context import await_cancellation_resistant, await_cleanup_resistant, rearm_cancellation
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
@@ -200,11 +206,20 @@ class KeysetFastStream:
             _attach_report(error, self.report)
             self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
             raise
-        except (PaginationError, BudgetExceededError) as error:
+        except (IncompleteTraversalError, PaginationError, BudgetExceededError) as error:
             await self._terminate(KernelState.INCOMPLETE, type(error).__name__, primary=error)
-            incomplete = IncompleteTraversalError(report=self.report)
+            cause = error.error if isinstance(error, IncompleteTraversalError) else error
+            incomplete = IncompleteTraversalError(
+                report=self.report,
+                error=cause if isinstance(cause, B24ApiError) else None,
+                replay_disposition=(
+                    error.replay_disposition
+                    if isinstance(error, IncompleteTraversalError)
+                    else getattr(error, "replay_disposition", ReplayDisposition.NOT_ELIGIBLE)
+                ),
+            )
             self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
-            raise incomplete from error
+            raise incomplete from cause
         except BaseException as error:
             await self._terminate(KernelState.FAILED, type(error).__name__, primary=error)
             _attach_report(error, self.report)

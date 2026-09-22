@@ -49,11 +49,11 @@ outcome.
 ## Resource and lifecycle model
 
 - Logical sources are consumed incrementally; physical Bitrix batches contain at most 50 commands.
-- Response bytes, buffered rows and commands, request/page budgets, concurrency and elapsed time are
-  bounded by `ExecutionPolicy`.
+- Response bytes, buffered rows and commands, retained unordered identity keys, request/page
+  budgets, concurrency and elapsed time are bounded by `ExecutionPolicy`.
 - The default response ceiling is enforced while streaming, before JSON decoding.
-- Exact sequential/counted traversal retains observed identities in memory and warns once above
-  100,000 identities; it has no database, spill file or automatic cardinality refusal.
+- Exact sequential/counted traversal retains observed identities in memory up to the explicit
+  `max_identity_keys` ceiling and rejects an overflowing page atomically.
 - Streams publish one immutable terminal report after cleanup. Early close and cancellation never
   claim completion.
 - The client owns its default transport and active streams; injected transports remain caller-owned.

@@ -212,8 +212,12 @@ def _validate_slot_shape(slot: Slot, contract: SlotContract) -> None:
 
 
 def _existing_child(parent: JsonValue, part: SlotPathPart) -> JsonValue:
-    if type(part) is str and isinstance(parent, dict) and part in parent:
-        return parent[part]
+    if type(part) is str and isinstance(parent, dict):
+        near_matches = tuple(key for key in parent if key != part and key.casefold() == part.casefold())
+        if near_matches:
+            raise ValueError("positional control path has near-match casing")
+        if part in parent:
+            return parent[part]
     if type(part) is int and isinstance(parent, list) and 0 <= part < len(parent):
         return parent[part]
     raise ValueError("positional control path does not exist")

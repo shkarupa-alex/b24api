@@ -23,7 +23,7 @@ and a reason; it is never reported as a passing LIVE claim.
 | 2 | [message_cursor_direction](message_cursor_direction.py) | passing | not recorded | FIRST_ID false clean end versus LAST_ID 5/5 at limits 1, 3 and 50 |
 | 3 | [recent_dialogs](recent_dialogs.py) | passing | not recorded | Envelope next, total=-1, five emitted rows, duplicate warning and four keyed chats |
 | 4 | [search_chat_messages](search_chat_messages.py) | passing | not recorded | Two-page chat, empty chat, typed ACCESS_ERROR and three correlated terminals |
-| 5 | [task_role_union](task_role_union.py) | passing | not recorded | Four role traversals, 932 exact IDs, 900/932 repeat hazard and aligned 950 empty page |
+| 5 | [task_role_union](task_role_union.py) | passing | not recorded | Four role traversals, 932 exact IDs, qualified total closure and the 900/932 repeat hazard |
 | 6 | [task_comments](task_comments.py) | passing | not recorded | Correlated TASKS_TASK batch, modern/legacy/empty/denied outcomes and exact three-slot legacy wire |
 | 7 | [chat_resume](chat_resume.py) | passing | not recorded | SQLite page commit, global early close, one-row overlap, eight exact keyed IDs |
 | 8 | [crm_item_delta](crm_item_delta.py) | passing | not recorded | Discovered smart-process type, edited old ID and new ID reconciled by time-window replay |

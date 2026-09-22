@@ -26,6 +26,7 @@ from b24api.contracts.request import (
     IdentitySpec,
     RequestLike,
     ResultSelector,
+    RouteKind,
     TraversalIdentity,
     canonical_request,
 )
@@ -115,6 +116,7 @@ def sequential_stream(  # noqa: PLR0913
         fixed_step=page_index.increment if page_index else offset.step,
         initial_control=page_index.initial if page_index else 0,
         sparse_raw_bound=offset.sparse_raw_bound,
+        page_stride=stride,
         terminal=offset_terminal_rules(offset),
         allow_create_controls=offset.allow_create_controls,
         identity_requirement=IdentityRequirement.OPTIONAL,
@@ -260,7 +262,12 @@ def counted_stream(  # noqa: PLR0913
     if offset.continuation is OffsetContinuation.FIXED_STEP and offset.step != page_size:
         raise ValueError("fixed-step traversal requires page_size equal to step")
     canonical = canonical_request(request)
-    if canonical.encoding is not BodyEncoding.JSON or canonical.headers.items or canonical.positional is not None:
+    if (
+        canonical.route is not RouteKind.BARE
+        or canonical.encoding is not BodyEncoding.JSON
+        or canonical.headers.items
+        or canonical.positional is not None
+    ):
         raise CapabilityError("counted traversal supports JSON requests without scoped headers")
     executor._preflight_request(canonical)  # noqa: SLF001 - operation-wide preflight before stream construction
     plan = CountedOffsetPlan(

@@ -48,7 +48,7 @@ from b24api.cli import _report_json
 from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.contracts.report import PageDispatch
 from b24api.contracts.request import RouteKind
-from b24api.errors import CapabilityError, IncompleteTraversalError, ResultShapeError
+from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError, ResultShapeError
 from b24api.execution import Executor, WireResponse
 from b24api.traversal import keyset_scheduler, page_validation
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
@@ -1144,9 +1144,10 @@ async def test_asymmetric_empty_boundary_is_classified_incomplete(
 ) -> None:
     stream = _stream(EmptyDescendingBoundaryTransport(tuple(range(1, 31))), execution)
 
-    with pytest.raises(IncompleteTraversalError):
+    with pytest.raises(IncompleteTraversalError) as captured:
         await anext(stream)
 
+    assert isinstance(captured.value.error, PaginationError)
     assert stream.report.state is TerminalState.INCOMPLETE
     assert stream.report.emitted == 0
 
@@ -1469,6 +1470,30 @@ def test_explicit_partitioned_rejects_policy_that_cannot_retain_anchors_and_a_bo
             selector=ResultSelector.root(),
             identity=_identity(),
             page_size=page_size,
+            keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+            execution=execution,
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("route", [RouteKind.JSON, RouteKind.API_V3])
+@pytest.mark.parametrize(
+    "execution",
+    [RangeKeysetExecution(StableIntegerKeysetContract()), PartitionedKeysetExecution(StableIntegerKeysetContract())],
+)
+def test_explicit_fast_keyset_rejects_non_bare_route_before_io(
+    route: RouteKind,
+    execution: RangeKeysetExecution | PartitionedKeysetExecution,
+) -> None:
+    transport = KeysetTransport(tuple(range(1, 31)))
+
+    with pytest.raises(CapabilityError, match="JSON requests without scoped headers"):
+        _client(transport).iter_list_keyset(
+            Request("item.list", route=route),
+            selector=ResultSelector.root(),
+            identity=_identity(),
+            page_size=PAGE_SIZE,
             keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
             execution=execution,
         )

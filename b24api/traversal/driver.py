@@ -450,10 +450,12 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             )
         if self._expected_total is not None and self.validated_rows + accepted_count > self._expected_total:
             raise _PageRejectionError("traversal exceeded its exact total", PageRejectionCode.TOTAL_DRIFT)
+        new_values = tuple(value for value in local if not self._store.contains(value))
+        self._store.ensure_capacity(len(new_values))
         self.validated_rows += accepted_count
         if terminal:
             self._validate_terminal_total()
-        for value in local:
+        for value in new_values:
             self._store.add(value)
         if identities:
             self._last_identity = identities[-1]

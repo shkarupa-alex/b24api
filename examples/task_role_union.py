@@ -1,7 +1,8 @@
-"""Scenario 5: four task roles with a fixed 50-row offset stride.
+"""Scenario 5: four task roles with a fixed 50-row stride and exact total.
 
 The responsible source has 932 rows. The server rounds start=932 down to
-start=900 and repeats the last 32; the public iterator advances 900 to 950.
+start=900 and repeats the last 32; the public iterator closes on the qualified
+total after the page at 900 and never derives the unsafe raw offset 932.
 The role union retains all 932 task identities and records overlapping roles.
 Run: `uv run python -m examples.task_role_union`.
 """
@@ -19,6 +20,7 @@ from b24api import (
     ResultSelector,
     RouteKind,
     Settings,
+    TotalTermination,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
@@ -70,12 +72,15 @@ def _request(role: str, offset: int) -> Request:
 def _fixture() -> ScriptedTransport:
     exchanges: list[ScriptedExchange] = []
     for role, ids in ROLE_IDS.items():
-        for offset in range(0, len(ids) + PAGE_SIZE, PAGE_SIZE):
+        for offset in range(0, len(ids), PAGE_SIZE):
             page = ids[offset : offset + PAGE_SIZE]
             exchanges.append(
                 ScriptedExchange.json(
                     _request(role, offset),
-                    {"result": {"tasks": [{"id": str(task_id)} for task_id in page]}},
+                    {
+                        "result": {"tasks": [{"id": str(task_id)} for task_id in page]},
+                        "total": len(ids),
+                    },
                 )
             )
     # A separate negative control proves the endpoint's rounded offset hazard.
@@ -95,8 +100,8 @@ def _assert_responsible_offsets(transport: ScriptedTransport) -> None:
         filters = parameters["filter"]
         if isinstance(filters, dict) and "RESPONSIBLE_ID" in filters:
             responsible_offsets.append(parameters["start"])
-    if tuple(responsible_offsets) != (*range(0, 951, PAGE_SIZE), 932):
-        raise AssertionError("scenario 5 public offset did not advance 900 to 950")
+    if tuple(responsible_offsets) != (*range(0, 901, PAGE_SIZE), 932):
+        raise AssertionError("scenario 5 public offset did not stop at its qualified total")
 
 
 async def run() -> RecipeEvidence:
@@ -115,6 +120,7 @@ async def run() -> RecipeEvidence:
                     continuation=OffsetContinuation.FIXED_STEP,
                     step=PAGE_SIZE,
                     page_stride=PageStride(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE),
+                    total_termination=TotalTermination.EXACT_QUALIFIED,
                 ),
             )
             observed = tuple([_task_id(row) async for row in stream])

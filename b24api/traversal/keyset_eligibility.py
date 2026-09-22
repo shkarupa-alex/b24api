@@ -19,6 +19,7 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     TotalSemantics,
 )
+from b24api.contracts.request import RouteKind
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.identity import _child_path, _request_with_controls
@@ -105,7 +106,7 @@ def validate_fast_keyset(  # noqa: C901, PLR0912, PLR0913
         raise CapabilityError("exact-boundary completion is not qualified for fast or auto keyset execution")
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         raise ValueError("page_size must be a positive integer")
-    if request.encoding is not BodyEncoding.JSON or request.headers.items:
+    if request.route is not RouteKind.BARE or request.encoding is not BodyEncoding.JSON or request.headers.items:
         raise CapabilityError("fast keyset traversal supports JSON requests without scoped headers")
     if identity.coercion not in {IdentityCoercion.EXACT_INTEGER, IdentityCoercion.DECIMAL_STRING_INTEGER}:
         raise CapabilityError("fast keyset traversal requires integer identity coercion")

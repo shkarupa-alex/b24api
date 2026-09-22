@@ -98,6 +98,24 @@ def test_positional_control_writer_can_create_only_the_declared_final_mapping_le
             ambiguous.write_control((4, "NAV_PARAMS", "iNumPage"), 2)
         assert ambiguous.to_wire_slots()[-1] == {"NAV_PARAMS": {near_match: 7}}
 
+    intermediate_ambiguous = PositionalArguments(
+        (
+            Present(42),
+            EmptyObject(),
+            EmptyObject(),
+            EmptyArray(),
+            Present({"NAV_PARAMS": {"iNumPage": 1}, "nav_params": {"iNumPage": 7}}),
+        ),
+        layout.layout_id,
+        layout=layout,
+    )
+    with pytest.raises(ValueError, match="near-match casing"):
+        intermediate_ambiguous.write_control((4, "NAV_PARAMS", "iNumPage"), 2)
+    assert intermediate_ambiguous.to_wire_slots()[-1] == {
+        "NAV_PARAMS": {"iNumPage": 1},
+        "nav_params": {"iNumPage": 7},
+    }
+
 
 def test_positional_layout_rejects_overlapping_control_paths() -> None:
     with pytest.raises(ValueError, match="non-overlapping"):
@@ -113,6 +131,36 @@ async def test_positional_near_match_fails_public_traversal_preflight_before_io(
     layout = _elapsed_layout()
     arguments = PositionalArguments(
         (Present(42), EmptyObject(), EmptyObject(), EmptyArray(), Present({"NAV_PARAMS": {"inumpage": 7}})),
+        layout.layout_id,
+        layout=layout,
+    )
+    transport = ScriptedTransport(())
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
+    path = ParameterPath((4, "NAV_PARAMS", "iNumPage"))
+
+    async with Bitrix24(settings, transport=transport) as client:
+        stream = client.iter_list(
+            Request("task.elapseditem.getlist", arguments, route=RouteKind.BARE),
+            page_size=2,
+            offset=OffsetSpec(parameter_path=path, page_index=PageIndex(path, max_rows=2)),
+        )
+        with pytest.raises(CapabilityError, match="positional request conflicts"):
+            _ = [row async for row in stream]
+
+    assert transport.calls == ()
+
+
+@pytest.mark.asyncio
+async def test_positional_intermediate_near_match_fails_public_traversal_before_io() -> None:
+    layout = _elapsed_layout()
+    arguments = PositionalArguments(
+        (
+            Present(42),
+            EmptyObject(),
+            EmptyObject(),
+            EmptyArray(),
+            Present({"NAV_PARAMS": {"iNumPage": 1}, "nav_params": {"iNumPage": 7}}),
+        ),
         layout.layout_id,
         layout=layout,
     )

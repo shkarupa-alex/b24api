@@ -10,7 +10,13 @@ from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
-from b24api.errors import BudgetExceededError, PageAdaptationError, PaginationError
+from b24api.errors import (
+    B24ApiError,
+    BudgetExceededError,
+    IncompleteTraversalError,
+    PageAdaptationError,
+    PaginationError,
+)
 from b24api.traversal import keyset_step
 from b24api.traversal.keyset_capability import (
     anchor_commands,
@@ -172,6 +178,13 @@ async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation tran
                 None,
             )
             if cause is not None:
+                rejection = next(receipt for receipt in rejections if receipt.error is cause)
+                if isinstance(cause, B24ApiError) and rejection.violation.code == "command_failure":
+                    raise IncompleteTraversalError(
+                        report=None,
+                        error=cause,
+                        replay_disposition=rejection.replay_disposition,
+                    ) from cause
                 raise cause
             raise PaginationError("fast keyset wave validation failed")
         stage_semantics = bool(phases & {KeysetPhase.BOUNDARY, KeysetPhase.CANARY})

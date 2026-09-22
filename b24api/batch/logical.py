@@ -7,7 +7,7 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator
 from typing import Protocol, Self, cast, runtime_checkable
 
-from b24api.batch.engine import BatchExecutor, BatchSource, _BatchInput, _BatchItem
+from b24api.batch.engine import BatchExecutor, BatchSource, _BatchInput, _BatchItem, _BatchNotExecutedError
 from b24api.batch.outcome import BatchFailure as KernelFailure
 from b24api.batch.outcome import BatchSuccess as KernelSuccess
 from b24api.batch.stream import _iterate_source, _next_chunk
@@ -127,6 +127,16 @@ def _public_outcomes(
             )
             continue
         error = outcome.error
+        if isinstance(error, _BatchNotExecutedError):
+            converted.append(
+                CommandNotExecuted(
+                    outcome.command_index,
+                    outcome.correlation,
+                    outcome.request.summary,
+                    NotExecutedReason.HALTED,
+                ),
+            )
+            continue
         if halt and halted and isinstance(error, ProtocolError):
             converted.append(
                 CommandNotExecuted(

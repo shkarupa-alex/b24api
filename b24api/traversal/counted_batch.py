@@ -10,7 +10,7 @@ from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import PageDispatch
 from b24api.contracts.traversal import OffsetContinuation
-from b24api.errors import CapabilityError, IncompleteTraversalError
+from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
 from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
@@ -203,6 +203,12 @@ class _CountedBatchMixin:
                         batch_index=outcome.command_index,
                         error=error,
                     )
+                    if isinstance(outcome.error, B24ApiError):
+                        raise IncompleteTraversalError(
+                            report=outcomes.report,
+                            error=outcome.error,
+                            replay_disposition=outcome.replay_disposition,
+                        ) from outcome.error
                     if isinstance(outcome.error, BaseException):
                         raise outcome.error
                     raise CapabilityError("parallel counted batch command failed")
