@@ -420,6 +420,14 @@ async def test_batch_outcomes_retains_typed_failure_without_halting_later_comman
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
     assert stream.report.successes == SMALL_BATCH_COMMANDS - 1
     assert stream.report.failures == 1
+    gate = stream._source.completion_gate  # noqa: SLF001 - public batch gate positive control
+    decision = gate.decision()
+    assert decision.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert not decision.exhausted
+    assert decision.bindings_admitted == decision.bindings_terminal == SMALL_BATCH_COMMANDS
+    assert decision.pages_scheduled == SMALL_BATCH_COMMANDS
+    assert decision.pages_acknowledged == SMALL_BATCH_COMMANDS - 1
+    assert gate.finish() == stream.report
 
 
 @pytest.mark.asyncio
