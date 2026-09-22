@@ -118,7 +118,7 @@ def sequential_stream(  # noqa: PLR0913
         terminal=offset_terminal_rules(offset),
         allow_create_controls=offset.allow_create_controls,
         identity_requirement=IdentityRequirement.OPTIONAL,
-        duplicate_policy=DuplicatePolicy.ERROR,
+        duplicate_policy=DuplicatePolicy.REPORT,
         total_semantics=(
             TotalSemantics.IGNORE
             if offset.total_termination is TotalTermination.DISABLED
