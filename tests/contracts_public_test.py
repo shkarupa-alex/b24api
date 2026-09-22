@@ -31,6 +31,7 @@ from b24api.contracts import (
     ReferenceItem,
     ReferenceNotExecuted,
     ReferenceOutcomeUnknown,
+    ReplayDisposition,
     ReplaySafety,
     Request,
     RequestSpec,
@@ -402,6 +403,8 @@ def test_command_outcome_partition_retains_every_closed_variant() -> None:
     )
     assert buckets.successes[0].result == {"ok": True}
     assert all(outcome.correlation is correlation for outcome in outcomes)
+    assert buckets.failures[0].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+    assert buckets.unknown[0].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
 
 
 def test_binding_rejects_overlapping_paths_and_never_exposes_correlation_in_repr() -> None:

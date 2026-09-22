@@ -229,7 +229,7 @@ class KeysetCapabilityReport:
             "cross_digit_pair_exercised": self.cross_digit_pair_exercised,
             "inconclusive_reason": self.inconclusive_reason,
             "inconclusive_detail": self.inconclusive_detail,
-            "violations": tuple(dataclasses.asdict(violation) for violation in self.violations),
+            "violations": tuple(violation.to_safe_dict() for violation in self.violations),
             "page_trace": tuple(dataclasses.asdict(record) for record in self.page_trace),
             "page_trace_truncated": self.page_trace_truncated,
         }

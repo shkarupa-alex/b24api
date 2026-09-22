@@ -22,6 +22,7 @@ from b24api import (
     Settings,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "socialnetwork.contentview.getlist"
 EXPECTED_EXTRANET_IDS = tuple(range(1, 14))
@@ -55,7 +56,7 @@ def _fixture() -> ScriptedTransport:
     )
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Verify nested wire shape and independent IDs for each readable mode."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
@@ -88,6 +89,10 @@ async def run() -> None:
     )
     if pages != (1, 2, 3):
         raise AssertionError("scenario 18 nested page index did not advance")
+    report = stream.report
+    if report is None:
+        raise AssertionError("scenario 18 lost its terminal report")
+    return RecipeEvidence(len(extranet), report, (report,))
 
 
 if __name__ == "__main__":

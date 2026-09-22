@@ -21,6 +21,7 @@ from b24api import (
     Settings,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "tasks.task.list"
 CHANGED_SINCE = "2026-09-01T00:00:00+03:00"
@@ -98,11 +99,12 @@ def _assert_responsible_offsets(transport: ScriptedTransport) -> None:
         raise AssertionError("scenario 5 public offset did not advance 900 to 950")
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Compare a naive 932 offset with four completed public role traversals."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     union: dict[int, set[str]] = {}
+    reports = []
     async with Bitrix24(settings, transport=transport) as client:
         for role, expected_role_ids in ROLE_IDS.items():
             stream = client.iter_list(
@@ -120,6 +122,7 @@ async def run() -> None:
                 raise AssertionError(f"scenario 5 {role} rows differed from role oracle")
             if stream.report is None or not stream.report.exhausted:
                 raise AssertionError(f"scenario 5 {role} lacked empty-page closure")
+            reports.append(stream.report)
             for task_id in observed:
                 union.setdefault(task_id, set()).add(role)
         repeated = await client.call(_request("RESPONSIBLE_ID", 932))
@@ -132,6 +135,7 @@ async def run() -> None:
     if union[930] != {"RESPONSIBLE_ID", "AUDITOR"}:
         raise AssertionError("scenario 5 lost overlapping task roles")
     _assert_responsible_offsets(transport)
+    return RecipeEvidence(len(union), reports[-1], tuple(reports))
 
 
 if __name__ == "__main__":

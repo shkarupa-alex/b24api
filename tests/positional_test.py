@@ -29,6 +29,7 @@ from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure
 from b24api.errors import CapabilityError
 from b24api.execution import Executor, HttpxTransport
+from b24api.testing import ScriptedTransport
 from b24api.transport import WireResponse
 
 
@@ -86,6 +87,49 @@ def test_positional_control_writer_can_create_only_the_declared_final_mapping_le
     )
     with pytest.raises(ValueError, match="does not exist"):
         missing_parent.write_control((4, "NAV_PARAMS", "iNumPage"), 2)
+
+    for near_match in ("inumpage", "INUMPAGE"):
+        ambiguous = PositionalArguments(
+            (Present(42), EmptyObject(), EmptyObject(), EmptyArray(), Present({"NAV_PARAMS": {near_match: 7}})),
+            layout.layout_id,
+            layout=layout,
+        )
+        with pytest.raises(ValueError, match="near-match casing"):
+            ambiguous.write_control((4, "NAV_PARAMS", "iNumPage"), 2)
+        assert ambiguous.to_wire_slots()[-1] == {"NAV_PARAMS": {near_match: 7}}
+
+
+def test_positional_layout_rejects_overlapping_control_paths() -> None:
+    with pytest.raises(ValueError, match="non-overlapping"):
+        PositionalLayout(
+            "overlap.v1",
+            (SlotContract("params", SlotShape.OBJECT),),
+            control_paths=frozenset({(0, "NAV_PARAMS"), (0, "NAV_PARAMS", "iNumPage")}),
+        )
+
+
+@pytest.mark.asyncio
+async def test_positional_near_match_fails_public_traversal_preflight_before_io() -> None:
+    layout = _elapsed_layout()
+    arguments = PositionalArguments(
+        (Present(42), EmptyObject(), EmptyObject(), EmptyArray(), Present({"NAV_PARAMS": {"inumpage": 7}})),
+        layout.layout_id,
+        layout=layout,
+    )
+    transport = ScriptedTransport(())
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
+    path = ParameterPath((4, "NAV_PARAMS", "iNumPage"))
+
+    async with Bitrix24(settings, transport=transport) as client:
+        stream = client.iter_list(
+            Request("task.elapseditem.getlist", arguments, route=RouteKind.BARE),
+            page_size=2,
+            offset=OffsetSpec(parameter_path=path, page_index=PageIndex(path, max_rows=2)),
+        )
+        with pytest.raises(CapabilityError, match="positional request conflicts"):
+            _ = [row async for row in stream]
+
+    assert transport.calls == ()
 
 
 def test_positional_rejects_wrong_arity_shape_and_internal_omission() -> None:

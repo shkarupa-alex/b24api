@@ -18,6 +18,7 @@ from b24api import (
     IncompleteTraversalError,
     OffsetContinuation,
     OffsetSpec,
+    OperationReport,
     PageOutcome,
     PageStride,
     ReplaySafety,
@@ -30,6 +31,7 @@ from b24api import (
     TraversalAssurance,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "crm.requisitelink.list"
 PAGE_SIZE = 50
@@ -119,7 +121,11 @@ def _key(row: object) -> tuple[int, int]:
     return left, right
 
 
-async def _run_complete(transport: ScriptedTransport, *, counted: bool) -> tuple[tuple[int, int], ...]:
+async def _run_complete(
+    transport: ScriptedTransport,
+    *,
+    counted: bool,
+) -> tuple[tuple[tuple[int, int], ...], OperationReport]:
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         stream = (
@@ -148,10 +154,12 @@ async def _run_complete(transport: ScriptedTransport, *, counted: bool) -> tuple
         if tuple(sorted(record.offset for record in report.page_trace if record.offset is not None)) != OFFSETS:
             raise AssertionError("scenario 14 left a raw offset window unaccounted")
     transport.assert_exhausted()
-    return keys
+    if report is None:
+        raise AssertionError("scenario 14 lost its complete terminal report")
+    return keys, report
 
 
-async def _reject_truncated_tail() -> None:
+async def _reject_truncated_tail() -> OperationReport:
     transport = _batch_fixture(truncated=True)
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
@@ -176,15 +184,20 @@ async def _reject_truncated_tail() -> None:
         ):
             raise AssertionError("scenario 14 did not identify the first divergent raw offset")
     transport.assert_exhausted()
+    report = stream.report
+    if report is None:
+        raise AssertionError("scenario 14 lost its incomplete terminal report")
+    return report
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Compare direct and batched exact keys and reject a truncated tail."""
-    direct = await _run_complete(_direct_fixture(), counted=False)
-    batched = await _run_complete(_batch_fixture(), counted=True)
+    direct, direct_report = await _run_complete(_direct_fixture(), counted=False)
+    batched, batch_report = await _run_complete(_batch_fixture(), counted=True)
     if direct != EXPECTED_KEYS or batched != EXPECTED_KEYS:
         raise AssertionError("scenario 14 direct/batch composite keys differ from oracle")
-    await _reject_truncated_tail()
+    truncated_report = await _reject_truncated_tail()
+    return RecipeEvidence(len(direct), batch_report, (direct_report, batch_report, truncated_report))
 
 
 if __name__ == "__main__":

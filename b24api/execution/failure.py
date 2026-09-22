@@ -6,11 +6,12 @@ import contextlib
 from dataclasses import dataclass, replace
 from typing import Any, TypeVar, cast
 
-from b24api.contracts.policy import KernelState
+from b24api.contracts.policy import KernelState, ReplayDisposition
 from b24api.contracts.report import TerminalState, Violation, ViolationSeverity
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
+    B24ApiError,
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
@@ -104,7 +105,17 @@ def finalize_failure[R](
     if not any(item.code == failure.code for item in violations):
         violations = (
             *violations,
-            Violation(failure.severity, failure.code, f"{reason} ({error_name})"),
+            Violation(
+                failure.severity,
+                failure.code,
+                f"{reason} ({error_name})",
+                error=report_error if isinstance(report_error, B24ApiError) else None,
+                replay_disposition=getattr(
+                    report_error,
+                    "replay_disposition",
+                    ReplayDisposition.NOT_ELIGIBLE,
+                ),
+            ),
         )
     state: object = TerminalState.INCOMPLETE if failure.incomplete else TerminalState.FAILED
     if isinstance(getattr(report, "state", None), KernelState):

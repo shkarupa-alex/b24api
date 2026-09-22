@@ -21,6 +21,7 @@ from b24api import (
     TraversalAssurance,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "documentgenerator.numerator.list"
 EXPECTED_IDS = tuple(range(1, 54))
@@ -44,7 +45,7 @@ def _fixture() -> ScriptedTransport:
     )
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Verify all fixed-step windows without treating page-local total as exact."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
@@ -65,6 +66,10 @@ async def run() -> None:
     transport.assert_exhausted()
     if tuple(request.copy_parameters()["start"] for request in transport.calls) != (0, 50, 100):
         raise AssertionError("scenario 17 did not cover all fixed wire offsets")
+    report = stream.report
+    if report is None:
+        raise AssertionError("scenario 17 lost its terminal report")
+    return RecipeEvidence(len(observed), report, (report,))
 
 
 if __name__ == "__main__":

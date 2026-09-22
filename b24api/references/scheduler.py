@@ -687,9 +687,10 @@ class ReferenceScheduler:
             raise event.error
         self.violations.append(
             Violation(
-                severity=ViolationSeverity.WARNING,
-                code="reference_failure",
-                message="one reference produced a typed failure outcome",
+                ViolationSeverity.WARNING,
+                "reference_failure",
+                "one reference produced a typed failure outcome",
+                replay_disposition=event.replay_disposition,
             ),
         )
         yield failure

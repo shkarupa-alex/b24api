@@ -33,6 +33,7 @@ from b24api import (
     TraversalAssurance,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "im.dialog.messages.get"
 EXPECTED_IDS = {"A": (109, 108, 3, 2), "B": (115, 114, 113, 112, 1), "C": (120, 119)}
@@ -90,7 +91,7 @@ def _expect(actual: object, expected: object, label: str) -> None:
         raise AssertionError(f"scenario 1 oracle mismatch: {label}")
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Execute the frozen fixture and verify the independent per-chat oracle."""
     transport = _fixture()
     stop = _Cutoff()
@@ -134,6 +135,7 @@ async def run() -> None:
             raise AssertionError("scenario 1 falsely claimed source exhaustion")
         _expect(report.physical_requests, len(transport.calls), "physical requests")
     transport.assert_exhausted()
+    return RecipeEvidence(sum(len(ids) for ids in observed.values()), report, (report,))
 
 
 if __name__ == "__main__":

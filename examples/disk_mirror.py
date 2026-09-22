@@ -17,6 +17,7 @@ from b24api import (
     IdentitySpec,
     OffsetContinuation,
     OffsetSpec,
+    OperationReport,
     PageStride,
     ReplaySafety,
     Request,
@@ -27,6 +28,7 @@ from b24api import (
     TraversalAssurance,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 STORAGE_METHOD = "disk.storage.getlist"
 CHILDREN_METHOD = "disk.folder.getchildren"
@@ -115,7 +117,12 @@ def _object_id(row: object, key: str) -> int:
     return int(value)
 
 
-async def _counted_rows(client: Bitrix24, request: Request, *, expected_offsets: tuple[int, ...]) -> list[object]:
+async def _counted_rows(
+    client: Bitrix24,
+    request: Request,
+    *,
+    expected_offsets: tuple[int, ...],
+) -> tuple[list[object], OperationReport]:
     stream = client.iter_list_counted(
         request,
         identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
@@ -131,15 +138,17 @@ async def _counted_rows(client: Bitrix24, request: Request, *, expected_offsets:
     offsets = tuple(sorted(record.offset for record in report.page_trace if record.offset is not None))
     if offsets != expected_offsets:
         raise AssertionError("scenario 15 folder left an offset window uncovered")
-    return rows
+    return rows, report
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Traverse a bounded folder queue without following link cycles."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
-        storages = await _counted_rows(client, _storage_request(None), expected_offsets=(0,))
+        reports = []
+        storages, storage_report = await _counted_rows(client, _storage_request(None), expected_offsets=(0,))
+        reports.append(storage_report)
         roots = tuple(_object_id(row, "ROOT_OBJECT_ID") for row in storages)
         if roots != ROOTS:
             raise AssertionError("scenario 15 storage roots differed from oracle")
@@ -153,7 +162,8 @@ async def run() -> None:
             folder_id = queue.popleft()
             visited_real.append(folder_id)
             offsets = (0, PAGE_SIZE) if folder_id == ROOTS[0] else (0,)
-            children = await _counted_rows(client, _children_request(folder_id, None), expected_offsets=offsets)
+            children, report = await _counted_rows(client, _children_request(folder_id, None), expected_offsets=offsets)
+            reports.append(report)
             for child in children:
                 object_ids.add(_object_id(child, "ID"))
                 if not isinstance(child, dict) or child.get("TYPE") != "folder":
@@ -167,6 +177,7 @@ async def run() -> None:
         if tuple(sorted(object_ids)) != EXPECTED_OBJECT_IDS:
             raise AssertionError("scenario 15 object IDs differed from independent oracle")
     transport.assert_exhausted()
+    return RecipeEvidence(len(object_ids), reports[-1], tuple(reports))
 
 
 if __name__ == "__main__":

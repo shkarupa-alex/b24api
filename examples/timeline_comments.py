@@ -36,6 +36,7 @@ from b24api import (
     TotalTermination,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "crm.timeline.comment.list"
 PAGE_SIZE = 50
@@ -124,7 +125,7 @@ def _verify_outcomes(
         raise AssertionError("scenario 10 keyed storage differs from independent oracle")
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Prove per-entity completion and caller-owned global deduplication."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
@@ -177,6 +178,11 @@ async def run() -> None:
         if not isinstance(probe, list) or tuple(_id(row) for row in probe) != DEAL_IDS[:PAGE_SIZE]:
             raise AssertionError("scenario 10 >ID negative baseline did not repeat first page")
     transport.assert_exhausted()
+    report = stream.report
+    if report is None:
+        raise AssertionError("scenario 10 lost its terminal report")
+    storage = {comment_id for ids in per_entity.values() for comment_id in ids}
+    return RecipeEvidence(len(storage), report, (report,))
 
 
 if __name__ == "__main__":

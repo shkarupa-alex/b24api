@@ -24,6 +24,7 @@ from b24api import (
     ParameterUpdate,
     ReferenceComplete,
     ReferenceItem,
+    ReplayDisposition,
     ReplaySafety,
     Request,
     ResultSelector,
@@ -163,6 +164,7 @@ async def test_tolerant_batch_preserves_all_correlated_states() -> None:
         CommandOutcomeUnknown,
     ]
     assert all(outcome.correlation is correlations[name] for outcome, name in zip(outcomes, correlations, strict=True))
+    assert unknown_outcomes[0].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
 
 
 @pytest.mark.asyncio

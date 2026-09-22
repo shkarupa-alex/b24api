@@ -14,6 +14,7 @@ from tempfile import TemporaryDirectory
 from b24api import Bitrix24, ReplaySafety, Request, RouteKind, Settings
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.calendar_sink import CalendarSink
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "calendar.event.get"
 INITIAL = "2026-09-01T09:00:00+03:00"
@@ -38,7 +39,7 @@ def _request(stamp: str) -> Request:
     )
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Replay an inclusive deletion border and compare the keyed oracle."""
     transport = ScriptedTransport(
         (
@@ -53,6 +54,7 @@ async def run() -> None:
         try:
             async with Bitrix24(settings, transport=transport) as client:
                 first = await client.call(_request(INITIAL))
+                observed_count = len(first) if isinstance(first, list) else -1
                 sink.apply_delta(first)
                 if sink.ids() != (101, 102) or sink.checkpoint() != INITIAL:
                     raise AssertionError("scenario 9 initial commit differs from oracle")
@@ -71,6 +73,7 @@ async def run() -> None:
         finally:
             sink.close()
     transport.assert_exhausted()
+    return RecipeEvidence(observed_count)
 
 
 if __name__ == "__main__":

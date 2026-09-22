@@ -30,6 +30,7 @@ from b24api import (
     TerminalState,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "im.dialog.messages.search"
 START = "2026-09-01T00:00:00+03:00"
@@ -82,7 +83,7 @@ def _fixture() -> ScriptedTransport:
     return ScriptedTransport(tuple(exchanges))
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:  # noqa: C901 - scenario intentionally exercises every terminal variant
     """Retain successful rows and all three correlated terminal outcomes."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
@@ -130,6 +131,10 @@ async def run() -> None:
         if stream.report.exhausted:
             raise AssertionError("scenario 4 failure cannot prove global exhaustion")
     transport.assert_exhausted()
+    report = stream.report
+    if report is None:
+        raise AssertionError("scenario 4 lost its terminal report")
+    return RecipeEvidence(sum(len(ids) for ids in rows.values()), report, (report,))
 
 
 if __name__ == "__main__":

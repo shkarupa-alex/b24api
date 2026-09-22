@@ -12,6 +12,7 @@ import asyncio
 
 from b24api import Bitrix24, OffsetSpec, PageIndex, ParameterPath, ReplaySafety, Request, RouteKind, Settings
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHODS = (
     ("socialnetwork.workgroup.getgridpopupmembers", "page"),
@@ -38,10 +39,11 @@ def _fixture() -> ScriptedTransport:
     return ScriptedTransport(tuple(exchanges))
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Verify exact wire controls and 13 IDs for both public traversals."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
+    reports = []
     async with Bitrix24(settings, transport=transport) as client:
         for method, control in METHODS:
             path = ParameterPath((control,))
@@ -58,12 +60,14 @@ async def run() -> None:
                 raise AssertionError("scenario 12 user IDs differed from independent oracle")
             if stream.report is None or not stream.report.exhausted:
                 raise AssertionError("scenario 12 page-index traversal lacked exhaustion evidence")
+            reports.append(stream.report)
             controls = tuple(
                 request.copy_parameters()[control] for request in transport.calls if request.method == method
             )
             if controls != (1, 2, 3):
                 raise AssertionError("scenario 12 wire page indexes did not advance 1/2/3")
     transport.assert_exhausted()
+    return RecipeEvidence(len(observed), reports[-1], tuple(reports))
 
 
 if __name__ == "__main__":

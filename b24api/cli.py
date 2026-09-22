@@ -83,7 +83,7 @@ def _report_json(report: OperationReport) -> dict[str, object]:
         "buffered_commands_high_water": report.buffered_commands_high_water,
         "buffered_rows_high_water": report.buffered_rows_high_water,
         "active_references_high_water": report.active_references_high_water,
-        "violations": tuple(dataclasses.asdict(item) for item in report.violations),
+        "violations": tuple(item.to_safe_dict() for item in report.violations),
     }
     if report.keyset_execution is not None:
         result["keyset_execution"] = dataclasses.asdict(report.keyset_execution)

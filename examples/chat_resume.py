@@ -36,6 +36,7 @@ from b24api import (
     TerminalState,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 from examples._support.sqlite_sink import SqliteMirror
 
 METHOD = "im.dialog.messages.get"
@@ -137,7 +138,7 @@ async def _run_once(sink: SqliteMirror, transport: ScriptedTransport, *, pause_a
     return report
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Verify exact keyed IDs and the two distinct terminal meanings."""
     with tempfile.TemporaryDirectory(prefix="b24api-example-") as temporary:
         sink = SqliteMirror(Path(temporary) / "mirror.sqlite3")
@@ -165,8 +166,10 @@ async def run() -> None:
                 raise AssertionError("scenario 7 resume did not complete")
             if {parent: sink.ids(parent) for parent in EXPECTED} != EXPECTED:
                 raise AssertionError("scenario 7 keyed sink differs from uninterrupted oracle")
+            observed_count = sum(len(sink.ids(parent)) for parent in EXPECTED)
         finally:
             sink.close()
+    return RecipeEvidence(observed_count, second_report, (first_report, second_report))
 
 
 if __name__ == "__main__":

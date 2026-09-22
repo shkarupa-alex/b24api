@@ -64,6 +64,16 @@ class PositionalLayout:
                 raise ValueError("fixed slots cannot own writable controls")
             if any(type(part) not in {str, int} or part == "" or (type(part) is int and part < 0) for part in path[1:]):
                 raise ValueError("control path has an invalid segment")
+        _validate_non_overlapping_paths(tuple(self.control_paths))
+
+
+def _validate_non_overlapping_paths(paths: tuple[tuple[SlotPathPart, ...], ...]) -> None:
+    """Reject two writable controls that own the same structural branch."""
+    for index, left in enumerate(paths):
+        for right in paths[index + 1 :]:
+            shared = min(len(left), len(right))
+            if left[:shared] == right[:shared]:
+                raise ValueError("control paths must be distinct and non-overlapping")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -211,6 +221,9 @@ def _existing_child(parent: JsonValue, part: SlotPathPart) -> JsonValue:
 
 def _set_existing_child(parent: JsonValue, part: SlotPathPart, value: JsonValue) -> None:
     if type(part) is str and isinstance(parent, dict):
+        near_matches = tuple(key for key in parent if key != part and key.casefold() == part.casefold())
+        if near_matches:
+            raise ValueError("positional control path has near-match casing")
         parent[part] = value
         return
     if type(part) is int and isinstance(parent, list) and 0 <= part < len(parent):

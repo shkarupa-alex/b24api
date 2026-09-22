@@ -25,6 +25,7 @@ from b24api import (
     TraversalAssurance,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "im.search.user"
 EXPECTED_IDS = (17, 83)
@@ -50,7 +51,7 @@ def _fixture() -> ScriptedTransport:
     )
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Verify the selected-empty middle page does not terminate traversal."""
     transport = _fixture()
     stride = PageStride(server_granularity=STRIDE, wire_increment=STRIDE, max_decoded_rows=STRIDE)
@@ -84,6 +85,10 @@ async def run() -> None:
     transport.assert_exhausted()
     if tuple(request.copy_parameters()["start"] for request in transport.calls) != (0, 50, 100):
         raise AssertionError("scenario 11 did not cover every raw offset window")
+    report = stream.report
+    if report is None:
+        raise AssertionError("scenario 11 lost its terminal report")
+    return RecipeEvidence(len(observed), report, (report,))
 
 
 if __name__ == "__main__":

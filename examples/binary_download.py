@@ -12,6 +12,7 @@ import json
 
 from b24api import ApiResponseError, Bitrix24, ReplaySafety, Request, RouteKind, Settings, WireResponse
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 EXPECTED_PDF = b"%PDF-1.4\nfixture\n%%EOF\n"
 EXPECTED_FILE = bytes((0, 1, 2, 255))
@@ -41,7 +42,7 @@ def _fixture() -> ScriptedTransport:
     )
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Check exact payload, media type, and failure classification offline."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
@@ -60,6 +61,7 @@ async def run() -> None:
         else:
             raise AssertionError("scenario 16 JSON API error was treated as binary success")
     transport.assert_exhausted()
+    return RecipeEvidence(len(pdf.body))
 
 
 if __name__ == "__main__":

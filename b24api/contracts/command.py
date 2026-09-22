@@ -87,6 +87,12 @@ class CommandOutcomeUnknown[C]:
     correlation: C = field(repr=False)
     request_summary: RequestSummary
     error: B24ApiError
+    replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
+
+    def __post_init__(self) -> None:
+        """Require ambiguity to retain the kernel's closed replay decision."""
+        if not isinstance(self.replay_disposition, ReplayDisposition):
+            raise TypeError("replay_disposition must be a ReplayDisposition")
 
 
 type CommandOutcome[C] = CommandSuccess[C] | CommandFailure[C] | CommandNotExecuted[C] | CommandOutcomeUnknown[C]

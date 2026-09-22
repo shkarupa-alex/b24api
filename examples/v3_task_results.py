@@ -12,6 +12,7 @@ import json
 
 from b24api import ApiResponseError, Bitrix24, ReplaySafety, Request, RouteKind, Settings, WireResponse
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "tasks.task.result.list"
 ERROR_CODE = "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION"
@@ -46,7 +47,7 @@ def _fixture() -> ScriptedTransport:
     )
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Verify independent IDs, typed validation, and unchanged failed checkpoint."""
     transport = _fixture()
     checkpoint = {11: 0, -1: 0}
@@ -71,6 +72,7 @@ async def run() -> None:
     transport.assert_exhausted()
     if checkpoint != {11: EXPECTED_RESULT_IDS[-1], -1: 0}:
         raise AssertionError("scenario 19 advanced a failed parent checkpoint")
+    return RecipeEvidence(len(ids))
 
 
 if __name__ == "__main__":

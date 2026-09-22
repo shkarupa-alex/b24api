@@ -14,6 +14,7 @@ from b24api import (
     Bitrix24,
     IdentityCoercion,
     IdentitySpec,
+    OperationReport,
     ReplaySafety,
     Request,
     ResultSelector,
@@ -23,6 +24,7 @@ from b24api import (
     TraversalAssurance,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "crm.item.list"
 ENTITY_TYPE_ID = 1256
@@ -75,7 +77,11 @@ def _item(row: object) -> tuple[int, str]:
     return item_id, mark
 
 
-async def _scan_window(client: Bitrix24, border: str, expected: tuple[dict[str, object], ...]) -> dict[int, str]:
+async def _scan_window(
+    client: Bitrix24,
+    border: str,
+    expected: tuple[dict[str, object], ...],
+) -> tuple[dict[int, str], OperationReport]:
     stream = client.iter_list_keyset(
         Request(
             METHOD,
@@ -95,10 +101,10 @@ async def _scan_window(client: Bitrix24, border: str, expected: tuple[dict[str, 
         raise AssertionError("scenario 8 keyset window lacked empty confirmation")
     if stream.report.assurance is not TraversalAssurance.IDENTITY_EXACT:
         raise AssertionError("scenario 8 ID traversal lacked identity assurance")
-    return dict(observed)
+    return dict(observed), stream.report
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Compare an ID-only cursor with a public time-filtered keyset replay."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
@@ -112,14 +118,17 @@ async def run() -> None:
             raise TypeError("scenario 8 type discovery did not return the expected row")
         if type_rows[0].get("entityTypeId") != ENTITY_TYPE_ID:
             raise AssertionError("scenario 8 discovered the wrong smart process")
-        sink.update(await _scan_window(client, INITIAL_BORDER, INITIAL))
+        initial, initial_report = await _scan_window(client, INITIAL_BORDER, INITIAL)
+        sink.update(initial)
         id_only = await client.call(_request(INITIAL_BORDER, 2))
         if not isinstance(id_only, dict) or id_only.get("items") != [DELTA[1]]:
             raise AssertionError("scenario 8 ID-only baseline did not miss the edited old ID")
-        sink.update(await _scan_window(client, REPLAY_BORDER, DELTA))
+        delta, delta_report = await _scan_window(client, REPLAY_BORDER, DELTA)
+        sink.update(delta)
     transport.assert_exhausted()
     if tuple(sorted(sink)) != EXPECTED_IDS or sink[1] != T1 or sink[3] != T1:
         raise AssertionError("scenario 8 keyed sink missed the edit or new item")
+    return RecipeEvidence(len(sink), delta_report, (initial_report, delta_report))
 
 
 if __name__ == "__main__":

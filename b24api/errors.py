@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from b24api._error_types import ErrorOrigin, FailurePhase
 from b24api.contracts.keyset_capability import KeysetCapabilityReport, KeysetCapabilityVerdict, KeysetInconclusiveReason
-from b24api.contracts.policy import AmbiguityReason, IdentityCoercion
+from b24api.contracts.policy import AmbiguityReason, IdentityCoercion, ReplayDisposition
 from b24api.contracts.response import ResponseEvidence, ResultCollectionShape
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
@@ -470,9 +470,21 @@ class AmbiguousExecutionError(B24ApiError):
 class IncompleteTraversalError(B24ApiError):
     """Traversal ended without complete terminal evidence."""
 
-    def __init__(self, *, report: object) -> None:
+    def __init__(
+        self,
+        *,
+        report: object,
+        error: B24ApiError | None = None,
+        replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE,
+    ) -> None:
         """Initialize instance state."""
+        if not isinstance(replay_disposition, ReplayDisposition):
+            raise TypeError("replay_disposition must be a ReplayDisposition")
+        if error is not None and not isinstance(error, B24ApiError):
+            raise TypeError("error must be a B24ApiError or None")
         self.report = report
+        self.error = error
+        self.replay_disposition = replay_disposition
         super().__init__("Traversal did not complete", origin=ErrorOrigin.PAGINATION)
 
     def __str__(self) -> str:
@@ -486,6 +498,17 @@ class IncompleteTraversalError(B24ApiError):
         if blocking is not None:
             message += f" [{blocking.code}] {blocking.message}"
         return message
+
+    def to_safe_dict(self) -> dict[str, object]:
+        """Expose the retained cause and replay decision without diagnostic I/O."""
+        safe = super().to_safe_dict()
+        safe.update(
+            {
+                "cause": self.error.to_safe_dict() if self.error is not None else None,
+                "replay_disposition": self.replay_disposition.value,
+            },
+        )
+        return safe
 
 
 class InputSourceError(B24ApiError):

@@ -56,6 +56,10 @@ def test_migration_covers_changed_completion_stop_keyset_and_replay_contracts() 
     text = MIGRATION.read_text(encoding="utf-8")
     for public_contract in ("exhausted", "partial", "page_stop", "BoundedIdentityRange", "ReplayDisposition"):
         assert public_contract in text
+    bounded = next(paragraph for paragraph in text.split("\n\n") if "BoundedIdentityRange" in paragraph)
+    assert "SequentialKeysetExecution" in bounded
+    assert "consumes that\nboundary" in bounded
+    assert "RangeKeysetExecution`, `PartitionedKeysetExecution`, and auto execution reject" in bounded
 
 
 def test_architecture_document_names_the_complete_public_capability_family() -> None:

@@ -247,11 +247,25 @@ class _ReferenceEventMapper:
             incomplete_cause = error
             error = IncompleteTraversalError(
                 report=_ReferenceIncompleteEvidence(emitted=event.partial_rows),
+                error=incomplete_cause,
+                replay_disposition=event.replay_disposition,
             )
             error.__cause__ = incomplete_cause
         if isinstance(error, AmbiguousExecutionError):
-            return ReferenceOutcomeUnknown(context.index, context.correlation, error, event.partial_rows)
-        return ReferenceFailure(context.index, context.correlation, error, event.partial_rows)
+            return ReferenceOutcomeUnknown(
+                context.index,
+                context.correlation,
+                error,
+                event.partial_rows,
+                event.replay_disposition,
+            )
+        return ReferenceFailure(
+            context.index,
+            context.correlation,
+            error,
+            event.partial_rows,
+            event.replay_disposition,
+        )
 
 
 def _reference_variant(outcome: ReferenceOutcome[object]) -> str:

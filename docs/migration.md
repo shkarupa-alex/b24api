@@ -50,13 +50,17 @@ Counted physical-batch tails reject page-stop construction because already sched
 cannot be withdrawn safely.
 
 Bounded keyset execution now needs a qualified admitted upper boundary, an enforced fence, and the
-declared method contract in `BoundedIdentityRange`. `RangeKeysetExecution` and
-`PartitionedKeysetExecution` use those bounds;
-`SequentialKeysetExecution` retains empty confirmation. `CALLER_ASSERTED_BOUNDS` describes the
-source of the bounds and does not assert a stable snapshot of a mutating source.
+declared method contract in `BoundedIdentityRange`. `SequentialKeysetExecution` consumes that
+boundary, closes only after the exact admitted upper ID is witnessed, and reports
+`BOUNDED_RANGE_OBSERVED`; it does not need a trailing empty confirmation. Fast
+`RangeKeysetExecution`, `PartitionedKeysetExecution`, and auto execution reject a boundary before
+I/O. `CALLER_ASSERTED_BOUNDS` describes the source of fast-execution bounds and does not assert a
+stable snapshot of a mutating source.
 
-Logical batch `CommandFailure` now exposes the kernel's `replay_disposition`. Retry only when it is
-`ReplayDisposition.ELIGIBLE`; replay safety and retryability remain inputs to that closed decision.
+Logical-batch `CommandFailure` and `CommandOutcomeUnknown`, reference failures and unknown outcomes,
+blocking violations, and `IncompleteTraversalError` now expose the kernel's
+`replay_disposition`. Retry only when it is `ReplayDisposition.ELIGIBLE`; replay safety and
+retryability remain inputs to that closed decision.
 
 For one-based page controls, pass `OffsetSpec(parameter_path=path, page_index=PageIndex(path,
 initial=1, increment=1, max_rows=10))` to `iter_list(..., page_size=10)`. The wire control

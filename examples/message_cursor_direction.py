@@ -24,6 +24,7 @@ from b24api import (
     Settings,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "im.dialog.messages.get"
 EXPECTED_IDS = (3573, 3575, 12561, 29991, 30211)
@@ -60,7 +61,7 @@ def _descending_fixture(limit: int) -> ScriptedTransport:
         cursor = page[-1]
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Compare a false clean ASC end with three complete DESC traversals."""
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     asc = ScriptedTransport(
@@ -79,6 +80,9 @@ async def run() -> None:
         if seen != ASC_IDS or set(seen) == set(EXPECTED_IDS):
             raise AssertionError("scenario 2 ASC fixture did not expose its false clean end")
     asc.assert_exhausted()
+    final_report = None
+    final_observed: tuple[int, ...] = ()
+    reports = []
     for limit in LIMITS:
         transport = _descending_fixture(limit)
         async with Bitrix24(settings, transport=transport) as client:
@@ -101,7 +105,13 @@ async def run() -> None:
                 raise AssertionError("scenario 2 LAST_ID omitted a source ID")
             if stream.report is None or not stream.report.exhausted:
                 raise AssertionError("scenario 2 LAST_ID lacked empty confirmation")
+            final_report = stream.report
+            final_observed = observed
+            reports.append(stream.report)
         transport.assert_exhausted()
+    if final_report is None:
+        raise AssertionError("scenario 2 did not execute a supported cursor traversal")
+    return RecipeEvidence(len(final_observed), final_report, tuple(reports))
 
 
 if __name__ == "__main__":

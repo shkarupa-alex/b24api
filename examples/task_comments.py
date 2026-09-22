@@ -23,6 +23,7 @@ from b24api import (
     IdentityCoercion,
     IdentitySpec,
     KeysetSpec,
+    OperationReport,
     ParameterPath,
     ParameterUpdate,
     PositionalArguments,
@@ -42,6 +43,7 @@ from b24api import (
     TerminalState,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 CHAT_METHOD = "im.chat.get"
 MESSAGE_METHOD = "im.dialog.messages.get"
@@ -127,7 +129,7 @@ def _id(row: object, key: str) -> int:
     return int(value)
 
 
-async def _resolve_chats(client: Bitrix24) -> dict[int, int | None]:
+async def _resolve_chats(client: Bitrix24) -> tuple[dict[int, int | None], OperationReport]:
     stream = client.batch_outcomes(tuple(Command(_chat_request(task_id), task_id) for task_id in TASKS))
     resolved: dict[int, int | None] = {}
     async for outcome in stream:
@@ -139,10 +141,10 @@ async def _resolve_chats(client: Bitrix24) -> dict[int, int | None]:
         raise AssertionError("scenario 6 batch chat correlation differed from oracle")
     if stream.report is None or stream.report.state is not TerminalState.COMPLETED:
         raise AssertionError("scenario 6 chat batch lacked completion")
-    return resolved
+    return resolved, stream.report
 
 
-async def _read_modern(client: Bitrix24, resolved: dict[int, int | None]) -> None:
+async def _read_modern(client: Bitrix24, resolved: dict[int, int | None]) -> tuple[int, OperationReport]:
     bindings = tuple(
         Binding(
             f"task:{task_id}",
@@ -186,9 +188,10 @@ async def _read_modern(client: Bitrix24, resolved: dict[int, int | None]) -> Non
         raise AssertionError("scenario 6 modern empty/inaccessible outcomes collapsed")
     if stream.report is None or stream.report.state is not TerminalState.COMPLETED_WITH_FAILURES:
         raise AssertionError("scenario 6 modern failure falsely claimed global completion")
+    return sum(len(values) for values in messages.values()), stream.report
 
 
-async def _read_legacy(client: Bitrix24) -> None:
+async def _read_legacy(client: Bitrix24) -> OperationReport:
     stream = client.iter_list_keyset(
         _legacy_request(0),
         selector=ResultSelector.root(),
@@ -204,16 +207,17 @@ async def _read_legacy(client: Bitrix24) -> None:
     observed = tuple([_id(row, "ID") async for row in stream])
     if observed != EXPECTED_LEGACY or stream.report is None or not stream.report.exhausted:
         raise AssertionError("scenario 6 legacy positional keyset differed from oracle")
+    return stream.report
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Retain modern and legacy outcomes through public traversal APIs."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
-        resolved = await _resolve_chats(client)
-        await _read_modern(client, resolved)
-        await _read_legacy(client)
+        resolved, resolution_report = await _resolve_chats(client)
+        observed_count, modern_report = await _read_modern(client, resolved)
+        legacy_report = await _read_legacy(client)
     transport.assert_exhausted()
     legacy_slots = tuple(
         request.positional.to_wire_slots()
@@ -222,6 +226,11 @@ async def run() -> None:
     )
     if legacy_slots != ([43, {"ID": "ASC"}, {">ID": 0}], [43, {"ID": "ASC"}, {">ID": 2}]):
         raise AssertionError("scenario 6 legacy TASKID/ORDER/FILTER wire order changed")
+    return RecipeEvidence(
+        observed_count,
+        modern_report,
+        (resolution_report, modern_report, legacy_report),
+    )
 
 
 if __name__ == "__main__":

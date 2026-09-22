@@ -26,6 +26,7 @@ from b24api import (
     Settings,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "im.recent.list"
 EXPECTED_IDS = (10, 20, 30, 40)
@@ -68,7 +69,7 @@ def _fixture() -> ScriptedTransport:
     )
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Record a duplicate warning while reconciling chat identities."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
@@ -96,6 +97,10 @@ async def run() -> None:
     transport.assert_exhausted()
     if tuple(request.copy_parameters()["OFFSET"] for request in transport.calls) != (0, 2, 4, 5):
         raise AssertionError("scenario 3 did not follow envelope continuation")
+    report = stream.report
+    if report is None:
+        raise AssertionError("scenario 3 lost its terminal report")
+    return RecipeEvidence(len(set(ids)), report, (report,))
 
 
 if __name__ == "__main__":

@@ -760,10 +760,42 @@ async def test_tolerant_reference_preserves_ambiguous_dispatch_as_unknown() -> N
     assert outcome.correlation is correlation
     assert isinstance(outcome.error, AmbiguousExecutionError)
     assert outcome.partial_rows == 0
+    assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
     assert len(transport.requests) == 1
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
     assert stream.report.unknown == 1
+
+
+@pytest.mark.asyncio
+async def test_tolerant_reference_preserves_kernel_replay_disposition() -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        key = next(iter(commands))
+        return {
+            "result": {
+                "result": {},
+                "result_error": {key: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "retry later"}},
+            },
+        }
+
+    stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        [Binding("safe", (), "safe")],
+        traversal=SequentialTraversal(),
+        dispatch=BatchDispatch(batch_size=1),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert isinstance(outcome, ReferenceFailure)
+    assert outcome.replay_disposition is ReplayDisposition.ELIGIBLE
+    assert stream.report is not None
+    violation = next(item for item in stream.report.violations if item.code == "reference_failure")
+    assert violation.replay_disposition is ReplayDisposition.ELIGIBLE
 
 
 def test_counted_reference_rejects_direct_dispatch_before_binding_pull_or_io() -> None:

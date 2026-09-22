@@ -143,7 +143,13 @@ def _public_outcomes(
             error = ProtocolError("batch command failed without a typed safe error")
         if isinstance(error, AmbiguousExecutionError):
             converted.append(
-                CommandOutcomeUnknown(outcome.command_index, outcome.correlation, outcome.request.summary, error),
+                CommandOutcomeUnknown(
+                    outcome.command_index,
+                    outcome.correlation,
+                    outcome.request.summary,
+                    error,
+                    outcome.replay_disposition,
+                ),
             )
         else:
             converted.append(

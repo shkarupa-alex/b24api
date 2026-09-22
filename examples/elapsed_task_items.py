@@ -29,6 +29,7 @@ from b24api import (
     SlotShape,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
 
 METHOD = "task.elapseditem.getlist"
 TASK_ID = 42
@@ -78,7 +79,7 @@ def _fixture() -> ScriptedTransport:
     )
 
 
-async def run() -> None:
+async def run() -> RecipeEvidence:
     """Check exact slot order, task scope, IDs, and page index progression."""
     transport = _fixture()
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
@@ -104,6 +105,10 @@ async def run() -> None:
         raise AssertionError("scenario 13 changed the five-slot task-scoped ABI")
     if tuple(page[4]["NAV_PARAMS"]["iNumPage"] for page in slots) != EXPECTED_PAGES:
         raise AssertionError("scenario 13 did not advance the positional page index")
+    report = stream.report
+    if report is None:
+        raise AssertionError("scenario 13 lost its terminal report")
+    return RecipeEvidence(len(rows), report, (report,))
 
 
 if __name__ == "__main__":
