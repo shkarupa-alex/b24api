@@ -85,6 +85,7 @@ from b24api.contracts.request import (
     ResultErrorShape,
     ResultErrorSpec,
     ResultSelector,
+    RouteKind,
     TraversalIdentity,
 )
 from b24api.contracts.response import BinaryEvidence, BinaryResponse, Response, ResultCollectionShape
@@ -190,6 +191,7 @@ __all__ = [
     "ResultErrorSpec",
     "ResultSelector",
     "RetryPolicy",
+    "RouteKind",
     "SequentialKeysetExecution",
     "SequentialTraversal",
     "SplitOrderSpec",

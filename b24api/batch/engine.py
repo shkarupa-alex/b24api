@@ -17,7 +17,7 @@ from b24api.contracts.policy import (
     ExecutionPolicy,
     ReplayDisposition,
 )
-from b24api.contracts.request import ReplaySafety, Request
+from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.contracts.response import Response
 from b24api.encoding import encode_php_query
 from b24api.errors import B24ApiError, BatchCommandError, CapabilityError, ProtocolError
@@ -301,8 +301,13 @@ class BatchExecutor:
 
 
 def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
-    if any(command.request.encoding.value != "json" or command.request.headers.items for command in commands):
-        raise CapabilityError("physical batch supports JSON requests without scoped headers; use direct dispatch")
+    if any(
+        command.request.route is not RouteKind.BARE
+        or command.request.encoding.value != "json"
+        or command.request.headers.items
+        for command in commands
+    ):
+        raise CapabilityError("physical batch supports BARE JSON requests without scoped headers; use direct dispatch")
     safety_values = {command.request.replay_safety or ReplaySafety.UNKNOWN for command in commands}
     if safety_values == {ReplaySafety.SAFE}:
         safety = ReplaySafety.SAFE
@@ -311,7 +316,7 @@ def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
     else:
         safety = ReplaySafety.UNKNOWN
     encoded = {command.stable_key: _command_query(command.request) for command in commands}
-    return Request("batch", parameters={"halt": int(halt), "cmd": encoded}, replay_safety=safety)
+    return Request("batch", parameters={"halt": int(halt), "cmd": encoded}, replay_safety=safety, route=RouteKind.BARE)
 
 
 def _command_query(request: Request) -> str:
@@ -421,11 +426,15 @@ def _partition_capabilities(
     eligible: list[_Command] = []
     rejected: dict[int, BatchOutcome] = {}
     for command in commands:
-        if command.request.encoding.value == "json" and not command.request.headers.items:
+        if (
+            command.request.route is RouteKind.BARE
+            and command.request.encoding.value == "json"
+            and not command.request.headers.items
+        ):
             eligible.append(command)
             continue
         error = CapabilityError(
-            "physical batch supports JSON requests without scoped headers; use direct dispatch",
+            "physical batch supports BARE JSON requests without scoped headers; use direct dispatch",
             request_summary=command.request.summary,
         )
         rejected[command.index] = _command_failure(

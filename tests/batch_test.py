@@ -24,7 +24,7 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     SnapshotState,
 )
-from b24api.contracts.request import ReplaySafety, Request
+from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
@@ -125,6 +125,23 @@ async def test_async_unlimited_input_pulls_only_one_bounded_chunk_before_first_y
     assert transport.requests[0].copy_parameters()["halt"] == 0
     await stream.aclose()
     assert stream.report.state is KernelState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_non_bare_inner_command_is_correlated_rejection_before_batch_dispatch() -> None:
+    transport = CallbackTransport(_echo_batch)
+    stream = BatchExecutor(Executor(transport))._outcomes([
+        Request("im.v2.Chat.Message.CommentInfo.list", route=RouteKind.JSON),
+        Request("profile", route=RouteKind.BARE),
+    ])
+    outcomes = [item async for item in stream]
+
+    assert isinstance(outcomes[0], BatchFailure)
+    assert outcomes[0].error.request_summary is not None
+    assert outcomes[0].error.request_summary.route is RouteKind.JSON
+    assert isinstance(outcomes[1], BatchSuccess)
+    assert len(transport.requests) == 1
+    assert transport.requests[0].route is RouteKind.BARE
 
 
 @pytest.mark.asyncio

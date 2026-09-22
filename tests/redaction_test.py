@@ -79,6 +79,7 @@ def test_safe_evidence_values_are_frozen_and_serializable() -> None:
         "parameter_keys": ["select"],
         "encoding": "json",
         "header_names": [],
+        "route": "bare",
     }
     assert response.to_dict()["headers"] == {"x-request-id": "safe"}
     assert command.to_dict()["original_code"] == 0

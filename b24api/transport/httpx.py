@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, cast
 import httpx
 
 from b24api._error_types import FailurePhase
+from b24api.contracts.request import RouteKind
 from b24api.contracts.wire import BodyEncoding, _validate_headers
 from b24api.encoding import encode_php_query
 from b24api.errors import (
@@ -57,6 +58,7 @@ def _webhook_vault() -> tuple[Callable[[str], str], Callable[[str], str], Callab
 
 
 _store_webhook, _webhook_for, _drop_webhook = _webhook_vault()
+_CLASSIC_WEBHOOK_PARTS = 3
 
 
 class _PhaseTracker:
@@ -108,6 +110,19 @@ def _normalized_webhook_host(webhook_url: str) -> str:
     if parsed.host is None:
         raise ValueError("webhook URL must contain a host")
     return parsed.host
+
+
+def _method_url(webhook_url: str, request: WireRequest) -> str:
+    """Resolve an explicit route only at dispatch, keeping credential out of public values."""
+    parsed = httpx.URL(webhook_url)
+    path = parsed.path
+    if request.route is RouteKind.API_V3:
+        parts = path.strip("/").split("/")
+        if len(parts) != _CLASSIC_WEBHOOK_PARTS or parts[0] != "rest" or not all(parts[1:]):
+            raise ValueError("API_V3 requires a classic /rest/user/token/ webhook base")
+        path = f"/rest/api/{parts[1]}/{parts[2]}/"
+    suffix = ".json" if request.route is RouteKind.JSON else ""
+    return str(parsed.copy_with(path=f"{path}{request.method}{suffix}"))
 
 
 class HttpxTransport:
@@ -171,6 +186,7 @@ class HttpxTransport:
         """Send one explicitly represented transport request attempt."""
         if self._closed:
             raise RuntimeError("transport is closed")
+        method_url = _method_url(_webhook_for(self._webhook_handle), request)
         if isinstance(max_response_bytes, bool) or max_response_bytes < 1:
             raise ValueError("max_response_bytes must be a positive integer")
         tracker = _PhaseTracker()
@@ -184,7 +200,7 @@ class HttpxTransport:
                 request_headers["content-type"] = "application/json"
                 http_request = self._client.build_request(
                     "POST",
-                    f"{_webhook_for(self._webhook_handle)}{request.method}",
+                    method_url,
                     headers=request_headers,
                     json=parameters,
                 )
@@ -193,12 +209,13 @@ class HttpxTransport:
                 content = encode_php_query(cast("Mapping[str | int, object]", parameters)).encode()
                 http_request = self._client.build_request(
                     "POST",
-                    f"{_webhook_for(self._webhook_handle)}{request.method}",
+                    method_url,
                     headers=request_headers,
                     content=content,
                 )
             else:  # pragma: no cover - guarded by typed contracts/capabilities
                 raise TypeError("unsupported body encoding")
+            method_url = ""
             http_request.extensions["trace"] = tracker
             http_request.extensions["timeout"] = {
                 "connect": attempt_timeout,

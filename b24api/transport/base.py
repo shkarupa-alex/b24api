@@ -6,7 +6,7 @@ from types import MappingProxyType
 from typing import Protocol, cast, runtime_checkable
 
 from b24api.contracts.json import FrozenMapping, JsonValue, _thaw_json
-from b24api.contracts.request import ReplaySafety, Request, RequestSummary, ResultErrorSpec
+from b24api.contracts.request import ReplaySafety, Request, RequestSummary, ResultErrorSpec, RouteKind
 from b24api.contracts.response import _safe_media_type
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 
@@ -76,6 +76,7 @@ class WireRequest:
     """Transport-facing request without a caller-controlled destination."""
 
     method: str
+    route: RouteKind
     replay_safety: ReplaySafety
     encoding: BodyEncoding
     headers: RequestHeaders
@@ -87,6 +88,7 @@ class WireRequest:
         if not isinstance(request, Request):
             raise TypeError("wire request requires a canonical Request")
         object.__setattr__(self, "method", request.method)
+        object.__setattr__(self, "route", request.route)
         object.__setattr__(self, "replay_safety", request.replay_safety)
         object.__setattr__(self, "encoding", request.encoding)
         object.__setattr__(self, "headers", request.headers)
@@ -110,6 +112,7 @@ class WireRequest:
             parameter_keys=tuple(sorted(self._parameters)),
             encoding=self.encoding,
             header_names=self.headers.names,
+            route=self.route,
         )
 
     def __repr__(self) -> str:

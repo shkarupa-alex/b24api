@@ -20,6 +20,14 @@ _COMPOSITE_COMPONENT_MINIMUM = 2
 _COMPOSITE_COMPONENT_MAXIMUM = 8
 
 
+class RouteKind(StrEnum):
+    """REST endpoint family selected by the caller."""
+
+    BARE = "bare"
+    JSON = "json"
+    API_V3 = "api_v3"
+
+
 @dataclass(frozen=True, slots=True)
 class RequestSummary:
     """Bounded request identity that intentionally excludes parameter values."""
@@ -28,6 +36,7 @@ class RequestSummary:
     parameter_keys: tuple[str, ...] = ()
     encoding: BodyEncoding = BodyEncoding.JSON
     header_names: tuple[str, ...] = ()
+    route: RouteKind = RouteKind.BARE
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -39,6 +48,8 @@ class RequestSummary:
         )
         if not isinstance(self.encoding, BodyEncoding):
             raise TypeError("encoding must be a BodyEncoding")
+        if not isinstance(self.route, RouteKind):
+            raise TypeError("route must be a RouteKind")
         object.__setattr__(
             self,
             "header_names",
@@ -57,14 +68,16 @@ class RequestSummary:
             "parameter_keys": list(self.parameter_keys),
             "encoding": self.encoding.value,
             "header_names": list(self.header_names),
+            "route": self.route.value,
         }
 
 
-def summarize_request(
+def summarize_request(  # noqa: PLR0913
     method: object,
     parameters: object = None,
     *,
     encoding: BodyEncoding = BodyEncoding.JSON,
+    route: RouteKind = RouteKind.BARE,
     header_names: tuple[str, ...] = (),
     redactor: Redactor = DEFAULT_REDACTOR,
 ) -> RequestSummary:
@@ -73,7 +86,13 @@ def summarize_request(
     keys: tuple[str, ...] = ()
     if isinstance(parameters, Mapping):
         keys = tuple(sorted(redactor.redact_text(str(key)) for key in parameters)[: redactor.max_items])
-    return RequestSummary(method=safe_method, parameter_keys=keys, encoding=encoding, header_names=header_names)
+    return RequestSummary(
+        method=safe_method,
+        parameter_keys=keys,
+        encoding=encoding,
+        header_names=header_names,
+        route=route,
+    )
 
 
 class ReplaySafety(StrEnum):
@@ -90,6 +109,7 @@ class _OptionalRequestSpec(TypedDict, total=False):
     encoding: BodyEncoding
     headers: RequestHeaders
     result_error: ResultErrorSpec
+    route: RouteKind
 
 
 class RequestSpec(_OptionalRequestSpec):
@@ -232,6 +252,7 @@ class Request:
     """Deeply immutable canonical request with detached accessors."""
 
     method: str
+    route: RouteKind
     replay_safety: ReplaySafety
     encoding: BodyEncoding
     headers: RequestHeaders
@@ -247,10 +268,17 @@ class Request:
         encoding: BodyEncoding = BodyEncoding.JSON,
         headers: RequestHeaders = RequestHeaders(),  # noqa: B008 - immutable value singleton
         result_error: ResultErrorSpec | None = None,
+        route: RouteKind = RouteKind.BARE,
     ) -> None:
         """Initialize instance state."""
         if not _METHOD_RE.fullmatch(method):
             raise ValueError("method must contain only letters, digits, dots, and underscores")
+        if route is RouteKind.JSON and method.endswith(".json"):
+            raise ValueError("JSON route adds its own .json suffix")
+        if not isinstance(route, RouteKind):
+            raise TypeError("route must be a RouteKind")
+        if route is RouteKind.API_V3 and encoding is not BodyEncoding.JSON:
+            raise ValueError("API_V3 requires JSON body encoding")
         if not isinstance(replay_safety, ReplaySafety):
             raise TypeError("replay_safety must be a ReplaySafety")
         if not isinstance(encoding, BodyEncoding) or not isinstance(headers, RequestHeaders):
@@ -261,6 +289,7 @@ class Request:
         if not isinstance(frozen, FrozenMapping):
             raise TypeError("request parameters must be a mapping")
         object.__setattr__(self, "method", method)
+        object.__setattr__(self, "route", route)
         object.__setattr__(self, "replay_safety", replay_safety)
         object.__setattr__(self, "encoding", encoding)
         object.__setattr__(self, "headers", headers)
@@ -289,6 +318,7 @@ class Request:
             encoding=self.encoding,
             headers=self.headers,
             result_error=self.result_error,
+            route=self.route,
         )
 
     @property
@@ -299,6 +329,7 @@ class Request:
             self._parameters,
             encoding=self.encoding,
             header_names=self.headers.names,
+            route=self.route,
         )
 
     def __repr__(self) -> str:
@@ -315,7 +346,7 @@ def canonical_request(raw: RequestLike) -> Request:
         return raw
     if not isinstance(raw, Mapping):
         raise TypeError("request must be a Request or closed request mapping")
-    unknown = set(raw) - {"method", "parameters", "replay_safety", "encoding", "headers", "result_error"}
+    unknown = set(raw) - {"method", "parameters", "replay_safety", "encoding", "headers", "result_error", "route"}
     if unknown:
         raise ValueError(f"unknown request fields: {sorted(unknown)}")
     method = raw.get("method")
@@ -324,6 +355,7 @@ def canonical_request(raw: RequestLike) -> Request:
     encoding = raw.get("encoding", BodyEncoding.JSON)
     headers = raw.get("headers", RequestHeaders())
     result_error = raw.get("result_error")
+    route = raw.get("route", RouteKind.BARE)
     if not isinstance(method, str):
         raise TypeError("request mapping requires a string method")
     if parameters is not None and not isinstance(parameters, Mapping):
@@ -334,6 +366,8 @@ def canonical_request(raw: RequestLike) -> Request:
         raise TypeError("request encoding and headers must use their declared contract types")
     if result_error is not None and not isinstance(result_error, ResultErrorSpec):
         raise TypeError("request result_error must be a ResultErrorSpec")
+    if not isinstance(route, RouteKind):
+        raise TypeError("request route must be a RouteKind")
     return Request(
         method,
         parameters,
@@ -341,4 +375,5 @@ def canonical_request(raw: RequestLike) -> Request:
         encoding=encoding,
         headers=headers,
         result_error=result_error,
+        route=route,
     )
