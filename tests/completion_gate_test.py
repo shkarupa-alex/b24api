@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from b24api.completion import CompletionGate
+from b24api.completion.gate import CompletionReportFacts
 from b24api.contracts.completion import (
     BindingAdmitted,
     BindingClosure,
@@ -20,7 +21,9 @@ from b24api.contracts.completion import (
     StreamClosure,
     StreamTerminal,
 )
+from b24api.contracts.policy import KernelState
 from b24api.contracts.report import TerminalState
+from b24api.execution.snapshot import KernelReport
 
 
 def _page(gate: CompletionGate, *, acknowledged: bool = True) -> int:
@@ -114,3 +117,35 @@ def test_gate_accounts_for_all_failed_bindings_without_claiming_exhaustion() -> 
     decision = gate.decision()
     assert decision.state is TerminalState.COMPLETED_WITH_FAILURES
     assert not decision.exhausted
+
+
+def test_gate_accounts_for_typed_unknown_without_claiming_exhaustion() -> None:
+    gate = CompletionGate("run")
+    gate.emit(BindingAdmitted(operation_id="run", sequence=0, binding_id=0))
+    gate.emit(PageScheduled(operation_id="run", sequence=1, binding_id=0, page_id=0))
+    gate.emit(PageCommandOutcome(
+        operation_id="run", sequence=2, binding_id=0, page_id=0, outcome=CommandSettlement.UNKNOWN,
+    ))
+    _close(gate, 3, BindingClosure.UNKNOWN)
+    decision = gate.decision()
+    assert decision.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert not decision.exhausted
+
+
+def test_gate_rejects_public_success_counts_that_omit_a_failed_binding() -> None:
+    gate = CompletionGate("run")
+    gate.emit(BindingAdmitted(operation_id="run", sequence=0, binding_id=0))
+    gate.emit(PageScheduled(operation_id="run", sequence=1, binding_id=0, page_id=0))
+    gate.emit(PageCommandOutcome(
+        operation_id="run", sequence=2, binding_id=0, page_id=0, outcome=CommandSettlement.FAILURE,
+    ))
+    _close(gate, 3, BindingClosure.FAILURE)
+    gate.attach_report(CompletionReportFacts(
+        source=KernelReport(state=KernelState.COMPLETED),
+        operation="batch_outcomes", assurance=None, admitted=1, emitted=0,
+        successes=0, failures=0, not_executed=0, unknown=0,
+        buffered_commands_high_water=0, active_references_high_water=0,
+    ))
+    report = gate.finish()
+    assert report.state is TerminalState.INCOMPLETE
+    assert "completion_outcome_count_mismatch" in {item.code for item in report.violations}

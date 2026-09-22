@@ -12,7 +12,7 @@ from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.page_stop import CallerStop, ContinuePage, PageBoundary, PageStopPolicy
 from b24api.contracts.report import PageDispatch, PageRecord, Violation, ViolationSeverity, retain_page_trace
 from b24api.contracts.request import ReplaySafety, Request, ResultSelector, TraversalIdentity
-from b24api.errors import BudgetExceededError, CapabilityError
+from b24api.errors import AmbiguousExecutionError, ApiResponseError, BudgetExceededError, CapabilityError
 from b24api.execution import (
     AsyncIteratorController,
     Executor,
@@ -361,7 +361,10 @@ class ReferenceScheduler:
                 settlement = dispatched.settlement
             except BaseException as error:
                 completion.settled(
-                    CommandSettlement.FAILURE if isinstance(error, _BatchPageError)
+                    CommandSettlement.UNKNOWN if isinstance(error, _BatchPageError) and isinstance(
+                        error.failure.error, AmbiguousExecutionError,
+                    )
+                    else CommandSettlement.FAILURE if isinstance(error, _BatchPageError | ApiResponseError)
                     else CommandSettlement.UNKNOWN if bool(getattr(error, "_b24api_dispatch_started", False))
                     else CommandSettlement.NOT_EXECUTED,
                 )

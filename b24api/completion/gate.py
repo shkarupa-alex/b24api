@@ -64,6 +64,7 @@ class CompletionDecision:
 
     state: TerminalState
     exhausted: bool
+    caller_stopped: bool
     violations: tuple[Violation, ...]
     bindings_admitted: int
     bindings_terminal: int
@@ -269,8 +270,7 @@ class CompletionGate:
             or self._bindings
             or self._pages
             or self._scheduled != self._acknowledged + self._negative_pages
-            or self._cleanup is CleanupState.FAILURE
-            or self._unknown,
+            or self._cleanup is CleanupState.FAILURE,
         )
         if self._stream is StreamClosure.CANCELLED:
             state = TerminalState.CANCELLED
@@ -285,6 +285,7 @@ class CompletionGate:
         return CompletionDecision(
             state,
             state is TerminalState.COMPLETED and not self._caller_stops and not self._bounded,
+            bool(self._caller_stops),
             tuple(self._violations),
             self._admitted,
             self._terminal,
@@ -305,12 +306,11 @@ class CompletionGate:
         if facts is None:
             raise RuntimeError("completion report facts were not attached")
         source = facts.source
+        negative_outcomes = facts.failures + facts.not_executed + facts.unknown
         if facts.early_closed:
             state = TerminalState.EARLY_CLOSED
         elif source.state is KernelState.COMPLETED:
-            state = TerminalState.COMPLETED_WITH_FAILURES if (
-                facts.failures + facts.not_executed + facts.unknown
-            ) else TerminalState.COMPLETED
+            state = decision.state
         elif source.state is KernelState.INCOMPLETE:
             state = TerminalState.INCOMPLETE
         elif source.state is KernelState.CANCELLED:
@@ -318,11 +318,21 @@ class CompletionGate:
         else:
             state = TerminalState.FAILED
         violations = (*source.violations, *decision.violations, *facts.extra_violations)
+        gate_negative = decision.state is TerminalState.COMPLETED_WITH_FAILURES
+        if source.state is KernelState.COMPLETED and gate_negative != bool(negative_outcomes):
+            violations = (*violations, Violation(
+                ViolationSeverity.BLOCKING,
+                "completion_outcome_count_mismatch",
+                "public negative outcome counts disagree with completion evidence",
+            ))
+            state = TerminalState.INCOMPLETE
         if state is TerminalState.COMPLETED and (
             decision.state is not TerminalState.COMPLETED
             or any(item.severity is ViolationSeverity.BLOCKING for item in violations)
         ):
             state = TerminalState.INCOMPLETE
+        if facts.forced_state in {TerminalState.COMPLETED, TerminalState.COMPLETED_WITH_FAILURES}:
+            raise ValueError("forced terminal state cannot claim successful completion")
         if facts.forced_state is not None:
             state = facts.forced_state
         return OperationReport(
@@ -330,7 +340,7 @@ class CompletionGate:
             operation=facts.operation,
             terminal_reason=source.terminal_reason or state.value,
             exhausted=state is TerminalState.COMPLETED and decision.exhausted,
-            assurance=TraversalAssurance.BOUNDED_PREFIX if source.caller_stopped else facts.assurance,
+            assurance=TraversalAssurance.BOUNDED_PREFIX if decision.caller_stopped else facts.assurance,
             admitted=facts.admitted,
             emitted=facts.emitted,
             successes=facts.successes,
