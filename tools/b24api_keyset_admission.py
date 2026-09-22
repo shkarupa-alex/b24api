@@ -16,8 +16,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs
 
-from b24api.contracts.request import RouteKind
-
 ROOT = Path(__file__).resolve().parents[1]
 
 if TYPE_CHECKING or __package__:
@@ -53,6 +51,7 @@ from b24api import (  # noqa: E402 - direct execution binds imports to this chec
     ReplaySafety,
     Request,
     ResultSelector,
+    RouteKind,
     Settings,
     StableIntegerKeysetContract,
     TotalHintMode,
