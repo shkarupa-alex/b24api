@@ -312,3 +312,36 @@ def test_gate_rejects_public_success_counts_that_omit_a_failed_binding() -> None
     report = gate.finish()
     assert report.state is TerminalState.INCOMPLETE
     assert "completion_outcome_count_mismatch" in {item.code for item in report.violations}
+
+
+@pytest.mark.parametrize("settled", [False, True], ids=["scheduled-only", "settled"])
+def test_rejection_requires_successful_command_settlement(settled: bool) -> None:  # noqa: FBT001
+    gate = CompletionGate("run")
+    gate.emit(BindingAdmitted(operation_id="run", sequence=0, binding_id=0))
+    gate.emit(PageScheduled(operation_id="run", sequence=1, binding_id=0, page_id=0))
+    sequence = 2
+    if settled:
+        gate.emit(
+            PageCommandOutcome(
+                operation_id="run",
+                sequence=sequence,
+                binding_id=0,
+                page_id=0,
+                outcome=CommandSettlement.SUCCESS,
+            )
+        )
+        sequence += 1
+    gate.emit(PageRejected(operation_id="run", sequence=sequence, binding_id=0, page_id=0, reason="shape"))
+    gate.emit(
+        BindingTerminal(operation_id="run", sequence=sequence + 1, binding_id=0, closure=BindingClosure.FAILURE),
+    )
+    gate.emit(StreamTerminal(operation_id="run", sequence=sequence + 2, closure=StreamClosure.NATURAL))
+    gate.emit(CleanupOutcome(operation_id="run", sequence=sequence + 3, state=CleanupState.SUCCESS))
+    decision = gate.decision()
+    violations = {item.code for item in decision.violations}
+    if settled:
+        assert decision.state is TerminalState.COMPLETED_WITH_FAILURES
+        assert not violations
+    else:
+        assert decision.state is TerminalState.INCOMPLETE
+        assert "completion_rejection_before_settlement" in violations

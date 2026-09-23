@@ -229,6 +229,11 @@ class CompletionGate:
             if page.stage is _Stage.DELIVERED:
                 self._violate("completion_rejection_after_delivery")
                 return
+            if page.stage is _Stage.SCHEDULED:
+                # A rejection is the negative result of a settled page; without the settlement the
+                # physical outcome is unknown and the page stays open for incomplete accounting.
+                self._violate("completion_rejection_before_settlement")
+                return
             self._negative_pages += 1
             self._bindings[event.binding_id].negative_pages += 1
             self._retire_page(event.binding_id, event.page_id)
