@@ -17,12 +17,17 @@ v3_request = Request("tasks.task.result.list", route=RouteKind.API_V3)
 
 HTTPX INFO records for requests owned by `HttpxTransport` have their registered webhook URL
 redacted before logging handlers format them. This applies to an injected `httpx.AsyncClient` while
-it is used through that transport, including its redirect hops and any retry of the same portal
-operation its auth flow substitutes, even under a rotated webhook credential. A request to any other
-address through the same client, even one sent from its event hook or sent or yielded by its auth
-flow while an owned request is in flight, is logged unchanged.
-Direct use of a caller-owned client after the transport closes is outside that shield. An application enabling the separate `httpcore` DEBUG logger needs its own
-logging policy and test; this guarantee covers the emitting `httpx` INFO logger.
+it is used through that transport, including its redirect hops. Any other request through the same
+client, even one sent from its event hook or auth flow while an owned request is in flight, is logged
+unchanged except that the registered webhook secret itself is never logged.
+An injected client's `auth` still runs on owned requests when it authorizes the request in place, as
+`httpx.BasicAuth`, `httpx.DigestAuth` and header-setting flows do. A flow that yields any other
+`Request` (a clone, a credential rotation or an unrelated request) is refused before that request is
+sent, with a non-retryable `TransportError` whose phase records whether the owned request had
+already been answered: a substitute would make it undecidable which records carry the webhook.
+Direct use of a caller-owned client after the transport closes is outside that shield. An
+application enabling the separate `httpcore` DEBUG logger needs its own logging policy and test;
+this guarantee covers the emitting `httpx` INFO logger.
 The supported HTTPX range is `>=0.28.1,<0.29`; raising that upper bound requires rerunning the
 positive logger controls against the newly admitted version.
 

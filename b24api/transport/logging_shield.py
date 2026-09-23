@@ -4,15 +4,15 @@ A b24api request can emit several records, including redirect hops whose URLs b2
 so the filter scrubs any credential-shaped Bitrix URL segment and sensitive query value, not only the
 registered webhook token. Neither task context nor client identity proves ownership: a caller's
 response hook or auth flow may send an unrelated request in the same task, even through the same
-injected client, and an auth flow may yield unrelated requests of its own. A record is therefore
-attributed to the root of the redirect chain that emits it: the request the innermost HTTPX
-``_send_handling_auth`` is dispatching. HTTPX rebinds that root to each request the auth flow yields
-but never to a redirect hop, and a nested send opens its own frame. The root is owned when it
-carries this dispatch's marker, holds the owned webhook credential, or retries the owned portal
-operation (same host and method path, whatever user and token segments it carries), which covers
-an auth-flow substitute of the owned request even under a rotated credential; roots to any other
-address stay untouched. If no such frame is found (a changed HTTPX internal), the record is
-scrubbed conservatively.
+injected client. A record is therefore attributed to the root of the redirect chain that emits it:
+the request the innermost HTTPX ``_send_handling_auth`` is dispatching, which HTTPX never rebinds to a
+redirect hop and which a nested send replaces with its own frame. The root is owned only when it
+carries this dispatch's marker. An auth flow could otherwise make lineage undecidable by yielding a
+fresh request, either a substitute for the owned call or an unrelated one with the same address, so
+the owned send runs the client's auth through a guard that admits only the marked request itself,
+mutated in place, and refuses any other request before HTTPX dispatches it. Records of other roots
+keep every byte except the registered webhook secret, which is never logged. If no emitting frame is
+found (a changed HTTPX internal), the record is scrubbed conservatively.
 """
 
 from __future__ import annotations
@@ -24,15 +24,14 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import PurePath
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
+
+import httpx
 
 from b24api.redaction import Redactor
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import AsyncGenerator, Iterator
     from types import FrameType
-
-    import httpx
 
 _LOGGER = logging.getLogger("httpx")
 _ACTIVE_OWNERSHIP: ContextVar[LogOwnership | None] = ContextVar(
@@ -45,7 +44,6 @@ _OWNER_EXTENSION = "b24api_log_owner"
 _UNATTRIBUTED = object()
 _REPLACEMENT = "[REDACTED]"
 _CREDENTIAL_PATH = re.compile(r"/rest/(?:api/)?[^/]+/([^/]+)/", re.IGNORECASE)
-_CREDENTIAL_SEGMENTS = re.compile(r"(?P<prefix>/rest/(?:api/)?)[^/]+/[^/]+/", re.IGNORECASE)
 # Full-length scrubbing: truncating a record's format string would break its %-interpolation.
 _RECORD_REDACTOR = Redactor(max_string=1 << 20)
 _HOP_CREDENTIAL = re.compile(
@@ -62,11 +60,14 @@ def _credentials(url: str) -> tuple[str, ...]:
     return (match.group(1),)
 
 
-def _operation(url: str) -> tuple[str, int | None, str]:
-    """Identify a portal operation independently of the user and token segments of its URL."""
-    parts = urlsplit(url)
-    path = _CREDENTIAL_SEGMENTS.sub(r"\g<prefix>*/*/", parts.path, count=1)
-    return ((parts.hostname or "").lower(), parts.port, path.lower())
+def _redact_registered_value(value: object, credentials: tuple[str, ...]) -> object:
+    """Remove only the registered secret from a foreign record field, leaving it otherwise untouched."""
+    rendered = str(value)
+    if not any(credential in rendered for credential in credentials):
+        return value
+    for credential in credentials:
+        rendered = rendered.replace(credential, _REPLACEMENT)
+    return rendered
 
 
 def _redact_owned_value(value: object, credentials: tuple[str, ...]) -> object:
@@ -92,51 +93,90 @@ def _emitting_root() -> object:
 
 
 class LogOwnership:
-    """Recognize the redirect chains of one owned dispatch, including auth-flow substitutes."""
+    """Recognize the redirect chains of one owned dispatch by its marked root request."""
 
-    __slots__ = ("credentials", "operation")
+    __slots__ = ("credentials",)
 
     def __init__(self, url: str) -> None:
-        """Bind the owned webhook credential segment and portal operation."""
+        """Bind the owned webhook credential segment."""
         self.credentials = _credentials(url)
-        self.operation = _operation(url)
 
     def claim(self, request: httpx.Request) -> None:
         """Attach this ownership marker before the request is sent."""
         request.extensions[_OWNER_EXTENSION] = self
 
     def owns(self, request: object) -> bool:
-        """Report whether a chain root is marked, holds the owned credential or retries the owned operation."""
+        """Report whether a chain root carries this exact marker."""
         extensions = getattr(request, "extensions", None)
-        if isinstance(extensions, dict) and extensions.get(_OWNER_EXTENSION) is self:
-            return True
-        url = str(getattr(request, "url", ""))
-        match = _CREDENTIAL_PATH.search(url)
-        if match is not None and match.group(1) in self.credentials:
-            return True
-        return match is not None and _operation(url) == self.operation
+        return isinstance(extensions, dict) and extensions.get(_OWNER_EXTENSION) is self
+
+    def guard(self, auth: httpx.Auth | None) -> httpx.Auth:
+        """Wrap the client's auth so the owned send can dispatch nothing but the marked request."""
+        return _OwnedRequestAuth(auth)
+
+
+class OwnedRequestReplacedError(RuntimeError):
+    """An injected client's auth flow yielded a request other than the owned one; it was not sent."""
+
+    def __init__(self, message: str, *, after_response: bool) -> None:
+        """Record whether the owned request had already been answered, so dispatch stays accounted."""
+        super().__init__(message)
+        self.after_response = after_response
+
+
+class _OwnedRequestAuth(httpx.Auth):
+    """Run the client's auth on the owned request, refusing any request it would substitute."""
+
+    def __init__(self, inner: httpx.Auth | None) -> None:
+        self._inner = inner
+
+    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        if self._inner is None:
+            yield request
+            return
+        flow = self._inner.async_auth_flow(request)
+        try:
+            try:
+                yielded = await flow.__anext__()
+            except StopAsyncIteration:
+                raise OwnedRequestReplacedError(
+                    "injected client auth yielded no request", after_response=False
+                ) from None
+            answered = False
+            while True:
+                if yielded is not request:
+                    raise OwnedRequestReplacedError(
+                        "injected client auth replaced the owned request", after_response=answered
+                    )
+                response = yield yielded
+                answered = True
+                try:
+                    yielded = await flow.asend(response)
+                except StopAsyncIteration:
+                    return
+        finally:
+            await flow.aclose()
 
 
 class _OwnedRequestFilter(logging.Filter):
-    """Rewrite records of an in-flight owned dispatch, across auth substitutes and redirect hops."""
+    """Rewrite records of an in-flight owned dispatch and its redirect hops; keep the secret out of all others."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         owner = _ACTIVE_OWNERSHIP.get()
         if owner is None:
             return True
         root = _emitting_root()
-        if root is not _UNATTRIBUTED and not owner.owns(root):
-            return True
+        redact = _redact_owned_value if root is _UNATTRIBUTED or owner.owns(root) else _redact_registered_value
         credentials = owner.credentials
         args = record.args
-        record.msg = _redact_owned_value(record.msg, credentials)
+        record.msg = redact(record.msg, credentials)
         if isinstance(args, dict):
-            record.args = {key: _redact_owned_value(value, credentials) for key, value in args.items()}
+            record.args = {key: redact(value, credentials) for key, value in args.items()}
         elif isinstance(args, tuple):
-            record.args = tuple(_redact_owned_value(value, credentials) for value in args)
+            record.args = tuple(redact(value, credentials) for value in args)
         for name in ("url", "request_url"):
             if name in record.__dict__:
-                record.__dict__[name] = _redact_owned_value(record.__dict__[name], credentials)
+                record.__dict__[name] = redact(record.__dict__[name], credentials)
         return True
 
 

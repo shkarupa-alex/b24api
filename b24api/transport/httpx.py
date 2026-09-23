@@ -28,7 +28,7 @@ from b24api.transport.base import (
     WireRequest,
     WireResponse,
 )
-from b24api.transport.logging_shield import HTTPX_LOG_SHIELD
+from b24api.transport.logging_shield import HTTPX_LOG_SHIELD, OwnedRequestReplacedError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -123,6 +123,9 @@ def _normalized_webhook_host(webhook_url: str) -> str:
     ):
         raise ValueError("webhook URL must be a classic /rest/user/token/ base")
     return parsed.host
+
+
+_REPLACED_OWNED_REQUEST = "Injected client auth replaced the owned request; only in-place auth is supported"
 
 
 def _method_url(webhook_url: str, request: WireRequest) -> str:
@@ -276,10 +279,17 @@ class HttpxTransport:
                 "write": attempt_timeout,
                 "pool": attempt_timeout,
             }
-            response = await self._client.send(http_request, stream=True)
+            response = await self._client.send(http_request, stream=True, auth=ownership.guard(self._client.auth))
         except asyncio.CancelledError as error:
             cancellation_args = error.args
             http_request = None
+        except OwnedRequestReplacedError as error:
+            # Only in-place auth flows keep the owned request's lineage provable; a substitute is never sent.
+            answered = error.after_response
+            failure = (
+                _REPLACED_OWNED_REQUEST,
+                _at_least_dispatch_started(tracker.phase) if answered else tracker.phase,
+            )
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             failure = ("Transport failed before dispatch", tracker.phase)
         except (httpx.WriteError, httpx.WriteTimeout):
@@ -311,7 +321,12 @@ class HttpxTransport:
             # chain or in the outgoing traceback frame's local variables.
             http_request = None
             message, phase = failure
-            raise TransportError(message, phase=phase, request_summary=request.summary)
+            raise TransportError(
+                message,
+                phase=phase,
+                request_summary=request.summary,
+                retryable=message != _REPLACED_OWNED_REQUEST,
+            )
         pending_error: B24ApiError | None = None
         body_outcome = _BodyReadOutcome()
         try:
