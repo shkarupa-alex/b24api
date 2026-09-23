@@ -42,6 +42,7 @@ from b24api import (
     PageIndex,
     PageOutcome,
     PageRejectionCode,
+    PageStride,
     ParameterPath,
     ReferenceFailure,
     ReferenceItem,
@@ -714,6 +715,78 @@ async def test_reference_sequential_preserves_page_index_controls() -> None:
     outcomes = [outcome async for outcome in stream]
     assert len(outcomes) == page_size + 1
     assert observed == [(initial_page, page_size), (next_page, page_size)]
+
+
+@pytest.mark.asyncio
+async def test_page_index_rejects_rows_after_a_short_window_in_direct_and_reference_paths() -> None:
+    page_size = 2
+    page_path = ParameterPath(("page",))
+
+    def handler(request: Request) -> WireResponse:
+        page = request.copy_parameters()["page"]
+        assert isinstance(page, int)
+        pages = {1: [{"ID": 1}, {"ID": 2}], 2: [{"ID": 3}], 3: [{"ID": 4}, {"ID": 5}]}
+        return _response(pages[page])
+
+    traversal = SequentialTraversal(
+        page_size=page_size,
+        offset=OffsetSpec(parameter_path=page_path, page_index=PageIndex(page_path, max_rows=page_size)),
+    )
+    direct = _client(_Transport(handler)).iter_list(
+        Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        page_size=traversal.page_size,
+        offset=traversal.offset,
+    )
+    with pytest.raises(IncompleteTraversalError) as direct_failure:
+        _ = [item async for item in direct]
+    assert isinstance(direct_failure.value.__cause__, PaginationError)
+    assert not direct.report.exhausted
+
+    reference = _client(_Transport(handler)).iter_reference_outcomes(
+        Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        [Binding("one", (), object())],
+        traversal=traversal,
+        dispatch=DirectDispatch(concurrency=1),
+    )
+    outcomes = [outcome async for outcome in reference]
+    failure = outcomes[-1]
+    assert isinstance(failure, ReferenceFailure)
+    assert isinstance(failure.error, IncompleteTraversalError)
+    assert isinstance(failure.error.__cause__, PaginationError)
+    assert not reference.report.exhausted
+
+
+def test_counted_rejects_inconsistent_or_wire_limited_page_stride_before_io() -> None:
+    transport = _Transport(lambda _request: pytest.fail("invalid counted stride must reject before I/O"))
+    client = _client(transport)
+    mismatched = OffsetSpec(
+        limit_path=ParameterPath(("limit",)),
+        continuation=OffsetContinuation.FIXED_STEP,
+        step=PAGE_SIZE,
+        total_termination=TotalTermination.EXACT_QUALIFIED,
+        page_stride=PageStride(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE // 2),
+    )
+    wire_limited = OffsetSpec(
+        limit_path=ParameterPath(("limit",)),
+        continuation=OffsetContinuation.FIXED_STEP,
+        step=PAGE_SIZE,
+        total_termination=TotalTermination.EXACT_QUALIFIED,
+        page_stride=PageStride(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, requested_wire_limit=PAGE_SIZE * 2),
+    )
+
+    with pytest.raises(ValueError, match="max_decoded_rows"):
+        client.iter_list_counted(Request("example.list", route=RouteKind.BARE), page_size=PAGE_SIZE, offset=mismatched)
+    with pytest.raises(ValueError, match="requested_wire_limit"):
+        client.iter_list_counted(
+            Request("example.list", route=RouteKind.BARE),
+            page_size=PAGE_SIZE,
+            offset=wire_limited,
+        )
+    with pytest.raises(ValueError, match="max_decoded_rows"):
+        CountedTraversal(page_size=PAGE_SIZE, offset=mismatched)
+    with pytest.raises(ValueError, match="requested_wire_limit"):
+        CountedTraversal(page_size=PAGE_SIZE, offset=wire_limited)
+    assert transport.requests == []
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import tomllib
+from pathlib import Path
 
 import httpx
 import pytest
@@ -19,6 +21,12 @@ _SUCCESS_STATUS = 200
 _RESPONSE_STATUS = 403
 _OWNED_RECORDS = 2
 _TOTAL_RECORDS = 3
+
+
+def test_httpx_dependency_range_matches_the_positive_controlled_minor() -> None:
+    project = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+
+    assert "httpx[http2]>=0.28.1,<0.29" in project["project"]["dependencies"]
 
 
 class _CollectingHandler(logging.StreamHandler[io.StringIO]):

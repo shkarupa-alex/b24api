@@ -84,6 +84,7 @@ class _SequentialMixin:
             raise CapabilityError("sparse raw traversal requires the complete range from offset zero")
         expected_raw_total: int | None = None
         pending_short_window = False
+        short_page_width = plan.short_page_width or plan.fixed_step
         self.cursor_state = offset
         visited_offsets: set[int] = set()
         while True:
@@ -137,8 +138,8 @@ class _SequentialMixin:
                     and plan.page_stride is None
                     and plan.continuation is OffsetContinuation.FIXED_STEP
                     and terminal is None
-                    and plan.fixed_step is not None
-                    and len(items) < plan.fixed_step
+                    and short_page_width is not None
+                    and len(items) < short_page_width
                 ):
                     pending_short_window = True
                 next_offset = (

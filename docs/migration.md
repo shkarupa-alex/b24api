@@ -20,6 +20,8 @@ redacted before logging handlers format them. This applies to an injected `httpx
 it is used through that transport. Direct use of a caller-owned client after the transport closes
 is outside that shield. An application enabling the separate `httpcore` DEBUG logger needs its own
 logging policy and test; this guarantee covers the emitting `httpx` INFO logger.
+The supported HTTPX range is `>=0.28.1,<0.29`; raising that upper bound requires rerunning the
+positive logger controls against the newly admitted version.
 
 Direct access to `RateCoordinator.acquire()` now requires a non-empty `methods` frozenset. A
 physical batch passes every inner method as one admission unit. `Retry-After` pauses the portal

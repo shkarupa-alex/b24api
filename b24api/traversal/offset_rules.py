@@ -43,6 +43,13 @@ def sequential_offset_plan(
         initial_control=page_index.initial if page_index else 0,
         sparse_raw_bound=offset.sparse_raw_bound,
         page_stride=stride,
+        short_page_width=(
+            page_index.max_rows
+            if page_index is not None
+            else stride.max_decoded_rows
+            if stride is not None
+            else offset.step
+        ),
         terminal=offset_terminal_rules(offset),
         allow_create_controls=offset.allow_create_controls,
         identity_requirement=IdentityRequirement.OPTIONAL,

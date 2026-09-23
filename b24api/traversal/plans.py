@@ -114,6 +114,7 @@ class OffsetSequentialPlan(PlanContract):
     initial_control: int = 0
     sparse_raw_bound: SparseRawBound | None = None
     page_stride: PageStride | None = None
+    short_page_width: int | None = None
 
     def __post_init__(self) -> None:  # noqa: C901
         """Validate and normalize instance state."""
@@ -149,6 +150,12 @@ class OffsetSequentialPlan(PlanContract):
             self.continuation is not OffsetContinuation.FIXED_STEP or self.fixed_step != self.page_stride.wire_increment
         ):
             raise ValueError("page_stride requires its matching fixed-step continuation")
+        if self.short_page_width is not None and (
+            self.continuation is not OffsetContinuation.FIXED_STEP
+            or not _is_plain_int(self.short_page_width)
+            or self.short_page_width < 1
+        ):
+            raise ValueError("short_page_width requires fixed-step continuation and a positive width")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

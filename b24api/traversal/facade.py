@@ -232,6 +232,11 @@ def counted_stream(  # noqa: PLR0913
         raise ValueError("counted traversal requires exact-qualified total termination")
     if offset.continuation is OffsetContinuation.FIXED_STEP and offset.step != page_size:
         raise ValueError("fixed-step traversal requires page_size equal to step")
+    stride = offset.page_stride
+    if stride is not None and stride.max_decoded_rows != page_size:
+        raise ValueError("counted page_size must match page_stride max_decoded_rows")
+    if stride is not None and stride.requested_wire_limit is not None:
+        raise ValueError("counted traversal does not support page_stride requested_wire_limit")
     canonical = canonical_request(request)
     if (
         canonical.route is not RouteKind.BARE

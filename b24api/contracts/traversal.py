@@ -306,6 +306,11 @@ class CountedTraversal:
             raise ValueError("counted traversal requires exact-qualified total termination")
         if self.offset.continuation is OffsetContinuation.FIXED_STEP and self.offset.step != self.page_size:
             raise ValueError("fixed-step counted traversal requires page_size equal to step")
+        stride = self.offset.page_stride
+        if stride is not None and stride.max_decoded_rows != self.page_size:
+            raise ValueError("counted page_size must match page_stride max_decoded_rows")
+        if stride is not None and stride.requested_wire_limit is not None:
+            raise ValueError("counted traversal does not support page_stride requested_wire_limit")
 
 
 @dataclass(frozen=True, slots=True)
