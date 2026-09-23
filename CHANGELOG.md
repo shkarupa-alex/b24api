@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The PyPI release workflow accepts only canonical stable tags `MAJOR.MINOR.PATCH` (for example
+  `2.2.1`, with no `fix-` or `v` prefix) and rejects any other tag before the build backend runs. It
+  then requires exactly one sdist and one wheel whose filenames and metadata carry that version, and
+  passes `twine check --strict`, before upload; publication still depends on the build job. The
+  checkout, setup-python, upload-artifact, and download-artifact actions move to their Node 24 `v7`
+  majors.
 - A positional request whose slots cannot accept a declared traversal control still raises
   `CapabilityError` with the original positional error as its cause; the message now appends a
   value-free reason (undeclared path, absent slot, missing parent, or near-match casing), and the
