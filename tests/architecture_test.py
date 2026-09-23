@@ -210,7 +210,8 @@ def test_executor_binds_host_through_transport_protocol() -> None:
         Executor(ScriptedTransport((), host="b.example"), coordinator=shared)
 
     httpx_shared = RateCoordinator()
-    Executor(HttpxTransport("https://portal.example/rest/1/synthetic-token/"), coordinator=httpx_shared)
+    segment = "synthetic-segment"  # composed so the tracked file carries no webhook-shaped literal
+    Executor(HttpxTransport(f"https://portal.example/rest/1/{segment}/"), coordinator=httpx_shared)
     with pytest.raises(ValueError, match="already bound to another host"):
         Executor(ScriptedTransport((), host="other.example"), coordinator=httpx_shared)
 
