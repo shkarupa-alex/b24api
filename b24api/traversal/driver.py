@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Sequence
 
     from b24api.completion.recorder import CompletionSink
+    from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.json import JsonValue
     from b24api.contracts.response import Response
     from b24api.execution import ExecutionContext, Executor
@@ -110,6 +111,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         initial_cursor: IdentityValue | None = None,
         completion_recorder: CompletionSink | None = None,
+        identity_store: IdentityStore | None = None,
     ) -> None:
         """Initialize instance state."""
         self.executor = executor
@@ -134,6 +136,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self.validated_rows = 0
         self._fingerprints: set[str] = set()
         self._identity_store: _IdentityStore | None = None
+        self._external_identity_store = identity_store
+        self.duplicate_identities = 0
         self._unique_rows_final: int | None = None
         self._last_identity: IdentityValue | None = None
         self._last_page_unique_mask: tuple[bool, ...] = ()
@@ -188,7 +192,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         if self._identity_store is not None:
             raise RuntimeError("page validation is already active")
         self._validate_capabilities()
-        self._identity_store = _identity_store(self.context, self.plan, self.identity)
+        self._identity_store = _identity_store(self.context, self.plan, self.identity, self._external_identity_store)
 
     def validate_external_page(
         self,
@@ -351,6 +355,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             len(self.violations),
             self._last_identity,
             self._last_page_unique_mask,
+            self.duplicate_identities,
         )
         try:
             return self._validate_page_impl(
@@ -370,6 +375,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                 violation_count,
                 self._last_identity,
                 self._last_page_unique_mask,
+                self.duplicate_identities,
             ) = snapshot
             self._advisory_totals = advisory_totals
             del self.violations[violation_count:]
@@ -440,28 +446,38 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._last_page_unique_mask = tuple(unique_mask)
         if duplicates and self._duplicate_policy is DuplicatePolicy.ERROR:
             raise _PageRejectionError("duplicate identity detected", PageRejectionCode.DUPLICATE_IDENTITY)
-        if duplicates and self._duplicate_policy is DuplicatePolicy.REPORT:
-            self.violations.append(
-                Violation(
-                    severity=ViolationSeverity.WARNING,
-                    code="duplicate_identity",
-                    message=f"observed {len(duplicates)} duplicate identities",
-                ),
-            )
         if self._expected_total is not None and self.validated_rows + accepted_count > self._expected_total:
             raise _PageRejectionError("traversal exceeded its exact total", PageRejectionCode.TOTAL_DRIFT)
-        new_values = tuple(value for value in local if not self._store.contains(value))
+        new_values = tuple(dict.fromkeys(value for value in identities if not self._store.contains(value)))
         self._store.ensure_capacity(len(new_values))
         self.validated_rows += accepted_count
         if terminal:
             self._validate_terminal_total()
-        for value in new_values:
-            self._store.add(value)
+        present = self._store.commit(new_values)
+        if present:
+            self._last_page_unique_mask = _first_unique_mask(identities, present)
+        self._settle_duplicates(len(identities) - sum(self._last_page_unique_mask))
         if identities:
             self._last_identity = identities[-1]
         self._fingerprints.update((fingerprint,) if track_fingerprint else ())
         self._record_committed_page(items, response, identities)
         return identities
+
+    def _settle_duplicates(self, duplicates: int) -> None:
+        """Apply the duplicate policy once per page after the identity ledger answered."""
+        if not duplicates:
+            return
+        if self._duplicate_policy is DuplicatePolicy.ERROR:
+            raise _PageRejectionError("duplicate identity detected", PageRejectionCode.DUPLICATE_IDENTITY)
+        if self._duplicate_policy is DuplicatePolicy.REPORT:
+            self.duplicate_identities += duplicates
+            self.violations.append(
+                Violation(
+                    severity=ViolationSeverity.WARNING,
+                    code="duplicate_identity",
+                    message=f"observed {duplicates} duplicate identities",
+                ),
+            )
 
     def _record_committed_page(
         self,
@@ -695,3 +711,13 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         if self._identity_store is None:
             raise RuntimeError("identity store is not active")
         return self._identity_store
+
+
+def _first_unique_mask(identities: Sequence[IdentityValue], present: frozenset[IdentityValue]) -> tuple[bool, ...]:
+    """Mark first in-page occurrences that the external ledger had not already recorded."""
+    seen: set[IdentityValue] = set()
+    mask: list[bool] = []
+    for value in identities:
+        mask.append(value not in seen and value not in present)
+        seen.add(value)
+    return tuple(mask)

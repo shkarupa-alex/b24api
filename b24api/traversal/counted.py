@@ -24,6 +24,7 @@ from b24api.traversal.driver import PaginationDriver
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.json import JsonValue
     from b24api.contracts.page import PageAdapter
     from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
@@ -47,6 +48,7 @@ class CountedItemStream:
         batch_size: int,
         policy: ExecutionPolicy,
         page_adapter: PageAdapter,
+        identity_store: IdentityStore | None = None,
     ) -> None:
         """Initialize without scheduling work."""
         self._context = executor.context(policy)
@@ -62,6 +64,7 @@ class CountedItemStream:
             page_cap_hint=page_size,
             page_adapter=page_adapter,
             completion_recorder=self._completion,
+            identity_store=identity_store,
         )
         self._page_size = page_size
         self._batch_size = batch_size
@@ -185,6 +188,7 @@ class CountedItemStream:
             dispatch_id="batch",
             emitted_rows=self._emitted,
             unique_rows=self._unique,
+            duplicate_identities=self._driver.duplicate_identities,
             physical_requests=snapshot.counters.physical_requests,
             logical_pages=snapshot.counters.logical_pages,
             batch_requests=batch.batch_requests if batch is not None else 0,

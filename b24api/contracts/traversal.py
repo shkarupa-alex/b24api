@@ -91,19 +91,31 @@ class PageStride:
             raise ValueError("requested wire limit must cover the wire increment")
 
 
+class RawTotalSource(StrEnum):
+    """Raw-total location that is not a path inside ``result``."""
+
+    ENVELOPE = "envelope"
+
+
 @dataclass(frozen=True, slots=True)
 class SparseRawBound:
-    """Explicit closure using stable raw total despite empty selected pages."""
+    """Explicit closure using stable raw total despite empty selected pages.
 
-    total_path: ResultSelector
+    ``total_path`` names where the qualified raw total lives: a non-root path inside ``result`` or
+    ``RawTotalSource.ENVELOPE`` for the response envelope ``total``, so either shape can prove closure.
+    """
+
+    total_path: ResultSelector | RawTotalSource
     stride: PageStride
     max_pages: int
     order_contract: str
 
     def __post_init__(self) -> None:
         """Require a finite qualified raw range and declared stable order."""
-        if not isinstance(self.total_path, ResultSelector) or not self.total_path.path:
-            raise ValueError("sparse raw total needs a non-root result path")
+        if self.total_path is not RawTotalSource.ENVELOPE and (
+            not isinstance(self.total_path, ResultSelector) or not self.total_path.path
+        ):
+            raise ValueError("sparse raw total needs a non-root result path or the envelope total")
         if not isinstance(self.stride, PageStride):
             raise TypeError("sparse stride must be a PageStride")
         if type(self.max_pages) is not int or self.max_pages < 1:

@@ -109,8 +109,10 @@ def test_readme_separates_offline_passes_from_unrecorded_live_gates() -> None:
     rows = [line for line in text.splitlines() if re.match(r"\| \d+ \|", line)]
 
     assert len(rows) == SCENARIO_COUNT
-    assert all("| passing | not recorded |" in row for row in rows)
+    assert all(("| endpoint-limited |" if row.startswith("| 17 |") else "| passing |") in row for row in rows)
+    assert all("| not recorded |" in row for row in rows)
     assert "| supported |" not in text
+    assert "ENV=PROD uv run" not in text
 
 
 def test_example_support_stays_below_the_public_helper_limit() -> None:

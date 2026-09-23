@@ -29,6 +29,7 @@ from b24api.contracts.completion import (
     StreamTerminal,
 )
 from b24api.contracts.dispatch import BatchDispatch, DeliveryOrder, DirectDispatch, DispatchSpec
+from b24api.contracts.identity_store import IdentityStore, identity_store_key
 from b24api.contracts.json import FrozenJson, FrozenMapping, JsonScalar, JsonValue
 from b24api.contracts.keyset_capability import (
     KeysetCapabilityCheckName,
@@ -133,6 +134,7 @@ from b24api.contracts.traversal import (
     OffsetSpec,
     PageIndex,
     PageStride,
+    RawTotalSource,
     SequentialTraversal,
     SparseRawBound,
     SplitOrderSpec,
@@ -188,6 +190,7 @@ __all__ = [
     "IdentityComponent",
     "IdentityPageAdapter",
     "IdentitySpec",
+    "IdentityStore",
     "JsonScalar",
     "JsonValue",
     "KeysetAssuranceSource",
@@ -237,6 +240,7 @@ __all__ = [
     "PositionalLayout",
     "Present",
     "RangeKeysetExecution",
+    "RawTotalSource",
     "ReferenceComplete",
     "ReferenceEvent",
     "ReferenceFailure",
@@ -278,6 +282,7 @@ __all__ = [
     "UnknownRequestCollector",
     "Violation",
     "ViolationSeverity",
+    "identity_store_key",
     "partition_command_outcomes",
     "partition_reference_outcomes",
     "traversal_control_paths",

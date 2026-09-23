@@ -53,7 +53,9 @@ outcome.
   budgets, concurrency and elapsed time are bounded by `ExecutionPolicy`.
 - The default response ceiling is enforced while streaming, before JSON decoding.
 - Exact sequential, counted, and multi-reference traversal shares one operation-wide
-  `max_identity_keys` ceiling and rejects an overflowing page atomically.
+  `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted
+  offset traversal may instead record identities in a caller-owned `IdentityStore`, keeping
+  in-process identity memory bounded by one page; a reported duplicate withdraws identity assurance.
 - Streams publish one immutable terminal report after cleanup. Early close and cancellation never
   claim completion.
 - The client owns its default transport and active streams; injected transports remain caller-owned.
@@ -76,6 +78,8 @@ I/O otherwise. No ordinary wire value can name an absolute destination.
 
 Traversal contracts separately declare progression (`server next`, observed width, or fixed step),
 completion (empty confirmation or caller-qualified exact total), collection shape, and identity.
+A fixed step without a qualified total fails closed after a short page; a sparse raw bound reads its
+qualified extent from a result path or the envelope `total`.
 Page evidence contains only bounded counters and enum classifications—never rows, identities,
 parameters, headers, URLs, or body fragments.
 

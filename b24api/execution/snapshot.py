@@ -24,6 +24,7 @@ class KernelReport:
     dispatch_id: str | None = None
     emitted_rows: int = 0
     unique_rows: int = 0
+    duplicate_identities: int = 0
     physical_requests: int = 0
     logical_pages: int = 0
     batch_requests: int = 0
@@ -57,6 +58,7 @@ class KernelReport:
         counters = (
             self.emitted_rows,
             self.unique_rows,
+            self.duplicate_identities,
             self.physical_requests,
             self.logical_pages,
             self.batch_requests,

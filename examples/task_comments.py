@@ -4,8 +4,8 @@ One physical batch resolves four task IDs: a modern chat with messages, a
 legacy task without a chat, an empty modern chat, and a chat whose messages
 are inaccessible. The legacy fallback uses the exact TASKID/ORDER/FILTER
 positional ABI and public keyset traversal; the stub tasks.task.comment.list
-is never used. Run the qualified frozen fixture:
-`ENV=PROD uv run python -m examples.task_comments`.
+is never used. Run the frozen fixture, including the verifier canary:
+`uv run python -m examples.task_comments`.
 """
 
 from __future__ import annotations

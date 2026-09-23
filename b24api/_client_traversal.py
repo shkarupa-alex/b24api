@@ -11,6 +11,7 @@ from b24api.contracts.traversal import CursorSpec, KeysetSpec, OffsetSpec, Total
 from b24api.traversal.facade import counted_stream, cursor_stream, keyset_stream, sequential_stream
 
 if TYPE_CHECKING:
+    from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.json import JsonValue
     from b24api.contracts.page_stop import PageStopPolicy
     from b24api.contracts.policy import ExecutionPolicy
@@ -57,6 +58,7 @@ class _TraversalFacade:
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         page_stop: PageStopPolicy | None = None,
         policy: ExecutionPolicy | None = None,
+        identity_store: IdentityStore | None = None,
     ) -> OperationStream[JsonValue]:
         """Return conservative sequential offset/server-next traversal."""
         self._require_open()
@@ -76,6 +78,7 @@ class _TraversalFacade:
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
                 audit_violations=(() if audit_violation is None else (audit_violation,)),
+                identity_store=identity_store,
             ),
         )
 
@@ -92,6 +95,7 @@ class _TraversalFacade:
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         page_stop: PageStopPolicy | None = None,
         policy: ExecutionPolicy | None = None,
+        identity_store: IdentityStore | None = None,
     ) -> OperationStream[JsonValue]:
         """Return exact direct-head plus physically batched counted traversal."""
         if page_stop is not None:
@@ -113,6 +117,7 @@ class _TraversalFacade:
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
                 audit_violations=(() if audit_violation is None else (audit_violation,)),
+                identity_store=identity_store,
             ),
         )
 

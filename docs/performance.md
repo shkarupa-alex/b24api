@@ -83,5 +83,8 @@ harness-produced observations for that portal cell, not general latency promises
   `coalesce_wait=0` is the low-latency opt-out. With multiple workers, only aggregate work
   conservation—not an exact command split per physical batch—is guaranteed.
 - Real portal latency, server work and network variance require a separately controlled live A/B.
-- Exact counted traversal retains identities for the operation lifetime; large exact traversals may
-  therefore use substantial memory and emit a warning above 100,000 identities.
+- Exact traversal retains identities for the operation lifetime under the hard
+  `ExecutionPolicy.max_identity_keys` budget (100,000 by default); exceeding it fails the operation
+  with `BudgetExceededError` instead of warning. For larger sources pass `identity_store=` to
+  `iter_list`/`iter_list_counted`: a caller-owned `IdentityStore` (for example a SQLite table with a
+  primary key) records each `identity_store_key(...)` so in-process memory stays bounded by one page.

@@ -2,7 +2,10 @@
 
 Frozen OFFSET/LIMIT source has five rows, including chat 20 on two adjacent
 pages. The public traversal reports that duplicate; caller-keyed storage has
-the independent four-chat oracle. `total=-1` is not used for closure. A
+the independent four-chat oracle. A repeated identity means the offset source
+shifted and may also have skipped a row, so the report weakens its assurance to
+mechanics only instead of claiming exact identity. `total=-1` is not used for
+closure. A
 same-date LAST_MESSAGE_DATE boundary needs separate live qualification.
 Run: `uv run python -m examples.recent_dialogs`.
 """
@@ -24,6 +27,7 @@ from b24api import (
     ResultSelector,
     RouteKind,
     Settings,
+    TraversalAssurance,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
@@ -92,6 +96,8 @@ async def run() -> RecipeEvidence:
             raise AssertionError("scenario 3 report lost duplicate accounting")
         if not any(violation.code == "duplicate_identity" for violation in stream.report.violations):
             raise AssertionError("scenario 3 report omitted duplicate warning")
+        if stream.report.assurance is not TraversalAssurance.MECHANICS_ONLY:
+            raise AssertionError("scenario 3 claimed identity strength after observing a shifted source")
         if tuple(sorted({_chat_id(row) for row in rows})) != EXPECTED_IDS:
             raise AssertionError("scenario 3 keyed chat set differs from independent oracle")
     transport.assert_exhausted()

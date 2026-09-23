@@ -3,8 +3,9 @@
 Offline fixture: task 42 has 53 elapsed items in pages of 50/3/empty.
 `task.elapseditem.getlist` receives exactly `taskId,order,filter,select,params`
 as top-level JSON slots; page control is `NAV_PARAMS.iNumPage`, not `start`.
-Each row's task scope is checked independently of HTTP success and total.
-Direct JSON only; physical batch/form encoding is not qualified. Run:
+Each row's task scope is checked independently of HTTP success and total, and
+a declared row identity with duplicate policy ERROR rejects a repeated page, the
+symptom of a wrong page control. Direct JSON only; physical batch/form encoding is not qualified. Run:
 `uv run python -m examples.elapsed_task_items`.
 """
 
@@ -15,6 +16,8 @@ from b24api import (
     Bitrix24,
     EmptyArray,
     EmptyObject,
+    IdentityCoercion,
+    IdentitySpec,
     OffsetSpec,
     PageIndex,
     ParameterPath,
@@ -36,6 +39,7 @@ TASK_ID = 42
 PAGE_SIZE = 50
 EXPECTED_IDS = tuple(range(1, 54))
 EXPECTED_PAGES = (1, 2, 3)
+PAGES = ((1, EXPECTED_IDS[:50]), (2, EXPECTED_IDS[50:]), (3, ()))
 SLOT_COUNT = 5
 CONTROL = ParameterPath((4, "NAV_PARAMS", "iNumPage"))
 LAYOUT = PositionalLayout(
@@ -66,8 +70,7 @@ def _request(page: int) -> Request:
     return Request(METHOD, arguments, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
 
 
-def _fixture() -> ScriptedTransport:
-    pages = ((1, EXPECTED_IDS[:50]), (2, EXPECTED_IDS[50:]), (3, ()))
+def _fixture(pages: tuple[tuple[int, tuple[int, ...]], ...]) -> ScriptedTransport:
     return ScriptedTransport(
         tuple(
             ScriptedExchange.json(
@@ -79,13 +82,14 @@ def _fixture() -> ScriptedTransport:
     )
 
 
-async def run() -> RecipeEvidence:
-    """Check exact slot order, task scope, IDs, and page index progression."""
-    transport = _fixture()
+async def run(pages: tuple[tuple[int, tuple[int, ...]], ...] = PAGES) -> RecipeEvidence:
+    """Check exact slot order, task scope, unique IDs, and page index progression."""
+    transport = _fixture(pages)
     settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_list(
             _request(1),
+            identity=IdentitySpec(("id",), "id", "id", IdentityCoercion.EXACT_INTEGER),
             page_size=PAGE_SIZE,
             offset=OffsetSpec(
                 parameter_path=CONTROL,

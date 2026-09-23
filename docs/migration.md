@@ -74,6 +74,24 @@ and stable-order contract; empty selected pages remain traversable until the raw
 This is structural coverage, so its report uses `RAW_RANGE_COVERED` rather than claiming a
 snapshot of a mutable source.
 
+`OffsetContinuation.FIXED_STEP` without `TotalTermination.EXACT_QUALIFIED` no longer accepts an
+empty page after a short page as closure. Such a traversal now raises `IncompleteTraversalError`
+(cause `PaginationError`) and reports `exhausted=False`; full pages followed by an empty page still
+complete with `mechanics_only` assurance. Qualify an exact total, switch to `OBSERVED_COUNT` or
+`PageIndex` when the endpoint supports them, or use `SparseRawBound`; see
+[endpoint recipes](recipes.md#fixed-server-stride).
+
+`SparseRawBound.total_path` also accepts `RawTotalSource.ENVELOPE` when the qualified raw extent is
+the response envelope `total` rather than a field inside `result`; a missing or negative envelope
+total fails closed like a missing result field.
+
+Exact traversal keeps its in-memory `ExecutionPolicy.max_identity_keys` budget. `iter_list` and
+`iter_list_counted` accept `identity_store=`, a caller-owned `IdentityStore` whose
+`add_if_absent(identity_store_key(value)) -> bool` records each identity after the rest of the page
+validates; `False` is a duplicate, and any exception rejects the page. The client does not close the
+store. Under `DuplicatePolicy.REPORT`, an observed duplicate now withdraws identity strength: the
+report carries `mechanics_only` instead of `identity_exact` or `identity_and_count_matched`.
+
 When a stride's decoded row cap differs from its wire increment and the request owns a limit
 control, set `requested_wire_limit` explicitly to at least the wire increment. Construction now
 rejects an omitted or smaller value before I/O instead of leaving part of each wire window

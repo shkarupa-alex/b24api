@@ -34,7 +34,7 @@ from b24api.contracts.traversal import OffsetContinuation, TotalTermination
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.counted import CountedItemStream
-from b24api.traversal.facade_support import _collection_selector, _direction
+from b24api.traversal.facade_support import _checked_identity_store, _collection_selector, _direction
 from b24api.traversal.keyset_eligibility import validate_fast_keyset
 from b24api.traversal.keyset_fast_stream import FastTraceRecorder, KeysetFastStream
 from b24api.traversal.keyset_scheduler import KeysetFastScheduler
@@ -51,6 +51,7 @@ from b24api.traversal.plans import (
 from b24api.traversal.stream import iter_list as _iter_list
 
 if TYPE_CHECKING:
+    from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.json import JsonValue
     from b24api.contracts.page import PageAdapter
     from b24api.contracts.page_stop import PageStopPolicy
@@ -95,8 +96,10 @@ def sequential_stream(  # noqa: PLR0913
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
+    identity_store: IdentityStore | None = None,
 ) -> OperationStream[JsonValue]:
     """Compose conservative sequential offset/server-next traversal."""
+    ledger = _checked_identity_store(identity_store, identity)
     plan = sequential_offset_plan(offset, page_size=page_size, duplicate_policy=DuplicatePolicy.REPORT)
     if offset.total_termination is TotalTermination.EXACT_QUALIFIED:
         assurance = (
@@ -125,6 +128,7 @@ def sequential_stream(  # noqa: PLR0913
         assurance=assurance,
         deregister=deregister,
         audit_violations=audit_violations,
+        identity_store=ledger,
     )
 
 
@@ -222,8 +226,10 @@ def counted_stream(  # noqa: PLR0913
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
+    identity_store: IdentityStore | None = None,
 ) -> OperationStream[JsonValue]:
     """Compose exact direct-head plus physically batched counted traversal."""
+    ledger = _checked_identity_store(identity_store, identity)
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         raise ValueError("page_size must be a positive integer")
     if offset.page_index is not None:
@@ -273,6 +279,7 @@ def counted_stream(  # noqa: PLR0913
         batch_size=resolve_batch_size(batch_size, policy),
         policy=policy,
         page_adapter=page_adapter,
+        identity_store=ledger,
     )
     return _mapped_stream(
         source,
@@ -357,6 +364,7 @@ def _plan_stream(  # noqa: PLR0913
     assurance: TraversalAssurance,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
+    identity_store: IdentityStore | None = None,
 ) -> OperationStream[JsonValue]:
     source = _iter_list(
         executor,
@@ -368,6 +376,7 @@ def _plan_stream(  # noqa: PLR0913
         _page_cap_hint=page_size,
         _page_adapter=page_adapter,
         _page_stop=page_stop,
+        _identity_store=identity_store,
     )
     return _mapped_stream(
         source,

@@ -39,6 +39,7 @@ from b24api.traversal.identity import _MISSING, _Page
 from b24api.traversal.plans import ItemCursorPlan, KeysetPlan, OffsetSequentialPlan
 
 if TYPE_CHECKING:
+    from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
     from b24api.traversal.plans import (
         ListPlan,
@@ -63,6 +64,7 @@ class ItemStream(AsyncIterator[JsonValue]):
         assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         page_stop: PageStopPolicy | None = None,
+        identity_store: IdentityStore | None = None,
     ) -> None:
         """Initialize instance state."""
         PaginationDriver.validate_plan(plan)
@@ -86,6 +88,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             page_cap_hint=page_cap_hint,
             page_adapter=page_adapter,
             completion_recorder=self._completion,
+            identity_store=identity_store,
         )
         self._assurance = assurance
         if page_stop is not None and not callable(getattr(page_stop, "on_page", None)):
@@ -356,6 +359,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             dispatch_id="sequential_direct",
             emitted_rows=self._emitted,
             unique_rows=self._unique_emitted,
+            duplicate_identities=self._driver.duplicate_identities,
             physical_requests=snapshot.counters.physical_requests,
             logical_pages=snapshot.counters.logical_pages,
             retries=snapshot.retries,
@@ -389,6 +393,7 @@ def iter_list(  # noqa: PLR0913
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
     _page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
     _page_stop: PageStopPolicy | None = None,
+    _identity_store: IdentityStore | None = None,
 ) -> ItemStream:
     """Construct a lazy canonical item stream without performing I/O."""
     return ItemStream(
@@ -402,4 +407,5 @@ def iter_list(  # noqa: PLR0913
         assurance=_assurance,
         page_adapter=_page_adapter,
         page_stop=_page_stop,
+        identity_store=_identity_store,
     )

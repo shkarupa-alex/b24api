@@ -12,6 +12,7 @@ from b24api import (
     OffsetSpec,
     PageStride,
     ParameterPath,
+    RawTotalSource,
     Request,
     ResultSelector,
     RouteKind,
@@ -26,10 +27,17 @@ from b24api.execution import Executor, WireResponse
 class SparseTransport:
     """Independent raw SQL offset oracle with sparse selected output."""
 
-    def __init__(self, *, raw_total: int = 200, overrides: dict[int, int | None] | None = None) -> None:
-        """Freeze one raw extent for the synthetic fixture."""
+    def __init__(
+        self,
+        *,
+        raw_total: int = 200,
+        overrides: dict[int, int | None] | None = None,
+        envelope: bool = False,
+    ) -> None:
+        """Freeze one raw extent for the synthetic fixture, in the result or the envelope."""
         self.raw_total = raw_total
         self.overrides = overrides or {}
+        self.envelope = envelope
         self.offsets: list[int] = []
 
     async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
@@ -42,20 +50,21 @@ class SparseTransport:
         rows = {0: [{"id": 1}], 150: [{"id": 2}]}.get(offset, [])
         result: dict[str, object] = {"items": rows}
         total = self.overrides.get(offset, self.raw_total)
+        payload: dict[str, object] = {"result": result}
         if total is not None:
-            result["rawTotal"] = total
-        body = json.dumps({"result": result}).encode()
+            (payload if self.envelope else result)["total" if self.envelope else "rawTotal"] = total
+        body = json.dumps(payload).encode()
         return WireResponse(200, (), body)
 
 
-def _sparse_spec(*, max_pages: int = 4) -> OffsetSpec:
+def _sparse_spec(*, max_pages: int = 4, envelope: bool = False) -> OffsetSpec:
     stride = PageStride(server_granularity=50, wire_increment=50, max_decoded_rows=50)
     return OffsetSpec(
         continuation=OffsetContinuation.FIXED_STEP,
         step=50,
         page_stride=stride,
         sparse_raw_bound=SparseRawBound(
-            ResultSelector(("rawTotal",)),
+            RawTotalSource.ENVELOPE if envelope else ResultSelector(("rawTotal",)),
             stride,
             max_pages,
             "qualified stable raw ID order",
@@ -148,6 +157,50 @@ async def test_sparse_raw_total_missing_invalid_or_changed_never_completes(
     assert isinstance(captured.value.__cause__, PaginationError)
     assert stream.report is not None
     assert not stream.report.exhausted
+
+
+@pytest.mark.asyncio
+async def test_sparse_raw_total_can_come_from_the_response_envelope() -> None:
+    transport = SparseTransport(raw_total=150, envelope=True)
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    stream = client.iter_list(
+        Request("example.search", route=RouteKind.BARE),
+        selector=ResultSelector(("items",)),
+        page_size=50,
+        offset=_sparse_spec(envelope=True),
+    )
+    rows = [row async for row in stream]
+    assert [row["id"] for row in rows] == [1]
+    assert transport.offsets == [0, 50, 100]
+    assert stream.report is not None
+    assert stream.report.exhausted
+    assert stream.report.assurance is TraversalAssurance.RAW_RANGE_COVERED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrides", [{50: None}, {50: -1}, {50: 201}])
+async def test_sparse_envelope_total_missing_unknown_or_changed_never_completes(
+    overrides: dict[int, int | None],
+) -> None:
+    transport = SparseTransport(overrides=overrides, envelope=True)
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    stream = client.iter_list(
+        Request("example.search", route=RouteKind.BARE),
+        selector=ResultSelector(("items",)),
+        page_size=50,
+        offset=_sparse_spec(envelope=True),
+    )
+    with pytest.raises(IncompleteTraversalError) as captured:
+        _ = [row async for row in stream]
+    assert isinstance(captured.value.__cause__, PaginationError)
+    assert stream.report is not None
+    assert not stream.report.exhausted
+
+
+def test_sparse_raw_total_rejects_a_root_result_path() -> None:
+    stride = PageStride(server_granularity=50, wire_increment=50, max_decoded_rows=50)
+    with pytest.raises(ValueError, match="envelope total"):
+        SparseRawBound(ResultSelector(()), stride, 2, "qualified stable raw ID order")
 
 
 @pytest.mark.asyncio

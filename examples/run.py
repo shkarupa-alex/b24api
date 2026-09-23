@@ -32,6 +32,9 @@ if TYPE_CHECKING:
 
     from b24api import Request
 
+# External reference, not verified here: the commit of the separate apidocs repository whose method
+# cards these recipes were written against. It does not resolve in this repository; rows carry it so a
+# reader can locate that source, and live evidence must repeat it, but nothing here loads or checks it.
 METHOD_CARD_SHA = "909c6bf14b29961a365dc6d6d4c2c47b5e2533d4"
 LIVE_RECORDER_PUBLIC_KEY = base64.b64decode("Huf/nl4BiI5pIKf7AWL6DbYni/pDSJIhwFkzDkWb+es=")
 MINIMUM_HTTP_STATUS = 100
@@ -54,7 +57,7 @@ class Scenario:
 SCENARIOS = (
     Scenario(1, "chat_bounded_mirror", "EXPECTED_IDS", "completed", "bounded_prefix"),
     Scenario(2, "message_cursor_direction", "EXPECTED_IDS", "completed", "identity_exact"),
-    Scenario(3, "recent_dialogs", "EXPECTED_IDS", "completed", "identity_exact"),
+    Scenario(3, "recent_dialogs", "EXPECTED_IDS", "completed", "mechanics_only"),
     Scenario(4, "search_chat_messages", "EXPECTED_IDS", "completed_with_failures", "not_applicable"),
     Scenario(5, "task_role_union", "EXPECTED_IDS", "completed", "count_matched"),
     Scenario(6, "task_comments", "EXPECTED_MODERN", "completed_with_failures", "not_applicable"),
@@ -64,7 +67,7 @@ SCENARIOS = (
     Scenario(10, "timeline_comments", "EXPECTED_STORAGE_IDS", "completed_with_failures", "not_applicable"),
     Scenario(11, "sparse_user_search", "EXPECTED_IDS", "completed", "raw_range_covered"),
     Scenario(12, "page_index_members", "EXPECTED_IDS", "completed", "mechanics_only"),
-    Scenario(13, "elapsed_task_items", "EXPECTED_IDS", "completed", "mechanics_only"),
+    Scenario(13, "elapsed_task_items", "EXPECTED_IDS", "completed", "identity_exact"),
     Scenario(14, "requisite_links", "EXPECTED_KEYS", "completed", "identity_and_count_matched"),
     Scenario(15, "disk_mirror", "EXPECTED_OBJECT_IDS", "completed", "identity_and_count_matched"),
     Scenario(16, "binary_download", "EXPECTED_PDF", "not_applicable", "not_applicable"),

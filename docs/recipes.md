@@ -29,8 +29,24 @@ stream = client.iter_list(
 )
 ```
 
-For endpoints with drifting or known-inexact totals, omit `total_termination`. The client then
-requires a confirming empty page and treats `next` as non-canonical.
+Without `EXACT_QUALIFIED` a fixed step has no closure witness after a short page. The client
+treats `next` as non-canonical and completes, with `mechanics_only` assurance, only when every page
+is a full step and a confirming empty page follows. After a short page it fails closed with
+`IncompleteTraversalError` whose cause is `PaginationError("fixed-step traversal cannot prove closure
+after a short page")`, whether the next window is empty or not: under a rounded server stride a short
+page does not distinguish the end of the source from a skipped or repeated window. Rows already
+yielded stay yielded; the report is not exhausted.
+
+For endpoints with drifting or known-inexact totals, choose a contract that can prove closure:
+
+- qualify an exact total for a stable filter and snapshot (`TotalTermination.EXACT_QUALIFIED`);
+- if the endpoint advances by the rows it returned, use `OffsetContinuation.OBSERVED_COUNT`, where an
+  empty page after a short page is an ordinary terminal witness;
+- for a page-number control, use `OffsetSpec(page_index=PageIndex(...))`, which accepts a short page
+  followed by an empty page as closure;
+- for a sparse selected result with a qualified raw extent, use `SparseRawBound`.
+
+Scenario 17 in [examples](../examples/README.md) shows the fail-closed outcome.
 
 ## Split keyset ordering
 

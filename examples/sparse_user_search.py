@@ -1,7 +1,11 @@
 """Scenario 11: sparse raw SQL offset continues after an empty selected page.
 
 Offline fixture for `im.search.user`: mapping values at raw offsets 0 and 100,
-no visible users at 50, qualified raw total 150 and stable raw order. The
+no visible users at 50, qualified raw total 150 in the response envelope
+``total`` and stable raw order. Where the raw total lives (envelope ``total``
+rather than a result field) is a FIXTURE assumption until live qualification;
+``SparseRawBound`` accepts either ``RawTotalSource.ENVELOPE`` or a non-root
+result path, so the recipe changes one argument if the portal disagrees. The
 independent expected IDs are fixed before traversal. This does not prove that
 all live portals expose a stable raw bound. Run:
 `uv run python -m examples.sparse_user_search`.
@@ -15,6 +19,7 @@ from b24api import (
     OffsetContinuation,
     OffsetSpec,
     PageStride,
+    RawTotalSource,
     ReplaySafety,
     Request,
     ResultCollectionShape,
@@ -45,7 +50,7 @@ def _fixture() -> ScriptedTransport:
     )
     return ScriptedTransport(
         tuple(
-            ScriptedExchange.json(_request(offset), {"result": {"items": users, "rawTotal": RAW_TOTAL}})
+            ScriptedExchange.json(_request(offset), {"result": {"items": users}, "total": RAW_TOTAL})
             for offset, users in pages
         )
     )
@@ -60,7 +65,7 @@ async def run() -> RecipeEvidence:
         step=STRIDE,
         page_stride=stride,
         sparse_raw_bound=SparseRawBound(
-            ResultSelector(("rawTotal",)),
+            RawTotalSource.ENVELOPE,
             stride,
             3,
             "qualified stable raw ID order",

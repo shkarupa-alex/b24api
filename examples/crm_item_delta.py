@@ -4,7 +4,7 @@ An existing smart-process item 1 changes after an initial ID sweep; new item
 3 appears. A later `>id=2` request sees only 3, while the time-window replay
 reconciles both through a keyed sink. This is FIXTURE behavior; the live gate
 must confirm that `>=updatedTime` filters on the target portal.
-Run the qualified frozen fixture: `ENV=PROD uv run python -m examples.crm_item_delta`.
+Run the frozen fixture, including the verifier canary: `uv run python -m examples.crm_item_delta`.
 """
 
 from __future__ import annotations

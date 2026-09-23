@@ -424,7 +424,7 @@ class CompletionGate:
             operation=facts.operation,
             terminal_reason=source.terminal_reason or state.value,
             exhausted=state is TerminalState.COMPLETED and decision.exhausted,
-            assurance=TraversalAssurance.BOUNDED_PREFIX if decision.caller_stopped else facts.assurance,
+            assurance=_observed_assurance(facts.assurance, source, caller_stopped=decision.caller_stopped),
             admitted=facts.admitted,
             emitted=facts.emitted,
             successes=facts.successes,
@@ -446,3 +446,25 @@ class CompletionGate:
             page_trace_truncated=source.page_trace_truncated,
             keyset_execution=source.keyset_execution,
         )
+
+
+_IDENTITY_STRENGTH = frozenset({TraversalAssurance.IDENTITY_EXACT, TraversalAssurance.IDENTITY_AND_COUNT_MATCHED})
+
+
+def _observed_assurance(
+    declared: TraversalAssurance | None,
+    source: KernelReport,
+    *,
+    caller_stopped: bool,
+) -> TraversalAssurance | None:
+    """Finalize assurance with what the traversal observed, not only what its plan declared.
+
+    A caller stop proves only a bounded prefix. An identity repeated across offset pages is the
+    signature of a shifting source that may also have skipped rows, so identity-strength claims fall to
+    mechanics even when the stream reached a natural end.
+    """
+    if caller_stopped:
+        return TraversalAssurance.BOUNDED_PREFIX
+    if source.duplicate_identities and declared in _IDENTITY_STRENGTH:
+        return TraversalAssurance.MECHANICS_ONLY
+    return declared

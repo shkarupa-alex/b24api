@@ -454,7 +454,10 @@ decoding.
 Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
 observed identities per operation in memory (100,000 by default). All active reference bindings
 share that ceiling. A page that would exceed it is rejected atomically with typed budget evidence.
-Set a larger finite ceiling when the expected aggregate cardinality is known.
+Set a larger finite ceiling when the expected aggregate cardinality is known, or pass
+`identity_store=` to `iter_list`/`iter_list_counted` so a caller-owned `IdentityStore` (for example a
+SQLite table keyed by `identity_store_key(...)`) proves uniqueness with in-process memory bounded by
+one page; the client never closes that store.
 Strict keyset and cursor traversal retain only monotonic progression state when sufficient.
 
 ## CLI

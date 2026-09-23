@@ -15,6 +15,7 @@ from b24api.contracts.policy import (
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, TraversalIdentity
 from b24api.contracts.response import Response, inject_controls
 from b24api.errors import CapabilityError, PaginationError
+from b24api.traversal.identity_ledger import _ExternalIdentityStore
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     CursorTerminalRule,
@@ -29,6 +30,9 @@ from b24api.traversal.plans import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.json import JsonValue
     from b24api.contracts.report import PageRejectionCode
     from b24api.execution import ExecutionContext
@@ -63,6 +67,8 @@ class _IdentityStore(Protocol):
 
     def add(self, value: IdentityValue) -> None: ...
 
+    def commit(self, values: Sequence[IdentityValue]) -> frozenset[IdentityValue]: ...
+
     def ensure_capacity(self, additional: int) -> None: ...
 
     def close(self) -> None: ...
@@ -85,6 +91,11 @@ class _MemoryIdentityStore:
             return
         self._context.retain_identity_key()
         self._values.add(value)
+
+    def commit(self, values: Sequence[IdentityValue]) -> frozenset[IdentityValue]:
+        for value in values:
+            self.add(value)
+        return frozenset()
 
     def ensure_capacity(self, additional: int) -> None:
         self._context.ensure_identity_capacity(additional)
@@ -111,6 +122,11 @@ class _MonotonicIdentityStore:
             return
         self._last = value
         self._count += 1
+
+    def commit(self, values: Sequence[IdentityValue]) -> frozenset[IdentityValue]:
+        for value in values:
+            self.add(value)
+        return frozenset()
 
     def ensure_capacity(self, additional: int) -> None:
         del additional
@@ -364,7 +380,14 @@ def _cursor_terminal(plan: ItemCursorPlan, page_size: int) -> str | None:
     return None
 
 
-def _identity_store(context: ExecutionContext, plan: ListPlan, identity: TraversalIdentity | None) -> _IdentityStore:
+def _identity_store(
+    context: ExecutionContext,
+    plan: ListPlan,
+    identity: TraversalIdentity | None,
+    external: IdentityStore | None = None,
+) -> _IdentityStore:
+    if external is not None:
+        return _ExternalIdentityStore(external)
     if isinstance(plan, KeysetPlan) or (
         isinstance(plan, ItemCursorPlan)
         and isinstance(identity, IdentitySpec)

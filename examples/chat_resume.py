@@ -3,7 +3,10 @@
 Offline fixture: two readable chats on `im.dialog.messages.get`, descending
 exclusive `LAST_ID`, exact `messages` selector, two rows per page. The first
 run stops A after a committed page and closes the operation before B. The
-second run resumes A from its durable one-row overlap and B from head. This
+second run resumes A from its durable one-row overlap and B from head; the
+keyed sink absorbs the re-read overlap row. That row may have been deleted
+between runs, so its absence is not an error: resume fails only on a
+contradiction, a returned ID at or above the committed exclusive bound. This
 demonstrates keyed deduplication; it does not claim snapshot consistency on a
 mutable live portal. Run: `uv run python -m examples.chat_resume`.
 """
@@ -42,6 +45,14 @@ from examples._support.sqlite_sink import SqliteMirror
 METHOD = "im.dialog.messages.get"
 EXPECTED = {"A": (105, 104, 103, 102, 101), "B": (115, 114, 113)}
 FIRST_OVERLAP = 105
+RESUMED_PAGES = (
+    ("A", 105, (104, 103)),
+    ("A", 103, (102, 101)),
+    ("A", 101, ()),
+    ("B", None, (115, 114)),
+    ("B", 114, (113,)),
+    ("B", 113, ()),
+)
 
 
 def _request(parent: str, cursor: int | None) -> Request:
@@ -86,18 +97,16 @@ class _Commit:
     def __init__(self, sink: SqliteMirror, *, pause_a: bool) -> None:
         self.sink = sink
         self.pause_a = pause_a
-        self.expected_overlap = {
-            parent: checkpoint - 1 for parent in EXPECTED if (checkpoint := sink.checkpoint(parent)) is not None
+        self.resume_bound = {
+            parent: checkpoint for parent in EXPECTED if (checkpoint := sink.checkpoint(parent)) is not None
         }
-        self.checked_overlap: set[str] = set()
 
     def on_page(self, boundary: PageBoundary) -> ContinuePage | CallerStop:
         parent = ("A", "B")[boundary.binding_id]
         ids = tuple(int(row["id"]) for row in boundary.rows)
-        if parent in self.expected_overlap and parent not in self.checked_overlap:
-            if self.expected_overlap[parent] not in ids:
-                raise AssertionError("scenario 7 first resumed page omitted its bounded overlap identity")
-            self.checked_overlap.add(parent)
+        bound = self.resume_bound.get(parent)
+        if bound is not None and any(value >= bound for value in ids):
+            raise ValueError("scenario 7 resumed page contradicts the committed exclusive bound")
         self.sink.commit_page(parent, ids)
         if self.pause_a and parent == "A":
             return CallerStop("persisted pause")
@@ -132,14 +141,14 @@ async def _run_once(sink: SqliteMirror, transport: ScriptedTransport, *, pause_a
         report = stream.report
         if report is None:
             raise AssertionError("scenario 7 lacked a terminal report")
-        if not pause_a and commit.checked_overlap != set(commit.expected_overlap):
-            raise AssertionError("scenario 7 did not verify every resumed overlap")
     transport.assert_exhausted()
     return report
 
 
-async def run() -> RecipeEvidence:
-    """Verify exact keyed IDs and the two distinct terminal meanings."""
+async def pause_and_resume(
+    resumed_pages: tuple[tuple[str, int | None, tuple[int, ...]], ...] = RESUMED_PAGES,
+) -> tuple[OperationReport, OperationReport, dict[str, tuple[int, ...]]]:
+    """Pause A after one committed page, then resume both chats against the given source pages."""
     with tempfile.TemporaryDirectory(prefix="b24api-example-") as temporary:
         sink = SqliteMirror(Path(temporary) / "mirror.sqlite3")
         try:
@@ -151,24 +160,21 @@ async def run() -> RecipeEvidence:
                 or sink.checkpoint("A") != FIRST_OVERLAP
             ):
                 raise AssertionError("scenario 7 did not preserve the committed early-close checkpoint")
-            second = _transport(
-                (
-                    ("A", 105, (104, 103)),
-                    ("A", 103, (102, 101)),
-                    ("A", 101, ()),
-                    ("B", None, (115, 114)),
-                    ("B", 114, (113,)),
-                    ("B", 113, ()),
-                )
-            )
-            second_report = await _run_once(sink, second, pause_a=False)
-            if second_report.state is not TerminalState.COMPLETED or not second_report.exhausted:
-                raise AssertionError("scenario 7 resume did not complete")
-            if {parent: sink.ids(parent) for parent in EXPECTED} != EXPECTED:
-                raise AssertionError("scenario 7 keyed sink differs from uninterrupted oracle")
-            observed_count = sum(len(sink.ids(parent)) for parent in EXPECTED)
+            second_report = await _run_once(sink, _transport(resumed_pages), pause_a=False)
+            mirrored = {parent: sink.ids(parent) for parent in EXPECTED}
         finally:
             sink.close()
+    return first_report, second_report, mirrored
+
+
+async def run() -> RecipeEvidence:
+    """Verify exact keyed IDs and the two distinct terminal meanings."""
+    first_report, second_report, mirrored = await pause_and_resume()
+    if second_report.state is not TerminalState.COMPLETED or not second_report.exhausted:
+        raise AssertionError("scenario 7 resume did not complete")
+    if mirrored != EXPECTED:
+        raise AssertionError("scenario 7 keyed sink differs from uninterrupted oracle")
+    observed_count = sum(len(ids) for ids in mirrored.values())
     return RecipeEvidence(observed_count, second_report, (first_report, second_report))
 
 

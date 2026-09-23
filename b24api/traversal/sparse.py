@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
+from b24api.contracts.traversal import RawTotalSource
 from b24api.errors import PaginationError
 
 if TYPE_CHECKING:
@@ -12,8 +13,14 @@ if TYPE_CHECKING:
     from b24api.contracts.traversal import SparseRawBound
 
 
-def raw_total_from_response(response: Response, path: ResultSelector) -> int:
+def raw_total_from_response(response: Response, path: ResultSelector | RawTotalSource) -> int:
     """Read an exact non-negative raw total without using selected row count."""
+    if path is RawTotalSource.ENVELOPE:
+        if response.total is None:
+            raise PaginationError("qualified sparse raw total is missing")
+        if response.total < 0:
+            raise PaginationError("qualified sparse raw total is not a non-negative integer")
+        return response.total
     current: object = response.result
     for part in path.path:
         if type(part) is str and isinstance(current, Mapping) and part in current:
