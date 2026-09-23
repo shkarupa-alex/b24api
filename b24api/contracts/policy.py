@@ -254,6 +254,7 @@ class ExecutionPolicy:
     # decode the portal page cap of 50 rows. Keeping the default below that
     # product split one safe batch into several physical requests.
     max_buffered_rows: int = 2_500
+    max_identity_keys: int = 100_000
     max_direct_concurrency: int = 10
     max_active_references: int = 100
     retry: RetryPolicy = field(default_factory=RetryPolicy)
@@ -283,6 +284,7 @@ class ExecutionPolicy:
             self.max_response_bytes,
             self.max_buffered_commands,
             self.max_buffered_rows,
+            self.max_identity_keys,
             self.max_direct_concurrency,
             self.max_active_references,
         )

@@ -14,40 +14,7 @@ from b24api.contracts.keyset_execution import (
     KeysetSelectionReason,
     TraceClass,
 )
-from b24api.redaction import DEFAULT_REDACTOR
-
-VIOLATION_CODE_MAXIMUM = 100
-VIOLATION_MESSAGE_MAXIMUM = 500
-
-
-class ViolationSeverity(StrEnum):
-    """Whether a bounded report violation blocks completion."""
-
-    WARNING = "warning"
-    BLOCKING = "blocking"
-
-
-@dataclass(frozen=True, slots=True)
-class Violation:
-    """Typed bounded report violation."""
-
-    severity: ViolationSeverity
-    code: str
-    message: str
-    field: str | None = None
-
-    def __post_init__(self) -> None:
-        """Redact and validate bounded diagnostic text."""
-        if not isinstance(self.severity, ViolationSeverity):
-            raise TypeError("severity must be a ViolationSeverity")
-        object.__setattr__(self, "code", DEFAULT_REDACTOR.redact_text(self.code))
-        object.__setattr__(self, "message", DEFAULT_REDACTOR.redact_text(self.message))
-        if self.field is not None:
-            object.__setattr__(self, "field", DEFAULT_REDACTOR.redact_text(self.field))
-        if not self.code or len(self.code) > VIOLATION_CODE_MAXIMUM:
-            raise ValueError("violation code must be 1..100 characters")
-        if not self.message or len(self.message) > VIOLATION_MESSAGE_MAXIMUM:
-            raise ValueError("violation message must be 1..500 characters")
+from b24api.contracts.violation import Violation, ViolationSeverity, retain_violations
 
 
 class TerminalState(StrEnum):
@@ -68,6 +35,9 @@ class TraversalAssurance(StrEnum):
     IDENTITY_EXACT = "identity_exact"
     COUNT_MATCHED = "count_matched"
     IDENTITY_AND_COUNT_MATCHED = "identity_and_count_matched"
+    RAW_RANGE_COVERED = "raw_range_covered"
+    BOUNDED_RANGE_OBSERVED = "bounded_range_observed"
+    BOUNDED_PREFIX = "bounded_prefix"
 
 
 class PageDispatch(StrEnum):
@@ -274,6 +244,14 @@ class KeysetExecutionReport:
             raise ValueError(f"{field} must contain declared enums and non-negative integer counts")
 
 
+def _validated_exhausted(state: TerminalState, *, value: bool | None) -> bool:
+    if value is None:
+        return state is TerminalState.COMPLETED
+    if not isinstance(value, bool) or (value and state is not TerminalState.COMPLETED):
+        raise ValueError("only a fully completed operation may be exhausted")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class OperationReport:
     """Bounded redacted counters frozen after cleanup."""
@@ -281,6 +259,7 @@ class OperationReport:
     state: TerminalState
     operation: str
     terminal_reason: str
+    exhausted: bool | None = None
     assurance: TraversalAssurance | None = None
     admitted: int = 0
     emitted: int = 0
@@ -311,6 +290,7 @@ class OperationReport:
             raise TypeError("assurance must be a TraversalAssurance or None")
         if not self.operation or not self.terminal_reason:
             raise ValueError("operation and terminal_reason must be non-empty")
+        object.__setattr__(self, "exhausted", _validated_exhausted(self.state, value=self.exhausted))
         counters = (
             self.admitted,
             self.emitted,
@@ -332,7 +312,7 @@ class OperationReport:
             raise ValueError("report counters must be non-negative integers")
         if not math.isfinite(self.cooldown_seconds) or self.cooldown_seconds < 0:
             raise ValueError("cooldown_seconds must be finite and non-negative")
-        object.__setattr__(self, "violations", tuple(self.violations))
+        object.__setattr__(self, "violations", retain_violations(self.violations))
         object.__setattr__(self, "page_trace", tuple(self.page_trace))
         if any(not isinstance(record, PageRecord) for record in self.page_trace):
             raise TypeError("page_trace must contain PageRecord values")
@@ -349,14 +329,9 @@ class OperationReport:
         return self.state is TerminalState.COMPLETED
 
     @property
-    def exhausted(self) -> bool:
-        """Whether the declared source was naturally exhausted."""
-        return self.state in {TerminalState.COMPLETED, TerminalState.COMPLETED_WITH_FAILURES}
-
-    @property
     def partial(self) -> bool:
         """Whether the operation ended before complete success/exhaustion."""
-        return not self.exhausted
+        return not self.successful or not self.exhausted
 
 
 def retain_page_trace(records: tuple[PageRecord, ...], limit: int) -> tuple[tuple[PageRecord, ...], bool]:

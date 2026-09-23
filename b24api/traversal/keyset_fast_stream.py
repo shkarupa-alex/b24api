@@ -8,16 +8,23 @@ from collections import Counter, deque
 from dataclasses import replace
 from typing import TYPE_CHECKING, Self
 
+from b24api.contracts.completion import CleanupState
 from b24api.contracts.json import FrozenJson, JsonValue, _thaw_json
 from b24api.contracts.keyset_execution import KeysetPhase, TraceClass
-from b24api.contracts.policy import CompletionAssurance, KernelState, SnapshotRequirement, SnapshotState
+from b24api.contracts.policy import (
+    CompletionAssurance,
+    KernelState,
+    ReplayDisposition,
+    SnapshotRequirement,
+    SnapshotState,
+)
 from b24api.contracts.report import (
     PageOutcome,
     PageRecord,
     Violation,
     ViolationSeverity,
 )
-from b24api.errors import BudgetExceededError, IncompleteTraversalError, PaginationError
+from b24api.errors import B24ApiError, BudgetExceededError, IncompleteTraversalError, PaginationError
 from b24api.execution.context import await_cancellation_resistant, await_cleanup_resistant, rearm_cancellation
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
@@ -26,6 +33,7 @@ from b24api.traversal.keyset_observation import PageObservation
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from b24api.completion.gate import CompletionGate
     from b24api.traversal.keyset_scheduler import KeysetFastScheduler
 
 
@@ -171,6 +179,11 @@ class KeysetFastStream:
         """Return this single-use async iterator."""
         return self
 
+    @property
+    def completion_gate(self) -> CompletionGate:
+        """Expose the active fast-keyset completion evidence to the public adapter."""
+        return self._scheduler.completion_recorder.gate
+
     async def __anext__(self) -> JsonValue:
         """Return the next admitted row or finalize terminal evidence."""
         if self._closed:
@@ -193,11 +206,20 @@ class KeysetFastStream:
             _attach_report(error, self.report)
             self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
             raise
-        except (PaginationError, BudgetExceededError) as error:
+        except (IncompleteTraversalError, PaginationError, BudgetExceededError) as error:
             await self._terminate(KernelState.INCOMPLETE, type(error).__name__, primary=error)
-            incomplete = IncompleteTraversalError(report=self.report)
+            cause = error.error if isinstance(error, IncompleteTraversalError) else error
+            incomplete = IncompleteTraversalError(
+                report=self.report,
+                error=cause if isinstance(cause, B24ApiError) else None,
+                replay_disposition=(
+                    error.replay_disposition
+                    if isinstance(error, IncompleteTraversalError)
+                    else getattr(error, "replay_disposition", ReplayDisposition.NOT_ELIGIBLE)
+                ),
+            )
             self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
-            raise incomplete from error
+            raise incomplete from cause
         except BaseException as error:
             await self._terminate(KernelState.FAILED, type(error).__name__, primary=error)
             _attach_report(error, self.report)
@@ -268,6 +290,21 @@ class KeysetFastStream:
             page_trace=records,
             page_trace_truncated=any(dropped.values()),
             keyset_execution=self._scheduler.report_fragment(),
+        )
+        counters = self._scheduler.counters
+        cleanup = (
+            CleanupState.FAILURE
+            if any(violation.code == "cleanup_failure" for violation in self._scheduler.violations)
+            else CleanupState.SUCCESS
+        )
+        closure, qualified_witnesses = self._scheduler.completion_closure()
+        self._scheduler.completion_recorder.terminal(
+            state,
+            rows_emitted=counters.emitted_rows,
+            rows_admitted=counters.admitted_rows,
+            cleanup=cleanup,
+            closure=closure,
+            qualified_witnesses=qualified_witnesses,
         )
 
 

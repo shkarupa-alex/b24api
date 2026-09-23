@@ -9,10 +9,12 @@ from typing import TYPE_CHECKING
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
+from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.report import PageOutcome, PageRejectionCode, Violation, ViolationSeverity
 from b24api.contracts.request import ResultSelector
 from b24api.errors import (
     AmbiguousExecutionError,
+    B24ApiError,
     CapabilityError,
     EnvelopeContractError,
     PageAdaptationError,
@@ -71,23 +73,32 @@ class ReceiptRejection:
     detail: str
     selected_rows: int = 0
     error: BaseException | None = None
+    replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
 
 
-def _rejection(
+def _rejection(  # noqa: PLR0913
     plan: LaneCommandPlan,
     message: str,
     *,
     code: str = "keyset_receipt",
     selected_rows: int = 0,
     error: BaseException | None = None,
+    replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE,
 ) -> ReceiptRejection:
     return ReceiptRejection(
         plan.lane_ordinal,
         plan.command_id,
-        Violation(ViolationSeverity.BLOCKING, code, message),
+        Violation(
+            ViolationSeverity.BLOCKING,
+            code,
+            message,
+            error=error if isinstance(error, B24ApiError) else None,
+            replay_disposition=replay_disposition,
+        ),
         message,
         selected_rows,
         error,
+        replay_disposition,
     )
 
 
@@ -128,7 +139,13 @@ def validate_lane_receipt(  # noqa: PLR0913
     """Validate one outcome without mutating global or lane state."""
     del collection_shape  # selection shape is represented by the prepared selector
     if isinstance(outcome, BatchFailure):
-        return _rejection(plan, "keyset batch command failed", code="command_failure")
+        return _rejection(
+            plan,
+            "keyset batch command failed",
+            code="command_failure",
+            error=outcome.error if isinstance(outcome.error, BaseException) else None,
+            replay_disposition=outcome.replay_disposition,
+        )
     if not isinstance(outcome, BatchSuccess) or outcome.response is None:
         return _rejection(plan, "keyset batch outcome is not a correlated success", code="command_failure")
     rows: tuple[FrozenJson, ...] = ()

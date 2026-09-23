@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, cast
 
 from b24api._stream import MappedOperationStream, _ClosableIterator
 from b24api.batch.engine import BatchExecutor
@@ -26,18 +26,20 @@ from b24api.contracts.request import (
     IdentitySpec,
     RequestLike,
     ResultSelector,
+    RouteKind,
     TraversalIdentity,
     canonical_request,
 )
-from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import OffsetContinuation, TotalTermination
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.counted import CountedItemStream
+from b24api.traversal.facade_support import _checked_identity_store, _collection_selector, _direction
 from b24api.traversal.keyset_eligibility import validate_fast_keyset
 from b24api.traversal.keyset_fast_stream import FastTraceRecorder, KeysetFastStream
 from b24api.traversal.keyset_scheduler import KeysetFastScheduler
 from b24api.traversal.keyset_step import sequential_keyset_plan
+from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
@@ -45,33 +47,20 @@ from b24api.traversal.plans import (
     ItemCursorPlan,
     KeysetPlan,
     OffsetSequentialPlan,
-    OffsetTerminalRule,
 )
 from b24api.traversal.stream import iter_list as _iter_list
-from b24api.traversal.values import _MappingValuesResultSelector, _TolerantMappingValuesResultSelector
 
 if TYPE_CHECKING:
+    from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.json import JsonValue
     from b24api.contracts.page import PageAdapter
+    from b24api.contracts.page_stop import PageStopPolicy
+    from b24api.contracts.response import ResultCollectionShape
     from b24api.contracts.stream import OperationStream
     from b24api.contracts.traversal import CursorSpec, KeysetSpec, OffsetSpec
     from b24api.execution.executor import Executor
 
 type Deregister = Callable[[object], None]
-
-
-def _direction(value: str) -> Literal["asc", "desc"]:
-    return "asc" if value == "ascending" else "desc"
-
-
-def _collection_selector(selector: ResultSelector, shape: ResultCollectionShape) -> ResultSelector:
-    if not isinstance(shape, ResultCollectionShape):
-        raise TypeError("collection_shape must be a ResultCollectionShape")
-    if shape is ResultCollectionShape.SEQUENCE:
-        return selector
-    if shape is ResultCollectionShape.MAPPING_VALUES_OR_EMPTY:
-        return _TolerantMappingValuesResultSelector(selector.path)
-    return _MappingValuesResultSelector(selector.path)
 
 
 def _mapped_stream(
@@ -103,39 +92,27 @@ def sequential_stream(  # noqa: PLR0913
     page_size: int,
     offset: OffsetSpec,
     page_adapter: PageAdapter,
+    page_stop: PageStopPolicy | None,
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
+    identity_store: IdentityStore | None = None,
 ) -> OperationStream[JsonValue]:
     """Compose conservative sequential offset/server-next traversal."""
-    if offset.continuation is OffsetContinuation.FIXED_STEP and offset.step != page_size:
-        raise ValueError("fixed-step traversal requires page_size equal to step")
-    plan = OffsetSequentialPlan(
-        offset_path=offset.parameter_path,
-        limit_path=offset.limit_path,
-        requested_page_size=page_size if offset.limit_path is not None else None,
-        continuation=offset.continuation,
-        fixed_step=offset.step,
-        terminal=(
-            frozenset({OffsetTerminalRule.EMPTY_PAGE})
-            if offset.total_termination is TotalTermination.DISABLED
-            else frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL})
-        ),
-        allow_create_controls=offset.allow_create_controls,
-        identity_requirement=IdentityRequirement.OPTIONAL,
-        duplicate_policy=DuplicatePolicy.ERROR,
-        total_semantics=(
-            TotalSemantics.IGNORE
-            if offset.total_termination is TotalTermination.DISABLED
-            else TotalSemantics.FILTERED_EXACT
-        ),
-    )
+    ledger = _checked_identity_store(identity_store, identity)
+    plan = sequential_offset_plan(offset, page_size=page_size, duplicate_policy=DuplicatePolicy.REPORT)
     if offset.total_termination is TotalTermination.EXACT_QUALIFIED:
         assurance = (
             TraversalAssurance.IDENTITY_AND_COUNT_MATCHED if identity is not None else TraversalAssurance.COUNT_MATCHED
         )
     else:
-        assurance = TraversalAssurance.IDENTITY_EXACT if identity is not None else TraversalAssurance.MECHANICS_ONLY
+        assurance = (
+            TraversalAssurance.RAW_RANGE_COVERED
+            if offset.sparse_raw_bound is not None
+            else TraversalAssurance.IDENTITY_EXACT
+            if identity is not None
+            else TraversalAssurance.MECHANICS_ONLY
+        )
     return _plan_stream(
         executor,
         request,
@@ -145,11 +122,13 @@ def sequential_stream(  # noqa: PLR0913
         collection_shape=collection_shape,
         page_size=page_size,
         page_adapter=page_adapter,
+        page_stop=page_stop,
         policy=policy,
         operation="iter_list",
         assurance=assurance,
         deregister=deregister,
         audit_violations=audit_violations,
+        identity_store=ledger,
     )
 
 
@@ -164,6 +143,7 @@ def keyset_stream(  # noqa: PLR0913
     keyset: KeysetSpec,
     execution: KeysetExecution,
     page_adapter: PageAdapter,
+    page_stop: PageStopPolicy | None,
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
@@ -174,6 +154,10 @@ def keyset_stream(  # noqa: PLR0913
         SequentialKeysetExecution | RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
     ):
         raise TypeError("execution must be a supported KeysetExecution")
+    if page_stop is not None and isinstance(execution, AutoKeysetExecution):
+        execution = SequentialKeysetExecution()
+    if page_stop is not None and not isinstance(execution, SequentialKeysetExecution):
+        raise CapabilityError("page stop requires sequential keyset execution")
     if not isinstance(execution, SequentialKeysetExecution):
         canonical = canonical_request(request)
         effective_cap = validate_fast_keyset(
@@ -219,9 +203,10 @@ def keyset_stream(  # noqa: PLR0913
         collection_shape=collection_shape,
         page_size=page_size,
         page_adapter=page_adapter,
+        page_stop=page_stop,
         policy=policy,
         operation="iter_list_keyset",
-        assurance=TraversalAssurance.IDENTITY_EXACT,
+        assurance=(TraversalAssurance.BOUNDED_RANGE_OBSERVED if keyset.boundary else TraversalAssurance.IDENTITY_EXACT),
         deregister=deregister,
         audit_violations=audit_violations,
     )
@@ -241,16 +226,30 @@ def counted_stream(  # noqa: PLR0913
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
+    identity_store: IdentityStore | None = None,
 ) -> OperationStream[JsonValue]:
     """Compose exact direct-head plus physically batched counted traversal."""
+    ledger = _checked_identity_store(identity_store, identity)
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         raise ValueError("page_size must be a positive integer")
+    if offset.page_index is not None:
+        raise ValueError("counted physical batch does not support page_index")
     if offset.total_termination is not TotalTermination.EXACT_QUALIFIED:
         raise ValueError("counted traversal requires exact-qualified total termination")
     if offset.continuation is OffsetContinuation.FIXED_STEP and offset.step != page_size:
         raise ValueError("fixed-step traversal requires page_size equal to step")
+    stride = offset.page_stride
+    if stride is not None and stride.max_decoded_rows != page_size:
+        raise ValueError("counted page_size must match page_stride max_decoded_rows")
+    if stride is not None and stride.requested_wire_limit is not None:
+        raise ValueError("counted traversal does not support page_stride requested_wire_limit")
     canonical = canonical_request(request)
-    if canonical.encoding is not BodyEncoding.JSON or canonical.headers.items:
+    if (
+        canonical.route is not RouteKind.BARE
+        or canonical.encoding is not BodyEncoding.JSON
+        or canonical.headers.items
+        or canonical.positional is not None
+    ):
         raise CapabilityError("counted traversal supports JSON requests without scoped headers")
     executor._preflight_request(canonical)  # noqa: SLF001 - operation-wide preflight before stream construction
     plan = CountedOffsetPlan(
@@ -280,6 +279,7 @@ def counted_stream(  # noqa: PLR0913
         batch_size=resolve_batch_size(batch_size, policy),
         policy=policy,
         page_adapter=page_adapter,
+        identity_store=ledger,
     )
     return _mapped_stream(
         source,
@@ -302,6 +302,7 @@ def cursor_stream(  # noqa: PLR0913
     collection_shape: ResultCollectionShape,
     page_size: int,
     page_adapter: PageAdapter,
+    page_stop: PageStopPolicy | None,
     policy: ExecutionPolicy,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
@@ -324,6 +325,7 @@ def cursor_stream(  # noqa: PLR0913
         requested_page_size=page_size if cursor.limit_path is not None else None,
         terminal=CursorTerminalRule.EMPTY_CONFIRMATION,
         allow_create_controls=cursor.allow_create_controls,
+        domain=cursor.domain,
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING if direction == "asc" else OrderSemantics.DESCENDING,
         duplicate_policy=DuplicatePolicy.ERROR,
@@ -337,6 +339,7 @@ def cursor_stream(  # noqa: PLR0913
         collection_shape=collection_shape,
         page_size=page_size,
         page_adapter=page_adapter,
+        page_stop=page_stop,
         policy=policy,
         operation="iter_list_cursor",
         assurance=TraversalAssurance.IDENTITY_EXACT,
@@ -355,11 +358,13 @@ def _plan_stream(  # noqa: PLR0913
     collection_shape: ResultCollectionShape,
     page_size: int,
     page_adapter: PageAdapter,
+    page_stop: PageStopPolicy | None,
     policy: ExecutionPolicy,
     operation: str,
     assurance: TraversalAssurance,
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
+    identity_store: IdentityStore | None = None,
 ) -> OperationStream[JsonValue]:
     source = _iter_list(
         executor,
@@ -370,6 +375,8 @@ def _plan_stream(  # noqa: PLR0913
         policy=policy,
         _page_cap_hint=page_size,
         _page_adapter=page_adapter,
+        _page_stop=page_stop,
+        _identity_store=identity_store,
     )
     return _mapped_stream(
         source,

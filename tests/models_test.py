@@ -17,8 +17,9 @@ from b24api.contracts.policy import (
     SnapshotState,
 )
 from b24api.contracts.report import Violation, ViolationSeverity
-from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request, ResultSelector
+from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request, ResultSelector, RouteKind
 from b24api.contracts.response import Response, inject_controls
+from b24api.contracts.violation import MAX_RETAINED_VIOLATIONS, retain_violations
 from b24api.errors import BudgetExceededError
 from b24api.execution.snapshot import KernelReport
 from b24api.references.outcome import ReferenceFailure, ReferenceItem, ReferenceRequest
@@ -26,6 +27,7 @@ from b24api.references.outcome import ReferenceFailure, ReferenceItem, Reference
 EXAMPLE_CREDENTIAL = "n1x2y3z4q5w6e7r8"
 TEST_LIMIT = 2
 TEST_CURSOR = 99
+EXCESS_VIOLATIONS = 140
 
 
 def _identity_list(parameters: Mapping[str, JsonValue]) -> list[JsonValue]:
@@ -39,7 +41,7 @@ def _identity_list(parameters: Mapping[str, JsonValue]) -> list[JsonValue]:
 def test_request_is_deeply_immutable_and_accessors_are_detached() -> None:
     caller_ids = [1, 2]
     caller = {"filter": {"ID": caller_ids}, "select": ["ID"]}
-    request = Request("tasks.task.list", caller, replay_safety=ReplaySafety.SAFE)
+    request = Request("tasks.task.list", caller, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
     caller_ids.append(3)
 
     first = request.copy_parameters()
@@ -59,28 +61,37 @@ def test_request_rejects_non_json_nonfinite_and_cycles() -> None:
     cyclic.append(cyclic)
 
     with pytest.raises(TypeError):
-        Request("profile", {1: "bad"})  # type: ignore[dict-item]
+        Request("profile", {1: "bad"}, route=RouteKind.BARE)  # type: ignore[dict-item]
     with pytest.raises(TypeError):
-        Request("profile", {"bad": {1, 2}})
+        Request("profile", {"bad": {1, 2}}, route=RouteKind.BARE)
     with pytest.raises(ValueError, match="finite"):
-        Request("profile", {"bad": float("nan")})
+        Request("profile", {"bad": float("nan")}, route=RouteKind.BARE)
     with pytest.raises(ValueError, match="finite"):
-        Request("profile", {"bad": 1e400})
+        Request("profile", {"bad": 1e400}, route=RouteKind.BARE)
     with pytest.raises(ValueError, match="cyclic"):
-        Request("profile", {"bad": cyclic})
+        Request("profile", {"bad": cyclic}, route=RouteKind.BARE)
     with pytest.raises(ValueError, match="method"):
-        Request("bad/method")
+        Request("bad/method", route=RouteKind.BARE)
     with pytest.raises(TypeError, match="replay_safety"):
-        Request("profile", replay_safety="safe")  # type: ignore[arg-type]
+        Request("profile", replay_safety="safe", route=RouteKind.BARE)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("route", list(RouteKind))
+def test_request_rejects_route_suffixed_logical_methods(route: RouteKind) -> None:
+    with pytest.raises(ValueError, match="logical names"):
+        Request("crm.item.list.json", route=route)
 
 
 def test_request_repr_contains_shape_not_values() -> None:
-    request = Request("profile", {"auth": EXAMPLE_CREDENTIAL, "select": ["ID"]})
+    request = Request("profile", {"auth": EXAMPLE_CREDENTIAL, "select": ["ID"]}, route=RouteKind.BARE)
 
     assert EXAMPLE_CREDENTIAL not in repr(request)
     assert "auth" in repr(request)
     assert request.replay_safety is ReplaySafety.UNKNOWN
-    assert Request("profile", replay_safety=ReplaySafety.UNKNOWN).replay_safety is ReplaySafety.UNKNOWN
+    assert (
+        Request("profile", replay_safety=ReplaySafety.UNKNOWN, route=RouteKind.BARE).replay_safety
+        is ReplaySafety.UNKNOWN
+    )
 
 
 def test_response_is_deeply_immutable_and_selectors_are_exact() -> None:
@@ -218,8 +229,22 @@ def test_report_is_frozen_and_completion_rejects_blocking_violation() -> None:
         )
 
 
+def test_violation_retention_is_bounded_and_preserves_a_late_blocking_cause() -> None:
+    warnings = tuple(
+        Violation(ViolationSeverity.WARNING, f"warning_{index}", "bounded warning")
+        for index in range(EXCESS_VIOLATIONS)
+    )
+    blocking = Violation(ViolationSeverity.BLOCKING, "late_blocking", "late blocking cause")
+
+    retained = retain_violations((*warnings, blocking))
+
+    assert len(retained) == MAX_RETAINED_VIOLATIONS
+    assert blocking in retained
+    assert retained[-1].code == "violations_truncated"
+
+
 def test_failure_repr_excludes_request_error_and_payload_values() -> None:
-    request = Request("profile", {"auth": EXAMPLE_CREDENTIAL})
+    request = Request("profile", {"auth": EXAMPLE_CREDENTIAL}, route=RouteKind.BARE)
     failure = BatchFailure(
         command_index=0,
         stable_key="_0",
@@ -232,7 +257,7 @@ def test_failure_repr_excludes_request_error_and_payload_values() -> None:
 
 
 def test_reference_values_hide_correlation_and_detach_mutable_items() -> None:
-    request = Request("profile", {"auth": EXAMPLE_CREDENTIAL})
+    request = Request("profile", {"auth": EXAMPLE_CREDENTIAL}, route=RouteKind.BARE)
     reference = ReferenceRequest(request, EXAMPLE_CREDENTIAL)
     source = {"rows": [1]}
     item = ReferenceItem(EXAMPLE_CREDENTIAL, source, correlation={"secret": EXAMPLE_CREDENTIAL})

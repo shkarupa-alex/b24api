@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from b24api.errors import PaginationError
+from b24api.traversal.cursor_domain import validate_cursor_progression, validate_cursor_value, validate_initial_cursor
 from b24api.traversal.identity import (
     _cursor_terminal,
     _Page,
@@ -34,9 +35,12 @@ class _CursorMixin:
     cursor_state: JsonValue
     initial_cursor: IdentityValue | None
 
-    async def _cursor(self: Any, plan: ItemCursorPlan) -> AsyncGenerator[_Page]:  # noqa: C901, PLR0912
+    async def _cursor(self: Any, plan: ItemCursorPlan) -> AsyncGenerator[_Page]:  # noqa: C901, PLR0912, PLR0915
         self._require_identity("item cursor")
-        cursor = self.initial_cursor
+        request_cursor = validate_initial_cursor(self.request, plan)
+        cursor = self.initial_cursor if self.initial_cursor is not None else request_cursor
+        if cursor is not None:
+            validate_cursor_value(cursor, plan.domain)
         first_page = True
         while True:
             updates: dict[ParameterPath, object] = {}
@@ -53,7 +57,11 @@ class _CursorMixin:
                     allow_create=plan.allow_create_controls,
                     replace=(
                         frozenset({plan.cursor_request_path})
-                        if self.initial_cursor is not None or not plan.allow_create_controls
+                        if (
+                            self.initial_cursor is not None
+                            or request_cursor is not None
+                            or not plan.allow_create_controls
+                        )
                         else frozenset()
                     ),
                 )
@@ -66,6 +74,8 @@ class _CursorMixin:
                 items = self.select_page(response)
                 source = self.source_page.current(items)
                 cursor_values = _cursor_values(source, plan)
+                for value in cursor_values:
+                    validate_cursor_progression(value, plan.domain)
                 _validate_order(cursor_values, plan.direction)
                 if cursor is not None and cursor_values:
                     comparison = _compare_identities(cursor_values[0], cursor)

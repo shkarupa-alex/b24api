@@ -56,6 +56,7 @@ from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.json import FrozenMapping
 from b24api.contracts.keyset_execution import KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import Violation, ViolationSeverity
+from b24api.contracts.request import RouteKind
 from b24api.contracts.response import Response, ResultCollectionShape
 from b24api.execution import Executor, WireResponse
 from b24api.references.dispatch import _BatchPageDispatcher, _ProducerState, _RowBuffer
@@ -162,7 +163,7 @@ async def test_iter_cursors_normalizes_independent_seeds_and_keeps_correlation_o
         Binding("b", (ParameterUpdate(ParameterPath(("parent",)), "b"),), correlations[1], start_cursor=10),
     ]
     stream = _client(transport).iter_cursors(
-        Request("item.list", {"parent": "base"}),
+        Request("item.list", {"parent": "base"}, route=RouteKind.BARE),
         bindings,
         selector=ResultSelector.root(),
         cursor=_cursor(),
@@ -190,7 +191,7 @@ async def test_iter_cursors_normalizes_independent_seeds_and_keeps_correlation_o
 async def test_cursor_seed_invalid_or_used_with_non_cursor_traversal_is_local() -> None:
     invalid_transport = CursorBatchTransport({"a": (1, 2)})
     invalid = _client(invalid_transport).iter_cursors(
-        Request("item.list", {"parent": "base"}),
+        Request("item.list", {"parent": "base"}, route=RouteKind.BARE),
         [Binding("a", (ParameterUpdate(ParameterPath(("parent",)), "a"),), "opaque", start_cursor="bad")],
         selector=ResultSelector.root(),
         cursor=_cursor(),
@@ -204,7 +205,7 @@ async def test_cursor_seed_invalid_or_used_with_non_cursor_traversal_is_local() 
 
     tolerant_transport = CursorBatchTransport({"a": (1, 2)})
     tolerant = _client(tolerant_transport).iter_reference_outcomes(
-        Request("item.list", {"parent": "base"}),
+        Request("item.list", {"parent": "base"}, route=RouteKind.BARE),
         [Binding("a", (), "opaque", start_cursor=1)],
         traversal=SequentialTraversal(),
     )
@@ -219,7 +220,7 @@ async def test_cursor_seed_invalid_or_used_with_non_cursor_traversal_is_local() 
 async def test_cursor_seed_must_advance_on_first_page_and_cursor_update_path_is_reserved() -> None:
     transport = CursorBatchTransport({"a": (1, 2, 3)})
     stream = _client(transport).iter_cursors(
-        Request("item.list", {"parent": "a"}),
+        Request("item.list", {"parent": "a"}, route=RouteKind.BARE),
         [Binding("a", (), None, start_cursor=3)],
         selector=ResultSelector.root(),
         cursor=_cursor(),
@@ -228,7 +229,7 @@ async def test_cursor_seed_must_advance_on_first_page_and_cursor_update_path_is_
     assert [event async for event in stream] == [ReferenceComplete(0, None, 0)]
 
     blocked = _client(transport).iter_cursors(
-        Request("item.list", {"parent": "a"}),
+        Request("item.list", {"parent": "a"}, route=RouteKind.BARE),
         [Binding("a", (ParameterUpdate(ParameterPath(("after",)), 1),), None, start_cursor=2)],
         selector=ResultSelector.root(),
         cursor=_cursor(),
@@ -251,7 +252,7 @@ async def test_cursor_seed_replaces_existing_control_when_creation_is_forbidden(
         allow_create_controls=False,
     )
     stream = _client(transport).iter_cursors(
-        Request("item.list", {"parent": "a", "after": 0, "limit": 1}),
+        Request("item.list", {"parent": "a", "after": 0, "limit": 1}, route=RouteKind.BARE),
         [Binding("a", (), None, start_cursor=1)],
         selector=ResultSelector.root(),
         cursor=cursor,
@@ -263,7 +264,7 @@ async def test_cursor_seed_replaces_existing_control_when_creation_is_forbidden(
     assert isinstance(events[-1], ReferenceComplete)
 
     singular = _client(CursorBatchTransport({"a": (1, 2)})).iter_list_cursor(
-        Request("item.list", {"parent": "a", "after": 0, "limit": 1}),
+        Request("item.list", {"parent": "a", "after": 0, "limit": 1}, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         cursor=cursor,
         page_size=1,
@@ -315,7 +316,7 @@ class ReorderingIdentityAdapter(IdentityPageAdapter):
 async def test_page_adapter_enriches_from_frozen_siblings_and_runs_on_empty_confirmation() -> None:
     adapter = EnrichMessages()
     stream = _client(PageTransport()).iter_list_cursor(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector(("messages",)),
         cursor=_cursor(),
         identity=_identity(),
@@ -336,7 +337,7 @@ async def test_custom_adapter_without_configured_identity_preserves_generic_list
     transport = PageTransport()
     adapter = EnrichMessages()
     stream = _client(transport).iter_list(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector(("messages",)),
         page_adapter=adapter,
     )
@@ -367,7 +368,7 @@ class BrokenAdapter:
 @pytest.mark.parametrize("violation", list(PageAdaptationViolation))
 async def test_page_adapter_violations_are_typed_atomic_and_value_free(violation: PageAdaptationViolation) -> None:
     stream = _client(PageTransport()).iter_list_cursor(
-        Request("item.list"),
+        Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector(("messages",)),
         cursor=_cursor(),
         identity=_identity(),
@@ -405,7 +406,7 @@ async def test_reference_adapter_failure_preserves_first_vs_partial_mapping(ordi
     transport = CursorBatchTransport({"a": (1,)})
     adapter = FailOnCall(ordinal)
     outcomes = _client(transport).iter_reference_outcomes(
-        Request("item.list", {"parent": "a"}),
+        Request("item.list", {"parent": "a"}, route=RouteKind.BARE),
         [Binding("a", (), "opaque")],
         traversal=CursorTraversal(ResultSelector.root(), _cursor(), _identity(), 1, adapter),
         dispatch=BatchDispatch(coalesce_wait=0),
@@ -489,7 +490,7 @@ class VerifierTransport:
 
 async def _verify(transport: VerifierTransport):
     return await _client(transport).verify_keyset_capability(
-        Request("item.list", {"filter": {"STATUS": "open"}, "select": ["id"]}),
+        Request("item.list", {"filter": {"STATUS": "open"}, "select": ["id"]}, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
@@ -525,7 +526,7 @@ async def test_keyset_verifier_rejects_owned_controls_before_io_and_detects_hidd
     blocked_transport = VerifierTransport((1, 2, 3, 4))
     with pytest.raises(CapabilityError, match="control conflicts"):
         await _client(blocked_transport).verify_keyset_capability(
-            Request("item.list", {"limit": 2}),
+            Request("item.list", {"limit": 2}, route=RouteKind.BARE),
             selector=ResultSelector.root(),
             identity=_identity(),
             keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
@@ -694,7 +695,7 @@ def test_frozen_selection_and_fingerprint_preserve_legacy_json_semantics() -> No
 
 
 def test_fast_keyset_lane_applies_adapter_only_to_publishable_phases() -> None:
-    request = Request("item.list")
+    request = Request("item.list", route=RouteKind.BARE)
     response = Response([{"id": 1}])
     outcome = BatchSuccess(0, "body:0", request, response.result, response=response)
     lane = LaneState(
@@ -750,7 +751,7 @@ async def test_fast_source_fills_initial_and_continuation_batches() -> None:
         max_pages_per_reference=3,
     )
     stream = _client(transport, policy=policy).iter_cursors(
-        Request("item.list", {"parent": "base"}),
+        Request("item.list", {"parent": "base"}, route=RouteKind.BARE),
         bindings,
         selector=ResultSelector.root(),
         cursor=_cursor(),
@@ -778,7 +779,7 @@ async def test_input_order_does_not_wait_for_an_unacknowledgeable_continuation()
         for parent in ("slow", "fast")
     ]
     stream = _client(transport).iter_cursors(
-        Request("item.list", {"parent": "base"}),
+        Request("item.list", {"parent": "base"}, route=RouteKind.BARE),
         bindings,
         selector=ResultSelector.root(),
         cursor=_cursor(),
@@ -798,7 +799,7 @@ async def test_sender_capacity_is_released_before_downstream_acknowledgement(
 ) -> None:
     transport = CursorBatchTransport({"a": (1,), "b": (2,)})
     stream = _client(transport).iter_cursors(
-        Request("item.list", {"parent": "base"}),
+        Request("item.list", {"parent": "base"}, route=RouteKind.BARE),
         [Binding(key, (ParameterUpdate(ParameterPath(("parent",)), key),), key) for key in transport.rows],
         selector=ResultSelector.root(),
         cursor=_cursor(),
@@ -852,7 +853,7 @@ async def test_slow_consumer_records_bounded_per_wave_coalescing_cost(
         observations.clear()
         transport = TimedCursorBatchTransport({str(index): (1, 2, 3) for index in range(count)})
         stream = _client(transport).iter_cursors(
-            Request("item.list", {"parent": "base"}),
+            Request("item.list", {"parent": "base"}, route=RouteKind.BARE),
             [Binding(key, (ParameterUpdate(ParameterPath(("parent",)), key),), key) for key in transport.rows],
             selector=ResultSelector.root(),
             cursor=_cursor(),
@@ -947,7 +948,7 @@ async def test_zero_coalesce_never_subscribes_to_producer_waits(monkeypatch: pyt
 
     monkeypatch.setattr(_ProducerState, "changed", reject_wait)
     stream = _client(CursorBatchTransport({"a": (1, 2)})).iter_cursors(
-        Request("item.list", {"parent": "a"}),
+        Request("item.list", {"parent": "a"}, route=RouteKind.BARE),
         [Binding("a", (), "a")],
         selector=ResultSelector.root(),
         cursor=_cursor(),
@@ -988,7 +989,7 @@ async def test_exhausted_single_producer_skips_wait_for_one_hundred_sequential_w
         page_cap=1,
     )
     for _ in range(101):
-        page = await dispatcher.fetch(Request("item.list", {"parent": "a"}), "r0")
+        page = await dispatcher.fetch(Request("item.list", {"parent": "a"}, route=RouteKind.BARE), "r0")
         assert page.admission is not None
         assert page.settlement is not None
         page.admission.set_result(None)
@@ -1003,7 +1004,7 @@ async def test_exhausted_single_producer_skips_wait_for_one_hundred_sequential_w
 async def test_singular_cursor_deep_pagination_stays_on_the_direct_no_coalescer_path() -> None:
     transport = CursorBatchTransport({"a": tuple(range(1, 121))})
     stream = _client(transport).iter_list_cursor(
-        Request("item.list", {"parent": "a"}),
+        Request("item.list", {"parent": "a"}, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         cursor=_cursor(),
         page_size=1,
@@ -1034,7 +1035,7 @@ async def test_exhausted_ten_parent_deep_pagination_fills_every_wave_without_dea
             max_pages_per_reference=120,
         ),
     ).iter_cursors(
-        Request("item.list", {"parent": "base"}),
+        Request("item.list", {"parent": "base"}, route=RouteKind.BARE),
         [Binding(key, (ParameterUpdate(ParameterPath(("parent",)), key),), key) for key in rows],
         selector=ResultSelector.root(),
         cursor=_cursor(),
@@ -1073,7 +1074,7 @@ async def test_capacity_saturated_jitter_preserves_every_page_and_releases_state
             max_pages_per_reference=6,
         ),
     ).iter_cursors(
-        Request("item.list", {"parent": "base"}),
+        Request("item.list", {"parent": "base"}, route=RouteKind.BARE),
         bindings,
         selector=ResultSelector.root(),
         cursor=_cursor(),

@@ -55,6 +55,7 @@ class ExecutionContext:
         self._cooldown_seconds = 0.0
         self._page_sequence = 0
         self._page_reservations: dict[_PageReservation, None] = {}
+        self._retained_identity_keys = 0
         self._lock = asyncio.Lock()
         self._page_changed = asyncio.Event()
 
@@ -168,6 +169,24 @@ class ExecutionContext:
         async with self._lock:
             target = self._counters.buffered_rows + delta
             self._counters = self._counters.with_buffered_rows(self.policy, target)
+
+    def ensure_identity_capacity(self, additional: int) -> None:
+        """Reject a page that would exceed the operation-wide identity budget."""
+        if not isinstance(additional, int) or isinstance(additional, bool) or additional < 0:
+            raise ValueError("additional identity keys must be a non-negative integer")
+        if self._retained_identity_keys + additional > self.policy.max_identity_keys:
+            raise BudgetExceededError("identity evidence budget exhausted")
+
+    def retain_identity_key(self) -> None:
+        """Charge one identity after its page-wide capacity check succeeds."""
+        self.ensure_identity_capacity(1)
+        self._retained_identity_keys += 1
+
+    def release_identity_keys(self, count: int) -> None:
+        """Release identities owned by one closing traversal binding."""
+        if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= self._retained_identity_keys:
+            raise RuntimeError("identity evidence accounting is inconsistent")
+        self._retained_identity_keys -= count
 
     def remaining_time(self, *, retry_started: float) -> float:
         """Return the tighter operation or retry time remaining."""

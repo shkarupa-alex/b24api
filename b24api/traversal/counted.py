@@ -4,16 +4,19 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Self
 
+from b24api.completion.recorder import CountedCompletionRecorder
+from b24api.contracts.completion import BindingClosure, CleanupState, StreamClosure
 from b24api.contracts.json import _thaw_json
 from b24api.contracts.policy import (
     CompletionAssurance,
     ExecutionPolicy,
     KernelState,
+    ReplayDisposition,
     SnapshotRequirement,
     SnapshotState,
 )
 from b24api.contracts.report import retain_page_trace
-from b24api.errors import CapabilityError, IncompleteTraversalError
+from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
@@ -21,6 +24,7 @@ from b24api.traversal.driver import PaginationDriver
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.json import JsonValue
     from b24api.contracts.page import PageAdapter
     from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
@@ -44,9 +48,12 @@ class CountedItemStream:
         batch_size: int,
         policy: ExecutionPolicy,
         page_adapter: PageAdapter,
+        identity_store: IdentityStore | None = None,
     ) -> None:
         """Initialize without scheduling work."""
         self._context = executor.context(policy)
+        self._completion = CountedCompletionRecorder()
+        self._completion_cleanup_done = False
         self._driver = PaginationDriver(
             executor,
             request,
@@ -56,6 +63,8 @@ class CountedItemStream:
             context=self._context,
             page_cap_hint=page_size,
             page_adapter=page_adapter,
+            completion_recorder=self._completion,
+            identity_store=identity_store,
         )
         self._page_size = page_size
         self._batch_size = batch_size
@@ -69,6 +78,17 @@ class CountedItemStream:
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
         return self
+
+    @property
+    def completion_gate(self) -> object:
+        """Expose live counted completion evidence to the operation wrapper."""
+        return self._completion.gate
+
+    def _finish_completion_cleanup(self) -> None:
+        if self._completion_cleanup_done or self.report.state is KernelState.NOT_STARTED:
+            return
+        self._completion.cleanup(CleanupState.SUCCESS)
+        self._completion_cleanup_done = True
 
     async def __anext__(self) -> JsonValue:
         """Return the next validated item."""
@@ -87,6 +107,7 @@ class CountedItemStream:
             await self._runner.aclose()
         if self.report.state is KernelState.NOT_STARTED:
             await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
+        self._finish_completion_cleanup()
 
     async def _run(self) -> AsyncGenerator[JsonValue]:
         primary: BaseException | None = None
@@ -100,6 +121,9 @@ class CountedItemStream:
                     self._emitted += 1
                     self._unique += int(is_unique)
                     yield _thaw_json(item)
+                if page.items:
+                    self._completion.delivered()
+                    self._completion.acknowledged()
             await self._finalize(KernelState.COMPLETED, "counted traversal completed exactly")
         except asyncio.CancelledError as error:
             primary = error
@@ -118,17 +142,29 @@ class CountedItemStream:
                 _attach_report(error, self.report)
                 raise
             await self._finalize(KernelState.INCOMPLETE, type(error).__name__)
-            incomplete = IncompleteTraversalError(report=self.report)
-            incomplete.__cause__ = error
-            raise incomplete from error
+            cause = error.error if isinstance(error, IncompleteTraversalError) else error
+            typed_cause = cause if isinstance(cause, B24ApiError) else None
+            replay_disposition = (
+                error.replay_disposition
+                if isinstance(error, IncompleteTraversalError)
+                else getattr(error, "replay_disposition", ReplayDisposition.NOT_ELIGIBLE)
+            )
+            incomplete = IncompleteTraversalError(
+                report=self.report,
+                error=typed_cause,
+                replay_disposition=replay_disposition,
+            )
+            raise incomplete from cause
         finally:
             self._closed = True
             if primary is not None and self.report.state is KernelState.NOT_STARTED:
                 await self._finalize(KernelState.FAILED, type(primary).__name__)
+            self._finish_completion_cleanup()
 
     async def _finalize(self, state: KernelState, reason: str) -> None:
         if self.report.state is not KernelState.NOT_STARTED:
             return
+        self._completion.settle_unobserved()
         snapshot = await self._context.snapshot()
         batch = self._driver.batch_report
         snapshot_state = (
@@ -152,6 +188,7 @@ class CountedItemStream:
             dispatch_id="batch",
             emitted_rows=self._emitted,
             unique_rows=self._unique,
+            duplicate_identities=self._driver.duplicate_identities,
             physical_requests=snapshot.counters.physical_requests,
             logical_pages=snapshot.counters.logical_pages,
             batch_requests=batch.batch_requests if batch is not None else 0,
@@ -164,6 +201,25 @@ class CountedItemStream:
             evidence=tuple(self._evidence),
             page_trace=page_trace,
             page_trace_truncated=page_trace_truncated,
+        )
+        closure = (
+            BindingClosure.QUALIFIED_TOTAL
+            if state is KernelState.COMPLETED
+            else BindingClosure.UNKNOWN
+            if self._completion.has_unknown
+            else BindingClosure.FAILURE
+        )
+        stream = (
+            StreamClosure.NATURAL
+            if state is KernelState.COMPLETED
+            else StreamClosure.CANCELLED
+            if state is KernelState.CANCELLED
+            else StreamClosure.EARLY_CLOSE
+        )
+        self._completion.terminal(
+            closure,
+            stream,
+            qualified_total=self._driver._expected_total if closure is BindingClosure.QUALIFIED_TOTAL else None,  # noqa: SLF001
         )
 
 

@@ -10,9 +10,10 @@ import pytest
 
 from b24api import execution as execution_module
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
-from b24api.contracts.request import ReplaySafety, Request
+from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
+    ApiResponseError,
     BudgetExceededError,
     FailurePhase,
     HTTPGatewayError,
@@ -28,6 +29,12 @@ from b24api.execution import (
     WireResponse,
     WorkClass,
     rearm_cancellation,
+)
+from b24api.execution.rate import (
+    CoordinatorBudgetError,
+    CoordinatorClosedError,
+    DeadlineBudget,
+    RatePolicyCapacityError,
 )
 from b24api.transport import httpx as httpx_transport_module
 
@@ -159,6 +166,8 @@ async def test_transport_webhook_vault_is_opaque_and_gc_bounded() -> None:
 class SequenceTransport:
     """Provide a deterministic test helper."""
 
+    host = "fixture.invalid"
+
     def __init__(self, outcomes: tuple[WireResponse | Exception, ...] | list[WireResponse | Exception]) -> None:
         """Initialize instance state."""
         self.outcomes = list(outcomes)
@@ -251,7 +260,7 @@ def _policy(*, attempts: int = 3, delay: float = 0.0, elapsed: float = 10.0) -> 
 async def test_terminal_negative_one_next_is_normalized() -> None:
     transport = SequenceTransport([_success(b'{"result":[],"next":-1}')])
 
-    response = await Executor(transport).execute(Request("mobile.disk.folder.getchildren"))
+    response = await Executor(transport).execute(Request("mobile.disk.folder.getchildren", route=RouteKind.BARE))
 
     assert response.result == []
     assert response.next is None
@@ -262,7 +271,7 @@ async def test_safe_and_unknown_retry_only_when_replay_is_proven() -> None:
     pre_dispatch = TransportError("connect", phase=FailurePhase.NOT_DISPATCHED)
     safe_transport = SequenceTransport([pre_dispatch, _success()])
     safe = await Executor(safe_transport).execute(
-        Request("profile", replay_safety=ReplaySafety.SAFE),
+        Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         policy=_policy(),
     )
     assert safe.result == {"ok": True}
@@ -271,7 +280,7 @@ async def test_safe_and_unknown_retry_only_when_replay_is_proven() -> None:
     unknown_transport = SequenceTransport(
         [TransportError("connect", phase=FailurePhase.CONNECTION_ESTABLISHED), _success()],
     )
-    unknown = await Executor(unknown_transport).execute(Request("profile"), policy=_policy())
+    unknown = await Executor(unknown_transport).execute(Request("profile", route=RouteKind.BARE), policy=_policy())
     assert unknown.result == {"ok": True}
     assert unknown_transport.calls == EXPECTED_RETRIED_CALLS
 
@@ -284,7 +293,10 @@ async def test_ambiguous_dispatch_never_retries_unproven_request(safety: ReplayS
     )
 
     with pytest.raises(AmbiguousExecutionError) as captured:
-        await Executor(transport).execute(Request("crm.deal.add", replay_safety=safety), policy=_policy())
+        await Executor(transport).execute(
+            Request("crm.deal.add", replay_safety=safety, route=RouteKind.BARE),
+            policy=_policy(),
+        )
 
     assert transport.calls == 1
     assert isinstance(captured.value.__cause__, TransportError)
@@ -300,7 +312,7 @@ async def test_safe_ambiguous_transport_retries_with_counted_attempts() -> None:
     context = executor.context(_policy())
 
     response = await executor.execute(
-        Request("profile", replay_safety=ReplaySafety.SAFE),
+        Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         context=context,
     )
     snapshot = await context.snapshot()
@@ -318,7 +330,7 @@ async def test_operation_elapsed_clock_starts_at_first_execution_not_context_con
     context = executor.context(_policy(elapsed=1))
     now[0] = 100.0
 
-    response = await executor.execute(Request("profile"), context=context)
+    response = await executor.execute(Request("profile", route=RouteKind.BARE), context=context)
 
     assert response.result == {"ok": True}
     assert (await context.snapshot()).elapsed == 0
@@ -332,13 +344,13 @@ async def test_retry_attempt_and_delay_budgets_terminate_before_extra_io() -> No
     )
     transport = SequenceTransport(always_connect)
     with pytest.raises(BudgetExceededError, match="attempt"):
-        await Executor(transport).execute(Request("profile"), policy=_policy(attempts=2))
+        await Executor(transport).execute(Request("profile", route=RouteKind.BARE), policy=_policy(attempts=2))
     assert transport.calls == EXPECTED_RETRIED_CALLS
 
     delayed = SequenceTransport([WireResponse(status_code=503, headers=(), body=b"gateway")])
     with pytest.raises(BudgetExceededError, match="delay"):
         await Executor(delayed).execute(
-            Request("profile", replay_safety=ReplaySafety.SAFE),
+            Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             policy=_policy(delay=2, elapsed=1),
         )
     assert delayed.calls == 1
@@ -360,7 +372,7 @@ async def test_structured_throttle_uses_shared_cooldown_and_safe_replay() -> Non
     executor = Executor(transport, coordinator=coordinator)
     context = executor.context(_policy())
 
-    await executor.execute(Request("profile", replay_safety=ReplaySafety.SAFE), context=context)
+    await executor.execute(Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), context=context)
     snapshot = await context.snapshot()
 
     assert snapshot.retries == 1
@@ -371,11 +383,11 @@ async def test_structured_throttle_uses_shared_cooldown_and_safe_replay() -> Non
 @pytest.mark.asyncio
 async def test_coordinator_merges_cooldowns_and_does_not_let_retries_starve_interactive() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
-    first = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT)
+    first = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
 
-    retry_one = asyncio.create_task(coordinator.acquire(WorkClass.RETRY))
-    retry_two = asyncio.create_task(coordinator.acquire(WorkClass.RETRY))
-    interactive = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT))
+    retry_one = asyncio.create_task(coordinator.acquire(WorkClass.RETRY, methods=frozenset({"profile"})))
+    retry_two = asyncio.create_task(coordinator.acquire(WorkClass.RETRY, methods=frozenset({"profile"})))
+    interactive = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"})))
     await asyncio.sleep(0)
     await first.release()
 
@@ -393,7 +405,7 @@ async def test_coordinator_merges_cooldowns_and_does_not_let_retries_starve_inte
     snapshot = await coordinator.snapshot()
     assert snapshot.state is CoordinatorState.COOLDOWN
     assert snapshot.cooldown_reason == "latest"
-    permit = await asyncio.wait_for(coordinator.acquire(WorkClass.BATCH), timeout=1)
+    permit = await asyncio.wait_for(coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"})), timeout=1)
     await permit.release()
     assert (await coordinator.snapshot()).state is CoordinatorState.OPEN
     await coordinator.close()
@@ -402,8 +414,8 @@ async def test_coordinator_merges_cooldowns_and_does_not_let_retries_starve_inte
 @pytest.mark.asyncio
 async def test_cancelled_waiter_is_removed_without_leaking_permit() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
-    first = await coordinator.acquire(WorkClass.BATCH)
-    waiter = asyncio.create_task(coordinator.acquire(WorkClass.TRAVERSAL_DIRECT))
+    first = await coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"}))
+    waiter = asyncio.create_task(coordinator.acquire(WorkClass.TRAVERSAL_DIRECT, methods=frozenset({"profile"})))
     await asyncio.sleep(0)
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -418,8 +430,8 @@ async def test_cancelled_waiter_is_removed_without_leaking_permit() -> None:
 @pytest.mark.asyncio
 async def test_cancellation_after_grant_returns_capacity() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
-    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT)
-    waiter = asyncio.create_task(coordinator.acquire(WorkClass.TRAVERSAL_DIRECT))
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
+    waiter = asyncio.create_task(coordinator.acquire(WorkClass.TRAVERSAL_DIRECT, methods=frozenset({"profile"})))
     await asyncio.sleep(0)
 
     await held.release()
@@ -428,7 +440,10 @@ async def test_cancellation_after_grant_returns_capacity() -> None:
         await waiter
 
     assert (await coordinator.snapshot()).active_permits == 0
-    replacement = await asyncio.wait_for(coordinator.acquire(WorkClass.BATCH), timeout=1)
+    replacement = await asyncio.wait_for(
+        coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"})),
+        timeout=1,
+    )
     await replacement.release()
     await coordinator.close()
 
@@ -436,7 +451,7 @@ async def test_cancellation_after_grant_returns_capacity() -> None:
 @pytest.mark.asyncio
 async def test_permit_wait_is_bounded_without_counting_or_dispatching_an_attempt() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
-    held = await coordinator.acquire(WorkClass.BATCH)
+    held = await coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"}))
     transport = SequenceTransport([_success()])
     executor = Executor(transport, coordinator=coordinator)
     context = executor.context(
@@ -445,7 +460,7 @@ async def test_permit_wait_is_bounded_without_counting_or_dispatching_an_attempt
 
     with pytest.raises(BudgetExceededError, match="permit wait"):
         await executor.execute(
-            Request("profile", replay_safety=ReplaySafety.SAFE),
+            Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             context=context,
         )
 
@@ -456,25 +471,178 @@ async def test_permit_wait_is_bounded_without_counting_or_dispatching_an_attempt
 
 
 @pytest.mark.asyncio
+async def test_method_limit_blocks_only_affected_method_and_whole_batch() -> None:
+    coordinator = RateCoordinator(max_concurrency=1, operation_time_limit_delay=0.03)
+    await coordinator.observe_operation_time_limit("crm.item.list")
+    blocked = asyncio.create_task(
+        coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.list"})),
+    )
+    batch = asyncio.create_task(
+        coordinator.acquire(WorkClass.BATCH, methods=frozenset({"crm.item.list", "profile"})),
+    )
+    await asyncio.sleep(0)
+    unrelated = await asyncio.wait_for(
+        coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"})),
+        timeout=1,
+    )
+    assert not blocked.done()
+    assert not batch.done()
+    await unrelated.release()
+    pending = {blocked, batch}
+    while pending:
+        done, pending = await asyncio.wait(pending, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+        assert done
+        for task in done:
+            await task.result().release()
+    assert (await coordinator.snapshot()).method_cooldowns == 0
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_method_limit_admission_budget_and_closed_error_are_typed() -> None:
+    coordinator = RateCoordinator(operation_time_limit_delay=1)
+    await coordinator.observe_operation_time_limit("profile")
+    with pytest.raises(CoordinatorBudgetError):
+        await coordinator.acquire(
+            WorkClass.INTERACTIVE_DIRECT,
+            methods=frozenset({"profile"}),
+            budget=DeadlineBudget(asyncio.get_running_loop().time() + 0.01),
+        )
+    assert dict((await coordinator.snapshot()).queued)[WorkClass.INTERACTIVE_DIRECT] == 0
+    await coordinator.close()
+    with pytest.raises(CoordinatorClosedError):
+        await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
+
+
+@pytest.mark.asyncio
+async def test_unsafe_operation_time_limit_observes_method_without_replay() -> None:
+    transport = SequenceTransport(
+        [
+            WireResponse(
+                status_code=200,
+                headers=(),
+                body=b'{"error":"OPERATION_TIME_LIMIT","error_description":"wait"}',
+            ),
+        ],
+    )
+    coordinator = RateCoordinator(operation_time_limit_delay=0.1)
+    with pytest.raises(ApiResponseError):
+        await Executor(transport, coordinator=coordinator).execute(
+            Request("crm.item.add", route=RouteKind.BARE, replay_safety=ReplaySafety.UNSAFE),
+        )
+    assert transport.calls == 1
+    assert (await coordinator.snapshot()).method_cooldowns == 1
+    await coordinator.close()
+
+
+_OPERATION_TIME_LIMIT = WireResponse(
+    status_code=200,
+    headers=(),
+    body=b'{"error":"OPERATION_TIME_LIMIT","error_description":"wait"}',
+)
+_SAFE_PROFILE = Request("profile", route=RouteKind.BARE, replay_safety=ReplaySafety.SAFE)
+
+
+@pytest.mark.asyncio
+async def test_safe_operation_time_limit_past_the_budget_fails_at_once_with_its_cause() -> None:
+    transport = SequenceTransport([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
+    coordinator = RateCoordinator()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(BudgetExceededError) as captured:
+        await Executor(transport, coordinator=coordinator).execute(
+            _SAFE_PROFILE, policy=ExecutionPolicy(max_retry_elapsed_per_request=2.0)
+        )
+    # The default 120-second method cooldown cannot fit a 2-second budget, so nothing waits.
+    assert loop.time() - started < 1.0
+    assert transport.calls == 1
+    assert isinstance(captured.value.__cause__, ApiResponseError)
+    assert captured.value.__cause__.normalized_code == "operation_time_limit"
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_safe_operation_time_limit_within_the_budget_retries_after_the_cooldown() -> None:
+    cooldown = 0.2
+    transport = SequenceTransport([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
+    coordinator = RateCoordinator(operation_time_limit_delay=cooldown)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    response = await Executor(transport, coordinator=coordinator).execute(
+        _SAFE_PROFILE, policy=ExecutionPolicy(max_retry_elapsed_per_request=5.0)
+    )
+    assert response.result is True
+    assert transport.calls == len(transport.outcomes)
+    assert loop.time() - started >= cooldown * 0.9
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_safe_traversal_page_operation_time_limit_keeps_its_typed_cause() -> None:
+    from b24api import Bitrix24  # noqa: PLC0415 - facade seam for one traversal control
+
+    transport = SequenceTransport([_OPERATION_TIME_LIMIT])
+    stream = Bitrix24._from_executor(Executor(transport)).iter_list(  # noqa: SLF001 - deterministic facade seam
+        Request("crm.item.list", route=RouteKind.BARE, replay_safety=ReplaySafety.SAFE),
+        page_size=50,
+        policy=ExecutionPolicy(max_retry_elapsed_per_request=2.0),
+    )
+    with pytest.raises(BudgetExceededError) as captured:
+        _ = [row async for row in stream]
+    assert transport.calls == 1
+    assert isinstance(captured.value.__cause__, ApiResponseError)
+    assert captured.value.__cause__.normalized_code == "operation_time_limit"
+    assert stream.report is not None
+    assert not stream.report.exhausted
+
+
+@pytest.mark.asyncio
+async def test_method_limit_repeated_signal_extends_deadline_and_capacity_is_explicit() -> None:
+    now = 100.0
+    default_delay = 120.0
+
+    def clock() -> float:
+        return now
+
+    coordinator = RateCoordinator(clock=clock)
+    assert await coordinator.observe_api_throttle("profile", "OPERATION_TIME_LIMIT") == default_delay
+    now += 30.0
+    assert await coordinator.observe_api_throttle("profile", "OPERATION_TIME_LIMIT") == default_delay
+    assert await coordinator.observe_api_throttle("profile", "SOME_OTHER_ERROR") == 0.0
+    for index in range(1_023):
+        await coordinator.observe_api_throttle(f"method.{index}", "OPERATION_TIME_LIMIT")
+    with pytest.raises(RatePolicyCapacityError):
+        await coordinator.observe_api_throttle("overflow", "OPERATION_TIME_LIMIT")
+    now += 121.0
+    assert (await coordinator.snapshot()).method_cooldowns == 0
+    await coordinator.observe_api_throttle("overflow", "OPERATION_TIME_LIMIT")
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
 async def test_socket_connect_and_post_dispatch_failures_have_distinct_phases() -> None:
     server = await asyncio.start_server(lambda _reader, writer: writer.close(), "127.0.0.1", 0)
     socket = server.sockets[0]
     assert socket is not None
     host, port = socket.getsockname()[:2]
-    transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
+    transport = HttpxTransport(f"http://{host}:{port}/rest/1/token/")
     try:
         with pytest.raises(TransportError) as post_dispatch:
-            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
+            await transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024)
         assert post_dispatch.value.phase is FailurePhase.DISPATCH_STARTED
     finally:
         await transport.aclose()
         server.close()
         await server.wait_closed()
 
-    dead_transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
+    dead_transport = HttpxTransport(f"http://{host}:{port}/rest/1/token/")
     try:
         with pytest.raises(TransportError) as not_dispatched:
-            await dead_transport.send(Request("profile"), attempt_timeout=0.2, max_response_bytes=1024)
+            await dead_transport.send(
+                Request("profile", route=RouteKind.BARE),
+                attempt_timeout=0.2,
+                max_response_bytes=1024,
+            )
         assert not_dispatched.value.phase is FailurePhase.NOT_DISPATCHED
     finally:
         await dead_transport.aclose()
@@ -490,11 +658,11 @@ async def test_transport_enforces_decompressed_response_byte_ceiling_and_closes_
         return response
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
+    transport = HttpxTransport("https://example.invalid/rest/1/token/", client=client)
     try:
         with pytest.raises(ResponseTooLargeError, match="byte ceiling"):
             await transport.send(
-                Request("profile", replay_safety=ReplaySafety.SAFE),
+                Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
                 attempt_timeout=1,
                 max_response_bytes=SMALL_RESPONSE_CEILING,
             )
@@ -511,11 +679,11 @@ async def test_oversized_response_after_unknown_dispatch_is_ambiguous() -> None:
         return httpx.Response(HTTP_OK, request=request, content=b'{"result":"too large"}')
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
+    transport = HttpxTransport("https://example.invalid/rest/1/token/", client=client)
     try:
         with pytest.raises(AmbiguousExecutionError, match="oversized response"):
             await Executor(transport).execute(
-                Request("crm.deal.add", replay_safety=ReplaySafety.UNKNOWN),
+                Request("crm.deal.add", replay_safety=ReplaySafety.UNKNOWN, route=RouteKind.BARE),
                 policy=ExecutionPolicy(max_response_bytes=SMALL_RESPONSE_CEILING),
             )
     finally:
@@ -537,11 +705,11 @@ async def test_no_trace_read_failure_is_conservatively_post_dispatch_and_never_r
 
     raw_transport = NoTraceTransport()
     client = httpx.AsyncClient(transport=raw_transport)
-    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
+    transport = HttpxTransport("https://example.invalid/rest/1/token/", client=client)
     try:
         with pytest.raises(AmbiguousExecutionError) as captured:
             await Executor(transport).execute(
-                Request("crm.deal.add", replay_safety=ReplaySafety.UNSAFE),
+                Request("crm.deal.add", replay_safety=ReplaySafety.UNSAFE, route=RouteKind.BARE),
                 policy=_policy(),
             )
         assert raw_transport.calls == 1
@@ -565,10 +733,10 @@ async def test_no_trace_post_dispatch_error_classes_have_conservative_minimum_ph
             raise error_type("no trace evidence", request=request)
 
     client = httpx.AsyncClient(transport=RaisingTransport())
-    transport = HttpxTransport("https://example.invalid/test-endpoint/", client=client)
+    transport = HttpxTransport("https://example.invalid/rest/1/token/", client=client)
     try:
         with pytest.raises(TransportError) as captured:
-            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
+            await transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024)
         assert captured.value.phase is FailurePhase.DISPATCH_STARTED
         assert captured.value.possible_acceptance is True
     finally:
@@ -594,7 +762,7 @@ async def test_transport_error_drops_credentialed_httpx_exception_and_request_lo
     transport = HttpxTransport(f"https://example.invalid/rest/1/{sensitive_fragment}/", client=client)
     try:
         with pytest.raises(TransportError) as captured:
-            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
+            await transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024)
 
         error = captured.value
         assert error.__cause__ is None
@@ -620,7 +788,9 @@ async def test_transport_cancellation_drops_httpx_traceback_and_request_locals()
     blocking = CancellationTransport()
     client = httpx.AsyncClient(transport=blocking)
     transport = HttpxTransport(f"https://example.invalid/rest/1/{sensitive_fragment}/", client=client)
-    task = asyncio.create_task(transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024))
+    task = asyncio.create_task(
+        transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024),
+    )
     try:
         await blocking.entered.wait()
         task.cancel("caller cancelled")
@@ -659,10 +829,10 @@ async def test_socket_partial_body_failure_is_classified_after_headers() -> None
     socket = server.sockets[0]
     assert socket is not None
     host, port = socket.getsockname()[:2]
-    transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
+    transport = HttpxTransport(f"http://{host}:{port}/rest/1/token/")
     try:
         with pytest.raises(TransportError) as captured:
-            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
+            await transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024)
         assert captured.value.phase is FailurePhase.BODY_PARTIALLY_RECEIVED
         assert captured.value.possible_acceptance is True
     finally:
@@ -689,7 +859,7 @@ async def test_out_of_range_socket_status_is_typed_and_drops_webhook_locals() ->
     transport = HttpxTransport(f"http://{host}:{port}/rest/1/{sensitive_fragment}/")
     try:
         with pytest.raises(ProtocolError, match="outside the valid range") as captured:
-            await transport.send(Request("profile"), attempt_timeout=1, max_response_bytes=1024)
+            await transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024)
 
         error = captured.value
         assert error.__cause__ is None
@@ -722,12 +892,12 @@ async def test_socket_cancellation_propagates_and_counts_dispatched_attempt() ->
     socket = server.sockets[0]
     assert socket is not None
     host, port = socket.getsockname()[:2]
-    transport = HttpxTransport(f"http://{host}:{port}/test-endpoint/")
+    transport = HttpxTransport(f"http://{host}:{port}/rest/1/token/")
     executor = Executor(transport)
     context = executor.context(_policy())
     task = asyncio.create_task(
         executor.execute(
-            Request("profile", replay_safety=ReplaySafety.SAFE),
+            Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             context=context,
         ),
     )
@@ -747,12 +917,12 @@ async def test_socket_cancellation_propagates_and_counts_dispatched_attempt() ->
 @pytest.mark.asyncio
 async def test_negative_one_total_sentinel_is_preserved_but_lower_values_are_typed_errors() -> None:
     sentinel = SequenceTransport([_success(b'{"result":[],"total":-1}')])
-    response = await Executor(sentinel).execute(Request("im.recent.list"), policy=_policy())
+    response = await Executor(sentinel).execute(Request("im.recent.list", route=RouteKind.BARE), policy=_policy())
     assert response.total == -1
 
     invalid = SequenceTransport([_success(b'{"result":[],"total":-2}')])
     with pytest.raises(HTTPGatewayError) as captured:
-        await Executor(invalid).execute(Request("profile"), policy=_policy())
+        await Executor(invalid).execute(Request("profile", route=RouteKind.BARE), policy=_policy())
     assert captured.value.http_status == HTTP_OK
 
 
@@ -768,7 +938,7 @@ async def test_success_model_contract_failures_are_typed_and_keep_http_evidence(
     transport = SequenceTransport([_success(body)])
 
     with pytest.raises(ProtocolError) as captured:
-        await Executor(transport).execute(Request("profile"), policy=_policy())
+        await Executor(transport).execute(Request("profile", route=RouteKind.BARE), policy=_policy())
 
     assert captured.value.http_status == HTTP_OK
     assert captured.value.request_summary is not None

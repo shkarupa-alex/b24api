@@ -20,6 +20,7 @@ from b24api import (
     Request,
     TotalHintMode,
 )
+from b24api.contracts.request import RouteKind
 from tools import b24api_keyset_admission as harness
 from tools.b24api_evidence.keyset_admission import LIVE_ATTEMPT_WINDOWS, _current_candidate_sha
 
@@ -67,7 +68,7 @@ async def test_fixture_latency_is_paid_inside_the_measured_transport(monkeypatch
     portal = harness.FixturePortal((1, 2, 3))
 
     await portal.send(
-        Request("fixture.list", replay_safety=ReplaySafety.SAFE),
+        Request("fixture.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         attempt_timeout=1.0,
         max_response_bytes=1_000,
     )

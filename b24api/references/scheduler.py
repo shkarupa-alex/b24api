@@ -3,12 +3,17 @@
 from __future__ import annotations
 import asyncio
 from dataclasses import replace
+from inspect import isawaitable
 from typing import TYPE_CHECKING, cast
 
+from b24api.completion.reference_recorder import ReferenceCompletionRecorder
+from b24api.contracts.completion import BindingClosure, CommandSettlement
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
+from b24api.contracts.page_stop import CallerStop, ContinuePage, PageBoundary, PageStopPolicy
 from b24api.contracts.report import PageDispatch, PageRecord, Violation, ViolationSeverity, retain_page_trace
 from b24api.contracts.request import ReplaySafety, Request, ResultSelector, TraversalIdentity
-from b24api.errors import BudgetExceededError, CapabilityError
+from b24api.contracts.violation import retain_violations
+from b24api.errors import AmbiguousExecutionError, ApiResponseError, BudgetExceededError, CapabilityError
 from b24api.execution import (
     AsyncIteratorController,
     Executor,
@@ -42,9 +47,12 @@ from b24api.references.outcome import (
 )
 from b24api.references.support import (
     _active_limit,
+    _finish_done_completion,
     _finish_task,
     _iterate_references,
+    _new_page_records,
     _page_cap,
+    _record_cleanup_failure,
     _wait_for_admission,
     _wait_for_cleanup_tasks,
     _wait_for_event,
@@ -88,6 +96,7 @@ class ReferenceScheduler:
         capture_fail_fast: bool = False,
         page_cap_hint: int | None = None,
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+        page_stop: PageStopPolicy | None = None,
     ) -> None:
         """Initialize instance state."""
         self.executor = executor
@@ -102,6 +111,9 @@ class ReferenceScheduler:
         self.emit_response = emit_response
         self.capture_fail_fast = capture_fail_fast
         self.page_adapter = page_adapter
+        self.page_stop = page_stop
+        self.stopped_bindings = 0
+        self.completion = ReferenceCompletionRecorder()
         self.context = executor.context(policy)
         self.page_cap = _page_cap(
             plan,
@@ -180,13 +192,13 @@ class ReferenceScheduler:
             if cleanup.error is not None:
                 cleanup_error = cleanup.error
                 if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                    self._record_cleanup_failure(cleanup_error)
+                    _record_cleanup_failure(self.violations, cleanup_error)
                     pending = cleanup.cancellation
                     if pending is None and isinstance(primary_error, asyncio.CancelledError):
                         pending = primary_error
                     rearm_cancellation(pending)
                     raise cleanup_error
-                self._record_cleanup_failure(cleanup_error)
+                _record_cleanup_failure(self.violations, cleanup_error)
                 if isinstance(cleanup_error, asyncio.CancelledError):
                     pending_cancellation = cleanup_error
                 if cleanup.cancellation is not None:
@@ -197,7 +209,7 @@ class ReferenceScheduler:
                 primary_error,
                 asyncio.CancelledError | GeneratorExit,
             ):
-                self._record_cleanup_failure(cleanup.cancellation)
+                _record_cleanup_failure(self.violations, cleanup.cancellation)
                 pending_cancellation = cleanup.cancellation
             if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
                 rearm_cancellation(pending_cancellation)
@@ -282,6 +294,7 @@ class ReferenceScheduler:
                     admission.slots.release()
                     raise TypeError("reference source must yield ReferenceRequest values")
                 work = _Work(next_index, reference)
+                self.completion.admit(next_index)
                 next_index += 1
                 queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue(maxsize=1)
                 admission.queues[work.index] = queue
@@ -301,12 +314,13 @@ class ReferenceScheduler:
             self.producer_state.touch()
             admission.changed.set()
 
-    async def _run_reference(  # noqa: C901, PLR0915 - owns the per-reference transaction boundary
+    async def _run_reference(  # noqa: C901, PLR0912, PLR0915 - owns the per-reference transaction boundary
         self,
         work: _Work,
         output: asyncio.Queue[_Event],
     ) -> None:
         producer_key = f"r{work.index}"
+        completion = self.completion.binding(work.index)
         self.producer_state.runnable.add(producer_key)
         self.producer_state.indexes[producer_key] = work.index
         self.producer_state.touch()
@@ -317,6 +331,7 @@ class ReferenceScheduler:
         violation_offset = 0
         trace_offset = 0
         scheduled_sequences: list[int] = []
+        stopped_reason: str | None = None
         page_admission: asyncio.Future[None] | None = None
         settlement: asyncio.Future[None] | None = None
 
@@ -340,12 +355,26 @@ class ReferenceScheduler:
             sequence = self._next_page_sequence
             self._next_page_sequence += 1
             scheduled_sequences.append(sequence)
+            completion.scheduled()
             try:
                 reservation = await self.buffer.reserve(work.index, self.page_cap)
                 dispatched: _DispatchedPage = await self.dispatcher.fetch(request, f"r{work.index}")
                 page_admission = dispatched.admission
                 settlement = dispatched.settlement
             except BaseException as error:
+                completion.settled(
+                    CommandSettlement.UNKNOWN
+                    if isinstance(error, _BatchPageError)
+                    and isinstance(
+                        error.failure.error,
+                        AmbiguousExecutionError,
+                    )
+                    else CommandSettlement.FAILURE
+                    if isinstance(error, _BatchPageError | ApiResponseError)
+                    else CommandSettlement.UNKNOWN
+                    if bool(getattr(error, "_b24api_dispatch_started", False))
+                    else CommandSettlement.NOT_EXECUTED,
+                )
                 self.producer_state.admitting.discard(producer_key)
                 self.producer_state.touch()
                 if reservation is not None:
@@ -372,6 +401,7 @@ class ReferenceScheduler:
                 dispatch=dispatched.dispatch,
                 batch_index=dispatched.batch_index,
             )
+            completion.settled(CommandSettlement.SUCCESS)
             page_state += 1
             return dispatched.response
 
@@ -387,9 +417,11 @@ class ReferenceScheduler:
             page_cap_hint=self.page_cap,
             page_adapter=self.page_adapter,
             initial_cursor=work.reference.initial_cursor,
+            completion_recorder=completion,
         )
+        pages = driver.pages()
         try:
-            async for page in driver.pages():
+            async for page in pages:
                 if reservation is None:
                     raise RuntimeError("page completed without a buffer reservation")  # noqa: TRY301
                 await self.buffer.accept(reservation, page.retained_rows)
@@ -406,6 +438,11 @@ class ReferenceScheduler:
                     self.producer_state.touch()
                 page_violations = tuple(driver.violations[violation_offset:])
                 violation_offset = len(driver.violations)
+                page_records = self._annotate_page_records(
+                    work,
+                    _new_page_records(driver, trace_offset),
+                    scheduled_sequences,
+                )
                 await output.put(
                     _PageEvent(
                         work,
@@ -414,11 +451,7 @@ class ReferenceScheduler:
                         page.item_weights,
                         driver.last_page_unique_mask,
                         page_violations,
-                        self._annotate_page_records(
-                            work,
-                            self._new_page_records(driver, trace_offset),
-                            scheduled_sequences,
-                        ),
+                        page_records,
                         reservation,
                         acknowledged,
                     ),
@@ -428,11 +461,25 @@ class ReferenceScheduler:
                 if self.output_order is ReferenceOutputOrder.READY:
                     settle_page()
                 self.producer_state.pending_continuations.discard(producer_key)
+                partial_rows += len(page.items)
+                reservation = None
+                if self.page_stop is not None:
+                    if len(page_records) != 1:
+                        raise RuntimeError("validated reference page lacks completion provenance")  # noqa: TRY301
+                    decision = self.page_stop.on_page(PageBoundary(work.index, page_records[0], tuple(page.items)))
+                    if isawaitable(decision):
+                        decision = await decision
+                    if not isinstance(decision, ContinuePage | CallerStop):
+                        raise TypeError("reference page stop policy returned an invalid decision")  # noqa: TRY301
+                    if isinstance(decision, CallerStop) and page.continuing:
+                        stopped_reason = decision.reason
+                        self.stopped_bindings += 1
+                        completion.acknowledged()
+                        break
+                completion.acknowledged()
                 if page.continuing:
                     self.producer_state.runnable.add(producer_key)
                     self.producer_state.touch()
-                partial_rows += len(page.items)
-                reservation = None
             if reservation is not None:
                 await self.buffer.abort(reservation)
                 reservation = None
@@ -443,9 +490,12 @@ class ReferenceScheduler:
                     tuple(driver.violations[violation_offset:]),
                     self._annotate_page_records(
                         work,
-                        self._new_page_records(driver, trace_offset),
+                        _new_page_records(driver, trace_offset),
                         scheduled_sequences,
                     ),
+                    stopped_reason,
+                    driver.terminal_reason,
+                    driver._expected_total,  # noqa: SLF001 - source driver owns qualified-total witness
                 ),
             )
         except asyncio.CancelledError:
@@ -461,7 +511,7 @@ class ReferenceScheduler:
                     tuple(driver.violations[violation_offset:]),
                     self._annotate_page_records(
                         work,
-                        self._new_page_records(driver, trace_offset),
+                        _new_page_records(driver, trace_offset),
                         scheduled_sequences,
                     ),
                     error.failure.replay_disposition,
@@ -478,12 +528,13 @@ class ReferenceScheduler:
                     tuple(driver.violations[violation_offset:]),
                     self._annotate_page_records(
                         work,
-                        self._new_page_records(driver, trace_offset),
+                        _new_page_records(driver, trace_offset),
                         scheduled_sequences,
                     ),
                 ),
             )
         finally:
+            await pages.aclose()
             admit_page()
             settle_page()
             self.producer_state.runnable.discard(producer_key)
@@ -555,19 +606,11 @@ class ReferenceScheduler:
         await producer
 
     def _record_event_violations(self, event: _Event) -> None:
-        self.violations.extend(event.violations)
+        self.violations = list(retain_violations((*self.violations, *event.violations)))
         combined = tuple(sorted((*self.page_trace, *event.page_records), key=lambda record: record.sequence))
         retained, truncated = retain_page_trace(combined, self.context.policy.page_trace_limit)
         self.page_trace[:] = retained
         self.page_trace_truncated = self.page_trace_truncated or truncated
-
-    @staticmethod
-    def _new_page_records(driver: PaginationDriver, previous_count: int) -> tuple[PageRecord, ...]:
-        if driver.page_trace_count == previous_count:
-            return ()
-        if driver.page_trace_count != previous_count + 1 or driver.last_page_record is None:
-            raise RuntimeError("one logical fetch must produce at most one page record")
-        return (driver.last_page_record,)
 
     @staticmethod
     def _annotate_page_records(
@@ -584,15 +627,6 @@ class ReferenceScheduler:
             for record in records
         )
 
-    def _record_cleanup_failure(self, error: BaseException) -> None:
-        self.violations.append(
-            Violation(
-                severity=ViolationSeverity.BLOCKING,
-                code="cleanup_failure",
-                message=f"reference cleanup also failed ({type(error).__name__})",
-            ),
-        )
-
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
         if isinstance(event, _PageEvent):
             try:
@@ -600,6 +634,7 @@ class ReferenceScheduler:
                     yield _KernelFanOutSuccess(event.work.index, event.work.reference, event.response)
                     for weight in event.item_weights:
                         await self.buffer.release(event.reservation, weight)
+                    self.completion.binding(event.work.index).delivered()
                     return
                 for item, weight, is_unique in zip(
                     event.items,
@@ -615,15 +650,26 @@ class ReferenceScheduler:
                     self._delivery_uniqueness[id(outcome)] = (outcome, is_unique)
                     yield outcome
                     await self.buffer.release(event.reservation, weight)
+                self.completion.binding(event.work.index).delivered()
             finally:
                 if not event.acknowledged.done():
                     event.acknowledged.set_result(None)
             return
         if isinstance(event, _DoneEvent):
+            _finish_done_completion(self.completion, event)
             if self.emit_complete:
-                yield _KernelReferenceComplete(event.work.index, event.work.reference, event.row_count)
+                yield _KernelReferenceComplete(
+                    event.work.index,
+                    event.work.reference,
+                    event.row_count,
+                    event.stopped_reason,
+                )
             return
         request = event.work.reference.request
+        self.completion.terminal(
+            event.work.index,
+            BindingClosure.UNKNOWN if self.completion.binding(event.work.index).unknown else BindingClosure.FAILURE,
+        )
         failure = ReferenceFailure(
             event.work.reference.reference_key,
             request,
@@ -640,13 +686,13 @@ class ReferenceScheduler:
             if self.capture_fail_fast:
                 raise _ReferenceWindowError(failure)
             raise event.error
-        self.violations.append(
-            Violation(
-                severity=ViolationSeverity.WARNING,
-                code="reference_failure",
-                message="one reference produced a typed failure outcome",
-            ),
+        violation = Violation(
+            ViolationSeverity.WARNING,
+            "reference_failure",
+            "one reference produced a typed failure outcome",
+            replay_disposition=event.replay_disposition,
         )
+        self.violations[:] = retain_violations((*self.violations, violation))
         yield failure
 
     def record_delivery(self, item: ReferenceItem) -> bool:

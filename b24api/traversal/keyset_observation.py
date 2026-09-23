@@ -227,6 +227,8 @@ async def close_scheduler(scheduler: KeysetFastScheduler) -> None:
         raise RuntimeError("fast scheduler buffer balance survived cleanup")
     for retained in (
         scheduler.transactions.pending,
+        scheduler._pending_owners,
+        scheduler._offered_owners,
         scheduler.transactions.lane_rows,
         scheduler.transactions.lane_identities,
         scheduler.transactions.lane_commands,

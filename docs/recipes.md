@@ -1,5 +1,9 @@
 # Endpoint recipes for b24api 2.x
 
+The complete executable scenario index is in [examples/README.md](../examples/README.md). It links
+the 19 frozen public-API recipes to their independent offline oracles and records the evidence
+boundary for the separate opt-in live fixtures.
+
 The runtime remains method-agnostic. These recipes are caller-owned configurations for endpoint
 contracts that have been verified separately; revalidate them against the portal and filter used by
 your application.
@@ -11,10 +15,11 @@ width instead of the number of decoded rows. If `total` is stable and exact for 
 snapshot, qualify it explicitly:
 
 ```python
+from b24api import RouteKind
 from b24api import OffsetContinuation, OffsetSpec, ReplaySafety, Request, TotalTermination
 
 stream = client.iter_list(
-    Request("log.blogpost.get", replay_safety=ReplaySafety.SAFE),
+    Request("log.blogpost.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     page_size=50,
     offset=OffsetSpec(
         continuation=OffsetContinuation.FIXED_STEP,
@@ -24,8 +29,25 @@ stream = client.iter_list(
 )
 ```
 
-For endpoints with drifting or known-inexact totals, omit `total_termination`. The client then
-requires a confirming empty page and treats `next` as non-canonical.
+Without `EXACT_QUALIFIED` a fixed step has no closure witness after a short page. The client
+treats `next` as non-canonical and completes, with `mechanics_only` assurance (`identity_exact` when
+an `IdentitySpec` is declared), only when every page is a full step and a confirming empty page follows. After a short page it fails closed with
+`IncompleteTraversalError` whose cause is `PaginationError("fixed-step traversal cannot prove closure
+after a short page")`, whether the next window is empty or not: under a rounded server stride a short
+page does not distinguish the end of the source from a skipped or repeated window. Rows already
+yielded stay yielded; the report is not exhausted.
+
+For endpoints with drifting or known-inexact totals, choose a contract that can prove closure:
+
+- qualify an exact total for a stable filter and snapshot (`TotalTermination.EXACT_QUALIFIED`);
+- if the endpoint advances by the rows it returned, use `OffsetContinuation.OBSERVED_COUNT`, where an
+  empty page after a short page is an ordinary terminal witness;
+- for a page-number control, use `OffsetSpec(page_index=PageIndex(...))`, which accepts a short page
+  followed by an empty page as closure;
+- for a sparse selected result with a qualified raw extent, use `SparseRawBound` with `iter_list`
+  from offset zero; reference traversal refuses it.
+
+Scenario 17 in [examples](../examples/README.md) shows the fail-closed outcome.
 
 ## Split keyset ordering
 
@@ -52,6 +74,8 @@ the first pull completes the planning barrier before yielding rows.
 
 <!-- tested: tests/keyset_fast_test.py::test_explicit_modes_match_sparse_ordered_oracle -->
 ```python
+import os
+
 from b24api import (
     IdentityCoercion,
     IdentitySpec,
@@ -68,25 +92,23 @@ keyset = KeysetSpec(
     order_path=ParameterPath(("order",)),
 )
 
+if os.environ.get("ENV") != "PROD":
+    # Accepting an ID filter does not prove strict bounds or ordering.
+    await client.verify_keyset_capability(
+        request,
+        selector=ResultSelector.root(),
+        identity=identity,
+        page_size=50,
+        keyset=keyset,
+    )
+
 stream = client.iter_list_keyset(
     request,
     selector=ResultSelector.root(),
     identity=identity,
+    page_size=50,
     keyset=keyset,
     execution=RangeKeysetExecution(contract=StableIntegerKeysetContract()),
-)
-```
-
-Run the explicit development guard before relying on strict bounds:
-
-```python
-from b24api import ResultSelector
-
-report = await client.verify_keyset_capability(
-    request,
-    selector=ResultSelector.root(),
-    identity=identity,
-    keyset=keyset,
 )
 ```
 
@@ -161,20 +183,23 @@ Composite identities are intentionally unavailable for keyset and cursor travers
 ## Form bodies, scoped headers, and binary responses
 
 ```python
+from b24api import RouteKind
 from b24api import BodyEncoding, Request, RequestHeaders
 
 form_request = Request(
     "socialnetwork.workgroup.creategroup",
     {"groupName": "Example", "viewMode": "closed", "avatarColor": "29AD49"},
     encoding=BodyEncoding.FORM_URLENCODED,
+    route=RouteKind.BARE,
 )
 
 header_request = Request(
     "baas.serverport.lead.verificationack",
     headers=RequestHeaders({"X-Domain-Ack": "caller-owned-value"}),
+    route=RouteKind.BARE,
 )
 
-download = await client.call_bytes(Request("crm.item.import.downloadexample"))
+download = await client.call_bytes(Request("crm.item.import.downloadexample", route=RouteKind.BARE))
 write_file(download.body, media_type=download.content_type)
 ```
 

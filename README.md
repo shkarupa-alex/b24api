@@ -17,10 +17,10 @@ work so its HTTP/2 connection pool and rate state are reused.
 
 <!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
 ```python
-from b24api import Bitrix24, Request
+from b24api import Bitrix24, Request, RouteKind
 
 async with Bitrix24() as client:
-    profile = await client.call(Request("profile"))
+    profile = await client.call(Request("profile", route=RouteKind.BARE))
 ```
 
 The client owns its default transport. An injected transport remains caller-owned. `aclose()` is
@@ -36,15 +36,17 @@ The operation is explicit and never hides malformed JSON by falling back to byte
 
 <!-- tested: tests/client_findings_3_test.py::test_binary_call_returns_every_success_byte_without_json_sniffing -->
 ```python
-archive = await client.call_bytes(Request("example.export.download", replay_safety=ReplaySafety.SAFE))
+from b24api import RouteKind
+archive = await client.call_bytes(Request("example.export.download", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
 payload = archive.body
 ```
 
 <!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
 ```python
+from b24api import RouteKind
 from b24api import ReplaySafety
 
-request = Request("example.item.get", {"id": 7}, ReplaySafety.SAFE)
+request = Request("example.item.get", {"id": 7}, ReplaySafety.SAFE, route=RouteKind.BARE)
 decoded = await client.call(request)
 response = await client.call_response(request)
 ```
@@ -85,11 +87,12 @@ matching a result to the object, file, chat or database row that produced its re
 
 <!-- tested: tests/client_v2_test.py::test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_off_wire -->
 ```python
+from b24api import RouteKind
 from b24api import Command, CommandSuccess
 
 commands = (
     Command(
-        Request("example.item.get", {"id": item_id}, ReplaySafety.SAFE),
+        Request("example.item.get", {"id": item_id}, ReplaySafety.SAFE, route=RouteKind.BARE),
         correlation=item_id,
     )
     for item_id in source_ids
@@ -154,6 +157,7 @@ control this strategy's completion. Exact database implementation is endpoint-sp
 
 <!-- tested: tests/client_v2_test.py::test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup -->
 ```python
+from b24api import RouteKind
 from b24api import IdentityCoercion, IdentitySpec, ResultSelector
 
 identity = IdentitySpec(
@@ -164,7 +168,7 @@ identity = IdentitySpec(
 )
 
 stream = client.iter_list(
-    Request("example.item.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     selector=ResultSelector(("items",)),
     identity=identity,
 )
@@ -182,10 +186,11 @@ sequence and records that degradation in the operation report.
 
 <!-- tested: tests/client_findings_3_test.py::test_shape_rejection_is_retained_as_zero_admission_page_evidence -->
 ```python
+from b24api import RouteKind
 from b24api import ResultCollectionShape
 
 stream = client.iter_list(
-    Request("example.dictionary.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.dictionary.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     selector=ResultSelector(("items",)),
     collection_shape=ResultCollectionShape.MAPPING_VALUES,
 )
@@ -202,8 +207,9 @@ bounded physical batches.
 
 <!-- tested: tests/client_v2_test.py::test_counted_traversal_preserves_frozen_request_shape_and_exact_identity -->
 ```python
+from b24api import RouteKind
 stream = client.iter_list_counted(
-    Request("example.item.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     selector=ResultSelector(("items",)),
     identity=identity,
     page_size=50,
@@ -245,6 +251,9 @@ representative fixture. It performs five strict-bound checks and returns only a 
 unsupported and inconclusive verdicts raise `KeysetCapabilityError`. The ordinary
 `iter_list_keyset()` remains a separate caller-asserted operation with zero verifier canaries and
 may emit a partial prefix before a late endpoint contradiction is detected.
+Keep the guard beside the traversal, for example under
+`if os.environ.get("ENV") != "PROD":`; set `ENV=PROD` only after qualifying the exact portal,
+credentials, method, request/filter, identity, ordering representation, and page cap.
 
 Every list operation also accepts an immutable `PageAdapter` strategy. The adapter synchronously
 maps selected frozen items using sibling result metadata while preserving cardinality, order and
@@ -257,16 +266,33 @@ record the selected strategy and reason: unbounded auto continuation has the sam
 
 <!-- tested: tests/keyset_fast_test.py::test_omitted_execution_defaults_to_auto -->
 ```python
-from b24api import KeysetSpec, ParameterPath
+import os
+
+from b24api import KeysetSpec, ParameterPath, ReplaySafety, Request, ResultSelector, RouteKind
+
+request = Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+selector = ResultSelector(("items",))
+keyset = KeysetSpec(
+    filter_path=ParameterPath(("filter",)),
+    order_path=ParameterPath(("order",)),
+)
+
+if os.environ.get("ENV") != "PROD":
+    # Accepting an ID filter does not prove strict bounds or ordering.
+    await client.verify_keyset_capability(
+        request,
+        selector=selector,
+        identity=identity,
+        page_size=50,
+        keyset=keyset,
+    )
 
 stream = client.iter_list_keyset(
-    Request("example.item.list", replay_safety=ReplaySafety.SAFE),
-    selector=ResultSelector(("items",)),
+    request,
+    selector=selector,
     identity=identity,
-    keyset=KeysetSpec(
-        filter_path=ParameterPath(("filter",)),
-        order_path=ParameterPath(("order",)),
-    ),
+    page_size=50,
+    keyset=keyset,
 )
 ```
 
@@ -277,10 +303,11 @@ message-list methods.
 
 <!-- tested: tests/client_v2_test.py::test_keyset_and_cursor_are_explicit_strict_alternatives -->
 ```python
+from b24api import RouteKind
 from b24api import CursorSpec, ParameterPath
 
 stream = client.iter_list_cursor(
-    Request("example.message.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.message.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     selector=ResultSelector(("items",)),
     cursor=CursorSpec(
         parameter_path=ParameterPath(("LAST_ID",)),
@@ -314,6 +341,7 @@ caller-defined parent.
 
 <!-- tested: tests/client_v2_test.py::test_bound_references_apply_nested_updates_off_wire_and_emit_exact_completion -->
 ```python
+from b24api import RouteKind
 from b24api import (
     BatchDispatch,
     Binding,
@@ -334,7 +362,7 @@ bindings = (
 )
 
 stream = client.iter_references(
-    Request("example.comment.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.comment.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     bindings,
     traversal=SequentialTraversal(selector=ResultSelector(("items",)), identity=identity),
     dispatch=BatchDispatch(batch_size=25, concurrency=2),
@@ -354,6 +382,7 @@ under different parents are not conflated.
 
 <!-- tested: tests/client_v2_test.py::test_bound_references_apply_nested_updates_off_wire_and_emit_exact_completion -->
 ```python
+from b24api import RouteKind
 from b24api import (
     Binding,
     CursorSpec,
@@ -375,7 +404,7 @@ chat_bindings = (
 )
 
 messages = client.iter_references(
-    Request("example.message.list", replay_safety=ReplaySafety.SAFE),
+    Request("example.message.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
     chat_bindings,
     traversal=CursorTraversal(
         selector=ResultSelector(("items",)),
@@ -418,13 +447,19 @@ and publish the same final report where the Python exception type permits it.
 ## Resource boundaries
 
 `ExecutionPolicy` bounds requests, pages, elapsed time, attempts, decompressed response bytes,
-buffered commands and rows, direct concurrency and active references. The default response ceiling
-is 16 MiB and is enforced while streaming, before JSON decoding.
+buffered commands and rows, retained unordered identity keys, direct concurrency and active
+references. The default response ceiling is 16 MiB and is enforced while streaming, before JSON
+decoding.
 
-Sequential and counted exact traversal retain observed identities in memory. There is no database,
-spill file or identity-count refusal. Crossing 100,000 distinct identities emits one
-`RuntimeWarning`; exact tracking continues. Strict keyset and cursor traversal retain only
-monotonic progression state when sufficient.
+Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
+observed identities per operation in memory (100,000 by default). All active reference bindings
+share that ceiling. A page that would exceed it is rejected atomically with typed budget evidence.
+Set a larger finite ceiling when the expected aggregate cardinality is known, or pass
+`identity_store=` to `iter_list`/`iter_list_counted` so a caller-owned `IdentityStore` (for example a
+SQLite table keyed by `identity_store_key(...)`) proves uniqueness while in-process identity memory
+stays bounded by one page; the client never closes that store. Repeated-page detection still keeps
+one short fingerprint per page, so raise `max_pages` deliberately for very long traversals.
+Strict keyset and cursor traversal retain only monotonic progression state when sufficient.
 
 ## CLI
 
@@ -433,10 +468,10 @@ errors go to stderr. Credentials come only from `Settings` and cannot be passed 
 
 <!-- tested-console: tests/cli_test.py::test_call_routes_replay_safety_and_keeps_success_data_on_stdout -->
 ```console
-b24api call profile
-b24api call example.item.get --params '{"id":7}' --raw --replay-safety safe
-b24api list example.item.list --params @params.json
-b24api list example.item.list --strategy counted --contract @counted-contract.json
+b24api call profile --route bare
+b24api call example.item.get --route bare --params '{"id":7}' --raw --replay-safety safe
+b24api list example.item.list --route bare --params @params.json
+b24api list example.item.list --route bare --strategy counted --contract @counted-contract.json
 ```
 
 The `--raw` CLI option selects the response envelope; it does not alter the Python API. Advanced

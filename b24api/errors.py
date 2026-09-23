@@ -1,12 +1,13 @@
 """Redacted Bitrix24 error hierarchy."""
 
 from __future__ import annotations
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from b24api._error_types import ErrorOrigin, FailurePhase
 from b24api.contracts.keyset_capability import KeysetCapabilityReport, KeysetCapabilityVerdict, KeysetInconclusiveReason
-from b24api.contracts.policy import AmbiguityReason, IdentityCoercion
+from b24api.contracts.policy import AmbiguityReason, IdentityCoercion, ReplayDisposition
 from b24api.contracts.response import ResponseEvidence, ResultCollectionShape
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
@@ -125,6 +126,14 @@ class ProtocolError(B24ApiError):
     default_origin = ErrorOrigin.PROTOCOL
 
 
+@dataclass(frozen=True, slots=True)
+class ValidationIssue:
+    """One redacted V3 validation location and message."""
+
+    field: str
+    message: str
+
+
 class ApiResponseError(B24ApiError):
     """Structured Bitrix REST error with committed `.code` semantics."""
 
@@ -137,6 +146,9 @@ class ApiResponseError(B24ApiError):
         http_status: int | None = None,
         headers: Mapping[str, str] | None = None,
         body_preview: str | None = None,
+        validation: tuple[ValidationIssue, ...] = (),
+        truncated: bool = False,
+        code_is_exact: bool = False,
         origin: ErrorOrigin = ErrorOrigin.REST_MODULE,
         retryable: bool = False,
         redactor: Redactor = DEFAULT_REDACTOR,
@@ -144,8 +156,10 @@ class ApiResponseError(B24ApiError):
         """Initialize instance state."""
         self.original_code = code
         self.code = str(code).lower()
-        self.normalized_code = str(code).strip().casefold()
+        self.normalized_code = str(code) if code_is_exact else str(code).strip().casefold()
         self.wire_code = redactor.redact_text(str(code))
+        self.validation = tuple(validation)
+        self.truncated = truncated
         summary = request_summary
         safe_description = redactor.redact_text(description) if description is not None else None
         rendered_code = self.wire_code
@@ -187,6 +201,8 @@ class ApiResponseError(B24ApiError):
                 "code": DEFAULT_REDACTOR.redact_text(self.code),
                 "normalized_code": DEFAULT_REDACTOR.redact_text(self.normalized_code),
                 "wire_code": self.wire_code,
+                "validation": [{"field": issue.field, "message": issue.message} for issue in self.validation],
+                "truncated": self.truncated,
             },
         )
         return safe
@@ -454,9 +470,21 @@ class AmbiguousExecutionError(B24ApiError):
 class IncompleteTraversalError(B24ApiError):
     """Traversal ended without complete terminal evidence."""
 
-    def __init__(self, *, report: object) -> None:
+    def __init__(
+        self,
+        *,
+        report: object,
+        error: B24ApiError | None = None,
+        replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE,
+    ) -> None:
         """Initialize instance state."""
+        if not isinstance(replay_disposition, ReplayDisposition):
+            raise TypeError("replay_disposition must be a ReplayDisposition")
+        if error is not None and not isinstance(error, B24ApiError):
+            raise TypeError("error must be a B24ApiError or None")
         self.report = report
+        self.error = error
+        self.replay_disposition = replay_disposition
         super().__init__("Traversal did not complete", origin=ErrorOrigin.PAGINATION)
 
     def __str__(self) -> str:
@@ -470,6 +498,17 @@ class IncompleteTraversalError(B24ApiError):
         if blocking is not None:
             message += f" [{blocking.code}] {blocking.message}"
         return message
+
+    def to_safe_dict(self) -> dict[str, object]:
+        """Expose the retained cause and replay decision without diagnostic I/O."""
+        safe = super().to_safe_dict()
+        safe.update(
+            {
+                "cause": self.error.to_safe_dict() if self.error is not None else None,
+                "replay_disposition": self.replay_disposition.value,
+            },
+        )
+        return safe
 
 
 class InputSourceError(B24ApiError):
@@ -503,5 +542,6 @@ _PUBLIC_ERROR_NAMES = (
     "CapabilityError EnvelopeContractError ErrorOrigin FailurePhase HTTPGatewayError IdentityContractError "
     "IncompleteTraversalError InputSourceError PaginationError ProtocolError ReferenceFailed ResponseTooLargeError "
     "KeysetCapabilityError PageAdaptationError PageAdaptationViolation ResultShapeError TransportError"
+    " ValidationIssue"
 )
 __all__ = tuple(_PUBLIC_ERROR_NAMES.split())

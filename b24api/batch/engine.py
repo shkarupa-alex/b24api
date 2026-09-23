@@ -17,7 +17,7 @@ from b24api.contracts.policy import (
     ExecutionPolicy,
     ReplayDisposition,
 )
-from b24api.contracts.request import ReplaySafety, Request
+from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.contracts.response import Response
 from b24api.encoding import encode_php_query
 from b24api.errors import B24ApiError, BatchCommandError, CapabilityError, ProtocolError
@@ -35,6 +35,10 @@ if TYPE_CHECKING:
 
 _MISSING = object()
 _SYNC_EXHAUSTED = object()
+
+
+class _BatchNotExecutedError(ProtocolError):
+    """Internal correlated marker for a fail-fast window stopped before dispatch."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,12 +119,24 @@ class BatchExecutor:
         strict_envelope: bool = False,
         strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
-        rejected: dict[int, BatchOutcome] = {}
-        eligible = commands
-        if not halt:
-            eligible, rejected = _partition_capabilities(commands)
-            if not eligible:
-                return tuple(rejected[command.index] for command in commands)
+        eligible, rejected = _partition_capabilities(commands)
+        if halt and rejected:
+            first_rejected = next(command.index for command in commands if command.index in rejected)
+            return tuple(
+                rejected[command.index]
+                if command.index == first_rejected
+                else _command_failure(
+                    command,
+                    _BatchNotExecutedError(
+                        "physical batch command was not executed after fail-fast capability rejection",
+                        request_summary=command.request.summary,
+                    ),
+                    evidence=BatchCommandEvidence(command.index, command.stable_key),
+                )
+                for command in commands
+            )
+        if not eligible:
+            return tuple(rejected[command.index] for command in commands)
         request = _batch_request(eligible, halt=halt)
         try:
             response = await self.executor.execute(
@@ -128,6 +144,7 @@ class BatchExecutor:
                 context=context,
                 work_class=WorkClass.BATCH,
                 strict_json_members=strict_json_members,
+                _admission_methods=frozenset(command.request.method for command in eligible),
             )
             envelope = _decode_batch_envelope(
                 response.result,
@@ -161,7 +178,30 @@ class BatchExecutor:
             )
             for command in eligible
         )
+        for command, outcome in zip(eligible, outcomes, strict=True):
+            if (
+                isinstance(outcome, BatchFailure)
+                and isinstance(outcome.error, BatchCommandError)
+                and outcome.error.normalized_code == "operation_time_limit"
+            ):
+                await context.coordinator.observe_api_throttle(command.request.method, outcome.error.normalized_code)
         return _merge_outcomes(commands, outcomes, rejected)
+
+    @staticmethod
+    def _will_dispatch_commands(commands: tuple[_Command, ...], *, halt: bool) -> bool:
+        """Return whether capability preflight admits a physical batch envelope."""
+        eligible = any(_batch_request_eligible(command.request) for command in commands)
+        rejected = any(not _batch_request_eligible(command.request) for command in commands)
+        return eligible and not (halt and rejected)
+
+    @staticmethod
+    def _will_dispatch_requests(requests: tuple[Request, ...], *, halt: bool = False) -> bool:
+        """Return whether scheduler-owned requests admit a physical batch envelope."""
+        commands = tuple(
+            _Command(index=index, stable_key=f"c{index:012d}", request=request, correlation=None)
+            for index, request in enumerate(requests)
+        )
+        return BatchExecutor._will_dispatch_commands(commands, halt=halt)
 
     def _decode_command(
         self,
@@ -301,8 +341,14 @@ class BatchExecutor:
 
 
 def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
-    if any(command.request.encoding.value != "json" or command.request.headers.items for command in commands):
-        raise CapabilityError("physical batch supports JSON requests without scoped headers; use direct dispatch")
+    if any(
+        command.request.route is not RouteKind.BARE
+        or command.request.encoding.value != "json"
+        or command.request.positional is not None
+        or command.request.headers.items
+        for command in commands
+    ):
+        raise CapabilityError("physical batch supports BARE JSON requests without scoped headers; use direct dispatch")
     safety_values = {command.request.replay_safety or ReplaySafety.UNKNOWN for command in commands}
     if safety_values == {ReplaySafety.SAFE}:
         safety = ReplaySafety.SAFE
@@ -311,7 +357,7 @@ def _batch_request(commands: tuple[_Command, ...], *, halt: bool) -> Request:
     else:
         safety = ReplaySafety.UNKNOWN
     encoded = {command.stable_key: _command_query(command.request) for command in commands}
-    return Request("batch", parameters={"halt": int(halt), "cmd": encoded}, replay_safety=safety)
+    return Request("batch", parameters={"halt": int(halt), "cmd": encoded}, replay_safety=safety, route=RouteKind.BARE)
 
 
 def _command_query(request: Request) -> str:
@@ -421,11 +467,11 @@ def _partition_capabilities(
     eligible: list[_Command] = []
     rejected: dict[int, BatchOutcome] = {}
     for command in commands:
-        if command.request.encoding.value == "json" and not command.request.headers.items:
+        if _batch_request_eligible(command.request):
             eligible.append(command)
             continue
         error = CapabilityError(
-            "physical batch supports JSON requests without scoped headers; use direct dispatch",
+            "physical batch supports BARE JSON requests without scoped headers; use direct dispatch",
             request_summary=command.request.summary,
         )
         rejected[command.index] = _command_failure(
@@ -434,6 +480,17 @@ def _partition_capabilities(
             evidence=BatchCommandEvidence(command.index, command.stable_key),
         )
     return tuple(eligible), rejected
+
+
+def _batch_request_eligible(request: Request) -> bool:
+    """Return whether one request has a physical-batch representation."""
+    return (
+        request.route is RouteKind.BARE
+        and not request.method.endswith(".json")
+        and request.encoding.value == "json"
+        and request.positional is None
+        and not request.headers.items
+    )
 
 
 def _command_failure(

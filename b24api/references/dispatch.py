@@ -71,6 +71,9 @@ class _DoneEvent:
     row_count: int
     violations: tuple[Violation, ...]
     page_records: tuple[PageRecord, ...]
+    stopped_reason: str | None = None
+    terminal_reason: str | None = None
+    qualified_total: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +97,7 @@ class _KernelReferenceComplete:
     work_index: int
     reference: ReferenceRequest
     row_count: int
+    stopped_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +113,7 @@ type ReferenceStreamItem = ReferenceItem | ReferenceFailure | _KernelReferenceCo
 class _ReferenceWindowError(Exception):
     def __init__(self, failure: ReferenceFailure) -> None:
         self.failure = failure
+        self.replay_disposition = failure.replay_disposition
         super().__init__("reference traversal window failed")
         self.report_cause = failure.error if isinstance(failure.error, BaseException) else self
         if self.report_cause is not self:
@@ -576,11 +581,12 @@ class _BatchPageDispatcher:
         return admitted + admitting + continuations + pending_pull + settling_admission
 
     async def _send(self, chunk: list[_PendingBatch]) -> None:
-        self.batch_requests += 1
+        requests = tuple(item.request for item in chunk)
+        self.batch_requests += int(self._executor._will_dispatch_requests(requests))  # noqa: SLF001
         self.batch_commands += len(chunk)
         try:
             outcomes = await self._executor.execute_requests(
-                tuple(item.request for item in chunk),
+                requests,
                 context=self.context,
             )
         except asyncio.CancelledError:

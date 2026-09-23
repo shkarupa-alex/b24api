@@ -23,7 +23,7 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode, ViolationSeverity
-from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request
+from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request, RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
@@ -57,10 +57,14 @@ TWO_REFERENCES = 2
 EXPECTED_LOGICAL_PAGES = 4
 CLEANUP_TEST_TIMEOUT = 0.2
 PULL_TEST_TIMEOUT = 0.15
+REFERENCE_FAILURE_COUNT = 140
+RETAINED_VIOLATION_LIMIT = 128
 
 
 class AsyncFunctionTransport:
     """Provide a deterministic test helper."""
+
+    host = "fixture.invalid"
 
     def __init__(self, handler: Callable[[Request], object]) -> None:
         """Initialize instance state."""
@@ -81,6 +85,8 @@ class AsyncFunctionTransport:
 class BlockingTransport:
     """Provide a deterministic test helper."""
 
+    host = "fixture.invalid"
+
     def __init__(self) -> None:
         """Initialize instance state."""
         self.started = asyncio.Event()
@@ -98,7 +104,7 @@ class BlockingTransport:
 
 
 def _reference(key: str) -> ReferenceRequest:
-    return ReferenceRequest(Request("crm.item.list", {"ref": key}), key)
+    return ReferenceRequest(Request("crm.item.list", {"ref": key}, route=RouteKind.BARE), key)
 
 
 def _one_page_plan() -> SingleResponsePlan:
@@ -169,6 +175,66 @@ async def test_ready_order_interleaves_references_by_actual_completion() -> None
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
     assert stream.report.state is KernelState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_reference_bindings_share_one_operation_identity_budget() -> None:
+    def handler(request: Request) -> object:
+        reference = request.copy_parameters()["ref"]
+        base = 0 if reference == "a" else TWO_REFERENCES
+        return {"result": [{"ID": base + 1}, {"ID": base + 2}]}
+
+    stream = iter_references(
+        Executor(AsyncFunctionTransport(handler)),
+        [_reference("a"), _reference("b")],
+        plan=_one_page_plan(),
+        _page_cap_hint=TWO_REFERENCES,
+        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        identity=_identity(),
+        tolerant=True,
+        policy=ExecutionPolicy(
+            max_active_references=TWO_REFERENCES,
+            max_buffered_rows=2 * TWO_REFERENCES,
+            max_identity_keys=3,
+        ),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+    items = [outcome for outcome in outcomes if isinstance(outcome, ReferenceItem)]
+    failures = [outcome for outcome in outcomes if isinstance(outcome, ReferenceFailure)]
+    assert len(items) == TWO_REFERENCES
+    assert len({item.reference_key for item in items}) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0].error, BudgetExceededError)
+
+
+@pytest.mark.asyncio
+async def test_reference_failure_violations_are_bounded_without_losing_outcomes() -> None:
+    transport = AsyncFunctionTransport(
+        lambda _request: {"error": "ACCESS_DENIED", "error_description": "denied"},
+    )
+    stream = iter_references(
+        Executor(transport),
+        (_reference(str(index)) for index in range(REFERENCE_FAILURE_COUNT)),
+        plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
+        dispatch=DirectDispatch(concurrency=1),
+        identity=_identity(),
+        tolerant=True,
+        policy=ExecutionPolicy(
+            max_active_references=1,
+            max_buffered_rows=1,
+            max_pages=REFERENCE_FAILURE_COUNT,
+            max_requests=REFERENCE_FAILURE_COUNT,
+        ),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == REFERENCE_FAILURE_COUNT
+    assert all(isinstance(outcome, ReferenceFailure) for outcome in outcomes)
+    assert len(stream.report.violations) <= RETAINED_VIOLATION_LIMIT
+    assert stream.report.violations[-1].code == "violations_truncated"
 
 
 @pytest.mark.asyncio
@@ -421,6 +487,8 @@ async def test_batch_dispatch_coalesces_pages_and_preserves_total_metadata() -> 
 @pytest.mark.asyncio
 async def test_reference_batch_preserves_tolerant_duplicate_json_members() -> None:
     class DuplicateMemberTransport:
+        host = "fixture.invalid"
+
         async def send(
             self,
             request: Request,
@@ -501,6 +569,8 @@ async def test_fan_out_accepts_list_result_whose_total_matches_list_length() -> 
 @pytest.mark.asyncio
 async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
     class TransientThenSuccessTransport:
+        host = "fixture.invalid"
+
         def __init__(self) -> None:
             self.requests: list[Request] = []
 
@@ -512,7 +582,7 @@ async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
             return WireResponse(200, (), b'{"result":{"ID":1}}')
 
     transport = TransientThenSuccessTransport()
-    request = Request("tasks.task.add")
+    request = Request("tasks.task.add", route=RouteKind.BARE)
     stream = fan_out(
         Executor(transport),
         [ReferenceRequest(request, "write")],
@@ -749,6 +819,28 @@ async def test_tolerant_batch_chunk_protocol_failure_yields_every_reference() ->
     assert all(isinstance(outcome, ReferenceFailure) for outcome in outcomes)
     assert {outcome.reference_key for outcome in outcomes} == {"a", "b"}
     assert stream.report.emitted_rows == 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_reference_batch_does_not_count_a_physical_batch_request() -> None:
+    transport = AsyncFunctionTransport(lambda _request: pytest.fail("unsupported batch must not be sent"))
+    stream = iter_references(
+        Executor(transport),
+        [ReferenceRequest(Request("crm.item.list", route=RouteKind.JSON), "bad")],
+        plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
+        dispatch=BatchDispatch(),
+        identity=_identity(),
+        tolerant=True,
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], ReferenceFailure)
+    assert transport.requests == []
+    assert stream.report.physical_requests == 0
+    assert stream.report.batch_requests == 0
 
 
 @pytest.mark.asyncio
@@ -1334,6 +1426,8 @@ async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_
     returned = asyncio.Event()
 
     class CancellationResistantTransport:
+        host = "fixture.invalid"
+
         async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
             del request, attempt_timeout, max_response_bytes
             started.set()
@@ -1393,6 +1487,8 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
     release = asyncio.Event()
 
     class CancellationResistantTransport:
+        host = "fixture.invalid"
+
         async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
             del attempt_timeout, max_response_bytes
             if request.method == "bad":
@@ -1410,7 +1506,10 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
 
     stream = fan_out(
         Executor(CancellationResistantTransport()),
-        [ReferenceRequest(Request("bad"), "bad"), ReferenceRequest(Request("slow"), "slow")],
+        [
+            ReferenceRequest(Request("bad", route=RouteKind.BARE), "bad"),
+            ReferenceRequest(Request("slow", route=RouteKind.BARE), "slow"),
+        ],
         dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_elapsed=0.04),
     )
@@ -1435,6 +1534,8 @@ async def test_closed_batch_worker_exits_after_transport_temporarily_resists_can
     release = asyncio.Event()
 
     class CancellationResistantTransport:
+        host = "fixture.invalid"
+
         async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
             del attempt_timeout, max_response_bytes
             started.set()
@@ -1567,7 +1668,7 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
         except RuntimeError as error:
             observed.append((str(error), current.cancelling()))
         try:
-            await Executor(independent_transport).execute(Request("independent"))
+            await Executor(independent_transport).execute(Request("independent", route=RouteKind.BARE))
         except asyncio.CancelledError as cancellation:
             observed.append((str(cancellation), current.cancelling()))
         while current.cancelling():

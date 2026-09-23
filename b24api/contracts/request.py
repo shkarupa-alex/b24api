@@ -10,6 +10,7 @@ from typing import TypedDict, cast
 
 from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, _thaw_json
 from b24api.contracts.policy import IdentityCoercion
+from b24api.contracts.positional import PositionalArguments
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
@@ -20,6 +21,14 @@ _COMPOSITE_COMPONENT_MINIMUM = 2
 _COMPOSITE_COMPONENT_MAXIMUM = 8
 
 
+class RouteKind(StrEnum):
+    """REST endpoint family selected by the caller."""
+
+    BARE = "bare"
+    JSON = "json"
+    API_V3 = "api_v3"
+
+
 @dataclass(frozen=True, slots=True)
 class RequestSummary:
     """Bounded request identity that intentionally excludes parameter values."""
@@ -28,6 +37,7 @@ class RequestSummary:
     parameter_keys: tuple[str, ...] = ()
     encoding: BodyEncoding = BodyEncoding.JSON
     header_names: tuple[str, ...] = ()
+    route: RouteKind = RouteKind.BARE
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -39,6 +49,8 @@ class RequestSummary:
         )
         if not isinstance(self.encoding, BodyEncoding):
             raise TypeError("encoding must be a BodyEncoding")
+        if not isinstance(self.route, RouteKind):
+            raise TypeError("route must be a RouteKind")
         object.__setattr__(
             self,
             "header_names",
@@ -57,14 +69,16 @@ class RequestSummary:
             "parameter_keys": list(self.parameter_keys),
             "encoding": self.encoding.value,
             "header_names": list(self.header_names),
+            "route": self.route.value,
         }
 
 
-def summarize_request(
+def summarize_request(  # noqa: PLR0913
     method: object,
     parameters: object = None,
     *,
     encoding: BodyEncoding = BodyEncoding.JSON,
+    route: RouteKind = RouteKind.BARE,
     header_names: tuple[str, ...] = (),
     redactor: Redactor = DEFAULT_REDACTOR,
 ) -> RequestSummary:
@@ -73,7 +87,13 @@ def summarize_request(
     keys: tuple[str, ...] = ()
     if isinstance(parameters, Mapping):
         keys = tuple(sorted(redactor.redact_text(str(key)) for key in parameters)[: redactor.max_items])
-    return RequestSummary(method=safe_method, parameter_keys=keys, encoding=encoding, header_names=header_names)
+    return RequestSummary(
+        method=safe_method,
+        parameter_keys=keys,
+        encoding=encoding,
+        header_names=header_names,
+        route=route,
+    )
 
 
 class ReplaySafety(StrEnum):
@@ -85,7 +105,7 @@ class ReplaySafety(StrEnum):
 
 
 class _OptionalRequestSpec(TypedDict, total=False):
-    parameters: Mapping[str, object]
+    parameters: Mapping[str, object] | PositionalArguments
     replay_safety: ReplaySafety
     encoding: BodyEncoding
     headers: RequestHeaders
@@ -96,6 +116,7 @@ class RequestSpec(_OptionalRequestSpec):
     """Closed mapping form accepted at public request boundaries."""
 
     method: str
+    route: RouteKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,40 +253,61 @@ class Request:
     """Deeply immutable canonical request with detached accessors."""
 
     method: str
+    route: RouteKind
     replay_safety: ReplaySafety
     encoding: BodyEncoding
     headers: RequestHeaders
     result_error: ResultErrorSpec | None
     _parameters: FrozenMapping = field(repr=False)
+    _positional: PositionalArguments | None = field(repr=False)
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: C901, PLR0913 - canonical request boundary validates each declared contract
         self,
         method: str,
-        parameters: Mapping[str, object] | None = None,
+        parameters: Mapping[str, object] | PositionalArguments | None = None,
         replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
         *,
         encoding: BodyEncoding = BodyEncoding.JSON,
         headers: RequestHeaders = RequestHeaders(),  # noqa: B008 - immutable value singleton
         result_error: ResultErrorSpec | None = None,
+        route: RouteKind,
     ) -> None:
         """Initialize instance state."""
         if not _METHOD_RE.fullmatch(method):
             raise ValueError("method must contain only letters, digits, dots, and underscores")
+        if method.endswith(".json"):
+            raise ValueError("request methods are logical names and cannot include a .json route suffix")
+        if not isinstance(route, RouteKind):
+            raise TypeError("route must be a RouteKind")
+        if route is RouteKind.API_V3 and encoding is not BodyEncoding.JSON:
+            raise ValueError("API_V3 requires JSON body encoding")
         if not isinstance(replay_safety, ReplaySafety):
             raise TypeError("replay_safety must be a ReplaySafety")
         if not isinstance(encoding, BodyEncoding) or not isinstance(headers, RequestHeaders):
             raise TypeError("encoding and headers must use their declared contract types")
         if result_error is not None and not isinstance(result_error, ResultErrorSpec):
             raise TypeError("result_error must be a ResultErrorSpec")
-        frozen = _freeze_json(parameters or {})
+        positional = parameters if isinstance(parameters, PositionalArguments) else None
+        if positional is not None and encoding is not BodyEncoding.JSON:
+            raise ValueError("positional arguments require JSON body encoding")
+        if positional is not None and route is RouteKind.API_V3:
+            raise ValueError("PHP positional arguments cannot use the API_V3 route")
+        frozen = _freeze_json({} if positional is not None else parameters or {})
         if not isinstance(frozen, FrozenMapping):
             raise TypeError("request parameters must be a mapping")
         object.__setattr__(self, "method", method)
+        object.__setattr__(self, "route", route)
         object.__setattr__(self, "replay_safety", replay_safety)
         object.__setattr__(self, "encoding", encoding)
         object.__setattr__(self, "headers", headers)
         object.__setattr__(self, "result_error", result_error)
         object.__setattr__(self, "_parameters", frozen)
+        object.__setattr__(self, "_positional", positional)
+
+    @property
+    def positional(self) -> PositionalArguments | None:
+        """Return immutable positional arguments, if this request uses them."""
+        return self._positional
 
     @property
     def parameters(self) -> Mapping[str, JsonValue]:
@@ -274,6 +316,8 @@ class Request:
 
     def copy_parameters(self) -> dict[str, JsonValue]:
         """Return a mutable copy of the immutable request parameters."""
+        if self._positional is not None:
+            raise ValueError("positional arguments have no named parameter mapping")
         return cast("dict[str, JsonValue]", _thaw_json(self._parameters))
 
     def to_wire_parameters(self) -> dict[str, JsonValue]:
@@ -282,6 +326,8 @@ class Request:
 
     def with_parameters(self, parameters: Mapping[str, object]) -> Request:
         """Replace parameters while preserving every other request contract."""
+        if self._positional is not None:
+            raise ValueError("with_parameters cannot replace positional arguments")
         return Request(
             self.method,
             parameters,
@@ -289,6 +335,7 @@ class Request:
             encoding=self.encoding,
             headers=self.headers,
             result_error=self.result_error,
+            route=self.route,
         )
 
     @property
@@ -296,9 +343,10 @@ class Request:
         """Return the summary."""
         return summarize_request(
             self.method,
-            self._parameters,
+            {f"@{self._positional.layout_id}": None} if self._positional else self._parameters,
             encoding=self.encoding,
             header_names=self.headers.names,
+            route=self.route,
         )
 
     def __repr__(self) -> str:
@@ -315,7 +363,7 @@ def canonical_request(raw: RequestLike) -> Request:
         return raw
     if not isinstance(raw, Mapping):
         raise TypeError("request must be a Request or closed request mapping")
-    unknown = set(raw) - {"method", "parameters", "replay_safety", "encoding", "headers", "result_error"}
+    unknown = set(raw) - {"method", "parameters", "replay_safety", "encoding", "headers", "result_error", "route"}
     if unknown:
         raise ValueError(f"unknown request fields: {sorted(unknown)}")
     method = raw.get("method")
@@ -324,16 +372,19 @@ def canonical_request(raw: RequestLike) -> Request:
     encoding = raw.get("encoding", BodyEncoding.JSON)
     headers = raw.get("headers", RequestHeaders())
     result_error = raw.get("result_error")
+    route = raw.get("route")
     if not isinstance(method, str):
         raise TypeError("request mapping requires a string method")
-    if parameters is not None and not isinstance(parameters, Mapping):
-        raise TypeError("request mapping parameters must be a mapping")
+    if parameters is not None and not isinstance(parameters, Mapping | PositionalArguments):
+        raise TypeError("request mapping parameters must be a mapping or PositionalArguments")
     if not isinstance(safety, ReplaySafety):
         raise TypeError("request replay_safety must be a ReplaySafety")
     if not isinstance(encoding, BodyEncoding) or not isinstance(headers, RequestHeaders):
         raise TypeError("request encoding and headers must use their declared contract types")
     if result_error is not None and not isinstance(result_error, ResultErrorSpec):
         raise TypeError("request result_error must be a ResultErrorSpec")
+    if not isinstance(route, RouteKind):
+        raise TypeError("request route must be a RouteKind")
     return Request(
         method,
         parameters,
@@ -341,4 +392,5 @@ def canonical_request(raw: RequestLike) -> Request:
         encoding=encoding,
         headers=headers,
         result_error=result_error,
+        route=route,
     )

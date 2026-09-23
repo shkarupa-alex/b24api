@@ -5,8 +5,11 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
+from b24api.completion.closure import QUALIFIED_TOTAL_REACHED, SINGLE_RESPONSE_COMPLETE
+from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch, PageRejectionCode
-from b24api.errors import CapabilityError, PaginationError
+from b24api.contracts.traversal import OffsetContinuation
+from b24api.errors import BudgetExceededError, CapabilityError, PaginationError
 from b24api.execution import (
     WorkClass,
 )
@@ -18,6 +21,7 @@ from b24api.traversal.identity import (
     _PageRejectionError,
     _request_with_controls,
 )
+from b24api.traversal.sparse import sparse_page_terminal
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -67,15 +71,26 @@ class _SequentialMixin:
             if self.page_trace_count == trace_count:
                 self.reject_external_page(items, response, error)
             raise
-        self.terminal_reason = "single response complete"
+        self.terminal_reason = SINGLE_RESPONSE_COMPLETE
         item_weights = (qualified_count,) if self._single_result_as_item else (1,) * len(items)
         yield _Page(tuple(items), response, item_weights, continuing=False)
 
-    async def _offset(self: Any, plan: OffsetSequentialPlan) -> AsyncGenerator[_Page]:
-        offset = _initial_offset(self.request, plan.offset_path)
+    async def _offset(  # noqa: C901, PLR0912 - one ordered page transaction with two closure variants
+        self: Any,
+        plan: OffsetSequentialPlan,
+    ) -> AsyncGenerator[_Page]:
+        offset = _initial_offset(self.request, plan.offset_path, default=plan.initial_control)
+        sparse = plan.sparse_raw_bound
+        if sparse is not None and offset != 0:
+            raise CapabilityError("sparse raw traversal requires the complete range from offset zero")
+        expected_raw_total: int | None = None
+        pending_short_window = False
+        short_page_width = plan.short_page_width or plan.fixed_step
         self.cursor_state = offset
         visited_offsets: set[int] = set()
         while True:
+            if sparse is not None and len(visited_offsets) >= sparse.max_pages:
+                raise BudgetExceededError("sparse raw page budget exhausted")
             if offset in visited_offsets:
                 raise PaginationError("offset cycle detected")
             visited_offsets.add(offset)
@@ -95,13 +110,40 @@ class _SequentialMixin:
             items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
-                terminal = _offset_terminal(
-                    plan,
-                    response,
-                    page_size=len(items),
-                    accepted=self.validated_rows + len(items),
-                    confirmation=self._confirmation_policy,
-                )
+                if pending_short_window and (items or not plan.allow_empty_after_short_window):
+                    raise PaginationError("fixed-step traversal cannot prove closure after a short page")
+                if sparse is None:
+                    terminal = _offset_terminal(
+                        plan,
+                        response,
+                        page_size=len(items),
+                        accepted=self.validated_rows + len(items),
+                        confirmation=self._confirmation_policy,
+                    )
+                else:
+                    terminal, expected_raw_total = sparse_page_terminal(
+                        sparse,
+                        response,
+                        offset=offset,
+                        selected=len(items),
+                        previous_total=expected_raw_total,
+                    )
+                if (
+                    sparse is None
+                    and plan.page_stride is not None
+                    and terminal is None
+                    and len(items) < plan.page_stride.max_decoded_rows
+                ):
+                    raise PaginationError("fixed-stride traversal observed an unexplained short page")
+                if (
+                    sparse is None
+                    and plan.page_stride is None
+                    and plan.continuation is OffsetContinuation.FIXED_STEP
+                    and terminal is None
+                    and short_page_width is not None
+                    and len(items) < short_page_width
+                ):
+                    pending_short_window = True
                 next_offset = (
                     None if terminal is not None else _next_offset(plan, response, current=offset, observed=len(items))
                 )
@@ -166,7 +208,7 @@ class _SequentialMixin:
             if items:
                 yield _Page(tuple(items), response, (1,) * len(items), not terminal)
             if self._expected_total is not None and self.validated_rows == self._expected_total:
-                self.terminal_reason = "qualified total reached"
+                self.terminal_reason = QUALIFIED_TOTAL_REACHED
                 return
             if next_offset is None:
                 raise RuntimeError("non-terminal counted page lacks its validated next offset")
@@ -176,6 +218,9 @@ class _SequentialMixin:
     async def _fetch(self: Any, request: Request) -> Response:
         if self._fetch_override is not None:
             return cast("Response", await self._fetch_override(request))
+        recorder = self.completion_recorder
+        if recorder is not None:
+            recorder.scheduled()
         reservation = None
         try:
             reservation = await self.context.reserve_page()
@@ -185,7 +230,15 @@ class _SequentialMixin:
                 work_class=WorkClass.TRAVERSAL_DIRECT,
             )
             self.context.commit_page(reservation)
+            if recorder is not None:
+                recorder.settled(CommandSettlement.SUCCESS)
         except BaseException as error:
+            if recorder is not None:
+                recorder.settled(
+                    CommandSettlement.UNKNOWN
+                    if bool(getattr(error, "_b24api_dispatch_started", False))
+                    else CommandSettlement.NOT_EXECUTED,
+                )
             if reservation is not None:
                 self.context.release_page(reservation)
             if bool(getattr(error, "_b24api_dispatch_started", False)):

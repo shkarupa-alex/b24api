@@ -4,9 +4,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, AsyncIterator
-from dataclasses import replace
 from typing import TYPE_CHECKING, Self, cast
 
+from b24api.contracts.completion import CleanupState, StreamClosure
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import (
     CompletionAssurance,
@@ -16,6 +16,7 @@ from b24api.contracts.policy import (
     SnapshotState,
 )
 from b24api.contracts.report import Violation, ViolationSeverity, retain_page_trace
+from b24api.contracts.violation import retain_violations
 from b24api.execution import (
     Executor,
     await_cancellation_resistant,
@@ -31,6 +32,7 @@ from b24api.references.dispatch import (
 )
 from b24api.references.outcome import ReferenceItem
 from b24api.references.scheduler import ReferenceScheduler
+from b24api.references.support import _cleanup_failed_report
 from b24api.traversal import PaginationDriver
 from b24api.traversal.plans import (
     BatchDispatch,
@@ -44,6 +46,7 @@ from b24api.traversal.plans import (
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 if TYPE_CHECKING:
+    from b24api.contracts.page_stop import PageStopPolicy
     from b24api.contracts.request import ResultSelector, TraversalIdentity
 
 
@@ -66,11 +69,24 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         self._emitted = 0
         self._unique_emitted = 0
         self._assurance = assurance
+        self._completion_cleanup_done = False
         self.report = KernelReport(assurance=assurance)
 
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
         return self
+
+    @property
+    def completion_gate(self) -> object:
+        """Expose the reference scheduler's correlated completion gate."""
+        return self._scheduler.completion.gate
+
+    def _finish_completion_cleanup(self) -> None:
+        if self._completion_cleanup_done or self.report.state is KernelState.NOT_STARTED:
+            return
+        failed = any(item.code == "cleanup_failure" for item in self.report.violations)
+        self._scheduler.completion.cleanup(CleanupState.FAILURE if failed else CleanupState.SUCCESS)
+        self._completion_cleanup_done = True
 
     @property
     def active_references_high_water(self) -> int:
@@ -88,7 +104,11 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             return item
         if self._runner is None:
             self._runner = self._run()
-        item = await anext(self._runner)
+        try:
+            item = await anext(self._runner)
+        except BaseException:
+            self._finish_completion_cleanup()
+            raise
         self._record_delivery(item)
         return item
 
@@ -136,6 +156,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         await self._observe_source_cleanup()
         if self.report.state is KernelState.NOT_STARTED and self._runner is not None:
             await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
+        self._finish_completion_cleanup()
 
     async def _observe_source_cleanup(self) -> None:
         try:
@@ -232,22 +253,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     async def _record_terminal_cleanup_failure(self, error: BaseException) -> None:
         if self.report.state is KernelState.NOT_STARTED:
             await self._finalize(KernelState.FAILED, "stream cleanup failed")
-        violations = self.report.violations
-        if not any(violation.code == "cleanup_failure" for violation in violations):
-            violations = (
-                *violations,
-                Violation(
-                    severity=ViolationSeverity.BLOCKING,
-                    code="cleanup_failure",
-                    message=f"reference cleanup failed ({type(error).__name__})",
-                ),
-            )
-        self.report = replace(
-            self.report,
-            state=KernelState.FAILED,
-            terminal_reason="stream cleanup failed",
-            violations=violations,
-        )
+        self.report = _cleanup_failed_report(self.report, error)
         _attach_report(error, self.report)
 
     async def _finalize(self, state: KernelState, reason: str) -> None:
@@ -261,17 +267,19 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             else SnapshotState.UNVERIFIED
         )
         source_violations = tuple(getattr(self._source, "violations", ()))
-        violations = (*self._scheduler.violations, *source_violations)
+        violations = retain_violations((*self._scheduler.violations, *source_violations))
         if state is KernelState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
             state = KernelState.INCOMPLETE
             reason = "required snapshot was not verified"
-            violations = (
-                *violations,
-                Violation(
-                    severity=ViolationSeverity.BLOCKING,
-                    code="snapshot_unverified",
-                    message="the requested stable snapshot was not verified",
-                ),
+            violations = retain_violations(
+                (
+                    *violations,
+                    Violation(
+                        severity=ViolationSeverity.BLOCKING,
+                        code="snapshot_unverified",
+                        message="the requested stable snapshot was not verified",
+                    ),
+                )
             )
         page_trace, page_trace_truncated = retain_page_trace(
             tuple(sorted(self._scheduler.page_trace, key=lambda record: record.sequence)),
@@ -295,8 +303,16 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
             violations=violations,
             terminal_reason=reason,
+            caller_stopped=bool(self._scheduler.stopped_bindings),
             page_trace=page_trace,
             page_trace_truncated=page_trace_truncated,
+        )
+        self._scheduler.completion.stream_terminal(
+            StreamClosure.NATURAL
+            if state is KernelState.COMPLETED
+            else StreamClosure.CANCELLED
+            if state is KernelState.CANCELLED
+            else StreamClosure.EARLY_CLOSE,
         )
 
 
@@ -340,6 +356,7 @@ def iter_references(  # noqa: PLR0913
     _page_cap_hint: int | None = None,
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
     _page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
+    _page_stop: PageStopPolicy | None = None,
 ) -> ReferenceStream:
     """Construct a lazy bounded reference traversal stream without I/O."""
     PaginationDriver.validate_plan(plan)
@@ -368,6 +385,7 @@ def iter_references(  # noqa: PLR0913
         capture_fail_fast=_capture_fail_fast,
         page_cap_hint=_page_cap_hint,
         page_adapter=_page_adapter,
+        page_stop=_page_stop,
     )
     return ReferenceStream(
         scheduler,

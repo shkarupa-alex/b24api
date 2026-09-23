@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _thaw_json
+from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ParameterPath
 from b24api.redaction import DEFAULT_REDACTOR
 
@@ -82,11 +83,13 @@ class ReferenceItem[C]:
 
 @dataclass(frozen=True, slots=True)
 class ReferenceComplete[C]:
-    """Successful binding terminal event, including zero-row results."""
+    """Successful binding terminal, with source-exhaustion evidence distinguished."""
 
     binding_index: int
     correlation: C = field(repr=False)
     row_count: int
+    exhausted: bool = True
+    stop_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +100,12 @@ class ReferenceFailure[C]:
     correlation: C = field(repr=False)
     error: B24ApiError
     partial_rows: int
+    replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
+
+    def __post_init__(self) -> None:
+        """Require the kernel replay decision to remain typed."""
+        if not isinstance(self.replay_disposition, ReplayDisposition):
+            raise TypeError("replay_disposition must be a ReplayDisposition")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +125,12 @@ class ReferenceOutcomeUnknown[C]:
     correlation: C = field(repr=False)
     error: B24ApiError
     partial_rows: int
+    replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
+
+    def __post_init__(self) -> None:
+        """Require ambiguity to retain the kernel replay decision."""
+        if not isinstance(self.replay_disposition, ReplayDisposition):
+            raise TypeError("replay_disposition must be a ReplayDisposition")
 
 
 type ReferenceEvent[C] = ReferenceItem[C] | ReferenceComplete[C]
