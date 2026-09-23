@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A positional request whose slots cannot accept a declared traversal control still raises
+  `CapabilityError` with the original positional error as its cause; the message now appends a
+  value-free reason (undeclared path, absent slot, missing parent, or near-match casing), and the
+  cause is a `ValueError` subclass carrying the closed `PositionalControlFault`.
+- Documented the five-slot positional `task.elapseditem.getlist` route and the optional,
+  offline-tested sequential positional keyset profile.
 - `iter_list_counted()` accepts a first page with no rows, no `next`, and a missing, `null`, or `-1`
   `total` as an observed empty source. The report completes and is exhausted with `mechanics_only`
   assurance (`identity_exact` with an identity) and never claims a count; `total: 0` keeps its
