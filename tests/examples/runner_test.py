@@ -267,7 +267,7 @@ async def test_offline_runner_rejects_a_recipe_result_that_disagrees_with_the_or
         return RecipeEvidence(0)
 
     monkeypatch.setattr(module, "run", contradictory_run)
-    with pytest.raises(AssertionError, match="observed 0 rows, expected 11"):
+    with pytest.raises(AssertionError, match="observed 0 rows, expected 17"):
         await recipe_runner._offline(recipe_runner.SCENARIOS[0])  # noqa: SLF001 - direct contract test
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import ast
+import importlib
 import re
 import subprocess
 import sys
@@ -136,6 +137,21 @@ def test_chat_bounded_recipe_matches_its_independent_oracle() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.asyncio
+async def test_chat_bounded_recipe_rejects_a_page_stop_that_saves_no_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("examples.chat_bounded_mirror")
+
+    async def matching_baseline(_settings: object) -> int:
+        return module.EXPECTED_REQUESTS
+
+    monkeypatch.setattr(module, "_baseline_requests", matching_baseline)
+    monkeypatch.setattr(module, "EXPECTED_BASELINE_REQUESTS", module.EXPECTED_REQUESTS)
+    with pytest.raises(AssertionError, match="saved no requests over exhaust-to-first"):
+        await module.run()
 
 
 @pytest.mark.asyncio

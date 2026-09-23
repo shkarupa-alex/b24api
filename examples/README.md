@@ -38,7 +38,7 @@ qualified closure. No scenario is `blocked by client gap`. Neither status is a L
 
 | Scenario | Recipe | Offline | LIVE | Offline oracle |
 | --- | --- | --- | --- | --- |
-| 1 | [chat_bounded_mirror](chat_bounded_mirror.py) | passing | not recorded | Three chats, 11 exact IDs, two per-binding stops and one natural exhaustion |
+| 1 | [chat_bounded_mirror](chat_bounded_mirror.py) | passing | not recorded | Four chats, 17 exact IDs, three per-binding stops and one natural exhaustion; 10 requests against a 14-request exhaust-to-first baseline |
 | 2 | [message_cursor_direction](message_cursor_direction.py) | passing | not recorded | FIRST_ID false clean end versus LAST_ID 5/5 at limits 1, 3 and 50 |
 | 3 | [recent_dialogs](recent_dialogs.py) | passing | not recorded | Envelope next, total=-1, five emitted rows, duplicate warning, `mechanics_only` assurance and four keyed chats |
 | 4 | [search_chat_messages](search_chat_messages.py) | passing | not recorded | Two-page chat, empty chat, typed ACCESS_ERROR and three correlated terminals |
