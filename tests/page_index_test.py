@@ -46,6 +46,12 @@ async def test_one_based_page_index_uses_wire_increment_not_row_count() -> None:
     assert stream.report.exhausted
 
 
+def test_page_index_rejects_a_zero_based_offset_spelling() -> None:
+    path = ParameterPath(("start",))
+    with pytest.raises(ValueError, match="initial"):
+        PageIndex(path, initial=0, increment=50, max_rows=50)
+
+
 def test_page_index_rejects_incompatible_limit_and_counted_tail() -> None:
     path = ParameterPath(("page",))
     index = PageIndex(path, max_rows=10)

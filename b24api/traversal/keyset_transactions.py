@@ -393,6 +393,9 @@ async def execute_finish_page(
             scheduler.transactions.pending.append(commit.rows)
             scheduler._pending_owners.append(((plan.command_id, len(commit.rows)),))  # noqa: SLF001
         if terminal is not None:
+            if receipt.witness is None:
+                raise RuntimeError("terminal fast finish page lacked a closure witness")
+            scheduler._completion_witnesses += 1  # noqa: SLF001 - transaction closes its owning scheduler
             scheduler.transactions.terminal = True
             scheduler.transactions.finishing = False
             return

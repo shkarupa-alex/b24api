@@ -30,6 +30,7 @@ from b24api.contracts.report import (
     Violation,
     ViolationSeverity,
 )
+from b24api.contracts.violation import retain_violations
 
 if TYPE_CHECKING:
     from b24api.execution.snapshot import KernelReport
@@ -268,6 +269,13 @@ class CompletionGate:
             ):
                 self._violate("completion_missing_range_witness")
                 return
+            if event.closure is BindingClosure.KEYSET_PLAN_COVERED and (
+                type(event.qualified_witnesses) is not int
+                or event.qualified_witnesses < 1
+                or binding.acknowledged_pages == 0
+            ):
+                self._violate("completion_missing_keyset_plan_witness")
+                return
             if event.closure in {BindingClosure.FAILURE, BindingClosure.UNKNOWN}:
                 self._negative_bindings += 1
                 if event.closure is BindingClosure.UNKNOWN:
@@ -388,16 +396,18 @@ class CompletionGate:
             state = TerminalState.CANCELLED
         else:
             state = TerminalState.FAILED
-        violations = (*source.violations, *decision.violations, *facts.extra_violations)
+        violations = retain_violations((*source.violations, *decision.violations, *facts.extra_violations))
         gate_negative = decision.state is TerminalState.COMPLETED_WITH_FAILURES
         if source.state is KernelState.COMPLETED and gate_negative != bool(negative_outcomes):
-            violations = (
-                *violations,
-                Violation(
-                    ViolationSeverity.BLOCKING,
-                    "completion_outcome_count_mismatch",
-                    "public negative outcome counts disagree with completion evidence",
-                ),
+            violations = retain_violations(
+                (
+                    *violations,
+                    Violation(
+                        ViolationSeverity.BLOCKING,
+                        "completion_outcome_count_mismatch",
+                        "public negative outcome counts disagree with completion evidence",
+                    ),
+                )
             )
             state = TerminalState.INCOMPLETE
         if state is TerminalState.COMPLETED and (

@@ -187,6 +187,22 @@ class BatchExecutor:
                 await context.coordinator.observe_api_throttle(command.request.method, outcome.error.normalized_code)
         return _merge_outcomes(commands, outcomes, rejected)
 
+    @staticmethod
+    def _will_dispatch_commands(commands: tuple[_Command, ...], *, halt: bool) -> bool:
+        """Return whether capability preflight admits a physical batch envelope."""
+        eligible = any(_batch_request_eligible(command.request) for command in commands)
+        rejected = any(not _batch_request_eligible(command.request) for command in commands)
+        return eligible and not (halt and rejected)
+
+    @staticmethod
+    def _will_dispatch_requests(requests: tuple[Request, ...], *, halt: bool = False) -> bool:
+        """Return whether scheduler-owned requests admit a physical batch envelope."""
+        commands = tuple(
+            _Command(index=index, stable_key=f"c{index:012d}", request=request, correlation=None)
+            for index, request in enumerate(requests)
+        )
+        return BatchExecutor._will_dispatch_commands(commands, halt=halt)
+
     def _decode_command(
         self,
         command: _Command,
@@ -451,13 +467,7 @@ def _partition_capabilities(
     eligible: list[_Command] = []
     rejected: dict[int, BatchOutcome] = {}
     for command in commands:
-        if (
-            command.request.route is RouteKind.BARE
-            and not command.request.method.endswith(".json")
-            and command.request.encoding.value == "json"
-            and command.request.positional is None
-            and not command.request.headers.items
-        ):
+        if _batch_request_eligible(command.request):
             eligible.append(command)
             continue
         error = CapabilityError(
@@ -470,6 +480,17 @@ def _partition_capabilities(
             evidence=BatchCommandEvidence(command.index, command.stable_key),
         )
     return tuple(eligible), rejected
+
+
+def _batch_request_eligible(request: Request) -> bool:
+    """Return whether one request has a physical-batch representation."""
+    return (
+        request.route is RouteKind.BARE
+        and not request.method.endswith(".json")
+        and request.encoding.value == "json"
+        and request.positional is None
+        and not request.headers.items
+    )
 
 
 def _command_failure(

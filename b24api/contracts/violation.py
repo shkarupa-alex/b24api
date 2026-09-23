@@ -10,10 +10,15 @@ from b24api.contracts.policy import ReplayDisposition
 from b24api.redaction import DEFAULT_REDACTOR
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from b24api.errors import B24ApiError
 
 VIOLATION_CODE_MAXIMUM = 100
 VIOLATION_MESSAGE_MAXIMUM = 500
+MAX_RETAINED_VIOLATIONS = 128
+_TRUNCATED_CODE = "violations_truncated"
+_MINIMUM_RETENTION_LIMIT = 2
 
 
 class ViolationSeverity(StrEnum):
@@ -64,6 +69,34 @@ class Violation:
             "error": self.error.to_safe_dict() if self.error is not None else None,
             "replay_disposition": self.replay_disposition.value,
         }
+
+
+def retain_violations(
+    values: Iterable[Violation],
+    *,
+    limit: int = MAX_RETAINED_VIOLATIONS,
+) -> tuple[Violation, ...]:
+    """Retain bounded evidence while preserving late blocking causes."""
+    items = tuple(values)
+    if any(not isinstance(item, Violation) for item in items):
+        raise TypeError("violation evidence must contain Violation values")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < _MINIMUM_RETENTION_LIMIT:
+        raise ValueError("violation retention limit must be at least two")
+    truncated = any(item.code == _TRUNCATED_CODE for item in items)
+    evidence = tuple(item for item in items if item.code != _TRUNCATED_CODE)
+    if len(evidence) <= limit and not truncated:
+        return evidence
+    blocking = tuple(item for item in evidence if item.severity is ViolationSeverity.BLOCKING)
+    warnings = tuple(item for item in evidence if item.severity is ViolationSeverity.WARNING)
+    capacity = limit - 1
+    retained_blocking = blocking[-capacity:]
+    retained_warnings = warnings[: capacity - len(retained_blocking)]
+    marker = Violation(
+        ViolationSeverity.WARNING,
+        _TRUNCATED_CODE,
+        "additional operation violations were omitted by the evidence retention limit",
+    )
+    return (*retained_blocking, *retained_warnings, marker)
 
 
 __all__ = ["Violation", "ViolationSeverity"]

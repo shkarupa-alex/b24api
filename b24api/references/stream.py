@@ -16,6 +16,7 @@ from b24api.contracts.policy import (
     SnapshotState,
 )
 from b24api.contracts.report import Violation, ViolationSeverity, retain_page_trace
+from b24api.contracts.violation import retain_violations
 from b24api.execution import (
     Executor,
     await_cancellation_resistant,
@@ -266,17 +267,19 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             else SnapshotState.UNVERIFIED
         )
         source_violations = tuple(getattr(self._source, "violations", ()))
-        violations = (*self._scheduler.violations, *source_violations)
+        violations = retain_violations((*self._scheduler.violations, *source_violations))
         if state is KernelState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
             state = KernelState.INCOMPLETE
             reason = "required snapshot was not verified"
-            violations = (
-                *violations,
-                Violation(
-                    severity=ViolationSeverity.BLOCKING,
-                    code="snapshot_unverified",
-                    message="the requested stable snapshot was not verified",
-                ),
+            violations = retain_violations(
+                (
+                    *violations,
+                    Violation(
+                        severity=ViolationSeverity.BLOCKING,
+                        code="snapshot_unverified",
+                        message="the requested stable snapshot was not verified",
+                    ),
+                )
             )
         page_trace, page_trace_truncated = retain_page_trace(
             tuple(sorted(self._scheduler.page_trace, key=lambda record: record.sequence)),

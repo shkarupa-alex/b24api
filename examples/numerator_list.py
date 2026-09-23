@@ -2,8 +2,9 @@
 
 Offline fixture for `documentgenerator.numerator.list`: 53 independently
 expected IDs, local totals 50/3/0, no `next`. A fixed wire step of 50 reaches
-an empty confirmation. The report proves traversal mechanics only; a mutable
-portal snapshot is not verified. Run: `uv run python -m examples.numerator_list`.
+an empty response after a short window and therefore fails closed. The report
+proves observed mechanics only; a mutable portal snapshot is not verified. Run:
+`uv run python -m examples.numerator_list`.
 """
 
 from __future__ import annotations
@@ -11,13 +12,16 @@ import asyncio
 
 from b24api import (
     Bitrix24,
+    IncompleteTraversalError,
     OffsetContinuation,
     OffsetSpec,
+    PaginationError,
     ReplaySafety,
     Request,
     ResultSelector,
     RouteKind,
     Settings,
+    TerminalState,
     TraversalAssurance,
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
@@ -56,11 +60,20 @@ async def run() -> RecipeEvidence:
             page_size=STEP,
             offset=OffsetSpec(continuation=OffsetContinuation.FIXED_STEP, step=STEP),
         )
-        observed = tuple([int(row["id"]) async for row in stream])
+        observed_rows: list[int] = []
+        try:
+            async for row in stream:
+                observed_rows.append(int(row["id"]))  # noqa: PERF401 - retain partial fail-closed evidence
+        except IncompleteTraversalError as error:
+            if not isinstance(error.__cause__, PaginationError):
+                raise TypeError("scenario 17 failed for an unexpected reason") from error
+        else:
+            raise AssertionError("scenario 17 falsely proved fixed-step closure")
+        observed = tuple(observed_rows)
         if observed != EXPECTED_IDS:
             raise AssertionError("scenario 17 numeral IDs differed from independent oracle")
-        if stream.report is None or not stream.report.exhausted:
-            raise AssertionError("scenario 17 lacked empty-page closure")
+        if stream.report is None or stream.report.state is not TerminalState.INCOMPLETE or stream.report.exhausted:
+            raise AssertionError("scenario 17 did not retain its fail-closed boundary")
         if stream.report.assurance is not TraversalAssurance.MECHANICS_ONLY:
             raise AssertionError("scenario 17 falsely promoted page-local total assurance")
     transport.assert_exhausted()

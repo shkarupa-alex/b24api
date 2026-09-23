@@ -751,6 +751,8 @@ async def test_fail_fast_batch_retains_correlations_for_unsupported_route_withou
     assert isinstance(outcomes[1], CommandNotExecuted)
     assert outcomes[1].correlation is correlations[1]
     assert transport.requests == []
+    assert stream.report.physical_requests == 0
+    assert stream.report.batch_requests == 0
     assert stream.report.not_executed == 1
     assert stream.report.successes == 0
     assert stream.report.failures == 1

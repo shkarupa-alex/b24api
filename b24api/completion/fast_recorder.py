@@ -144,7 +144,16 @@ class FastCompletionRecorder:
             if page.recorded and page.remaining is None:
                 self.admit(command_id, 0)
 
-    def terminal(self, state: KernelState, *, rows_emitted: int, rows_admitted: int, cleanup: CleanupState) -> None:
+    def terminal(  # noqa: PLR0913
+        self,
+        state: KernelState,
+        *,
+        rows_emitted: int,
+        rows_admitted: int,
+        cleanup: CleanupState,
+        closure: BindingClosure | None = None,
+        qualified_witnesses: int = 0,
+    ) -> None:
         """Settle the operation only after owned scheduler cleanup has finished."""
         if self._terminal:
             return
@@ -156,13 +165,16 @@ class FastCompletionRecorder:
                 self._emit(PageRejected, binding_id=0, page_id=page.page_id, reason=state.value)
                 self._negative = True
                 del self._active[command_id]
-        closure = (
-            BindingClosure.SOURCE_EMPTY
-            if state is KernelState.COMPLETED and rows_emitted == rows_admitted
-            else BindingClosure.CALLER_STOP
-            if state is KernelState.CANCELLED and not self._negative
-            else BindingClosure.FAILURE
-        )
+        successful = state is KernelState.COMPLETED and rows_emitted == rows_admitted
+        if successful and closure not in {BindingClosure.SOURCE_EMPTY, BindingClosure.KEYSET_PLAN_COVERED}:
+            closure = BindingClosure.FAILURE
+            self._negative = True
+        elif not successful:
+            closure = (
+                BindingClosure.CALLER_STOP
+                if state is KernelState.CANCELLED and not self._negative
+                else BindingClosure.FAILURE
+            )
         stream = (
             StreamClosure.NATURAL
             if state is KernelState.COMPLETED
@@ -170,7 +182,12 @@ class FastCompletionRecorder:
             if state is KernelState.CANCELLED
             else StreamClosure.EARLY_CLOSE
         )
-        self._emit(BindingTerminal, binding_id=0, closure=closure)
+        self._emit(
+            BindingTerminal,
+            binding_id=0,
+            closure=closure,
+            qualified_witnesses=qualified_witnesses if closure is BindingClosure.KEYSET_PLAN_COVERED else None,
+        )
         self._emit(StreamTerminal, closure=stream)
         self._emit(CleanupOutcome, state=cleanup)
 

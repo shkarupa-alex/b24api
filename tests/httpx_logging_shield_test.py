@@ -21,6 +21,7 @@ _SUCCESS_STATUS = 200
 _RESPONSE_STATUS = 403
 _OWNED_RECORDS = 2
 _TOTAL_RECORDS = 3
+_REDIRECT_RECORDS = 2
 
 
 def test_httpx_dependency_range_matches_the_positive_controlled_minor() -> None:
@@ -151,3 +152,41 @@ async def test_closing_transport_keeps_filter_until_inflight_httpx_record_is_emi
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - in-flight cleanup control
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.JSON, RouteKind.API_V3])
+async def test_redirect_hops_keep_the_owned_webhook_credential_out_of_httpx_info(
+    route: RouteKind,
+) -> None:
+    logger = logging.getLogger("httpx")
+    previous_level = logger.level
+    handler = _CollectingHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "portal.invalid":
+            redirected = request.url.copy_with(scheme="https", host="redirect.invalid")
+            return httpx.Response(301, headers={"location": str(redirected)}, request=request)
+        return httpx.Response(_SUCCESS_STATUS, json={"result": True}, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond), follow_redirects=True)
+    transport = HttpxTransport(f"http://portal.invalid/rest/1/{_OWNED_MARKER}/", client=client)
+    try:
+        response = await transport.send(
+            Request("profile", route=route),
+            attempt_timeout=1,
+            max_response_bytes=1024,
+        )
+        assert response.status_code == _SUCCESS_STATUS
+        assert len(handler.records) == _REDIRECT_RECORDS
+        for record in handler.records:
+            assert _OWNED_MARKER not in f"{record.msg!r} {record.args!r}"
+            assert _OWNED_MARKER not in record.getMessage()
+        assert _OWNED_MARKER not in handler.output.getvalue()
+    finally:
+        await transport.aclose()
+        await client.aclose()
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)

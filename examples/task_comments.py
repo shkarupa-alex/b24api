@@ -97,7 +97,40 @@ def _legacy_request(*, cursor: int | None = None, ordered: bool = False) -> Requ
     return Request(LEGACY_METHOD, arguments, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
 
 
+def _legacy_control_request(direction: str, lower: int | None, upper: int | None) -> Request:
+    keyset_filter = {
+        **({">ID": lower} if lower is not None else {}),
+        **({"<ID": upper} if upper is not None else {}),
+    }
+    arguments = PositionalArguments(
+        (Present(43), Present({"ID": direction}), Present(keyset_filter)),
+        LAYOUT.layout_id,
+        layout=LAYOUT,
+    )
+    return Request(LEGACY_METHOD, arguments, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+
+
+def _legacy_verifier_exchanges() -> tuple[ScriptedExchange, ...]:
+    controls = (
+        ("ASC", None, None, EXPECTED_LEGACY),
+        ("DESC", None, None, tuple(reversed(EXPECTED_LEGACY))),
+        ("ASC", 0, 1, ()),
+        ("ASC", 1, 2, ()),
+        ("ASC", 0, 2, (1,)),
+        ("ASC", 0, 3, EXPECTED_LEGACY),
+        ("DESC", 0, 3, tuple(reversed(EXPECTED_LEGACY))),
+    )
+    return tuple(
+        ScriptedExchange.json(
+            _legacy_control_request(direction, lower, upper),
+            {"result": [{"ID": str(value)} for value in values]},
+        )
+        for direction, lower, upper, values in controls
+    )
+
+
 def _fixture() -> ScriptedTransport:
+    verifier = _legacy_verifier_exchanges() if os.environ.get("ENV") != "PROD" else ()
     return ScriptedTransport(
         (
             ScriptedExchange.batch(
@@ -115,6 +148,7 @@ def _fixture() -> ScriptedTransport:
                 _message_request(902, None),
                 {"error": "ACCESS_ERROR", "error_description": "denied"},
             ),
+            *verifier,
             ScriptedExchange.json(
                 _legacy_request(ordered=True),
                 {"result": [{"ID": str(value)} for value in EXPECTED_LEGACY]},
@@ -243,7 +277,7 @@ async def run() -> RecipeEvidence:
         for request in transport.calls
         if request.method == LEGACY_METHOD and request.positional is not None
     )
-    if legacy_slots != ([43, {"ID": "ASC"}, {}], [43, {"ID": "ASC"}, {">ID": 2}]):
+    if legacy_slots[-2:] != ([43, {"ID": "ASC"}, {}], [43, {"ID": "ASC"}, {">ID": 2}]):
         raise AssertionError("scenario 6 legacy TASKID/ORDER/FILTER wire order changed")
     return RecipeEvidence(
         observed_count,

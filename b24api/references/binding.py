@@ -11,6 +11,7 @@ from b24api.contracts.command import NotExecutedReason
 from b24api.contracts.json import _freeze_json
 from b24api.contracts.reference import Binding
 from b24api.contracts.traversal import CursorTraversal, TraversalSpec, traversal_control_paths
+from b24api.contracts.violation import retain_violations
 from b24api.errors import CapabilityError, PaginationError
 from b24api.references.outcome import ReferenceRequest
 from b24api.traversal.cursor_domain import validate_cursor_value
@@ -178,7 +179,7 @@ class _SyncBindingAdapter[C](Iterator[ReferenceRequest]):
         if self._audit is not None:
             violation = self._audit(request.request)
             if violation is not None:
-                self.violations.append(violation)
+                self.violations = list(retain_violations((*self.violations, violation)))
         self._index += 1
         return request
 
@@ -222,7 +223,7 @@ class _AsyncBindingAdapter[C](AsyncIterator[ReferenceRequest]):
         if self._audit is not None:
             violation = self._audit(request.request)
             if violation is not None:
-                self.violations.append(violation)
+                self.violations = list(retain_violations((*self.violations, violation)))
         self._index += 1
         return request
 

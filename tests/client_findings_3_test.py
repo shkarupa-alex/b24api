@@ -650,7 +650,10 @@ async def test_fixed_step_ignores_relative_next_and_exact_total_can_terminate() 
 
 
 @pytest.mark.asyncio
-async def test_fixed_step_rejects_rows_after_a_short_unqualified_window() -> None:
+@pytest.mark.parametrize("second_page", [[{"ID": 2}], []])
+async def test_fixed_step_rejects_any_closure_after_a_short_unqualified_window(
+    second_page: list[dict[str, int]],
+) -> None:
     step = 2
 
     def handler(request: Request) -> WireResponse:
@@ -658,7 +661,7 @@ async def test_fixed_step_rejects_rows_after_a_short_unqualified_window() -> Non
         if start == 0:
             return _response([{"ID": 1}])
         if start == step:
-            return _response([{"ID": 2}])
+            return _response(second_page)
         raise AssertionError("fixed-step traversal used an undeclared offset")
 
     transport = _Transport(handler)
@@ -673,8 +676,35 @@ async def test_fixed_step_rejects_rows_after_a_short_unqualified_window() -> Non
         await anext(stream)
 
     assert isinstance(captured.value.__cause__, PaginationError)
-    assert "rows after a short" in str(captured.value.__cause__)
+    assert "cannot prove closure after a short page" in str(captured.value.__cause__)
     assert [request.copy_parameters()["start"] for request in transport.requests] == [0, step]
+
+
+@pytest.mark.asyncio
+async def test_reference_fixed_step_rejects_empty_closure_after_a_short_window() -> None:
+    step = 2
+
+    def handler(request: Request) -> WireResponse:
+        start = request.copy_parameters().get("start", 0)
+        return _response([{"ID": 1}]) if start == 0 else _response([])
+
+    stream = _client(_Transport(handler)).iter_reference_outcomes(
+        Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        [Binding("one", (), object())],
+        traversal=SequentialTraversal(
+            page_size=step,
+            offset=OffsetSpec(continuation=OffsetContinuation.FIXED_STEP, step=step),
+        ),
+        dispatch=DirectDispatch(concurrency=1),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+    failure = outcomes[-1]
+    assert isinstance(failure, ReferenceFailure)
+    assert isinstance(failure.error, IncompleteTraversalError)
+    assert isinstance(failure.error.__cause__, PaginationError)
+    assert "cannot prove closure after a short page" in str(failure.error.__cause__)
+    assert not stream.report.exhausted
 
 
 @pytest.mark.asyncio
@@ -759,13 +789,14 @@ async def test_page_index_rejects_rows_after_a_short_window_in_direct_and_refere
 def test_counted_rejects_inconsistent_or_wire_limited_page_stride_before_io() -> None:
     transport = _Transport(lambda _request: pytest.fail("invalid counted stride must reject before I/O"))
     client = _client(transport)
-    mismatched = OffsetSpec(
-        limit_path=ParameterPath(("limit",)),
-        continuation=OffsetContinuation.FIXED_STEP,
-        step=PAGE_SIZE,
-        total_termination=TotalTermination.EXACT_QUALIFIED,
-        page_stride=PageStride(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE // 2),
-    )
+    with pytest.raises(ValueError, match="decoded row cap must equal"):
+        OffsetSpec(
+            limit_path=ParameterPath(("limit",)),
+            continuation=OffsetContinuation.FIXED_STEP,
+            step=PAGE_SIZE,
+            total_termination=TotalTermination.EXACT_QUALIFIED,
+            page_stride=PageStride(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE // 2),
+        )
     wire_limited = OffsetSpec(
         limit_path=ParameterPath(("limit",)),
         continuation=OffsetContinuation.FIXED_STEP,
@@ -774,46 +805,33 @@ def test_counted_rejects_inconsistent_or_wire_limited_page_stride_before_io() ->
         page_stride=PageStride(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE, requested_wire_limit=PAGE_SIZE * 2),
     )
 
-    with pytest.raises(ValueError, match="max_decoded_rows"):
-        client.iter_list_counted(Request("example.list", route=RouteKind.BARE), page_size=PAGE_SIZE, offset=mismatched)
     with pytest.raises(ValueError, match="requested_wire_limit"):
         client.iter_list_counted(
             Request("example.list", route=RouteKind.BARE),
             page_size=PAGE_SIZE,
             offset=wire_limited,
         )
-    with pytest.raises(ValueError, match="max_decoded_rows"):
-        CountedTraversal(page_size=PAGE_SIZE, offset=mismatched)
     with pytest.raises(ValueError, match="requested_wire_limit"):
         CountedTraversal(page_size=PAGE_SIZE, offset=wire_limited)
     assert transport.requests == []
 
 
-def test_sequential_stride_requires_an_explicit_distinct_wire_limit_before_io() -> None:
-    transport = _Transport(lambda _request: pytest.fail("invalid stride must reject before I/O"))
-    client = _client(transport)
-    offset = OffsetSpec(
-        limit_path=ParameterPath(("limit",)),
-        continuation=OffsetContinuation.FIXED_STEP,
-        step=PAGE_SIZE,
-        page_stride=PageStride(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE // 2),
-    )
-
-    with pytest.raises(ValueError, match="requested wire limit is required"):
-        client.iter_list(
-            Request("example.list", route=RouteKind.BARE),
-            page_size=PAGE_SIZE // 2,
-            offset=offset,
+@pytest.mark.parametrize("requested_wire_limit", [None, PAGE_SIZE])
+def test_ordinary_sequential_stride_rejects_a_decoded_subwindow(
+    requested_wire_limit: int | None,
+) -> None:
+    with pytest.raises(ValueError, match="decoded row cap must equal the wire increment"):
+        OffsetSpec(
+            limit_path=ParameterPath(("limit",)),
+            continuation=OffsetContinuation.FIXED_STEP,
+            step=PAGE_SIZE,
+            page_stride=PageStride(
+                PAGE_SIZE,
+                PAGE_SIZE,
+                PAGE_SIZE // 2,
+                requested_wire_limit=requested_wire_limit,
+            ),
         )
-    with pytest.raises(ValueError, match="requested wire limit is required"):
-        client.iter_reference_outcomes(
-            Request("example.list", route=RouteKind.BARE),
-            [Binding("one", (), object())],
-            traversal=SequentialTraversal(page_size=PAGE_SIZE // 2, offset=offset),
-            dispatch=DirectDispatch(concurrency=1),
-        )
-
-    assert transport.requests == []
 
 
 def test_page_stride_rejects_an_explicit_subwindow_wire_limit() -> None:
@@ -827,7 +845,7 @@ def test_page_stride_rejects_an_explicit_subwindow_wire_limit() -> None:
 
 
 def test_ordinary_page_stride_rejects_overlapping_decoded_windows() -> None:
-    with pytest.raises(ValueError, match="decoded row cap cannot exceed the wire increment"):
+    with pytest.raises(ValueError, match="decoded row cap must equal the wire increment"):
         OffsetSpec(
             limit_path=ParameterPath(("limit",)),
             continuation=OffsetContinuation.FIXED_STEP,

@@ -324,7 +324,8 @@ class LogicalBatchKernelStream[C]:
                     raise InputSourceError("Logical batch input source failed") from chunk.source_error
                 for command in chunk.commands:
                     self._completion.binding(command.index).scheduled()
-                self._batch_requests += 1
+                if self._batch_executor._will_dispatch_commands(chunk.commands, halt=self._fail_fast):
+                    self._batch_requests += 1
                 self._batch_commands += len(chunk.commands)
                 kernel = await self._batch_executor._execute_chunk(
                     chunk.commands,

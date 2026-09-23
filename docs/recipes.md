@@ -57,6 +57,8 @@ the first pull completes the planning barrier before yielding rows.
 
 <!-- tested: tests/keyset_fast_test.py::test_explicit_modes_match_sparse_ordered_oracle -->
 ```python
+import os
+
 from b24api import (
     IdentityCoercion,
     IdentitySpec,
@@ -73,25 +75,23 @@ keyset = KeysetSpec(
     order_path=ParameterPath(("order",)),
 )
 
+if os.environ.get("ENV") != "PROD":
+    # Accepting an ID filter does not prove strict bounds or ordering.
+    await client.verify_keyset_capability(
+        request,
+        selector=ResultSelector.root(),
+        identity=identity,
+        page_size=50,
+        keyset=keyset,
+    )
+
 stream = client.iter_list_keyset(
     request,
     selector=ResultSelector.root(),
     identity=identity,
+    page_size=50,
     keyset=keyset,
     execution=RangeKeysetExecution(contract=StableIntegerKeysetContract()),
-)
-```
-
-Run the explicit development guard before relying on strict bounds:
-
-```python
-from b24api import ResultSelector
-
-report = await client.verify_keyset_capability(
-    request,
-    selector=ResultSelector.root(),
-    identity=identity,
-    keyset=keyset,
 )
 ```
 

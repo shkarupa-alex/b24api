@@ -109,8 +109,8 @@ class _SequentialMixin:
             items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
-                if pending_short_window and items:
-                    raise PaginationError("fixed-step traversal observed rows after a short non-terminal page")
+                if pending_short_window and (items or not plan.allow_empty_after_short_window):
+                    raise PaginationError("fixed-step traversal cannot prove closure after a short page")
                 if sparse is None:
                     terminal = _offset_terminal(
                         plan,

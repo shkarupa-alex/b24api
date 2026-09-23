@@ -47,7 +47,7 @@ reason; it is never reported as a passing LIVE claim.
 | 14 | [requisite_links](requisite_links.py) | passing | not recorded | 582 composite keys, exact direct/batch windows, truncated 400-row tail rejected |
 | 15 | [disk_mirror](disk_mirror.py) | passing | not recorded | Two roots, four counted folders, 53-row batch tail, link deduplication and cycle guard |
 | 16 | [binary_download](binary_download.py) | passing | not recorded | Exact PDF/file bytes and media types; denied JSON remains `ApiResponseError` |
-| 17 | [numerator_list](numerator_list.py) | passing | not recorded | Fixed offsets 0/50/100; 53 IDs despite page-local totals |
+| 17 | [numerator_list](numerator_list.py) | passing | not recorded | Fixed offsets 0/50/100; 53 IDs observed, then fail-closed without qualified closure |
 | 18 | [content_viewers](content_viewers.py) | passing | not recorded | Direct nested `params`, paged `items`, ordinary user mapping and guarded empty success |
 | 19 | [v3_task_results](v3_task_results.py) | passing | not recorded | Exact task result ID, object-valued validation error, unchanged failed-parent checkpoint |
 

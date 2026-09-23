@@ -145,6 +145,23 @@ async def test_non_bare_inner_command_is_correlated_rejection_before_batch_dispa
     assert isinstance(outcomes[1], BatchSuccess)
     assert len(transport.requests) == 1
     assert transport.requests[0].route is RouteKind.BARE
+    assert stream.report.batch_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_fully_rejected_window_does_not_count_a_physical_batch_request() -> None:
+    transport = CallbackTransport(_echo_batch)
+    stream = BatchExecutor(Executor(transport))._outcomes(
+        [Request("im.v2.Chat.Message.CommentInfo.list", route=RouteKind.JSON)],
+    )
+
+    outcomes = [item async for item in stream]
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], BatchFailure)
+    assert transport.requests == []
+    assert stream.report.physical_requests == 0
+    assert stream.report.batch_requests == 0
 
 
 @pytest.mark.asyncio

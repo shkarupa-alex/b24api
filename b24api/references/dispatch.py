@@ -581,11 +581,12 @@ class _BatchPageDispatcher:
         return admitted + admitting + continuations + pending_pull + settling_admission
 
     async def _send(self, chunk: list[_PendingBatch]) -> None:
-        self.batch_requests += 1
+        requests = tuple(item.request for item in chunk)
+        self.batch_requests += int(self._executor._will_dispatch_requests(requests))  # noqa: SLF001
         self.batch_commands += len(chunk)
         try:
             outcomes = await self._executor.execute_requests(
-                tuple(item.request for item in chunk),
+                requests,
                 context=self.context,
             )
         except asyncio.CancelledError:

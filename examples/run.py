@@ -68,7 +68,7 @@ SCENARIOS = (
     Scenario(14, "requisite_links", "EXPECTED_KEYS", "completed", "identity_and_count_matched"),
     Scenario(15, "disk_mirror", "EXPECTED_OBJECT_IDS", "completed", "identity_and_count_matched"),
     Scenario(16, "binary_download", "EXPECTED_PDF", "not_applicable", "not_applicable"),
-    Scenario(17, "numerator_list", "EXPECTED_IDS", "completed", "mechanics_only"),
+    Scenario(17, "numerator_list", "EXPECTED_IDS", "incomplete", "mechanics_only"),
     Scenario(18, "content_viewers", "EXPECTED_EXTRANET_IDS", "completed", "mechanics_only"),
     Scenario(19, "v3_task_results", "EXPECTED_RESULT_IDS", "not_applicable", "not_applicable"),
 )

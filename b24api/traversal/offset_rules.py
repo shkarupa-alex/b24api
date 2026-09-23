@@ -63,6 +63,7 @@ def sequential_offset_plan(
             if stride is not None
             else offset.step
         ),
+        allow_empty_after_short_window=page_index is not None,
         terminal=offset_terminal_rules(offset),
         allow_create_controls=offset.allow_create_controls,
         identity_requirement=IdentityRequirement.OPTIONAL,

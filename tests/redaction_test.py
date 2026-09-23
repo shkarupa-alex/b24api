@@ -35,6 +35,12 @@ def test_redactor_covers_nested_and_textual_credential_forms() -> None:
     assert redacted["nested"]["token"] == REDACTED
 
 
+def test_redactor_covers_v3_webhook_urls() -> None:
+    value = f"https://portal.invalid/rest/api/1/{EXAMPLE_CREDENTIAL}/method"
+
+    assert EXAMPLE_CREDENTIAL not in Redactor().redact_text(value)
+
+
 def test_redactor_supports_configured_paths_and_pii_fields() -> None:
     redactor = Redactor(
         secret_paths=(("payload", "custom"),),

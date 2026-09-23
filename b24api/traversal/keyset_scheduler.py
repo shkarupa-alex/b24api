@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from b24api.completion.fast_recorder import FastCompletionRecorder
+from b24api.contracts.completion import BindingClosure
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     ClosureWitness,
@@ -159,6 +160,7 @@ class KeysetFastScheduler:
         self._interior_estimate: int | None = None
         self._total_estimate: int | None = None
         self._selected_estimate: int | None = None
+        self._completion_witnesses = 0
         self._frozen_report: KeysetExecutionReport | None = None
 
     @property
@@ -170,6 +172,17 @@ class KeysetFastScheduler:
     def terminal(self) -> bool:
         """Return whether traversal has reached a terminal state."""
         return self.transactions.terminal
+
+    def completion_closure(self) -> tuple[BindingClosure | None, int]:
+        """Return scheduler-qualified evidence for one naturally completed plan."""
+        if not self.transactions.terminal:
+            return None, 0
+        if self._head_rows == 0:
+            return BindingClosure.SOURCE_EMPTY, 0
+        witnesses = sum(self.transactions.closures.values()) + self._completion_witnesses
+        if witnesses < 1:
+            return None, 0
+        return BindingClosure.KEYSET_PLAN_COVERED, witnesses
 
     def mark_emitted(self, count: int) -> None:
         """Record rows delivered to the caller."""

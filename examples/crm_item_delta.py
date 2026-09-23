@@ -54,16 +54,79 @@ def _request(border: str, cursor: int | None = None) -> Request:
     )
 
 
+def _verifier_request(
+    border: str,
+    direction: str,
+    lower: int | None,
+    upper: int | None,
+) -> Request:
+    filters: dict[str, object] = {
+        ">=updatedTime": border,
+        **({">id": lower} if lower is not None else {}),
+        **({"<id": upper} if upper is not None else {}),
+    }
+    return Request(
+        METHOD,
+        {
+            "entityTypeId": ENTITY_TYPE_ID,
+            "select": ["id", "updatedTime"],
+            "filter": filters,
+            "order": {"id": direction},
+            "start": -1,
+        },
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
+    )
+
+
+def _verifier_exchanges(border: str, rows: tuple[dict[str, object], ...]) -> tuple[ScriptedExchange, ...]:
+    identities = tuple(int(row["id"]) for row in rows)
+
+    def selected(direction: str, lower: int | None, upper: int | None) -> dict[str, object]:
+        values = tuple(
+            row
+            for row in rows
+            if (lower is None or int(row["id"]) > lower) and (upper is None or int(row["id"]) < upper)
+        )
+        return {"items": list(reversed(values)) if direction == "DESC" else list(values)}
+
+    low, high = min(identities), max(identities)
+    boundaries = (("ASC", None, None), ("DESC", None, None))
+    canaries = (
+        ("ASC", low - 1, low),
+        ("ASC", low, low + 1),
+        ("ASC", low - 1, low + 1),
+        ("ASC", low - 1, high + 1),
+        ("DESC", low - 1, high + 1),
+    )
+    return (
+        ScriptedExchange.batch(
+            tuple(_verifier_request(border, *control) for control in boundaries),
+            tuple(selected(*control) for control in boundaries),
+            total=len(rows),
+        ),
+        ScriptedExchange.batch(
+            tuple(_verifier_request(border, *control) for control in canaries),
+            tuple(selected(*control) for control in canaries),
+            total=len(rows),
+        ),
+    )
+
+
 def _fixture() -> ScriptedTransport:
+    initial_verifier = _verifier_exchanges(INITIAL_BORDER, INITIAL) if os.environ.get("ENV") != "PROD" else ()
+    delta_verifier = _verifier_exchanges(REPLAY_BORDER, DELTA) if os.environ.get("ENV") != "PROD" else ()
     return ScriptedTransport(
         (
             ScriptedExchange.json(
                 Request("crm.type.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
                 {"result": {"types": [{"title": "Mirror fixture", "entityTypeId": ENTITY_TYPE_ID}]}},
             ),
+            *initial_verifier,
             ScriptedExchange.json(_request(INITIAL_BORDER), {"result": {"items": list(INITIAL)}}),
             ScriptedExchange.json(_request(INITIAL_BORDER, 2), {"result": {"items": []}}),
             ScriptedExchange.json(_request(INITIAL_BORDER, 2), {"result": {"items": [DELTA[1]]}}),
+            *delta_verifier,
             ScriptedExchange.json(_request(REPLAY_BORDER), {"result": {"items": list(DELTA)}}),
             ScriptedExchange.json(_request(REPLAY_BORDER, 3), {"result": {"items": []}}),
         )

@@ -50,7 +50,7 @@ class CursorDomain(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class PageIndex:
-    """One-based or arbitrary page control independent of decoded row count."""
+    """One-based page control independent of decoded row count."""
 
     control_path: ParameterPath
     initial: int = 1
@@ -140,8 +140,8 @@ def _validate_offset_extensions(spec: OffsetSpec) -> None:  # noqa: C901 - close
             raise ValueError("page_stride cannot combine with page_index")
         if spec.continuation is not OffsetContinuation.FIXED_STEP or spec.step != spec.page_stride.wire_increment:
             raise ValueError("page_stride requires matching fixed-step continuation")
-        if spec.sparse_raw_bound is None and spec.page_stride.max_decoded_rows > spec.page_stride.wire_increment:
-            raise ValueError("ordinary page stride decoded row cap cannot exceed the wire increment")
+        if spec.sparse_raw_bound is None and spec.page_stride.max_decoded_rows != spec.page_stride.wire_increment:
+            raise ValueError("ordinary page stride decoded row cap must equal the wire increment")
     if spec.sparse_raw_bound is not None:
         if not isinstance(spec.sparse_raw_bound, SparseRawBound) or spec.page_stride != spec.sparse_raw_bound.stride:
             raise ValueError("sparse raw bound requires its declared page_stride")

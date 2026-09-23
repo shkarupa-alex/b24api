@@ -77,9 +77,9 @@ snapshot of a mutable source.
 When a stride's decoded row cap differs from its wire increment and the request owns a limit
 control, set `requested_wire_limit` explicitly to at least the wire increment. Construction now
 rejects an omitted or smaller value before I/O instead of leaving part of each wire window
-unrequested. For ordinary exact-total traversal, `max_decoded_rows` must not exceed the wire
-increment, which prevents overlapping windows from satisfying totals with duplicate rows. Sparse
-raw-bound traversal keeps its separate raw-range closure contract.
+unrequested. For ordinary traversal, `max_decoded_rows` must equal the wire increment, which
+prevents both skipped subwindows and overlapping windows from claiming completion. Sparse raw-bound
+traversal keeps its separate raw-range closure contract.
 
 The earlier 2.x keyset migration notes below remain as historical guidance for that API.
 
@@ -105,6 +105,7 @@ call; verification does not switch runtime mode and is not cached:
 import os
 
 if os.environ.get("ENV") != "PROD":
+    # Accepting an ID filter does not prove strict bounds or ordering.
     await api.verify_keyset_capability(
         request,
         selector=selector,
@@ -272,7 +273,18 @@ behavior is required, opt out per call. This performs the original sequential ke
 does not run the auto planning barrier:
 
 ```python
+import os
+
 from b24api import SequentialKeysetExecution
+
+if os.environ.get("ENV") != "PROD":
+    # Accepting an ID filter does not prove strict bounds or ordering.
+    await client.verify_keyset_capability(
+        request,
+        selector=selector,
+        identity=identity,
+        keyset=keyset,
+    )
 
 stream = client.iter_list_keyset(
     request,

@@ -19,6 +19,7 @@ from b24api.contracts.policy import (
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request, ResultSelector, RouteKind
 from b24api.contracts.response import Response, inject_controls
+from b24api.contracts.violation import MAX_RETAINED_VIOLATIONS, retain_violations
 from b24api.errors import BudgetExceededError
 from b24api.execution.snapshot import KernelReport
 from b24api.references.outcome import ReferenceFailure, ReferenceItem, ReferenceRequest
@@ -26,6 +27,7 @@ from b24api.references.outcome import ReferenceFailure, ReferenceItem, Reference
 EXAMPLE_CREDENTIAL = "n1x2y3z4q5w6e7r8"
 TEST_LIMIT = 2
 TEST_CURSOR = 99
+EXCESS_VIOLATIONS = 140
 
 
 def _identity_list(parameters: Mapping[str, JsonValue]) -> list[JsonValue]:
@@ -225,6 +227,20 @@ def test_report_is_frozen_and_completion_rejects_blocking_violation() -> None:
                 ),
             ),
         )
+
+
+def test_violation_retention_is_bounded_and_preserves_a_late_blocking_cause() -> None:
+    warnings = tuple(
+        Violation(ViolationSeverity.WARNING, f"warning_{index}", "bounded warning")
+        for index in range(EXCESS_VIOLATIONS)
+    )
+    blocking = Violation(ViolationSeverity.BLOCKING, "late_blocking", "late blocking cause")
+
+    retained = retain_violations((*warnings, blocking))
+
+    assert len(retained) == MAX_RETAINED_VIOLATIONS
+    assert blocking in retained
+    assert retained[-1].code == "violations_truncated"
 
 
 def test_failure_repr_excludes_request_error_and_payload_values() -> None:

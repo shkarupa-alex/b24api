@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import logging
+import re
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -13,14 +14,25 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 _LOGGER = logging.getLogger("httpx")
-_ACTIVE_URL: ContextVar[str | None] = ContextVar("b24api_httpx_url", default=None)
+_ACTIVE_CREDENTIALS: ContextVar[tuple[str, ...] | None] = ContextVar("b24api_httpx_credentials", default=None)
 _REPLACEMENT = "[REDACTED]"
+_CREDENTIAL_PATH = re.compile(r"/rest/(?:api/)?[^/]+/([^/]+)/", re.IGNORECASE)
 
 
-def _redact_owned_url(value: object, url: str) -> object:
+def _credentials(url: str) -> tuple[str, ...]:
+    """Extract the credential segment shared by classic and V3 method URLs."""
+    match = _CREDENTIAL_PATH.search(url)
+    if match is None or not match.group(1):
+        raise ValueError("HTTPX log shield requires a credentialed Bitrix method URL")
+    return (match.group(1),)
+
+
+def _redact_owned_value(value: object, credentials: tuple[str, ...]) -> object:
     rendered = str(value)
-    if isinstance(value, str) or url in rendered:
-        return DEFAULT_REDACTOR.redact_text(rendered.replace(url, _REPLACEMENT))
+    if any(credential in rendered for credential in credentials):
+        for credential in credentials:
+            rendered = rendered.replace(credential, _REPLACEMENT)
+        return DEFAULT_REDACTOR.redact_text(rendered)
     return value
 
 
@@ -28,21 +40,22 @@ class _OwnedRequestFilter(logging.Filter):
     """Rewrite only a record emitted while this task sends its registered URL."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        url = _ACTIVE_URL.get()
-        if url is None:
+        credentials = _ACTIVE_CREDENTIALS.get()
+        if credentials is None:
             return True
         args = record.args
         values = args.values() if isinstance(args, dict) else args if isinstance(args, tuple) else ()
-        if url not in str(record.msg) and not any(url in str(value) for value in values):
+        extras = tuple(record.__dict__.get(name) for name in ("url", "request_url"))
+        if not any(credential in str(value) for credential in credentials for value in (record.msg, *values, *extras)):
             return True
-        record.msg = _redact_owned_url(record.msg, url)
+        record.msg = _redact_owned_value(record.msg, credentials)
         if isinstance(args, dict):
-            record.args = {key: _redact_owned_url(value, url) for key, value in args.items()}
+            record.args = {key: _redact_owned_value(value, credentials) for key, value in args.items()}
         elif isinstance(args, tuple):
-            record.args = tuple(_redact_owned_url(value, url) for value in args)
+            record.args = tuple(_redact_owned_value(value, credentials) for value in args)
         for name in ("url", "request_url"):
             if name in record.__dict__:
-                record.__dict__[name] = _redact_owned_url(record.__dict__[name], url)
+                record.__dict__[name] = _redact_owned_value(record.__dict__[name], credentials)
         return True
 
 
@@ -78,11 +91,11 @@ class HttpxLogShield:
                 raise RuntimeError("HTTPX log shield has no registered transport")
             self._in_flight += 1
             self._ensure_installed()
-        token = _ACTIVE_URL.set(url)
+        token = _ACTIVE_CREDENTIALS.set(_credentials(url))
         try:
             yield
         finally:
-            _ACTIVE_URL.reset(token)
+            _ACTIVE_CREDENTIALS.reset(token)
             with self._lock:
                 self._in_flight -= 1
                 self._remove_if_idle()

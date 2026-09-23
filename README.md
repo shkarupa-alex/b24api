@@ -266,17 +266,33 @@ record the selected strategy and reason: unbounded auto continuation has the sam
 
 <!-- tested: tests/keyset_fast_test.py::test_omitted_execution_defaults_to_auto -->
 ```python
-from b24api import RouteKind
-from b24api import KeysetSpec, ParameterPath
+import os
+
+from b24api import KeysetSpec, ParameterPath, ReplaySafety, Request, ResultSelector, RouteKind
+
+request = Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+selector = ResultSelector(("items",))
+keyset = KeysetSpec(
+    filter_path=ParameterPath(("filter",)),
+    order_path=ParameterPath(("order",)),
+)
+
+if os.environ.get("ENV") != "PROD":
+    # Accepting an ID filter does not prove strict bounds or ordering.
+    await client.verify_keyset_capability(
+        request,
+        selector=selector,
+        identity=identity,
+        page_size=50,
+        keyset=keyset,
+    )
 
 stream = client.iter_list_keyset(
-    Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
-    selector=ResultSelector(("items",)),
+    request,
+    selector=selector,
     identity=identity,
-    keyset=KeysetSpec(
-        filter_path=ParameterPath(("filter",)),
-        order_path=ParameterPath(("order",)),
-    ),
+    page_size=50,
+    keyset=keyset,
 )
 ```
 

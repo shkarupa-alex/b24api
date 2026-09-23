@@ -14,7 +14,7 @@ from b24api.contracts.keyset_execution import (
     KeysetSelectionReason,
     TraceClass,
 )
-from b24api.contracts.violation import Violation, ViolationSeverity
+from b24api.contracts.violation import Violation, ViolationSeverity, retain_violations
 
 
 class TerminalState(StrEnum):
@@ -312,7 +312,7 @@ class OperationReport:
             raise ValueError("report counters must be non-negative integers")
         if not math.isfinite(self.cooldown_seconds) or self.cooldown_seconds < 0:
             raise ValueError("cooldown_seconds must be finite and non-negative")
-        object.__setattr__(self, "violations", tuple(self.violations))
+        object.__setattr__(self, "violations", retain_violations(self.violations))
         object.__setattr__(self, "page_trace", tuple(self.page_trace))
         if any(not isinstance(record, PageRecord) for record in self.page_trace):
             raise TypeError("page_trace must contain PageRecord values")

@@ -12,6 +12,7 @@ from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.page_stop import CallerStop, ContinuePage, PageBoundary, PageStopPolicy
 from b24api.contracts.report import PageDispatch, PageRecord, Violation, ViolationSeverity, retain_page_trace
 from b24api.contracts.request import ReplaySafety, Request, ResultSelector, TraversalIdentity
+from b24api.contracts.violation import retain_violations
 from b24api.errors import AmbiguousExecutionError, ApiResponseError, BudgetExceededError, CapabilityError
 from b24api.execution import (
     AsyncIteratorController,
@@ -605,7 +606,7 @@ class ReferenceScheduler:
         await producer
 
     def _record_event_violations(self, event: _Event) -> None:
-        self.violations.extend(event.violations)
+        self.violations = list(retain_violations((*self.violations, *event.violations)))
         combined = tuple(sorted((*self.page_trace, *event.page_records), key=lambda record: record.sequence))
         retained, truncated = retain_page_trace(combined, self.context.policy.page_trace_limit)
         self.page_trace[:] = retained
@@ -685,14 +686,13 @@ class ReferenceScheduler:
             if self.capture_fail_fast:
                 raise _ReferenceWindowError(failure)
             raise event.error
-        self.violations.append(
-            Violation(
-                ViolationSeverity.WARNING,
-                "reference_failure",
-                "one reference produced a typed failure outcome",
-                replay_disposition=event.replay_disposition,
-            ),
+        violation = Violation(
+            ViolationSeverity.WARNING,
+            "reference_failure",
+            "one reference produced a typed failure outcome",
+            replay_disposition=event.replay_disposition,
         )
+        self.violations[:] = retain_violations((*self.violations, violation))
         yield failure
 
     def record_delivery(self, item: ReferenceItem) -> bool:

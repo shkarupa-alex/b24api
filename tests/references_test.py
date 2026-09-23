@@ -57,6 +57,8 @@ TWO_REFERENCES = 2
 EXPECTED_LOGICAL_PAGES = 4
 CLEANUP_TEST_TIMEOUT = 0.2
 PULL_TEST_TIMEOUT = 0.15
+REFERENCE_FAILURE_COUNT = 140
+RETAINED_VIOLATION_LIMIT = 128
 
 
 class AsyncFunctionTransport:
@@ -200,6 +202,35 @@ async def test_reference_bindings_share_one_operation_identity_budget() -> None:
     assert len({item.reference_key for item in items}) == 1
     assert len(failures) == 1
     assert isinstance(failures[0].error, BudgetExceededError)
+
+
+@pytest.mark.asyncio
+async def test_reference_failure_violations_are_bounded_without_losing_outcomes() -> None:
+    transport = AsyncFunctionTransport(
+        lambda _request: {"error": "ACCESS_DENIED", "error_description": "denied"},
+    )
+    stream = iter_references(
+        Executor(transport),
+        (_reference(str(index)) for index in range(REFERENCE_FAILURE_COUNT)),
+        plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
+        dispatch=DirectDispatch(concurrency=1),
+        identity=_identity(),
+        tolerant=True,
+        policy=ExecutionPolicy(
+            max_active_references=1,
+            max_buffered_rows=1,
+            max_pages=REFERENCE_FAILURE_COUNT,
+            max_requests=REFERENCE_FAILURE_COUNT,
+        ),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == REFERENCE_FAILURE_COUNT
+    assert all(isinstance(outcome, ReferenceFailure) for outcome in outcomes)
+    assert len(stream.report.violations) <= RETAINED_VIOLATION_LIMIT
+    assert stream.report.violations[-1].code == "violations_truncated"
 
 
 @pytest.mark.asyncio
@@ -780,6 +811,28 @@ async def test_tolerant_batch_chunk_protocol_failure_yields_every_reference() ->
     assert all(isinstance(outcome, ReferenceFailure) for outcome in outcomes)
     assert {outcome.reference_key for outcome in outcomes} == {"a", "b"}
     assert stream.report.emitted_rows == 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_reference_batch_does_not_count_a_physical_batch_request() -> None:
+    transport = AsyncFunctionTransport(lambda _request: pytest.fail("unsupported batch must not be sent"))
+    stream = iter_references(
+        Executor(transport),
+        [ReferenceRequest(Request("crm.item.list", route=RouteKind.JSON), "bad")],
+        plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
+        dispatch=BatchDispatch(),
+        identity=_identity(),
+        tolerant=True,
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], ReferenceFailure)
+    assert transport.requests == []
+    assert stream.report.physical_requests == 0
+    assert stream.report.batch_requests == 0
 
 
 @pytest.mark.asyncio

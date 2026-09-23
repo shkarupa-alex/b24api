@@ -132,8 +132,16 @@ def validate_fast_keyset(  # noqa: C901, PLR0912, PLR0913
         raise CapabilityError("exact-boundary completion is not qualified for fast or auto keyset execution")
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         raise ValueError("page_size must be a positive integer")
-    if request.route is not RouteKind.BARE or request.encoding is not BodyEncoding.JSON or request.headers.items:
-        raise CapabilityError("fast keyset traversal supports JSON requests without scoped headers")
+    if (
+        request.route is not RouteKind.BARE
+        or request.encoding is not BodyEncoding.JSON
+        or request.headers.items
+        or request.positional is not None
+    ):
+        raise CapabilityError(
+            "fast keyset traversal supports named BARE JSON requests without scoped headers; "
+            "use SequentialKeysetExecution for positional requests"
+        )
     if identity.coercion not in {IdentityCoercion.EXACT_INTEGER, IdentityCoercion.DECIMAL_STRING_INTEGER}:
         raise CapabilityError("fast keyset traversal requires integer identity coercion")
     consistency = policy.consistency

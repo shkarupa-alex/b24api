@@ -297,11 +297,14 @@ class KeysetFastStream:
             if any(violation.code == "cleanup_failure" for violation in self._scheduler.violations)
             else CleanupState.SUCCESS
         )
+        closure, qualified_witnesses = self._scheduler.completion_closure()
         self._scheduler.completion_recorder.terminal(
             state,
             rows_emitted=counters.emitted_rows,
             rows_admitted=counters.admitted_rows,
             cleanup=cleanup,
+            closure=closure,
+            qualified_witnesses=qualified_witnesses,
         )
 
 

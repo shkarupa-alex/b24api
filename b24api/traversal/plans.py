@@ -115,6 +115,7 @@ class OffsetSequentialPlan(PlanContract):
     sparse_raw_bound: SparseRawBound | None = None
     page_stride: PageStride | None = None
     short_page_width: int | None = None
+    allow_empty_after_short_window: bool = False
 
     def __post_init__(self) -> None:  # noqa: C901
         """Validate and normalize instance state."""
@@ -156,6 +157,8 @@ class OffsetSequentialPlan(PlanContract):
             or self.short_page_width < 1
         ):
             raise ValueError("short_page_width requires fixed-step continuation and a positive width")
+        if not isinstance(self.allow_empty_after_short_window, bool):
+            raise TypeError("allow_empty_after_short_window must be a boolean")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

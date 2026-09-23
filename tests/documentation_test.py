@@ -43,6 +43,18 @@ def test_docs_are_flat_compact_and_linked_from_readme() -> None:
     assert MIGRATION.is_file()
 
 
+def test_every_documented_keyset_traversal_keeps_the_non_production_guard_beside_it() -> None:
+    for path in (README, DOCS / "recipes.md", MIGRATION):
+        for source in PYTHON_BLOCK.findall(path.read_text(encoding="utf-8")):
+            traversal = source.find("iter_list_keyset(")
+            if traversal < 0:
+                continue
+            verifier = source.find("verify_keyset_capability(")
+            assert 'os.environ.get("ENV") != "PROD"' in source
+            assert "Accepting an ID filter does not prove strict bounds or ordering." in source
+            assert 0 <= verifier < traversal
+
+
 def test_user_documentation_contains_no_internal_issue_identifiers() -> None:
     text = "\n".join(
         path.read_text(encoding="utf-8")

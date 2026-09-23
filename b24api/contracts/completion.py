@@ -24,6 +24,7 @@ class BindingClosure(StrEnum):
     RAW_RANGE_COVERED = "raw_range_covered"
     SINGLE_RESPONSE = "single_response"
     BOUNDARY_SEEN = "boundary_seen"
+    KEYSET_PLAN_COVERED = "keyset_plan_covered"
     CALLER_STOP = "caller_stop"
     FAILURE = "failure"
     UNKNOWN = "unknown"
@@ -125,6 +126,7 @@ class BindingTerminal(CompletionEvent):
     binding_id: int
     closure: BindingClosure
     qualified_total: int | None = None
+    qualified_witnesses: int | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

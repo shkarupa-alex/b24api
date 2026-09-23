@@ -68,15 +68,19 @@ class _LegacyKeysetTransport:
         return None
 
 
-def test_task_comments_recipe_uses_correlated_batch_and_legacy_slots() -> None:
+@pytest.mark.parametrize("environment", [None, "PROD"])
+def test_task_comments_recipe_uses_correlated_batch_and_legacy_slots(environment: str | None) -> None:
     root = Path(__file__).resolve().parents[2]
+    env = {key: value for key, value in os.environ.items() if key != "ENV"}
+    if environment is not None:
+        env["ENV"] = environment
     result = subprocess.run(
         [sys.executable, "-m", "examples.task_comments"],
         cwd=root,
         check=False,
         capture_output=True,
         text=True,
-        env={**os.environ, "ENV": "PROD"},
+        env=env,
     )
     assert result.returncode == 0, result.stderr
 
@@ -173,5 +177,31 @@ async def test_positional_keyset_verifier_rejects_unrelated_order_before_io() ->
                     start_suppression_path=None,
                 ),
             )
+
+    assert transport.requests == []
+
+
+def test_positional_keyset_auto_rejects_synchronously_before_io() -> None:
+    transport = _LegacyKeysetTransport()
+    settings = task_comments.Settings(webhook_url="https://fixture.invalid/rest/1/test/")
+    client = task_comments.Bitrix24(settings, transport=transport)
+
+    with pytest.raises(CapabilityError, match="SequentialKeysetExecution"):
+        client.iter_list_keyset(
+            task_comments._legacy_request(),  # noqa: SLF001
+            selector=task_comments.ResultSelector.root(),
+            identity=task_comments.IdentitySpec(
+                ("ID",),
+                "ID",
+                "ID",
+                task_comments.IdentityCoercion.DECIMAL_STRING_INTEGER,
+            ),
+            page_size=2,
+            keyset=task_comments.KeysetSpec(
+                filter_path=task_comments.ParameterPath((2,)),
+                order_path=task_comments.ParameterPath((1,)),
+                start_suppression_path=None,
+            ),
+        )
 
     assert transport.requests == []
