@@ -14,8 +14,14 @@ request counts, bounded-resource high-water counters, and `provenance=fixture`.
 To validate separately recorded disposable-portal results, pass
 `--live-evidence path/to/evidence.jsonl`. Accepted rows must match the exact
 client and method-card SHAs, independent oracle, report state, request counters,
-and a non-empty disposable-fixture ID. Missing LIVE evidence exits with status 3
-and a reason; it is never reported as a passing LIVE claim.
+and a non-empty disposable-fixture ID. They also carry an authenticated
+`b24api-live-capture-v1` block with a timestamp, non-reversible portal
+fingerprint, and one method/status/response-digest entry per physical request.
+Set `B24API_LIVE_EVIDENCE_ATTESTATION_KEY` to the same independent recorder key
+used to create the HMAC-SHA256 attestation. A fixture summary with its provenance
+label changed to `live` has neither that capture detail nor a valid attestation
+and is rejected. Missing LIVE evidence exits with status 3 and a reason; it is
+never reported as a passing LIVE claim.
 
 | Scenario | Recipe | Offline | LIVE | Offline oracle |
 | --- | --- | --- | --- | --- |

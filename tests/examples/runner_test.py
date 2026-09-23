@@ -1,7 +1,10 @@
 """The shared recipe runner emits bound structured evidence and fails closed for LIVE."""
 
 from __future__ import annotations
+import hashlib
+import hmac
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +17,7 @@ from examples._support.evidence import RecipeEvidence
 ROOT = Path(__file__).resolve().parents[2]
 LIVE_SKIPPED = 3
 SCENARIO_COUNT = 19
+LIVE_KEY = "test-live-evidence-attestation-key-32-bytes"
 
 
 def _offline_record(scenario: int = 1) -> dict[str, object]:
@@ -23,14 +27,47 @@ def _offline_record(scenario: int = 1) -> dict[str, object]:
         check=True,
         capture_output=True,
         text=True,
+        env=_live_env(),
     )
     return json.loads(result.stdout)
 
 
 def _live_record() -> dict[str, object]:
     record = _offline_record()
-    record.update({"provenance": "live", "fixture_id": "disposable-portal-fixture-1"})
+    physical_requests = record["physical_requests"]
+    logical_requests = record["logical_requests"]
+    assert isinstance(physical_requests, int)
+    assert isinstance(logical_requests, int)
+    requests = [
+        {
+            "method": f"captured.method.{index}",
+            "http_status": 200,
+            "logical_requests": logical_requests - physical_requests + 1 if index == 0 else 1,
+            "response_sha256": hashlib.sha256(f"response-{index}".encode()).hexdigest(),
+        }
+        for index in range(physical_requests)
+    ]
+    fixture_id = "disposable-portal-fixture-1"
+    record.update(
+        {
+            "provenance": "live",
+            "fixture_id": fixture_id,
+            "capture": {
+                "kind": "b24api-live-capture-v1",
+                "captured_at": "2026-09-23T12:00:00+00:00",
+                "portal_fingerprint": hashlib.sha256(b"disposable-portal").hexdigest(),
+                "fixture_id": fixture_id,
+                "requests": requests,
+            },
+        },
+    )
+    digest = hmac.new(LIVE_KEY.encode(), recipe_runner._live_attestation_payload(record), hashlib.sha256).hexdigest()  # noqa: SLF001
+    record["attestation"] = f"hmac-sha256:{digest}"
     return record
+
+
+def _live_env() -> dict[str, str]:
+    return {**os.environ, recipe_runner.LIVE_ATTESTATION_KEY_ENV: LIVE_KEY}
 
 
 def test_offline_runner_emits_required_structured_summary() -> None:
@@ -40,6 +77,7 @@ def test_offline_runner_emits_required_structured_summary() -> None:
         check=False,
         capture_output=True,
         text=True,
+        env=_live_env(),
     )
     assert result.returncode == 0, result.stderr
     summary = json.loads(result.stdout)
@@ -93,10 +131,55 @@ def test_live_runner_accepts_only_a_fully_bound_consistent_record(tmp_path: Path
         check=False,
         capture_output=True,
         text=True,
+        env=_live_env(),
     )
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == record
+
+
+def test_live_runner_rejects_a_relabelled_offline_summary(tmp_path: Path) -> None:
+    record = _offline_record()
+    record.update({"provenance": "live", "fixture_id": "disposable-portal-fixture-1"})
+    evidence = tmp_path / "relabelled.jsonl"
+    evidence.write_text(json.dumps(record) + "\n")
+
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and repository module
+        [sys.executable, "-m", "examples.run", "--scenario", "1", "--live-evidence", str(evidence)],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_live_env(),
+    )
+
+    assert result.returncode != 0
+    assert "missing required fields" in result.stderr
+
+
+def test_live_runner_rejects_capture_modified_after_attestation(tmp_path: Path) -> None:
+    record = _live_record()
+    capture = record["capture"]
+    assert isinstance(capture, dict)
+    requests = capture["requests"]
+    assert isinstance(requests, list)
+    request = requests[0]
+    assert isinstance(request, dict)
+    request["method"] = "relabeled.offline.method"
+    evidence = tmp_path / "tampered.jsonl"
+    evidence.write_text(json.dumps(record) + "\n")
+
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and repository module
+        [sys.executable, "-m", "examples.run", "--scenario", "1", "--live-evidence", str(evidence)],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_live_env(),
+    )
+
+    assert result.returncode != 0
+    assert "no valid capture attestation" in result.stderr
 
 
 @pytest.mark.asyncio
@@ -140,6 +223,7 @@ def test_live_runner_rejects_contradictory_passing_evidence(
         check=False,
         capture_output=True,
         text=True,
+        env=_live_env(),
     )
 
     assert result.returncode != 0

@@ -8,12 +8,17 @@ The latter never contacts a portal implicitly and never promotes a missing fixtu
 from __future__ import annotations
 import argparse
 import asyncio
+import hashlib
+import hmac
 import importlib
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,6 +31,11 @@ if TYPE_CHECKING:
     from b24api import Request
 
 METHOD_CARD_SHA = "909c6bf14b29961a365dc6d6d4c2c47b5e2533d4"
+LIVE_ATTESTATION_KEY_ENV = "B24API_LIVE_EVIDENCE_ATTESTATION_KEY"
+MINIMUM_ATTESTATION_KEY_BYTES = 32
+MINIMUM_HTTP_STATUS = 100
+MAXIMUM_HTTP_STATUS = 599
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +170,66 @@ async def _offline(scenario: Scenario) -> dict[str, object]:
     }
 
 
+def _live_attestation_payload(record: dict[str, object]) -> bytes:
+    unsigned = {key: value for key, value in record.items() if key != "attestation"}
+    return json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def _validate_captured_requests(record: dict[str, object], requests: object, scenario: Scenario) -> None:
+    if not isinstance(requests, list) or len(requests) != record.get("physical_requests"):
+        raise ValueError(f"LIVE evidence for scenario {scenario.number} has inconsistent request capture")
+    logical_requests = 0
+    required = {"method", "http_status", "logical_requests", "response_sha256"}
+    for request in requests:
+        if not isinstance(request, dict) or set(request) != required:
+            raise ValueError(f"LIVE evidence for scenario {scenario.number} has invalid request capture")
+        method = request["method"]
+        status = request["http_status"]
+        logical = request["logical_requests"]
+        response_sha256 = request["response_sha256"]
+        if (
+            not isinstance(method, str)
+            or not method
+            or type(status) is not int
+            or not MINIMUM_HTTP_STATUS <= status <= MAXIMUM_HTTP_STATUS
+            or type(logical) is not int
+            or logical < 1
+            or not isinstance(response_sha256, str)
+            or _SHA256_RE.fullmatch(response_sha256) is None
+        ):
+            raise ValueError(f"LIVE evidence for scenario {scenario.number} has invalid request capture")
+        logical_requests += logical
+    if logical_requests != record.get("logical_requests"):
+        raise ValueError(f"LIVE evidence for scenario {scenario.number} has inconsistent logical request capture")
+
+
+def _validate_live_capture(record: dict[str, object], scenario: Scenario) -> None:
+    key = os.environ.get(LIVE_ATTESTATION_KEY_ENV)
+    if key is None or len(key.encode()) < MINIMUM_ATTESTATION_KEY_BYTES:
+        raise ValueError(f"LIVE evidence requires a 32-byte {LIVE_ATTESTATION_KEY_ENV}")
+    attestation = record.get("attestation")
+    expected = hmac.new(key.encode(), _live_attestation_payload(record), hashlib.sha256).hexdigest()
+    if not isinstance(attestation, str) or not hmac.compare_digest(attestation, f"hmac-sha256:{expected}"):
+        raise ValueError(f"LIVE evidence for scenario {scenario.number} has no valid capture attestation")
+    capture = record.get("capture")
+    required = {"kind", "captured_at", "portal_fingerprint", "fixture_id", "requests"}
+    if not isinstance(capture, dict) or set(capture) != required:
+        raise ValueError(f"LIVE evidence for scenario {scenario.number} has no verifiable capture detail")
+    if capture["kind"] != "b24api-live-capture-v1" or capture["fixture_id"] != record.get("fixture_id"):
+        raise ValueError(f"LIVE evidence for scenario {scenario.number} has inconsistent capture provenance")
+    captured_at = capture["captured_at"]
+    try:
+        timestamp = datetime.fromisoformat(captured_at) if isinstance(captured_at, str) else None
+    except ValueError as error:
+        raise ValueError(f"LIVE evidence for scenario {scenario.number} has an invalid capture timestamp") from error
+    if timestamp is None or timestamp.tzinfo is None:
+        raise ValueError(f"LIVE evidence for scenario {scenario.number} has an invalid capture timestamp")
+    fingerprint = capture["portal_fingerprint"]
+    if not isinstance(fingerprint, str) or _SHA256_RE.fullmatch(fingerprint) is None:
+        raise ValueError(f"LIVE evidence for scenario {scenario.number} has an invalid portal fingerprint")
+    _validate_captured_requests(record, capture["requests"], scenario)
+
+
 def _validate_live_record(record: object, scenario: Scenario, current_sha: str) -> dict[str, object]:
     required = {
         "scenario",
@@ -176,6 +246,8 @@ def _validate_live_record(record: object, scenario: Scenario, current_sha: str) 
         "active_references_high_water",
         "provenance",
         "fixture_id",
+        "capture",
+        "attestation",
         "status",
     }
     if not isinstance(record, dict) or required - record.keys():
@@ -214,6 +286,7 @@ def _validate_live_record(record: object, scenario: Scenario, current_sha: str) 
         raise ValueError(f"LIVE evidence for scenario {scenario.number} has no request evidence")
     if not isinstance(record["fixture_id"], str) or not record["fixture_id"].strip():
         raise ValueError(f"LIVE evidence for scenario {scenario.number} has no fixture provenance")
+    _validate_live_capture(record, scenario)
     return record
 
 

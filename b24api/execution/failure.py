@@ -100,9 +100,9 @@ def finalize_failure[R](
     failure = classify_failure(error)
     report_error = getattr(error, "report_cause", error)
     replay_disposition = getattr(
-        report_error,
+        error,
         "replay_disposition",
-        ReplayDisposition.NOT_ELIGIBLE,
+        getattr(report_error, "replay_disposition", ReplayDisposition.NOT_ELIGIBLE),
     )
     if isinstance(error, IncompleteTraversalError):
         report_error = error.error or report_error

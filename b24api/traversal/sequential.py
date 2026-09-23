@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch, PageRejectionCode
+from b24api.contracts.traversal import OffsetContinuation
 from b24api.errors import BudgetExceededError, CapabilityError, PaginationError
 from b24api.execution import (
     WorkClass,
@@ -82,6 +83,7 @@ class _SequentialMixin:
         if sparse is not None and offset != 0:
             raise CapabilityError("sparse raw traversal requires the complete range from offset zero")
         expected_raw_total: int | None = None
+        pending_short_window = False
         self.cursor_state = offset
         visited_offsets: set[int] = set()
         while True:
@@ -106,6 +108,8 @@ class _SequentialMixin:
             items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
+                if pending_short_window and items:
+                    raise PaginationError("fixed-step traversal observed rows after a short non-terminal page")
                 if sparse is None:
                     terminal = _offset_terminal(
                         plan,
@@ -128,6 +132,15 @@ class _SequentialMixin:
                     and len(items) < plan.page_stride.max_decoded_rows
                 ):
                     raise PaginationError("fixed-stride traversal observed an unexplained short page")
+                if (
+                    sparse is None
+                    and plan.page_stride is None
+                    and plan.continuation is OffsetContinuation.FIXED_STEP
+                    and terminal is None
+                    and plan.fixed_step is not None
+                    and len(items) < plan.fixed_step
+                ):
+                    pending_short_window = True
                 next_offset = (
                     None if terminal is not None else _next_offset(plan, response, current=offset, observed=len(items))
                 )

@@ -39,9 +39,11 @@ from b24api import (
     OffsetContinuation,
     OffsetSpec,
     PageDispatch,
+    PageIndex,
     PageOutcome,
     PageRejectionCode,
     ParameterPath,
+    ReferenceFailure,
     ReferenceItem,
     ReplayDisposition,
     ReplaySafety,
@@ -618,11 +620,13 @@ asyncio.run(main())
 
 @pytest.mark.asyncio
 async def test_fixed_step_ignores_relative_next_and_exact_total_can_terminate() -> None:
+    step = 2
+
     def handler(request: Request) -> WireResponse:
         start = request.copy_parameters().get("start", 0)
         if start == 0:
             return _response([{"ID": 1}, {"ID": 2}], total=3, next_value=2)
-        if start == PAGE_SIZE:
+        if start == step:
             return _response([{"ID": 3}], total=3, next_value=1)
         raise AssertionError("fixed-step traversal used an undeclared offset")
 
@@ -630,18 +634,86 @@ async def test_fixed_step_ignores_relative_next_and_exact_total_can_terminate() 
     stream = _client(transport).iter_list(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER),
-        page_size=PAGE_SIZE,
+        page_size=step,
         offset=OffsetSpec(
             continuation=OffsetContinuation.FIXED_STEP,
-            step=PAGE_SIZE,
+            step=step,
             total_termination=TotalTermination.EXACT_QUALIFIED,
         ),
     )
 
     assert [row async for row in stream] == [{"ID": 1}, {"ID": 2}, {"ID": 3}]
-    assert [request.copy_parameters()["start"] for request in transport.requests] == [0, PAGE_SIZE]
+    assert [request.copy_parameters()["start"] for request in transport.requests] == [0, step]
     assert stream.report is not None
     assert stream.report.assurance.value == "identity_and_count_matched"
+
+
+@pytest.mark.asyncio
+async def test_fixed_step_rejects_rows_after_a_short_unqualified_window() -> None:
+    step = 2
+
+    def handler(request: Request) -> WireResponse:
+        start = request.copy_parameters().get("start", 0)
+        if start == 0:
+            return _response([{"ID": 1}])
+        if start == step:
+            return _response([{"ID": 2}])
+        raise AssertionError("fixed-step traversal used an undeclared offset")
+
+    transport = _Transport(handler)
+    stream = _client(transport).iter_list(
+        Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        page_size=step,
+        offset=OffsetSpec(continuation=OffsetContinuation.FIXED_STEP, step=step),
+    )
+
+    assert await anext(stream) == {"ID": 1}
+    with pytest.raises(IncompleteTraversalError) as captured:
+        await anext(stream)
+
+    assert isinstance(captured.value.__cause__, PaginationError)
+    assert "rows after a short" in str(captured.value.__cause__)
+    assert [request.copy_parameters()["start"] for request in transport.requests] == [0, step]
+
+
+@pytest.mark.asyncio
+async def test_reference_sequential_preserves_page_index_controls() -> None:
+    initial_page = 3
+    next_page = 5
+    page_size = 2
+    observed: list[tuple[int, int]] = []
+
+    def handler(request: Request) -> WireResponse:
+        parameters = request.copy_parameters()
+        page = parameters["page"]
+        limit = parameters["limit"]
+        assert isinstance(page, int)
+        assert isinstance(limit, int)
+        observed.append((page, limit))
+        return _response([{"ID": 1}, {"ID": 2}]) if page == initial_page else _response([])
+
+    stream = _client(_Transport(handler)).iter_references(
+        Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        [Binding("one", (), object())],
+        traversal=SequentialTraversal(
+            page_size=page_size,
+            offset=OffsetSpec(
+                parameter_path=ParameterPath(("page",)),
+                limit_path=ParameterPath(("limit",)),
+                page_index=PageIndex(
+                    ParameterPath(("page",)),
+                    initial=initial_page,
+                    increment=page_size,
+                    max_rows=page_size,
+                ),
+            ),
+        ),
+        dispatch=DirectDispatch(concurrency=1),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+    assert len(outcomes) == page_size + 1
+    assert observed == [(initial_page, page_size), (next_page, page_size)]
 
 
 @pytest.mark.asyncio
@@ -1045,6 +1117,36 @@ async def test_reference_fail_fast_classifies_underlying_pagination_failure() ->
     assert captured.value.report.terminal_reason == "PaginationError"
     assert "_ReferenceWindowError" not in repr(captured.value.report)
     assert "_PageRejectionError" not in repr(captured.value.report)
+
+
+@pytest.mark.asyncio
+async def test_reference_fail_fast_retains_retryable_replay_disposition_in_report() -> None:
+    def handler(request: Request) -> WireResponse:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        key = next(iter(commands))
+        return _response(
+            {
+                "result": {},
+                "result_error": {key: {"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}},
+            },
+        )
+
+    stream = _client(_Transport(handler)).iter_references(
+        Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        [Binding("one", (), object())],
+        traversal=CountedTraversal(),
+        dispatch=BatchDispatch(batch_size=1),
+    )
+
+    with pytest.raises(ReferenceFailed) as captured:
+        await anext(stream)
+
+    outcome = captured.value.outcomes[0]
+    assert isinstance(outcome, ReferenceFailure)
+    assert outcome.replay_disposition is ReplayDisposition.ELIGIBLE
+    blocking = next(item for item in captured.value.report.violations if item.severity.value == "blocking")
+    assert blocking.replay_disposition is ReplayDisposition.ELIGIBLE
 
 
 @pytest.mark.asyncio

@@ -37,7 +37,6 @@ from b24api.contracts.traversal import (
     CountedTraversal,
     KeysetTraversal,
     SequentialTraversal,
-    TotalTermination,
     TraversalSpec,
 )
 from b24api.errors import (
@@ -60,6 +59,7 @@ from b24api.references.outcome import ReferenceFailure as KernelFailure
 from b24api.references.outcome import ReferenceItem as KernelItem
 from b24api.references.stream import iter_references as _iter_references
 from b24api.traversal.driver import PaginationDriver
+from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
@@ -69,8 +69,6 @@ from b24api.traversal.plans import (
     KeysetTerminalRule,
     ListPlan,
     OffsetContinuation,
-    OffsetSequentialPlan,
-    OffsetTerminalRule,
 )
 
 if TYPE_CHECKING:
@@ -99,27 +97,11 @@ def _direction(value: str) -> Literal["asc", "desc"]:
 
 def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, TraversalIdentity | None]:
     if isinstance(traversal, SequentialTraversal):
-        offset_mechanics = traversal.offset
         return (
-            OffsetSequentialPlan(
-                offset_path=offset_mechanics.parameter_path,
-                limit_path=offset_mechanics.limit_path,
-                requested_page_size=traversal.page_size if offset_mechanics.limit_path is not None else None,
-                continuation=offset_mechanics.continuation,
-                fixed_step=offset_mechanics.step,
-                terminal=(
-                    frozenset({OffsetTerminalRule.EMPTY_PAGE})
-                    if offset_mechanics.total_termination is TotalTermination.DISABLED
-                    else frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL})
-                ),
-                allow_create_controls=offset_mechanics.allow_create_controls,
-                identity_requirement=IdentityRequirement.OPTIONAL,
+            sequential_offset_plan(
+                traversal.offset,
+                page_size=traversal.page_size,
                 duplicate_policy=DuplicatePolicy.ERROR,
-                total_semantics=(
-                    TotalSemantics.IGNORE
-                    if offset_mechanics.total_termination is TotalTermination.DISABLED
-                    else TotalSemantics.FILTERED_EXACT
-                ),
             ),
             traversal.selector,
             traversal.identity,

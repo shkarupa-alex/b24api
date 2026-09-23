@@ -113,6 +113,7 @@ type ReferenceStreamItem = ReferenceItem | ReferenceFailure | _KernelReferenceCo
 class _ReferenceWindowError(Exception):
     def __init__(self, failure: ReferenceFailure) -> None:
         self.failure = failure
+        self.replay_disposition = failure.replay_disposition
         super().__init__("reference traversal window failed")
         self.report_cause = failure.error if isinstance(failure.error, BaseException) else self
         if self.report_cause is not self:
