@@ -40,11 +40,16 @@ def sparse_page_terminal(
     response: Response,
     *,
     offset: int,
+    selected: int,
     previous_total: int | None,
 ) -> tuple[str | None, int]:
     """Validate stable raw extent and return its structural closure witness."""
     total = raw_total_from_response(response, bound.total_path)
     if previous_total is not None and total != previous_total:
         raise PaginationError("sparse raw total changed during traversal")
+    # Selected rows are a subset of the raw window, so more of them than the total leaves in this
+    # window means the total is stale or of the wrong shape and cannot witness closure.
+    if selected > max(0, min(total, offset + bound.stride.wire_increment) - offset):
+        raise PaginationError("sparse selected rows exceed the qualified raw window")
     terminal = SPARSE_RAW_RANGE_COVERED if offset + bound.stride.wire_increment >= total else None
     return terminal, total

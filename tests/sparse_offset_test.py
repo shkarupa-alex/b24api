@@ -20,6 +20,7 @@ from b24api import (
     RouteKind,
     SequentialTraversal,
     SparseRawBound,
+    TerminalState,
     TraversalAssurance,
 )
 from b24api.contracts.traversal import OffsetContinuation
@@ -38,10 +39,12 @@ class SparseTransport:
         raw_total: int = 200,
         overrides: dict[int, int | None] | None = None,
         envelope: bool = False,
+        rows: dict[int, list[dict[str, int]]] | None = None,
     ) -> None:
         """Freeze one raw extent for the synthetic fixture, in the result or the envelope."""
         self.raw_total = raw_total
         self.overrides = overrides or {}
+        self.rows = {0: [{"id": 1}], 150: [{"id": 2}]} if rows is None else rows
         self.envelope = envelope
         self.offsets: list[int] = []
 
@@ -52,7 +55,7 @@ class SparseTransport:
         offset = request.copy_parameters()["start"]
         assert isinstance(offset, int)
         self.offsets.append(offset)
-        rows = {0: [{"id": 1}], 150: [{"id": 2}]}.get(offset, [])
+        rows = self.rows.get(offset, [])
         result: dict[str, object] = {"items": rows}
         total = self.overrides.get(offset, self.raw_total)
         payload: dict[str, object] = {"result": result}
@@ -90,6 +93,56 @@ async def test_sparse_offset_crosses_two_empty_selected_pages() -> None:
     rows = [row async for row in stream]
     assert [row["id"] for row in rows] == [1, 2]
     assert transport.offsets == [0, 50, 100, 150]
+    assert stream.report is not None
+    assert stream.report.exhausted
+    assert stream.report.assurance is TraversalAssurance.RAW_RANGE_COVERED
+
+
+@pytest.mark.parametrize(
+    ("raw_total", "rows", "offsets"),
+    [
+        pytest.param(0, {0: [{"id": 1}]}, [0], id="total-below-selected"),
+        pytest.param(51, {0: [{"id": 1}], 50: [{"id": 2}, {"id": 3}]}, [0, 50], id="terminal-window-overflow"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_sparse_raw_total_contradicted_by_selected_rows_fails_closed(
+    raw_total: int,
+    rows: dict[int, list[dict[str, int]]],
+    offsets: list[int],
+) -> None:
+    transport = SparseTransport(raw_total=raw_total, rows=rows)
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    stream = client.iter_list(
+        Request("example.search", route=RouteKind.BARE),
+        selector=ResultSelector(("items",)),
+        page_size=50,
+        offset=_sparse_spec(),
+    )
+    with pytest.raises(IncompleteTraversalError) as captured:
+        _ = [row async for row in stream]
+    assert isinstance(captured.value.error, PaginationError)
+    assert "exceed the qualified raw window" in str(captured.value.error)
+    assert transport.offsets == offsets
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.INCOMPLETE
+    assert not stream.report.exhausted
+    # An incomplete report never carries the strength its plan would have proved on completion.
+    assert stream.report.assurance is TraversalAssurance.MECHANICS_ONLY
+
+
+@pytest.mark.asyncio
+async def test_sparse_terminal_window_holding_its_remaining_raw_rows_closes() -> None:
+    transport = SparseTransport(raw_total=51, rows={0: [{"id": 1}], 50: [{"id": 2}]})
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    stream = client.iter_list(
+        Request("example.search", route=RouteKind.BARE),
+        selector=ResultSelector(("items",)),
+        page_size=50,
+        offset=_sparse_spec(),
+    )
+    assert [row["id"] async for row in stream] == [1, 2]
+    assert transport.offsets == [0, 50]
     assert stream.report is not None
     assert stream.report.exhausted
     assert stream.report.assurance is TraversalAssurance.RAW_RANGE_COVERED

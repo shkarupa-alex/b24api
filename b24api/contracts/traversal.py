@@ -103,6 +103,8 @@ class SparseRawBound:
 
     ``total_path`` names where the qualified raw total lives: a non-root path inside ``result`` or
     ``RawTotalSource.ENVELOPE`` for the response envelope ``total``, so either shape can prove closure.
+    Selected rows are a subset of the raw rows, so a page selecting more rows than its raw window
+    holds under that total contradicts the total and fails the traversal closed.
     """
 
     total_path: ResultSelector | RawTotalSource

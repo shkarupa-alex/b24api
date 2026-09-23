@@ -125,6 +125,7 @@ class _SequentialMixin:
                         sparse,
                         response,
                         offset=offset,
+                        selected=len(items),
                         previous_total=expected_raw_total,
                     )
                 if (
