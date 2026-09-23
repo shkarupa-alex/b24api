@@ -79,6 +79,11 @@ blocking violations, and `IncompleteTraversalError` now expose the kernel's
 `replay_disposition`. Retry only when it is `ReplayDisposition.ELIGIBLE`; replay safety and
 retryability remain inputs to that closed decision.
 
+A per-reference `IncompleteTraversalError` (the `error` of a `ReferenceFailure`, including those in
+`ReferenceFailed.outcomes`) now carries `report=None`: only the whole stream has an operation report,
+available as `stream.report` and `ReferenceFailed.report`. Read the binding's typed cause from the
+error's `error` attribute and its delivered prefix from `ReferenceFailure.partial_rows`.
+
 For one-based page controls, pass `OffsetSpec(parameter_path=path, page_index=PageIndex(path,
 initial=1, increment=1, max_rows=10))` to `iter_list(..., page_size=10)`. The wire control
 advances by one even when a page selects fewer than ten rows. An empty page is the terminal
@@ -97,7 +102,10 @@ empty page after a short page as closure. Such a traversal now raises `Incomplet
 complete with `mechanics_only` assurance. Qualify an exact total, switch to `OBSERVED_COUNT` or
 `PageIndex` when the endpoint supports them, or use `SparseRawBound`; see
 [endpoint recipes](recipes.md#fixed-server-stride). Assurance names what a completed traversal
-proved: a report that did not complete carries at most `mechanics_only`, whatever its plan declared.
+proved: a report that did not complete carries at most `mechanics_only`, whatever its plan declared
+and even when a caller stopped one of its bindings; `bounded_prefix` appears only on a completed
+report. `completed_with_failures` keeps the declared assurance, which describes the bindings that
+completed.
 
 `SparseRawBound.total_path` also accepts `RawTotalSource.ENVELOPE` when the qualified raw extent is
 the response envelope `total` rather than a field inside `result`; a missing or negative envelope

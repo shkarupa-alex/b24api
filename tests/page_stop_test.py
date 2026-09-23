@@ -8,9 +8,11 @@ import pytest
 from b24api import (
     Bitrix24,
     CallerStop,
+    ConsistencyPolicy,
     ContinuePage,
     CursorDomain,
     CursorSpec,
+    ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
     KeysetSpec,
@@ -24,6 +26,7 @@ from b24api import (
     TraversalAssurance,
 )
 from b24api.contracts.completion import PageAcknowledged, PageDelivered, PageScheduled
+from b24api.contracts.policy import SnapshotRequirement
 from b24api.execution import Executor, WireResponse
 
 
@@ -128,6 +131,25 @@ async def test_page_stop_prevents_next_request_and_reports_bounded_prefix(family
     assert not stream.report.exhausted
     assert stream.report.partial
     assert stream.report.terminal_reason == "cutoff reached"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_caller_stop_downgrades_assurance() -> None:
+    transport = ListTransport()
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    frozen = ExecutionPolicy(consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST))
+    stream = client.iter_list(
+        Request("offset.list", route=RouteKind.BARE),
+        page_size=2,
+        page_stop=StopAfterCommit(),
+        policy=frozen,
+    )
+    assert [row["id"] async for row in stream] == [1, 2]
+    assert len(transport.requests) == 1
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.INCOMPLETE
+    assert not stream.report.exhausted
+    assert stream.report.assurance is TraversalAssurance.MECHANICS_ONLY
 
 
 def test_counted_batch_tail_rejects_page_stop_at_construction() -> None:

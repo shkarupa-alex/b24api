@@ -3,7 +3,6 @@
 # ruff: noqa: PLR0913 - bounded orchestration adapter
 from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from b24api._stream import MappedOperationStream
@@ -24,7 +23,6 @@ from b24api.contracts.reference import (
     ReferenceOutcome,
     ReferenceOutcomeUnknown,
 )
-from b24api.contracts.report import OperationReport, TerminalState, Violation
 from b24api.contracts.request import (
     IdentitySpec,
     Request,
@@ -73,6 +71,7 @@ from b24api.traversal.plans import (
 
 if TYPE_CHECKING:
     from b24api.contracts.page_stop import PageStopPolicy
+    from b24api.contracts.report import OperationReport, Violation
     from b24api.contracts.stream import OperationStream
     from b24api.execution.snapshot import KernelReport
 
@@ -193,14 +192,6 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _ReferenceIncompleteEvidence:
-    """A per-binding failure fragment, not an operation terminal report."""
-
-    state: TerminalState = TerminalState.INCOMPLETE
-    emitted: int = 0
-
-
 class _ReferenceEventMapper:
     """Stateful bounded converter assigning per-binding item indexes."""
 
@@ -235,8 +226,9 @@ class _ReferenceEventMapper:
             isinstance(error, CapabilityError) and event.page_state > 0 and not application_failure
         ):
             incomplete_cause = error
+            # Only the whole stream has an operation report; the binding's evidence is this failure.
             error = IncompleteTraversalError(
-                report=_ReferenceIncompleteEvidence(emitted=event.partial_rows),
+                report=None,
                 error=incomplete_cause,
                 replay_disposition=event.replay_disposition,
             )

@@ -74,6 +74,11 @@ def test_migration_covers_changed_completion_stop_keyset_and_replay_contracts() 
     assert "SequentialKeysetExecution" in bounded
     assert "consumes that\nboundary" in bounded
     assert "RangeKeysetExecution`, `PartitionedKeysetExecution`, and auto execution reject" in bounded
+    reference = next(
+        paragraph for paragraph in text.split("\n\n") if "per-reference `IncompleteTraversalError`" in paragraph
+    )
+    assert "`report=None`" in reference
+    assert "partial_rows" in reference
 
 
 def test_architecture_document_names_the_complete_public_capability_family() -> None:

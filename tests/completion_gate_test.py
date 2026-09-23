@@ -386,3 +386,64 @@ def test_rejection_requires_successful_command_settlement(settled: bool) -> None
     else:
         assert decision.state is TerminalState.INCOMPLETE
         assert "completion_rejection_before_settlement" in violations
+
+
+def _caller_stop_report(
+    source_state: KernelState,
+    *,
+    cleanup: CleanupState = CleanupState.SUCCESS,
+    early_closed: bool = False,
+) -> tuple[TerminalState, TraversalAssurance | None, bool]:
+    gate = CompletionGate("run")
+    sequence = _page(gate)
+    gate.emit(BindingTerminal(operation_id="run", sequence=sequence, binding_id=0, closure=BindingClosure.CALLER_STOP))
+    gate.emit(StreamTerminal(operation_id="run", sequence=sequence + 1, closure=StreamClosure.NATURAL))
+    gate.emit(CleanupOutcome(operation_id="run", sequence=sequence + 2, state=cleanup))
+    gate.attach_report(
+        CompletionReportFacts(
+            source=KernelReport(state=source_state),
+            operation="iter_list",
+            assurance=TraversalAssurance.IDENTITY_EXACT,
+            admitted=1,
+            emitted=2,
+            successes=1,
+            failures=0,
+            not_executed=0,
+            unknown=0,
+            buffered_commands_high_water=0,
+            active_references_high_water=0,
+            early_closed=early_closed,
+        )
+    )
+    report = gate.finish()
+    return report.state, report.assurance, report.exhausted
+
+
+@pytest.mark.parametrize(
+    ("source_state", "cleanup", "early_closed"),
+    [
+        (KernelState.INCOMPLETE, CleanupState.SUCCESS, False),
+        (KernelState.FAILED, CleanupState.SUCCESS, False),
+        (KernelState.CANCELLED, CleanupState.SUCCESS, False),
+        (KernelState.COMPLETED, CleanupState.FAILURE, False),
+        (KernelState.COMPLETED, CleanupState.SUCCESS, True),
+    ],
+    ids=["incomplete", "failed", "cancelled", "cleanup-failure", "early-closed"],
+)
+def test_caller_stop_never_lifts_assurance_of_an_unfinished_report(
+    source_state: KernelState,
+    cleanup: CleanupState,
+    early_closed: bool,  # noqa: FBT001
+) -> None:
+    state, assurance, exhausted = _caller_stop_report(source_state, cleanup=cleanup, early_closed=early_closed)
+    assert state not in {TerminalState.COMPLETED, TerminalState.COMPLETED_WITH_FAILURES}
+    assert assurance is TraversalAssurance.MECHANICS_ONLY
+    assert not exhausted
+
+
+def test_completed_caller_stop_reports_bounded_prefix() -> None:
+    assert _caller_stop_report(KernelState.COMPLETED) == (
+        TerminalState.COMPLETED,
+        TraversalAssurance.BOUNDED_PREFIX,
+        False,
+    )

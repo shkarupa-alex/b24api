@@ -16,10 +16,14 @@ from b24api import (
     CursorSpec,
     DirectDispatch,
     IdentityCoercion,
+    IncompleteTraversalError,
     PageBoundary,
+    PaginationError,
     ParameterPath,
     ParameterUpdate,
     ReferenceComplete,
+    ReferenceFailed,
+    ReferenceFailure,
     ReferenceItem,
     Request,
     ResultSelector,
@@ -143,3 +147,67 @@ async def test_reference_page_stop_is_per_binding_and_not_source_exhaustion(disp
     assert stream.report.assurance is TraversalAssurance.BOUNDED_PREFIX
     assert not stream.report.exhausted
     assert stream.report.partial
+
+
+class RepeatingSecondChat(ChatTransport):
+    """Chat b answers its second page with IDs it has already delivered."""
+
+    def _rows(self, parent: str, control: int) -> list[dict[str, int]]:
+        if parent == "b" and control != 100:  # noqa: PLR2004 - the initial LAST_ID of the fixture
+            self.requests.append((parent, control))
+            return [{"id": 15}, {"id": 14}]
+        return super()._rows(parent, control)
+
+
+def _two_chat_stream(transport: ChatTransport):  # noqa: ANN202 - public stream type is internal here
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    path = ParameterPath(("parent",))
+    return client.iter_cursors(
+        Request("messages.get", {"parent": "", "LAST_ID": 100}, route=RouteKind.BARE),
+        (Binding("chat a", (ParameterUpdate(path, "a"),), "a"), Binding("chat b", (ParameterUpdate(path, "b"),), "b")),
+        selector=ResultSelector.root(),
+        cursor=CursorSpec(
+            ParameterPath(("LAST_ID",)),
+            ("id",),
+            IdentityCoercion.EXACT_INTEGER,
+            "descending",
+            "last",
+            domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
+        ),
+        page_size=2,
+        dispatch=DirectDispatch(concurrency=1),
+        page_stop=StopFirstChat(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_incomplete_multi_chat_mirror_with_a_stopped_chat_reports_mechanics_only() -> None:
+    stream = _two_chat_stream(RepeatingSecondChat())
+    with pytest.raises(ReferenceFailed) as raised:
+        async for _event in stream:
+            pass
+    failure = next(outcome for outcome in raised.value.outcomes if isinstance(outcome, ReferenceFailure))
+    assert failure.correlation == "b"
+    assert failure.partial_rows == 2  # noqa: PLR2004 - the first page of chat b
+    assert isinstance(failure.error, IncompleteTraversalError)
+    # Only the stream has an operation report; the binding carries its typed cause instead.
+    assert failure.error.report is None
+    assert isinstance(failure.error.error, PaginationError)
+    assert str(failure.error) == "Traversal did not complete"
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.INCOMPLETE
+    assert stream.report.assurance is TraversalAssurance.MECHANICS_ONLY
+    assert not stream.report.exhausted
+
+
+@pytest.mark.asyncio
+async def test_early_closed_multi_chat_mirror_with_a_stopped_chat_reports_mechanics_only() -> None:
+    stream = _two_chat_stream(ChatTransport())
+    async for event in stream:
+        if isinstance(event, ReferenceComplete) and event.binding_index == 0:
+            break
+    await stream.aclose()
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.EARLY_CLOSED
+    assert stream.report.assurance is TraversalAssurance.MECHANICS_ONLY
+    assert not stream.report.exhausted

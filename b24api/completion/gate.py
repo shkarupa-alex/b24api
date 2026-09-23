@@ -465,14 +465,15 @@ def _observed_assurance(
 ) -> TraversalAssurance | None:
     """Finalize assurance with what the traversal observed, not only what its plan declared.
 
-    A caller stop proves only a bounded prefix. An identity repeated across offset pages is the
-    signature of a shifting source that may also have skipped rows, so identity-strength claims fall to
-    mechanics even when the stream reached a natural end.
+    A report that did not complete proves at most mechanics, even when a caller stopped one of its
+    bindings. A completed caller stop proves only a bounded prefix. An identity repeated across offset
+    pages is the signature of a shifting source that may also have skipped rows, so identity-strength
+    claims fall to mechanics even when the stream reached a natural end.
     """
+    if state not in {TerminalState.COMPLETED, TerminalState.COMPLETED_WITH_FAILURES}:
+        return TraversalAssurance.MECHANICS_ONLY if declared is not None or caller_stopped else None
     if caller_stopped:
         return TraversalAssurance.BOUNDED_PREFIX
-    if declared is not None and state not in {TerminalState.COMPLETED, TerminalState.COMPLETED_WITH_FAILURES}:
-        return TraversalAssurance.MECHANICS_ONLY
     if source.duplicate_identities and declared in _IDENTITY_STRENGTH:
         return TraversalAssurance.MECHANICS_ONLY
     return declared
