@@ -310,12 +310,34 @@ async def test_unrelated_httpx_request_inside_owned_response_hook_is_unchanged(s
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
 
 
-_AUTH_FLOWS = ("clone", "challenge", "refresh", "redirect", "yield-foreign", "challenge-foreign")
+_AUTH_FLOWS = (
+    "clone",
+    "challenge",
+    "refresh",
+    "redirect",
+    "yield-foreign",
+    "challenge-foreign",
+    "rotate",
+    "challenge-rotate",
+    "yield-portal-oauth",
+)
+_ROTATED_MARKER = "synthetic-rotated-secret-424242"
+_PORTAL_OAUTH_URL = "https://portal.invalid/oauth/token/?grant_type=refresh_token"
 _UNAUTHORIZED = 401
 
 
 def _auth_records(flow: str) -> int:
-    return {"clone": 1, "challenge": 2, "refresh": 2, "redirect": 2, "yield-foreign": 2, "challenge-foreign": 3}[flow]
+    return {
+        "clone": 1,
+        "challenge": 2,
+        "refresh": 2,
+        "redirect": 2,
+        "yield-foreign": 2,
+        "challenge-foreign": 3,
+        "rotate": 1,
+        "challenge-rotate": 2,
+        "yield-portal-oauth": 2,
+    }[flow]
 
 
 class _ReplacingAuth(httpx.Auth):
@@ -330,14 +352,21 @@ class _ReplacingAuth(httpx.Auth):
         await request.aread()
 
         def fresh() -> httpx.Request:
-            return httpx.Request(request.method, request.url, headers=request.headers, content=request.content)
+            url = str(request.url)
+            if self.flow.endswith("rotate"):
+                url = url.replace(_OWNED_MARKER, _ROTATED_MARKER)
+            return httpx.Request(request.method, url, headers=request.headers, content=request.content)
 
-        if self.flow in {"challenge", "challenge-foreign"}:
+        if self.flow in {"challenge", "challenge-foreign", "challenge-rotate"}:
             response = yield request
             if response.status_code == _UNAUTHORIZED:
                 if self.flow == "challenge-foreign":
                     yield httpx.Request("GET", self.foreign_url)
                 yield fresh()
+            return
+        if self.flow == "yield-portal-oauth":
+            yield httpx.Request("GET", _PORTAL_OAUTH_URL)
+            yield request
             return
         if self.flow == "yield-foreign":
             yield httpx.Request("GET", self.foreign_url)
@@ -360,7 +389,7 @@ async def test_injected_auth_replacement_keeps_owned_webhook_out_of_info(route: 
     foreign_url = f"https://other.invalid/rest/1/{_FOREIGN_MARKER}/profile"
 
     def respond(request: httpx.Request) -> httpx.Response:
-        if flow in {"challenge", "challenge-foreign"} and "b24api_log_owner" in request.extensions:
+        if flow in {"challenge", "challenge-foreign", "challenge-rotate"} and "b24api_log_owner" in request.extensions:
             return httpx.Response(_UNAUTHORIZED, request=request)
         if flow == "redirect" and request.url.host == "portal.invalid":
             location = f"https://redirect.invalid/rest/1/{_THIRD_MARKER}/profile"
@@ -375,16 +404,16 @@ async def test_injected_auth_replacement_keeps_owned_webhook_out_of_info(route: 
         assert response.status_code == _SUCCESS_STATUS
         assert len(handler.records) == _auth_records(flow)
         for record in handler.records:
-            if "other.invalid" in record.getMessage():
-                assert foreign_url in record.getMessage()
+            if "other.invalid" in record.getMessage() or "/oauth/" in record.getMessage():
+                assert (foreign_url if flow != "yield-portal-oauth" else _PORTAL_OAUTH_URL) in record.getMessage()
                 assert isinstance(record.args, tuple)
                 assert isinstance(record.args[1], httpx.URL)
                 continue
-            for marker in (_OWNED_MARKER, _THIRD_MARKER):
+            for marker in (_OWNED_MARKER, _THIRD_MARKER, _ROTATED_MARKER):
                 assert marker not in f"{record.msg!r} {record.args!r}"
                 assert marker not in record.getMessage()
-        assert _OWNED_MARKER not in handler.output.getvalue()
-        assert _THIRD_MARKER not in handler.output.getvalue()
+        for marker in (_OWNED_MARKER, _THIRD_MARKER, _ROTATED_MARKER):
+            assert marker not in handler.output.getvalue()
         assert (foreign_url in handler.output.getvalue()) is flow.endswith(("refresh", "foreign"))
     finally:
         await transport.aclose()

@@ -17,10 +17,10 @@ v3_request = Request("tasks.task.result.list", route=RouteKind.API_V3)
 
 HTTPX INFO records for requests owned by `HttpxTransport` have their registered webhook URL
 redacted before logging handlers format them. This applies to an injected `httpx.AsyncClient` while
-it is used through that transport, including its redirect hops and any request its auth flow
-substitutes for the owned webhook URL. Any other request through the same client, even one sent from
-its event hook or sent or yielded by its auth flow while an owned request is in flight, is logged
-unchanged.
+it is used through that transport, including its redirect hops and any retry of the same portal
+operation its auth flow substitutes, even under a rotated webhook credential. A request to any other
+address through the same client, even one sent from its event hook or sent or yielded by its auth
+flow while an owned request is in flight, is logged unchanged.
 Direct use of a caller-owned client after the transport closes is outside that shield. An application enabling the separate `httpcore` DEBUG logger needs its own
 logging policy and test; this guarantee covers the emitting `httpx` INFO logger.
 The supported HTTPX range is `>=0.28.1,<0.29`; raising that upper bound requires rerunning the

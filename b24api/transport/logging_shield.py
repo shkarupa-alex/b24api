@@ -8,9 +8,11 @@ injected client, and an auth flow may yield unrelated requests of its own. A rec
 attributed to the root of the redirect chain that emits it: the request the innermost HTTPX
 ``_send_handling_auth`` is dispatching. HTTPX rebinds that root to each request the auth flow yields
 but never to a redirect hop, and a nested send opens its own frame. The root is owned when it
-carries this dispatch's marker or when its URL holds the owned webhook credential, which covers an
-auth-flow substitute of the owned request; other roots stay untouched. If no such frame is found
-(a changed HTTPX internal), the record is scrubbed conservatively.
+carries this dispatch's marker, holds the owned webhook credential, or retries the owned portal
+operation (same host and method path, whatever user and token segments it carries), which covers
+an auth-flow substitute of the owned request even under a rotated credential; roots to any other
+address stay untouched. If no such frame is found (a changed HTTPX internal), the record is
+scrubbed conservatively.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import PurePath
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from b24api.redaction import Redactor
 
@@ -42,6 +45,7 @@ _OWNER_EXTENSION = "b24api_log_owner"
 _UNATTRIBUTED = object()
 _REPLACEMENT = "[REDACTED]"
 _CREDENTIAL_PATH = re.compile(r"/rest/(?:api/)?[^/]+/([^/]+)/", re.IGNORECASE)
+_CREDENTIAL_SEGMENTS = re.compile(r"(?P<prefix>/rest/(?:api/)?)[^/]+/[^/]+/", re.IGNORECASE)
 # Full-length scrubbing: truncating a record's format string would break its %-interpolation.
 _RECORD_REDACTOR = Redactor(max_string=1 << 20)
 _HOP_CREDENTIAL = re.compile(
@@ -56,6 +60,13 @@ def _credentials(url: str) -> tuple[str, ...]:
     if match is None or not match.group(1):
         raise ValueError("HTTPX log shield requires a credentialed Bitrix method URL")
     return (match.group(1),)
+
+
+def _operation(url: str) -> tuple[str, int | None, str]:
+    """Identify a portal operation independently of the user and token segments of its URL."""
+    parts = urlsplit(url)
+    path = _CREDENTIAL_SEGMENTS.sub(r"\g<prefix>*/*/", parts.path, count=1)
+    return ((parts.hostname or "").lower(), parts.port, path.lower())
 
 
 def _redact_owned_value(value: object, credentials: tuple[str, ...]) -> object:
@@ -83,23 +94,27 @@ def _emitting_root() -> object:
 class LogOwnership:
     """Recognize the redirect chains of one owned dispatch, including auth-flow substitutes."""
 
-    __slots__ = ("credentials",)
+    __slots__ = ("credentials", "operation")
 
-    def __init__(self, credentials: tuple[str, ...]) -> None:
-        """Bind the owned webhook credential segment."""
-        self.credentials = credentials
+    def __init__(self, url: str) -> None:
+        """Bind the owned webhook credential segment and portal operation."""
+        self.credentials = _credentials(url)
+        self.operation = _operation(url)
 
     def claim(self, request: httpx.Request) -> None:
         """Attach this ownership marker before the request is sent."""
         request.extensions[_OWNER_EXTENSION] = self
 
     def owns(self, request: object) -> bool:
-        """Report whether a chain root carries this marker or targets the owned webhook credential."""
+        """Report whether a chain root is marked, holds the owned credential or retries the owned operation."""
         extensions = getattr(request, "extensions", None)
         if isinstance(extensions, dict) and extensions.get(_OWNER_EXTENSION) is self:
             return True
-        match = _CREDENTIAL_PATH.search(str(getattr(request, "url", "")))
-        return match is not None and match.group(1) in self.credentials
+        url = str(getattr(request, "url", ""))
+        match = _CREDENTIAL_PATH.search(url)
+        if match is not None and match.group(1) in self.credentials:
+            return True
+        return match is not None and _operation(url) == self.operation
 
 
 class _OwnedRequestFilter(logging.Filter):
@@ -152,12 +167,12 @@ class HttpxLogShield:
     @contextmanager
     def request(self, url: str) -> Iterator[LogOwnership]:
         """Protect one dispatch; the caller claims its HTTPX request with the yielded marker."""
+        ownership = LogOwnership(url)
         with self._lock:
             if self._transports < 1:
                 raise RuntimeError("HTTPX log shield has no registered transport")
             self._in_flight += 1
             self._ensure_installed()
-        ownership = LogOwnership(_credentials(url))
         token = _ACTIVE_OWNERSHIP.set(ownership)
         try:
             yield ownership
