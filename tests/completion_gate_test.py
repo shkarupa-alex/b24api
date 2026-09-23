@@ -23,7 +23,7 @@ from b24api.contracts.completion import (
     StreamTerminal,
 )
 from b24api.contracts.policy import KernelState
-from b24api.contracts.report import TerminalState
+from b24api.contracts.report import TerminalState, TraversalAssurance
 from b24api.execution.snapshot import KernelReport
 
 
@@ -312,6 +312,47 @@ def test_gate_rejects_public_success_counts_that_omit_a_failed_binding() -> None
     report = gate.finish()
     assert report.state is TerminalState.INCOMPLETE
     assert "completion_outcome_count_mismatch" in {item.code for item in report.violations}
+
+
+@pytest.mark.parametrize(
+    ("declared", "reported"),
+    [
+        (TraversalAssurance.RAW_RANGE_COVERED, TraversalAssurance.MECHANICS_ONLY),
+        (TraversalAssurance.IDENTITY_EXACT, TraversalAssurance.MECHANICS_ONLY),
+        (TraversalAssurance.COUNT_MATCHED, TraversalAssurance.MECHANICS_ONLY),
+        (None, None),
+    ],
+)
+def test_incomplete_report_never_claims_its_declared_assurance(
+    declared: TraversalAssurance | None,
+    reported: TraversalAssurance | None,
+) -> None:
+    gate = CompletionGate("run")
+    gate.emit(BindingAdmitted(operation_id="run", sequence=0, binding_id=0))
+    gate.emit(PageScheduled(operation_id="run", sequence=1, binding_id=0, page_id=0))
+    gate.emit(
+        PageCommandOutcome(operation_id="run", sequence=2, binding_id=0, page_id=0, outcome=CommandSettlement.UNKNOWN)
+    )
+    _close(gate, 3, BindingClosure.UNKNOWN)
+    gate.attach_report(
+        CompletionReportFacts(
+            source=KernelReport(state=KernelState.INCOMPLETE),
+            operation="iter_list",
+            assurance=declared,
+            admitted=1,
+            emitted=0,
+            successes=0,
+            failures=0,
+            not_executed=0,
+            unknown=1,
+            buffered_commands_high_water=0,
+            active_references_high_water=0,
+        )
+    )
+    report = gate.finish()
+    assert report.state not in {TerminalState.COMPLETED, TerminalState.COMPLETED_WITH_FAILURES}
+    assert not report.exhausted
+    assert report.assurance is reported
 
 
 @pytest.mark.parametrize("settled", [False, True], ids=["scheduled-only", "settled"])

@@ -429,7 +429,7 @@ class CompletionGate:
             operation=facts.operation,
             terminal_reason=source.terminal_reason or state.value,
             exhausted=state is TerminalState.COMPLETED and decision.exhausted,
-            assurance=_observed_assurance(facts.assurance, source, caller_stopped=decision.caller_stopped),
+            assurance=_observed_assurance(facts.assurance, source, caller_stopped=decision.caller_stopped, state=state),
             admitted=facts.admitted,
             emitted=facts.emitted,
             successes=facts.successes,
@@ -461,6 +461,7 @@ def _observed_assurance(
     source: KernelReport,
     *,
     caller_stopped: bool,
+    state: TerminalState,
 ) -> TraversalAssurance | None:
     """Finalize assurance with what the traversal observed, not only what its plan declared.
 
@@ -470,6 +471,8 @@ def _observed_assurance(
     """
     if caller_stopped:
         return TraversalAssurance.BOUNDED_PREFIX
+    if declared is not None and state not in {TerminalState.COMPLETED, TerminalState.COMPLETED_WITH_FAILURES}:
+        return TraversalAssurance.MECHANICS_ONLY
     if source.duplicate_identities and declared in _IDENTITY_STRENGTH:
         return TraversalAssurance.MECHANICS_ONLY
     return declared

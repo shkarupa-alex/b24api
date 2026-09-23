@@ -92,7 +92,8 @@ empty page after a short page as closure. Such a traversal now raises `Incomplet
 (cause `PaginationError`) and reports `exhausted=False`; full pages followed by an empty page still
 complete with `mechanics_only` assurance. Qualify an exact total, switch to `OBSERVED_COUNT` or
 `PageIndex` when the endpoint supports them, or use `SparseRawBound`; see
-[endpoint recipes](recipes.md#fixed-server-stride).
+[endpoint recipes](recipes.md#fixed-server-stride). Assurance names what a completed traversal
+proved: a report that did not complete carries at most `mechanics_only`, whatever its plan declared.
 
 `SparseRawBound.total_path` also accepts `RawTotalSource.ENVELOPE` when the qualified raw extent is
 the response envelope `total` rather than a field inside `result`; a missing or negative envelope
