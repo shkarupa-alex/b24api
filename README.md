@@ -251,6 +251,9 @@ representative fixture. It performs five strict-bound checks and returns only a 
 unsupported and inconclusive verdicts raise `KeysetCapabilityError`. The ordinary
 `iter_list_keyset()` remains a separate caller-asserted operation with zero verifier canaries and
 may emit a partial prefix before a late endpoint contradiction is detected.
+Keep the guard beside the traversal, for example under
+`if os.environ.get("ENV") != "PROD":`; set `ENV=PROD` only after qualifying the exact portal,
+credentials, method, request/filter, identity, ordering representation, and page cap.
 
 Every list operation also accepts an immutable `PageAdapter` strategy. The adapter synchronously
 maps selected frozen items using sibling result metadata while preserving cardinality, order and

@@ -6,8 +6,14 @@ unlisted request fails instead of returning an empty success. The examples use
 the public client and a dummy `fixture.invalid` host, so they make no network
 requests.
 
+The keyset recipes keep `verify_keyset_capability()` immediately beside traversal when
+`ENV != "PROD"`. Accepting an ID filter does not prove that a method honors strict bounds and
+ordering. Scenarios 6 and 8 use already-qualified frozen fixtures, so run those fixture commands
+with `ENV=PROD`; use the default non-production branch against a stable development/staging portal
+before adopting the same traversal in an application.
+
 Run the complete structured fixture matrix with
-`uv run python -m examples.run --scenario all`. Each JSONL row contains the
+`ENV=PROD uv run python -m examples.run --scenario all`. Each JSONL row contains the
 scenario number, exact client and method-card SHAs, measured report state and
 assurance, independent expected and observed counts, physical and logical
 request counts, bounded-resource high-water counters, and `provenance=fixture`.

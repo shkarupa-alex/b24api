@@ -22,6 +22,12 @@ LIVE_SIGNING_KEY = Ed25519PrivateKey.generate()
 LIVE_PUBLIC_KEY = LIVE_SIGNING_KEY.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 
 
+@pytest.fixture(autouse=True)
+def _qualified_keyset_fixture_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The frozen recipe matrix represents already-qualified endpoint behavior."""
+    monkeypatch.setenv("ENV", "PROD")
+
+
 def _offline_record(scenario: int = 1) -> dict[str, object]:
     result = subprocess.run(  # noqa: S603 - fixed interpreter and repository module
         [sys.executable, "-m", "examples.run", "--scenario", str(scenario)],

@@ -4,16 +4,18 @@ An existing smart-process item 1 changes after an initial ID sweep; new item
 3 appears. A later `>id=2` request sees only 3, while the time-window replay
 reconciles both through a keyed sink. This is FIXTURE behavior; the live gate
 must confirm that `>=updatedTime` filters on the target portal.
-Run: `uv run python -m examples.crm_item_delta`.
+Run the qualified frozen fixture: `ENV=PROD uv run python -m examples.crm_item_delta`.
 """
 
 from __future__ import annotations
 import asyncio
+import os
 
 from b24api import (
     Bitrix24,
     IdentityCoercion,
     IdentitySpec,
+    KeysetSpec,
     OperationReport,
     ReplaySafety,
     Request,
@@ -82,16 +84,32 @@ async def _scan_window(
     border: str,
     expected: tuple[dict[str, object], ...],
 ) -> tuple[dict[int, str], OperationReport]:
+    request = Request(
+        METHOD,
+        {"entityTypeId": ENTITY_TYPE_ID, "select": ["id", "updatedTime"], "filter": {">=updatedTime": border}},
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
+    )
+    selector = ResultSelector(("items",))
+    identity = IdentitySpec(("id",), "id", "id", IdentityCoercion.EXACT_INTEGER)
+    keyset = KeysetSpec()
+    if os.environ.get("ENV") != "PROD":
+        # An endpoint accepting ID filters may still ignore strict bounds or ordering.
+        # Keep this fail-closed guard until this exact portal/request is qualified;
+        # after qualification, set ENV=PROD or deliberately remove the guard.
+        await client.verify_keyset_capability(
+            request,
+            selector=selector,
+            identity=identity,
+            page_size=2,
+            keyset=keyset,
+        )
     stream = client.iter_list_keyset(
-        Request(
-            METHOD,
-            {"entityTypeId": ENTITY_TYPE_ID, "select": ["id", "updatedTime"], "filter": {">=updatedTime": border}},
-            replay_safety=ReplaySafety.SAFE,
-            route=RouteKind.BARE,
-        ),
-        selector=ResultSelector(("items",)),
-        identity=IdentitySpec(("id",), "id", "id", IdentityCoercion.EXACT_INTEGER),
+        request,
+        selector=selector,
+        identity=identity,
         page_size=2,
+        keyset=keyset,
         execution=SequentialKeysetExecution(),
     )
     observed = tuple([_item(row) async for row in stream])

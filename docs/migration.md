@@ -104,7 +104,7 @@ call; verification does not switch runtime mode and is not cached:
 ```python
 import os
 
-if not os.environ.get("PROD"):
+if os.environ.get("ENV") != "PROD":
     await api.verify_keyset_capability(
         request,
         selector=selector,

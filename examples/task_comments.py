@@ -4,11 +4,13 @@ One physical batch resolves four task IDs: a modern chat with messages, a
 legacy task without a chat, an empty modern chat, and a chat whose messages
 are inaccessible. The legacy fallback uses the exact TASKID/ORDER/FILTER
 positional ABI and public keyset traversal; the stub tasks.task.comment.list
-is never used. Run: `uv run python -m examples.task_comments`.
+is never used. Run the qualified frozen fixture:
+`ENV=PROD uv run python -m examples.task_comments`.
 """
 
 from __future__ import annotations
 import asyncio
+import os
 
 from b24api import (
     ApiResponseError,
@@ -192,16 +194,31 @@ async def _read_modern(client: Bitrix24, resolved: dict[int, int | None]) -> tup
 
 
 async def _read_legacy(client: Bitrix24) -> OperationReport:
+    request = _legacy_request(0)
+    selector = ResultSelector.root()
+    identity = IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER)
+    keyset = KeysetSpec(
+        filter_path=ParameterPath((2,)),
+        order_path=ParameterPath((1,)),
+        start_suppression_path=None,
+    )
+    if os.environ.get("ENV") != "PROD":
+        # An endpoint accepting ID filters may still ignore strict bounds or ordering.
+        # Keep this fail-closed guard until this exact portal/request is qualified;
+        # after qualification, set ENV=PROD or deliberately remove the guard.
+        await client.verify_keyset_capability(
+            request,
+            selector=selector,
+            identity=identity,
+            page_size=2,
+            keyset=keyset,
+        )
     stream = client.iter_list_keyset(
-        _legacy_request(0),
-        selector=ResultSelector.root(),
-        identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
+        request,
+        selector=selector,
+        identity=identity,
         page_size=2,
-        keyset=KeysetSpec(
-            filter_path=ParameterPath((2,)),
-            order_path=ParameterPath((1,)),
-            start_suppression_path=None,
-        ),
+        keyset=keyset,
         execution=SequentialKeysetExecution(),
     )
     observed = tuple([_id(row, "ID") async for row in stream])
