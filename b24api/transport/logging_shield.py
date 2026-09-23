@@ -45,6 +45,10 @@ _EMITTING_METHOD = "_send_handling_auth"
 _EMITTING_MODULE = ("httpx", "_client.py")
 _OWNER_EXTENSION = "b24api_log_owner"
 _UNATTRIBUTED = object()
+# Fields logging itself sets; everything else on a record arrived through ``extra``.
+_STANDARD_RECORD_FIELDS = frozenset(
+    (*logging.LogRecord("", logging.INFO, "", 0, "", None, None).__dict__, "message", "asctime"),
+)
 _REPLACEMENT = "[REDACTED]"
 _CREDENTIAL_PATH = re.compile(r"/rest/(?:api/)?[^/]+/([^/]+)/", re.IGNORECASE)
 # Full-length scrubbing: truncating a record's format string would break its %-interpolation.
@@ -179,9 +183,10 @@ class _OwnedRequestFilter(logging.Filter):
             record.args = {key: redact(value, credentials) for key, value in args.items()}
         elif isinstance(args, tuple):
             record.args = tuple(redact(value, credentials) for value in args)
-        for name in ("url", "request_url"):
-            if name in record.__dict__:
-                record.__dict__[name] = redact(record.__dict__[name], credentials)
+        # Any caller-supplied extra (a hook's ``hop_url``, instrumentation fields) can carry a URL.
+        for name, value in tuple(record.__dict__.items()):
+            if name not in _STANDARD_RECORD_FIELDS:
+                record.__dict__[name] = redact(value, credentials)
         return True
 
 
