@@ -249,8 +249,9 @@ _THIRD_MARKER = "synthetic-third-secret-777777"
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hook_kind", ["request", "response"])
 @pytest.mark.parametrize("same_client", [True, False], ids=["same-client", "other-client"])
-async def test_unrelated_httpx_request_inside_owned_response_hook_is_unchanged(same_client: bool) -> None:  # noqa: FBT001
+async def test_unrelated_httpx_request_inside_owned_hook_is_unchanged(same_client: bool, hook_kind: str) -> None:  # noqa: FBT001
     logger = logging.getLogger("httpx")
     previous_level = logger.level
     handler = _CollectingHandler()
@@ -262,9 +263,9 @@ async def test_unrelated_httpx_request_inside_owned_response_hook_is_unchanged(s
     )
     hook_calls: list[str] = []
 
-    async def hook(response: httpx.Response) -> None:
+    async def hook(event: httpx.Request | httpx.Response) -> None:
         if not hook_calls:
-            hook_calls.append(str(response.url))
+            hook_calls.append(str(event.url))
             await (client if same_client else foreign).get(foreign_url)
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -276,7 +277,7 @@ async def test_unrelated_httpx_request_inside_owned_response_hook_is_unchanged(s
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(respond),
         follow_redirects=True,
-        event_hooks={"response": [hook]},
+        event_hooks={hook_kind: [hook]},
     )
     transport = HttpxTransport(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/", client=client)
     try:
