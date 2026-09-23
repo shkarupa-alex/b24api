@@ -1,4 +1,4 @@
-"""Completion evidence evaluation; the gate judges recorded evidence, and only the recorders read traversal plans."""
+"""Completion evidence evaluation; the gate judges recorded evidence that family recorders translate from events."""
 
 from b24api.completion.gate import CompletionDecision, CompletionGate
 

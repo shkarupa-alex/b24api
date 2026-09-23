@@ -7,6 +7,7 @@ from collections.abc import AsyncGenerator, AsyncIterable, Iterator
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
+from b24api.completion.closure import qualified_closure
 from b24api.contracts.completion import BindingClosure
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
@@ -16,7 +17,6 @@ from b24api.references.dispatch import (
     _DoneEvent,
     _Event,
 )
-from b24api.traversal.closure import qualified_closure
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     DirectDispatch,

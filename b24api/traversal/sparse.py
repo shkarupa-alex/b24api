@@ -4,9 +4,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
+from b24api.completion.closure import SPARSE_RAW_RANGE_COVERED
 from b24api.contracts.traversal import RawTotalSource
 from b24api.errors import PaginationError
-from b24api.traversal.closure import SPARSE_RAW_RANGE_COVERED
 
 if TYPE_CHECKING:
     from b24api.contracts.request import ResultSelector

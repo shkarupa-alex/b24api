@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 import ast
+import subprocess
+import sys
 from pathlib import Path
+from typing import Any, cast
+
+import pytest
 
 import b24api.client
 
@@ -53,6 +58,27 @@ def _sources() -> tuple[Path, ...]:
 def _imports(path: Path) -> set[str]:
     result: set[str] = set()
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            result.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            result.add(node.module)
+    return result
+
+
+def _runtime_imports(path: Path) -> set[str]:
+    """Imports executed at module load, leaving out ``if TYPE_CHECKING:`` blocks."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    type_only = {
+        id(child)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+        for statement in node.body
+        for child in ast.walk(statement)
+    }
+    result: set[str] = set()
+    for node in ast.walk(tree):
+        if id(node) in type_only:
+            continue
         if isinstance(node, ast.Import):
             result.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module is not None:
@@ -121,6 +147,104 @@ def test_runtime_layer_import_boundaries_are_acyclic_and_evidence_free() -> None
                     "b24api.references",
                 )
             )
+
+
+def test_completion_layer_does_not_import_traversal_families() -> None:
+    completion = sorted((PACKAGE / "completion").glob("*.py"))
+    assert completion
+    for path in completion:
+        imports = _runtime_imports(path)
+        assert not any(
+            name == family or name.startswith(f"{family}.")
+            for name in imports
+            for family in ("b24api.traversal", "b24api.references", "b24api.batch")
+        ), f"{path.relative_to(PACKAGE)} imports a traversal family at runtime"
+
+
+def test_runtime_imports_ignore_only_type_checking_blocks(tmp_path: Path) -> None:
+    module = tmp_path / "module.py"
+    module.write_text(
+        "from typing import TYPE_CHECKING\n"
+        "import b24api.contracts\n"
+        "if TYPE_CHECKING:\n"
+        "    from b24api.traversal.values import IdentityValue\n"
+        "else:\n"
+        "    from b24api.traversal import plans\n",
+        encoding="utf-8",
+    )
+    assert _runtime_imports(module) == {"typing", "b24api.contracts", "b24api.traversal"}
+
+
+def test_completion_recorder_imports_without_the_package_facade() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            # A bare parent package keeps the b24api facade, which imports every family, out of the way.
+            "import importlib, sys, types; package = types.ModuleType('b24api');"
+            " package.__path__ = ['b24api']; sys.modules['b24api'] = package;"
+            " importlib.import_module('b24api.completion.recorder');"
+            " assert not any(name.startswith(('b24api.traversal', 'b24api.references', 'b24api.batch'))"
+            " for name in sys.modules), sorted(sys.modules)",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_executor_binds_host_through_transport_protocol() -> None:
+    from b24api.execution.executor import Executor  # noqa: PLC0415 - focused contract import
+    from b24api.execution.rate import RateCoordinator  # noqa: PLC0415 - focused contract import
+    from b24api.testing.scripted import ScriptedTransport  # noqa: PLC0415 - focused contract import
+    from b24api.transport.httpx import HttpxTransport  # noqa: PLC0415 - focused contract import
+
+    assert "b24api.transport.httpx" not in _imports(PACKAGE / "execution" / "executor.py")
+
+    shared = RateCoordinator()
+    Executor(ScriptedTransport((), host="a.example"), coordinator=shared)
+    Executor(ScriptedTransport((), host="a.example"), coordinator=shared)
+    with pytest.raises(ValueError, match="already bound to another host"):
+        Executor(ScriptedTransport((), host="b.example"), coordinator=shared)
+
+    httpx_shared = RateCoordinator()
+    Executor(HttpxTransport("https://portal.example/rest/1/synthetic-token/"), coordinator=httpx_shared)
+    with pytest.raises(ValueError, match="already bound to another host"):
+        Executor(ScriptedTransport((), host="other.example"), coordinator=httpx_shared)
+
+    class HostlessTransport:
+        async def send(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("a transport without a host is refused before any send")
+
+    with pytest.raises(TypeError, match="normalized portal host"):
+        Executor(cast("Any", HostlessTransport()))
+
+
+def test_report_replacements_stay_on_reviewed_downgrade_sites() -> None:
+    # Only the gate builds terminal reports; ``dataclasses.replace`` on a report is a second
+    # construction path, so every site that does it is pinned here for review. The AST cannot see
+    # types, so any first argument whose source names a report counts.
+    sites = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in _sources()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "replace")
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "replace"
+                and ast.unparse(node.func.value) == "dataclasses"
+            )
+        )
+        and node.args
+        and "report" in ast.unparse(node.args[0]).casefold()
+    }
+    # batch/stream.py and traversal/stream.py replace their KernelReport; references/support.py and
+    # execution/failure.py only downgrade a report to FAILED/INCOMPLETE with exhausted=False.
+    assert sites == {"batch/stream.py", "traversal/stream.py", "references/support.py", "execution/failure.py"}
 
 
 def test_failure_classification_importers_stay_inside_state_machine_layers() -> None:
@@ -311,8 +435,8 @@ def test_only_completion_gate_constructs_terminal_operation_reports() -> None:
 
 
 def test_closure_reason_constants_map_to_their_qualified_closure() -> None:
+    from b24api.completion import closure  # noqa: PLC0415 - focused contract import
     from b24api.contracts.completion import BindingClosure  # noqa: PLC0415 - focused contract import
-    from b24api.traversal import closure  # noqa: PLC0415 - focused contract import
 
     assert closure.qualified_closure(closure.SINGLE_RESPONSE_COMPLETE) is BindingClosure.SINGLE_RESPONSE
     assert closure.qualified_closure(closure.QUALIFIED_TOTAL_REACHED) is BindingClosure.QUALIFIED_TOTAL

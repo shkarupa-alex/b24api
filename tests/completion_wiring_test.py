@@ -24,13 +24,14 @@ from b24api.contracts.completion import (
 )
 from b24api.contracts.policy import KernelState
 from b24api.execution import Executor, WireResponse
-from b24api.traversal.plans import OffsetSequentialPlan
 
 RESERVED_PAGE_COUNT = 3
 
 
 class GateProbeTransport:
     """Assert scheduling evidence exists before each physical send."""
+
+    host = "fixture.invalid"
 
     def __init__(self) -> None:
         """Capture the observer installed after stream construction."""
@@ -99,7 +100,7 @@ def test_sequential_recorder_preserves_ambiguous_dispatch_as_unknown_terminal() 
     recorder = CompletionRecorder()
     recorder.scheduled()
     recorder.settled(CommandSettlement.UNKNOWN)
-    recorder.terminal_from_plan(OffsetSequentialPlan(), KernelState.INCOMPLETE, caller_stopped=False)
+    recorder.terminal_from_kernel(KernelState.INCOMPLETE, boundary=False, caller_stopped=False)
     recorder.cleanup(CleanupState.SUCCESS)
 
     decision = recorder.gate.decision()

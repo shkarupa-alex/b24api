@@ -372,9 +372,10 @@ class ItemStream(AsyncIterator[JsonValue]):
             page_trace_truncated=page_trace_truncated,
         )
         if self._completion is not None:
-            self._completion.terminal_from_plan(
-                self._driver.plan,
+            plan = self._driver.plan
+            self._completion.terminal_from_kernel(
                 state,
+                boundary=isinstance(plan, KeysetPlan) and plan.boundary is not None,
                 caller_stopped=self._caller_stopped,
                 terminal_reason=self._driver.terminal_reason,
                 qualified_total=self._driver._expected_total,  # noqa: SLF001 - driver qualified-total witness

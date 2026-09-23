@@ -5,6 +5,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
+from b24api.completion.closure import QUALIFIED_TOTAL_REACHED, SINGLE_RESPONSE_COMPLETE
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch, PageRejectionCode
 from b24api.contracts.traversal import OffsetContinuation
@@ -12,7 +13,6 @@ from b24api.errors import BudgetExceededError, CapabilityError, PaginationError
 from b24api.execution import (
     WorkClass,
 )
-from b24api.traversal.closure import QUALIFIED_TOTAL_REACHED, SINGLE_RESPONSE_COMPLETE
 from b24api.traversal.identity import (
     _initial_offset,
     _next_offset,

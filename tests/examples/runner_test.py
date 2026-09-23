@@ -332,6 +332,22 @@ def test_live_runner_rejects_duplicate_and_wrong_selected_scenario(tmp_path: Pat
     assert "missing required fields" in selected.stderr
 
 
+@pytest.mark.parametrize(("scenario", "default_requests", "prod_requests"), [(6, 14, 7), (8, 10, 6)])
+def test_runner_default_environment_runs_keyset_verifiers(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: int,
+    default_requests: int,
+    prod_requests: int,
+) -> None:
+    prod = _offline_record(scenario)
+    monkeypatch.delenv("ENV")
+    default = _offline_record(scenario)
+
+    assert prod["status"] == default["status"] == "passed"
+    # Outside PROD the unqualified keyset verifiers run on top of the qualified traversal.
+    assert (default["physical_requests"], prod["physical_requests"]) == (default_requests, prod_requests)
+
+
 def test_all_offline_recipes_emit_measured_passing_evidence() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "examples.run", "--scenario", "all"],

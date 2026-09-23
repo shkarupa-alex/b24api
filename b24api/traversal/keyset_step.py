@@ -3,6 +3,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
+from b24api.completion.closure import ADMITTED_UPPER_BOUNDARY_REACHED
 from b24api.contracts.bounded_range import filter_fingerprint
 from b24api.contracts.policy import (
     DuplicatePolicy,
@@ -12,7 +13,6 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.errors import CapabilityError, PaginationError
-from b24api.traversal.closure import ADMITTED_UPPER_BOUNDARY_REACHED
 from b24api.traversal.identity import _child_path, _request_with_controls
 from b24api.traversal.plans import KeysetPlan, KeysetTerminalRule
 from b24api.traversal.values import IdentityValue, _compare_identities

@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
+from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
 from b24api.contracts.json import FrozenJson, _freeze_json, _thaw_json
 from b24api.contracts.policy import (
     ConfirmationPolicy,
@@ -15,7 +16,6 @@ from b24api.contracts.policy import (
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, TraversalIdentity
 from b24api.contracts.response import Response, inject_controls
 from b24api.errors import CapabilityError, PaginationError
-from b24api.traversal.closure import QUALIFIED_TOTAL_REACHED
 from b24api.traversal.identity_ledger import _ExternalIdentityStore
 from b24api.traversal.plans import (
     CountedOffsetPlan,

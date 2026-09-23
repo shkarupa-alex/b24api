@@ -6,6 +6,7 @@ import json
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
+from b24api.completion.closure import qualified_closure
 from b24api.completion.gate import CompletionGate
 from b24api.contracts.completion import (
     BindingAdmitted,
@@ -24,8 +25,6 @@ from b24api.contracts.completion import (
     StreamTerminal,
 )
 from b24api.contracts.policy import KernelState
-from b24api.traversal.closure import qualified_closure
-from b24api.traversal.plans import KeysetPlan, ListPlan
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -182,11 +181,11 @@ class CompletionRecorder:
             )
         )
 
-    def terminal_from_plan(
+    def terminal_from_kernel(
         self,
-        plan: ListPlan,
         state: KernelState,
         *,
+        boundary: bool,
         caller_stopped: bool,
         terminal_reason: str | None = None,
         qualified_total: int | None = None,
@@ -201,7 +200,7 @@ class CompletionRecorder:
             else BindingClosure.FAILURE
             if state is not KernelState.COMPLETED
             else BindingClosure.BOUNDARY_SEEN
-            if isinstance(plan, KeysetPlan) and plan.boundary
+            if boundary
             else qualified_closure(terminal_reason) or BindingClosure.SOURCE_EMPTY
         )
         stream = (
