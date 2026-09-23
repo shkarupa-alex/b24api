@@ -8,11 +8,10 @@ The latter never contacts a portal implicitly and never promotes a missing fixtu
 from __future__ import annotations
 import argparse
 import asyncio
-import hashlib
-import hmac
+import base64
+import binascii
 import importlib
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -21,6 +20,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
@@ -31,8 +33,7 @@ if TYPE_CHECKING:
     from b24api import Request
 
 METHOD_CARD_SHA = "909c6bf14b29961a365dc6d6d4c2c47b5e2533d4"
-LIVE_ATTESTATION_KEY_ENV = "B24API_LIVE_EVIDENCE_ATTESTATION_KEY"
-MINIMUM_ATTESTATION_KEY_BYTES = 32
+LIVE_RECORDER_PUBLIC_KEY = base64.b64decode("Huf/nl4BiI5pIKf7AWL6DbYni/pDSJIhwFkzDkWb+es=")
 MINIMUM_HTTP_STATUS = 100
 MAXIMUM_HTTP_STATUS = 599
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -204,13 +205,19 @@ def _validate_captured_requests(record: dict[str, object], requests: object, sce
 
 
 def _validate_live_capture(record: dict[str, object], scenario: Scenario) -> None:
-    key = os.environ.get(LIVE_ATTESTATION_KEY_ENV)
-    if key is None or len(key.encode()) < MINIMUM_ATTESTATION_KEY_BYTES:
-        raise ValueError(f"LIVE evidence requires a 32-byte {LIVE_ATTESTATION_KEY_ENV}")
     attestation = record.get("attestation")
-    expected = hmac.new(key.encode(), _live_attestation_payload(record), hashlib.sha256).hexdigest()
-    if not isinstance(attestation, str) or not hmac.compare_digest(attestation, f"hmac-sha256:{expected}"):
-        raise ValueError(f"LIVE evidence for scenario {scenario.number} has no valid capture attestation")
+    try:
+        signature = (
+            base64.b64decode(attestation.removeprefix("ed25519:"), validate=True)
+            if isinstance(attestation, str) and attestation.startswith("ed25519:")
+            else b""
+        )
+        Ed25519PublicKey.from_public_bytes(LIVE_RECORDER_PUBLIC_KEY).verify(
+            signature,
+            _live_attestation_payload(record),
+        )
+    except (ValueError, binascii.Error, InvalidSignature):
+        raise ValueError(f"LIVE evidence for scenario {scenario.number} has no valid capture attestation") from None
     capture = record.get("capture")
     required = {"kind", "captured_at", "portal_fingerprint", "fixture_id", "requests"}
     if not isinstance(capture, dict) or set(capture) != required:

@@ -1,15 +1,16 @@
 """The shared recipe runner emits bound structured evidence and fails closed for LIVE."""
 
 from __future__ import annotations
+import base64
 import hashlib
-import hmac
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from examples import run as recipe_runner
 from examples._support.evidence import RecipeEvidence
@@ -17,7 +18,8 @@ from examples._support.evidence import RecipeEvidence
 ROOT = Path(__file__).resolve().parents[2]
 LIVE_SKIPPED = 3
 SCENARIO_COUNT = 19
-LIVE_KEY = "test-live-evidence-attestation-key-32-bytes"
+LIVE_SIGNING_KEY = Ed25519PrivateKey.generate()
+LIVE_PUBLIC_KEY = LIVE_SIGNING_KEY.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 
 
 def _offline_record(scenario: int = 1) -> dict[str, object]:
@@ -27,7 +29,6 @@ def _offline_record(scenario: int = 1) -> dict[str, object]:
         check=True,
         capture_output=True,
         text=True,
-        env=_live_env(),
     )
     return json.loads(result.stdout)
 
@@ -61,13 +62,9 @@ def _live_record() -> dict[str, object]:
             },
         },
     )
-    digest = hmac.new(LIVE_KEY.encode(), recipe_runner._live_attestation_payload(record), hashlib.sha256).hexdigest()  # noqa: SLF001
-    record["attestation"] = f"hmac-sha256:{digest}"
+    signature = LIVE_SIGNING_KEY.sign(recipe_runner._live_attestation_payload(record))  # noqa: SLF001
+    record["attestation"] = f"ed25519:{base64.b64encode(signature).decode()}"
     return record
-
-
-def _live_env() -> dict[str, str]:
-    return {**os.environ, recipe_runner.LIVE_ATTESTATION_KEY_ENV: LIVE_KEY}
 
 
 def test_offline_runner_emits_required_structured_summary() -> None:
@@ -77,7 +74,6 @@ def test_offline_runner_emits_required_structured_summary() -> None:
         check=False,
         capture_output=True,
         text=True,
-        env=_live_env(),
     )
     assert result.returncode == 0, result.stderr
     summary = json.loads(result.stdout)
@@ -120,9 +116,23 @@ def test_live_runner_never_promotes_missing_evidence_to_success(tmp_path: Path) 
     assert summary["reason"]
 
 
-def test_live_runner_accepts_only_a_fully_bound_consistent_record(tmp_path: Path) -> None:
+def test_live_runner_accepts_only_a_capture_from_the_pinned_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
     record = _live_record()
-    evidence = tmp_path / "evidence.jsonl"
+    monkeypatch.setattr(recipe_runner, "LIVE_RECORDER_PUBLIC_KEY", LIVE_PUBLIC_KEY)
+
+    assert (
+        recipe_runner._validate_live_record(  # noqa: SLF001
+            record,
+            recipe_runner.SCENARIOS[0],
+            str(record["client_sha"]),
+        )
+        == record
+    )
+
+
+def test_live_runner_rejects_capture_signed_by_the_caller(tmp_path: Path) -> None:
+    record = _live_record()
+    evidence = tmp_path / "caller-signed.jsonl"
     evidence.write_text(json.dumps(record) + "\n")
 
     result = subprocess.run(  # noqa: S603 - fixed interpreter and repository module
@@ -131,11 +141,10 @@ def test_live_runner_accepts_only_a_fully_bound_consistent_record(tmp_path: Path
         check=False,
         capture_output=True,
         text=True,
-        env=_live_env(),
     )
 
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == record
+    assert result.returncode != 0
+    assert "no valid capture attestation" in result.stderr
 
 
 def test_live_runner_rejects_a_relabelled_offline_summary(tmp_path: Path) -> None:
@@ -150,7 +159,6 @@ def test_live_runner_rejects_a_relabelled_offline_summary(tmp_path: Path) -> Non
         check=False,
         capture_output=True,
         text=True,
-        env=_live_env(),
     )
 
     assert result.returncode != 0
@@ -175,7 +183,6 @@ def test_live_runner_rejects_capture_modified_after_attestation(tmp_path: Path) 
         check=False,
         capture_output=True,
         text=True,
-        env=_live_env(),
     )
 
     assert result.returncode != 0
@@ -223,7 +230,6 @@ def test_live_runner_rejects_contradictory_passing_evidence(
         check=False,
         capture_output=True,
         text=True,
-        env=_live_env(),
     )
 
     assert result.returncode != 0
