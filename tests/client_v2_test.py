@@ -966,8 +966,9 @@ async def test_reference_incomplete_maps_to_typed_failure_not_unknown() -> None:
     assert failure.correlation is correlation
     assert failure.partial_rows == 1
     assert isinstance(failure.error, IncompleteTraversalError)
-    assert failure.error.report.state is TerminalState.INCOMPLETE
-    assert failure.error.report.emitted == 1
+    assert failure.error.report is None
+    assert failure.error.error is not None
+    assert failure.error.error is failure.error.__cause__
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
     assert stream.report.failures == 1
@@ -1003,7 +1004,8 @@ async def test_counted_reference_post_io_capability_failure_is_typed_incomplete(
     assert failure.partial_rows == 0
     assert isinstance(failure.error, IncompleteTraversalError)
     assert isinstance(failure.error.__cause__, CapabilityError)
-    assert failure.error.report.state is TerminalState.INCOMPLETE
+    assert failure.error.report is None
+    assert failure.error.error is failure.error.__cause__
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
 
