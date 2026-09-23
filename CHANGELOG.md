@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `iter_list_counted()` accepts a first page with no rows, no `next`, and a missing, `null`, or `-1`
+  `total` as an observed empty source. The report completes and is exhausted with `mechanics_only`
+  assurance (`identity_exact` with an identity) and never claims a count; `total: 0` keeps its
+  count-matched result, and an explicit `ConsistencyPolicy` confirmation of `QUALIFIED_TOTAL` keeps such a page strict.
 - Added `Bitrix24.iter_cursors()` with lazy one/many-parent scheduling, per-binding
   `Binding.start_cursor`, strict seed progression, shared physical batching and existing
   fail-fast/tolerant reference semantics. When cursor-control creation is disabled, the complete

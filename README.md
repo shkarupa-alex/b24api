@@ -220,6 +220,16 @@ stream = client.iter_list_counted(
 Use it only when `total` is exact for the supplied filter and offset pages are stable. Any missing
 range, overlap, duplicate identity or total contradiction raises `IncompleteTraversalError`.
 
+A filtered call that matches nothing may omit `total` entirely, as `user.get` does with
+`result: []`. A first page with no rows, no `next` and no usable `total` (missing, `null`, or the
+`-1` unknown sentinel) therefore completes as an observed empty source after that one request: the
+report is `completed` and `exhausted`, but its assurance is `mechanics_only` (`identity_exact` with an
+identity), never a count-matched claim, and no total is invented. A first page that reports
+`total: 0` keeps the count-matched result. Rows without a usable total, a remaining `next`, a
+positive total with no rows, a fixed step, or a `ConsistencyPolicy` whose `confirmation_policy` is
+`QUALIFIED_TOTAL` (from `b24api.contracts.policy.ConfirmationPolicy`) stay strict and raise
+`IncompleteTraversalError`.
+
 Physical batching reduces HTTP exchanges, but does not suppress server-side COUNT in ordinary
 counted list subrequests. Each command still performs its own offset page retrieval and associated
 total calculation on the server. Do not confuse batching these commands with a no-count traversal.

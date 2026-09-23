@@ -5,6 +5,7 @@ import contextlib
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
+from b24api.contracts.completion import EMPTY_SOURCE_WITNESS, EmptySourceWitness
 from b24api.contracts.json import FrozenJson, _json_type_name
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import (
@@ -158,6 +159,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._page_batch_index: int | None = None
         self._page_offset: int | None = None
         self.source_page = _SourcePageState()
+        self.empty_source_witness: EmptySourceWitness | None = None
+        self._empty_source_allowance = False
 
     async def pages(self) -> AsyncGenerator[_Page]:  # noqa: C901
         """Yield validated traversal pages."""
@@ -200,11 +203,12 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         response: Response,
         *,
         terminal: bool = False,
+        empty_source: bool = False,
     ) -> None:
         """Validate one externally dispatched page with the canonical traversal state machine."""
         if self._identity_store is None:
             raise RuntimeError("page validation is not active")
-        self._validate_page(items, response=response, terminal=terminal)
+        self._validate_page(items, response=response, terminal=terminal, empty_source=empty_source)
 
     def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:
         """Select one scheduled page and retain value-free evidence on shape rejection."""
@@ -335,7 +339,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._confirmation_policy = effective.confirmation_policy
         preflight_controls(self)
 
-    def _validate_page(
+    def _validate_page(  # noqa: PLR0913
         self,
         items: tuple[FrozenJson, ...],
         *,
@@ -343,9 +347,12 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         qualified_count: int | None = None,
         terminal: bool = False,
         identities: list[IdentityValue] | None = None,
+        empty_source: bool = False,
     ) -> list[IdentityValue]:
         """Evaluate a page transactionally and commit only after all checks pass."""
         source_items = self.source_page.take(items)
+        # The allowance is re-derived from pre-commit state and lives only inside this transaction.
+        self._empty_source_allowance = empty_source and self.empty_source_head_eligible(response, source_items, items)
         snapshot = (
             self.validated_rows,
             self._expected_total,
@@ -358,7 +365,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             self.duplicate_identities,
         )
         try:
-            return self._validate_page_impl(
+            accepted = self._validate_page_impl(
                 source_items,
                 response=response,
                 qualified_count=qualified_count,
@@ -381,6 +388,12 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             del self.violations[violation_count:]
             self._record_rejected_page(source_items, response, error)
             raise
+        finally:
+            witnessed, self._empty_source_allowance = self._empty_source_allowance, False
+        if witnessed:
+            self.empty_source_witness = EMPTY_SOURCE_WITNESS
+            self.terminal_reason = EMPTY_SOURCE_WITNESS.terminal_reason
+        return accepted
 
     def _validate_page_impl(  # noqa: C901, PLR0912, PLR0915
         self,
@@ -618,8 +631,9 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
     def _validate_response_total(self, response: Response, accepted_count: int) -> None:
         if self._total_semantics is TotalSemantics.FILTERED_EXACT:
             if response.total in {None, -1}:
-                raise CapabilityError("filtered exact total requires a non-negative total")
-            if self._expected_total is None:
+                if not self._empty_source_allowance:
+                    raise CapabilityError("filtered exact total requires a non-negative total")
+            elif self._expected_total is None:
                 self._expected_total = response.total
             elif response.total != self._expected_total:
                 raise _PageRejectionError("traversal exact total drifted", PageRejectionCode.TOTAL_DRIFT)
@@ -659,7 +673,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
                 )
                 self._advisory_total_mismatch_reported = True
             return
-        if self._total_semantics is not TotalSemantics.FILTERED_EXACT:
+        if self._total_semantics is not TotalSemantics.FILTERED_EXACT or self._empty_source_allowance:
             return
         if self._expected_total is None:
             raise CapabilityError("terminal traversal lacks its filtered exact total")

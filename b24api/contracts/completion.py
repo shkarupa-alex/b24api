@@ -3,6 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import ClassVar
 
 _MAX_ID_LENGTH = 128
 
@@ -28,6 +29,21 @@ class BindingClosure(StrEnum):
     CALLER_STOP = "caller_stop"
     FAILURE = "failure"
     UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class EmptySourceWitness:
+    """Value-free proof that a validated first page showed an empty source without an exact total.
+
+    The binding closure a recorder emits and the terminal reason a report publishes both derive
+    from this one value, so neither side can claim an observed count the response never carried.
+    """
+
+    closure: ClassVar[BindingClosure] = BindingClosure.SOURCE_EMPTY
+    terminal_reason: ClassVar[str] = "empty source observed without a total"
+
+
+EMPTY_SOURCE_WITNESS = EmptySourceWitness()
 
 
 class StreamClosure(StrEnum):

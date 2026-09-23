@@ -131,6 +131,8 @@ def finalize_failure[R](
     }
     if hasattr(report, "exhausted"):
         changes["exhausted"] = False
+    if getattr(report, "empty_source_witness", None) is not None:
+        changes["empty_source_witness"] = None
     try:
         frozen = cast(
             "R",

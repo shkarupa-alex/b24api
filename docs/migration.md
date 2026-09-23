@@ -250,6 +250,12 @@ latency-oriented workloads. The dispatcher shutdown remains cancellation-based; 
   subclass of `HTTPGatewayError`. Malformed non-empty JSON remains `ProtocolError`.
 - Counted identity is optional. Without it, matching a qualified total yields count-only assurance;
   with it, the report records identity-and-count assurance.
+- `iter_list_counted()` no longer fails when the first page has no rows, no `next`, and no usable
+  `total` (missing, `null`, or `-1`). It completes and is exhausted after that one request, with
+  `mechanics_only` assurance (`identity_exact` with an identity) and the terminal reason
+  `empty source observed without a total`. Callers that must see an exact total set
+  `ConsistencyPolicy.confirmation_policy` to `b24api.contracts.policy.ConfirmationPolicy.QUALIFIED_TOTAL`,
+  which keeps such a page incomplete.
 - Final 1xx and 3xx responses are classified as `HTTPGatewayError` with their actual status before
   envelope decoding.
 - `RequestSummary.to_dict()` now includes bounded `encoding` and normalized `header_names` fields.
