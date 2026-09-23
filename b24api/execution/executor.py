@@ -231,6 +231,7 @@ class Executor:
         await context.start()
         retry_started = self._clock()
         attempts = 0
+        last_error: B24ApiError | None = None
         while True:
             remaining = context.remaining_time(retry_started=retry_started)
             if remaining <= 0:
@@ -244,7 +245,7 @@ class Executor:
                         budget=DeadlineBudget(self._clock() + remaining),
                     )
             except TimeoutError as error:
-                raise BudgetExceededError("permit wait exhausted execution time budget") from error
+                raise BudgetExceededError("permit wait exhausted execution time budget") from (last_error or error)
             try:
                 async with permit:
                     remaining = context.remaining_time(retry_started=retry_started)
@@ -278,6 +279,7 @@ class Executor:
                     retry_started=retry_started,
                     attempts=attempts,
                 )
+                last_error = error
                 attempts += 1
                 continue
 
@@ -314,11 +316,12 @@ class Executor:
                 if context.remaining_time(retry_started=retry_started) <= 0:
                     raise BudgetExceededError("transport completed after execution time budget")
                 return wire
-            if (
-                isinstance(response_error, ApiResponseError)
-                and response_error.normalized_code == "operation_time_limit"
-            ):
-                await context.coordinator.observe_api_throttle(request.method, response_error.normalized_code)
+            code = response_error.normalized_code if isinstance(response_error, ApiResponseError) else None
+            method_cooldown = (
+                await context.coordinator.observe_api_throttle(request.method, code)
+                if code == "operation_time_limit"
+                else 0.0
+            )
             throttle_delay = _retry_after_seconds(wire)
             if throttle_delay is not None:
                 merged = await context.coordinator.observe_throttle(
@@ -336,7 +339,9 @@ class Executor:
                 retry_started=retry_started,
                 attempts=attempts,
                 wire=wire,
+                method_cooldown=method_cooldown,
             )
+            last_error = response_error
             attempts += 1
 
     async def _prepare_retry(  # noqa: PLR0913
@@ -348,6 +353,7 @@ class Executor:
         retry_started: float,
         attempts: int,
         wire: WireResponse | None = None,
+        method_cooldown: float = 0.0,
     ) -> None:
         safety = request.replay_safety or ReplaySafety.UNKNOWN
         if isinstance(error, ResponseTooLargeError) and safety is not ReplaySafety.SAFE:
@@ -396,13 +402,13 @@ class Executor:
             raise BudgetExceededError("per-request attempt budget exhausted") from error
         delay = _retry_delay(context.policy, retry_number=next_attempt, random_source=self._random)
         throttle_delay = _retry_after_seconds(wire) if wire is not None else None
-        if throttle_delay is not None:
-            delay = max(delay, throttle_delay)
+        # The coordinator holds the next permit until a method cooldown ends; past the budget it cannot succeed.
+        delay = max(delay, throttle_delay or 0.0, method_cooldown)
         remaining = context.remaining_time(retry_started=retry_started)
         if delay >= remaining:
             raise BudgetExceededError("retry delay would exceed elapsed budget") from error
         await context.record_retry()
-        if throttle_delay is None and delay > 0:
+        if throttle_delay is None and not method_cooldown and delay > 0:
             await self._sleep(delay)
 
 

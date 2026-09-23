@@ -535,6 +535,67 @@ async def test_unsafe_operation_time_limit_observes_method_without_replay() -> N
     await coordinator.close()
 
 
+_OPERATION_TIME_LIMIT = WireResponse(
+    status_code=200,
+    headers=(),
+    body=b'{"error":"OPERATION_TIME_LIMIT","error_description":"wait"}',
+)
+_SAFE_PROFILE = Request("profile", route=RouteKind.BARE, replay_safety=ReplaySafety.SAFE)
+
+
+@pytest.mark.asyncio
+async def test_safe_operation_time_limit_past_the_budget_fails_at_once_with_its_cause() -> None:
+    transport = SequenceTransport([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
+    coordinator = RateCoordinator()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(BudgetExceededError) as captured:
+        await Executor(transport, coordinator=coordinator).execute(
+            _SAFE_PROFILE, policy=ExecutionPolicy(max_retry_elapsed_per_request=2.0)
+        )
+    # The default 120-second method cooldown cannot fit a 2-second budget, so nothing waits.
+    assert loop.time() - started < 1.0
+    assert transport.calls == 1
+    assert isinstance(captured.value.__cause__, ApiResponseError)
+    assert captured.value.__cause__.normalized_code == "operation_time_limit"
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_safe_operation_time_limit_within_the_budget_retries_after_the_cooldown() -> None:
+    cooldown = 0.2
+    transport = SequenceTransport([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
+    coordinator = RateCoordinator(operation_time_limit_delay=cooldown)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    response = await Executor(transport, coordinator=coordinator).execute(
+        _SAFE_PROFILE, policy=ExecutionPolicy(max_retry_elapsed_per_request=5.0)
+    )
+    assert response.result is True
+    assert transport.calls == len(transport.outcomes)
+    assert loop.time() - started >= cooldown * 0.9
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_safe_traversal_page_operation_time_limit_keeps_its_typed_cause() -> None:
+    from b24api import Bitrix24  # noqa: PLC0415 - facade seam for one traversal control
+
+    transport = SequenceTransport([_OPERATION_TIME_LIMIT])
+    stream = Bitrix24._from_executor(Executor(transport)).iter_list(  # noqa: SLF001 - deterministic facade seam
+        Request("crm.item.list", route=RouteKind.BARE, replay_safety=ReplaySafety.SAFE),
+        page_size=50,
+        policy=ExecutionPolicy(max_retry_elapsed_per_request=2.0),
+    )
+    with pytest.raises(BudgetExceededError) as captured:
+        _ = [row async for row in stream]
+    assert transport.calls == 1
+    assert isinstance(captured.value.__cause__, ApiResponseError)
+    assert captured.value.__cause__.normalized_code == "operation_time_limit"
+    assert stream.report is not None
+    assert not stream.report.exhausted
+
+
 @pytest.mark.asyncio
 async def test_method_limit_repeated_signal_extends_deadline_and_capacity_is_explicit() -> None:
     now = 100.0
