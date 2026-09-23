@@ -816,6 +816,16 @@ def test_sequential_stride_requires_an_explicit_distinct_wire_limit_before_io() 
     assert transport.requests == []
 
 
+def test_page_stride_rejects_an_explicit_subwindow_wire_limit() -> None:
+    with pytest.raises(ValueError, match="must cover the wire increment"):
+        PageStride(
+            server_granularity=PAGE_SIZE,
+            wire_increment=PAGE_SIZE * 2,
+            max_decoded_rows=PAGE_SIZE,
+            requested_wire_limit=PAGE_SIZE,
+        )
+
+
 @pytest.mark.asyncio
 async def test_reference_counted_fixed_step_ignores_relative_next() -> None:
     starts: list[int] = []

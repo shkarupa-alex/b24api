@@ -87,6 +87,8 @@ class PageStride:
             or self.requested_wire_limit % self.server_granularity
         ):
             raise ValueError("requested wire limit must align with server page granularity")
+        if self.requested_wire_limit is not None and self.requested_wire_limit < self.wire_increment:
+            raise ValueError("requested wire limit must cover the wire increment")
 
 
 @dataclass(frozen=True, slots=True)

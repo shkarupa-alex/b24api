@@ -75,8 +75,8 @@ This is structural coverage, so its report uses `RAW_RANGE_COVERED` rather than 
 snapshot of a mutable source.
 
 When a stride's decoded row cap differs from its wire increment and the request owns a limit
-control, set `requested_wire_limit` explicitly. Construction now rejects an omitted value before
-I/O instead of silently sending the smaller decoded cap and leaving part of each wire window
+control, set `requested_wire_limit` explicitly to at least the wire increment. Construction now
+rejects an omitted or smaller value before I/O instead of leaving part of each wire window
 unrequested.
 
 The earlier 2.x keyset migration notes below remain as historical guidance for that API.
