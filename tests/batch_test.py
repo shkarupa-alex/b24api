@@ -52,6 +52,8 @@ NESTED_ROW_COUNT = 2
 class CallbackTransport:
     """Provide a deterministic test helper."""
 
+    host = "fixture.invalid"
+
     def __init__(self, callback: Callable[[Request], WireResponse | Exception]) -> None:
         """Initialize instance state."""
         self.callback = callback
@@ -569,6 +571,8 @@ async def test_batch_cancellation_carries_same_terminal_report() -> None:
     started = asyncio.Event()
 
     class BlockingTransport:
+        host = "fixture.invalid"
+
         async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
             del request, attempt_timeout, max_response_bytes
             started.set()
@@ -632,6 +636,8 @@ async def test_repeated_batch_cancellation_still_carries_final_report() -> None:
     started = asyncio.Event()
 
     class BlockingTransport:
+        host = "fixture.invalid"
+
         async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
             del request, attempt_timeout, max_response_bytes
             started.set()

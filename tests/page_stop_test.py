@@ -30,6 +30,8 @@ from b24api.execution import Executor, WireResponse
 class ListTransport:
     """Three distinct wire families over an independent five-row oracle."""
 
+    host = "fixture.invalid"
+
     def __init__(self) -> None:
         """Track physical requests per run."""
         self.requests: list[Request] = []

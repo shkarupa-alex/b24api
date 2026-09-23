@@ -42,7 +42,6 @@ from b24api.execution.context import (
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
 from b24api.transport.base import TransportCapabilities, WireRequest, WireTransport
-from b24api.transport.httpx import HttpxTransport
 from b24api.transport.protocol import ProtocolCodec
 
 if TYPE_CHECKING:
@@ -99,8 +98,11 @@ class Executor:
         self.transport = transport
         self._wire_transport = transport if isinstance(transport, WireTransport) else None
         self.coordinator = coordinator or RateCoordinator(clock=clock)
-        if isinstance(transport, HttpxTransport):
-            self.coordinator.bind_host(transport.host)
+        try:
+            host = transport.host
+        except AttributeError:
+            raise TypeError("transport must expose the normalized portal host its coordinator binds") from None
+        self.coordinator.bind_host(host)
         self.codec = codec or ProtocolCodec()
         self._clock = clock
         self._sleep = sleep

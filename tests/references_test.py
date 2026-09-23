@@ -64,6 +64,8 @@ RETAINED_VIOLATION_LIMIT = 128
 class AsyncFunctionTransport:
     """Provide a deterministic test helper."""
 
+    host = "fixture.invalid"
+
     def __init__(self, handler: Callable[[Request], object]) -> None:
         """Initialize instance state."""
         self.handler = handler
@@ -82,6 +84,8 @@ class AsyncFunctionTransport:
 
 class BlockingTransport:
     """Provide a deterministic test helper."""
+
+    host = "fixture.invalid"
 
     def __init__(self) -> None:
         """Initialize instance state."""
@@ -483,6 +487,8 @@ async def test_batch_dispatch_coalesces_pages_and_preserves_total_metadata() -> 
 @pytest.mark.asyncio
 async def test_reference_batch_preserves_tolerant_duplicate_json_members() -> None:
     class DuplicateMemberTransport:
+        host = "fixture.invalid"
+
         async def send(
             self,
             request: Request,
@@ -563,6 +569,8 @@ async def test_fan_out_accepts_list_result_whose_total_matches_list_length() -> 
 @pytest.mark.asyncio
 async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
     class TransientThenSuccessTransport:
+        host = "fixture.invalid"
+
         def __init__(self) -> None:
             self.requests: list[Request] = []
 
@@ -1418,6 +1426,8 @@ async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_
     returned = asyncio.Event()
 
     class CancellationResistantTransport:
+        host = "fixture.invalid"
+
         async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
             del request, attempt_timeout, max_response_bytes
             started.set()
@@ -1477,6 +1487,8 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
     release = asyncio.Event()
 
     class CancellationResistantTransport:
+        host = "fixture.invalid"
+
         async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
             del attempt_timeout, max_response_bytes
             if request.method == "bad":
@@ -1522,6 +1534,8 @@ async def test_closed_batch_worker_exits_after_transport_temporarily_resists_can
     release = asyncio.Event()
 
     class CancellationResistantTransport:
+        host = "fixture.invalid"
+
         async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
             del attempt_timeout, max_response_bytes
             started.set()

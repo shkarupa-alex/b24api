@@ -35,6 +35,8 @@ from b24api.execution import Executor, WireResponse
 class BoundaryTransport:
     """Independent finite rows with optional server fence defect."""
 
+    host = "fixture.invalid"
+
     def __init__(self, ids: tuple[int, ...], *, ignore_fence: bool = False) -> None:
         self.ids = ids
         self.ignore_fence = ignore_fence

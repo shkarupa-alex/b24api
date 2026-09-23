@@ -33,6 +33,8 @@ from b24api.execution import Executor, WireResponse
 class ChatTransport:
     """Two independent descending chats with a finite source oracle."""
 
+    host = "fixture.invalid"
+
     def __init__(self) -> None:
         """Track each exact binding and cursor sent over the wire."""
         self.requests: list[tuple[str, int]] = []

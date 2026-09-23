@@ -67,6 +67,8 @@ THREE_ROWS = 3
 class FunctionTransport:
     """Provide a deterministic test helper."""
 
+    host = "fixture.invalid"
+
     def __init__(self, handler: Callable[[Request], object]) -> None:
         """Initialize instance state."""
         self.handler = handler
@@ -82,6 +84,8 @@ class FunctionTransport:
 
 class BlockingTransport:
     """Provide a deterministic test helper."""
+
+    host = "fixture.invalid"
 
     def __init__(self) -> None:
         """Initialize instance state."""
@@ -1161,6 +1165,8 @@ async def test_task_cancellation_propagates_to_transport_and_finalizes_report() 
 @pytest.mark.asyncio
 async def test_cancellation_after_decoded_response_cannot_rollback_logical_page() -> None:
     class CancelAfterResponseTransport:
+        host = "fixture.invalid"
+
         def __init__(self) -> None:
             self.context: ExecutionContext | None = None
             self.locked = asyncio.Event()
@@ -1202,6 +1208,8 @@ async def test_cancellation_after_decoded_response_cannot_rollback_logical_page(
 @pytest.mark.asyncio
 async def test_cancellation_during_failed_finalization_preserves_failure_report() -> None:
     class MalformedAfterLockTransport:
+        host = "fixture.invalid"
+
         def __init__(self) -> None:
             self.context: ExecutionContext | None = None
             self.locked = asyncio.Event()

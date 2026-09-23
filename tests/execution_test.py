@@ -166,6 +166,8 @@ async def test_transport_webhook_vault_is_opaque_and_gc_bounded() -> None:
 class SequenceTransport:
     """Provide a deterministic test helper."""
 
+    host = "fixture.invalid"
+
     def __init__(self, outcomes: tuple[WireResponse | Exception, ...] | list[WireResponse | Exception]) -> None:
         """Initialize instance state."""
         self.outcomes = list(outcomes)

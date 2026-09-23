@@ -23,6 +23,8 @@ from b24api.execution import Executor, WireResponse
 class MessageTransport:
     """LAST_ID strictly excludes IDs at or above a positive control."""
 
+    host = "fixture.invalid"
+
     def __init__(self, ids: tuple[int, ...] = (3, 2, 1)) -> None:
         """Retain all physical cursor controls."""
         self.controls: list[int] = []

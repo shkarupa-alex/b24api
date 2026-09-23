@@ -34,10 +34,12 @@ positive logger controls against the newly admitted version.
 Direct access to `RateCoordinator.acquire()` now requires a non-empty `methods` frozenset. A
 physical batch passes every inner method as one admission unit. `Retry-After` pauses the portal
 host; `OPERATION_TIME_LIMIT` pauses only its method, with a configurable 120-second default.
-The coordinator uses one portal host per `HttpxTransport` and rejects attempts to share it across
-different hosts. An unsafe request or batch failure records the throttle without automatically
-replaying the request. Callers can pass an absolute monotonic `DeadlineBudget` to bound permit
-waits and handle typed budget, closed, and capacity errors.
+The coordinator binds the portal host of every transport it serves, `HttpxTransport` or custom,
+through the `Transport.host` property, and rejects attempts to share it across different hosts; a
+custom transport without `host` is refused with `TypeError` when the `Executor` is built. An unsafe
+request or batch failure records the throttle without automatically replaying the request. Callers
+can pass an absolute monotonic `DeadlineBudget` to bound permit waits and handle typed budget,
+closed, and capacity errors.
 
 Qualified PHP methods that take positional arguments now use `PositionalArguments` with an
 explicit `PositionalLayout`. Pass that value as the second argument to `Request`. Slots are

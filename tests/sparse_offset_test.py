@@ -27,6 +27,8 @@ from b24api.execution import Executor, WireResponse
 class SparseTransport:
     """Independent raw SQL offset oracle with sparse selected output."""
 
+    host = "fixture.invalid"
+
     def __init__(
         self,
         *,
@@ -95,6 +97,8 @@ async def test_non_sparse_fixed_stride_rejects_an_unexplained_short_window() -> 
     short_window_extent = 100
 
     class ShortWindowTransport:
+        host = "fixture.invalid"
+
         def __init__(self) -> None:
             self.offsets: list[int] = []
 

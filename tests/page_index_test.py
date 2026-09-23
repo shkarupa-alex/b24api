@@ -13,6 +13,8 @@ from b24api.execution import Executor, WireResponse
 class PageTransport:
     """Independent oracle with 10, 3, and 0 decoded rows."""
 
+    host = "fixture.invalid"
+
     def __init__(self) -> None:
         """Track exact wire page controls."""
         self.pages: list[int] = []

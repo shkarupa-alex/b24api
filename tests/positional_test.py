@@ -219,6 +219,7 @@ def test_positional_null_and_trailing_omission_are_distinct() -> None:
 @pytest.mark.asyncio
 async def test_positional_requires_advertised_wire_capability_before_io() -> None:
     class LegacyTransport:
+        host = "fixture.invalid"
         calls = 0
 
         async def send(
