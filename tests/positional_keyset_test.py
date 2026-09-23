@@ -44,6 +44,7 @@ from b24api.contracts.positional import PositionalControlError, PositionalContro
 from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError
 from b24api.execution import HttpxTransport
 from b24api.testing import ScriptedTransport
+from b24api.traversal.identity import _request_with_controls
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -357,3 +358,44 @@ async def test_documented_positional_keyset_guard_verifies_offline() -> None:
     assert report.verdict is KeysetCapabilityVerdict.VERIFIED
     assert requests
     assert {len(slots) for slots in requests} == {len(_layout().slots)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params", [{}, {"NAV_PARAMS": []}], ids=["absent", "wrong-shape"])
+async def test_positional_page_control_without_its_parent_fails_before_io(params: dict[str, object]) -> None:
+    path = ParameterPath((4, "NAV_PARAMS", "iNumPage"))
+    layout = PositionalLayout("page.v1", _layout().slots, control_paths=frozenset({path.path}))
+    arguments = PositionalArguments(
+        (Present(TASK_ID), EmptyObject(), EmptyObject(), EmptyArray(), Present(params)),
+        layout.layout_id,
+        layout=layout,
+    )
+    transport = ScriptedTransport((), host=HOST)
+
+    async with Bitrix24(SETTINGS, transport=transport) as client:
+        stream = client.iter_list(
+            Request("task.elapseditem.getlist", arguments, route=RouteKind.BARE),
+            page_size=PAGE_SIZE,
+            offset=OffsetSpec(parameter_path=path, page_index=PageIndex(path, max_rows=PAGE_SIZE)),
+        )
+        with pytest.raises(CapabilityError) as caught:
+            _ = [row async for row in stream]
+
+    assert transport.calls == ()
+    assert str(caught.value).endswith(PositionalControlFault.MISSING_PARENT.value)
+    assert isinstance(caught.value.__cause__, PositionalControlError)
+    assert caught.value.__cause__.fault is PositionalControlFault.MISSING_PARENT
+
+
+def test_positional_control_value_outside_its_slot_contract_uses_the_generic_reason() -> None:
+    layout = PositionalLayout("array.v1", (SlotContract("page", SlotShape.ARRAY),), control_paths=frozenset({(0,)}))
+    arguments = PositionalArguments((Present([]),), layout.layout_id, layout=layout)
+    request = Request("example.list", arguments, route=RouteKind.BARE)
+
+    with pytest.raises(CapabilityError) as caught:
+        _request_with_controls(request, {ParameterPath((0,)): 5}, allow_create=True)
+
+    assert type(caught.value) is CapabilityError
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert not isinstance(caught.value.__cause__, PositionalControlError)
+    assert str(caught.value).endswith("control value does not satisfy its slot contract")

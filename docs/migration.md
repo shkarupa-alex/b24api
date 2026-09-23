@@ -53,7 +53,8 @@ declares exact arity, each slot's shape, fixed slots, and case-sensitive writabl
 final mapping leaf may be created when every parent container already exists. Positional requests
 use a top-level JSON array; form encoding and physical batch reject them before I/O. A traversal
 control the slots cannot accept raises `CapabilityError` before I/O; its message names a value-free
-reason and its cause is the positional control error carrying a `PositionalControlFault`.
+reason and its cause is the positional control error carrying a
+`b24api.contracts.positional.PositionalControlFault`.
 
 `OperationReport.exhausted` now records whether every binding reached qualified full-source
 closure. A successful page-boundary stop therefore has `state=COMPLETED`, `exhausted=false`, and

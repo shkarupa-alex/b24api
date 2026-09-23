@@ -336,6 +336,10 @@ async def test_rejected_eligible_head_leaves_no_empty_source_evidence(
     assert (last.outcome, last.rejection_code) == (PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION)
     assert [closure for closure, _stream_closure, _total in closures] == [BindingClosure.FAILURE]
     assert _source_report(stream).empty_source_witness is None
+    driver = stream._source._driver  # type: ignore[attr-defined] # noqa: SLF001
+    assert driver.empty_source_witness is None
+    assert driver.terminal_reason is None
+    assert driver._empty_source_allowance is False  # noqa: SLF001
 
 
 def test_empty_source_witness_is_only_valid_on_a_completed_report_without_rows() -> None:
