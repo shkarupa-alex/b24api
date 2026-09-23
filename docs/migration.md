@@ -103,7 +103,8 @@ proved: a report that did not complete carries at most `mechanics_only`, whateve
 the response envelope `total` rather than a field inside `result`; a missing or negative envelope
 total fails closed like a missing result field.
 
-Exact traversal keeps its in-memory `ExecutionPolicy.max_identity_keys` budget. `iter_list` and
+Exact traversal now has an in-memory `ExecutionPolicy.max_identity_keys` budget (100,000 keys by
+default); exceeding it fails the operation closed. `iter_list` and
 `iter_list_counted` accept `identity_store=`, a caller-owned `IdentityStore` whose
 `add_if_absent(identity_store_key(value)) -> bool` records each identity after the rest of the page
 validates; `False` is a duplicate, and any exception rejects the page. The client does not close the
