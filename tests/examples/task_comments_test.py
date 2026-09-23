@@ -138,3 +138,40 @@ async def test_positional_keyset_verifier_rejects_preseeded_controls_before_io()
             )
 
     assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_positional_keyset_verifier_rejects_unrelated_order_before_io() -> None:
+    transport = _LegacyKeysetTransport()
+    settings = task_comments.Settings(webhook_url="https://fixture.invalid/rest/1/test/")
+    arguments = task_comments.PositionalArguments(
+        (task_comments.Present(43), task_comments.Present({"OTHER": "ASC"}), task_comments.Present({})),
+        task_comments.LAYOUT.layout_id,
+        layout=task_comments.LAYOUT,
+    )
+    request = task_comments.Request(
+        task_comments.LEGACY_METHOD,
+        arguments,
+        replay_safety=task_comments.ReplaySafety.SAFE,
+        route=task_comments.RouteKind.BARE,
+    )
+    async with task_comments.Bitrix24(settings, transport=transport) as client:
+        with pytest.raises(CapabilityError, match="control"):
+            await client.verify_keyset_capability(
+                request,
+                selector=task_comments.ResultSelector.root(),
+                identity=task_comments.IdentitySpec(
+                    ("ID",),
+                    "ID",
+                    "ID",
+                    task_comments.IdentityCoercion.DECIMAL_STRING_INTEGER,
+                ),
+                page_size=2,
+                keyset=task_comments.KeysetSpec(
+                    filter_path=task_comments.ParameterPath((2,)),
+                    order_path=task_comments.ParameterPath((1,)),
+                    start_suppression_path=None,
+                ),
+            )
+
+    assert transport.requests == []

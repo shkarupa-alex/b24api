@@ -75,11 +75,19 @@ def _reject_owned_controls(request: Request, identity: IdentitySpec, keyset: Key
             raise CapabilityError("caller identity bounds conflict with fast keyset traversal")
     order_paths: tuple[ParameterPath | None, ...]
     if keyset.split_order is None:
-        order_paths = (
-            (_child_path(keyset.order_path, identity.order_key),)
-            if positional and keyset.order_path is not None
-            else (keyset.order_path,)
-        )
+        if positional and keyset.order_path is not None:
+            order_exists, order_value = _path_lookup(
+                parameters,
+                keyset.order_path,
+                case_sensitive=True,
+            )
+            if order_exists and not isinstance(order_value, dict):
+                raise CapabilityError("keyset order path must contain an object")
+            if order_exists and order_value:
+                raise CapabilityError("caller traversal control conflicts with fast keyset traversal")
+            order_paths = ()
+        else:
+            order_paths = (keyset.order_path,)
     else:
         order_paths = (keyset.split_order.field_path, keyset.split_order.direction_path)
     for path in (*order_paths, keyset.start_suppression_path, keyset.limit_path):
