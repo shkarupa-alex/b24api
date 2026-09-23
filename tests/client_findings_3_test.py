@@ -1464,3 +1464,53 @@ async def test_lazy_audit_failures_are_retained_in_batch_report() -> None:
         assert len([outcome async for outcome in stream]) == 1
     assert stream.report is not None
     assert any(item.code == "audit_hook_failed" for item in stream.report.violations)
+
+
+_ROUNDED_STRIDE = OffsetSpec(
+    continuation=OffsetContinuation.FIXED_STEP,
+    step=PAGE_SIZE,
+    page_stride=PageStride(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE),
+)
+
+
+@pytest.mark.asyncio
+async def test_page_stride_rejects_misaligned_initial_offset_before_io() -> None:
+    transport = _Transport(lambda _request: pytest.fail("a misaligned stride offset must reject before I/O"))
+    direct = _client(transport).iter_list(
+        Request("example.list", {"start": 932}, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        page_size=PAGE_SIZE,
+        offset=_ROUNDED_STRIDE,
+    )
+    with pytest.raises(CapabilityError, match="align with the qualified server page granularity"):
+        _ = [item async for item in direct]
+    assert transport.requests == []
+    assert not direct.report.exhausted
+
+    with pytest.raises(CapabilityError, match="align with the qualified server page granularity"):
+        _client(transport).iter_reference_outcomes(
+            Request("example.list", {"start": 932}, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+            [Binding("one", (), object())],
+            traversal=SequentialTraversal(page_size=PAGE_SIZE, offset=_ROUNDED_STRIDE),
+            dispatch=DirectDispatch(concurrency=1),
+        )
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_page_stride_accepts_an_aligned_initial_offset() -> None:
+    starts: list[object] = []
+
+    def handler(request: Request) -> WireResponse:
+        start = request.copy_parameters()["start"]
+        starts.append(start)
+        rows = [{"ID": index} for index in range(PAGE_SIZE)] if start == 900 else []  # noqa: PLR2004
+        return _response(rows)
+
+    stream = _client(_Transport(handler)).iter_list(
+        Request("example.list", {"start": 900}, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        page_size=PAGE_SIZE,
+        offset=_ROUNDED_STRIDE,
+    )
+    rows = [item async for item in stream]
+    assert len(rows) == PAGE_SIZE
+    assert starts == [900, 900 + PAGE_SIZE]
