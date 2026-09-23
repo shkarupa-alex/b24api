@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 import json
+import re
 import sqlite3
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
 IDENTITY = IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER)
 LEDGER_UNIQUE_ROWS = 3
 REPORTED_UNIQUE_ROWS = 4
+LONG_TRAVERSAL_ROWS = 2_000
 
 
 class _Transport:
@@ -251,3 +254,34 @@ async def test_exact_total_duplicate_under_report_withdraws_identity_and_count_s
     _ = [row async for row in stream]
     assert stream.report is not None
     assert stream.report.assurance is not TraversalAssurance.IDENTITY_AND_COUNT_MATCHED
+
+
+@pytest.mark.asyncio
+async def test_external_ledger_completes_a_long_traversal_within_the_page_budget() -> None:
+    ids = list(range(1, LONG_TRAVERSAL_ROWS + 1))
+    ledger = _SqliteLedger()
+    stream = _client(_Transport(_pages(*([value] for value in ids), []))).iter_list(
+        _request(),
+        identity=IDENTITY,
+        page_size=1,
+        policy=ExecutionPolicy(
+            max_identity_keys=1,
+            max_pages=LONG_TRAVERSAL_ROWS + 10,
+            max_requests=LONG_TRAVERSAL_ROWS + 10,
+        ),
+        identity_store=ledger,
+    )
+
+    assert [row["ID"] async for row in stream] == ids
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED
+    assert stream.report.assurance is TraversalAssurance.IDENTITY_EXACT
+    assert stream.report.unique_rows == LONG_TRAVERSAL_ROWS
+
+
+def test_ledger_documentation_names_the_page_fingerprint_bound() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for path in (root / "README.md", root / "docs" / "performance.md", root / "b24api/traversal/identity_ledger.py"):
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        assert re.search(r"(?<!identity )memory (?:stays )?bounded by one page", text) is None
+        assert "max_pages" in text

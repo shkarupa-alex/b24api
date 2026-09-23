@@ -55,7 +55,8 @@ outcome.
 - Exact sequential, counted, and multi-reference traversal shares one operation-wide
   `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted
   offset traversal may instead record identities in a caller-owned `IdentityStore`, keeping
-  in-process identity memory bounded by one page; a reported duplicate withdraws identity assurance.
+  in-process identity memory bounded by one page (per-page fingerprints remain bounded by
+  `max_pages`); a reported duplicate withdraws identity assurance.
 - Streams publish one immutable terminal report after cleanup. Early close and cancellation never
   claim completion.
 - The client owns its default transport and active streams; injected transports remain caller-owned.

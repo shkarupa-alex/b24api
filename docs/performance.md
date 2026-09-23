@@ -87,4 +87,6 @@ harness-produced observations for that portal cell, not general latency promises
   `ExecutionPolicy.max_identity_keys` budget (100,000 by default); exceeding it fails the operation
   with `BudgetExceededError` instead of warning. For larger sources pass `identity_store=` to
   `iter_list`/`iter_list_counted`: a caller-owned `IdentityStore` (for example a SQLite table with a
-  primary key) records each `identity_store_key(...)` so in-process memory stays bounded by one page.
+  primary key) records each `identity_store_key(...)` so in-process identity memory stays bounded by
+  one page. Repeated-page detection still retains one 64-character fingerprint per page, which grows
+  with the page count and is bounded by `ExecutionPolicy.max_pages` (10,000 by default).

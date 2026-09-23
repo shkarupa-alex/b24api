@@ -3,7 +3,9 @@
 The in-memory store answers membership before a page commits; an external ledger can only answer by
 recording. This adapter therefore reports no prior membership during validation and turns the store's
 ``add_if_absent`` result into the page's cross-page duplicates at commit, keeping in process only a
-counter, so memory stays bounded by one page regardless of source size.
+counter, so identity memory stays bounded by one page regardless of source size. The driver's
+repeated-page fingerprints are separate evidence: one short digest per page, bounded by
+``ExecutionPolicy.max_pages``.
 """
 
 from __future__ import annotations

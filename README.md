@@ -456,8 +456,9 @@ observed identities per operation in memory (100,000 by default). All active ref
 share that ceiling. A page that would exceed it is rejected atomically with typed budget evidence.
 Set a larger finite ceiling when the expected aggregate cardinality is known, or pass
 `identity_store=` to `iter_list`/`iter_list_counted` so a caller-owned `IdentityStore` (for example a
-SQLite table keyed by `identity_store_key(...)`) proves uniqueness with in-process memory bounded by
-one page; the client never closes that store.
+SQLite table keyed by `identity_store_key(...)`) proves uniqueness while in-process identity memory
+stays bounded by one page; the client never closes that store. Repeated-page detection still keeps
+one short fingerprint per page, so raise `max_pages` deliberately for very long traversals.
 Strict keyset and cursor traversal retain only monotonic progression state when sufficient.
 
 ## CLI
