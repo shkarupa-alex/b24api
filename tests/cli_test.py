@@ -31,6 +31,7 @@ from b24api import (
     Response,
     ResultCollectionShape,
     ResultSelector,
+    RouteKind,
     TerminalState,
     TraversalAssurance,
     cli,
@@ -193,6 +194,8 @@ def _run(monkeypatch: pytest.MonkeyPatch, client: _Client, args: list[str], *, s
     monkeypatch.setattr(cli, "Bitrix24", lambda: client)
     stdout = io.StringIO()
     stderr = io.StringIO()
+    if args[0] in {"call", "list", "verify-keyset"} and "--route" not in args:
+        args = [*args[:2], "--route", "bare", *args[2:]]
     code = cli.main(args, stdin=io.StringIO(stdin), stdout=stdout, stderr=stderr)
     return code, stdout.getvalue(), stderr.getvalue()
 
@@ -201,6 +204,16 @@ def _contract(tmp_path: Path, value: dict[str, object]) -> str:
     path = tmp_path / "contract.json"
     path.write_text(json.dumps(value), encoding="utf-8")
     return f"@{path}"
+
+
+def test_cli_requires_route_and_preserves_v3_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _Client()
+    code, _, _ = _run(monkeypatch, client, ["call", "tasks.task.result.list", "--route", "api_v3"])
+    assert code == 0
+    assert client.calls[0].request.route is RouteKind.API_V3
+
+    code = cli.main(["call", "tasks.task.result.list"], stdout=io.StringIO(), stderr=io.StringIO())
+    assert code == _USAGE
 
 
 def _capability_report(
@@ -385,7 +398,7 @@ def test_verify_keyset_cli_prints_one_report_for_every_verdict(
     monkeypatch.setattr(cli, "_verify_keyset", fake_verify)
     stdout, stderr = io.StringIO(), io.StringIO()
     code = cli.main(
-        ["verify-keyset", "test.list", "--contract", contract],
+        ["verify-keyset", "test.list", "--route", "bare", "--contract", contract],
         stdin=io.StringIO(),
         stdout=stdout,
         stderr=stderr,
@@ -615,7 +628,7 @@ def test_invalid_contract_is_rejected_before_client_construction(
     monkeypatch.setattr(cli, "Bitrix24", unused_client)
     stderr = io.StringIO()
     code = cli.main(
-        ["list", "test.list", "--contract", _contract(tmp_path, {"version": 1, "unknown": True})],
+        ["list", "test.list", "--route", "bare", "--contract", _contract(tmp_path, {"version": 1, "unknown": True})],
         stdin=io.StringIO(),
         stdout=io.StringIO(),
         stderr=stderr,
@@ -687,7 +700,7 @@ def test_configuration_failure_maps_to_unavailable(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(cli, "Bitrix24", fail)
     stderr = io.StringIO()
-    code = cli.main(["call", "test.get"], stdin=io.StringIO(), stdout=io.StringIO(), stderr=stderr)
+    code = cli.main(["call", "test.get", "--route", "bare"], stdin=io.StringIO(), stdout=io.StringIO(), stderr=stderr)
     assert code == _UNAVAILABLE
     assert json.loads(stderr.getvalue()) == {"kind": "unavailable", "message": "configuration unavailable"}
 
@@ -698,7 +711,7 @@ def test_broken_pipe_closes_stream_and_uses_exit_five(monkeypatch: pytest.Monkey
     stderr = io.StringIO()
 
     code = cli.main(
-        ["list", "test.list"],
+        ["list", "test.list", "--route", "bare"],
         stdin=io.StringIO(),
         stdout=_BrokenOutput(),
         stderr=stderr,

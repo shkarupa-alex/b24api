@@ -6,6 +6,8 @@ from collections import deque
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+from b24api.completion.fast_recorder import FastCompletionRecorder
+from b24api.contracts.completion import BindingClosure
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     ClosureWitness,
@@ -118,6 +120,7 @@ class KeysetFastScheduler:
         self.page_size, self.effective_page_cap = page_size, effective_page_cap
         self.execution, self.context, self.engine, self.trace = execution, context, engine, trace
         self.page_adapter = page_adapter
+        self.completion_recorder = FastCompletionRecorder()
         self.completion = execution.contract.page_completion
         requested_batch = getattr(execution, "batch_size", None) or 50
         self.batch_capacity = min(
@@ -148,6 +151,8 @@ class KeysetFastScheduler:
         self._window_count: int | None = None
         self._range_geometry: LazyRangePlan | None = None
         self._offered_rows = 0
+        self._pending_owners: deque[tuple[tuple[str, int], ...]] = deque()
+        self._offered_owners: deque[tuple[str, int]] = deque()
         self._head_rows, self._tail_rows = 0, 0
         self._interior_span: int | None = None
         self._density_num: int | None = None
@@ -155,6 +160,7 @@ class KeysetFastScheduler:
         self._interior_estimate: int | None = None
         self._total_estimate: int | None = None
         self._selected_estimate: int | None = None
+        self._completion_witnesses = 0
         self._frozen_report: KeysetExecutionReport | None = None
 
     @property
@@ -167,9 +173,27 @@ class KeysetFastScheduler:
         """Return whether traversal has reached a terminal state."""
         return self.transactions.terminal
 
+    def completion_closure(self) -> tuple[BindingClosure | None, int]:
+        """Return scheduler-qualified evidence for one naturally completed plan."""
+        if not self.transactions.terminal:
+            return None, 0
+        if self._head_rows == 0:
+            return BindingClosure.SOURCE_EMPTY, 0
+        witnesses = sum(self.transactions.closures.values()) + self._completion_witnesses
+        if witnesses < 1:
+            return None, 0
+        return BindingClosure.KEYSET_PLAN_COVERED, witnesses
+
     def mark_emitted(self, count: int) -> None:
         """Record rows delivered to the caller."""
         self.admission.mark_emitted(count)
+        for _ in range(count):
+            if not self._offered_owners:
+                raise RuntimeError("fast emitted row has no page owner")
+            command_id, remaining = self._offered_owners.popleft()
+            self.completion_recorder.emitted(command_id)
+            if remaining > 1:
+                self._offered_owners.appendleft((command_id, remaining - 1))
 
     def next_command_id(self, phase: KeysetPhase) -> str:
         """Allocate a unique command identifier for a transaction phase."""
@@ -212,6 +236,9 @@ class KeysetFastScheduler:
             witness=witness,
             dispatch=dispatch,
         )
+        self.completion_recorder.recorded(plan.command_id, outcome)
+        if outcome is PageOutcome.COMMITTED and selected == 0:
+            self.completion_recorder.admit(plan.command_id, 0)
 
     async def execute_wave(self, plans: tuple[LaneCommandPlan, ...]) -> tuple[LaneReceipt, ...]:
         """Execute one correlated transaction wave."""
@@ -555,8 +582,17 @@ class KeysetFastScheduler:
     def _admit_receipt(self, receipt: LaneReceipt) -> None:
         commit = self.admission.validate_and_commit(receipt)
         self.trace.admit(receipt.command_id, len(commit.rows))
+        if receipt.command_id.startswith("body-admit-"):
+            owners = tuple(self.transactions.lane_commands[receipt.lane_ordinal])
+        else:
+            owners = ((receipt.command_id, len(commit.rows)),)
+        if sum(count for _, count in owners) != len(commit.rows):
+            raise RuntimeError("fast admission lost page provenance")
+        for command_id, count in owners:
+            self.completion_recorder.admit(command_id, count)
         if commit.rows:
             self.transactions.pending.append(commit.rows)
+            self._pending_owners.append(tuple((command_id, count) for command_id, count in owners if count))
 
     async def _admit_tail(self, tail: LaneReceipt) -> None:
         normalized, overlap = normalize_tail_receipt(tail, already_seen=self.admission.has_seen)
@@ -595,7 +631,14 @@ class KeysetFastScheduler:
             self.transactions.terminal = True
         if not self.transactions.pending:
             return ()
+        return self._offer_pending()
+
+    def _offer_pending(self) -> tuple[FrozenJson, ...]:
+        """Transfer one admitted group and its command owners to the iterator."""
         rows = self.transactions.pending.popleft()
+        if self._offered_owners:
+            raise RuntimeError("fast row group was replaced before delivery")
+        self._offered_owners = deque(self._pending_owners.popleft())
         self._offered_rows = len(rows)
         return rows
 

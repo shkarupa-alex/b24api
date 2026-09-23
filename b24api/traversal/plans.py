@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from b24api.contracts.policy import (
     DuplicatePolicy,
@@ -17,7 +17,10 @@ from b24api.contracts.request import (
     ParameterPath,
     ResultSelector,
 )
-from b24api.contracts.traversal import OffsetContinuation, SplitOrderSpec
+from b24api.contracts.traversal import CursorDomain, OffsetContinuation, PageStride, SparseRawBound, SplitOrderSpec
+
+if TYPE_CHECKING:
+    from b24api.contracts.bounded_range import BoundedIdentityRange
 
 PORTAL_BATCH_CAP = 50
 _START_PATH = ParameterPath(("start",))
@@ -31,6 +34,7 @@ class OffsetTerminalRule(StrEnum):
 
     EMPTY_PAGE = "empty_page"
     QUALIFIED_TOTAL = "qualified_total"
+    SPARSE_RAW_BOUND = "sparse_raw_bound"
 
 
 class CountedOffsetMode(StrEnum):
@@ -107,8 +111,13 @@ class OffsetSequentialPlan(PlanContract):
     terminal: frozenset[OffsetTerminalRule] = frozenset({OffsetTerminalRule.EMPTY_PAGE})
     allow_create_controls: bool = True
     fixed_step: int | None = None
+    initial_control: int = 0
+    sparse_raw_bound: SparseRawBound | None = None
+    page_stride: PageStride | None = None
+    short_page_width: int | None = None
+    allow_empty_after_short_window: bool = False
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901
         """Validate and normalize instance state."""
         super(OffsetSequentialPlan, self).__post_init__()
         if not isinstance(self.continuation, OffsetContinuation):
@@ -130,6 +139,26 @@ class OffsetSequentialPlan(PlanContract):
                 raise ValueError("fixed-step continuation requires a positive fixed_step")
         elif self.fixed_step is not None:
             raise ValueError("fixed_step is valid only for fixed-step continuation")
+        if not _is_plain_int(self.initial_control) or self.initial_control < 0:
+            raise ValueError("initial_control must be a non-negative integer")
+        if self.sparse_raw_bound is not None and (
+            self.continuation is not OffsetContinuation.FIXED_STEP
+            or self.fixed_step != self.sparse_raw_bound.stride.wire_increment
+            or self.terminal != frozenset({OffsetTerminalRule.SPARSE_RAW_BOUND})
+        ):
+            raise ValueError("sparse raw bound requires its fixed stride and exclusive closure rule")
+        if self.page_stride is not None and (
+            self.continuation is not OffsetContinuation.FIXED_STEP or self.fixed_step != self.page_stride.wire_increment
+        ):
+            raise ValueError("page_stride requires its matching fixed-step continuation")
+        if self.short_page_width is not None and (
+            self.continuation is not OffsetContinuation.FIXED_STEP
+            or not _is_plain_int(self.short_page_width)
+            or self.short_page_width < 1
+        ):
+            raise ValueError("short_page_width requires fixed-step continuation and a positive width")
+        if not isinstance(self.allow_empty_after_short_window, bool):
+            raise TypeError("allow_empty_after_short_window must be a boolean")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -176,6 +205,7 @@ class KeysetPlan(PlanContract):
     start_suppression_path: ParameterPath | None = _START_PATH
     terminal: KeysetTerminalRule = KeysetTerminalRule.EMPTY_CONFIRMATION
     allow_create_controls: bool = True
+    boundary: BoundedIdentityRange | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -220,6 +250,7 @@ class ItemCursorPlan(PlanContract):
     requested_page_size: int | None = None
     terminal: CursorTerminalRule = CursorTerminalRule.EMPTY_CONFIRMATION
     allow_create_controls: bool = True
+    domain: CursorDomain = CursorDomain.OPAQUE
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -230,6 +261,8 @@ class ItemCursorPlan(PlanContract):
         ParameterPath(self.cursor_item_path)
         if not isinstance(self.cursor_coercion, IdentityCoercion):
             raise TypeError("cursor_coercion must be an IdentityCoercion")
+        if not isinstance(self.domain, CursorDomain):
+            raise TypeError("domain must be a CursorDomain")
         if self.direction not in {"asc", "desc"}:
             raise ValueError("cursor direction must be asc or desc")
         if self.cursor_take not in {"first", "last"}:

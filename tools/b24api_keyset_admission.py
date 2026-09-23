@@ -51,6 +51,7 @@ from b24api import (  # noqa: E402 - direct execution binds imports to this chec
     ReplaySafety,
     Request,
     ResultSelector,
+    RouteKind,
     Settings,
     StableIntegerKeysetContract,
     TotalHintMode,
@@ -322,7 +323,7 @@ async def _run(cell: Cell, mode: str | None) -> MeasuredRun:
     if mode is not None:
         kwargs["execution"] = _execution(mode, cell)
     stream = client.iter_list_keyset(
-        Request("fixture.list", replay_safety=ReplaySafety.SAFE),
+        Request("fixture.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=IdentitySpec(("id",), "ID", "id", IdentityCoercion.EXACT_INTEGER),
         page_size=PAGE_SIZE,
@@ -494,6 +495,7 @@ async def _run_live(cell: LiveCell, mode: str | None) -> MeasuredRun:
                 cell.method,
                 parameters=json.loads(cell.parameters_json),
                 replay_safety=ReplaySafety.SAFE,
+                route=RouteKind.BARE,
             ),
             selector=ResultSelector(cell.selector_path),
             identity=IdentitySpec(

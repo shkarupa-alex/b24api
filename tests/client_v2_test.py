@@ -34,6 +34,7 @@ from b24api.contracts import (
     ReferenceItem,
     ReferenceNotExecuted,
     ReferenceOutcomeUnknown,
+    ReplayDisposition,
     ReplaySafety,
     Request,
     ResultCollectionShape,
@@ -43,9 +44,13 @@ from b24api.contracts import (
     TerminalState,
     TraversalAssurance,
 )
+from b24api.contracts.completion import PageAcknowledged, PageScheduled
+from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
+    BatchCommandError,
     BatchFailed,
+    BudgetExceededError,
     CapabilityError,
     FailurePhase,
     IncompleteTraversalError,
@@ -183,8 +188,8 @@ async def test_call_and_call_response_have_stable_detached_types() -> None:
     transport = FunctionTransport(lambda _request: {"result": {"items": [1, 2]}})
     client = _client(transport)
 
-    decoded = await client.call(Request("test.get", replay_safety=ReplaySafety.SAFE))
-    response = await client.call_response(Request("test.get", replay_safety=ReplaySafety.SAFE))
+    decoded = await client.call(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
+    response = await client.call_response(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
 
     assert decoded == {"items": [1, 2]}
     assert response.result == decoded
@@ -197,14 +202,14 @@ async def test_closed_request_mapping_canonicalizes_immediately_and_rejects_unkn
     client = _client(transport)
 
     result = await client.call(
-        {"method": "test.get", "parameters": {"ID": 7}, "replay_safety": ReplaySafety.SAFE},
+        {"method": "test.get", "route": RouteKind.BARE, "parameters": {"ID": 7}, "replay_safety": ReplaySafety.SAFE},
     )
 
     assert result == {"ID": 7}
     with pytest.raises(ValueError, match="unknown request fields"):
-        await client.call({"method": "test.get", "unexpected": True})  # type: ignore[typeddict-unknown-key]
+        await client.call({"method": "test.get", "route": RouteKind.BARE, "unexpected": True})  # type: ignore[typeddict-unknown-key]
     with pytest.raises(TypeError, match="must be a ReplaySafety"):
-        await client.call({"method": "test.get", "replay_safety": "safe"})  # type: ignore[typeddict-item]
+        await client.call({"method": "test.get", "route": RouteKind.BARE, "replay_safety": "safe"})  # type: ignore[typeddict-item]
     assert len(transport.requests) == 1
 
 
@@ -230,7 +235,7 @@ async def test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_of
     client = _client(transport)
     stream = client.batch(
         (
-            Command(Request("test.get", {"index": index}, ReplaySafety.SAFE), correlations[index])
+            Command(Request("test.get", {"index": index}, ReplaySafety.SAFE, route=RouteKind.BARE), correlations[index])
             for index in range(LOGICAL_BATCH_COMMANDS)
         ),
         batch_size=LOGICAL_BATCH_SIZE,
@@ -250,7 +255,7 @@ async def test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_of
 
 
 @pytest.mark.asyncio
-async def test_public_counted_traversal_above_100k_stays_exact_and_warns_once() -> None:
+async def test_public_counted_traversal_above_100k_uses_declared_identity_budget() -> None:
     def page(start: int) -> list[dict[str, int]]:
         return [{"ID": value} for value in range(start, min(start + PAGE_SIZE, LARGE_COUNTED_ROWS))]
 
@@ -283,8 +288,9 @@ async def test_public_counted_traversal_above_100k_stays_exact_and_warns_once() 
     transport = FunctionTransport(handler)
     client = _client(transport)
     stream = client.iter_list_counted(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
+        policy=ExecutionPolicy(max_identity_keys=LARGE_COUNTED_ROWS),
     )
 
     async def consume() -> int:
@@ -294,15 +300,47 @@ async def test_public_counted_traversal_above_100k_stays_exact_and_warns_once() 
             count += 1
         return count
 
-    with pytest.warns(RuntimeWarning, match="exact duplicate/loss detection") as captured:
-        count = await consume()
-
-    matching = [warning for warning in captured if "exact duplicate/loss detection" in str(warning.message)]
-    assert len(matching) == 1
+    count = await consume()
     assert count == LARGE_COUNTED_ROWS
     assert stream.report is not None
     assert stream.report.unique_rows == LARGE_COUNTED_ROWS
     assert stream.report.assurance is TraversalAssurance.IDENTITY_AND_COUNT_MATCHED
+
+
+@pytest.mark.asyncio
+async def test_counted_identity_budget_stops_before_admitting_an_overflow_page() -> None:
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {
+                "result": [{"ID": index} for index in range(PAGE_SIZE)],
+                "total": PAGE_SIZE * 2,
+                "next": PAGE_SIZE,
+            }
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        key = next(iter(commands))
+        return {
+            "result": {
+                "result": {key: [{"ID": index} for index in range(PAGE_SIZE, PAGE_SIZE * 2)]},
+                "result_error": {},
+                "result_total": {key: PAGE_SIZE * 2},
+            },
+        }
+
+    stream = _client(FunctionTransport(handler)).iter_list_counted(
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        identity=_identity(),
+        policy=ExecutionPolicy(max_identity_keys=PAGE_SIZE + 1),
+    )
+
+    assert len([await anext(stream) for _index in range(PAGE_SIZE)]) == PAGE_SIZE
+    with pytest.raises(IncompleteTraversalError) as captured:
+        await anext(stream)
+
+    assert isinstance(captured.value.error, BudgetExceededError)
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.INCOMPLETE
+    assert stream.report.emitted == PAGE_SIZE
 
 
 @pytest.mark.asyncio
@@ -325,7 +363,7 @@ async def test_public_keyset_above_100k_uses_monotonic_progression_without_ident
     transport = FunctionTransport(handler)
     client = _client(transport)
     stream = client.iter_list_keyset(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         page_size=page_size,
@@ -369,7 +407,7 @@ async def test_public_logical_batch_accepts_100k_generator_without_input_materia
     client = _client(transport)
     stream = client.batch(
         (
-            Command(Request("test.get", {"index": index}, ReplaySafety.SAFE), index)
+            Command(Request("test.get", {"index": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
             for index in range(LARGE_LOGICAL_BATCH_COMMANDS)
         ),
         batch_size=PAGE_SIZE,
@@ -404,17 +442,59 @@ async def test_batch_outcomes_retains_typed_failure_without_halting_later_comman
         return {"result": {"result": results, "result_error": errors}}
 
     stream = _client(FunctionTransport(handler)).batch_outcomes(
-        [Command(Request("test.get", replay_safety=ReplaySafety.SAFE), index) for index in range(SMALL_BATCH_COMMANDS)],
+        [
+            Command(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), index)
+            for index in range(SMALL_BATCH_COMMANDS)
+        ],
         batch_size=SMALL_BATCH_COMMANDS,
     )
     outcomes = [outcome async for outcome in stream]
 
     assert isinstance(outcomes[failed_index], CommandFailure)
+    assert outcomes[failed_index].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
     assert all(isinstance(outcome, CommandSuccess) for index, outcome in enumerate(outcomes) if index != failed_index)
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
     assert stream.report.successes == SMALL_BATCH_COMMANDS - 1
     assert stream.report.failures == 1
+    gate = stream._source.completion_gate  # noqa: SLF001 - public batch gate positive control
+    decision = gate.decision()
+    assert decision.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert not decision.exhausted
+    assert decision.bindings_admitted == decision.bindings_terminal == SMALL_BATCH_COMMANDS
+    assert decision.pages_scheduled == SMALL_BATCH_COMMANDS
+    assert decision.pages_acknowledged == SMALL_BATCH_COMMANDS - 1
+    assert gate.finish() == stream.report
+
+
+@pytest.mark.asyncio
+async def test_logical_batch_preserves_kernel_replay_disposition() -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {},
+                "result_error": {
+                    key: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "retry later"} for key in commands
+                },
+            },
+        }
+
+    outcomes = [
+        outcome
+        async for outcome in _client(FunctionTransport(handler)).batch_outcomes(
+            (
+                Command(Request("safe.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), "safe"),
+                Command(Request("unsafe.add", replay_safety=ReplaySafety.UNSAFE, route=RouteKind.BARE), "unsafe"),
+                Command(Request("unknown.get", route=RouteKind.BARE), "unknown"),
+            ),
+        )
+    ]
+    assert all(isinstance(outcome, CommandFailure) for outcome in outcomes)
+    failures = cast("list[CommandFailure[str]]", outcomes)
+    assert failures[0].replay_disposition is ReplayDisposition.ELIGIBLE
+    assert all(outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE for outcome in failures[1:])
 
 
 @pytest.mark.asyncio
@@ -431,7 +511,10 @@ async def test_fail_fast_batch_raises_bounded_window_after_preceding_successes()
         }
 
     stream = _client(FunctionTransport(handler)).batch(
-        [Command(Request("test.get", replay_safety=ReplaySafety.SAFE), index) for index in range(SMALL_BATCH_COMMANDS)],
+        [
+            Command(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), index)
+            for index in range(SMALL_BATCH_COMMANDS)
+        ],
         batch_size=SMALL_BATCH_COMMANDS,
     )
 
@@ -441,6 +524,7 @@ async def test_fail_fast_batch_raises_bounded_window_after_preceding_successes()
 
     assert isinstance(first, CommandSuccess)
     assert isinstance(captured.value.outcomes[0], CommandFailure)
+    assert captured.value.outcomes[0].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
     assert all(isinstance(outcome, CommandNotExecuted) for outcome in captured.value.outcomes[1:])
     assert len(captured.value.outcomes) == FAIL_FAST_WINDOW
     assert stream.report is captured.value.report
@@ -458,8 +542,8 @@ async def test_batch_source_failure_does_not_dispatch_partial_window_and_closes_
     async def commands() -> AsyncGenerator[Command[str]]:
         nonlocal closed
         try:
-            yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE), "a")
-            yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE), "b")
+            yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), "a")
+            yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), "b")
             raise RuntimeError("source broke")
         finally:
             closed = True
@@ -495,7 +579,7 @@ async def test_bound_references_apply_nested_updates_off_wire_and_emit_exact_com
 
     transport = FunctionTransport(handler)
     stream = _client(transport).iter_references(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [
             Binding(
                 f"owner-{owner}",
@@ -530,7 +614,7 @@ async def test_binding_collision_rejects_before_reference_io() -> None:
     correlation = object()
     transport = FunctionTransport(lambda _request: pytest.fail("binding collision must reject before I/O"))
     stream = _client(transport).iter_references(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("bad", (ParameterUpdate(ParameterPath(("start",)), 100),), correlation)],
         traversal=SequentialTraversal(),
     )
@@ -553,7 +637,7 @@ async def test_tolerant_batch_distinguishes_user_source_failure_from_local_item_
     correlation = object()
 
     def failed_source() -> Iterator[Command[object]]:
-        yield Command(Request("test.get"), correlation)
+        yield Command(Request("test.get", route=RouteKind.BARE), correlation)
         raise ValueError("caller source failed")
 
     transport = FunctionTransport(lambda _request: pytest.fail("partial source window must not dispatch"))
@@ -572,7 +656,7 @@ async def test_tolerant_batch_distinguishes_user_source_failure_from_local_item_
     assert transport.requests == []
 
     def invalid_item_source() -> Iterator[object]:
-        yield Command(Request("test.get"), correlation)
+        yield Command(Request("test.get", route=RouteKind.BARE), correlation)
         yield object()
 
     local = _client(transport).batch_outcomes(invalid_item_source(), batch_size=2)  # type: ignore[arg-type]
@@ -597,7 +681,7 @@ async def test_early_closed_batch_reports_every_command_admitted_into_the_physic
         }
 
     commands = tuple(
-        Command(Request("test.get", {"index": index}, ReplaySafety.SAFE), index)
+        Command(Request("test.get", {"index": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
         for index in range(SMALL_BATCH_COMMANDS)
     )
     stream = _client(FunctionTransport(handler)).batch_outcomes(
@@ -619,7 +703,7 @@ async def test_tolerant_local_binding_failure_emits_not_executed_and_continues()
     correlations = (object(), object())
     transport = FunctionTransport(lambda _request: {"result": []})
     stream = _client(transport).iter_reference_outcomes(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [
             Binding("invalid", (ParameterUpdate(ParameterPath(("start",)), 100),), correlations[0]),
             Binding("valid", (), correlations[1]),
@@ -641,6 +725,37 @@ async def test_tolerant_local_binding_failure_emits_not_executed_and_continues()
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
     assert stream.report.not_executed == 1
     assert stream.report.successes == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.JSON, RouteKind.API_V3])
+async def test_fail_fast_batch_retains_correlations_for_unsupported_route_without_io(route: RouteKind) -> None:
+    transport = FunctionTransport(lambda _request: pytest.fail("unsupported physical batch must not be sent"))
+    correlations = (object(), object())
+    stream = _client(transport).batch(
+        (
+            Command(Request("test.get", route=route), correlations[0]),
+            Command(Request("test.get", route=RouteKind.BARE), correlations[1]),
+        ),
+        batch_size=2,
+    )
+
+    with pytest.raises(BatchFailed) as captured:
+        _ = [outcome async for outcome in stream]
+
+    outcomes = captured.value.outcomes
+    assert len(outcomes) == len(correlations)
+    assert isinstance(outcomes[0], CommandFailure)
+    assert outcomes[0].correlation is correlations[0]
+    assert isinstance(outcomes[0].error, CapabilityError)
+    assert isinstance(outcomes[1], CommandNotExecuted)
+    assert outcomes[1].correlation is correlations[1]
+    assert transport.requests == []
+    assert stream.report.physical_requests == 0
+    assert stream.report.batch_requests == 0
+    assert stream.report.not_executed == 1
+    assert stream.report.successes == 0
+    assert stream.report.failures == 1
 
 
 @pytest.mark.asyncio
@@ -673,7 +788,7 @@ async def test_reference_source_rejects_uncorrelated_malformed_value_without_fab
         }
 
     stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         bindings(),
         traversal=SequentialTraversal(),
         dispatch=dispatch,
@@ -697,7 +812,7 @@ async def test_tolerant_reference_preserves_ambiguous_dispatch_as_unknown() -> N
     correlation = object()
     transport = AmbiguousTransport(lambda _request: None)
     stream = _client(transport).iter_reference_outcomes(
-        Request("test.list", replay_safety=ReplaySafety.UNKNOWN),
+        Request("test.list", replay_safety=ReplaySafety.UNKNOWN, route=RouteKind.BARE),
         [Binding("ambiguous", (), correlation)],
         traversal=SequentialTraversal(),
         dispatch=DirectDispatch(concurrency=1),
@@ -711,10 +826,42 @@ async def test_tolerant_reference_preserves_ambiguous_dispatch_as_unknown() -> N
     assert outcome.correlation is correlation
     assert isinstance(outcome.error, AmbiguousExecutionError)
     assert outcome.partial_rows == 0
+    assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
     assert len(transport.requests) == 1
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
     assert stream.report.unknown == 1
+
+
+@pytest.mark.asyncio
+async def test_tolerant_reference_preserves_kernel_replay_disposition() -> None:
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        key = next(iter(commands))
+        return {
+            "result": {
+                "result": {},
+                "result_error": {key: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "retry later"}},
+            },
+        }
+
+    stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        [Binding("safe", (), "safe")],
+        traversal=SequentialTraversal(),
+        dispatch=BatchDispatch(batch_size=1),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert isinstance(outcome, ReferenceFailure)
+    assert outcome.replay_disposition is ReplayDisposition.ELIGIBLE
+    assert stream.report is not None
+    violation = next(item for item in stream.report.violations if item.code == "reference_failure")
+    assert violation.replay_disposition is ReplayDisposition.ELIGIBLE
 
 
 def test_counted_reference_rejects_direct_dispatch_before_binding_pull_or_io() -> None:
@@ -730,7 +877,7 @@ def test_counted_reference_rejects_direct_dispatch_before_binding_pull_or_io() -
 
     with pytest.raises(CapabilityError, match="requires BatchDispatch"):
         client.iter_references(
-            Request("test.list", replay_safety=ReplaySafety.SAFE),
+            Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             bindings(),
             traversal=CountedTraversal(identity=_identity()),
             dispatch=DirectDispatch(),
@@ -752,7 +899,7 @@ async def test_tolerant_reference_failure_has_no_false_completion_and_later_bind
         return {"result": []}
 
     stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [
             Binding(
                 f"owner-{owner}",
@@ -781,7 +928,7 @@ async def test_reference_traversal_enforces_its_local_page_cap_without_a_wire_li
     transport = FunctionTransport(lambda _request: {"result": rows})
     correlation = object()
     stream = _client(transport).iter_reference_outcomes(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("oversized", (), correlation)],
         traversal=SequentialTraversal(page_size=PAGE_SIZE, identity=_identity()),
         dispatch=DirectDispatch(),
@@ -804,7 +951,7 @@ async def test_reference_incomplete_maps_to_typed_failure_not_unknown() -> None:
     transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
     correlation = object()
     stream = _client(transport).iter_reference_outcomes(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("one", (), correlation)],
         traversal=SequentialTraversal(identity=_identity()),
         dispatch=DirectDispatch(),
@@ -819,8 +966,9 @@ async def test_reference_incomplete_maps_to_typed_failure_not_unknown() -> None:
     assert failure.correlation is correlation
     assert failure.partial_rows == 1
     assert isinstance(failure.error, IncompleteTraversalError)
-    assert failure.error.report.state is TerminalState.INCOMPLETE
-    assert failure.error.report.emitted == 1
+    assert failure.error.report is None
+    assert failure.error.error is not None
+    assert failure.error.error is failure.error.__cause__
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
     assert stream.report.failures == 1
@@ -841,7 +989,7 @@ async def test_counted_reference_post_io_capability_failure_is_typed_incomplete(
 
     correlation = object()
     stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("missing exact total", (), correlation)],
         traversal=CountedTraversal(identity=_identity()),
         dispatch=BatchDispatch(batch_size=1),
@@ -856,7 +1004,8 @@ async def test_counted_reference_post_io_capability_failure_is_typed_incomplete(
     assert failure.partial_rows == 0
     assert isinstance(failure.error, IncompleteTraversalError)
     assert isinstance(failure.error.__cause__, CapabilityError)
-    assert failure.error.report.state is TerminalState.INCOMPLETE
+    assert failure.error.report is None
+    assert failure.error.error is failure.error.__cause__
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
 
@@ -865,7 +1014,7 @@ async def test_counted_reference_post_io_capability_failure_is_typed_incomplete(
 async def test_fail_fast_reference_raises_bounded_reference_failed() -> None:
     transport = FunctionTransport(lambda _request: {"error": "denied", "error_description": "no access"})
     stream = _client(transport).iter_references(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("one", (), {"private": True})],
         traversal=SequentialTraversal(),
         dispatch=DirectDispatch(concurrency=1),
@@ -892,7 +1041,7 @@ async def test_direct_fanout_preserves_full_response_without_treating_it_as_trav
     stream = _client(transport).fan_out(
         [
             Command(
-                Request("test.get", {"value": index}, ReplaySafety.SAFE),
+                Request("test.get", {"value": index}, ReplaySafety.SAFE, route=RouteKind.BARE),
                 correlations[index],
             )
             for index in range(3)
@@ -929,7 +1078,10 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
 
     transport = FunctionTransport(handler, delay=0.005)
     stream = _client(transport).fan_out(
-        [Command(Request("test.get", {"value": index}, ReplaySafety.SAFE), index) for index in range(FANOUT_COMMANDS)],
+        [
+            Command(Request("test.get", {"value": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
+            for index in range(FANOUT_COMMANDS)
+        ],
         dispatch=BatchDispatch(
             batch_size=FANOUT_BATCH_SIZE,
             concurrency=concurrency,
@@ -958,7 +1110,10 @@ async def test_tolerant_fanout_continues_after_one_direct_failure() -> None:
         return {"result": value}
 
     stream = _client(FunctionTransport(handler)).fan_out_outcomes(
-        [Command(Request("test.get", {"value": index}, ReplaySafety.SAFE), index) for index in range(3)],
+        [
+            Command(Request("test.get", {"value": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
+            for index in range(3)
+        ],
         dispatch=DirectDispatch(concurrency=2, output_order=DeliveryOrder.INPUT),
     )
 
@@ -988,7 +1143,7 @@ async def test_fanout_source_failure_accounts_known_commands_without_fabricating
     correlation = object()
 
     def commands() -> Iterator[Command[object]]:
-        yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE), correlation)
+        yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), correlation)
         if malformed_item:
             yield cast("Command[object]", object())
         raise ValueError("caller source failed")
@@ -1041,7 +1196,7 @@ async def test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup
         return {"result": pages[start]}
 
     transport = FunctionTransport(handler)
-    stream = _client(transport).iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE))
+    stream = _client(transport).iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
 
     assert stream.report is None
     rows = [item async for item in stream]
@@ -1068,7 +1223,7 @@ async def test_iter_list_starts_from_the_callers_existing_offset() -> None:
     transport = FunctionTransport(handler)
     client = _client(transport)
     stream = client.iter_list(
-        Request("test.list", {"start": CUSTOM_INITIAL_OFFSET}, ReplaySafety.SAFE),
+        Request("test.list", {"start": CUSTOM_INITIAL_OFFSET}, ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
 
@@ -1090,7 +1245,7 @@ async def test_iter_list_starts_from_the_callers_existing_offset() -> None:
 async def test_sequential_missing_offset_refuses_before_io_when_control_creation_is_disabled() -> None:
     transport = FunctionTransport(lambda _request: pytest.fail("missing traversal control must reject before I/O"))
     stream = _client(transport).iter_list(
-        Request("test.list"),
+        Request("test.list", route=RouteKind.BARE),
         offset=OffsetSpec(allow_create_controls=False),
     )
 
@@ -1109,7 +1264,7 @@ async def test_mapping_values_shape_preserves_mapping_insertion_order() -> None:
         {"result": {"items": {}}},
     ]
     stream = _client(FunctionTransport(lambda _request: responses.pop(0))).iter_list(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector(("items",)),
         collection_shape=ResultCollectionShape.MAPPING_VALUES,
     )
@@ -1131,7 +1286,7 @@ async def test_keyset_and_cursor_are_explicit_strict_alternatives() -> None:
 
     keyset_transport = FunctionTransport(keyset_handler)
     keyset = _client(keyset_transport).iter_list_keyset(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
         keyset=KeysetSpec(),
@@ -1147,7 +1302,7 @@ async def test_keyset_and_cursor_are_explicit_strict_alternatives() -> None:
         return {"result": rows}
 
     cursor = _client(FunctionTransport(cursor_handler)).iter_list_cursor(
-        Request("im.list", replay_safety=ReplaySafety.SAFE),
+        Request("im.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         cursor=CursorSpec(
             ParameterPath(("LAST_ID",)),
@@ -1170,6 +1325,8 @@ async def test_counted_traversal_preserves_frozen_request_shape_and_exact_identi
         return rows, next_offset
 
     def handler(request: Request) -> object:
+        assert events
+        assert events[-1] is PageScheduled
         if request.method == "test.list":
             raw_start = request.copy_parameters().get("start", 0)
             assert isinstance(raw_start, int)
@@ -1201,9 +1358,18 @@ async def test_counted_traversal_preserves_frozen_request_shape_and_exact_identi
 
     portal = FunctionTransport(handler)
     stream = _client(portal).iter_list_counted(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
+    gate = stream._source.completion_gate  # noqa: SLF001 - inspect counted lifecycle seam
+    events: list[type[object]] = []
+    original_emit = gate.emit
+
+    def observe(event: object) -> None:
+        events.append(type(event))
+        original_emit(event)
+
+    gate.emit = observe
 
     rows = [item async for item in stream]
 
@@ -1213,13 +1379,17 @@ async def test_counted_traversal_preserves_frozen_request_shape_and_exact_identi
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.physical_requests == EXPECTED_COUNTED_REQUESTS
     assert stream.report.batch_requests == 1
+    assert gate.decision().pages_scheduled == gate.decision().pages_acknowledged
+    assert gate.decision().exhausted
+    assert gate.finish() == stream.report
+    assert events.count(PageScheduled) == events.count(PageAcknowledged) == COUNTED_ROWS // PAGE_SIZE
 
 
 @pytest.mark.asyncio
 async def test_counted_missing_in_band_stride_fails_incomplete() -> None:
     transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}], "total": 2})
     stream = _client(transport).iter_list_counted(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
 
@@ -1233,6 +1403,47 @@ async def test_counted_missing_in_band_stride_fails_incomplete() -> None:
 
 
 @pytest.mark.asyncio
+async def test_counted_batch_failure_retains_cause_and_kernel_replay_decision() -> None:
+    def handler(request: Request) -> object:
+        if request.method != "batch":
+            return {
+                "result": [{"ID": index} for index in range(PAGE_SIZE)],
+                "total": PAGE_SIZE * 2,
+                "next": PAGE_SIZE,
+            }
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        key = next(iter(commands))
+        return {
+            "result": {
+                "result": {},
+                "result_error": {key: {"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}},
+            },
+        }
+
+    stream = _client(FunctionTransport(handler)).iter_list_counted(
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        identity=_identity(),
+    )
+
+    for _index in range(PAGE_SIZE):
+        await anext(stream)
+    with pytest.raises(IncompleteTraversalError) as captured:
+        await anext(stream)
+
+    error = captured.value
+    assert isinstance(error.error, BatchCommandError)
+    assert error.error.normalized_code == "operation_time_limit"
+    assert error.error.retryable
+    assert error.replay_disposition is ReplayDisposition.ELIGIBLE
+    assert error.to_safe_dict()["cause"]["normalized_code"] == "operation_time_limit"
+    assert stream.report is not None
+    violation = next(item for item in stream.report.violations if item.severity.value == "blocking")
+    assert violation.error is error.error
+    assert violation.replay_disposition is ReplayDisposition.ELIGIBLE
+
+
+@pytest.mark.asyncio
 async def test_counted_page_cap_rejects_a_wider_observed_head_before_tail_or_rows() -> None:
     transport = FunctionTransport(
         lambda _request: {
@@ -1242,7 +1453,7 @@ async def test_counted_page_cap_rejects_a_wider_observed_head_before_tail_or_row
         },
     )
     stream = _client(transport).iter_list_counted(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
         page_size=2,
     )
@@ -1265,7 +1476,7 @@ async def test_empty_page_with_continuation_never_completes_and_negative_pull_is
         return {"result": [], "next": 2}
 
     stream = _client(FunctionTransport(handler)).iter_list(
-        Request("test.list", replay_safety=ReplaySafety.SAFE),
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
 
@@ -1285,7 +1496,7 @@ async def test_empty_page_with_continuation_never_completes_and_negative_pull_is
 @pytest.mark.asyncio
 async def test_partial_helper_closes_without_claiming_completion() -> None:
     transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
-    stream = _client(transport).iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE))
+    stream = _client(transport).iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
 
     partial = await stream.first()
 
@@ -1301,15 +1512,16 @@ async def test_client_closes_active_stream_before_owned_transport_but_not_inject
     transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
     settings = Settings(webhook_url="https://test.invalid/rest/1/token/")
     client = Bitrix24(settings, transport=transport)
-    stream = client.iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE))
+    stream = client.iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
 
     await client.aclose()
 
     assert stream.report is not None
     assert stream.report.state is TerminalState.EARLY_CLOSED
+    assert stream._source.completion_gate.finish() == stream.report  # noqa: SLF001 - gate ownership assertion
     assert not transport.closed
     with pytest.raises(RuntimeError, match="client is closed"):
-        await client.call(Request("test.get"))
+        await client.call(Request("test.get", route=RouteKind.BARE))
 
 
 @pytest.mark.asyncio
@@ -1367,7 +1579,7 @@ async def test_client_context_preserves_body_error_when_owned_cleanup_fails() ->
 @pytest.mark.asyncio
 async def test_public_aclose_is_permitted_during_an_inflight_pull_and_cancels_owned_work() -> None:
     transport = BlockingRequestTransport()
-    stream = _client(transport).iter_list(Request("test.list"))
+    stream = _client(transport).iter_list(Request("test.list", route=RouteKind.BARE))
     pull = asyncio.create_task(anext(stream))
     await transport.started.wait()
 
@@ -1384,7 +1596,7 @@ async def test_public_aclose_is_permitted_during_an_inflight_pull_and_cancels_ow
 @pytest.mark.asyncio
 async def test_concurrent_public_pulls_reject_without_stealing_the_owned_pull() -> None:
     transport = BlockingRequestTransport()
-    stream = _client(transport).iter_list(Request("test.list"))
+    stream = _client(transport).iter_list(Request("test.list", route=RouteKind.BARE))
     owned_pull = asyncio.create_task(anext(stream))
     await transport.started.wait()
 
@@ -1401,7 +1613,7 @@ async def test_long_lived_client_registry_does_not_retain_terminated_streams() -
     client = _client(FunctionTransport(lambda _request: {"result": []}))
 
     for _ in range(100):
-        stream = client.iter_list(Request("test.list"))
+        stream = client.iter_list(Request("test.list", route=RouteKind.BARE))
         assert [row async for row in stream] == []
         assert stream.report is not None
         assert stream.report.state is TerminalState.COMPLETED

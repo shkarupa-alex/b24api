@@ -6,11 +6,12 @@ import contextlib
 from dataclasses import dataclass, replace
 from typing import Any, TypeVar, cast
 
-from b24api.contracts.policy import KernelState
+from b24api.contracts.policy import KernelState, ReplayDisposition
 from b24api.contracts.report import TerminalState, Violation, ViolationSeverity
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
+    B24ApiError,
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
@@ -59,7 +60,7 @@ def classify_failure(error: BaseException) -> FailureClass:  # noqa: C901, PLR09
     if isinstance(error, AmbiguousExecutionError):
         return FailureClass("ambiguous_execution")
     if isinstance(error, BudgetExceededError):
-        return FailureClass("budget_exhausted")
+        return FailureClass("budget_exhausted", incomplete=True)
     if isinstance(error, ResponseTooLargeError):
         return FailureClass("response_too_large")
     if isinstance(error, TransportError):
@@ -98,26 +99,42 @@ def finalize_failure[R](
         return report, error
     failure = classify_failure(error)
     report_error = getattr(error, "report_cause", error)
+    replay_disposition = getattr(
+        error,
+        "replay_disposition",
+        getattr(report_error, "replay_disposition", ReplayDisposition.NOT_ELIGIBLE),
+    )
+    if isinstance(error, IncompleteTraversalError):
+        report_error = error.error or report_error
+        replay_disposition = error.replay_disposition
     error_name = str(getattr(report_error, "report_name", type(report_error).__name__))
     reason = terminal_reason if terminal_reason and terminal_reason != error_name else f"{operation} failed"
     violations = tuple(getattr(report, "violations", ()))
     if not any(item.code == failure.code for item in violations):
         violations = (
             *violations,
-            Violation(failure.severity, failure.code, f"{reason} ({error_name})"),
+            Violation(
+                failure.severity,
+                failure.code,
+                f"{reason} ({error_name})",
+                error=report_error if isinstance(report_error, B24ApiError) else None,
+                replay_disposition=replay_disposition,
+            ),
         )
     state: object = TerminalState.INCOMPLETE if failure.incomplete else TerminalState.FAILED
     if isinstance(getattr(report, "state", None), KernelState):
         state = KernelState.INCOMPLETE if failure.incomplete else KernelState.FAILED
+    changes: dict[str, object] = {
+        "state": state,
+        "terminal_reason": terminal_reason or operation,
+        "violations": violations,
+    }
+    if hasattr(report, "exhausted"):
+        changes["exhausted"] = False
     try:
         frozen = cast(
             "R",
-            replace(
-                cast("Any", report),
-                state=state,
-                terminal_reason=terminal_reason or operation,
-                violations=violations,
-            ),
+            replace(cast("Any", report), **changes),
         )
     except Exception as finalization_error:  # noqa: BLE001
         finalization_error.__context__ = error.__context__

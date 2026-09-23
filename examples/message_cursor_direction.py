@@ -1,0 +1,118 @@
+"""Scenario 2: FIRST_ID omission versus qualified LAST_ID descending traversal.
+
+Frozen source oracle has five message IDs. The synthetic FIRST_ID response
+jumps over two middle IDs and then returns empty; clean HTTP alone cannot
+certify completeness. Public LAST_ID traversal returns 5/5 at limits 1, 3,
+and 50 with empty confirmation. This fixture records the observed method
+hazard; it does not claim every page was captured live. Run:
+`uv run python -m examples.message_cursor_direction`.
+"""
+
+from __future__ import annotations
+import asyncio
+
+from b24api import (
+    Bitrix24,
+    CursorDomain,
+    CursorSpec,
+    IdentityCoercion,
+    ParameterPath,
+    ReplaySafety,
+    Request,
+    ResultSelector,
+    RouteKind,
+    Settings,
+)
+from b24api.testing import ScriptedExchange, ScriptedTransport
+from examples._support.evidence import RecipeEvidence
+
+METHOD = "im.dialog.messages.get"
+EXPECTED_IDS = (3573, 3575, 12561, 29991, 30211)
+ASC_IDS = (3573, 3575, 30211)
+LIMITS = (1, 3, 50)
+
+
+def _request(control: str | None, cursor: int | None, limit: int) -> Request:
+    params = {"DIALOG_ID": "chat-1", "LIMIT": limit}
+    if control is not None and cursor is not None:
+        params[control] = cursor
+    return Request(
+        METHOD,
+        params,
+        replay_safety=ReplaySafety.SAFE,
+        route=RouteKind.BARE,
+    )
+
+
+def _descending_fixture(limit: int) -> ScriptedTransport:
+    remaining = tuple(reversed(EXPECTED_IDS))
+    cursor: int | None = None
+    exchanges: list[ScriptedExchange] = []
+    while True:
+        page = tuple(value for value in remaining if cursor is None or value < cursor)[:limit]
+        exchanges.append(
+            ScriptedExchange.json(
+                _request("LAST_ID" if cursor is not None else None, cursor, limit),
+                {"result": {"messages": [{"id": value} for value in page]}},
+            )
+        )
+        if not page:
+            return ScriptedTransport(tuple(exchanges))
+        cursor = page[-1]
+
+
+async def run() -> RecipeEvidence:
+    """Compare a false clean ASC end with three complete DESC traversals."""
+    settings = Settings(webhook_url="https://fixture.invalid/rest/1/test/")
+    asc = ScriptedTransport(
+        (
+            ScriptedExchange.json(
+                _request("FIRST_ID", 0, 3),
+                {"result": {"messages": [{"id": value} for value in ASC_IDS]}},
+            ),
+            ScriptedExchange.json(_request("FIRST_ID", 30211, 3), {"result": {"messages": []}}),
+        )
+    )
+    async with Bitrix24(settings, transport=asc) as client:
+        first = await client.call(_request("FIRST_ID", 0, 3))
+        second = await client.call(_request("FIRST_ID", 30211, 3))
+        seen = tuple(int(item["id"]) for item in first["messages"] + second["messages"])
+        if seen != ASC_IDS or set(seen) == set(EXPECTED_IDS):
+            raise AssertionError("scenario 2 ASC fixture did not expose its false clean end")
+    asc.assert_exhausted()
+    final_report = None
+    final_observed: tuple[int, ...] = ()
+    reports = []
+    for limit in LIMITS:
+        transport = _descending_fixture(limit)
+        async with Bitrix24(settings, transport=transport) as client:
+            stream = client.iter_list_cursor(
+                _request(None, None, limit),
+                selector=ResultSelector(("messages",)),
+                cursor=CursorSpec(
+                    ParameterPath(("LAST_ID",)),
+                    ("id",),
+                    IdentityCoercion.EXACT_INTEGER,
+                    "descending",
+                    "last",
+                    domain=CursorDomain.EXCLUSIVE_POSITIVE_INTEGER,
+                    limit_path=ParameterPath(("LIMIT",)),
+                ),
+                page_size=limit,
+            )
+            observed = tuple([int(item["id"]) async for item in stream])
+            if observed != tuple(reversed(EXPECTED_IDS)):
+                raise AssertionError("scenario 2 LAST_ID omitted a source ID")
+            if stream.report is None or not stream.report.exhausted:
+                raise AssertionError("scenario 2 LAST_ID lacked empty confirmation")
+            final_report = stream.report
+            final_observed = observed
+            reports.append(stream.report)
+        transport.assert_exhausted()
+    if final_report is None:
+        raise AssertionError("scenario 2 did not execute a supported cursor traversal")
+    return RecipeEvidence(len(final_observed), final_report, tuple(reports))
+
+
+if __name__ == "__main__":
+    asyncio.run(run())

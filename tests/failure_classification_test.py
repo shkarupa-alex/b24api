@@ -7,6 +7,7 @@ from b24api import (
     AmbiguityReason,
     IdentityCoercion,
     OperationReport,
+    ReplayDisposition,
     ResultCollectionShape,
     ResultSelector,
     TerminalState,
@@ -77,3 +78,22 @@ def test_finalize_failure_adds_one_stable_blocking_violation_before_attachment()
         ("envelope_contract", "Malformed successful HTTP response (EnvelopeContractError)"),
     ]
     assert error.report is finalized
+    violation = finalized.violations[0]
+    assert violation.error is error
+    assert violation.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+    assert violation.to_safe_dict()["error"] == error.to_safe_dict()
+
+
+def test_incomplete_traversal_exposes_its_original_cause_and_replay_decision() -> None:
+    report = OperationReport(operation="list", state=TerminalState.INCOMPLETE, terminal_reason="page failed")
+    cause = error_types.ApiResponseError(code="QUERY_LIMIT_EXCEEDED", description="retry later")
+    error = error_types.IncompleteTraversalError(
+        report=report,
+        error=cause,
+        replay_disposition=ReplayDisposition.ELIGIBLE,
+    )
+
+    assert error.error is cause
+    assert error.replay_disposition is ReplayDisposition.ELIGIBLE
+    assert error.to_safe_dict()["cause"] == cause.to_safe_dict()
+    assert error.to_safe_dict()["replay_disposition"] == "eligible"

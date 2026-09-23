@@ -6,10 +6,11 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import PageDispatch
 from b24api.contracts.traversal import OffsetContinuation
-from b24api.errors import CapabilityError, IncompleteTraversalError
+from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
 from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
@@ -21,7 +22,7 @@ from b24api.traversal.plans import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Iterator
 
     from b24api.contracts.json import FrozenJson
     from b24api.contracts.request import ParameterPath
@@ -53,6 +54,9 @@ class _CountedBatchMixin:
             if self.plan.limit_path is not None:
                 head_controls[self.plan.limit_path] = page_size
             self.schedule_page(offset=0, dispatch=PageDispatch.DIRECT)
+            recorder = self.completion_recorder
+            if recorder is not None:
+                recorder.activate(recorder.reserve())
             head_reservation = None
             try:
                 head_reservation = await self.context.reserve_page()
@@ -65,6 +69,12 @@ class _CountedBatchMixin:
                     context=self.context,
                 )
             except BaseException as error:
+                if recorder is not None:
+                    recorder.settled(
+                        CommandSettlement.UNKNOWN
+                        if bool(getattr(error, "_b24api_dispatch_started", False))
+                        else CommandSettlement.NOT_EXECUTED,
+                    )
                 if head_reservation is not None:
                     self.context.release_page(head_reservation)
                 if bool(getattr(error, "_b24api_dispatch_started", False)):
@@ -75,6 +85,8 @@ class _CountedBatchMixin:
                     )
                 raise
             self.context.commit_page(head_reservation)
+            if recorder is not None:
+                recorder.settled(CommandSettlement.SUCCESS)
             trace_count = self.page_trace_count
             head_items: tuple[FrozenJson, ...] = ()
             try:
@@ -144,19 +156,23 @@ class _CountedBatchMixin:
             if total == len(head_items):
                 self.terminal_reason = "parallel counted traversal completed"
                 return
-            requests = (
-                _BatchInput(
-                    _request_with_controls(
-                        self.request,
-                        {
-                            self.plan.offset_path: start,
-                            **({self.plan.limit_path: page_size} if self.plan.limit_path is not None else {}),
-                        },
-                        allow_create=self.plan.allow_create_controls,
-                    ),
-                )
-                for start in range(stride, total, stride)
-            )
+
+            def tail_requests() -> Iterator[_BatchInput]:
+                for start in range(stride, total, stride):
+                    if recorder is not None:
+                        recorder.reserve()
+                    yield _BatchInput(
+                        _request_with_controls(
+                            self.request,
+                            {
+                                self.plan.offset_path: start,
+                                **({self.plan.limit_path: page_size} if self.plan.limit_path is not None else {}),
+                            },
+                            allow_create=self.plan.allow_create_controls,
+                        ),
+                    )
+
+            requests = tail_requests()
             outcomes = _BatchOutcomeStream(
                 BatchExecutor(self.executor),
                 requests,
@@ -166,8 +182,11 @@ class _CountedBatchMixin:
                 logical_page_per_command=True,
             )
 
-            def validated_outcome(outcome: object) -> tuple[Response, tuple[FrozenJson, ...], bool]:
+            def validated_outcome(outcome: object) -> tuple[Response, tuple[FrozenJson, ...], bool]:  # noqa: C901
                 if isinstance(outcome, BatchFailure):
+                    if recorder is not None:
+                        recorder.activate(outcome.command_index + 1)
+                        recorder.settled(CommandSettlement.FAILURE)
                     error = (
                         outcome.error
                         if isinstance(outcome.error, BaseException)
@@ -184,12 +203,21 @@ class _CountedBatchMixin:
                         batch_index=outcome.command_index,
                         error=error,
                     )
+                    if isinstance(outcome.error, B24ApiError):
+                        raise IncompleteTraversalError(
+                            report=outcomes.report,
+                            error=outcome.error,
+                            replay_disposition=outcome.replay_disposition,
+                        ) from outcome.error
                     if isinstance(outcome.error, BaseException):
                         raise outcome.error
                     raise CapabilityError("parallel counted batch command failed")
                 if not isinstance(outcome, BatchSuccess) or outcome.response is None:
                     raise CapabilityError("parallel counted batch outcome lacks correlated response evidence")
                 response = outcome.response
+                if recorder is not None:
+                    recorder.activate(outcome.command_index + 1)
+                    recorder.settled(CommandSettlement.SUCCESS)
                 start = stride * (outcome.command_index + 1)
                 self.schedule_page(
                     offset=start,

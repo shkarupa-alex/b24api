@@ -21,6 +21,7 @@ from b24api import (
     Request,
     ResultCollectionShape,
     ResultSelector,
+    RouteKind,
     SequentialKeysetExecution,
     StableIntegerKeysetContract,
     TotalHintMode,
@@ -30,6 +31,8 @@ from b24api.contracts.keyset_execution import KeysetExecutionJson
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from b24api.contracts.request import RouteKind
 
 _CONTRACT_VERSION = 1
 _PORTAL_BATCH_CAP = 50
@@ -79,10 +82,15 @@ def decode_one_object(text: str, *, label: str) -> dict[str, object]:
     return cast("dict[str, object]", value)
 
 
-def cli_request(method: str, parameters: Mapping[str, object], replay_safety: ReplaySafety) -> Request:
+def cli_request(
+    method: str,
+    parameters: Mapping[str, object],
+    replay_safety: ReplaySafety,
+    route: RouteKind,
+) -> Request:
     """Construct one request while preserving the CLI's local-error boundary."""
     try:
-        return Request(method, parameters=parameters, replay_safety=replay_safety)
+        return Request(method, parameters=parameters, replay_safety=replay_safety, route=route)
     except (TypeError, ValueError) as error:
         raise CliUsageError("request method or parameters are invalid") from error
 

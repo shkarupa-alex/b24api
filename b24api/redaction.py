@@ -10,7 +10,7 @@ from typing import Any
 
 REDACTED = "[REDACTED]"
 TRUNCATED = "[TRUNCATED]"
-_WEBHOOK_RE = re.compile(r"https?://[^\s/]+/rest/[0-9]+/[A-Za-z0-9_-]{6,}/?", re.IGNORECASE)
+_WEBHOOK_RE = re.compile(r"https?://[^\s/]+/rest/(?:api/)?[0-9]+/[A-Za-z0-9_-]{6,}/?", re.IGNORECASE)
 _QUERY_SECRET_RE = re.compile(
     r"(?P<prefix>[?&](?:auth|access_token|refresh_token)=)[^\s&#]+",
     re.IGNORECASE,

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import Request, RequestSummary
 
 if TYPE_CHECKING:
@@ -60,6 +61,12 @@ class CommandFailure[C]:
     correlation: C = field(repr=False)
     request_summary: RequestSummary
     error: B24ApiError
+    replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
+
+    def __post_init__(self) -> None:
+        """Require the kernel replay decision to remain a closed public value."""
+        if not isinstance(self.replay_disposition, ReplayDisposition):
+            raise TypeError("replay_disposition must be a ReplayDisposition")
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +87,12 @@ class CommandOutcomeUnknown[C]:
     correlation: C = field(repr=False)
     request_summary: RequestSummary
     error: B24ApiError
+    replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
+
+    def __post_init__(self) -> None:
+        """Require ambiguity to retain the kernel's closed replay decision."""
+        if not isinstance(self.replay_disposition, ReplayDisposition):
+            raise TypeError("replay_disposition must be a ReplayDisposition")
 
 
 type CommandOutcome[C] = CommandSuccess[C] | CommandFailure[C] | CommandNotExecuted[C] | CommandOutcomeUnknown[C]

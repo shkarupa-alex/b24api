@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import json
 import secrets
 import uuid
 import weakref
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING, cast
 import httpx
 
 from b24api._error_types import FailurePhase
+from b24api.contracts.request import RouteKind
 from b24api.contracts.wire import BodyEncoding, _validate_headers
 from b24api.encoding import encode_php_query
 from b24api.errors import (
@@ -26,11 +28,13 @@ from b24api.transport.base import (
     WireRequest,
     WireResponse,
 )
+from b24api.transport.logging_shield import HTTPX_LOG_SHIELD, OwnedRequestReplacedError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
     from b24api.contracts.request import Request
+    from b24api.transport.logging_shield import LogOwnership
 
 
 def _webhook_vault() -> tuple[Callable[[str], str], Callable[[str], str], Callable[[str], None]]:
@@ -57,6 +61,7 @@ def _webhook_vault() -> tuple[Callable[[str], str], Callable[[str], str], Callab
 
 
 _store_webhook, _webhook_for, _drop_webhook = _webhook_vault()
+_CLASSIC_WEBHOOK_PARTS = 3
 
 
 class _PhaseTracker:
@@ -107,7 +112,33 @@ def _normalized_webhook_host(webhook_url: str) -> str:
     parsed = httpx.URL(webhook_url)
     if parsed.host is None:
         raise ValueError("webhook URL must contain a host")
+    parts = parsed.path.strip("/").split("/")
+    if (
+        len(parts) != _CLASSIC_WEBHOOK_PARTS
+        or parts[0] != "rest"
+        or not all(parts[1:])
+        or not parsed.path.endswith("/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("webhook URL must be a classic /rest/user/token/ base")
     return parsed.host
+
+
+_REPLACED_OWNED_REQUEST = "Injected client auth replaced the owned request; only in-place auth is supported"
+
+
+def _method_url(webhook_url: str, request: WireRequest) -> str:
+    """Resolve an explicit route only at dispatch, keeping credential out of public values."""
+    parsed = httpx.URL(webhook_url)
+    path = parsed.path
+    if request.route is RouteKind.API_V3:
+        parts = path.strip("/").split("/")
+        if len(parts) != _CLASSIC_WEBHOOK_PARTS or parts[0] != "rest" or not all(parts[1:]):
+            raise ValueError("API_V3 requires a classic /rest/user/token/ webhook base")
+        path = f"/rest/api/{parts[1]}/{parts[2]}/"
+    suffix = ".json" if request.route is RouteKind.JSON else ""
+    return str(parsed.copy_with(path=f"{path}{request.method}{suffix}"))
 
 
 class HttpxTransport:
@@ -116,6 +147,8 @@ class HttpxTransport:
     capabilities = TransportCapabilities(
         encodings=frozenset({BodyEncoding.JSON, BodyEncoding.FORM_URLENCODED}),
         scoped_headers=True,
+        positional_json=True,
+        routes=frozenset(RouteKind),
     )
 
     def __init__(self, webhook_url: str, *, client: httpx.AsyncClient | None = None) -> None:
@@ -141,6 +174,8 @@ class HttpxTransport:
         self._owns_client = client is None
         self._closed = False
         self._host = normalized_host
+        HTTPX_LOG_SHIELD.register_transport()
+        self._shield_finalizer = weakref.finalize(self, HTTPX_LOG_SHIELD.release_transport)
 
     @property
     def host(self) -> str:
@@ -161,10 +196,35 @@ class HttpxTransport:
             max_response_bytes=max_response_bytes,
         )
 
-    async def send_wire(  # noqa: C901, PLR0912, PLR0915
+    async def send_wire(
         self,
         request: WireRequest,
         *,
+        attempt_timeout: float,
+        max_response_bytes: int,
+    ) -> WireResponse:
+        """Protect the emitting HTTPX logger for one owned request."""
+        if self._closed:
+            raise RuntimeError("transport is closed")
+        method_url = _method_url(_webhook_for(self._webhook_handle), request)
+        try:
+            with HTTPX_LOG_SHIELD.request(method_url) as ownership:
+                return await self._send_wire_impl(
+                    request,
+                    method_url=method_url,
+                    ownership=ownership,
+                    attempt_timeout=attempt_timeout,
+                    max_response_bytes=max_response_bytes,
+                )
+        finally:
+            method_url = ""
+
+    async def _send_wire_impl(  # noqa: C901, PLR0912, PLR0915
+        self,
+        request: WireRequest,
+        *,
+        method_url: str,
+        ownership: LogOwnership,
         attempt_timeout: float,
         max_response_bytes: int,
     ) -> WireResponse:
@@ -179,26 +239,40 @@ class HttpxTransport:
         http_request: httpx.Request | None = None
         try:
             request_headers = dict(_validate_headers(request.headers.items))
-            parameters = request.copy_parameters()
             if request.encoding is BodyEncoding.JSON:
                 request_headers["content-type"] = "application/json"
-                http_request = self._client.build_request(
-                    "POST",
-                    f"{_webhook_for(self._webhook_handle)}{request.method}",
-                    headers=request_headers,
-                    json=parameters,
-                )
+                if request.positional is not None:
+                    content = json.dumps(
+                        request.positional.to_wire_slots(),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode()
+                    http_request = self._client.build_request(
+                        "POST",
+                        method_url,
+                        headers=request_headers,
+                        content=content,
+                    )
+                else:
+                    http_request = self._client.build_request(
+                        "POST",
+                        method_url,
+                        headers=request_headers,
+                        json=request.copy_parameters(),
+                    )
             elif request.encoding is BodyEncoding.FORM_URLENCODED:
                 request_headers["content-type"] = "application/x-www-form-urlencoded"
-                content = encode_php_query(cast("Mapping[str | int, object]", parameters)).encode()
+                content = encode_php_query(cast("Mapping[str | int, object]", request.copy_parameters())).encode()
                 http_request = self._client.build_request(
                     "POST",
-                    f"{_webhook_for(self._webhook_handle)}{request.method}",
+                    method_url,
                     headers=request_headers,
                     content=content,
                 )
             else:  # pragma: no cover - guarded by typed contracts/capabilities
                 raise TypeError("unsupported body encoding")
+            method_url = ""
+            ownership.claim(http_request)
             http_request.extensions["trace"] = tracker
             http_request.extensions["timeout"] = {
                 "connect": attempt_timeout,
@@ -206,10 +280,17 @@ class HttpxTransport:
                 "write": attempt_timeout,
                 "pool": attempt_timeout,
             }
-            response = await self._client.send(http_request, stream=True)
+            response = await self._client.send(http_request, stream=True, auth=ownership.guard(self._client.auth))
         except asyncio.CancelledError as error:
             cancellation_args = error.args
             http_request = None
+        except OwnedRequestReplacedError as error:
+            # Only in-place auth flows keep the owned request's lineage provable; a substitute is never sent.
+            answered = error.after_response
+            failure = (
+                _REPLACED_OWNED_REQUEST,
+                _at_least_dispatch_started(tracker.phase) if answered else tracker.phase,
+            )
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             failure = ("Transport failed before dispatch", tracker.phase)
         except (httpx.WriteError, httpx.WriteTimeout):
@@ -241,7 +322,12 @@ class HttpxTransport:
             # chain or in the outgoing traceback frame's local variables.
             http_request = None
             message, phase = failure
-            raise TransportError(message, phase=phase, request_summary=request.summary)
+            raise TransportError(
+                message,
+                phase=phase,
+                request_summary=request.summary,
+                retryable=message != _REPLACED_OWNED_REQUEST,
+            )
         pending_error: B24ApiError | None = None
         body_outcome = _BodyReadOutcome()
         try:
@@ -284,7 +370,10 @@ class HttpxTransport:
             if self._owns_client:
                 await self._client.aclose()
         finally:
-            self._webhook_finalizer()
+            try:
+                self._webhook_finalizer()
+            finally:
+                self._shield_finalizer()
 
 
 def _at_least_dispatch_started(phase: FailurePhase) -> FailurePhase:

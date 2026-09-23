@@ -7,10 +7,11 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator
 from typing import Protocol, Self, cast, runtime_checkable
 
-from b24api.batch.engine import BatchExecutor, BatchSource, _BatchInput, _BatchItem
+from b24api.batch.engine import BatchExecutor, BatchSource, _BatchInput, _BatchItem, _BatchNotExecutedError
 from b24api.batch.outcome import BatchFailure as KernelFailure
 from b24api.batch.outcome import BatchSuccess as KernelSuccess
 from b24api.batch.stream import _iterate_source, _next_chunk
+from b24api.completion.reference_recorder import ReferenceCompletionRecorder
 from b24api.contracts.command import (
     Command,
     CommandFailure,
@@ -20,6 +21,7 @@ from b24api.contracts.command import (
     CommandSuccess,
     NotExecutedReason,
 )
+from b24api.contracts.completion import BindingClosure, CleanupState, CommandSettlement, StreamClosure
 from b24api.contracts.policy import (
     CompletionAssurance,
     ExecutionPolicy,
@@ -125,6 +127,16 @@ def _public_outcomes(
             )
             continue
         error = outcome.error
+        if isinstance(error, _BatchNotExecutedError):
+            converted.append(
+                CommandNotExecuted(
+                    outcome.command_index,
+                    outcome.correlation,
+                    outcome.request.summary,
+                    NotExecutedReason.HALTED,
+                ),
+            )
+            continue
         if halt and halted and isinstance(error, ProtocolError):
             converted.append(
                 CommandNotExecuted(
@@ -141,10 +153,24 @@ def _public_outcomes(
             error = ProtocolError("batch command failed without a typed safe error")
         if isinstance(error, AmbiguousExecutionError):
             converted.append(
-                CommandOutcomeUnknown(outcome.command_index, outcome.correlation, outcome.request.summary, error),
+                CommandOutcomeUnknown(
+                    outcome.command_index,
+                    outcome.correlation,
+                    outcome.request.summary,
+                    error,
+                    outcome.replay_disposition,
+                ),
             )
         else:
-            converted.append(CommandFailure(outcome.command_index, outcome.correlation, outcome.request.summary, error))
+            converted.append(
+                CommandFailure(
+                    outcome.command_index,
+                    outcome.correlation,
+                    outcome.request.summary,
+                    error,
+                    outcome.replay_disposition,
+                ),
+            )
     return tuple(converted)
 
 
@@ -166,6 +192,8 @@ class LogicalBatchKernelStream[C]:
         self._batch_size = batch_size
         self._fail_fast = fail_fast
         self._context = executor.context(policy)
+        self._completion = ReferenceCompletionRecorder()
+        self._completion_cleanup_done = False
         self._runner: AsyncIterator[CommandOutcome[object]] | None = None
         self._controller: AsyncIteratorController[_BatchItem] | None = None
         self._closed = False
@@ -180,13 +208,52 @@ class LogicalBatchKernelStream[C]:
         """Return this asynchronous iterator."""
         return self
 
+    @property
+    def completion_gate(self) -> object:
+        """Expose the live logical-command completion gate."""
+        return self._completion.gate
+
+    def _finish_completion_cleanup(self) -> None:
+        if self._completion_cleanup_done or self.report.state is KernelState.NOT_STARTED:
+            return
+        self._completion.cleanup(CleanupState.SUCCESS)
+        self._completion_cleanup_done = True
+
+    def _settle_outcome(self, outcome: CommandOutcome[object]) -> None:
+        binding = self._completion.binding(outcome.index)
+        if isinstance(outcome, CommandSuccess):
+            binding.settled(CommandSettlement.SUCCESS)
+            binding.validated((outcome.index,), 1)
+        elif isinstance(outcome, CommandOutcomeUnknown):
+            binding.settled(CommandSettlement.UNKNOWN)
+        elif isinstance(outcome, CommandNotExecuted):
+            binding.settled(CommandSettlement.NOT_EXECUTED)
+        else:
+            binding.settled(CommandSettlement.FAILURE)
+
+    def _finish_outcome(self, outcome: CommandOutcome[object]) -> None:
+        binding = self._completion.binding(outcome.index)
+        if isinstance(outcome, CommandSuccess):
+            binding.delivered()
+            binding.acknowledged()
+            closure = BindingClosure.SINGLE_RESPONSE
+        elif isinstance(outcome, CommandOutcomeUnknown):
+            closure = BindingClosure.UNKNOWN
+        else:
+            closure = BindingClosure.FAILURE
+        self._completion.terminal(outcome.index, closure)
+
     async def __anext__(self) -> CommandOutcome[object]:
         """Return one correlated command outcome."""
         if self._closed:
             raise StopAsyncIteration
         if self._runner is None:
             self._runner = self._run()
-        return await anext(self._runner)
+        try:
+            return await anext(self._runner)
+        except BaseException:
+            self._finish_completion_cleanup()
+            raise
 
     async def aclose(self) -> None:
         """Close input and pending work idempotently."""
@@ -198,6 +265,7 @@ class LogicalBatchKernelStream[C]:
         await self._close_controller()
         if self.report.state is KernelState.NOT_STARTED:
             await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
+        self._finish_completion_cleanup()
 
     async def _run(self) -> AsyncGenerator[CommandOutcome[object]]:  # noqa: C901
         await self._context.start()
@@ -231,6 +299,8 @@ class LogicalBatchKernelStream[C]:
                     break
                 next_index += len(chunk.commands)
                 self.admitted += len(chunk.commands)
+                for command in chunk.commands:
+                    self._completion.admit(command.index)
                 self.buffered_commands_high_water = max(
                     self.buffered_commands_high_water,
                     len(chunk.commands),
@@ -250,8 +320,12 @@ class LogicalBatchKernelStream[C]:
                     for pending_outcome in pending:
                         self._emitted += 1
                         yield pending_outcome
+                        self._completion.terminal(pending_outcome.index, BindingClosure.FAILURE)
                     raise InputSourceError("Logical batch input source failed") from chunk.source_error
-                self._batch_requests += 1
+                for command in chunk.commands:
+                    self._completion.binding(command.index).scheduled()
+                if self._batch_executor._will_dispatch_commands(chunk.commands, halt=self._fail_fast):
+                    self._batch_requests += 1
                 self._batch_commands += len(chunk.commands)
                 kernel = await self._batch_executor._execute_chunk(
                     chunk.commands,
@@ -268,12 +342,16 @@ class LogicalBatchKernelStream[C]:
                         index for index, outcome in enumerate(outcomes) if not isinstance(outcome, CommandSuccess)
                     )
                     for successful_outcome in outcomes[:failed_at]:
+                        self._settle_outcome(successful_outcome)
                         self._emitted += 1
                         yield successful_outcome
+                        self._finish_outcome(successful_outcome)
                     raise _BatchWindowError(outcomes[failed_at:])
                 for batch_outcome in outcomes:
+                    self._settle_outcome(batch_outcome)
                     self._emitted += 1
                     yield batch_outcome
+                    self._finish_outcome(batch_outcome)
                 await self._context.set_buffered_rows(0)
             await self._finalize(KernelState.COMPLETED, "input exhausted")
         except asyncio.CancelledError as error:
@@ -342,6 +420,13 @@ class LogicalBatchKernelStream[C]:
             cooldown_seconds=snapshot.cooldown_seconds,
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
             terminal_reason=reason,
+        )
+        self._completion.stream_terminal(
+            StreamClosure.NATURAL
+            if state is KernelState.COMPLETED
+            else StreamClosure.CANCELLED
+            if state is KernelState.CANCELLED
+            else StreamClosure.EARLY_CLOSE,
         )
 
 

@@ -8,6 +8,8 @@ from b24api.traversal.keyset_step import (
     keyset_page_request,
     keyset_page_terminal,
     next_keyset_cursor,
+    validate_bounded_keyset,
+    validate_bounded_keyset_page,
     validate_keyset_continuation,
 )
 
@@ -27,7 +29,8 @@ class _KeysetMixin:
 
     async def _keyset(self: Any, plan: KeysetPlan) -> AsyncGenerator[_Page]:
         identity = self._require_identity("keyset")
-        cursor: IdentityValue | None = None
+        validate_bounded_keyset(self.request, plan, identity)
+        cursor: IdentityValue | None = plan.boundary.lower_exclusive if plan.boundary else None
         while True:
             response = await self._fetch(
                 keyset_page_request(
@@ -44,7 +47,8 @@ class _KeysetMixin:
                 source = self.source_page.current(items)
                 candidate_identities = self._extract_identities(source)
                 validate_keyset_continuation(plan, cursor, candidate_identities)
-                terminal = keyset_page_terminal(plan, len(items))
+                validate_bounded_keyset_page(plan, candidate_identities)
+                terminal = keyset_page_terminal(plan, len(items), candidate_identities)
                 identities = self._validate_page(
                     items,
                     response=response,

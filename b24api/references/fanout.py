@@ -19,7 +19,7 @@ from b24api.references.dispatch import (
     _KernelFanOutSuccess,
     _ReferenceWindowError,
 )
-from b24api.references.facade import _kernel_dispatch
+from b24api.references.dispatch_plan import kernel_dispatch
 from b24api.references.outcome import ReferenceFailure as KernelFailure
 from b24api.references.outcome import ReferenceRequest
 from b24api.references.stream import (
@@ -215,7 +215,7 @@ def kernel_fanout_stream[C](
 
     if not isinstance(executor, Executor):
         raise TypeError("executor must be an Executor")
-    kernel_dispatch = _kernel_dispatch(dispatch, policy)
+    dispatch_plan = kernel_dispatch(dispatch, policy)
     stream = _iter_references(
         executor,
         _command_source(commands),
@@ -223,8 +223,8 @@ def kernel_fanout_stream[C](
             reject_continuation=False,
             reject_positive_total_over_result=False,
         ),
-        dispatch=kernel_dispatch,
-        output_order=kernel_dispatch.output_order,
+        dispatch=dispatch_plan,
+        output_order=dispatch_plan.output_order,
         tolerant=tolerant,
         policy=policy,
         _whole_result=True,

@@ -49,11 +49,14 @@ outcome.
 ## Resource and lifecycle model
 
 - Logical sources are consumed incrementally; physical Bitrix batches contain at most 50 commands.
-- Response bytes, buffered rows and commands, request/page budgets, concurrency and elapsed time are
-  bounded by `ExecutionPolicy`.
+- Response bytes, buffered rows and commands, retained unordered identity keys, request/page
+  budgets, concurrency and elapsed time are bounded by `ExecutionPolicy`.
 - The default response ceiling is enforced while streaming, before JSON decoding.
-- Exact sequential/counted traversal retains observed identities in memory and warns once above
-  100,000 identities; it has no database, spill file or automatic cardinality refusal.
+- Exact sequential, counted, and multi-reference traversal shares one operation-wide
+  `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted
+  offset traversal may instead record identities in a caller-owned `IdentityStore`, keeping
+  in-process identity memory bounded by one page (per-page fingerprints remain bounded by
+  `max_pages`); a reported duplicate withdraws identity assurance.
 - Streams publish one immutable terminal report after cleanup. Early close and cancellation never
   claim completion.
 - The client owns its default transport and active streams; injected transports remain caller-owned.
@@ -69,13 +72,15 @@ payload conventions, public low-level execution plans or mutable global registri
 
 ## Wire, traversal, and evidence boundaries
 
-`Request` owns immutable body encoding, scoped headers, replay safety, and an optional declarative
+`Request` owns an explicit route, immutable body encoding, scoped headers, replay safety, and an optional declarative
 embedded-result error contract. Legacy transports continue to support ordinary JSON requests;
 advanced request representations require an advertised `WireTransport` capability and fail before
 I/O otherwise. No ordinary wire value can name an absolute destination.
 
 Traversal contracts separately declare progression (`server next`, observed width, or fixed step),
 completion (empty confirmation or caller-qualified exact total), collection shape, and identity.
+A fixed step without a qualified total fails closed after a short page; a sparse raw bound reads its
+qualified extent from a result path or the envelope `total`.
 Page evidence contains only bounded counters and enum classifications—never rows, identities,
 parameters, headers, URLs, or body fragments.
 

@@ -168,7 +168,8 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
                 next_index += len(chunk.commands)
                 if chunk.source_error is not None:
                     _raise_source_error(chunk.source_error)
-                self._batch_requests += 1
+                if self._executor._will_dispatch_commands(chunk.commands, halt=False):  # noqa: SLF001
+                    self._batch_requests += 1
                 self._batch_commands += len(chunk.commands)
                 reservations = []
                 try:

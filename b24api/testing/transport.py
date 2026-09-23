@@ -9,8 +9,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
+from types import MappingProxyType
 
-from b24api.contracts.request import Request
+from b24api.contracts.request import Request, RouteKind
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 from b24api.errors import ResponseTooLargeError
 from b24api.testing._isolation import (
@@ -42,6 +43,23 @@ class ConformanceCase(StrEnum):
     REPR_REDACTION = "repr_redaction"
     HOST_PROPERTY_CREDENTIAL_FREE = "host_property_credential_free"
     CANCELLATION_PROPAGATES = "cancellation_propagates"
+    ROUTE_JSON_SUFFIX = "route_json_suffix"
+    ROUTE_API_V3_REBASE = "route_api_v3_rebase"
+
+
+# A declared route must reach its own endpoint on the conformance webhook ``/rest/1/token/``.
+_CASE_ROUTES = MappingProxyType(
+    {
+        ConformanceCase.ROUTE_JSON_SUFFIX: RouteKind.JSON,
+        ConformanceCase.ROUTE_API_V3_REBASE: RouteKind.API_V3,
+    }
+)
+_ROUTE_PATHS = MappingProxyType(
+    {
+        RouteKind.JSON: "/rest/1/token/conformance.test.json",
+        RouteKind.API_V3: "/rest/api/1/token/conformance.test",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +165,7 @@ async def _run_case_environment(
     server = await asyncio.start_server(handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     try:
-        return await _run_owned_case(case, factory, f"http://127.0.0.1:{port}/", captures, controller)
+        return await _run_owned_case(case, factory, f"http://127.0.0.1:{port}/rest/1/token/", captures, controller)
     finally:
         server.close()
         await server.wait_closed()
@@ -262,6 +280,9 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         return ConformanceOutcome(case, passed=True, skipped=True)
     if case is ConformanceCase.SCOPED_HEADERS_FORWARDED and not capabilities.scoped_headers:
         return ConformanceOutcome(case, passed=True, skipped=True)
+    route = _CASE_ROUTES.get(case, RouteKind.BARE)
+    if route not in capabilities.routes:
+        return ConformanceOutcome(case, passed=True, skipped=True)
     if case is ConformanceCase.RESPONSE_STATUS_RANGE:
         try:
             WireResponse(99, (), b"")
@@ -276,7 +297,9 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
     if case is ConformanceCase.REPR_REDACTION:
         sensitive_value = "conformance-sensitive-value"
         response = WireResponse(200, (), sensitive_value.encode())
-        safe_wire_request = WireRequest(Request("repr.test", parameters={"value": sensitive_value}))
+        safe_wire_request = WireRequest(
+            Request("repr.test", parameters={"value": sensitive_value}, route=RouteKind.BARE),
+        )
         return ConformanceOutcome(
             case,
             passed=sensitive_value not in repr(response) and sensitive_value not in repr(safe_wire_request),
@@ -288,7 +311,7 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
             return ConformanceOutcome(case, passed=True, skipped=True)
         forged_headers = RequestHeaders()
         object.__setattr__(forged_headers, "items", (("authorization", "secret"),))
-        forged = WireRequest(Request("header.test"))
+        forged = WireRequest(Request("header.test", route=RouteKind.BARE))
         object.__setattr__(forged, "headers", forged_headers)
         try:
             await transport.send_wire(forged, attempt_timeout=5, max_response_bytes=1024)
@@ -299,7 +322,7 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         return ConformanceOutcome(case, passed=False)
     if case is ConformanceCase.CANCELLATION_PROPAGATES:
         task = asyncio.create_task(
-            transport.send(Request("cancel.test"), attempt_timeout=5, max_response_bytes=1024),
+            transport.send(Request("cancel.test", route=RouteKind.BARE), attempt_timeout=5, max_response_bytes=1024),
         )
         await captures.get()
         task.cancel()
@@ -310,14 +333,14 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         return ConformanceOutcome(case, passed=False)
     if case is ConformanceCase.RESPONSE_BYTE_CEILING:
         try:
-            await transport.send(Request("limit.test"), attempt_timeout=5, max_response_bytes=1)
+            await transport.send(Request("limit.test", route=RouteKind.BARE), attempt_timeout=5, max_response_bytes=1)
         except ResponseTooLargeError:
             await captures.get()
             return ConformanceOutcome(case, passed=True)
         _discard_capture(captures)
         return ConformanceOutcome(case, passed=False)
 
-    request = Request("conformance.test", parameters={"plain": "a b"})
+    request = Request("conformance.test", parameters={"plain": "a b"}, route=route)
     expected_body: bytes | None = None
     expected_header: tuple[str, str] | None = None
     if case is ConformanceCase.FORM_ENCODING_EXACT:
@@ -325,6 +348,7 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
             "conformance.test",
             parameters={"plain": "a b", "flag": False},
             encoding=BodyEncoding.FORM_URLENCODED,
+            route=RouteKind.BARE,
         )
         expected_body = b"plain=a+b&flag=0"
     elif case is ConformanceCase.FORM_NESTED_BRACKETS:
@@ -332,10 +356,15 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
             "conformance.test",
             parameters={"outer": {"items": ["x", None]}},
             encoding=BodyEncoding.FORM_URLENCODED,
+            route=RouteKind.BARE,
         )
         expected_body = b"outer%5Bitems%5D%5B0%5D=x"
     elif case is ConformanceCase.SCOPED_HEADERS_FORWARDED:
-        request = Request("conformance.test", headers=RequestHeaders({"X-Conformance": "present"}))
+        request = Request(
+            "conformance.test",
+            headers=RequestHeaders({"X-Conformance": "present"}),
+            route=RouteKind.BARE,
+        )
         expected_header = ("x-conformance", "present")
     response = (
         await transport.send(request, attempt_timeout=5, max_response_bytes=1024)
@@ -355,6 +384,8 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         passed = passed and capture.body == expected_body
     elif expected_header is not None:
         passed = passed and capture.headers.get(expected_header[0]) == expected_header[1]
+    elif case in _CASE_ROUTES:
+        passed = passed and capture.request_line.split(" ")[1] == _ROUTE_PATHS[route]
     return ConformanceOutcome(case, passed=passed)
 
 

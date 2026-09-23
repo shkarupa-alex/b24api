@@ -31,10 +31,12 @@ from b24api.contracts import (
     ReferenceItem,
     ReferenceNotExecuted,
     ReferenceOutcomeUnknown,
+    ReplayDisposition,
     ReplaySafety,
     Request,
     RequestSpec,
     Response,
+    RouteKind,
     TerminalState,
     TraversalAssurance,
     partition_command_outcomes,
@@ -74,6 +76,7 @@ def test_public_error_module_export_snapshot_is_static_contract_evidence() -> No
         "PageAdaptationViolation",
         "ResultShapeError",
         "TransportError",
+        "ValidationIssue",
     )
 
 
@@ -144,24 +147,39 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "BinaryEvidence",
         "BinaryResponse",
         "Binding",
+        "BindingAdmitted",
+        "BindingClosure",
+        "BindingTerminal",
         "Bitrix24",
         "BodyEncoding",
+        "BoundedIdentityRange",
         "BudgetExceededError",
+        "CallerStop",
         "CapabilityError",
+        "CleanupOutcome",
+        "CleanupState",
         "ClosureWitness",
         "Command",
         "CommandFailure",
         "CommandNotExecuted",
         "CommandOutcome",
         "CommandOutcomeUnknown",
+        "CommandSettlement",
         "CommandSuccess",
+        "CompletionEvent",
+        "CompletionGate",
         "CompositeIdentitySpec",
         "ConsistencyPolicy",
+        "ContinuePage",
         "CountedTraversal",
+        "CursorDomain",
         "CursorSpec",
         "CursorTraversal",
         "DeliveryOrder",
         "DirectDispatch",
+        "DuplicatePolicy",
+        "EmptyArray",
+        "EmptyObject",
         "EnvelopeContractError",
         "ExecutionPolicy",
         "FrozenJson",
@@ -172,6 +190,7 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "IdentityContractError",
         "IdentityPageAdapter",
         "IdentitySpec",
+        "IdentityStore",
         "IncompleteTraversalError",
         "InputSourceError",
         "KeysetAssuranceSource",
@@ -192,25 +211,41 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "KeysetTraversal",
         "MembershipRecheck",
         "NotExecutedReason",
+        "Null",
         "OffsetContinuation",
         "OffsetSpec",
+        "Omitted",
         "OperationReport",
         "OperationStream",
+        "PageAcknowledged",
         "PageAdaptationError",
         "PageAdaptationViolation",
         "PageAdapter",
+        "PageBoundary",
+        "PageCommandOutcome",
+        "PageDelivered",
         "PageDispatch",
+        "PageIndex",
         "PageOutcome",
         "PageRecord",
+        "PageRejected",
         "PageRejectionCode",
+        "PageScheduled",
+        "PageStopPolicy",
+        "PageStride",
+        "PageValidated",
         "PageView",
         "PaginationError",
         "ParameterPath",
         "ParameterUpdate",
         "PartialResult",
         "PartitionedKeysetExecution",
+        "PositionalArguments",
+        "PositionalLayout",
+        "Present",
         "ProtocolError",
         "RangeKeysetExecution",
+        "RawTotalSource",
         "ReferenceComplete",
         "ReferenceEvent",
         "ReferenceFailed",
@@ -219,6 +254,7 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "ReferenceNotExecuted",
         "ReferenceOutcome",
         "ReferenceOutcomeUnknown",
+        "ReplayDisposition",
         "ReplaySafety",
         "Request",
         "RequestHeaders",
@@ -231,11 +267,17 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "ResultSelector",
         "ResultShapeError",
         "RetryPolicy",
+        "RouteKind",
         "SequentialKeysetExecution",
         "SequentialTraversal",
         "Settings",
+        "SlotContract",
+        "SlotShape",
+        "SparseRawBound",
         "SplitOrderSpec",
         "StableIntegerKeysetContract",
+        "StreamClosure",
+        "StreamTerminal",
         "TerminalState",
         "TotalHintMode",
         "TotalTermination",
@@ -247,11 +289,13 @@ def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
         "TraversalIdentity",
         "UnknownRequestAudit",
         "UnknownRequestCollector",
+        "ValidationIssue",
         "Violation",
         "ViolationSeverity",
         "WireRequest",
         "WireResponse",
         "WireTransport",
+        "identity_store_key",
         "partition_command_outcomes",
         "partition_reference_outcomes",
         "traversal_control_paths",
@@ -309,7 +353,7 @@ def test_keyset_cursor_streams_add_only_the_declared_fields_and_methods() -> Non
 
 def test_request_mapping_contract_is_a_closed_typed_dict() -> None:
     assert is_typeddict(RequestSpec)
-    assert RequestSpec.__required_keys__ == frozenset({"method"})
+    assert RequestSpec.__required_keys__ == frozenset({"method", "route"})
     assert RequestSpec.__optional_keys__ == frozenset(
         {"parameters", "replay_safety", "encoding", "headers", "result_error"},
     )
@@ -330,17 +374,17 @@ def _error() -> ProtocolError:
 
 def test_command_correlation_is_opaque_and_excluded_from_repr() -> None:
     correlation = {"private": object()}
-    command = Command(Request("test.method", {"wire": 1}), correlation)
+    command = Command(Request("test.method", {"wire": 1}, route=RouteKind.BARE), correlation)
 
     assert command.correlation is correlation
     assert "private" not in repr(command)
     assert command.request.copy_parameters() == {"wire": 1}
     with pytest.raises(FrozenInstanceError):
-        command.request = Request("other.method")  # type: ignore[misc]
+        command.request = Request("other.method", route=RouteKind.BARE)  # type: ignore[misc]
 
 
 def test_command_outcome_partition_retains_every_closed_variant() -> None:
-    request = Request("test.method", replay_safety=ReplaySafety.UNKNOWN)
+    request = Request("test.method", replay_safety=ReplaySafety.UNKNOWN, route=RouteKind.BARE)
     correlation = object()
     outcomes = (
         CommandSuccess(0, correlation, request.summary, Response({"ok": True})),
@@ -362,6 +406,8 @@ def test_command_outcome_partition_retains_every_closed_variant() -> None:
     )
     assert buckets.successes[0].result == {"ok": True}
     assert all(outcome.correlation is correlation for outcome in outcomes)
+    assert buckets.failures[0].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+    assert buckets.unknown[0].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
 
 
 def test_binding_rejects_overlapping_paths_and_never_exposes_correlation_in_repr() -> None:
@@ -469,3 +515,6 @@ def test_operation_report_terminal_properties_are_explicit() -> None:
     assert not partial.successful
     assert not partial.exhausted
     assert partial.partial
+    with_failures = OperationReport(TerminalState.COMPLETED_WITH_FAILURES, "batch", "some commands failed")
+    assert not with_failures.exhausted
+    assert with_failures.partial

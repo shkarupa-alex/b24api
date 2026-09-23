@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import ast
+import json
 import re
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Self, cast
 import pytest
 
 import b24api
+from b24api.execution import Executor, WireResponse
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
@@ -27,6 +29,13 @@ def test_docs_are_flat_compact_and_linked_from_readme() -> None:
         "docs/migration.md",
         "docs/performance.md",
         "docs/recipes.md",
+        "docs/specifications/b24api-issues-architecture/decision-ledger.md",
+        "docs/specifications/b24api-issues-architecture/examples-contracts.md",
+        "docs/specifications/b24api-issues-architecture/registry-contracts.md",
+        "docs/specifications/b24api-issues-architecture/specification.md",
+        "docs/specifications/b24api-issues-architecture/synthesis.md",
+        "docs/specifications/b24api-issues-architecture/transport-and-errors.md",
+        "docs/specifications/b24api-issues-architecture/traversal-contracts.md",
     ]
     text = README.read_text(encoding="utf-8")
     assert "docs/architecture.md" in text
@@ -36,6 +45,18 @@ def test_docs_are_flat_compact_and_linked_from_readme() -> None:
     assert MIGRATION.is_file()
 
 
+def test_every_documented_keyset_traversal_keeps_the_non_production_guard_beside_it() -> None:
+    for path in (README, DOCS / "recipes.md", MIGRATION):
+        for source in PYTHON_BLOCK.findall(path.read_text(encoding="utf-8")):
+            traversal = source.find("iter_list_keyset(")
+            if traversal < 0:
+                continue
+            verifier = source.find("verify_keyset_capability(")
+            assert 'os.environ.get("ENV") != "PROD"' in source
+            assert "Accepting an ID filter does not prove strict bounds or ordering." in source
+            assert 0 <= verifier < traversal
+
+
 def test_user_documentation_contains_no_internal_issue_identifiers() -> None:
     text = "\n".join(
         path.read_text(encoding="utf-8")
@@ -43,6 +64,21 @@ def test_user_documentation_contains_no_internal_issue_identifiers() -> None:
     )
 
     assert re.search(r"\b[BC]\d+[a-z]?\b", text) is None
+
+
+def test_migration_covers_changed_completion_stop_keyset_and_replay_contracts() -> None:
+    text = MIGRATION.read_text(encoding="utf-8")
+    for public_contract in ("exhausted", "partial", "page_stop", "BoundedIdentityRange", "ReplayDisposition"):
+        assert public_contract in text
+    bounded = next(paragraph for paragraph in text.split("\n\n") if "BoundedIdentityRange" in paragraph)
+    assert "SequentialKeysetExecution" in bounded
+    assert "consumes that\nboundary" in bounded
+    assert "RangeKeysetExecution`, `PartitionedKeysetExecution`, and auto execution reject" in bounded
+    reference = next(
+        paragraph for paragraph in text.split("\n\n") if "per-reference `IncompleteTraversalError`" in paragraph
+    )
+    assert "`report=None`" in reference
+    assert "partial_rows" in reference
 
 
 def test_architecture_document_names_the_complete_public_capability_family() -> None:
@@ -119,3 +155,51 @@ async def test_migration_python_examples_execute_without_io() -> None:
         stream = namespace.get("stream")
         if isinstance(stream, dict) and "execution" in stream:
             assert isinstance(stream["execution"], b24api.SequentialKeysetExecution)
+
+
+class _FixedStepTransport:
+    host = "test.invalid"
+
+    def __init__(self, pages: dict[int, list[int]]) -> None:
+        self.pages = pages
+
+    async def send(self, request: b24api.Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        rows = [{"ID": value} for value in self.pages[request.copy_parameters().get("start", 0)]]
+        return WireResponse(200, (), json.dumps({"result": rows}).encode())
+
+
+_Outcome = tuple[b24api.OperationReport | None, BaseException | None]
+
+
+async def _fixed_step_outcome(pages: dict[int, list[int]]) -> _Outcome:
+    client = b24api.Bitrix24._from_executor(Executor(_FixedStepTransport(pages)))  # noqa: SLF001
+    stream = client.iter_list(
+        b24api.Request("example.list", replay_safety=b24api.ReplaySafety.SAFE, route=b24api.RouteKind.BARE),
+        page_size=2,
+        offset=b24api.OffsetSpec(continuation=b24api.OffsetContinuation.FIXED_STEP, step=2),
+    )
+    try:
+        _ = [row async for row in stream]
+    except b24api.IncompleteTraversalError as error:
+        return stream.report, error
+    return stream.report, None
+
+
+@pytest.mark.asyncio
+async def test_fixed_step_recipe_documents_the_actual_unqualified_outcomes() -> None:
+    recipe = " ".join((DOCS / "recipes.md").read_text(encoding="utf-8").split())
+    migration = " ".join(MIGRATION.read_text(encoding="utf-8").split())
+
+    report, error = await _fixed_step_outcome({0: [1, 2], 2: [3, 4], 4: []})
+    assert error is None
+    assert report is not None
+    assert report.assurance is b24api.TraversalAssurance.MECHANICS_ONLY
+    assert "`mechanics_only` assurance" in recipe
+
+    report, error = await _fixed_step_outcome({0: [1, 2], 2: [3], 4: []})
+    assert error is not None
+    assert report is not None
+    assert not report.exhausted
+    assert str(error.__cause__) in recipe
+    assert "no longer accepts an empty page after a short page as closure" in migration

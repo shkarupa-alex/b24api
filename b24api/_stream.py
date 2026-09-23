@@ -4,9 +4,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
-from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
+from b24api.completion.gate import CompletionGate, CompletionReportFacts
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import OperationReport, TerminalState, TraversalAssurance, Violation
 from b24api.contracts.stream import PartialResult
@@ -26,64 +26,6 @@ class _ClosableIterator[T](AsyncIterator[T], Protocol):
     async def aclose(self) -> None:
         """Close the underlying subsystem stream."""
         ...
-
-
-def _terminal_state(state: KernelState, *, negative_outcomes: int) -> TerminalState:
-    if state is KernelState.COMPLETED:
-        return TerminalState.COMPLETED_WITH_FAILURES if negative_outcomes else TerminalState.COMPLETED
-    if state is KernelState.INCOMPLETE:
-        return TerminalState.INCOMPLETE
-    if state is KernelState.CANCELLED:
-        return TerminalState.CANCELLED
-    return TerminalState.FAILED
-
-
-def _public_report(  # noqa: PLR0913
-    report: KernelReport,
-    *,
-    operation: str,
-    assurance: TraversalAssurance | None,
-    admitted: int,
-    emitted: int,
-    successes: int,
-    failures: int,
-    not_executed: int,
-    unknown: int,
-    buffered_commands_high_water: int,
-    active_references_high_water: int,
-    early_closed: bool = False,
-) -> OperationReport:
-    state = (
-        TerminalState.EARLY_CLOSED
-        if early_closed
-        else _terminal_state(report.state, negative_outcomes=failures + not_executed + unknown)
-    )
-    return OperationReport(
-        state=state,
-        operation=operation,
-        terminal_reason=report.terminal_reason or state.value,
-        assurance=assurance,
-        admitted=admitted,
-        emitted=emitted,
-        successes=successes,
-        failures=failures,
-        not_executed=not_executed,
-        unknown=unknown,
-        unique_rows=report.unique_rows,
-        physical_requests=report.physical_requests,
-        logical_pages=report.logical_pages,
-        batch_requests=report.batch_requests,
-        batch_commands=report.batch_commands,
-        retries=report.retries,
-        cooldown_seconds=report.cooldown_seconds,
-        buffered_commands_high_water=buffered_commands_high_water,
-        buffered_rows_high_water=report.buffered_rows_high_water,
-        active_references_high_water=active_references_high_water,
-        violations=report.violations,
-        page_trace=report.page_trace,
-        page_trace_truncated=report.page_trace_truncated,
-        keyset_execution=report.keyset_execution,
-    )
 
 
 async def _resolve[T](value: T | Awaitable[T]) -> T:
@@ -276,25 +218,34 @@ class MappedOperationStream[S, T]:
     def _finalize(self, *, forced_state: TerminalState | None = None) -> None:
         if self._report is not None:
             return
-        report = _public_report(
-            self._source.report,
-            operation=self._operation,
-            assurance=self._assurance,
-            admitted=max(self._admitted, _read_source_counter(self._source_admitted)),
-            emitted=self._emitted,
-            successes=self._successes,
-            failures=self._failures,
-            not_executed=self._not_executed,
-            unknown=self._unknown,
-            buffered_commands_high_water=_read_source_counter(self._source_buffered_commands),
-            active_references_high_water=_read_source_counter(self._source_active_references),
-            early_closed=self._early_closed,
-        )
+        gate = getattr(self._source, "completion_gate", None)
         extra_violations = (*self._initial_violations, *(_read_violations(self._source_violations)))
-        if extra_violations:
-            report = replace(report, violations=(*report.violations, *extra_violations))
-        if forced_state is not None and report.state is not forced_state:
-            report = replace(report, state=forced_state)
+        admitted = max(self._admitted, _read_source_counter(self._source_admitted))
+        buffered_commands = _read_source_counter(self._source_buffered_commands)
+        active_references = _read_source_counter(self._source_active_references)
+        if not isinstance(gate, CompletionGate):
+            raise TypeError("public operation source lacks completion evidence")
+        if self._source.report.state is KernelState.NOT_STARTED:
+            gate.abort_unstarted()
+        gate.attach_report(
+            CompletionReportFacts(
+                source=self._source.report,
+                operation=self._operation,
+                assurance=self._assurance,
+                admitted=admitted,
+                emitted=self._emitted,
+                successes=self._successes,
+                failures=self._failures,
+                not_executed=self._not_executed,
+                unknown=self._unknown,
+                buffered_commands_high_water=buffered_commands,
+                active_references_high_water=active_references,
+                early_closed=self._early_closed,
+                forced_state=forced_state,
+                extra_violations=extra_violations,
+            )
+        )
+        report = gate.finish()
         self._report = report
         self._terminated = True
         if self._deregister is not None:

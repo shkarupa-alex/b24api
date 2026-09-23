@@ -1,8 +1,132 @@
-# Migrating within b24api 2.x
+# Migrating to the issues architecture
 
-This release keeps the established wire representation and transport compatibility, but changes
-the default execution of direct no-count keyset traversal from sequential to auto. Existing JSON
-requests and the `Transport.send()` protocol remain supported.
+The route is now a required part of every `Request` and closed request mapping. Existing callers
+must choose `RouteKind.BARE`, `RouteKind.JSON` or `RouteKind.API_V3`; `with_parameters()` preserves
+that choice. The CLI likewise requires `--route bare|json|api_v3` for `call`, `list` and
+`verify-keyset`. A classic webhook base must have the form `/rest/<user>/<token>/`. The transport
+resolves bare and `.json` suffixes or `/rest/api/<user>/<token>/` at dispatch. Physical batch
+inner commands accept only `BARE`; use explicit direct dispatch for other routes. V3 accepts a JSON
+body and reports object-valued API errors with typed validation details. A transport serves only the
+routes it declares in `TransportCapabilities.routes`, which defaults to `BARE`; `HttpxTransport`
+declares all three. A custom send-only transport, which cannot declare routes, serves only `BARE`.
+An undeclared route is refused with `CapabilityError` before any request, instead of silently
+reaching the classic handler.
+
+```python
+from b24api import Request, RouteKind
+
+request = Request("profile", route=RouteKind.BARE)
+v3_request = Request("tasks.task.result.list", route=RouteKind.API_V3)
+```
+
+HTTPX INFO records for requests owned by `HttpxTransport` have their registered webhook URL
+redacted before logging handlers format them. This applies to an injected `httpx.AsyncClient` while
+it is used through that transport, including its redirect hops. Any other request through the same
+client, even one sent from its event hook or auth flow while an owned request is in flight, is logged
+unchanged except that the registered webhook secret itself is never logged.
+An injected client's `auth` still runs on owned requests when it authorizes the request in place, as
+`httpx.BasicAuth`, `httpx.DigestAuth` and header-setting flows do. A flow that yields any other
+`Request` (a clone, a credential rotation or an unrelated request) is refused before that request is
+sent, with a non-retryable `TransportError` whose phase records whether the owned request had
+already been answered: a substitute would make it undecidable which records carry the webhook.
+Direct use of a caller-owned client after the transport closes is outside that shield. An
+application enabling the separate `httpcore` DEBUG logger needs its own logging policy and test;
+this guarantee covers the emitting `httpx` INFO logger.
+The supported HTTPX range is `>=0.28.1,<0.29`; raising that upper bound requires rerunning the
+positive logger controls against the newly admitted version.
+
+Direct access to `RateCoordinator.acquire()` now requires a non-empty `methods` frozenset. A
+physical batch passes every inner method as one admission unit. `Retry-After` pauses the portal
+host; `OPERATION_TIME_LIMIT` pauses only its method, with a configurable 120-second default.
+The coordinator binds the portal host of every transport it serves, `HttpxTransport` or custom,
+through the `Transport.host` property, and rejects attempts to share it across different hosts; a
+custom transport without `host` is refused with `TypeError` when the `Executor` is built. An unsafe
+request or batch failure records the throttle without automatically replaying the request. Callers
+can pass an absolute monotonic `DeadlineBudget` to bound permit waits and handle typed budget,
+closed, and capacity errors.
+
+Qualified PHP methods that take positional arguments now use `PositionalArguments` with an
+explicit `PositionalLayout`. Pass that value as the second argument to `Request`. Slots are
+represented by `Present`, `EmptyObject`, `EmptyArray`, `Null`, or a trailing `Omitted`. A layout
+declares exact arity, each slot's shape, fixed slots, and case-sensitive writable control paths.
+`write_control()` returns a new value and rejects an undeclared or missing parent path. A declared
+final mapping leaf may be created when every parent container already exists. Positional requests
+use a top-level JSON array; form encoding and physical batch reject them before I/O.
+
+`OperationReport.exhausted` now records whether every binding reached qualified full-source
+closure. A successful page-boundary stop therefore has `state=COMPLETED`, `exhausted=false`, and
+`partial=true`. Failures, unknown outcomes, early close, and cleanup failure also cannot claim
+exhaustion. Applications that previously treated successful state as a complete checkpoint must
+gate that checkpoint on `report.exhausted`.
+
+The public `page_stop` callback runs after the validated page has been delivered. Return only after
+the page and its checkpoint are durably committed; the client emits `PageAcknowledged` after the
+callback succeeds and before scheduling the next page. A callback exception is a traversal failure.
+Counted physical-batch tails reject page-stop construction because already scheduled sibling pages
+cannot be withdrawn safely.
+
+Bounded keyset execution now needs a qualified admitted upper boundary, an enforced fence, and the
+declared method contract in `BoundedIdentityRange`. `SequentialKeysetExecution` consumes that
+boundary, closes only after the exact admitted upper ID is witnessed, and reports
+`BOUNDED_RANGE_OBSERVED`; it does not need a trailing empty confirmation. Fast
+`RangeKeysetExecution`, `PartitionedKeysetExecution`, and auto execution reject a boundary before
+I/O, and so does a reference `KeysetTraversal`, because one filter-bound range cannot be shared by
+bindings that rewrite parameters. `CALLER_ASSERTED_BOUNDS` describes the source of fast-execution bounds and does not assert a
+stable snapshot of a mutating source.
+
+Logical-batch `CommandFailure` and `CommandOutcomeUnknown`, reference failures and unknown outcomes,
+blocking violations, and `IncompleteTraversalError` now expose the kernel's
+`replay_disposition`. Retry only when it is `ReplayDisposition.ELIGIBLE`; replay safety and
+retryability remain inputs to that closed decision.
+
+A per-reference `IncompleteTraversalError` (the `error` of a `ReferenceFailure`, including those in
+`ReferenceFailed.outcomes`) now carries `report=None`: only the whole stream has an operation report,
+available as `stream.report` and `ReferenceFailed.report`. Read the binding's typed cause from the
+error's `error` attribute and its delivered prefix from `ReferenceFailure.partial_rows`.
+
+For one-based page controls, pass `OffsetSpec(parameter_path=path, page_index=PageIndex(path,
+initial=1, increment=1, max_rows=10))` to `iter_list(..., page_size=10)`. The wire control
+advances by one even when a page selects fewer than ten rows. An empty page is the terminal
+witness. `PageStride` records a method's qualified server offset granularity separately from its
+decoded row cap and rejects increments that would alias a rounded server page. For a sparse
+selected result, `SparseRawBound` adds an exact raw total path, fixed stride, finite page budget,
+and stable-order contract; empty selected pages remain traversable until the raw range is covered.
+This is structural coverage, so its report uses `RAW_RANGE_COVERED` rather than claiming a
+snapshot of a mutable source. A sparse traversal starts at offset zero and is available only
+through `iter_list`: a resumed nonzero start, an offset off the server granularity, and a reference
+traversal with `SparseRawBound` are each refused with `CapabilityError` before any request.
+
+`OffsetContinuation.FIXED_STEP` without `TotalTermination.EXACT_QUALIFIED` no longer accepts an
+empty page after a short page as closure. Such a traversal now raises `IncompleteTraversalError`
+(cause `PaginationError`) and reports `exhausted=False`; full pages followed by an empty page still
+complete with `mechanics_only` assurance. Qualify an exact total, switch to `OBSERVED_COUNT` or
+`PageIndex` when the endpoint supports them, or use `SparseRawBound`; see
+[endpoint recipes](recipes.md#fixed-server-stride). Assurance names what a completed traversal
+proved: a report that did not complete carries at most `mechanics_only`, whatever its plan declared
+and even when a caller stopped one of its bindings; `bounded_prefix` appears only on a completed
+report. `completed_with_failures` keeps the declared assurance, which describes the bindings that
+completed.
+
+`SparseRawBound.total_path` also accepts `RawTotalSource.ENVELOPE` when the qualified raw extent is
+the response envelope `total` rather than a field inside `result`; a missing or negative envelope
+total fails closed like a missing result field.
+
+Exact traversal now has an in-memory `ExecutionPolicy.max_identity_keys` budget (100,000 keys by
+default); exceeding it fails the operation closed. `iter_list` and
+`iter_list_counted` accept `identity_store=`, a caller-owned `IdentityStore` whose
+`add_if_absent(identity_store_key(value)) -> bool` records each identity after the rest of the page
+validates; `False` is a duplicate, and any exception rejects the page. The client does not close the
+store. Under `DuplicatePolicy.REPORT`, an observed duplicate now withdraws identity strength: the
+report carries `mechanics_only` instead of `identity_exact` or `identity_and_count_matched`.
+
+When a stride's decoded row cap differs from its wire increment and the request owns a limit
+control, set `requested_wire_limit` explicitly to at least the wire increment. Construction now
+rejects an omitted or smaller value before I/O instead of leaving part of each wire window
+unrequested. For ordinary traversal, `max_decoded_rows` must equal the wire increment, which
+prevents both skipped subwindows and overlapping windows from claiming completion. Sparse raw-bound
+traversal keeps its separate raw-range closure contract.
+
+The earlier 2.x keyset migration notes below remain as historical guidance for that API.
 
 ## Keyset verification, cursor fan-out, and page adaptation
 
@@ -25,7 +149,8 @@ call; verification does not switch runtime mode and is not cached:
 ```python
 import os
 
-if not os.environ.get("PROD"):
+if os.environ.get("ENV") != "PROD":
+    # Accepting an ID filter does not prove strict bounds or ordering.
     await api.verify_keyset_capability(
         request,
         selector=selector,
@@ -193,7 +318,18 @@ behavior is required, opt out per call. This performs the original sequential ke
 does not run the auto planning barrier:
 
 ```python
+import os
+
 from b24api import SequentialKeysetExecution
+
+if os.environ.get("ENV") != "PROD":
+    # Accepting an ID filter does not prove strict bounds or ordering.
+    await client.verify_keyset_capability(
+        request,
+        selector=selector,
+        identity=identity,
+        keyset=keyset,
+    )
 
 stream = client.iter_list_keyset(
     request,

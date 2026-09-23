@@ -30,6 +30,7 @@ from b24api.contracts import (
     Request,
     SequentialTraversal,
 )
+from b24api.contracts.request import RouteKind
 from b24api.errors import ResponseTooLargeError
 from b24api.execution import HttpxTransport, Transport, WireResponse
 from b24api.settings import Settings
@@ -127,7 +128,7 @@ async def _direct_case() -> dict[str, Any]:
     transport = _Transport(lambda _request: {"result": {"ID": 1}})
     client = _client(transport)
     started = time.perf_counter_ns()
-    result = await client.call(Request("profile.get", replay_safety=ReplaySafety.SAFE))
+    result = await client.call(Request("profile.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
     first_row_seconds = (time.perf_counter_ns() - started) / 1_000_000_000
     await client.aclose()
     return {
@@ -148,7 +149,7 @@ async def _logical_batch_case(total: int) -> dict[str, Any]:
         try:
             for index in range(total):
                 yield Command(
-                    Request("profile.get", {"index": index}, ReplaySafety.SAFE),
+                    Request("profile.get", {"index": index}, ReplaySafety.SAFE, route=RouteKind.BARE),
                     ("profile-correlation", index),
                 )
         finally:
@@ -212,7 +213,7 @@ async def _counted_case(case_id: str) -> dict[str, Any]:
     portal = DeterministicPortal(case)
     client = _client(portal, policy=ExecutionPolicy(max_requests=1_000, max_pages=1_000))
     stream = client.iter_list_counted(
-        Request("model.entity.list", replay_safety=ReplaySafety.SAFE),
+        Request("model.entity.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
     started = time.perf_counter_ns()
@@ -276,7 +277,7 @@ async def _reference_backpressure_case() -> dict[str, Any]:
         for owner in range(8)
     ]
     stream = client.iter_references(
-        Request("profile.list", replay_safety=ReplaySafety.SAFE),
+        Request("profile.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         bindings,
         traversal=SequentialTraversal(identity=_identity()),
         dispatch=DirectDispatch(concurrency=8, output_order=DeliveryOrder.INPUT),
@@ -304,7 +305,7 @@ async def _repeated_lifecycle_case() -> dict[str, Any]:
     stream_refs: list[weakref.ReferenceType[object]] = []
 
     async def traverse_once() -> weakref.ReferenceType[object]:
-        stream = client.iter_list(Request("profile.list", replay_safety=ReplaySafety.SAFE))
+        stream = client.iter_list(Request("profile.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
         reference: weakref.ReferenceType[object] = weakref.ref(stream)
         async for _row in stream:
             pass
@@ -355,7 +356,11 @@ async def _oversized_response_case() -> dict[str, Any]:
     refused = False
     try:
         try:
-            await transport.send(Request("profile.get"), attempt_timeout=1, max_response_bytes=ceiling)
+            await transport.send(
+                Request("profile.get", route=RouteKind.BARE),
+                attempt_timeout=1,
+                max_response_bytes=ceiling,
+            )
         except ResponseTooLargeError:
             refused = True
     finally:

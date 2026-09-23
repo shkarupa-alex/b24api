@@ -19,6 +19,7 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     TotalSemantics,
 )
+from b24api.contracts.request import RouteKind
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.identity import _child_path, _request_with_controls
@@ -30,13 +31,22 @@ if TYPE_CHECKING:
     from b24api.execution.executor import Executor
 
 
-def _path_lookup(parameters: object, path: ParameterPath) -> tuple[bool, object]:
+def _path_lookup(
+    parameters: object,
+    path: ParameterPath,
+    *,
+    case_sensitive: bool = False,
+) -> tuple[bool, object]:
     current = parameters
     for part in path.path:
         if isinstance(part, str):
             if not isinstance(current, dict):
                 return False, None
-            matches = [key for key in current if key.casefold() == part.casefold()]
+            matches = (
+                [part]
+                if case_sensitive and part in current
+                else ([] if case_sensitive else [key for key in current if key.casefold() == part.casefold()])
+            )
             if len(matches) > 1:
                 raise CapabilityError("request contains a case-insensitively ambiguous traversal control")
             if not matches:
@@ -50,21 +60,38 @@ def _path_lookup(parameters: object, path: ParameterPath) -> tuple[bool, object]
 
 
 def _reject_owned_controls(request: Request, identity: IdentitySpec, keyset: KeysetSpec) -> None:
-    parameters = request.copy_parameters()
-    filter_exists, filter_value = _path_lookup(parameters, keyset.filter_path)
+    positional_arguments = request.positional
+    positional = positional_arguments is not None
+    parameters = positional_arguments.to_wire_slots() if positional_arguments is not None else request.copy_parameters()
+    filter_exists, filter_value = _path_lookup(parameters, keyset.filter_path, case_sensitive=positional)
     if filter_exists:
         if not isinstance(filter_value, dict):
             raise CapabilityError("keyset filter path must contain an object")
-        forbidden = {f"{operator}{identity.filter_key}".casefold() for operator in (">", "<", ">=", "<=")}
+        forbidden = {
+            identity.filter_key.casefold(),
+            *(f"{operator}{identity.filter_key}".casefold() for operator in (">", "<", ">=", "<=")),
+        }
         if any(str(key).casefold() in forbidden for key in filter_value):
             raise CapabilityError("caller identity bounds conflict with fast keyset traversal")
-    order_paths = (
-        (keyset.order_path,)
-        if keyset.split_order is None
-        else (keyset.split_order.field_path, keyset.split_order.direction_path)
-    )
+    order_paths: tuple[ParameterPath | None, ...]
+    if keyset.split_order is None:
+        if positional and keyset.order_path is not None:
+            order_exists, order_value = _path_lookup(
+                parameters,
+                keyset.order_path,
+                case_sensitive=True,
+            )
+            if order_exists and not isinstance(order_value, dict):
+                raise CapabilityError("keyset order path must contain an object")
+            if order_exists and order_value:
+                raise CapabilityError("caller traversal control conflicts with fast keyset traversal")
+            order_paths = ()
+        else:
+            order_paths = (keyset.order_path,)
+    else:
+        order_paths = (keyset.split_order.field_path, keyset.split_order.direction_path)
     for path in (*order_paths, keyset.start_suppression_path, keyset.limit_path):
-        if path is not None and _path_lookup(parameters, path)[0]:
+        if path is not None and _path_lookup(parameters, path, case_sensitive=positional)[0]:
             raise CapabilityError("caller traversal control conflicts with fast keyset traversal")
 
 
@@ -101,10 +128,20 @@ def validate_fast_keyset(  # noqa: C901, PLR0912, PLR0913
     policy: ExecutionPolicy,
 ) -> int:
     """Prove every static prerequisite before registration and I/O."""
+    if keyset.boundary is not None:
+        raise CapabilityError("exact-boundary completion is not qualified for fast or auto keyset execution")
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         raise ValueError("page_size must be a positive integer")
-    if request.encoding is not BodyEncoding.JSON or request.headers.items:
-        raise CapabilityError("fast keyset traversal supports JSON requests without scoped headers")
+    if (
+        request.route is not RouteKind.BARE
+        or request.encoding is not BodyEncoding.JSON
+        or request.headers.items
+        or request.positional is not None
+    ):
+        raise CapabilityError(
+            "fast keyset traversal supports named BARE JSON requests without scoped headers; "
+            "use SequentialKeysetExecution for positional requests"
+        )
     if identity.coercion not in {IdentityCoercion.EXACT_INTEGER, IdentityCoercion.DECIMAL_STRING_INTEGER}:
         raise CapabilityError("fast keyset traversal requires integer identity coercion")
     consistency = policy.consistency

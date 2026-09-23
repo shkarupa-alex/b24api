@@ -15,6 +15,7 @@ from b24api import (
     ReplaySafety,
     Request,
     Response,
+    RouteKind,
     TerminalState,
     TraversalAssurance,
 )
@@ -82,7 +83,7 @@ def _report_json(report: OperationReport) -> dict[str, object]:
         "buffered_commands_high_water": report.buffered_commands_high_water,
         "buffered_rows_high_water": report.buffered_rows_high_water,
         "active_references_high_water": report.active_references_high_water,
-        "violations": tuple(dataclasses.asdict(item) for item in report.violations),
+        "violations": tuple(item.to_safe_dict() for item in report.violations),
     }
     if report.keyset_execution is not None:
         result["keyset_execution"] = dataclasses.asdict(report.keyset_execution)
@@ -106,6 +107,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     call = subparsers.add_parser("call", help="execute one method and print one JSON value")
     call.add_argument("method", help="Bitrix24 REST method name")
+    call.add_argument("--route", choices=tuple(route.value for route in RouteKind), required=True)
     call.add_argument("--params", help="JSON object, @file, or - for stdin")
     call.add_argument("--raw", action="store_true", help="print the immutable response envelope")
     call.add_argument(
@@ -116,6 +118,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     listing = subparsers.add_parser("list", help="stream one list traversal as JSONL")
     listing.add_argument("method", help="Bitrix24 REST method name")
+    listing.add_argument("--route", choices=tuple(route.value for route in RouteKind), required=True)
     listing.add_argument("--params", help="JSON object, @file, or - for stdin")
     listing.add_argument(
         "--strategy",
@@ -126,6 +129,7 @@ def _parser() -> argparse.ArgumentParser:
     listing.add_argument("--contract", help="closed v1 traversal contract as @file or -")
     verify = subparsers.add_parser("verify-keyset", help="verify strict keyset bounds for one portal method")
     verify.add_argument("method", help="Bitrix24 REST method name")
+    verify.add_argument("--route", choices=tuple(route.value for route in RouteKind), required=True)
     verify.add_argument("--params", help="JSON object, @file, or - for stdin")
     verify.add_argument("--contract", required=True, help="closed v1 verifier contract as @file")
     return parser
@@ -205,17 +209,17 @@ def main(  # noqa: C901, PLR0911, PLR0912 - stable process-code boundary
         args = _parser().parse_args(argv)
         params = read_json_source(args.params, label="parameters", stdin=input_stream)
         if args.command == "call":
-            request = cli_request(args.method, params, ReplaySafety(args.replay_safety))
+            request = cli_request(args.method, params, ReplaySafety(args.replay_safety), RouteKind(args.route))
             asyncio.run(_call(args, request, output_stream))
         elif args.command == "list":
             contract = default_contract(args.strategy, args.contract, input_stream)
             route = parse_list_contract(args.strategy, contract)
-            request = cli_request(args.method, params, ReplaySafety.UNKNOWN)
+            request = cli_request(args.method, params, ReplaySafety.UNKNOWN, RouteKind(args.route))
             asyncio.run(_list(request, route, output_stream, error_stream))
         else:
             contract = default_contract("verify-keyset", args.contract, input_stream)
             verify_route = parse_verify_keyset_contract(contract)
-            request = cli_request(args.method, params, ReplaySafety.UNKNOWN)
+            request = cli_request(args.method, params, ReplaySafety.UNKNOWN, RouteKind(args.route))
             asyncio.run(_verify_keyset(request, verify_route, output_stream))
     except KeyboardInterrupt:
         return _INTERRUPTED
