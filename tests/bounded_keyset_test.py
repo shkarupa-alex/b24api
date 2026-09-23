@@ -9,14 +9,18 @@ import pytest
 
 from b24api import (
     AutoKeysetExecution,
+    Binding,
     Bitrix24,
     BoundedIdentityRange,
     CapabilityError,
+    DirectDispatch,
     IdentityCoercion,
     IdentitySpec,
     IncompleteTraversalError,
     KeysetSpec,
+    KeysetTraversal,
     ParameterPath,
+    ParameterUpdate,
     Request,
     ResultSelector,
     RouteKind,
@@ -107,6 +111,7 @@ async def test_missing_boundary_cannot_claim_completion() -> None:
     assert len(transport.requests) == 2
     assert stream.report is not None
     assert not stream.report.exhausted
+    assert {violation.code for violation in stream.report.violations} == {"pagination_invariant"}
 
 
 @pytest.mark.asyncio
@@ -147,4 +152,16 @@ async def test_mismatched_filter_and_auto_execution_reject_before_io() -> None:
             keyset=spec,
             execution=AutoKeysetExecution(StableIntegerKeysetContract()),
         )
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_reference_keyset_rejects_a_bounded_range_before_io() -> None:
+    transport, client, request, spec, identity = _setup((1, 2, 3, 4), upper=2)
+    traversal = KeysetTraversal(ResultSelector.root(), identity, page_size=2, keyset=spec)
+    path = ParameterPath(("filter", "STATUS"))
+    bindings = (Binding("open", (ParameterUpdate(path, "open"),), "open"),)
+
+    with pytest.raises(CapabilityError, match="bounded identity range"):
+        client.iter_references(request, bindings, traversal=traversal, dispatch=DirectDispatch(concurrency=1))
     assert transport.requests == []

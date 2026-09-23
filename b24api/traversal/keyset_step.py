@@ -12,6 +12,7 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.errors import CapabilityError, PaginationError
+from b24api.traversal.closure import ADMITTED_UPPER_BOUNDARY_REACHED
 from b24api.traversal.identity import _child_path, _request_with_controls
 from b24api.traversal.plans import KeysetPlan, KeysetTerminalRule
 from b24api.traversal.values import IdentityValue, _compare_identities
@@ -155,7 +156,7 @@ def keyset_page_terminal(
     """Return the declared completion reason for one validated keyset page."""
     if plan.boundary is not None:
         if plan.boundary.upper_id in identities:
-            return "exact admitted upper boundary reached"
+            return ADMITTED_UPPER_BOUNDARY_REACHED
         if page_size == 0:
             raise PaginationError("bounded keyset ended before its exact upper boundary")
         return None

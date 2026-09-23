@@ -134,6 +134,10 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
         if not isinstance(traversal.execution, SequentialKeysetExecution):
             raise CapabilityError("reference keyset traversal supports sequential execution only")
         keyset_mechanics = traversal.keyset
+        if keyset_mechanics.boundary is not None:
+            # A bounded range is fingerprinted to one request filter; bindings rewrite parameters,
+            # so it cannot be shared across references and must not be silently dropped.
+            raise CapabilityError("reference keyset traversal does not support a bounded identity range")
         direction = _direction(keyset_mechanics.direction)
         return (
             KeysetPlan(

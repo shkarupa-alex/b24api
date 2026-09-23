@@ -24,6 +24,7 @@ from b24api.contracts.completion import (
     StreamTerminal,
 )
 from b24api.contracts.policy import KernelState
+from b24api.traversal.closure import qualified_closure
 from b24api.traversal.plans import KeysetPlan, ListPlan
 
 if TYPE_CHECKING:
@@ -191,20 +192,17 @@ class CompletionRecorder:
         qualified_total: int | None = None,
     ) -> None:
         """Preserve the driver's qualified closure distinction in gate evidence."""
+        # A kernel that did not complete never claims a success closure, whatever its plan shape.
         closure = (
             BindingClosure.UNKNOWN
             if self._unknown
             else BindingClosure.CALLER_STOP
             if caller_stopped
+            else BindingClosure.FAILURE
+            if state is not KernelState.COMPLETED
             else BindingClosure.BOUNDARY_SEEN
             if isinstance(plan, KeysetPlan) and plan.boundary
-            else BindingClosure.QUALIFIED_TOTAL
-            if terminal_reason == "qualified total reached"
-            else BindingClosure.RAW_RANGE_COVERED
-            if terminal_reason == "qualified sparse raw range covered"
-            else BindingClosure.SOURCE_EMPTY
-            if state is KernelState.COMPLETED
-            else BindingClosure.FAILURE
+            else qualified_closure(terminal_reason) or BindingClosure.SOURCE_EMPTY
         )
         stream = (
             StreamClosure.NATURAL

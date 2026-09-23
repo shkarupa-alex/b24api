@@ -12,6 +12,7 @@ from b24api.errors import BudgetExceededError, CapabilityError, PaginationError
 from b24api.execution import (
     WorkClass,
 )
+from b24api.traversal.closure import QUALIFIED_TOTAL_REACHED, SINGLE_RESPONSE_COMPLETE
 from b24api.traversal.identity import (
     _initial_offset,
     _next_offset,
@@ -70,7 +71,7 @@ class _SequentialMixin:
             if self.page_trace_count == trace_count:
                 self.reject_external_page(items, response, error)
             raise
-        self.terminal_reason = "single response complete"
+        self.terminal_reason = SINGLE_RESPONSE_COMPLETE
         item_weights = (qualified_count,) if self._single_result_as_item else (1,) * len(items)
         yield _Page(tuple(items), response, item_weights, continuing=False)
 
@@ -206,7 +207,7 @@ class _SequentialMixin:
             if items:
                 yield _Page(tuple(items), response, (1,) * len(items), not terminal)
             if self._expected_total is not None and self.validated_rows == self._expected_total:
-                self.terminal_reason = "qualified total reached"
+                self.terminal_reason = QUALIFIED_TOTAL_REACHED
                 return
             if next_offset is None:
                 raise RuntimeError("non-terminal counted page lacks its validated next offset")

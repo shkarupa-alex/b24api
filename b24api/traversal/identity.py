@@ -15,6 +15,7 @@ from b24api.contracts.policy import (
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, TraversalIdentity
 from b24api.contracts.response import Response, inject_controls
 from b24api.errors import CapabilityError, PaginationError
+from b24api.traversal.closure import QUALIFIED_TOTAL_REACHED
 from b24api.traversal.identity_ledger import _ExternalIdentityStore
 from b24api.traversal.plans import (
     CountedOffsetPlan,
@@ -349,7 +350,7 @@ def _offset_terminal(
         and accepted == response.total
         and (response.next is None or plan.continuation is OffsetContinuation.FIXED_STEP)
     ):
-        return "qualified total reached"
+        return QUALIFIED_TOTAL_REACHED
     return None
 
 

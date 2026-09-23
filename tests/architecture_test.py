@@ -308,3 +308,15 @@ def test_only_completion_gate_constructs_terminal_operation_reports() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "OperationReport"
     }
     assert constructors == {"completion/gate.py"}
+
+
+def test_closure_reason_constants_map_to_their_qualified_closure() -> None:
+    from b24api.contracts.completion import BindingClosure  # noqa: PLC0415 - focused contract import
+    from b24api.traversal import closure  # noqa: PLC0415 - focused contract import
+
+    assert closure.qualified_closure(closure.SINGLE_RESPONSE_COMPLETE) is BindingClosure.SINGLE_RESPONSE
+    assert closure.qualified_closure(closure.QUALIFIED_TOTAL_REACHED) is BindingClosure.QUALIFIED_TOTAL
+    assert closure.qualified_closure(closure.SPARSE_RAW_RANGE_COVERED) is BindingClosure.RAW_RANGE_COVERED
+    assert closure.qualified_closure(closure.ADMITTED_UPPER_BOUNDARY_REACHED) is BindingClosure.BOUNDARY_SEEN
+    assert closure.qualified_closure("source exhausted") is None
+    assert closure.qualified_closure(None) is None

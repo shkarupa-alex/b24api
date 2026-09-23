@@ -16,6 +16,7 @@ from b24api.references.dispatch import (
     _DoneEvent,
     _Event,
 )
+from b24api.traversal.closure import qualified_closure
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     DirectDispatch,
@@ -39,14 +40,7 @@ def _done_closure(event: _DoneEvent) -> BindingClosure:
     """Translate the validated source termination into its gate witness class."""
     if event.stopped_reason:
         return BindingClosure.CALLER_STOP
-    if event.terminal_reason is None:
-        return BindingClosure.SOURCE_EMPTY
-    return {
-        "single response complete": BindingClosure.SINGLE_RESPONSE,
-        "qualified total reached": BindingClosure.QUALIFIED_TOTAL,
-        "qualified sparse raw range covered": BindingClosure.RAW_RANGE_COVERED,
-        "exact admitted upper boundary reached": BindingClosure.BOUNDARY_SEEN,
-    }.get(event.terminal_reason, BindingClosure.SOURCE_EMPTY)
+    return qualified_closure(event.terminal_reason) or BindingClosure.SOURCE_EMPTY
 
 
 def _finish_done_completion(completion: ReferenceCompletionRecorder, event: _DoneEvent) -> None:

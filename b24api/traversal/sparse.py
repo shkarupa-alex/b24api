@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, cast
 
 from b24api.contracts.traversal import RawTotalSource
 from b24api.errors import PaginationError
+from b24api.traversal.closure import SPARSE_RAW_RANGE_COVERED
 
 if TYPE_CHECKING:
     from b24api.contracts.request import ResultSelector
@@ -45,5 +46,5 @@ def sparse_page_terminal(
     total = raw_total_from_response(response, bound.total_path)
     if previous_total is not None and total != previous_total:
         raise PaginationError("sparse raw total changed during traversal")
-    terminal = "qualified sparse raw range covered" if offset + bound.stride.wire_increment >= total else None
+    terminal = SPARSE_RAW_RANGE_COVERED if offset + bound.stride.wire_increment >= total else None
     return terminal, total

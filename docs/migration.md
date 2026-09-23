@@ -56,7 +56,8 @@ declared method contract in `BoundedIdentityRange`. `SequentialKeysetExecution` 
 boundary, closes only after the exact admitted upper ID is witnessed, and reports
 `BOUNDED_RANGE_OBSERVED`; it does not need a trailing empty confirmation. Fast
 `RangeKeysetExecution`, `PartitionedKeysetExecution`, and auto execution reject a boundary before
-I/O. `CALLER_ASSERTED_BOUNDS` describes the source of fast-execution bounds and does not assert a
+I/O, and so does a reference `KeysetTraversal`, because one filter-bound range cannot be shared by
+bindings that rewrite parameters. `CALLER_ASSERTED_BOUNDS` describes the source of fast-execution bounds and does not assert a
 stable snapshot of a mutating source.
 
 Logical-batch `CommandFailure` and `CommandOutcomeUnknown`, reference failures and unknown outcomes,

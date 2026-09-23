@@ -1,4 +1,10 @@
-"""Keep b24api webhook URLs out of HTTPX INFO records before handler formatting."""
+"""Keep b24api webhook URLs out of HTTPX INFO records before handler formatting.
+
+While a b24api request is in flight, every record HTTPX emits in that task belongs to it, including
+records for redirect hops whose URLs b24api never built. The filter therefore scrubs any
+credential-shaped Bitrix URL segment and sensitive query value in those records, not only the
+registered webhook token, and leaves records emitted outside an owned request untouched.
+"""
 
 from __future__ import annotations
 import logging
@@ -8,7 +14,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
-from b24api.redaction import DEFAULT_REDACTOR
+from b24api.redaction import Redactor
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -17,6 +23,12 @@ _LOGGER = logging.getLogger("httpx")
 _ACTIVE_CREDENTIALS: ContextVar[tuple[str, ...] | None] = ContextVar("b24api_httpx_credentials", default=None)
 _REPLACEMENT = "[REDACTED]"
 _CREDENTIAL_PATH = re.compile(r"/rest/(?:api/)?[^/]+/([^/]+)/", re.IGNORECASE)
+# Full-length scrubbing: truncating a record's format string would break its %-interpolation.
+_RECORD_REDACTOR = Redactor(max_string=1 << 20)
+_HOP_CREDENTIAL = re.compile(
+    r"(?P<prefix>/rest/(?:api/)?[^/\s?#\"']+/)(?P<token>[^/\s?#\"']+)(?=[/?#\s\"']|$)",
+    re.IGNORECASE,
+)
 
 
 def _credentials(url: str) -> tuple[str, ...]:
@@ -28,26 +40,24 @@ def _credentials(url: str) -> tuple[str, ...]:
 
 
 def _redact_owned_value(value: object, credentials: tuple[str, ...]) -> object:
+    """Scrub one field of an owned record, keeping its original type when nothing is secret."""
     rendered = str(value)
-    if any(credential in rendered for credential in credentials):
-        for credential in credentials:
-            rendered = rendered.replace(credential, _REPLACEMENT)
-        return DEFAULT_REDACTOR.redact_text(rendered)
-    return value
+    scrubbed = rendered
+    for credential in credentials:
+        scrubbed = scrubbed.replace(credential, _REPLACEMENT)
+    scrubbed = _HOP_CREDENTIAL.sub(lambda match: match.group("prefix") + _REPLACEMENT, scrubbed)
+    scrubbed = _RECORD_REDACTOR.redact_text(scrubbed)
+    return value if scrubbed == rendered else scrubbed
 
 
 class _OwnedRequestFilter(logging.Filter):
-    """Rewrite only a record emitted while this task sends its registered URL."""
+    """Rewrite every record emitted while this task sends an owned request, across all redirect hops."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         credentials = _ACTIVE_CREDENTIALS.get()
         if credentials is None:
             return True
         args = record.args
-        values = args.values() if isinstance(args, dict) else args if isinstance(args, tuple) else ()
-        extras = tuple(record.__dict__.get(name) for name in ("url", "request_url"))
-        if not any(credential in str(value) for credential in credentials for value in (record.msg, *values, *extras)):
-            return True
         record.msg = _redact_owned_value(record.msg, credentials)
         if isinstance(args, dict):
             record.args = {key: _redact_owned_value(value, credentials) for key, value in args.items()}

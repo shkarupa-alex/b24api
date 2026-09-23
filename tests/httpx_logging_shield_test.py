@@ -190,3 +190,52 @@ async def test_redirect_hops_keep_the_owned_webhook_credential_out_of_httpx_info
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
+
+
+_SECOND_MARKER = "synthetic-second-secret-654321"
+_REDIRECT_TARGETS = (
+    f"/rest/1/{_SECOND_MARKER}/profile",
+    f"/rest/api/1/{_SECOND_MARKER}/profile",
+    f"/profile?auth={_SECOND_MARKER}",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", _REDIRECT_TARGETS, ids=["classic", "api-v3", "auth-query"])
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.JSON, RouteKind.API_V3])
+async def test_redirect_replaces_webhook_token_without_logging_either_secret(route: RouteKind, target: str) -> None:
+    logger = logging.getLogger("httpx")
+    previous_level = logger.level
+    handler = _CollectingHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "portal.invalid":
+            return httpx.Response(301, headers={"location": f"https://redirect.invalid{target}"}, request=request)
+        logger.info("hop observed", extra={"url": str(request.url), "request_url": str(request.url)})
+        return httpx.Response(_SUCCESS_STATUS, json={"result": True}, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond), follow_redirects=True)
+    transport = HttpxTransport(f"http://portal.invalid/rest/1/{_OWNED_MARKER}/", client=client)
+    try:
+        response = await transport.send(Request("profile", route=route), attempt_timeout=1, max_response_bytes=1024)
+        assert response.status_code == _SUCCESS_STATUS
+        assert len(handler.records) == _REDIRECT_RECORDS + 1
+        for record in handler.records:
+            extras = (record.__dict__.get("url"), record.__dict__.get("request_url"))
+            raw = f"{record.msg!r} {record.args!r} {extras!r}"
+            for marker in (_OWNED_MARKER, _SECOND_MARKER):
+                assert marker not in raw
+                assert marker not in record.getMessage()
+        assert _OWNED_MARKER not in handler.output.getvalue()
+        assert _SECOND_MARKER not in handler.output.getvalue()
+
+        await client.get(f"https://redirect.invalid/rest/1/{_FOREIGN_MARKER}/profile")
+        assert _FOREIGN_MARKER in handler.records[-1].getMessage()
+    finally:
+        await transport.aclose()
+        await client.aclose()
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
