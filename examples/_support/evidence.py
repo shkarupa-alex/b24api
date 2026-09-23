@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from b24api import OperationReport
+from b24api.testing import ScriptedTransport
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +14,8 @@ class RecipeEvidence:
     observed_count: int
     primary_report: OperationReport | None = None
     reports: tuple[OperationReport, ...] = ()
+    # A comparison run the recipe measures against; the runner reports its requests separately.
+    baseline_transport: ScriptedTransport | None = None
 
     def __post_init__(self) -> None:
         """Reject asserted or malformed evidence before the runner serializes it."""
@@ -23,6 +26,8 @@ class RecipeEvidence:
             raise TypeError("primary_report must be an OperationReport or None")
         if any(not isinstance(report, OperationReport) for report in reports):
             raise TypeError("reports must contain only OperationReport values")
+        if self.baseline_transport is not None and not isinstance(self.baseline_transport, ScriptedTransport):
+            raise TypeError("baseline_transport must be a ScriptedTransport or None")
         if self.primary_report is not None and self.primary_report not in reports:
             reports = (*reports, self.primary_report)
         object.__setattr__(self, "reports", reports)

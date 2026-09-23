@@ -123,7 +123,7 @@ def _stream(client: Bitrix24, stop: _Cutoff | None):  # noqa: ANN202 - public st
     )
 
 
-async def _baseline_requests(settings: Settings) -> int:
+async def _baseline(settings: Settings) -> ScriptedTransport:
     """Read every chat to its empty confirmation, as a mirror without page stop would."""
     transport = _fixture(bounded=False)
     async with Bitrix24(settings, transport=transport) as client:
@@ -133,7 +133,7 @@ async def _baseline_requests(settings: Settings) -> int:
         if stream.report is None or stream.report.state is not TerminalState.COMPLETED:
             raise AssertionError("scenario 1 baseline did not complete")
     transport.assert_exhausted()
-    return len(transport.calls)
+    return transport
 
 
 async def run() -> RecipeEvidence:
@@ -163,11 +163,11 @@ async def run() -> RecipeEvidence:
         _expect(report.physical_requests, len(transport.calls), "physical requests")
         _expect(report.physical_requests, EXPECTED_REQUESTS, "bounded request count")
     transport.assert_exhausted()
-    baseline = await _baseline_requests(settings)
-    _expect(baseline, EXPECTED_BASELINE_REQUESTS, "exhaust-to-first baseline")
-    if not report.physical_requests < baseline:
+    baseline = await _baseline(settings)
+    _expect(len(baseline.calls), EXPECTED_BASELINE_REQUESTS, "exhaust-to-first baseline")
+    if not report.physical_requests < len(baseline.calls):
         raise AssertionError("scenario 1 page stop saved no requests over exhaust-to-first")
-    return RecipeEvidence(sum(len(ids) for ids in observed.values()), report, (report,))
+    return RecipeEvidence(sum(len(ids) for ids in observed.values()), report, (report,), baseline_transport=baseline)
 
 
 if __name__ == "__main__":

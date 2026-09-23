@@ -3,6 +3,7 @@
 from __future__ import annotations
 import base64
 import hashlib
+import importlib
 import json
 import subprocess
 import sys
@@ -92,6 +93,7 @@ def test_offline_runner_emits_required_structured_summary() -> None:
         "client_sha",
         "assurance",
         "active_references_high_water",
+        "baseline_physical_requests",
         "buffered_commands_high_water",
         "buffered_rows_high_water",
         "expected_count",
@@ -110,6 +112,23 @@ def test_offline_runner_emits_required_structured_summary() -> None:
     assert summary["assurance"] == "bounded_prefix"
     assert summary["provenance"] == "fixture"
     assert summary["status"] == "passed"
+
+
+@pytest.mark.parametrize("environment", [None, "PROD"], ids=["default", "prod"])
+def test_scenario_one_row_separates_bounded_and_baseline_requests(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: str | None,
+) -> None:
+    if environment is None:
+        monkeypatch.delenv("ENV", raising=False)
+    else:
+        monkeypatch.setenv("ENV", environment)
+    scenario = importlib.import_module("examples.chat_bounded_mirror")
+    record = _offline_record(1)
+    assert record["physical_requests"] == record["logical_requests"] == scenario.EXPECTED_REQUESTS
+    assert record["baseline_physical_requests"] == scenario.EXPECTED_BASELINE_REQUESTS
+    assert record["physical_requests"] < record["baseline_physical_requests"]
+    assert _offline_record(2)["baseline_physical_requests"] is None
 
 
 def test_live_runner_never_promotes_missing_evidence_to_success(tmp_path: Path) -> None:

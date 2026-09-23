@@ -156,7 +156,11 @@ async def _offline(scenario: Scenario) -> dict[str, object]:
         raise AssertionError(
             f"scenario {scenario.number} assurance {evidence.assurance!r} differs from {scenario.assurance!r}",
         )
-    calls = [request for transport in transports for request in transport.calls]
+    baseline = evidence.baseline_transport
+    calls = [request for transport in transports if transport is not baseline for request in transport.calls]
+    baseline_requests = len(baseline.calls) if baseline is not None else None
+    if baseline_requests is not None and not len(calls) < baseline_requests:
+        raise AssertionError(f"scenario {scenario.number} used no fewer requests than its baseline")
     return {
         "scenario": scenario.number,
         "client_sha": _client_sha(),
@@ -167,6 +171,7 @@ async def _offline(scenario: Scenario) -> dict[str, object]:
         "observed_count": evidence.observed_count,
         "physical_requests": len(calls),
         "logical_requests": _logical_requests(calls),
+        "baseline_physical_requests": baseline_requests,
         "buffered_commands_high_water": evidence.high_water("buffered_commands_high_water"),
         "buffered_rows_high_water": evidence.high_water("buffered_rows_high_water"),
         "active_references_high_water": evidence.high_water("active_references_high_water"),

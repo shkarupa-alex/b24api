@@ -145,10 +145,15 @@ async def test_chat_bounded_recipe_rejects_a_page_stop_that_saves_no_requests(
 ) -> None:
     module = importlib.import_module("examples.chat_bounded_mirror")
 
-    async def matching_baseline(_settings: object) -> int:
-        return module.EXPECTED_REQUESTS
+    class MatchingBaseline(ScriptedTransport):
+        @property
+        def calls(self) -> tuple[Request, ...]:
+            return (Request("listed", route=RouteKind.BARE),) * module.EXPECTED_REQUESTS
 
-    monkeypatch.setattr(module, "_baseline_requests", matching_baseline)
+    async def matching_baseline(_settings: object) -> ScriptedTransport:
+        return MatchingBaseline(())
+
+    monkeypatch.setattr(module, "_baseline", matching_baseline)
     monkeypatch.setattr(module, "EXPECTED_BASELINE_REQUESTS", module.EXPECTED_REQUESTS)
     with pytest.raises(AssertionError, match="saved no requests over exhaust-to-first"):
         await module.run()
