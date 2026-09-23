@@ -324,7 +324,7 @@ class _RefreshingAuth(httpx.Auth):
 
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
         await self.client.get(self.foreign_url, auth=None)
-        request.headers["authorization"] = "Bearer synthetic-bearer"
+        request.headers["x-synthetic-auth"] = "in-place"
         yield request
 
 
