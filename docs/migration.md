@@ -83,7 +83,9 @@ decoded row cap and rejects increments that would alias a rounded server page. F
 selected result, `SparseRawBound` adds an exact raw total path, fixed stride, finite page budget,
 and stable-order contract; empty selected pages remain traversable until the raw range is covered.
 This is structural coverage, so its report uses `RAW_RANGE_COVERED` rather than claiming a
-snapshot of a mutable source.
+snapshot of a mutable source. A sparse traversal starts at offset zero and is available only
+through `iter_list`: a resumed nonzero start, an offset off the server granularity, and a reference
+traversal with `SparseRawBound` are each refused with `CapabilityError` before any request.
 
 `OffsetContinuation.FIXED_STEP` without `TotalTermination.EXACT_QUALIFIED` no longer accepts an
 empty page after a short page as closure. Such a traversal now raises `IncompleteTraversalError`

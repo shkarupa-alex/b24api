@@ -6,7 +6,9 @@ import json
 import pytest
 
 from b24api import (
+    Binding,
     Bitrix24,
+    DirectDispatch,
     IdentityCoercion,
     IdentitySpec,
     OffsetSpec,
@@ -16,11 +18,12 @@ from b24api import (
     Request,
     ResultSelector,
     RouteKind,
+    SequentialTraversal,
     SparseRawBound,
     TraversalAssurance,
 )
 from b24api.contracts.traversal import OffsetContinuation
-from b24api.errors import BudgetExceededError, IncompleteTraversalError, PaginationError
+from b24api.errors import BudgetExceededError, CapabilityError, IncompleteTraversalError, PaginationError
 from b24api.execution import Executor, WireResponse
 
 
@@ -90,6 +93,46 @@ async def test_sparse_offset_crosses_two_empty_selected_pages() -> None:
     assert stream.report is not None
     assert stream.report.exhausted
     assert stream.report.assurance is TraversalAssurance.RAW_RANGE_COVERED
+
+
+_MISALIGNED = "align with the qualified server page granularity"
+_NOT_FROM_ZERO = "complete range from offset zero"
+_NO_SPARSE_REFERENCE = "reference traversal does not support a sparse raw bound"
+
+
+def _resumed(start: int) -> Request:
+    return Request("example.search", {"start": start}, route=RouteKind.BARE)
+
+
+@pytest.mark.parametrize(("start", "message"), [(932, _MISALIGNED), (900, _NOT_FROM_ZERO)])
+@pytest.mark.asyncio
+async def test_sparse_resume_alignment_before_io(start: int, message: str) -> None:
+    # 932 aliases the server's floor-to-50 window; an aligned 900 is still only part of the raw
+    # range, which cannot prove raw-range coverage. Both are refused before the first send.
+    transport = SparseTransport(raw_total=1050)
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    stream = client.iter_list(_resumed(start), selector=ResultSelector(("items",)), page_size=50, offset=_sparse_spec())
+    with pytest.raises(CapabilityError, match=message):
+        _ = [row async for row in stream]
+    assert stream.report is not None
+    assert not stream.report.exhausted
+    assert transport.offsets == []
+
+
+@pytest.mark.parametrize("start", [0, 900, 932])
+def test_sparse_raw_bound_is_refused_for_reference_traversal_before_io(start: int) -> None:
+    # An empty raw window is continued past without a delivered page, which reference provenance
+    # cannot record, so every origin is refused when the stream is built.
+    transport = SparseTransport()
+    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    with pytest.raises(CapabilityError, match=_NO_SPARSE_REFERENCE):
+        client.iter_reference_outcomes(
+            _resumed(start),
+            [Binding("one", (), "one")],
+            traversal=SequentialTraversal(page_size=50, selector=ResultSelector(("items",)), offset=_sparse_spec()),
+            dispatch=DirectDispatch(concurrency=1),
+        )
+    assert transport.offsets == []
 
 
 @pytest.mark.asyncio

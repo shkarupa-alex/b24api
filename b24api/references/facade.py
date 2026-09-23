@@ -97,6 +97,10 @@ def _direction(value: str) -> Literal["asc", "desc"]:
 
 def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, TraversalIdentity | None]:
     if isinstance(traversal, SequentialTraversal):
+        if traversal.offset.sparse_raw_bound is not None:
+            # Reference pages carry one provenance record per delivered page; an empty raw window the
+            # driver continues past has no delivery, so the binding could never close truthfully.
+            raise CapabilityError("reference traversal does not support a sparse raw bound; traverse it directly")
         return (
             sequential_offset_plan(
                 traversal.offset,

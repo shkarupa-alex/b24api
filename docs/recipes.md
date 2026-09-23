@@ -44,7 +44,8 @@ For endpoints with drifting or known-inexact totals, choose a contract that can 
   empty page after a short page is an ordinary terminal witness;
 - for a page-number control, use `OffsetSpec(page_index=PageIndex(...))`, which accepts a short page
   followed by an empty page as closure;
-- for a sparse selected result with a qualified raw extent, use `SparseRawBound`.
+- for a sparse selected result with a qualified raw extent, use `SparseRawBound` with `iter_list`
+  from offset zero; reference traversal refuses it.
 
 Scenario 17 in [examples](../examples/README.md) shows the fail-closed outcome.
 
