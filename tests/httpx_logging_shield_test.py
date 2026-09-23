@@ -245,7 +245,8 @@ _THIRD_MARKER = "synthetic-third-secret-777777"
 
 
 @pytest.mark.asyncio
-async def test_unrelated_httpx_request_inside_owned_response_hook_is_unchanged() -> None:
+@pytest.mark.parametrize("same_client", [True, False], ids=["same-client", "other-client"])
+async def test_unrelated_httpx_request_inside_owned_response_hook_is_unchanged(same_client: bool) -> None:  # noqa: FBT001
     logger = logging.getLogger("httpx")
     previous_level = logger.level
     handler = _CollectingHandler()
@@ -260,7 +261,7 @@ async def test_unrelated_httpx_request_inside_owned_response_hook_is_unchanged()
     async def hook(response: httpx.Response) -> None:
         if not hook_calls:
             hook_calls.append(str(response.url))
-            await foreign.get(foreign_url)
+            await (client if same_client else foreign).get(foreign_url)
 
     def respond(request: httpx.Request) -> httpx.Response:
         if request.url.host == "portal.invalid":
@@ -305,7 +306,7 @@ async def test_unrelated_httpx_request_inside_owned_response_hook_is_unchanged()
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
 
 
-def test_record_without_an_emitting_httpx_client_is_scrubbed_conservatively() -> None:
+def test_record_without_an_emitting_httpx_request_is_scrubbed_conservatively() -> None:
     logger = logging.getLogger("httpx")
     previous_level = logger.level
     handler = _CollectingHandler()
@@ -313,7 +314,7 @@ def test_record_without_an_emitting_httpx_client_is_scrubbed_conservatively() ->
     logger.setLevel(logging.INFO)
     HTTPX_LOG_SHIELD.register_transport()
     try:
-        with HTTPX_LOG_SHIELD.request(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/profile", client=object()):
+        with HTTPX_LOG_SHIELD.request(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/profile"):
             logger.info("hop %s", f"https://redirect.invalid/rest/1/{_SECOND_MARKER}/profile")
         assert len(handler.records) == 1
         assert _SECOND_MARKER not in handler.records[0].getMessage()

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
     from b24api.contracts.request import Request
+    from b24api.transport.logging_shield import LogOwnership
 
 
 def _webhook_vault() -> tuple[Callable[[str], str], Callable[[str], str], Callable[[str], None]]:
@@ -203,10 +204,11 @@ class HttpxTransport:
             raise RuntimeError("transport is closed")
         method_url = _method_url(_webhook_for(self._webhook_handle), request)
         try:
-            with HTTPX_LOG_SHIELD.request(method_url, client=self._client):
+            with HTTPX_LOG_SHIELD.request(method_url) as ownership:
                 return await self._send_wire_impl(
                     request,
                     method_url=method_url,
+                    ownership=ownership,
                     attempt_timeout=attempt_timeout,
                     max_response_bytes=max_response_bytes,
                 )
@@ -218,6 +220,7 @@ class HttpxTransport:
         request: WireRequest,
         *,
         method_url: str,
+        ownership: LogOwnership,
         attempt_timeout: float,
         max_response_bytes: int,
     ) -> WireResponse:
@@ -265,6 +268,7 @@ class HttpxTransport:
             else:  # pragma: no cover - guarded by typed contracts/capabilities
                 raise TypeError("unsupported body encoding")
             method_url = ""
+            ownership.claim(http_request)
             http_request.extensions["trace"] = tracker
             http_request.extensions["timeout"] = {
                 "connect": attempt_timeout,

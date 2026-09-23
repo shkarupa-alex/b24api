@@ -2,10 +2,12 @@
 
 A b24api request can emit several records, including redirect hops whose URLs b24api never built,
 so the filter scrubs any credential-shaped Bitrix URL segment and sensitive query value, not only the
-registered webhook token. Task context alone does not prove ownership: a caller's response hook may
-send an unrelated request through another client in the same task. A record is therefore attributed
-to the HTTPX client whose send emitted it; records of any other client stay untouched. If that
-emitting frame cannot be found (a changed HTTPX internal), the record is scrubbed conservatively.
+registered webhook token. Neither task context nor client identity proves ownership: a caller's
+response hook may send an unrelated request in the same task, even through the same injected client.
+Each owned request therefore carries a unique marker in its HTTPX extensions, which HTTPX copies to
+every redirect hop, and a record is attributed to the request whose single send emitted it; records
+of any unmarked request stay untouched. If that emitting frame cannot be found (a changed HTTPX
+internal), the record is scrubbed conservatively.
 """
 
 from __future__ import annotations
@@ -24,13 +26,16 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from types import FrameType
 
+    import httpx
+
 _LOGGER = logging.getLogger("httpx")
-_ACTIVE_CREDENTIALS: ContextVar[tuple[tuple[str, ...], object | None] | None] = ContextVar(
+_ACTIVE_CREDENTIALS: ContextVar[tuple[tuple[str, ...], LogOwnership] | None] = ContextVar(
     "b24api_httpx_credentials",
     default=None,
 )
 _EMITTING_METHOD = "_send_single_request"
 _EMITTING_MODULE = ("httpx", "_client.py")
+_OWNER_EXTENSION = "b24api_log_owner"
 _UNATTRIBUTED = object()
 _REPLACEMENT = "[REDACTED]"
 _CREDENTIAL_PATH = re.compile(r"/rest/(?:api/)?[^/]+/([^/]+)/", re.IGNORECASE)
@@ -61,27 +66,42 @@ def _redact_owned_value(value: object, credentials: tuple[str, ...]) -> object:
     return value if scrubbed == rendered else scrubbed
 
 
-def _emitting_client() -> object:
-    """Return the HTTPX client whose single-request send is emitting the current record."""
+def _emitting_request() -> object:
+    """Return the HTTPX request whose single send is emitting the current record."""
     frame: FrameType | None = sys._getframe(2)  # noqa: SLF001 - attribution must inspect the synchronous emitting stack
     while frame is not None:
         code = frame.f_code
         if code.co_name == _EMITTING_METHOD and PurePath(code.co_filename).parts[-2:] == _EMITTING_MODULE:
-            return frame.f_locals.get("self", _UNATTRIBUTED)
+            return frame.f_locals.get("request", _UNATTRIBUTED)
         frame = frame.f_back
     return _UNATTRIBUTED
 
 
+class LogOwnership:
+    """Mark one owned HTTPX request so its records, and those of its redirect hops, are recognized."""
+
+    __slots__ = ()
+
+    def claim(self, request: httpx.Request) -> None:
+        """Attach this ownership marker before the request is sent."""
+        request.extensions[_OWNER_EXTENSION] = self
+
+    def owns(self, request: object) -> bool:
+        """Report whether an emitted request carries this exact marker."""
+        extensions = getattr(request, "extensions", None)
+        return isinstance(extensions, dict) and extensions.get(_OWNER_EXTENSION) is self
+
+
 class _OwnedRequestFilter(logging.Filter):
-    """Rewrite records the owned client emits for an in-flight owned request, across all redirect hops."""
+    """Rewrite records emitted for an in-flight owned request, across all redirect hops."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         active = _ACTIVE_CREDENTIALS.get()
         if active is None:
             return True
         credentials, owner = active
-        emitter = _emitting_client()
-        if owner is not None and emitter is not _UNATTRIBUTED and emitter is not owner:
+        emitted = _emitting_request()
+        if emitted is not _UNATTRIBUTED and not owner.owns(emitted):
             return True
         args = record.args
         record.msg = _redact_owned_value(record.msg, credentials)
@@ -120,16 +140,17 @@ class HttpxLogShield:
             self._remove_if_idle()
 
     @contextmanager
-    def request(self, url: str, *, client: object | None = None) -> Iterator[None]:
-        """Protect one dispatch without changing unrelated HTTPX logger traffic."""
+    def request(self, url: str) -> Iterator[LogOwnership]:
+        """Protect one dispatch; the caller claims its HTTPX request with the yielded marker."""
         with self._lock:
             if self._transports < 1:
                 raise RuntimeError("HTTPX log shield has no registered transport")
             self._in_flight += 1
             self._ensure_installed()
-        token = _ACTIVE_CREDENTIALS.set((_credentials(url), client))
+        ownership = LogOwnership()
+        token = _ACTIVE_CREDENTIALS.set((_credentials(url), ownership))
         try:
-            yield
+            yield ownership
         finally:
             _ACTIVE_CREDENTIALS.reset(token)
             with self._lock:
