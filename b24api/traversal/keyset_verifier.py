@@ -28,6 +28,7 @@ from b24api.contracts.report import (
 )
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError, KeysetCapabilityError, PaginationError
+from b24api.execution import WorkClass
 from b24api.traversal import keyset_step
 from b24api.traversal.facade_support import _collection_selector
 from b24api.traversal.identity import _child_path, _request_with_controls
@@ -164,6 +165,8 @@ class _Verifier:
         )
 
     async def _waves(self, requests: tuple[Request, ...], phase: KeysetPhase) -> tuple[Response, ...]:
+        if self.request.positional is not None:
+            return await self._direct_wave(requests, phase)
         responses: list[Response] = []
         for offset in range(0, len(requests), self.capacity):
             wave = requests[offset : offset + self.capacity]
@@ -194,7 +197,34 @@ class _Verifier:
                     self.context.release_page(reservation)
         return tuple(responses)
 
-    def _record_response(self, response: Response, batch_index: int, phase: KeysetPhase) -> None:
+    async def _direct_wave(self, requests: tuple[Request, ...], phase: KeysetPhase) -> tuple[Response, ...]:
+        """Dispatch positional canaries directly because Bitrix batch cannot encode their JSON slots."""
+        responses: list[Response] = []
+        for request in requests:
+            reservation = (await self.context.reserve_pages(1))[0]
+            self.logical_commands += 1
+            try:
+                response = await self.executor.execute(
+                    request,
+                    context=self.context,
+                    work_class=WorkClass.TRAVERSAL_DIRECT,
+                    strict_json_members=True,
+                )
+                self.context.commit_page(reservation)
+                responses.append(response)
+                self._record_response(response, None, phase, dispatch=PageDispatch.DIRECT)
+            finally:
+                self.context.release_page(reservation)
+        return tuple(responses)
+
+    def _record_response(
+        self,
+        response: Response,
+        batch_index: int | None,
+        phase: KeysetPhase,
+        *,
+        dispatch: PageDispatch = PageDispatch.BATCH,
+    ) -> None:
         try:
             rows_selected = len(_response_items(response, self.selector))
         except (CapabilityError, PaginationError):
@@ -204,7 +234,7 @@ class _Verifier:
         record = PageRecord(
             sequence=self._trace_sequence,
             offset=None,
-            dispatch=PageDispatch.BATCH,
+            dispatch=dispatch,
             batch_index=batch_index,
             rows_selected=rows_selected,
             rows_admitted=0,

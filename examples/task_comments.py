@@ -61,7 +61,7 @@ LAYOUT = PositionalLayout(
         SlotContract("ORDER", SlotShape.OBJECT),
         SlotContract("FILTER", SlotShape.OBJECT),
     ),
-    control_paths=frozenset({(1, "ID"), (2, ">ID")}),
+    control_paths=frozenset({(1, "ID"), (2, "ID"), (2, ">ID"), (2, "<ID")}),
 )
 
 
@@ -86,9 +86,11 @@ def _message_request(chat_id: int, cursor: int | None) -> Request:
     )
 
 
-def _legacy_request(cursor: int) -> Request:
+def _legacy_request(*, cursor: int | None = None, ordered: bool = False) -> Request:
+    order = {"ID": "ASC"} if ordered else {}
+    keyset_filter = {} if cursor is None else {">ID": cursor}
     arguments = PositionalArguments(
-        (Present(43), Present({"ID": "ASC"}), Present({">ID": cursor})),
+        (Present(43), Present(order), Present(keyset_filter)),
         LAYOUT.layout_id,
         layout=LAYOUT,
     )
@@ -114,10 +116,10 @@ def _fixture() -> ScriptedTransport:
                 {"error": "ACCESS_ERROR", "error_description": "denied"},
             ),
             ScriptedExchange.json(
-                _legacy_request(0),
+                _legacy_request(ordered=True),
                 {"result": [{"ID": str(value)} for value in EXPECTED_LEGACY]},
             ),
-            ScriptedExchange.json(_legacy_request(2), {"result": []}),
+            ScriptedExchange.json(_legacy_request(cursor=2, ordered=True), {"result": []}),
         )
     )
 
@@ -194,7 +196,7 @@ async def _read_modern(client: Bitrix24, resolved: dict[int, int | None]) -> tup
 
 
 async def _read_legacy(client: Bitrix24) -> OperationReport:
-    request = _legacy_request(0)
+    request = _legacy_request()
     selector = ResultSelector.root()
     identity = IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER)
     keyset = KeysetSpec(
@@ -241,7 +243,7 @@ async def run() -> RecipeEvidence:
         for request in transport.calls
         if request.method == LEGACY_METHOD and request.positional is not None
     )
-    if legacy_slots != ([43, {"ID": "ASC"}, {">ID": 0}], [43, {"ID": "ASC"}, {">ID": 2}]):
+    if legacy_slots != ([43, {"ID": "ASC"}, {}], [43, {"ID": "ASC"}, {">ID": 2}]):
         raise AssertionError("scenario 6 legacy TASKID/ORDER/FILTER wire order changed")
     return RecipeEvidence(
         observed_count,

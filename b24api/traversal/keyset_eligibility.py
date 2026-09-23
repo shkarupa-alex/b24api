@@ -31,13 +31,22 @@ if TYPE_CHECKING:
     from b24api.execution.executor import Executor
 
 
-def _path_lookup(parameters: object, path: ParameterPath) -> tuple[bool, object]:
+def _path_lookup(
+    parameters: object,
+    path: ParameterPath,
+    *,
+    case_sensitive: bool = False,
+) -> tuple[bool, object]:
     current = parameters
     for part in path.path:
         if isinstance(part, str):
             if not isinstance(current, dict):
                 return False, None
-            matches = [key for key in current if key.casefold() == part.casefold()]
+            matches = (
+                [part]
+                if case_sensitive and part in current
+                else ([] if case_sensitive else [key for key in current if key.casefold() == part.casefold()])
+            )
             if len(matches) > 1:
                 raise CapabilityError("request contains a case-insensitively ambiguous traversal control")
             if not matches:
@@ -51,21 +60,30 @@ def _path_lookup(parameters: object, path: ParameterPath) -> tuple[bool, object]
 
 
 def _reject_owned_controls(request: Request, identity: IdentitySpec, keyset: KeysetSpec) -> None:
-    parameters = request.copy_parameters()
-    filter_exists, filter_value = _path_lookup(parameters, keyset.filter_path)
+    positional_arguments = request.positional
+    positional = positional_arguments is not None
+    parameters = positional_arguments.to_wire_slots() if positional_arguments is not None else request.copy_parameters()
+    filter_exists, filter_value = _path_lookup(parameters, keyset.filter_path, case_sensitive=positional)
     if filter_exists:
         if not isinstance(filter_value, dict):
             raise CapabilityError("keyset filter path must contain an object")
-        forbidden = {f"{operator}{identity.filter_key}".casefold() for operator in (">", "<", ">=", "<=")}
+        forbidden = {
+            identity.filter_key.casefold(),
+            *(f"{operator}{identity.filter_key}".casefold() for operator in (">", "<", ">=", "<=")),
+        }
         if any(str(key).casefold() in forbidden for key in filter_value):
             raise CapabilityError("caller identity bounds conflict with fast keyset traversal")
-    order_paths = (
-        (keyset.order_path,)
-        if keyset.split_order is None
-        else (keyset.split_order.field_path, keyset.split_order.direction_path)
-    )
+    order_paths: tuple[ParameterPath | None, ...]
+    if keyset.split_order is None:
+        order_paths = (
+            (_child_path(keyset.order_path, identity.order_key),)
+            if positional and keyset.order_path is not None
+            else (keyset.order_path,)
+        )
+    else:
+        order_paths = (keyset.split_order.field_path, keyset.split_order.direction_path)
     for path in (*order_paths, keyset.start_suppression_path, keyset.limit_path):
-        if path is not None and _path_lookup(parameters, path)[0]:
+        if path is not None and _path_lookup(parameters, path, case_sensitive=positional)[0]:
             raise CapabilityError("caller traversal control conflicts with fast keyset traversal")
 
 
