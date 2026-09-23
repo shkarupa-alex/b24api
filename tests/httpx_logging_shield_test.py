@@ -239,3 +239,86 @@ async def test_redirect_replaces_webhook_token_without_logging_either_secret(rou
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+
+
+_THIRD_MARKER = "synthetic-third-secret-777777"
+
+
+@pytest.mark.asyncio
+async def test_unrelated_httpx_request_inside_owned_response_hook_is_unchanged() -> None:
+    logger = logging.getLogger("httpx")
+    previous_level = logger.level
+    handler = _CollectingHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    foreign_url = f"https://other.invalid/rest/1/{_FOREIGN_MARKER}/profile"
+    foreign = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(_SUCCESS_STATUS, request=request)),
+    )
+    hook_calls: list[str] = []
+
+    async def hook(response: httpx.Response) -> None:
+        if not hook_calls:
+            hook_calls.append(str(response.url))
+            await foreign.get(foreign_url)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "portal.invalid":
+            location = f"https://redirect.invalid/rest/1/{_THIRD_MARKER}/profile"
+            return httpx.Response(301, headers={"location": location}, request=request)
+        return httpx.Response(_SUCCESS_STATUS, json={"result": True}, request=request)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(respond),
+        follow_redirects=True,
+        event_hooks={"response": [hook]},
+    )
+    transport = HttpxTransport(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/", client=client)
+    try:
+        response = await transport.send(
+            Request("profile", route=RouteKind.BARE),
+            attempt_timeout=1,
+            max_response_bytes=1024,
+        )
+        assert response.status_code == _SUCCESS_STATUS
+        messages = [record.getMessage() for record in handler.records]
+        assert len(messages) == _TOTAL_RECORDS
+        foreign_records = [record for record in handler.records if "other.invalid" in record.getMessage()]
+        assert len(foreign_records) == 1
+        assert _FOREIGN_MARKER in f"{foreign_records[0].args!r}"
+        assert foreign_url in foreign_records[0].getMessage()
+        assert foreign_url in handler.output.getvalue()
+        for record in handler.records:
+            if record in foreign_records:
+                continue
+            for marker in (_OWNED_MARKER, _THIRD_MARKER):
+                assert marker not in f"{record.msg!r} {record.args!r}"
+                assert marker not in record.getMessage()
+        for marker in (_OWNED_MARKER, _THIRD_MARKER):
+            assert marker not in handler.output.getvalue()
+    finally:
+        await transport.aclose()
+        await client.aclose()
+        await foreign.aclose()
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+
+
+def test_record_without_an_emitting_httpx_client_is_scrubbed_conservatively() -> None:
+    logger = logging.getLogger("httpx")
+    previous_level = logger.level
+    handler = _CollectingHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    HTTPX_LOG_SHIELD.register_transport()
+    try:
+        with HTTPX_LOG_SHIELD.request(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/profile", client=object()):
+            logger.info("hop %s", f"https://redirect.invalid/rest/1/{_SECOND_MARKER}/profile")
+        assert len(handler.records) == 1
+        assert _SECOND_MARKER not in handler.records[0].getMessage()
+    finally:
+        HTTPX_LOG_SHIELD.release_transport()
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control

@@ -203,7 +203,7 @@ class HttpxTransport:
             raise RuntimeError("transport is closed")
         method_url = _method_url(_webhook_for(self._webhook_handle), request)
         try:
-            with HTTPX_LOG_SHIELD.request(method_url):
+            with HTTPX_LOG_SHIELD.request(method_url, client=self._client):
                 return await self._send_wire_impl(
                     request,
                     method_url=method_url,
