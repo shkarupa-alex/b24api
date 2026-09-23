@@ -759,6 +759,77 @@ async def test_owned_response_hook_scrubs_url_bearing_extra() -> None:
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
 
 
+def _extra_matrix(url: httpx.URL, hop: httpx.URL) -> dict[str, object]:
+    return {
+        "word": str(url),
+        "url": url,
+        "raw": str(url).encode(),
+        "nested": {"urls": [url, hop], "raw": [bytes(hop.raw_path)]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_owned_and_foreign_extra_value_matrix() -> None:
+    logger = logging.getLogger("httpx")
+    previous_level = logger.level
+    handler = _CollectingHandler()
+    fields = ("word", "url", "raw", "nested")
+    handler.setFormatter(
+        logging.Formatter(
+            "%(message)s " + " ".join(f"%({name})s" for name in fields),
+            defaults=dict.fromkeys(fields, ""),
+        )
+    )
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    foreign_url = httpx.URL(f"https://other.invalid/rest/1/{_FOREIGN_MARKER}/profile")
+    foreign_extra = _extra_matrix(foreign_url, httpx.URL(f"https://hop.invalid/rest/1/{_SECOND_MARKER}/profile"))
+
+    async def foreign_hook(_response: httpx.Response) -> None:
+        logger.info("hook", extra=foreign_extra)
+
+    foreign = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(_SUCCESS_STATUS, request=request)),
+        event_hooks={"response": [foreign_hook]},
+    )
+
+    async def owned_hook(response: httpx.Response) -> None:
+        hop = httpx.URL(f"https://hop.invalid/rest/1/{_THIRD_MARKER}/profile")
+        logger.info("hook", extra=_extra_matrix(response.request.url, hop))
+        await foreign.get(foreign_url)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(_SUCCESS_STATUS, json={"result": True}, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond), event_hooks={"response": [owned_hook]})
+    transport = HttpxTransport(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/", client=client)
+    try:
+        response = await transport.send(
+            Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024
+        )
+        assert response.status_code == _SUCCESS_STATUS
+        hooks = [record for record in handler.records if record.msg == "hook"]
+        assert len(hooks) == _OWNED_RECORDS
+        owned, unrelated = hooks
+        output = handler.output.getvalue()
+        for secret in (_OWNED_MARKER, _THIRD_MARKER):
+            assert secret not in repr(owned.__dict__)
+            assert secret not in owned.getMessage()
+            assert secret not in output
+        # A foreign record keeps every extra value and type; only the registered secret would be removed.
+        assert {name: unrelated.__dict__[name] for name in fields} == foreign_extra
+        assert [type(unrelated.__dict__[name]) for name in fields] == [str, httpx.URL, bytes, dict]
+        assert _FOREIGN_MARKER in output
+        assert _SECOND_MARKER in output
+    finally:
+        await transport.aclose()
+        await client.aclose()
+        await foreign.aclose()
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+
+
 def test_invalid_owned_url_does_not_leave_the_filter_in_flight() -> None:
     logger = logging.getLogger("httpx")
     HTTPX_LOG_SHIELD.register_transport()
