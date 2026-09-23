@@ -82,7 +82,7 @@ class ScriptedExchange:
 class ScriptedTransport:
     """Match a finite frozen exchange table by complete canonical Request value."""
 
-    capabilities = TransportCapabilities(positional_json=True)
+    capabilities = TransportCapabilities(positional_json=True, routes=frozenset(RouteKind))
 
     def __init__(self, exchanges: tuple[ScriptedExchange, ...], *, host: str = "fixture.invalid") -> None:
         """Copy fixture entries without reading credentials or opening a socket."""

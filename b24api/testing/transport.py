@@ -42,6 +42,19 @@ class ConformanceCase(StrEnum):
     REPR_REDACTION = "repr_redaction"
     HOST_PROPERTY_CREDENTIAL_FREE = "host_property_credential_free"
     CANCELLATION_PROPAGATES = "cancellation_propagates"
+    ROUTE_JSON_SUFFIX = "route_json_suffix"
+    ROUTE_API_V3_REBASE = "route_api_v3_rebase"
+
+
+# A declared route must reach its own endpoint on the conformance webhook ``/rest/1/token/``.
+_CASE_ROUTES = {
+    ConformanceCase.ROUTE_JSON_SUFFIX: RouteKind.JSON,
+    ConformanceCase.ROUTE_API_V3_REBASE: RouteKind.API_V3,
+}
+_ROUTE_PATHS = {
+    RouteKind.JSON: "/rest/1/token/conformance.test.json",
+    RouteKind.API_V3: "/rest/api/1/token/conformance.test",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +275,9 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         return ConformanceOutcome(case, passed=True, skipped=True)
     if case is ConformanceCase.SCOPED_HEADERS_FORWARDED and not capabilities.scoped_headers:
         return ConformanceOutcome(case, passed=True, skipped=True)
+    route = _CASE_ROUTES.get(case, RouteKind.BARE)
+    if route not in capabilities.routes:
+        return ConformanceOutcome(case, passed=True, skipped=True)
     if case is ConformanceCase.RESPONSE_STATUS_RANGE:
         try:
             WireResponse(99, (), b"")
@@ -319,7 +335,7 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         _discard_capture(captures)
         return ConformanceOutcome(case, passed=False)
 
-    request = Request("conformance.test", parameters={"plain": "a b"}, route=RouteKind.BARE)
+    request = Request("conformance.test", parameters={"plain": "a b"}, route=route)
     expected_body: bytes | None = None
     expected_header: tuple[str, str] | None = None
     if case is ConformanceCase.FORM_ENCODING_EXACT:
@@ -363,6 +379,8 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         passed = passed and capture.body == expected_body
     elif expected_header is not None:
         passed = passed and capture.headers.get(expected_header[0]) == expected_header[1]
+    elif case in _CASE_ROUTES:
+        passed = passed and capture.request_line.split(" ")[1] == _ROUTE_PATHS[route]
     return ConformanceOutcome(case, passed=passed)
 
 

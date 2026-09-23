@@ -6,7 +6,11 @@ that choice. The CLI likewise requires `--route bare|json|api_v3` for `call`, `l
 `verify-keyset`. A classic webhook base must have the form `/rest/<user>/<token>/`. The transport
 resolves bare and `.json` suffixes or `/rest/api/<user>/<token>/` at dispatch. Physical batch
 inner commands accept only `BARE`; use explicit direct dispatch for other routes. V3 accepts a JSON
-body and reports object-valued API errors with typed validation details.
+body and reports object-valued API errors with typed validation details. A transport serves only the
+routes it declares in `TransportCapabilities.routes`, which defaults to `BARE`; `HttpxTransport`
+declares all three. A custom send-only transport, which cannot declare routes, serves only `BARE`.
+An undeclared route is refused with `CapabilityError` before any request, instead of silently
+reaching the classic handler.
 
 ```python
 from b24api import Request, RouteKind

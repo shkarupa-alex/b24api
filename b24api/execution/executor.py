@@ -41,7 +41,7 @@ from b24api.execution.context import (
 )
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
-from b24api.transport.base import TransportCapabilities, WireRequest, WireTransport
+from b24api.transport.base import TransportCapabilities, WireRequest, WireTransport, preflight_transport
 from b24api.transport.protocol import ProtocolCodec
 
 if TYPE_CHECKING:
@@ -110,7 +110,7 @@ class Executor:
 
     def _preflight_request(self, request: Request) -> None:
         """Validate transport representation without reserving budget or dispatching."""
-        _preflight_transport(self._wire_transport, request)
+        preflight_transport(self._wire_transport, request)
 
     def context(self, policy: ExecutionPolicy | None = None) -> ExecutionContext:
         """Create an operation execution context."""
@@ -426,28 +426,6 @@ def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: Execution
         and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
         and error.http_status in policy.retry.transient_http_statuses
     )
-
-
-def _preflight_transport(transport: WireTransport | None, request: Request) -> None:
-    """Reject unsupported request representation before budget reservation or I/O."""
-    if request.positional is not None and (
-        transport is None
-        or not isinstance(transport.capabilities, TransportCapabilities)
-        or not transport.capabilities.positional_json
-    ):
-        raise CapabilityError("transport does not support positional JSON arguments", request_summary=request.summary)
-    advanced = request.encoding.value != "json" or bool(request.headers.items)
-    if transport is None:
-        if not advanced:
-            return
-        raise CapabilityError("transport does not support advanced request delivery")
-    capabilities = transport.capabilities
-    if not isinstance(capabilities, TransportCapabilities):
-        raise CapabilityError("transport exposes malformed capabilities")
-    if request.encoding not in capabilities.encodings:
-        raise CapabilityError(f"transport does not support {request.encoding.value} request bodies")
-    if request.headers.items and not capabilities.scoped_headers:
-        raise CapabilityError("transport does not support scoped request headers")
 
 
 async def _send_transport(  # noqa: PLR0913 - keeps legacy and wire boundaries explicit

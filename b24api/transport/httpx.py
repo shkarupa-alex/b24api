@@ -148,6 +148,7 @@ class HttpxTransport:
         encodings=frozenset({BodyEncoding.JSON, BodyEncoding.FORM_URLENCODED}),
         scoped_headers=True,
         positional_json=True,
+        routes=frozenset(RouteKind),
     )
 
     def __init__(self, webhook_url: str, *, client: httpx.AsyncClient | None = None) -> None:

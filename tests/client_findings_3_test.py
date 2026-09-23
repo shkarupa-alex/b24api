@@ -382,6 +382,9 @@ async def test_repository_httpx_transport_passes_complete_public_conformance_sui
 
     assert report.passed
     assert len(report.outcomes) == len(ConformanceCase)
+    routes = {outcome.case: outcome for outcome in report.outcomes if outcome.case.value.startswith("route_")}
+    assert set(routes) == {ConformanceCase.ROUTE_JSON_SUFFIX, ConformanceCase.ROUTE_API_V3_REBASE}
+    assert all(outcome.passed and not outcome.skipped for outcome in routes.values())
 
 
 @pytest.mark.asyncio
