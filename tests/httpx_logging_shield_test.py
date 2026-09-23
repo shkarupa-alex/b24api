@@ -6,6 +6,7 @@ import io
 import logging
 import tomllib
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
@@ -14,6 +15,9 @@ from b24api import BodyEncoding, Request, RouteKind
 from b24api.errors import TransportError
 from b24api.transport import HttpxTransport
 from b24api.transport.logging_shield import HTTPX_LOG_SHIELD
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 _OWNED_MARKER = "synthetic-owned-secret-123456"
 _FOREIGN_MARKER = "synthetic-foreign-secret-123456"
@@ -301,6 +305,82 @@ async def test_unrelated_httpx_request_inside_owned_response_hook_is_unchanged(s
         await transport.aclose()
         await client.aclose()
         await foreign.aclose()
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+
+
+_AUTH_FLOWS = ("clone", "challenge", "refresh", "redirect")
+_UNAUTHORIZED = 401
+
+
+def _auth_records(flow: str) -> int:
+    return {"clone": 1, "challenge": 2, "refresh": 2, "redirect": 2}[flow]
+
+
+class _ReplacingAuth(httpx.Auth):
+    """Yield a fresh credentialed Request that carries none of the original extensions."""
+
+    def __init__(self, flow: str, client: httpx.AsyncClient, foreign_url: str) -> None:
+        self.flow = flow
+        self.client = client
+        self.foreign_url = foreign_url
+
+    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        await request.aread()
+
+        def fresh() -> httpx.Request:
+            return httpx.Request(request.method, request.url, headers=request.headers, content=request.content)
+
+        if self.flow == "challenge":
+            response = yield request
+            if response.status_code == _UNAUTHORIZED:
+                yield fresh()
+            return
+        if self.flow == "refresh":
+            await self.client.get(self.foreign_url, auth=None)
+        yield fresh()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flow", _AUTH_FLOWS)
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3])
+async def test_injected_auth_replacement_keeps_owned_webhook_out_of_info(route: RouteKind, flow: str) -> None:
+    logger = logging.getLogger("httpx")
+    previous_level = logger.level
+    handler = _CollectingHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    foreign_url = f"https://other.invalid/rest/1/{_FOREIGN_MARKER}/profile"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if flow == "challenge" and "b24api_log_owner" in request.extensions:
+            return httpx.Response(_UNAUTHORIZED, request=request)
+        if flow == "redirect" and request.url.host == "portal.invalid":
+            location = f"https://redirect.invalid/rest/1/{_THIRD_MARKER}/profile"
+            return httpx.Response(301, headers={"location": location}, request=request)
+        return httpx.Response(_SUCCESS_STATUS, json={"result": True}, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond), follow_redirects=True)
+    client.auth = _ReplacingAuth(flow, client, foreign_url)
+    transport = HttpxTransport(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/", client=client)
+    try:
+        response = await transport.send(Request("profile", route=route), attempt_timeout=1, max_response_bytes=1024)
+        assert response.status_code == _SUCCESS_STATUS
+        assert len(handler.records) == _auth_records(flow)
+        for record in handler.records:
+            if "other.invalid" in record.getMessage():
+                assert foreign_url in record.getMessage()
+                continue
+            for marker in (_OWNED_MARKER, _THIRD_MARKER):
+                assert marker not in f"{record.msg!r} {record.args!r}"
+                assert marker not in record.getMessage()
+        assert _OWNED_MARKER not in handler.output.getvalue()
+        assert _THIRD_MARKER not in handler.output.getvalue()
+        assert (foreign_url in handler.output.getvalue()) is (flow == "refresh")
+    finally:
+        await transport.aclose()
+        await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control

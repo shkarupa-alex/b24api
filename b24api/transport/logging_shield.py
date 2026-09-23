@@ -3,11 +3,12 @@
 A b24api request can emit several records, including redirect hops whose URLs b24api never built,
 so the filter scrubs any credential-shaped Bitrix URL segment and sensitive query value, not only the
 registered webhook token. Neither task context nor client identity proves ownership: a caller's
-response hook may send an unrelated request in the same task, even through the same injected client.
-Each owned request therefore carries a unique marker in its HTTPX extensions, which HTTPX copies to
-every redirect hop, and a record is attributed to the request whose single send emitted it; records
-of any unmarked request stay untouched. If that emitting frame cannot be found (a changed HTTPX
-internal), the record is scrubbed conservatively.
+response hook or auth flow may send an unrelated request in the same task, even through the same
+injected client. Nor does the request that reaches the wire: an auth flow may replace it, and a
+redirect builds a new one. Each owned request therefore carries a unique marker, and a record is
+attributed to the request passed to the innermost HTTPX ``send`` on the emitting stack. Auth
+replacements and redirect hops run inside that call; an unrelated nested request opens its own. If
+no such frame is found (a changed HTTPX internal), the record is scrubbed conservatively.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ _ACTIVE_CREDENTIALS: ContextVar[tuple[tuple[str, ...], LogOwnership] | None] = C
     "b24api_httpx_credentials",
     default=None,
 )
-_EMITTING_METHOD = "_send_single_request"
+_EMITTING_METHOD = "send"
 _EMITTING_MODULE = ("httpx", "_client.py")
 _OWNER_EXTENSION = "b24api_log_owner"
 _UNATTRIBUTED = object()
@@ -67,7 +68,7 @@ def _redact_owned_value(value: object, credentials: tuple[str, ...]) -> object:
 
 
 def _emitting_request() -> object:
-    """Return the HTTPX request whose single send is emitting the current record."""
+    """Return the request passed to the innermost HTTPX client send that is emitting the current record."""
     frame: FrameType | None = sys._getframe(2)  # noqa: SLF001 - attribution must inspect the synchronous emitting stack
     while frame is not None:
         code = frame.f_code
@@ -78,7 +79,7 @@ def _emitting_request() -> object:
 
 
 class LogOwnership:
-    """Mark one owned HTTPX request so its records, and those of its redirect hops, are recognized."""
+    """Mark one owned HTTPX request so records emitted anywhere inside its send are recognized."""
 
     __slots__ = ()
 
@@ -87,7 +88,7 @@ class LogOwnership:
         request.extensions[_OWNER_EXTENSION] = self
 
     def owns(self, request: object) -> bool:
-        """Report whether an emitted request carries this exact marker."""
+        """Report whether a sent request carries this exact marker."""
         extensions = getattr(request, "extensions", None)
         return isinstance(extensions, dict) and extensions.get(_OWNER_EXTENSION) is self
 
