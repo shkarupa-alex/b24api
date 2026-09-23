@@ -9,13 +9,12 @@ from b24api.contracts.json import FrozenJson, _freeze_json, _thaw_json
 from b24api.contracts.policy import (
     ConfirmationPolicy,
     DuplicatePolicy,
-    ExecutionPolicy,
     OrderSemantics,
     TotalSemantics,
 )
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, TraversalIdentity
 from b24api.contracts.response import Response, inject_controls
-from b24api.errors import BudgetExceededError, CapabilityError, PaginationError
+from b24api.errors import CapabilityError, PaginationError
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     CursorTerminalRule,
@@ -32,6 +31,7 @@ from b24api.traversal.plans import (
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
     from b24api.contracts.report import PageRejectionCode
+    from b24api.execution import ExecutionContext
     from b24api.traversal.values import IdentityValue
 
 type PageFetch = Callable[[Request], Awaitable[Response]]
@@ -69,9 +69,9 @@ class _IdentityStore(Protocol):
 
 
 class _MemoryIdentityStore:
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, context: ExecutionContext) -> None:
         self._values: set[IdentityValue] = set()
-        self._capacity = capacity
+        self._context = context
 
     @property
     def count(self) -> int:
@@ -81,13 +81,16 @@ class _MemoryIdentityStore:
         return value in self._values
 
     def add(self, value: IdentityValue) -> None:
+        if value in self._values:
+            return
+        self._context.retain_identity_key()
         self._values.add(value)
 
     def ensure_capacity(self, additional: int) -> None:
-        if len(self._values) + additional > self._capacity:
-            raise BudgetExceededError("identity evidence budget exhausted")
+        self._context.ensure_identity_capacity(additional)
 
     def close(self) -> None:
+        self._context.release_identity_keys(len(self._values))
         self._values.clear()
 
 
@@ -361,7 +364,7 @@ def _cursor_terminal(plan: ItemCursorPlan, page_size: int) -> str | None:
     return None
 
 
-def _identity_store(policy: ExecutionPolicy, plan: ListPlan, identity: TraversalIdentity | None) -> _IdentityStore:
+def _identity_store(context: ExecutionContext, plan: ListPlan, identity: TraversalIdentity | None) -> _IdentityStore:
     if isinstance(plan, KeysetPlan) or (
         isinstance(plan, ItemCursorPlan)
         and isinstance(identity, IdentitySpec)
@@ -369,4 +372,4 @@ def _identity_store(policy: ExecutionPolicy, plan: ListPlan, identity: Traversal
         and identity.coercion is plan.cursor_coercion
     ):
         return _MonotonicIdentityStore()
-    return _MemoryIdentityStore(policy.max_identity_keys)
+    return _MemoryIdentityStore(context)

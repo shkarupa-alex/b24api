@@ -188,7 +188,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         if self._identity_store is not None:
             raise RuntimeError("page validation is already active")
         self._validate_capabilities()
-        self._identity_store = _identity_store(self.context.policy, self.plan, self.identity)
+        self._identity_store = _identity_store(self.context, self.plan, self.identity)
 
     def validate_external_page(
         self,

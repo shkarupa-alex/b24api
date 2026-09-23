@@ -30,10 +30,23 @@ def sequential_offset_plan(
         raise ValueError("page_size must match page_stride max_decoded_rows")
     if stride is not None and stride.requested_wire_limit is not None and offset.limit_path is None:
         raise ValueError("requested wire limit requires a limit_path")
+    if (
+        stride is not None
+        and offset.limit_path is not None
+        and stride.requested_wire_limit is None
+        and stride.max_decoded_rows != stride.wire_increment
+    ):
+        raise ValueError("requested wire limit is required when the decoded row cap differs from the wire increment")
     page_index = offset.page_index
     if page_index is not None and page_size != page_index.max_rows:
         raise ValueError("page_size must match page_index max_rows")
-    wire_limit = stride.requested_wire_limit if stride and stride.requested_wire_limit else page_size
+    wire_limit = (
+        stride.requested_wire_limit
+        if stride is not None and stride.requested_wire_limit is not None
+        else stride.wire_increment
+        if stride is not None
+        else page_size
+    )
     return OffsetSequentialPlan(
         offset_path=offset.parameter_path,
         limit_path=offset.limit_path,

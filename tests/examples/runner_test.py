@@ -67,6 +67,11 @@ def _live_record() -> dict[str, object]:
     return record
 
 
+def _attest(record: dict[str, object]) -> None:
+    signature = LIVE_SIGNING_KEY.sign(recipe_runner._live_attestation_payload(record))  # noqa: SLF001
+    record["attestation"] = f"ed25519:{base64.b64encode(signature).decode()}"
+
+
 def test_offline_runner_emits_required_structured_summary() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "examples.run", "--scenario", "1"],
@@ -118,6 +123,63 @@ def test_live_runner_never_promotes_missing_evidence_to_success(tmp_path: Path) 
 
 def test_live_runner_accepts_only_a_capture_from_the_pinned_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
     record = _live_record()
+    monkeypatch.setattr(recipe_runner, "LIVE_RECORDER_PUBLIC_KEY", LIVE_PUBLIC_KEY)
+
+    assert (
+        recipe_runner._validate_live_record(  # noqa: SLF001
+            record,
+            recipe_runner.SCENARIOS[0],
+            str(record["client_sha"]),
+        )
+        == record
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "logical_requests"),
+    [("batch", 51), ("profile", 2)],
+)
+def test_live_runner_rejects_signed_physically_impossible_request_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    logical_requests: int,
+) -> None:
+    record = _live_record()
+    capture = record["capture"]
+    assert isinstance(capture, dict)
+    requests = capture["requests"]
+    assert isinstance(requests, list)
+    request = requests[0]
+    assert isinstance(request, dict)
+    request.update(method=method, logical_requests=logical_requests)
+    record["logical_requests"] = sum(item["logical_requests"] for item in requests if isinstance(item, dict))
+    _attest(record)
+    monkeypatch.setattr(recipe_runner, "LIVE_RECORDER_PUBLIC_KEY", LIVE_PUBLIC_KEY)
+
+    with pytest.raises(ValueError, match="impossible request capture"):
+        recipe_runner._validate_live_record(  # noqa: SLF001
+            record,
+            recipe_runner.SCENARIOS[0],
+            str(record["client_sha"]),
+        )
+
+
+@pytest.mark.parametrize(("method", "logical_requests"), [("batch", 50), ("profile", 1)])
+def test_live_runner_accepts_signed_feasible_request_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    logical_requests: int,
+) -> None:
+    record = _live_record()
+    capture = record["capture"]
+    assert isinstance(capture, dict)
+    requests = capture["requests"]
+    assert isinstance(requests, list)
+    request = requests[0]
+    assert isinstance(request, dict)
+    request.update(method=method, logical_requests=logical_requests)
+    record["logical_requests"] = sum(item["logical_requests"] for item in requests if isinstance(item, dict))
+    _attest(record)
     monkeypatch.setattr(recipe_runner, "LIVE_RECORDER_PUBLIC_KEY", LIVE_PUBLIC_KEY)
 
     assert (

@@ -172,6 +172,37 @@ async def test_ready_order_interleaves_references_by_actual_completion() -> None
 
 
 @pytest.mark.asyncio
+async def test_reference_bindings_share_one_operation_identity_budget() -> None:
+    def handler(request: Request) -> object:
+        reference = request.copy_parameters()["ref"]
+        base = 0 if reference == "a" else TWO_REFERENCES
+        return {"result": [{"ID": base + 1}, {"ID": base + 2}]}
+
+    stream = iter_references(
+        Executor(AsyncFunctionTransport(handler)),
+        [_reference("a"), _reference("b")],
+        plan=_one_page_plan(),
+        _page_cap_hint=TWO_REFERENCES,
+        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        identity=_identity(),
+        tolerant=True,
+        policy=ExecutionPolicy(
+            max_active_references=TWO_REFERENCES,
+            max_buffered_rows=2 * TWO_REFERENCES,
+            max_identity_keys=3,
+        ),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+    items = [outcome for outcome in outcomes if isinstance(outcome, ReferenceItem)]
+    failures = [outcome for outcome in outcomes if isinstance(outcome, ReferenceFailure)]
+    assert len(items) == TWO_REFERENCES
+    assert len({item.reference_key for item in items}) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0].error, BudgetExceededError)
+
+
+@pytest.mark.asyncio
 async def test_input_order_allows_later_progress_without_cross_reference_reordering() -> None:
     release_first = asyncio.Event()
     second_started = asyncio.Event()

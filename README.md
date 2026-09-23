@@ -432,9 +432,10 @@ buffered commands and rows, retained unordered identity keys, direct concurrency
 references. The default response ceiling is 16 MiB and is enforced while streaming, before JSON
 decoding.
 
-Sequential and counted exact traversal retain at most `max_identity_keys` observed identities in
-memory (100,000 by default). A page that would exceed that declared ceiling is rejected atomically
-with typed budget evidence. Set a larger finite ceiling when the expected cardinality is known.
+Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
+observed identities per operation in memory (100,000 by default). All active reference bindings
+share that ceiling. A page that would exceed it is rejected atomically with typed budget evidence.
+Set a larger finite ceiling when the expected aggregate cardinality is known.
 Strict keyset and cursor traversal retain only monotonic progression state when sufficient.
 
 ## CLI

@@ -789,6 +789,33 @@ def test_counted_rejects_inconsistent_or_wire_limited_page_stride_before_io() ->
     assert transport.requests == []
 
 
+def test_sequential_stride_requires_an_explicit_distinct_wire_limit_before_io() -> None:
+    transport = _Transport(lambda _request: pytest.fail("invalid stride must reject before I/O"))
+    client = _client(transport)
+    offset = OffsetSpec(
+        limit_path=ParameterPath(("limit",)),
+        continuation=OffsetContinuation.FIXED_STEP,
+        step=PAGE_SIZE,
+        page_stride=PageStride(PAGE_SIZE, PAGE_SIZE, PAGE_SIZE // 2),
+    )
+
+    with pytest.raises(ValueError, match="requested wire limit is required"):
+        client.iter_list(
+            Request("example.list", route=RouteKind.BARE),
+            page_size=PAGE_SIZE // 2,
+            offset=offset,
+        )
+    with pytest.raises(ValueError, match="requested wire limit is required"):
+        client.iter_reference_outcomes(
+            Request("example.list", route=RouteKind.BARE),
+            [Binding("one", (), object())],
+            traversal=SequentialTraversal(page_size=PAGE_SIZE // 2, offset=offset),
+            dispatch=DirectDispatch(concurrency=1),
+        )
+
+    assert transport.requests == []
+
+
 @pytest.mark.asyncio
 async def test_reference_counted_fixed_step_ignores_relative_next() -> None:
     starts: list[int] = []

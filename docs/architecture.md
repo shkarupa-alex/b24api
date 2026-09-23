@@ -52,7 +52,7 @@ outcome.
 - Response bytes, buffered rows and commands, retained unordered identity keys, request/page
   budgets, concurrency and elapsed time are bounded by `ExecutionPolicy`.
 - The default response ceiling is enforced while streaming, before JSON decoding.
-- Exact sequential/counted traversal retains observed identities in memory up to the explicit
+- Exact sequential, counted, and multi-reference traversal shares one operation-wide
   `max_identity_keys` ceiling and rejects an overflowing page atomically.
 - Streams publish one immutable terminal report after cleanup. Early close and cancellation never
   claim completion.

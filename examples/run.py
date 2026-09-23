@@ -25,6 +25,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from b24api.traversal.plans import PORTAL_BATCH_CAP
 from examples._support.evidence import RecipeEvidence
 
 if TYPE_CHECKING:
@@ -199,6 +200,8 @@ def _validate_captured_requests(record: dict[str, object], requests: object, sce
             or _SHA256_RE.fullmatch(response_sha256) is None
         ):
             raise ValueError(f"LIVE evidence for scenario {scenario.number} has invalid request capture")
+        if (method == "batch" and logical > PORTAL_BATCH_CAP) or (method != "batch" and logical != 1):
+            raise ValueError(f"LIVE evidence for scenario {scenario.number} has impossible request capture")
         logical_requests += logical
     if logical_requests != record.get("logical_requests"):
         raise ValueError(f"LIVE evidence for scenario {scenario.number} has inconsistent logical request capture")
