@@ -310,12 +310,12 @@ async def test_unrelated_httpx_request_inside_owned_response_hook_is_unchanged(s
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
 
 
-_AUTH_FLOWS = ("clone", "challenge", "refresh", "redirect")
+_AUTH_FLOWS = ("clone", "challenge", "refresh", "redirect", "yield-foreign", "challenge-foreign")
 _UNAUTHORIZED = 401
 
 
 def _auth_records(flow: str) -> int:
-    return {"clone": 1, "challenge": 2, "refresh": 2, "redirect": 2}[flow]
+    return {"clone": 1, "challenge": 2, "refresh": 2, "redirect": 2, "yield-foreign": 2, "challenge-foreign": 3}[flow]
 
 
 class _ReplacingAuth(httpx.Auth):
@@ -332,10 +332,16 @@ class _ReplacingAuth(httpx.Auth):
         def fresh() -> httpx.Request:
             return httpx.Request(request.method, request.url, headers=request.headers, content=request.content)
 
-        if self.flow == "challenge":
+        if self.flow in {"challenge", "challenge-foreign"}:
             response = yield request
             if response.status_code == _UNAUTHORIZED:
+                if self.flow == "challenge-foreign":
+                    yield httpx.Request("GET", self.foreign_url)
                 yield fresh()
+            return
+        if self.flow == "yield-foreign":
+            yield httpx.Request("GET", self.foreign_url)
+            yield request
             return
         if self.flow == "refresh":
             await self.client.get(self.foreign_url, auth=None)
@@ -354,7 +360,7 @@ async def test_injected_auth_replacement_keeps_owned_webhook_out_of_info(route: 
     foreign_url = f"https://other.invalid/rest/1/{_FOREIGN_MARKER}/profile"
 
     def respond(request: httpx.Request) -> httpx.Response:
-        if flow == "challenge" and "b24api_log_owner" in request.extensions:
+        if flow in {"challenge", "challenge-foreign"} and "b24api_log_owner" in request.extensions:
             return httpx.Response(_UNAUTHORIZED, request=request)
         if flow == "redirect" and request.url.host == "portal.invalid":
             location = f"https://redirect.invalid/rest/1/{_THIRD_MARKER}/profile"
@@ -371,13 +377,15 @@ async def test_injected_auth_replacement_keeps_owned_webhook_out_of_info(route: 
         for record in handler.records:
             if "other.invalid" in record.getMessage():
                 assert foreign_url in record.getMessage()
+                assert isinstance(record.args, tuple)
+                assert isinstance(record.args[1], httpx.URL)
                 continue
             for marker in (_OWNED_MARKER, _THIRD_MARKER):
                 assert marker not in f"{record.msg!r} {record.args!r}"
                 assert marker not in record.getMessage()
         assert _OWNED_MARKER not in handler.output.getvalue()
         assert _THIRD_MARKER not in handler.output.getvalue()
-        assert (foreign_url in handler.output.getvalue()) is (flow == "refresh")
+        assert (foreign_url in handler.output.getvalue()) is flow.endswith(("refresh", "foreign"))
     finally:
         await transport.aclose()
         await client.aclose()
