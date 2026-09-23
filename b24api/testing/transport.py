@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
+from types import MappingProxyType
 
 from b24api.contracts.request import Request, RouteKind
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
@@ -47,14 +48,18 @@ class ConformanceCase(StrEnum):
 
 
 # A declared route must reach its own endpoint on the conformance webhook ``/rest/1/token/``.
-_CASE_ROUTES = {
-    ConformanceCase.ROUTE_JSON_SUFFIX: RouteKind.JSON,
-    ConformanceCase.ROUTE_API_V3_REBASE: RouteKind.API_V3,
-}
-_ROUTE_PATHS = {
-    RouteKind.JSON: "/rest/1/token/conformance.test.json",
-    RouteKind.API_V3: "/rest/api/1/token/conformance.test",
-}
+_CASE_ROUTES = MappingProxyType(
+    {
+        ConformanceCase.ROUTE_JSON_SUFFIX: RouteKind.JSON,
+        ConformanceCase.ROUTE_API_V3_REBASE: RouteKind.API_V3,
+    }
+)
+_ROUTE_PATHS = MappingProxyType(
+    {
+        RouteKind.JSON: "/rest/1/token/conformance.test.json",
+        RouteKind.API_V3: "/rest/api/1/token/conformance.test",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
