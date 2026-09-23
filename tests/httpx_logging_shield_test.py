@@ -394,6 +394,7 @@ def _substitute(url: httpx.URL, target: str) -> str:
         "rebased-route": rendered.replace("/rest/api/", "/rest/").replace(_OWNED_MARKER, _ROTATED_MARKER),
         "other-host-foreign": f"https://other.invalid/rest/1/{_FOREIGN_MARKER}/profile",
         "portal-oauth": "https://portal.invalid/oauth/token/?grant_type=refresh_token",
+        "scheme": rendered.replace("https://", "http://", 1),
     }[target]
 
 
@@ -412,7 +413,7 @@ class _SubstitutingAuth(httpx.Auth):
                 return
         yield httpx.Request(
             "POST"
-            if self.target in {"clone", "rotated-token", "rotated-user", "rebased-host", "rebased-route"}
+            if self.target in {"clone", "rotated-token", "rotated-user", "rebased-host", "rebased-route", "scheme"}
             else "GET",
             _substitute(request.url, self.target),
             headers=request.headers,
@@ -431,6 +432,7 @@ _SUBSTITUTES = (
     "rebased-route",
     "other-host-foreign",
     "portal-oauth",
+    "scheme",
 )
 
 
@@ -562,6 +564,146 @@ async def test_concurrent_owned_sends_with_distinct_tokens_share_one_client() ->
     finally:
         await first.aclose()
         await second.aclose()
+        await client.aclose()
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+
+
+class _MutatingAuth(httpx.Auth):
+    """Authorize the owned request in place while stripping its ownership label or rotating its URL."""
+
+    def __init__(self, mutation: str) -> None:
+        self.mutation = mutation
+
+    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        if self.mutation == "auth-replace-extensions":
+            request.extensions = {key: value for key, value in request.extensions.items() if key != "b24api_log_owner"}
+        else:
+            request.extensions.pop("b24api_log_owner", None)
+        if self.mutation == "auth-rotate-url":
+            request.url = httpx.URL(str(request.url).replace(_OWNED_MARKER, _ROTATED_MARKER))
+        yield request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["auth-pop", "auth-replace-extensions", "auth-rotate-url", "request-hook-pop"])
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3])
+async def test_mutating_the_owned_request_in_place_keeps_every_credential_private(
+    route: RouteKind, mutation: str
+) -> None:
+    logger = logging.getLogger("httpx")
+    previous_level = logger.level
+    handler = _CollectingHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    async def strip_label(request: httpx.Request) -> None:
+        request.extensions.pop("b24api_log_owner", None)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "portal.invalid":
+            hop = "/rest/api/1" if route is RouteKind.API_V3 else "/rest/1"
+            location = f"https://redirect.invalid{hop}/{_THIRD_MARKER}/profile"
+            return httpx.Response(301, headers={"location": location}, request=request)
+        return httpx.Response(_SUCCESS_STATUS, json={"result": True}, request=request)
+
+    hooked = mutation == "request-hook-pop"
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(respond),
+        follow_redirects=True,
+        auth=None if hooked else _MutatingAuth(mutation),
+        event_hooks={"request": [strip_label]} if hooked else None,
+    )
+    transport = HttpxTransport(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/", client=client)
+    try:
+        response = await transport.send(Request("profile", route=route), attempt_timeout=1, max_response_bytes=1024)
+        assert response.status_code == _SUCCESS_STATUS
+        assert len(handler.records) == _REDIRECT_RECORDS
+        for marker in (_OWNED_MARKER, _ROTATED_MARKER, _THIRD_MARKER):
+            assert marker not in handler.output.getvalue()
+            for record in handler.records:
+                assert marker not in f"{record.msg!r} {record.args!r}"
+                assert marker not in record.getMessage()
+    finally:
+        await transport.aclose()
+        await client.aclose()
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+
+
+class _SilentAuth(httpx.Auth):
+    """An auth flow that yields no request at all."""
+
+    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        if request.method == "NEVER":
+            yield request
+
+
+@pytest.mark.asyncio
+async def test_injected_auth_yielding_nothing_is_refused_before_dispatch() -> None:
+    dispatched: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        dispatched.append(request)
+        return httpx.Response(_SUCCESS_STATUS, json={"result": True}, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond), auth=_SilentAuth())
+    transport = HttpxTransport(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/", client=client)
+    try:
+        with pytest.raises(TransportError, match="replaced the owned request") as caught:
+            await transport.send(Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024)
+        assert caught.value.retryable is False
+        assert caught.value.possible_acceptance is False
+        assert dispatched == []
+    finally:
+        await transport.aclose()
+        await client.aclose()
+    assert HTTPX_LOG_SHIELD._filter not in logging.getLogger("httpx").filters  # noqa: SLF001 - final cleanup control
+
+
+@pytest.mark.asyncio
+async def test_nested_foreign_redirect_with_a_distinct_token_stays_unchanged() -> None:
+    logger = logging.getLogger("httpx")
+    previous_level = logger.level
+    handler = _CollectingHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    foreign_url = f"https://other.invalid/rest/1/{_FOREIGN_MARKER}/profile"
+    hop_url = f"https://hop.invalid/rest/1/{_THIRD_MARKER}/profile"
+    hook_calls: list[str] = []
+
+    async def hook(response: httpx.Response) -> None:
+        if not hook_calls:
+            hook_calls.append(str(response.url))
+            await client.get(foreign_url)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "other.invalid":
+            return httpx.Response(301, headers={"location": hop_url}, request=request)
+        return httpx.Response(_SUCCESS_STATUS, json={"result": True}, request=request)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(respond),
+        follow_redirects=True,
+        event_hooks={"response": [hook]},
+    )
+    transport = HttpxTransport(f"https://portal.invalid/rest/1/{_OWNED_MARKER}/", client=client)
+    try:
+        response = await transport.send(
+            Request("profile", route=RouteKind.BARE), attempt_timeout=1, max_response_bytes=1024
+        )
+        assert response.status_code == _SUCCESS_STATUS
+        assert len(handler.records) == _TOTAL_RECORDS
+        foreign = [record for record in handler.records if "portal.invalid" not in record.getMessage()]
+        assert [str(record.args[1]) for record in foreign if isinstance(record.args, tuple)] == [foreign_url, hop_url]
+        assert all(isinstance(record.args, tuple) and isinstance(record.args[1], httpx.URL) for record in foreign)
+        assert foreign_url in handler.output.getvalue()
+        assert hop_url in handler.output.getvalue()
+        assert _OWNED_MARKER not in handler.output.getvalue()
+    finally:
+        await transport.aclose()
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)

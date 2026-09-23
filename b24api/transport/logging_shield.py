@@ -6,11 +6,13 @@ registered webhook token. Neither task context nor client identity proves owners
 response hook or auth flow may send an unrelated request in the same task, even through the same
 injected client. A record is therefore attributed to the root of the redirect chain that emits it:
 the request the innermost HTTPX ``_send_handling_auth`` is dispatching, which HTTPX never rebinds to a
-redirect hop and which a nested send replaces with its own frame. The root is owned only when it
-carries this dispatch's marker. An auth flow could otherwise make lineage undecidable by yielding a
-fresh request, either a substitute for the owned call or an unrelated one with the same address, so
-the owned send runs the client's auth through a guard that admits only the marked request itself,
-mutated in place, and refuses any other request before HTTPX dispatches it. Records of other roots
+redirect hop and which a nested send replaces with its own frame. The root is owned only when it is
+the very Request object b24api built for this dispatch; its URL, headers and extensions are mutable
+by caller auth and hooks, so none of them can prove ownership. An auth flow could otherwise make
+lineage undecidable by yielding a fresh request, either a substitute for the owned call or an
+unrelated one with the same address, so the owned send runs the client's auth through a guard that
+admits only that object itself, mutated in place, and refuses any other request before HTTPX
+dispatches it. Records of other roots
 keep every byte except the registered webhook secret, which is never logged. If no emitting frame is
 found (a changed HTTPX internal), the record is scrubbed conservatively.
 """
@@ -20,6 +22,7 @@ import logging
 import re
 import sys
 import threading
+import weakref
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import PurePath
@@ -93,25 +96,27 @@ def _emitting_root() -> object:
 
 
 class LogOwnership:
-    """Recognize the redirect chains of one owned dispatch by its marked root request."""
+    """Recognize the redirect chains of one owned dispatch by the identity of its root request."""
 
-    __slots__ = ("credentials",)
+    __slots__ = ("_request", "credentials")
 
     def __init__(self, url: str) -> None:
         """Bind the owned webhook credential segment."""
         self.credentials = _credentials(url)
+        self._request: weakref.ref[httpx.Request] | None = None
 
     def claim(self, request: httpx.Request) -> None:
-        """Attach this ownership marker before the request is sent."""
+        """Bind the exact owned request before it is sent; the extension only labels it for observers."""
+        # Weak, so a context copied into a caller task cannot keep the credential-bearing request alive.
+        self._request = weakref.ref(request)
         request.extensions[_OWNER_EXTENSION] = self
 
     def owns(self, request: object) -> bool:
-        """Report whether a chain root carries this exact marker."""
-        extensions = getattr(request, "extensions", None)
-        return isinstance(extensions, dict) and extensions.get(_OWNER_EXTENSION) is self
+        """Report whether a chain root is the claimed request object, however it was mutated."""
+        return self._request is not None and self._request() is request
 
     def guard(self, auth: httpx.Auth | None) -> httpx.Auth:
-        """Wrap the client's auth so the owned send can dispatch nothing but the marked request."""
+        """Wrap the client's auth so the owned send can dispatch nothing but the claimed request."""
         return _OwnedRequestAuth(auth)
 
 
