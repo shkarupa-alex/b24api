@@ -826,6 +826,22 @@ def test_page_stride_rejects_an_explicit_subwindow_wire_limit() -> None:
         )
 
 
+def test_ordinary_page_stride_rejects_overlapping_decoded_windows() -> None:
+    with pytest.raises(ValueError, match="decoded row cap cannot exceed the wire increment"):
+        OffsetSpec(
+            limit_path=ParameterPath(("limit",)),
+            continuation=OffsetContinuation.FIXED_STEP,
+            step=PAGE_SIZE,
+            total_termination=TotalTermination.EXACT_QUALIFIED,
+            page_stride=PageStride(
+                server_granularity=PAGE_SIZE,
+                wire_increment=PAGE_SIZE,
+                max_decoded_rows=PAGE_SIZE * 2,
+                requested_wire_limit=PAGE_SIZE * 2,
+            ),
+        )
+
+
 @pytest.mark.asyncio
 async def test_reference_counted_fixed_step_ignores_relative_next() -> None:
     starts: list[int] = []

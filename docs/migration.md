@@ -77,7 +77,9 @@ snapshot of a mutable source.
 When a stride's decoded row cap differs from its wire increment and the request owns a limit
 control, set `requested_wire_limit` explicitly to at least the wire increment. Construction now
 rejects an omitted or smaller value before I/O instead of leaving part of each wire window
-unrequested.
+unrequested. For ordinary exact-total traversal, `max_decoded_rows` must not exceed the wire
+increment, which prevents overlapping windows from satisfying totals with duplicate rows. Sparse
+raw-bound traversal keeps its separate raw-range closure contract.
 
 The earlier 2.x keyset migration notes below remain as historical guidance for that API.
 
