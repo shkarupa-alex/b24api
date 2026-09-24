@@ -59,19 +59,15 @@ class LifecycleHooks[R]:
     propagate: Callable[[BaseException, R], BaseException] | None = None
 
 
-# Kernel reports map a cause to one state and reason; a FAILED cause uses ``report_reason``.
-KERNEL_TERMINALS = {
-    TerminalCause.EXHAUSTED: (KernelState.COMPLETED, "input exhausted"),
-    TerminalCause.EARLY_CLOSED: (KernelState.CANCELLED, EARLY_CLOSE_REASON),
-    TerminalCause.CANCELLED: (KernelState.CANCELLED, "iteration cancelled"),
-    TerminalCause.FAILED: (KernelState.FAILED, "stream failed"),
-}
-
-
 def kernel_terminal(cause: TerminalCause, reason: str | None) -> tuple[KernelState, str]:
     """Return the kernel state and reason a family's report starts from for this cause."""
-    state, default = KERNEL_TERMINALS[cause]
-    return state, reason if cause is TerminalCause.FAILED and reason else default
+    if cause is TerminalCause.EXHAUSTED:
+        return KernelState.COMPLETED, "input exhausted"
+    if cause is TerminalCause.EARLY_CLOSED:
+        return KernelState.CANCELLED, EARLY_CLOSE_REASON
+    if cause is TerminalCause.CANCELLED:
+        return KernelState.CANCELLED, "iteration cancelled"
+    return KernelState.FAILED, reason or "stream failed"
 
 
 def with_cleanup_attempt(report: KernelReport, cause: TerminalCause, attempt: CleanupAttempt) -> KernelReport:
@@ -359,7 +355,6 @@ class OperationRunner[T, R]:
 
 
 __all__ = [
-    "KERNEL_TERMINALS",
     "CleanupAttempt",
     "LifecycleHooks",
     "OperationRunner",
