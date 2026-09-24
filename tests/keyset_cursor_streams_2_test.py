@@ -64,6 +64,7 @@ from b24api.references.dispatch import _BatchPageDispatcher, _ProducerState, _Ro
 from b24api.traversal.keyset_fast_plan import LaneBounds, LaneKind, LaneSpec, LaneState, LaneStatus
 from b24api.traversal.keyset_page_validation import LaneCommandPlan, ReceiptRejection, validate_lane_receipt
 from b24api.traversal.values import _page_fingerprint, _response_items
+from tests.scripting import ResponderTransport, client_for
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Mapping
@@ -83,7 +84,7 @@ _COALESCE_BATCH = 4
 
 
 def _client(transport: object, *, policy: ExecutionPolicy | None = None) -> Bitrix24:
-    return Bitrix24._from_executor(Executor(transport), policy=policy)  # type: ignore[arg-type]
+    return client_for(transport, policy=policy)  # type: ignore[arg-type]
 
 
 def _identity() -> IdentitySpec:
@@ -283,23 +284,10 @@ async def test_cursor_seed_replaces_existing_control_when_creation_is_forbidden(
     assert [row["id"] async for row in singular] == [1, 2]
 
 
-class PageTransport:
-    host = "test.invalid"
-
-    def __init__(self) -> None:
-        self.requests: list[Request] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        del attempt_timeout, max_response_bytes
-        self.requests.append(request)
-        cursor = int(request.copy_parameters().get("after", 0))
-        messages = [] if cursor else [{"id": 1, "author_id": 7}, {"id": 2, "author_id": 8}]
-        result = {"chat_id": 42, "messages": messages, "users": {"7": "Ada", "8": "Lin"}, "files": []}
-        return WireResponse(
-            200,
-            (("content-type", "application/json"),),
-            json.dumps({"result": result}).encode(),
-        )
+def _chat_page(request: Request) -> object:
+    cursor = int(request.copy_parameters().get("after", 0))
+    messages = [] if cursor else [{"id": 1, "author_id": 7}, {"id": 2, "author_id": 8}]
+    return {"result": {"chat_id": 42, "messages": messages, "users": {"7": "Ada", "8": "Lin"}, "files": []}}
 
 
 class EnrichMessages:
@@ -326,7 +314,7 @@ class ReorderingIdentityAdapter(IdentityPageAdapter):
 @pytest.mark.asyncio
 async def test_page_adapter_enriches_from_frozen_siblings_and_runs_on_empty_confirmation() -> None:
     adapter = EnrichMessages()
-    stream = _client(PageTransport()).iter_list_cursor(
+    stream = _client(ResponderTransport(_chat_page)).iter_list_cursor(
         Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector(("messages",)),
         cursor=_cursor(),
@@ -345,7 +333,7 @@ async def test_page_adapter_enriches_from_frozen_siblings_and_runs_on_empty_conf
 
 @pytest.mark.asyncio
 async def test_custom_adapter_without_configured_identity_preserves_generic_list_support() -> None:
-    transport = PageTransport()
+    transport = ResponderTransport(_chat_page)
     adapter = EnrichMessages()
     stream = _client(transport).iter_list(
         Request("item.list", route=RouteKind.BARE),
@@ -378,7 +366,7 @@ class BrokenAdapter:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("violation", list(PageAdaptationViolation))
 async def test_page_adapter_violations_are_typed_atomic_and_value_free(violation: PageAdaptationViolation) -> None:
-    stream = _client(PageTransport()).iter_list_cursor(
+    stream = _client(ResponderTransport(_chat_page)).iter_list_cursor(
         Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector(("messages",)),
         cursor=_cursor(),

@@ -55,53 +55,13 @@ from b24api.traversal.plans import (
     SingleResponsePlan,
 )
 from tests.ledger_hold import LedgerHold
+from tests.scripting import Blocker, ResponderTransport
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from b24api.contracts.json import JsonValue
 
 PAGE_SIZE = 2
 THREE_ROWS = 3
-
-
-class FunctionTransport:
-    """Provide a deterministic test helper."""
-
-    host = "fixture.invalid"
-
-    def __init__(self, handler: Callable[[Request], object]) -> None:
-        """Initialize instance state."""
-        self.handler = handler
-        self.requests: list[Request] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Send one transport request attempt."""
-        del attempt_timeout, max_response_bytes
-        self.requests.append(request)
-        body = json.dumps(self.handler(request), separators=(",", ":")).encode()
-        return WireResponse(200, (("content-type", "application/json"),), body)
-
-
-class BlockingTransport:
-    """Provide a deterministic test helper."""
-
-    host = "fixture.invalid"
-
-    def __init__(self) -> None:
-        """Initialize instance state."""
-        self.started = asyncio.Event()
-        self.cancelled = asyncio.Event()
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Send one transport request attempt."""
-        del request, attempt_timeout, max_response_bytes
-        self.started.set()
-        try:
-            return await asyncio.Future[WireResponse]()
-        except asyncio.CancelledError:
-            self.cancelled.set()
-            raise
 
 
 def _identity() -> IdentitySpec:
@@ -190,7 +150,7 @@ async def _assert_incomplete_pagination(stream: object, pattern: str) -> Incompl
 
 @pytest.mark.asyncio
 async def test_single_stream_is_lazy_and_reports_scalar_completion() -> None:
-    transport = FunctionTransport(lambda _request: {"result": {"ID": 7}})
+    transport = ResponderTransport(lambda _request: {"result": {"ID": 7}})
     stream = iter_list(Executor(transport), Request("crm.item.get", route=RouteKind.BARE), plan=SingleResponsePlan())
 
     assert transport.requests == []
@@ -203,7 +163,7 @@ async def test_single_stream_is_lazy_and_reports_scalar_completion() -> None:
 
 @pytest.mark.asyncio
 async def test_async_context_entry_reads_nothing_until_the_first_pull() -> None:
-    transport = FunctionTransport(lambda _request: {"result": {"ID": 7}})
+    transport = ResponderTransport(lambda _request: {"result": {"ID": 7}})
     stream = iter_list(Executor(transport), Request("crm.item.get", route=RouteKind.BARE), plan=SingleResponsePlan())
 
     async with stream as entered:
@@ -217,7 +177,7 @@ async def test_async_context_entry_reads_nothing_until_the_first_pull() -> None:
 
 @pytest.mark.asyncio
 async def test_single_rejects_continuation_and_records_failure() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [], "next": 2})
+    transport = ResponderTransport(lambda _request: {"result": [], "next": 2})
     stream = iter_list(Executor(transport), Request("crm.item.list", route=RouteKind.BARE), plan=SingleResponsePlan())
 
     with pytest.raises(CapabilityError, match="continuation") as captured:
@@ -241,7 +201,7 @@ async def test_offset_does_not_treat_arbitrary_short_page_as_terminal_or_mutate_
         }
         return {"result": pages[start]}
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", original, route=RouteKind.BARE),
@@ -258,7 +218,7 @@ async def test_offset_does_not_treat_arbitrary_short_page_as_terminal_or_mutate_
 
 @pytest.mark.asyncio
 async def test_offset_detects_ignored_control_by_repeated_page_fingerprint() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", route=RouteKind.BARE),
@@ -274,14 +234,14 @@ async def test_offset_detects_ignored_control_by_repeated_page_fingerprint() -> 
 
 @pytest.mark.asyncio
 async def test_required_identity_and_oversized_pages_are_rejected() -> None:
-    no_identity_transport = FunctionTransport(lambda _request: {"result": []})
+    no_identity_transport = ResponderTransport(lambda _request: {"result": []})
     required = OffsetSequentialPlan(identity_requirement=IdentityRequirement.REQUIRED)
     stream = iter_list(Executor(no_identity_transport), Request("crm.item.list", route=RouteKind.BARE), plan=required)
     with pytest.raises(CapabilityError, match="IdentitySpec"):
         await _collect(stream)
     assert no_identity_transport.requests == []
 
-    oversized_transport = FunctionTransport(
+    oversized_transport = ResponderTransport(
         lambda _request: {"result": [{"ID": 1}, {"ID": 2}, {"ID": 3}]},
     )
     oversized = iter_list(
@@ -300,7 +260,7 @@ async def test_offset_exact_total_must_be_present_stable_and_not_overshot() -> N
         {"result": [{"ID": 1}], "total": 2},
         {"result": [{"ID": 2}], "total": 3},
     ]
-    transport = FunctionTransport(lambda _request: responses.pop(0))
+    transport = ResponderTransport(lambda _request: responses.pop(0))
     plan = OffsetSequentialPlan(
         continuation=OffsetContinuation.OBSERVED_COUNT,
         terminal=frozenset({OffsetTerminalRule.QUALIFIED_TOTAL}),
@@ -322,7 +282,7 @@ async def test_empty_page_cannot_override_an_unreached_exact_total() -> None:
         {"result": [{"ID": 1}], "total": 2},
         {"result": [], "total": 2},
     ]
-    transport = FunctionTransport(lambda _request: responses.pop(0))
+    transport = ResponderTransport(lambda _request: responses.pop(0))
     plan = OffsetSequentialPlan(
         continuation=OffsetContinuation.OBSERVED_COUNT,
         terminal=frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL}),
@@ -344,7 +304,7 @@ async def test_empty_page_cannot_override_an_unreached_exact_total() -> None:
 
 @pytest.mark.asyncio
 async def test_page_budget_refuses_continuation_before_network_io() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", route=RouteKind.BARE),
@@ -364,7 +324,7 @@ async def test_page_budget_refuses_continuation_before_network_io() -> None:
 
 @pytest.mark.asyncio
 async def test_selector_shape_failure_is_typed_and_reported() -> None:
-    transport = FunctionTransport(lambda _request: {"result": {"items": {"ID": 1}}})
+    transport = ResponderTransport(lambda _request: {"result": {"items": {"ID": 1}}})
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", route=RouteKind.BARE),
@@ -388,7 +348,7 @@ async def test_counted_offset_requires_one_stable_non_negative_exact_total() -> 
             else {"result": [{"ID": 3}], "total": 3}
         )
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", route=RouteKind.BARE),
@@ -407,7 +367,7 @@ async def test_counted_offset_detects_repeated_items_when_continuation_metadata_
         {"result": [{"ID": 1}, {"ID": 2}], "total": 4, "next": 2},
         {"result": [{"ID": 1}, {"ID": 2}], "total": 4},
     ]
-    transport = FunctionTransport(lambda _request: responses.pop(0))
+    transport = ResponderTransport(lambda _request: responses.pop(0))
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", route=RouteKind.BARE),
@@ -439,7 +399,7 @@ async def test_counted_offset_detects_repeated_items_when_continuation_metadata_
     ],
 )
 async def test_declared_order_is_enforced_for_single_and_offset_plans(plan: ListPlan) -> None:
-    transport = FunctionTransport(
+    transport = ResponderTransport(
         lambda _request: {"result": [{"ID": 2}, {"ID": 1}], "total": PAGE_SIZE},
     )
     stream = iter_list(
@@ -456,7 +416,7 @@ async def test_declared_order_is_enforced_for_single_and_offset_plans(plan: List
 
 @pytest.mark.asyncio
 async def test_consistency_policy_requires_identity_before_io() -> None:
-    transport = FunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     policy = ExecutionPolicy(
         consistency=ConsistencyPolicy(identity_requirement=IdentityRequirement.REQUIRED),
     )
@@ -475,7 +435,7 @@ async def test_consistency_policy_requires_identity_before_io() -> None:
 
 @pytest.mark.asyncio
 async def test_consistency_policy_enforces_duplicates_order_total_and_confirmation() -> None:
-    duplicate_transport = FunctionTransport(
+    duplicate_transport = ResponderTransport(
         lambda _request: {"result": [{"ID": 1}, {"ID": 1}]},
     )
     duplicate_stream = iter_list(
@@ -486,7 +446,7 @@ async def test_consistency_policy_enforces_duplicates_order_total_and_confirmati
     )
     await _assert_incomplete_pagination(duplicate_stream, "duplicate identity")
 
-    order_transport = FunctionTransport(
+    order_transport = ResponderTransport(
         lambda _request: {"result": [{"ID": 2}, {"ID": 1}]},
     )
     order_policy = ExecutionPolicy(
@@ -501,7 +461,7 @@ async def test_consistency_policy_enforces_duplicates_order_total_and_confirmati
     )
     await _assert_incomplete_pagination(order_stream, "strictly ascending")
 
-    total_transport = FunctionTransport(
+    total_transport = ResponderTransport(
         lambda _request: {"result": [{"ID": 1}, {"ID": 2}], "total": 1},
     )
     total_policy = ExecutionPolicy(
@@ -515,7 +475,7 @@ async def test_consistency_policy_enforces_duplicates_order_total_and_confirmati
     )
     await _assert_incomplete_pagination(total_stream, "exact total")
 
-    confirmation_transport = FunctionTransport(lambda _request: {"result": []})
+    confirmation_transport = ResponderTransport(lambda _request: {"result": []})
     confirmation_policy = ExecutionPolicy(
         consistency=ConsistencyPolicy(confirmation_policy=ConfirmationPolicy.EMPTY_AFTER_BOUNDARY),
     )
@@ -537,7 +497,7 @@ async def test_empty_boundary_policy_requires_the_empty_offset_confirmation() ->
         rows = [{"ID": 1}, {"ID": 2}] if start == 0 else []
         return {"result": rows, "total": PAGE_SIZE}
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     plan = OffsetSequentialPlan(
         continuation=OffsetContinuation.OBSERVED_COUNT,
         terminal=frozenset({OffsetTerminalRule.QUALIFIED_TOTAL, OffsetTerminalRule.EMPTY_PAGE}),
@@ -564,7 +524,7 @@ async def test_empty_boundary_policy_requires_the_empty_offset_confirmation() ->
 
 @pytest.mark.asyncio
 async def test_advisory_total_mismatch_is_reported_without_blocking_completion() -> None:
-    transport = FunctionTransport(
+    transport = ResponderTransport(
         lambda _request: {"result": [{"ID": 1}, {"ID": 2}], "total": 99},
     )
     stream = iter_list(
@@ -583,7 +543,7 @@ async def test_advisory_total_mismatch_is_reported_without_blocking_completion()
 
 @pytest.mark.asyncio
 async def test_conflicting_policy_and_plan_semantics_refuse_before_io() -> None:
-    transport = FunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     plan = CountedOffsetPlan(order_semantics=OrderSemantics.ASCENDING)
     policy = ExecutionPolicy(
         consistency=ConsistencyPolicy(
@@ -630,7 +590,7 @@ async def test_counted_offset_rejects_unproven_totals(
     message: str,
 ) -> None:
     pending = list(responses)
-    transport = FunctionTransport(lambda _request: pending.pop(0))
+    transport = ResponderTransport(lambda _request: pending.pop(0))
     stream = iter_list(Executor(transport), Request("crm.item.list", route=RouteKind.BARE), plan=CountedOffsetPlan())
 
     await _assert_incomplete_pagination(stream, message)
@@ -649,7 +609,7 @@ async def test_page_trace_limit_bounds_live_driver_evidence() -> None:
         {"result": []},
     ]
     stream = iter_list(
-        Executor(FunctionTransport(lambda _request: responses.pop(0))),
+        Executor(ResponderTransport(lambda _request: responses.pop(0))),
         Request("crm.item.list", route=RouteKind.BARE),
         plan=OffsetSequentialPlan(
             continuation=OffsetContinuation.SERVER_NEXT,
@@ -670,7 +630,7 @@ async def test_page_trace_limit_bounds_live_driver_evidence() -> None:
 async def test_direct_fetch_failure_records_unknown_scheduled_page() -> None:
     stream = iter_list(
         Executor(
-            FunctionTransport(
+            ResponderTransport(
                 lambda _request: {"error": "ACCESS_DENIED", "error_description": "denied"},
             ),
         ),
@@ -695,7 +655,7 @@ async def test_cancellation_while_waiting_for_dispatch_records_no_unknown_page()
     coordinator = RateCoordinator(max_concurrency=1)
     held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
     stream = iter_list(
-        Executor(FunctionTransport(lambda _request: {"result": []}), coordinator=coordinator),
+        Executor(ResponderTransport(lambda _request: {"result": []}), coordinator=coordinator),
         Request("crm.item.list", route=RouteKind.BARE),
         plan=_offset_plan(),
         identity=_identity(),
@@ -714,7 +674,7 @@ async def test_cancellation_while_waiting_for_dispatch_records_no_unknown_page()
 
 @pytest.mark.asyncio
 async def test_boundary_keyset_strategy_refuses_before_io() -> None:
-    transport = FunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     boundary = KeysetPlan(
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING,
@@ -774,7 +734,7 @@ async def test_unadmitted_consistency_controls_refuse_before_io(
     policy: ExecutionPolicy,
     message: str,
 ) -> None:
-    transport = FunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", route=RouteKind.BARE),
@@ -798,7 +758,7 @@ async def test_keyset_injects_exact_controls_and_requires_empty_confirmation() -
             return {"result": [{"ID": 3}]}
         return {"result": []}
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", route=RouteKind.BARE),
@@ -820,7 +780,7 @@ async def test_keyset_rejects_page_that_does_not_respect_previous_bound() -> Non
         {"result": [{"ID": 1}, {"ID": 2}]},
         {"result": [{"ID": 2}, {"ID": 3}]},
     ]
-    transport = FunctionTransport(lambda _request: responses.pop(0))
+    transport = ResponderTransport(lambda _request: responses.pop(0))
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", route=RouteKind.BARE),
@@ -838,7 +798,7 @@ async def test_item_cursor_advances_from_items_until_empty_confirmation() -> Non
         pages = {None: [{"ID": 1}, {"ID": 2}], 2: [{"ID": 3}], 3: []}
         return {"result": pages[cursor]}
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     plan = ItemCursorPlan(
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING,
@@ -864,7 +824,7 @@ async def test_item_cursor_orders_cursor_values_independently_from_row_identity(
         {"result": [{"ID": 10, "cursor": 3}]},
         {"result": []},
     ]
-    transport = FunctionTransport(lambda _request: responses.pop(0))
+    transport = ResponderTransport(lambda _request: responses.pop(0))
     plan = ItemCursorPlan(
         identity_requirement=IdentityRequirement.REQUIRED,
         cursor_item_path=("cursor",),
@@ -899,7 +859,7 @@ async def test_item_cursor_uses_independent_cursor_coercion() -> None:
         {"result": [{"uuid": "a", "cursor": 1}, {"uuid": "b", "cursor": 2}]},
         {"result": []},
     ]
-    transport = FunctionTransport(lambda _request: responses.pop(0))
+    transport = ResponderTransport(lambda _request: responses.pop(0))
     plan = ItemCursorPlan(
         identity_requirement=IdentityRequirement.REQUIRED,
         cursor_item_path=("cursor",),
@@ -946,7 +906,7 @@ async def test_composite_identity_refuses_before_io(
     plan: ListPlan,
     policy: ExecutionPolicy,
 ) -> None:
-    transport = FunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", route=RouteKind.BARE),
@@ -961,7 +921,7 @@ async def test_composite_identity_refuses_before_io(
 
 @pytest.mark.asyncio
 async def test_item_cursor_rejects_wrong_order_within_first_page() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 2}, {"ID": 1}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 2}, {"ID": 1}]})
     plan = ItemCursorPlan(
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING,
@@ -984,7 +944,7 @@ async def test_item_cursor_uses_internal_monotonic_tracking() -> None:
             return {"result": []}
         return {"result": [{"ID": 1, "cursor": 1}]}
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     plan = ItemCursorPlan(
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING,
@@ -1003,7 +963,7 @@ async def test_item_cursor_uses_internal_monotonic_tracking() -> None:
 
 @pytest.mark.asyncio
 async def test_latent_keyset_filter_collision_refuses_before_io() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", {"filter": {">ID": 99}}, route=RouteKind.BARE),
@@ -1018,7 +978,7 @@ async def test_latent_keyset_filter_collision_refuses_before_io() -> None:
 
 @pytest.mark.asyncio
 async def test_latent_item_cursor_collision_refuses_before_io() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
     plan = ItemCursorPlan(
         identity_requirement=IdentityRequirement.REQUIRED,
         order_semantics=OrderSemantics.ASCENDING,
@@ -1043,7 +1003,7 @@ async def test_duplicate_report_preserves_multiset_and_exact_unique_count() -> N
         pages = {0: [{"ID": 1}, {"ID": 2}], 2: [{"ID": 2}], 3: []}
         return {"result": pages[start]}
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", route=RouteKind.BARE),
@@ -1071,7 +1031,7 @@ async def test_early_close_counts_only_unique_rows_delivered_from_later_page() -
         return {"result": pages.get(start, [])}
 
     stream = iter_list(
-        Executor(FunctionTransport(handler)),
+        Executor(ResponderTransport(handler)),
         Request("crm.item.list", route=RouteKind.BARE),
         plan=_offset_plan(duplicate_policy=DuplicatePolicy.REPORT),
         identity=_identity(),
@@ -1095,7 +1055,7 @@ async def test_large_exact_identity_tracking_uses_declared_finite_budget() -> No
     rows = [{"ID": index} for index in range(distinct)]
     rows.insert(50_000, {"ID": 0})
     rows.append({"ID": distinct - 1})
-    transport = FunctionTransport(lambda _request: {"result": rows})
+    transport = ResponderTransport(lambda _request: {"result": rows})
     policy = ExecutionPolicy(
         max_buffered_rows=len(rows),
         max_identity_keys=distinct,
@@ -1119,7 +1079,7 @@ async def test_large_exact_identity_tracking_uses_declared_finite_budget() -> No
 
 @pytest.mark.asyncio
 async def test_buffer_budget_blocks_page_before_any_row_is_emitted() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", route=RouteKind.BARE),
@@ -1136,7 +1096,7 @@ async def test_buffer_budget_blocks_page_before_any_row_is_emitted() -> None:
 
 @pytest.mark.asyncio
 async def test_early_close_is_idempotent_and_reports_cancelled_with_buffer_high_water() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
     stream = iter_list(Executor(transport), Request("crm.item.list", route=RouteKind.BARE), plan=SingleResponsePlan())
 
     assert await anext(stream) == {"ID": 1}
@@ -1150,16 +1110,17 @@ async def test_early_close_is_idempotent_and_reports_cancelled_with_buffer_high_
 
 @pytest.mark.asyncio
 async def test_task_cancellation_propagates_to_transport_and_finalizes_report() -> None:
-    transport = BlockingTransport()
+    blocker = Blocker()
+    transport = ResponderTransport(blocker)
     stream = iter_list(Executor(transport), Request("crm.item.list", route=RouteKind.BARE), plan=SingleResponsePlan())
     task = asyncio.create_task(anext(stream))
-    await transport.started.wait()
+    await blocker.started.wait()
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert transport.cancelled.is_set()
+    assert blocker.cancelled.is_set()
     assert stream.report.state is KernelState.CANCELLED
 
 
@@ -1245,7 +1206,7 @@ async def test_cancellation_during_failed_finalization_preserves_failure_report(
 
 @pytest.mark.asyncio
 async def test_non_traversal_snapshot_requirement_is_unverified_and_incomplete() -> None:
-    transport = FunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     policy = ExecutionPolicy(
         consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST),
     )
@@ -1266,7 +1227,7 @@ async def test_non_traversal_snapshot_requirement_is_unverified_and_incomplete()
 
 @pytest.mark.asyncio
 async def test_case_insensitive_control_ambiguity_fails_before_network_io() -> None:
-    transport = FunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     stream = iter_list(
         Executor(transport),
         Request("crm.item.list", {"start": 99, "START": 99}, route=RouteKind.BARE),

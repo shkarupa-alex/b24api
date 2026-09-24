@@ -10,6 +10,9 @@
   full table, generated from `b24api.migration.ROOT_MOVES`. `KeysetSelectionSummary` is exported
   only by `b24api.contracts`.
 - `HttpxTransport` is exported from the root.
+- Development: `pytest-httpx` is no longer a dev dependency. Tests share one offline responder
+  transport and build clients through the public constructor, and the README, recipe and migration
+  examples are bound against the real `Bitrix24` signatures (B13, B15).
 - `Request.bare(...)` and `Request.v3(...)` build a request with the route fixed; they take the
   constructor's other arguments unchanged, and `v3` keeps the V3 contract (a mapping, JSON only). The
   route stays explicit and `Request(...)` is unchanged (C1, C13).

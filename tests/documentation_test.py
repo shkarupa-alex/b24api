@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 import ast
-import json
 import re
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -13,7 +12,8 @@ import pytest
 
 import b24api
 import b24api.contracts
-from b24api.execution import Executor, WireResponse
+from tests.real_signature import real_signature
+from tests.scripting import ResponderTransport, client_for
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
@@ -121,12 +121,17 @@ class _EmptyStream(AsyncIterator[object]):
 
 
 class _MigrationClient:
+    """No-I/O stand-in whose calls are bound against the real ``Bitrix24`` methods."""
+
+    @real_signature
     def iter_list_keyset(self, *_args: object, **kwargs: object) -> dict[str, object]:
         return kwargs
 
+    @real_signature
     def iter_cursors(self, *_args: object, **_kwargs: object) -> _EmptyStream:
         return _EmptyStream()
 
+    @real_signature
     async def verify_keyset_capability(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(verdict="verified")
 
@@ -164,23 +169,17 @@ async def test_migration_python_examples_execute_without_io() -> None:
             assert isinstance(stream["execution"], b24api.SequentialKeysetExecution)
 
 
-class _FixedStepTransport:
-    host = "test.invalid"
-
-    def __init__(self, pages: dict[int, list[int]]) -> None:
-        self.pages = pages
-
-    async def send(self, request: b24api.Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        del attempt_timeout, max_response_bytes
-        rows = [{"ID": value} for value in self.pages[request.copy_parameters().get("start", 0)]]
-        return WireResponse(200, (), json.dumps({"result": rows}).encode())
+def _fixed_step(pages: dict[int, list[int]]) -> ResponderTransport:
+    return ResponderTransport(
+        lambda request: {"result": [{"ID": value} for value in pages[request.copy_parameters().get("start", 0)]]}
+    )
 
 
 _Outcome = tuple[b24api.OperationReport | None, BaseException | None]
 
 
 async def _fixed_step_outcome(pages: dict[int, list[int]]) -> _Outcome:
-    client = b24api.Bitrix24._from_executor(Executor(_FixedStepTransport(pages)))  # noqa: SLF001
+    client = client_for(_fixed_step(pages))
     stream = client.iter_list(
         b24api.Request("example.list", replay_safety=b24api.ReplaySafety.SAFE, route=b24api.RouteKind.BARE),
         page_size=2,

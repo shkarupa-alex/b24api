@@ -13,23 +13,11 @@ from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError
 from b24api.execution import CoordinatorState, Executor, RateCoordinator, WireResponse
 from b24api.execution.throttle import parse_rate_limit_reset, parse_retry_after
+from tests.scripting import ResponderTransport, always
 
 HOST = "test.invalid"
 CAP = 3_600.0
 WALL_NOW = 1_800_000_000.0
-
-
-class _Transport:
-    """Answer every request with one fixed wire response."""
-
-    host = HOST
-
-    def __init__(self, response: WireResponse) -> None:
-        self.response = response
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        del request, attempt_timeout, max_response_bytes
-        return self.response
 
 
 def _json(status: int, payload: object, headers: tuple[tuple[str, str], ...] = ()) -> WireResponse:
@@ -76,7 +64,7 @@ def test_retry_after_keeps_rfc_forms_without_epoch_reinterpretation() -> None:
 
 async def _cooldown_after(headers: tuple[tuple[str, str], ...]) -> float:
     coordinator = RateCoordinator()
-    transport = _Transport(_json(429, {"error": "QUERY_LIMIT_EXCEEDED"}, headers))
+    transport = ResponderTransport(always(_json(429, {"error": "QUERY_LIMIT_EXCEEDED"}, headers)))
     executor = Executor(transport, coordinator=coordinator)
     try:
         with pytest.raises(BudgetExceededError):
@@ -110,7 +98,9 @@ async def test_retry_after_keeps_priority_over_rate_limit_reset() -> None:
 @pytest.mark.asyncio
 async def test_invalid_rate_limit_reset_never_freezes_the_host() -> None:
     coordinator = RateCoordinator()
-    transport = _Transport(_json(429, {"error": "QUERY_LIMIT_EXCEEDED"}, (("x-bitrix-ratelimit-reset", "garbage"),)))
+    transport = ResponderTransport(
+        always(_json(429, {"error": "QUERY_LIMIT_EXCEEDED"}, (("x-bitrix-ratelimit-reset", "garbage"),)))
+    )
     executor = Executor(transport, coordinator=coordinator)
     try:
         with pytest.raises(BudgetExceededError):

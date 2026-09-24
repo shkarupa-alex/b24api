@@ -14,6 +14,7 @@ import b24api
 from b24api import IdentitySpec, ReplaySafety, Request, ResultSelector, Settings
 from b24api.contracts import Command, CommandSuccess, IdentityCoercion, ReferenceComplete, ReferenceItem, Response
 from b24api.contracts.request import RouteKind
+from tests.real_signature import real_signature
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
@@ -68,7 +69,11 @@ class _ExampleStream[T](AsyncIterator[T]):
 
 
 class _ExampleClient:
-    """Method-agnostic no-I/O facade sufficient to execute README snippets exactly."""
+    """No-I/O facade for README snippets; every call is bound against the real ``Bitrix24`` method."""
+
+    @real_signature
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        return None
 
     async def __aenter__(self) -> Self:
         return self
@@ -76,57 +81,81 @@ class _ExampleClient:
     async def __aexit__(self, *_exc: object) -> None:
         return None
 
+    @real_signature
     async def call(self, request: Request, **_kwargs: object) -> object:
         return request.copy_parameters()
 
+    @real_signature
     async def call_response(self, _request: Request, **_kwargs: object) -> Response:
         return Response({"ok": True})
 
+    @real_signature
     async def call_bytes(self, _request: Request, **_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(body=b"", content_type="application/octet-stream")
 
+    @real_signature
     def batch(self, commands: Iterable[Command[object]], **_kwargs: object) -> _ExampleStream[CommandSuccess[object]]:
+        return self._successes(commands)
+
+    @staticmethod
+    def _successes(commands: Iterable[Command[object]]) -> _ExampleStream[CommandSuccess[object]]:
         return _ExampleStream(
             CommandSuccess(index, command.correlation, command.request.summary, Response({"ok": True}))
             for index, command in enumerate(commands)
         )
 
+    @real_signature
     def batch_outcomes(
         self,
         commands: Iterable[Command[object]],
         **_kwargs: object,
     ) -> _ExampleStream[CommandSuccess[object]]:
-        return self.batch(commands)
+        return self._successes(commands)
 
+    @real_signature
     def iter_list(self, _request: Request, **_kwargs: object) -> _ExampleStream[object]:
+        return self._rows()
+
+    @staticmethod
+    def _rows() -> _ExampleStream[object]:
         return _ExampleStream(({"ID": 1},))
 
-    def iter_list_counted(self, request: Request, **kwargs: object) -> _ExampleStream[object]:
-        return self.iter_list(request, **kwargs)
+    @real_signature
+    def iter_list_counted(self, _request: Request, **_kwargs: object) -> _ExampleStream[object]:
+        return self._rows()
 
-    def iter_list_keyset(self, request: Request, **kwargs: object) -> _ExampleStream[object]:
-        return self.iter_list(request, **kwargs)
+    @real_signature
+    def iter_list_keyset(self, _request: Request, **_kwargs: object) -> _ExampleStream[object]:
+        return self._rows()
 
-    def iter_list_cursor(self, request: Request, **kwargs: object) -> _ExampleStream[object]:
-        return self.iter_list(request, **kwargs)
+    @real_signature
+    def iter_list_cursor(self, _request: Request, **_kwargs: object) -> _ExampleStream[object]:
+        return self._rows()
 
+    @real_signature
     def iter_cursors(
         self,
-        request: Request,
+        _request: Request,
         bindings: Iterable[object],
-        **kwargs: object,
+        **_kwargs: object,
     ) -> _ExampleStream[object]:
-        return self.iter_references(request, bindings, **kwargs)
+        return self._references(bindings)
 
+    @real_signature
     async def verify_keyset_capability(self, _request: Request, **_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(verdict="verified")
 
+    @real_signature
     def iter_references(
         self,
         _request: Request,
         bindings: Iterable[object],
         **_kwargs: object,
     ) -> _ExampleStream[object]:
+        return self._references(bindings)
+
+    @staticmethod
+    def _references(bindings: Iterable[object]) -> _ExampleStream[object]:
         binding = next(iter(bindings))
         correlation = cast("Any", binding).correlation
         return _ExampleStream(
@@ -135,6 +164,20 @@ class _ExampleClient:
                 ReferenceComplete(0, correlation, 1),
             ),
         )
+
+
+def test_example_client_rejects_calls_the_real_client_would_reject() -> None:
+    client = _ExampleClient()
+    request = Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+
+    with pytest.raises(TypeError, match="page_sise"):
+        client.iter_list(request, page_sise=10)
+    with pytest.raises(TypeError, match="missing a required argument"):
+        client.iter_references(request)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="too many positional arguments"):
+        client.iter_list_counted(request, 1)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        _ExampleClient(Settings(webhook_url="https://example.invalid/rest/1/doc/"), transprot=None)
 
 
 def test_every_readme_python_example_is_syntax_checked_and_names_an_executable_test() -> None:

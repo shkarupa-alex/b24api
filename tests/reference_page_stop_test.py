@@ -1,7 +1,7 @@
 """A stopped reference binding leaves sibling pagination and correlation intact."""
 
 from __future__ import annotations
-import json
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs
 
 import pytest
@@ -9,7 +9,6 @@ import pytest
 from b24api import (
     BatchDispatch,
     Binding,
-    Bitrix24,
     CursorSpec,
     DirectDispatch,
     IdentityCoercion,
@@ -33,30 +32,27 @@ from b24api.contracts import (
     ReferenceFailure,
     ReferenceItem,
 )
-from b24api.execution import Executor, WireResponse
+from tests.scripting import ResponderTransport, client_for
+
+if TYPE_CHECKING:
+    from tests.scripting import ClientFactory
 
 
-class ChatTransport:
-    """Two independent descending chats with a finite source oracle."""
-
-    host = "fixture.invalid"
+class ChatPortal:
+    """Two independent descending chats with a finite source oracle, answered directly or in a batch."""
 
     def __init__(self) -> None:
-        """Track each exact binding and cursor sent over the wire."""
-        self.requests: list[tuple[str, int]] = []
+        """Track each exact binding and cursor the portal answered."""
+        self.seen: list[tuple[str, int]] = []
         self.ids = {"a": (5, 4, 3, 2, 1), "b": (15, 14, 13)}
-        self.physical_batches = 0
 
     def _rows(self, parent: str, control: int) -> list[dict[str, int]]:
-        self.requests.append((parent, control))
+        self.seen.append((parent, control))
         return [{"id": value} for value in self.ids[parent] if value < control][:2]
 
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Return at most two IDs strictly below LAST_ID."""
-        assert attempt_timeout > 0
-        assert max_response_bytes > 0
+    def __call__(self, request: Request) -> object:
+        """Return at most two IDs strictly below LAST_ID for each command."""
         if request.method == "batch":
-            self.physical_batches += 1
             commands = request.copy_parameters()["cmd"]
             assert isinstance(commands, dict)
             result: dict[str, object] = {}
@@ -64,14 +60,13 @@ class ChatTransport:
                 assert isinstance(command, str)
                 parameters = parse_qs(command.split("?", 1)[1])
                 result[key] = self._rows(parameters["parent"][0], int(parameters["LAST_ID"][0]))
-            return WireResponse(200, (), json.dumps({"result": {"result": result, "result_error": []}}).encode())
+            return {"result": {"result": result, "result_error": []}}
         parameters = request.copy_parameters()
         parent = parameters["parent"]
         control = parameters["LAST_ID"]
         assert isinstance(parent, str)
         assert isinstance(control, int)
-        rows = self._rows(parent, control)
-        return WireResponse(200, (), json.dumps({"result": rows}).encode())
+        return {"result": self._rows(parent, control)}
 
 
 class StopFirstChat:
@@ -91,9 +86,12 @@ class StopFirstChat:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dispatch_kind", ["direct", "batch"])
-async def test_reference_page_stop_is_per_binding_and_not_source_exhaustion(dispatch_kind: str) -> None:
-    transport = ChatTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_reference_page_stop_is_per_binding_and_not_source_exhaustion(
+    dispatch_kind: str, scripted_client: ClientFactory
+) -> None:
+    portal = ChatPortal()
+    transport = ResponderTransport(portal)
+    client = scripted_client(transport)
     path = ParameterPath(("parent",))
     bindings = (
         Binding("chat a", (ParameterUpdate(path, "a"),), "a"),
@@ -129,9 +127,9 @@ async def test_reference_page_stop_is_per_binding_and_not_source_exhaustion(disp
         (1, 14),
         (1, 13),
     ]
-    assert [control for parent, control in transport.requests if parent == "a"] == [100]
-    assert [control for parent, control in transport.requests if parent == "b"] == [100, 14, 13]
-    assert (transport.physical_batches > 0) is (dispatch_kind == "batch")
+    assert [control for parent, control in portal.seen if parent == "a"] == [100]
+    assert [control for parent, control in portal.seen if parent == "b"] == [100, 14, 13]
+    assert any(request.method == "batch" for request in transport.requests) is (dispatch_kind == "batch")
     assert not completions[0].exhausted
     assert completions[0].stop_reason == "first chat cutoff"
     assert completions[1].exhausted
@@ -151,18 +149,18 @@ async def test_reference_page_stop_is_per_binding_and_not_source_exhaustion(disp
     assert stream.report.partial
 
 
-class RepeatingSecondChat(ChatTransport):
+class RepeatingSecondChat(ChatPortal):
     """Chat b answers its second page with IDs it has already delivered."""
 
     def _rows(self, parent: str, control: int) -> list[dict[str, int]]:
         if parent == "b" and control != 100:  # noqa: PLR2004 - the initial LAST_ID of the fixture
-            self.requests.append((parent, control))
+            self.seen.append((parent, control))
             return [{"id": 15}, {"id": 14}]
         return super()._rows(parent, control)
 
 
-def _two_chat_stream(transport: ChatTransport):  # noqa: ANN202 - public stream type is internal here
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+def _two_chat_stream(portal: ChatPortal):  # noqa: ANN202 - public stream type is internal here
+    client = client_for(ResponderTransport(portal))
     path = ParameterPath(("parent",))
     return client.iter_cursors(
         Request("messages.get", {"parent": "", "LAST_ID": 100}, route=RouteKind.BARE),
@@ -204,7 +202,7 @@ async def test_incomplete_multi_chat_mirror_with_a_stopped_chat_reports_mechanic
 
 @pytest.mark.asyncio
 async def test_early_closed_multi_chat_mirror_with_a_stopped_chat_reports_mechanics_only() -> None:
-    stream = _two_chat_stream(ChatTransport())
+    stream = _two_chat_stream(ChatPortal())
     async for event in stream:
         if isinstance(event, ReferenceComplete) and event.binding_index == 0:
             break

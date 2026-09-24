@@ -1,13 +1,11 @@
 """A counted head that returns no rows and no total closes as an observed empty source."""
 
 from __future__ import annotations
-import json
 from typing import TYPE_CHECKING
 
 import pytest
 
 from b24api import (
-    Bitrix24,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
@@ -42,9 +40,9 @@ from b24api.contracts.response import Response
 from b24api.errors import CapabilityError, IncompleteTraversalError
 from b24api.execution import Executor
 from b24api.execution.snapshot import KernelReport
-from b24api.transport import WireResponse
 from b24api.traversal.driver import PaginationDriver
 from b24api.traversal.plans import CountedOffsetPlan
+from tests.scripting import ResponderTransport, client_for, replies
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -57,21 +55,6 @@ PAGE_SIZE = 50
 _ABSENT = object()
 _IDENTITY = IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER)
 _COUNTED = OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED)
-
-
-class _Transport:
-    host = "test.invalid"
-
-    def __init__(self, *payloads: dict[str, object] | Callable[[Request], dict[str, object]]) -> None:
-        self.payloads = list(payloads)
-        self.requests: list[Request] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        del attempt_timeout, max_response_bytes
-        self.requests.append(request)
-        payload = self.payloads.pop(0)
-        body = payload(request) if callable(payload) else payload
-        return WireResponse(200, (("Content-Type", "application/json"),), json.dumps(body).encode())
 
 
 def _batch_tail(rows: list[dict[str, int]], *, total: object = _ABSENT) -> Callable[[Request], dict[str, object]]:
@@ -116,13 +99,13 @@ def closures(monkeypatch: pytest.MonkeyPatch) -> list[tuple[BindingClosure, Stre
 
 
 def _stream(
-    transport: _Transport,
+    transport: ResponderTransport,
     *,
     identity: IdentitySpec | None = None,
     offset: OffsetSpec = _COUNTED,
     policy: ExecutionPolicy | None = None,
 ) -> OperationStream[JsonValue]:
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001
+    client = client_for(transport)
     return client.iter_list_counted(
         Request("user.get", {"filter": {"ID": 0}}, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=identity,
@@ -151,7 +134,7 @@ async def test_empty_head_without_usable_total_closes_as_source_empty(
     identity: IdentitySpec | None,
     assurance: TraversalAssurance,
 ) -> None:
-    transport = _Transport(_payload([], total=total))
+    transport = ResponderTransport(replies(_payload([], total=total)))
     stream = _stream(transport, identity=identity)
 
     assert [row async for row in stream] == []
@@ -189,7 +172,7 @@ async def test_empty_head_with_zero_total_keeps_the_qualified_total_closure(
     identity: IdentitySpec | None,
     assurance: TraversalAssurance,
 ) -> None:
-    transport = _Transport(_payload([], total=0))
+    transport = ResponderTransport(replies(_payload([], total=0)))
     stream = _stream(transport, identity=identity)
 
     assert [row async for row in stream] == []
@@ -211,7 +194,7 @@ async def test_positive_total_head_is_unchanged_and_batches_its_tail(
 ) -> None:
     rows = [{"ID": identity} for identity in range(1, PAGE_SIZE + 1)]
     tail = _batch_tail([{"ID": PAGE_SIZE + 1}], total=PAGE_SIZE + 1)
-    transport = _Transport(_payload(rows, total=PAGE_SIZE + 1, next_value=PAGE_SIZE), tail)
+    transport = ResponderTransport(replies(_payload(rows, total=PAGE_SIZE + 1, next_value=PAGE_SIZE), tail))
     stream = _stream(transport, identity=_IDENTITY)
 
     assert len([row async for row in stream]) == PAGE_SIZE + 1
@@ -251,7 +234,7 @@ async def test_heads_outside_the_empty_source_contract_remain_incomplete(
     offset: OffsetSpec,
     policy: ExecutionPolicy | None,
 ) -> None:
-    transport = _Transport(payload)
+    transport = ResponderTransport(replies(payload))
     stream = _stream(transport, offset=offset, policy=policy)
 
     with pytest.raises(IncompleteTraversalError):
@@ -273,7 +256,7 @@ async def test_heads_outside_the_empty_source_contract_remain_incomplete(
 async def test_later_page_without_total_remains_incomplete() -> None:
     rows = [{"ID": identity} for identity in range(1, PAGE_SIZE + 1)]
     tail = _batch_tail([{"ID": PAGE_SIZE + 1}])
-    transport = _Transport(_payload(rows, total=PAGE_SIZE + 1, next_value=PAGE_SIZE), tail)
+    transport = ResponderTransport(replies(_payload(rows, total=PAGE_SIZE + 1, next_value=PAGE_SIZE), tail))
     stream = _stream(transport, identity=_IDENTITY)
 
     with pytest.raises(IncompleteTraversalError) as caught:
@@ -294,7 +277,7 @@ async def test_empty_source_still_requires_a_verified_snapshot(
     closures: list[tuple[BindingClosure, StreamClosure, int | None]],
 ) -> None:
     policy = ExecutionPolicy(consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST))
-    transport = _Transport(_payload([]))
+    transport = ResponderTransport(replies(_payload([])))
     stream = _stream(transport, policy=policy)
 
     assert [row async for row in stream] == []
@@ -319,7 +302,7 @@ async def test_rejected_eligible_head_leaves_no_empty_source_evidence(
         raise CapabilityError("scripted commit refusal")
 
     monkeypatch.setattr(CountedCompletionRecorder, "validated", refuse)
-    transport = _Transport(_payload([]))
+    transport = ResponderTransport(replies(_payload([])))
     stream = _stream(transport)
 
     with pytest.raises(IncompleteTraversalError):
@@ -352,7 +335,7 @@ def test_empty_source_witness_is_only_valid_on_a_completed_report_without_rows()
 
 
 def _driver() -> PaginationDriver:
-    executor = Executor(_Transport())
+    executor = Executor(ResponderTransport(replies()))
     plan = CountedOffsetPlan(
         identity_requirement=IdentityRequirement.OPTIONAL,
         order_semantics=OrderSemantics.UNORDERED,

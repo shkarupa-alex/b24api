@@ -83,6 +83,7 @@ from b24api.testing import transport as testing_transport
 from b24api.transport import HttpxTransport, TransportCapabilities, WireRequest, WireResponse
 from b24api.traversal import iter_list
 from b24api.traversal.plans import CountedOffsetPlan
+from tests.scripting import ResponderTransport, client_for
 
 PAGE_SIZE = 50
 OBSERVED_REQUESTS = 2
@@ -93,21 +94,10 @@ DISTINCT_REQUESTS = 2
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
 
-
-class _Transport:
-    host = "test.invalid"
-
-    def __init__(self, handler: Callable[[Request], WireResponse]) -> None:
-        self.handler = handler
-        self.requests: list[Request] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        del attempt_timeout, max_response_bytes
-        self.requests.append(request)
-        return self.handler(request)
+    from tests.scripting import ClientFactory
 
 
-class _WireTransport(_Transport):
+class _WireTransport(ResponderTransport):
     capabilities = TransportCapabilities(
         frozenset({BodyEncoding.JSON, BodyEncoding.FORM_URLENCODED}),
         scoped_headers=True,
@@ -115,6 +105,7 @@ class _WireTransport(_Transport):
 
     def __init__(self, handler: Callable[[Request], WireResponse]) -> None:
         super().__init__(handler)
+        self.handler = handler
         self.wire_requests: list[WireRequest] = []
 
     async def send_wire(
@@ -148,8 +139,8 @@ def _response(result: object, *, total: int | None = None, next_value: int | Non
     return WireResponse(200, (("Content-Type", "application/json"),), json.dumps(payload).encode())
 
 
-def _client(transport: _Transport) -> Bitrix24:
-    return Bitrix24._from_executor(Executor(transport))  # noqa: SLF001
+def _client(transport: ResponderTransport) -> Bitrix24:
+    return client_for(transport)
 
 
 def test_request_derivation_preserves_all_non_parameter_contracts() -> None:
@@ -227,7 +218,7 @@ def test_public_request_summary_normalizes_and_redacts_header_names() -> None:
 
 @pytest.mark.asyncio
 async def test_advanced_request_requires_advertised_transport_before_io() -> None:
-    transport = _Transport(lambda _request: _response(result=True))
+    transport = ResponderTransport(lambda _request: _response(result=True))
     request = Request("example.action", encoding=BodyEncoding.FORM_URLENCODED, route=RouteKind.BARE)
 
     with pytest.raises(CapabilityError):
@@ -238,7 +229,7 @@ async def test_advanced_request_requires_advertised_transport_before_io() -> Non
 
 @pytest.mark.asyncio
 async def test_binary_call_returns_every_success_byte_without_json_sniffing() -> None:
-    transport = _Transport(lambda _request: WireResponse(200, (("Content-Type", "text/csv"),), b"a,b\n1,2\n"))
+    transport = ResponderTransport(lambda _request: WireResponse(200, (("Content-Type", "text/csv"),), b"a,b\n1,2\n"))
 
     response = await _client(transport).call_bytes(
         Request("example.download", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
@@ -272,7 +263,7 @@ def test_wire_response_repr_drops_unbounded_invalid_media_type() -> None:
 @pytest.mark.asyncio
 async def test_binary_content_type_evidence_drops_parameters_and_rejects_unsafe_media_types() -> None:
     sensitive_value = "token-secret-value-123"
-    transport = _Transport(
+    transport = ResponderTransport(
         lambda _request: WireResponse(
             200,
             (("Content-Type", f"application/octet-stream; token={sensitive_value}"),),
@@ -328,7 +319,8 @@ async def test_embedded_error_contract_is_opt_in_and_preserves_wire_code() -> No
         ("message",),
         ResultErrorShape.MAPPING,
     )
-    transport = _Transport(lambda _request: _response({"error": {"code": "ACCESS_DENIED", "message": "Denied"}}))
+    denied = {"error": {"code": "ACCESS_DENIED", "message": "Denied"}}
+    transport = ResponderTransport(lambda _request: _response(denied))
 
     with pytest.raises(ApiResponseError) as captured:
         await Executor(transport).execute(Request("example.list", result_error=spec, route=RouteKind.BARE))
@@ -340,7 +332,7 @@ async def test_embedded_error_contract_is_opt_in_and_preserves_wire_code() -> No
 
 @pytest.mark.asyncio
 async def test_unstructured_post_dispatch_status_is_ambiguous_for_unknown() -> None:
-    transport = _Transport(lambda _request: WireResponse(503, (), b"unstructured"))
+    transport = ResponderTransport(lambda _request: WireResponse(503, (), b"unstructured"))
 
     with pytest.raises(AmbiguousExecutionError) as captured:
         await Executor(transport).execute(Request("example.write", route=RouteKind.BARE))
@@ -354,7 +346,7 @@ async def test_unstructured_post_dispatch_status_is_ambiguous_for_unknown() -> N
 async def test_malformed_nonempty_2xx_remains_protocol_error_under_broad_ambiguity_policy(
     safety: ReplaySafety,
 ) -> None:
-    transport = _Transport(lambda _request: WireResponse(200, (), b"not-json"))
+    transport = ResponderTransport(lambda _request: WireResponse(200, (), b"not-json"))
     policy = ExecutionPolicy(ambiguity=AmbiguityPolicy(frozenset(range(100, 600))))
 
     with pytest.raises(ProtocolError) as captured:
@@ -369,7 +361,7 @@ async def test_malformed_nonempty_2xx_remains_protocol_error_under_broad_ambigui
 @pytest.mark.asyncio
 @pytest.mark.parametrize("body", [b"", b"[]", b"{}"])
 async def test_success_envelope_defects_remain_envelope_contract_errors(body: bytes) -> None:
-    transport = _Transport(lambda _request: WireResponse(200, (), body))
+    transport = ResponderTransport(lambda _request: WireResponse(200, (), body))
 
     with pytest.raises(EnvelopeContractError):
         await Executor(transport).execute(
@@ -379,7 +371,7 @@ async def test_success_envelope_defects_remain_envelope_contract_errors(body: by
 
 @pytest.mark.asyncio
 async def test_envelope_contract_error_is_a_gateway_origin_protocol_error_and_is_not_retried() -> None:
-    transport = _Transport(lambda _request: WireResponse(200, (), b"{}"))
+    transport = ResponderTransport(lambda _request: WireResponse(200, (), b"{}"))
 
     with pytest.raises(ProtocolError) as captured:
         await Executor(transport).execute(
@@ -411,7 +403,7 @@ async def test_conformance_runner_times_out_transport_that_never_reaches_respond
     monkeypatch.setattr(testing_transport, "_CASE_TIMEOUT_SECONDS", 0.05)
     started = time.monotonic()
     report = await run_transport_conformance(
-        lambda _url: _Transport(lambda _request: _response(result=True)),
+        lambda _url: ResponderTransport(lambda _request: _response(result=True)),
         cases=frozenset({ConformanceCase.LEGACY_JSON_BODY}),
     )
 
@@ -432,9 +424,9 @@ async def test_conformance_runner_bounds_blocking_factory_and_hanging_cleanup(
     monkeypatch.setattr(testing_transport, "_CASE_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(testing_transport, "_CLOSE_TIMEOUT_SECONDS", 0.05)
 
-    def blocking_factory(_url: str) -> _Transport:
+    def blocking_factory(_url: str) -> ResponderTransport:
         time.sleep(0.2)
-        return _Transport(lambda _request: _response(result=True))
+        return ResponderTransport(lambda _request: _response(result=True))
 
     started = time.monotonic()
     factory_report = await run_transport_conformance(
@@ -447,7 +439,7 @@ async def test_conformance_runner_bounds_blocking_factory_and_hanging_cleanup(
 
     release_cleanup = asyncio.Event()
 
-    class HangingCloseTransport(_Transport):
+    class HangingCloseTransport(ResponderTransport):
         async def aclose(self) -> None:
             while not release_cleanup.is_set():
                 try:
@@ -473,7 +465,7 @@ async def test_conformance_runner_distinguishes_transport_timeout_from_harness_d
         raise TimeoutError
 
     report = await run_transport_conformance(
-        lambda _url: _Transport(raises_timeout),
+        lambda _url: ResponderTransport(raises_timeout),
         cases=frozenset({ConformanceCase.LEGACY_JSON_BODY}),
     )
 
@@ -482,7 +474,7 @@ async def test_conformance_runner_distinguishes_transport_timeout_from_harness_d
 
 @pytest.mark.asyncio
 async def test_isolated_base_exceptions_become_outcomes_without_cancelling_caller() -> None:
-    class CancelledSend(_Transport):
+    class CancelledSend(ResponderTransport):
         async def send(
             self,
             request: Request,
@@ -498,7 +490,7 @@ async def test_isolated_base_exceptions_become_outcomes_without_cancelling_calle
         cases=frozenset({ConformanceCase.LEGACY_JSON_BODY}),
     )
 
-    class CancelledClose(_Transport):
+    class CancelledClose(ResponderTransport):
         async def aclose(self) -> None:
             raise asyncio.CancelledError
 
@@ -519,7 +511,7 @@ async def test_isolated_base_exceptions_become_outcomes_without_cancelling_calle
 async def test_isolated_process_aborts_become_value_free_outcomes(
     abort: type[BaseException],
 ) -> None:
-    class AbortingSend(_Transport):
+    class AbortingSend(ResponderTransport):
         async def send(
             self,
             request: Request,
@@ -545,7 +537,7 @@ async def test_case_failure_deterministically_precedes_resistant_cleanup(
     monkeypatch.setattr(testing_transport, "_CLOSE_TIMEOUT_SECONDS", 0.02)
     releases: list[threading.Event] = []
 
-    class TimeoutThenResistantClose(_Transport):
+    class TimeoutThenResistantClose(ResponderTransport):
         async def send(
             self,
             request: Request,
@@ -651,7 +643,7 @@ async def test_fixed_step_ignores_relative_next_and_exact_total_can_terminate() 
             return _response([{"ID": 3}], total=3, next_value=1)
         raise AssertionError("fixed-step traversal used an undeclared offset")
 
-    transport = _Transport(handler)
+    transport = ResponderTransport(handler)
     stream = _client(transport).iter_list(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER),
@@ -679,7 +671,7 @@ async def test_fixed_step_rejects_any_closure_after_a_short_unqualified_window()
         # No answer here could close the window: rows contradict it and an empty page is not accepted (B10).
         raise AssertionError("fixed-step traversal requested a confirmation it cannot use")
 
-    transport = _Transport(handler)
+    transport = ResponderTransport(handler)
     stream = _client(transport).iter_list(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         page_size=step,
@@ -703,7 +695,7 @@ async def test_reference_fixed_step_rejects_empty_closure_after_a_short_window()
         start = request.copy_parameters().get("start", 0)
         return _response([{"ID": 1}]) if start == 0 else _response([])
 
-    stream = _client(_Transport(handler)).iter_reference_outcomes(
+    stream = _client(ResponderTransport(handler)).iter_reference_outcomes(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("one", (), object())],
         traversal=SequentialTraversal(
@@ -738,7 +730,7 @@ async def test_reference_sequential_preserves_page_index_controls() -> None:
         observed.append((page, limit))
         return _response([{"ID": 1}, {"ID": 2}]) if page == initial_page else _response([])
 
-    stream = _client(_Transport(handler)).iter_references(
+    stream = _client(ResponderTransport(handler)).iter_references(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("one", (), object())],
         traversal=SequentialTraversal(
@@ -777,7 +769,7 @@ async def test_page_index_rejects_rows_after_a_short_window_in_direct_and_refere
         page_size=page_size,
         offset=OffsetSpec(parameter_path=page_path, page_index=PageIndex(page_path, max_rows=page_size)),
     )
-    direct = _client(_Transport(handler)).iter_list(
+    direct = _client(ResponderTransport(handler)).iter_list(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         page_size=traversal.page_size,
         offset=traversal.offset,
@@ -787,7 +779,7 @@ async def test_page_index_rejects_rows_after_a_short_window_in_direct_and_refere
     assert isinstance(direct_failure.value.__cause__, PaginationError)
     assert not direct.report.exhausted
 
-    reference = _client(_Transport(handler)).iter_reference_outcomes(
+    reference = _client(ResponderTransport(handler)).iter_reference_outcomes(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("one", (), object())],
         traversal=traversal,
@@ -802,7 +794,7 @@ async def test_page_index_rejects_rows_after_a_short_window_in_direct_and_refere
 
 
 def test_counted_rejects_inconsistent_or_wire_limited_page_stride_before_io() -> None:
-    transport = _Transport(lambda _request: pytest.fail("invalid counted stride must reject before I/O"))
+    transport = ResponderTransport(lambda _request: pytest.fail("invalid counted stride must reject before I/O"))
     client = _client(transport)
     with pytest.raises(ValueError, match="decoded row cap must equal"):
         OffsetSpec(
@@ -899,7 +891,7 @@ async def test_reference_counted_fixed_step_ignores_relative_next() -> None:
             },
         )
 
-    transport = _Transport(handler)
+    transport = ResponderTransport(handler)
     stream = _client(transport).iter_references(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("one", (), object())],
@@ -925,7 +917,7 @@ async def test_reference_counted_fixed_step_ignores_relative_next() -> None:
 
 @pytest.mark.asyncio
 async def test_counted_fixed_step_accepts_zero_total_terminal_next_zero() -> None:
-    stream = _client(_Transport(lambda _request: _response([], total=0, next_value=0))).iter_list_counted(
+    stream = _client(ResponderTransport(lambda _request: _response([], total=0, next_value=0))).iter_list_counted(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=None,
         offset=OffsetSpec(
@@ -969,7 +961,7 @@ def test_counted_rejects_unqualified_total_and_non_batchable_request_before_io()
 
 @pytest.mark.asyncio
 async def test_filtered_exact_rejects_minus_one_as_absent_on_nonterminal_page() -> None:
-    stream = _client(_Transport(lambda _request: _response([{"ID": 1}], total=-1, next_value=1))).iter_list(
+    stream = _client(ResponderTransport(lambda _request: _response([{"ID": 1}], total=-1, next_value=1))).iter_list(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=None,
         offset=OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED),
@@ -987,7 +979,7 @@ async def test_composite_identity_detects_duplicate_tuple() -> None:
             IdentityComponent(("id",), IdentityCoercion.EXACT_INTEGER),
         ),
     )
-    transport = _Transport(lambda _request: _response([{"type": 1, "id": 7}, {"type": 1, "id": 7}]))
+    transport = ResponderTransport(lambda _request: _response([{"type": 1, "id": 7}, {"type": 1, "id": 7}]))
     stream = _client(transport).iter_list(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=identity,
@@ -1018,7 +1010,7 @@ async def test_keyset_page_trace_never_publishes_identity_as_offset() -> None:
         calls += 1
         return _response([{"ID": 900001}]) if calls == 1 else _response([])
 
-    stream = _client(_Transport(handler)).iter_list_keyset(
+    stream = _client(ResponderTransport(handler)).iter_list_keyset(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER),
@@ -1032,7 +1024,7 @@ async def test_keyset_page_trace_never_publishes_identity_as_offset() -> None:
 
 @pytest.mark.asyncio
 async def test_shape_rejection_is_retained_as_zero_admission_page_evidence() -> None:
-    stream = _client(_Transport(lambda _request: _response("not-a-mapping"))).iter_list(
+    stream = _client(ResponderTransport(lambda _request: _response("not-a-mapping"))).iter_list(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         collection_shape=ResultCollectionShape.MAPPING_VALUES,
     )
@@ -1052,7 +1044,7 @@ async def test_shape_rejection_is_retained_as_zero_admission_page_evidence() -> 
 
 @pytest.mark.asyncio
 async def test_sequence_shape_rejection_has_selector_type_and_page_context() -> None:
-    stream = _client(_Transport(lambda _request: _response({"items": {"one": 1}}))).iter_list(
+    stream = _client(ResponderTransport(lambda _request: _response({"items": {"one": 1}}))).iter_list(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector(("items",)),
     )
@@ -1080,7 +1072,7 @@ async def test_batch_isolates_embedded_shape_failure_and_normalizes_terminal_nex
             },
         )
 
-    stream = _client(_Transport(handler)).batch_outcomes(
+    stream = _client(ResponderTransport(handler)).batch_outcomes(
         [
             Command(
                 Request("example.bad", replay_safety=ReplaySafety.SAFE, result_error=malformed, route=RouteKind.BARE),
@@ -1105,7 +1097,7 @@ async def test_tolerant_batch_rejects_unsupported_representation_per_command() -
         assert len(keys) == 1
         return _response({"result": {keys[0]: {"ok": True}}, "result_error": {}})
 
-    stream = _client(_Transport(handler)).batch_outcomes(
+    stream = _client(ResponderTransport(handler)).batch_outcomes(
         [
             Command(
                 Request(
@@ -1133,7 +1125,7 @@ async def test_reference_report_aggregates_page_trace_with_global_sequences() ->
         start = request.copy_parameters().get("start", 0)
         return _response([{"ID": 1}], next_value=1) if start == 0 else _response([])
 
-    stream = _client(_Transport(handler)).iter_reference_outcomes(
+    stream = _client(ResponderTransport(handler)).iter_reference_outcomes(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("one", (), object())],
         traversal=SequentialTraversal(),
@@ -1156,7 +1148,7 @@ def test_reference_base_control_preflight_does_not_consume_bindings() -> None:
         yield Binding("one", (), object())
 
     with pytest.raises(CapabilityError, match="traversal controls"):
-        _client(_Transport(lambda _request: _response([]))).iter_references(
+        _client(ResponderTransport(lambda _request: _response([]))).iter_references(
             Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             bindings(),
             traversal=SequentialTraversal(
@@ -1186,7 +1178,7 @@ def test_reference_transport_preflight_does_not_consume_bindings(candidate_reque
         consumed = True
         yield Binding("one", (), object())
 
-    transport = _Transport(lambda _request: _response([]))
+    transport = ResponderTransport(lambda _request: _response([]))
     with pytest.raises(CapabilityError, match="advanced request delivery"):
         _client(transport).iter_references(
             candidate_request,
@@ -1224,7 +1216,7 @@ def test_reference_malformed_capabilities_do_not_consume_async_bindings() -> Non
 @pytest.mark.asyncio
 async def test_zero_total_counted_page_completes_in_kernel_and_reference_paths() -> None:
     kernel = iter_list(
-        Executor(_Transport(lambda _request: _response([], total=0))),
+        Executor(ResponderTransport(lambda _request: _response([], total=0))),
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         plan=CountedOffsetPlan(),
     )
@@ -1243,7 +1235,7 @@ async def test_zero_total_counted_page_completes_in_kernel_and_reference_paths()
             },
         )
 
-    reference = _client(_Transport(reference_handler)).iter_references(
+    reference = _client(ResponderTransport(reference_handler)).iter_references(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("empty", (), object())],
         traversal=CountedTraversal(),
@@ -1261,7 +1253,7 @@ async def test_zero_total_counted_page_completes_in_kernel_and_reference_paths()
 
 @pytest.mark.asyncio
 async def test_reference_fail_fast_classifies_underlying_pagination_failure() -> None:
-    stream = _client(_Transport(lambda _request: _response([{"ID": 7}, {"ID": 7}]))).iter_references(
+    stream = _client(ResponderTransport(lambda _request: _response([{"ID": 7}, {"ID": 7}]))).iter_references(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("one", (), object())],
         traversal=SequentialTraversal(identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER)),
@@ -1291,7 +1283,7 @@ async def test_reference_fail_fast_retains_retryable_replay_disposition_in_repor
             },
         )
 
-    stream = _client(_Transport(handler)).iter_references(
+    stream = _client(ResponderTransport(handler)).iter_references(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("one", (), object())],
         traversal=CountedTraversal(),
@@ -1319,7 +1311,7 @@ async def test_split_keyset_controls_and_tolerant_mapping_terminal() -> None:
             return _response({"one": {"CONFIG_ID": 4}})
         return _response([])
 
-    transport = _Transport(handler)
+    transport = ResponderTransport(handler)
     stream = _client(transport).iter_list_keyset(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
@@ -1354,8 +1346,8 @@ async def test_unknown_audit_failure_is_value_free_and_retained_in_stream_report
     def broken_audit(_summary: object) -> None:
         raise RuntimeError(sensitive_value)
 
-    client = Bitrix24._from_executor(  # noqa: SLF001
-        Executor(_Transport(lambda _request: _response([]))),
+    client = client_for(
+        ResponderTransport(lambda _request: _response([])),
         unknown_request_audit=broken_audit,
     )
     with pytest.warns(RuntimeWarning, match="audit hook raised RuntimeError"):
@@ -1412,7 +1404,7 @@ async def test_split_order_control_paths_equal_controls_injected_by_deterministi
         IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER),
         keyset=keyset,
     )
-    stream = _client(_Transport(handler)).iter_list_keyset(
+    stream = _client(ResponderTransport(handler)).iter_list_keyset(
         Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=traversal.selector,
         identity=traversal.identity,
@@ -1447,10 +1439,10 @@ async def test_conformance_detects_transport_that_skips_reserved_header_revalida
 
 
 @pytest.mark.asyncio
-async def test_unknown_audit_runs_at_each_lazy_fanout_admission_only() -> None:
+async def test_unknown_audit_runs_at_each_lazy_fanout_admission_only(scripted_client: ClientFactory) -> None:
     collector = UnknownRequestCollector()
-    transport = _Transport(lambda _request: _response({"ok": 1}))
-    client = Bitrix24._from_executor(Executor(transport), unknown_request_audit=collector)  # noqa: SLF001
+    transport = ResponderTransport(lambda _request: _response({"ok": 1}))
+    client = scripted_client(transport, unknown_request_audit=collector)
     commands = (
         Command(Request("unknown.one", route=RouteKind.BARE), 1),
         Command(Request("safe.one", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), 2),
@@ -1469,8 +1461,8 @@ async def test_lazy_audit_failures_are_retained_in_batch_report() -> None:
     def broken_audit(_summary: object) -> None:
         raise RuntimeError("opaque failure")
 
-    client = Bitrix24._from_executor(  # noqa: SLF001
-        Executor(_Transport(lambda _request: _response({"ok": 1}))),
+    client = client_for(
+        ResponderTransport(lambda _request: _response({"ok": 1})),
         unknown_request_audit=broken_audit,
     )
     stream = client.fan_out_outcomes((Command(Request("unknown.one", route=RouteKind.BARE), 1),))
@@ -1490,7 +1482,7 @@ _ROUNDED_STRIDE = OffsetSpec(
 
 @pytest.mark.asyncio
 async def test_page_stride_rejects_misaligned_initial_offset_before_io() -> None:
-    transport = _Transport(lambda _request: pytest.fail("a misaligned stride offset must reject before I/O"))
+    transport = ResponderTransport(lambda _request: pytest.fail("a misaligned stride offset must reject before I/O"))
     direct = _client(transport).iter_list(
         Request("example.list", {"start": 932}, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         page_size=PAGE_SIZE,
@@ -1521,7 +1513,7 @@ async def test_page_stride_accepts_an_aligned_initial_offset() -> None:
         rows = [{"ID": index} for index in range(PAGE_SIZE)] if start == 900 else []  # noqa: PLR2004
         return _response(rows)
 
-    stream = _client(_Transport(handler)).iter_list(
+    stream = _client(ResponderTransport(handler)).iter_list(
         Request("example.list", {"start": 900}, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         page_size=PAGE_SIZE,
         offset=_ROUNDED_STRIDE,

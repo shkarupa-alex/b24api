@@ -1,13 +1,12 @@
 """Qualified raw bounds traverse empty selected pages without false closure."""
 
 from __future__ import annotations
-import json
+from typing import TYPE_CHECKING
 
 import pytest
 
 from b24api import (
     Binding,
-    Bitrix24,
     DirectDispatch,
     IdentityCoercion,
     IdentitySpec,
@@ -23,44 +22,40 @@ from b24api import (
 from b24api.contracts import PageStride, RawTotalSource, SparseRawBound
 from b24api.contracts.traversal import OffsetContinuation
 from b24api.errors import BudgetExceededError, CapabilityError, IncompleteTraversalError, PaginationError
-from b24api.execution import Executor, WireResponse
+from tests.scripting import ResponderTransport, client_for
+
+if TYPE_CHECKING:
+    from tests.scripting import ClientFactory
 
 
-class SparseTransport:
-    """Independent raw SQL offset oracle with sparse selected output."""
+def _sparse(
+    *,
+    raw_total: int = 200,
+    overrides: dict[int, int | None] | None = None,
+    envelope: bool = False,
+    rows: dict[int, list[dict[str, int]]] | None = None,
+) -> ResponderTransport:
+    """Independent raw SQL offset oracle with sparse selected output and one frozen raw extent.
 
-    host = "fixture.invalid"
+    The extent travels in the result as ``rawTotal`` or, with ``envelope``, as the envelope ``total``.
+    """
+    selected = {0: [{"id": 1}], 150: [{"id": 2}]} if rows is None else rows
 
-    def __init__(
-        self,
-        *,
-        raw_total: int = 200,
-        overrides: dict[int, int | None] | None = None,
-        envelope: bool = False,
-        rows: dict[int, list[dict[str, int]]] | None = None,
-    ) -> None:
-        """Freeze one raw extent for the synthetic fixture, in the result or the envelope."""
-        self.raw_total = raw_total
-        self.overrides = overrides or {}
-        self.rows = {0: [{"id": 1}], 150: [{"id": 2}]} if rows is None else rows
-        self.envelope = envelope
-        self.offsets: list[int] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Return selected rows and a separate raw extent."""
-        assert attempt_timeout > 0
-        assert max_response_bytes > 0
+    def respond(request: Request) -> object:
         offset = request.copy_parameters()["start"]
         assert isinstance(offset, int)
-        self.offsets.append(offset)
-        rows = self.rows.get(offset, [])
-        result: dict[str, object] = {"items": rows}
-        total = self.overrides.get(offset, self.raw_total)
+        result: dict[str, object] = {"items": selected.get(offset, [])}
         payload: dict[str, object] = {"result": result}
+        total = (overrides or {}).get(offset, raw_total)
         if total is not None:
-            (payload if self.envelope else result)["total" if self.envelope else "rawTotal"] = total
-        body = json.dumps(payload).encode()
-        return WireResponse(200, (), body)
+            (payload if envelope else result)["total" if envelope else "rawTotal"] = total
+        return payload
+
+    return ResponderTransport(respond)
+
+
+def _offsets(transport: ResponderTransport) -> list[object]:
+    return [parameters["start"] for parameters in transport.parameters]
 
 
 def _sparse_spec(*, max_pages: int = 4, envelope: bool = False) -> OffsetSpec:
@@ -79,9 +74,9 @@ def _sparse_spec(*, max_pages: int = 4, envelope: bool = False) -> OffsetSpec:
 
 
 @pytest.mark.asyncio
-async def test_sparse_offset_crosses_two_empty_selected_pages() -> None:
-    transport = SparseTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_sparse_offset_crosses_two_empty_selected_pages(scripted_client: ClientFactory) -> None:
+    transport = _sparse()
+    client = scripted_client(transport)
     stream = client.iter_list(
         Request("example.search", route=RouteKind.BARE),
         selector=ResultSelector(("items",)),
@@ -90,7 +85,7 @@ async def test_sparse_offset_crosses_two_empty_selected_pages() -> None:
     )
     rows = [row async for row in stream]
     assert [row["id"] for row in rows] == [1, 2]
-    assert transport.offsets == [0, 50, 100, 150]
+    assert _offsets(transport) == [0, 50, 100, 150]
     assert stream.report is not None
     assert stream.report.exhausted
     assert stream.report.assurance is TraversalAssurance.RAW_RANGE_COVERED
@@ -105,12 +100,10 @@ async def test_sparse_offset_crosses_two_empty_selected_pages() -> None:
 )
 @pytest.mark.asyncio
 async def test_sparse_raw_total_contradicted_by_selected_rows_fails_closed(
-    raw_total: int,
-    rows: dict[int, list[dict[str, int]]],
-    offsets: list[int],
+    raw_total: int, rows: dict[int, list[dict[str, int]]], offsets: list[int], scripted_client: ClientFactory
 ) -> None:
-    transport = SparseTransport(raw_total=raw_total, rows=rows)
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    transport = _sparse(raw_total=raw_total, rows=rows)
+    client = scripted_client(transport)
     stream = client.iter_list(
         Request("example.search", route=RouteKind.BARE),
         selector=ResultSelector(("items",)),
@@ -121,7 +114,7 @@ async def test_sparse_raw_total_contradicted_by_selected_rows_fails_closed(
         _ = [row async for row in stream]
     assert isinstance(captured.value.error, PaginationError)
     assert "exceed the qualified raw window" in str(captured.value.error)
-    assert transport.offsets == offsets
+    assert _offsets(transport) == offsets
     assert stream.report is not None
     assert stream.report.state is TerminalState.INCOMPLETE
     assert not stream.report.exhausted
@@ -130,9 +123,9 @@ async def test_sparse_raw_total_contradicted_by_selected_rows_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_sparse_terminal_window_holding_its_remaining_raw_rows_closes() -> None:
-    transport = SparseTransport(raw_total=51, rows={0: [{"id": 1}], 50: [{"id": 2}]})
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_sparse_terminal_window_holding_its_remaining_raw_rows_closes(scripted_client: ClientFactory) -> None:
+    transport = _sparse(raw_total=51, rows={0: [{"id": 1}], 50: [{"id": 2}]})
+    client = scripted_client(transport)
     stream = client.iter_list(
         Request("example.search", route=RouteKind.BARE),
         selector=ResultSelector(("items",)),
@@ -140,7 +133,7 @@ async def test_sparse_terminal_window_holding_its_remaining_raw_rows_closes() ->
         offset=_sparse_spec(),
     )
     assert [row["id"] async for row in stream] == [1, 2]
-    assert transport.offsets == [0, 50]
+    assert _offsets(transport) == [0, 50]
     assert stream.report is not None
     assert stream.report.exhausted
     assert stream.report.assurance is TraversalAssurance.RAW_RANGE_COVERED
@@ -157,25 +150,25 @@ def _resumed(start: int) -> Request:
 
 @pytest.mark.parametrize(("start", "message"), [(932, _MISALIGNED), (900, _NOT_FROM_ZERO)])
 @pytest.mark.asyncio
-async def test_sparse_resume_alignment_before_io(start: int, message: str) -> None:
+async def test_sparse_resume_alignment_before_io(start: int, message: str, scripted_client: ClientFactory) -> None:
     # 932 aliases the server's floor-to-50 window; an aligned 900 is still only part of the raw
     # range, which cannot prove raw-range coverage. Both are refused before the first send.
-    transport = SparseTransport(raw_total=1050)
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    transport = _sparse(raw_total=1050)
+    client = scripted_client(transport)
     stream = client.iter_list(_resumed(start), selector=ResultSelector(("items",)), page_size=50, offset=_sparse_spec())
     with pytest.raises(CapabilityError, match=message):
         _ = [row async for row in stream]
     assert stream.report is not None
     assert not stream.report.exhausted
-    assert transport.offsets == []
+    assert _offsets(transport) == []
 
 
 @pytest.mark.parametrize("start", [0, 900, 932])
 def test_sparse_raw_bound_is_refused_for_reference_traversal_before_io(start: int) -> None:
     # An empty raw window is continued past without a delivered page, which reference provenance
     # cannot record, so every origin is refused when the stream is built.
-    transport = SparseTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    transport = _sparse()
+    client = client_for(transport)
     with pytest.raises(CapabilityError, match=_NO_SPARSE_REFERENCE):
         client.iter_reference_outcomes(
             _resumed(start),
@@ -183,30 +176,23 @@ def test_sparse_raw_bound_is_refused_for_reference_traversal_before_io(start: in
             traversal=SequentialTraversal(page_size=50, selector=ResultSelector(("items",)), offset=_sparse_spec()),
             dispatch=DirectDispatch(concurrency=1),
         )
-    assert transport.offsets == []
+    assert _offsets(transport) == []
 
 
 @pytest.mark.asyncio
-async def test_non_sparse_fixed_stride_rejects_an_unexplained_short_window() -> None:
+async def test_non_sparse_fixed_stride_rejects_an_unexplained_short_window(scripted_client: ClientFactory) -> None:
     short_window_extent = 100
 
-    class ShortWindowTransport:
-        host = "fixture.invalid"
+    def short_window(request: Request) -> object:
+        offset = request.copy_parameters()["start"]
+        assert isinstance(offset, int)
+        return {
+            "result": [{"id": value} for value in range(offset, offset + 25)] if offset < short_window_extent else []
+        }
 
-        def __init__(self) -> None:
-            self.offsets: list[int] = []
-
-        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-            del attempt_timeout, max_response_bytes
-            offset = request.copy_parameters()["start"]
-            assert isinstance(offset, int)
-            self.offsets.append(offset)
-            rows = [{"id": value} for value in range(offset, offset + 25)] if offset < short_window_extent else []
-            return WireResponse(200, (), json.dumps({"result": rows}).encode())
-
-    transport = ShortWindowTransport()
+    transport = ResponderTransport(short_window)
     stride = PageStride(server_granularity=50, wire_increment=50, max_decoded_rows=50)
-    stream = Bitrix24._from_executor(Executor(transport)).iter_list(  # noqa: SLF001
+    stream = scripted_client(transport).iter_list(
         Request("example.search", route=RouteKind.BARE),
         identity=IdentitySpec(("id",), "ID", "ID", IdentityCoercion.EXACT_INTEGER),
         page_size=50,
@@ -217,7 +203,7 @@ async def test_non_sparse_fixed_stride_rejects_an_unexplained_short_window() -> 
         await anext(stream)
 
     assert isinstance(captured.value.error, PaginationError)
-    assert transport.offsets == [0]
+    assert _offsets(transport) == [0]
     assert stream.report is not None
     assert not stream.report.exhausted
 
@@ -240,10 +226,10 @@ def test_stride_rejects_rounded_alias_and_sparse_budget_is_explicit() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overrides", [{50: None}, {50: -1}, {50: 201}])
 async def test_sparse_raw_total_missing_invalid_or_changed_never_completes(
-    overrides: dict[int, int | None],
+    overrides: dict[int, int | None], scripted_client: ClientFactory
 ) -> None:
-    transport = SparseTransport(overrides=overrides)
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    transport = _sparse(overrides=overrides)
+    client = scripted_client(transport)
     stream = client.iter_list(
         Request("example.search", route=RouteKind.BARE),
         selector=ResultSelector(("items",)),
@@ -258,9 +244,9 @@ async def test_sparse_raw_total_missing_invalid_or_changed_never_completes(
 
 
 @pytest.mark.asyncio
-async def test_sparse_raw_total_can_come_from_the_response_envelope() -> None:
-    transport = SparseTransport(raw_total=150, envelope=True)
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_sparse_raw_total_can_come_from_the_response_envelope(scripted_client: ClientFactory) -> None:
+    transport = _sparse(raw_total=150, envelope=True)
+    client = scripted_client(transport)
     stream = client.iter_list(
         Request("example.search", route=RouteKind.BARE),
         selector=ResultSelector(("items",)),
@@ -269,7 +255,7 @@ async def test_sparse_raw_total_can_come_from_the_response_envelope() -> None:
     )
     rows = [row async for row in stream]
     assert [row["id"] for row in rows] == [1]
-    assert transport.offsets == [0, 50, 100]
+    assert _offsets(transport) == [0, 50, 100]
     assert stream.report is not None
     assert stream.report.exhausted
     assert stream.report.assurance is TraversalAssurance.RAW_RANGE_COVERED
@@ -278,10 +264,10 @@ async def test_sparse_raw_total_can_come_from_the_response_envelope() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overrides", [{50: None}, {50: -1}, {50: 201}])
 async def test_sparse_envelope_total_missing_unknown_or_changed_never_completes(
-    overrides: dict[int, int | None],
+    overrides: dict[int, int | None], scripted_client: ClientFactory
 ) -> None:
-    transport = SparseTransport(overrides=overrides, envelope=True)
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    transport = _sparse(overrides=overrides, envelope=True)
+    client = scripted_client(transport)
     stream = client.iter_list(
         Request("example.search", route=RouteKind.BARE),
         selector=ResultSelector(("items",)),
@@ -302,9 +288,9 @@ def test_sparse_raw_total_rejects_a_root_result_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sparse_raw_page_budget_prevents_unbounded_holes() -> None:
-    transport = SparseTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_sparse_raw_page_budget_prevents_unbounded_holes(scripted_client: ClientFactory) -> None:
+    transport = _sparse()
+    client = scripted_client(transport)
     stream = client.iter_list(
         Request("example.search", route=RouteKind.BARE),
         selector=ResultSelector(("items",)),
@@ -313,4 +299,4 @@ async def test_sparse_raw_page_budget_prevents_unbounded_holes() -> None:
     )
     with pytest.raises(BudgetExceededError):
         _ = [row async for row in stream]
-    assert transport.offsets == [0, 50]
+    assert _offsets(transport) == [0, 50]

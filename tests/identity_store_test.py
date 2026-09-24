@@ -24,8 +24,8 @@ from b24api import (
 )
 from b24api.contracts import ConsistencyPolicy, DuplicatePolicy, IdentityStore, identity_store_key
 from b24api.errors import BudgetExceededError, IncompleteTraversalError
-from b24api.execution import Executor
 from b24api.transport import WireResponse
+from tests.scripting import ResponderTransport, client_for
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -34,19 +34,6 @@ IDENTITY = IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER)
 LEDGER_UNIQUE_ROWS = 3
 REPORTED_UNIQUE_ROWS = 4
 LONG_TRAVERSAL_ROWS = 2_000
-
-
-class _Transport:
-    host = "test.invalid"
-
-    def __init__(self, handler: Callable[[Request], WireResponse]) -> None:
-        self.handler = handler
-        self.requests: list[Request] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        del attempt_timeout, max_response_bytes
-        self.requests.append(request)
-        return self.handler(request)
 
 
 class _SqliteLedger:
@@ -88,8 +75,8 @@ def _pages(*pages: Sequence[int], total: int | None = None) -> Callable[[Request
     return handler
 
 
-def _client(transport: _Transport) -> Bitrix24:
-    return Bitrix24._from_executor(Executor(transport))  # noqa: SLF001
+def _client(transport: ResponderTransport) -> Bitrix24:
+    return client_for(transport)
 
 
 def _request() -> Request:
@@ -110,7 +97,7 @@ def test_identity_store_key_is_canonical_and_type_distinct() -> None:
 @pytest.mark.asyncio
 async def test_external_ledger_proves_uniqueness_beyond_the_in_memory_key_budget() -> None:
     ledger = _SqliteLedger()
-    transport = _Transport(_pages([1, 2], [3], []))
+    transport = ResponderTransport(_pages([1, 2], [3], []))
     stream = _client(transport).iter_list(
         _request(),
         identity=IDENTITY,
@@ -132,7 +119,7 @@ async def test_external_ledger_proves_uniqueness_beyond_the_in_memory_key_budget
 
 @pytest.mark.asyncio
 async def test_in_memory_budget_still_fails_closed_without_a_ledger() -> None:
-    stream = _client(_Transport(_pages([1, 2], [3], []))).iter_list(
+    stream = _client(ResponderTransport(_pages([1, 2], [3], []))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -147,7 +134,7 @@ async def test_in_memory_budget_still_fails_closed_without_a_ledger() -> None:
 
 @pytest.mark.asyncio
 async def test_external_ledger_duplicate_under_error_policy_rejects_the_page() -> None:
-    stream = _client(_Transport(_pages([1, 2], [2, 3], []))).iter_list(
+    stream = _client(ResponderTransport(_pages([1, 2], [2, 3], []))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -164,7 +151,7 @@ async def test_external_ledger_duplicate_under_error_policy_rejects_the_page() -
 
 @pytest.mark.asyncio
 async def test_failing_ledger_never_acknowledges_or_completes() -> None:
-    stream = _client(_Transport(_pages([1, 2], []))).iter_list(
+    stream = _client(ResponderTransport(_pages([1, 2], []))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -179,7 +166,7 @@ async def test_failing_ledger_never_acknowledges_or_completes() -> None:
 
 
 def test_ledger_requires_identity_and_the_public_protocol() -> None:
-    client = _client(_Transport(_pages([])))
+    client = _client(ResponderTransport(_pages([])))
     with pytest.raises(ValueError, match="identity declaration"):
         client.iter_list(_request(), identity_store=_SqliteLedger())
     with pytest.raises(TypeError, match="add_if_absent"):
@@ -189,7 +176,7 @@ def test_ledger_requires_identity_and_the_public_protocol() -> None:
 @pytest.mark.asyncio
 async def test_counted_traversal_accepts_a_ledger_for_its_identity_evidence() -> None:
     ledger = _SqliteLedger()
-    stream = _client(_Transport(_pages([1, 2], total=2))).iter_list_counted(
+    stream = _client(ResponderTransport(_pages([1, 2], total=2))).iter_list_counted(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -207,7 +194,7 @@ async def test_counted_traversal_accepts_a_ledger_for_its_identity_evidence() ->
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ledger", [None, _SqliteLedger], ids=["memory", "external"])
 async def test_reported_cross_page_duplicate_withdraws_identity_strength(ledger: type[_SqliteLedger] | None) -> None:
-    stream = _client(_Transport(_pages([10, 20], [20, 30], [40], []))).iter_list(
+    stream = _client(ResponderTransport(_pages([10, 20], [20, 30], [40], []))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -226,7 +213,7 @@ async def test_reported_cross_page_duplicate_withdraws_identity_strength(ledger:
 
 @pytest.mark.asyncio
 async def test_reported_policy_without_duplicates_keeps_identity_exact() -> None:
-    stream = _client(_Transport(_pages([10, 20], [30], []))).iter_list(
+    stream = _client(ResponderTransport(_pages([10, 20], [30], []))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -240,7 +227,7 @@ async def test_reported_policy_without_duplicates_keeps_identity_exact() -> None
 
 @pytest.mark.asyncio
 async def test_exact_total_duplicate_under_report_withdraws_identity_and_count_strength() -> None:
-    stream = _client(_Transport(_pages([10, 20], [20, 30], total=4))).iter_list(
+    stream = _client(ResponderTransport(_pages([10, 20], [20, 30], total=4))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -257,7 +244,7 @@ async def test_exact_total_duplicate_under_report_withdraws_identity_and_count_s
 async def test_external_ledger_completes_a_long_traversal_within_the_page_budget() -> None:
     ids = list(range(1, LONG_TRAVERSAL_ROWS + 1))
     ledger = _SqliteLedger()
-    stream = _client(_Transport(_pages(*([value] for value in ids), []))).iter_list(
+    stream = _client(ResponderTransport(_pages(*([value] for value in ids), []))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=1,

@@ -53,12 +53,13 @@ from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSe
 from b24api.contracts.report import OperationReport, PageDispatch
 from b24api.contracts.request import RouteKind
 from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError, ResultShapeError
-from b24api.execution import Executor, WireResponse
+from b24api.execution import WireResponse
 from b24api.traversal import keyset_page_validation, keyset_plan
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
 from b24api.traversal.keyset_geometry import anchor_guesses, estimates
 from b24api.traversal.keyset_observation import FastTraceRecorder, PageObservation
+from tests.scripting import client_for
 
 if TYPE_CHECKING:
     from b24api.contracts import JsonValue
@@ -301,7 +302,7 @@ def _sends_no_canary(report: OperationReport | None) -> bool:
 
 
 def _client(transport: KeysetTransport, *, policy: ExecutionPolicy | None = None) -> Bitrix24:
-    return Bitrix24._from_executor(Executor(transport), policy=policy)
+    return client_for(transport, policy=policy)
 
 
 def _identity() -> IdentitySpec:

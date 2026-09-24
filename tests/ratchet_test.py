@@ -29,6 +29,19 @@ def _private_member_accesses(*paths: str, exclude: str | None = None) -> int:
     return len(json.loads(result.stdout))
 
 
+def _homemade_transports() -> int:
+    """Count test classes that implement ``send`` instead of using ``tests/scripting.py`` (B15)."""
+    shared = ROOT / "tests" / "scripting.py"
+    return sum(
+        1
+        for source in sorted((ROOT / "tests").rglob("*.py"))
+        if source != shared
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8")))
+        if isinstance(node, ast.ClassDef)
+        and any(isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef) and item.name == "send" for item in node.body)
+    )
+
+
 def _long_functions() -> dict[str, int]:
     found: dict[str, int] = {}
 
@@ -60,6 +73,11 @@ def test_private_member_access_only_goes_down() -> None:
     _assert_ratchet("slf001_package", _private_member_accesses("b24api"))
     # Traversal modules talk through protocols and public accessors only (C5): a hard invariant, not a ratchet.
     assert _private_member_accesses("b24api/traversal") == 0
+
+
+def test_homemade_test_transports_only_go_down() -> None:
+    # 49 on c4cafdd by this count; a scenario the responder cannot express keeps its own transport.
+    _assert_ratchet("homemade_transports", _homemade_transports())
 
 
 def test_package_noqa_and_untyped_self_only_go_down() -> None:
