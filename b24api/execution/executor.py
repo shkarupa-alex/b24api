@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING
 
 from b24api._error_types import FailurePhase
+from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.json import _json_type_name
 from b24api.contracts.policy import AmbiguityReason, ExecutionPolicy
 from b24api.contracts.request import ReplaySafety, Request, RequestSummary, ResultErrorShape, diagnostic_context
@@ -18,7 +19,6 @@ from b24api.contracts.response import (
     BinaryEvidence,
     BinaryResponse,
     Response,
-    ResponseEvidence,
     ResponseTime,
 )
 from b24api.errors import (

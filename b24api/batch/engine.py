@@ -16,7 +16,6 @@ from b24api.batch.outcome import (
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.policy import (
     AmbiguityReason,
-    ExecutionPolicy,
     ReplayDisposition,
 )
 from b24api.contracts.request import ReplaySafety, Request, RouteKind, diagnostic_context
@@ -39,7 +38,6 @@ from b24api.execution import (
 from b24api.execution.executor import _raise_embedded_result_error
 
 if TYPE_CHECKING:
-    from b24api.batch.stream import _BatchOutcomeStream
     from b24api.contracts.json import JsonValue
 
 _MISSING = object()
@@ -97,26 +95,6 @@ class BatchExecutor:
             raise ValueError("portal command cap must be between 1 and 50")
         self.executor = executor
         self.portal_command_cap = portal_command_cap
-
-    def _outcomes(
-        self,
-        requests: BatchSource,
-        *,
-        batch_size: int | None = None,
-        policy: ExecutionPolicy | None = None,
-    ) -> _BatchOutcomeStream:
-        """Build the internal total-outcome stream used by kernel tests and traversal."""
-        from b24api.batch.stream import _BatchOutcomeStream  # noqa: PLC0415
-
-        size = self.portal_command_cap if batch_size is None else batch_size
-        if isinstance(size, bool) or not 1 <= size <= self.portal_command_cap:
-            raise ValueError("batch_size must be within the portal command cap")
-        return _BatchOutcomeStream(
-            self,
-            requests,
-            batch_size=size,
-            policy=policy or ExecutionPolicy(),
-        )
 
     async def _execute_chunk(  # noqa: PLR0913
         self,

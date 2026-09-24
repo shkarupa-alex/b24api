@@ -11,7 +11,7 @@ from b24api.contracts.report import KeysetExecutionReport, PageRecord, Violation
 from b24api.redaction import DEFAULT_REDACTOR
 
 if TYPE_CHECKING:
-    from b24api.contracts.response import ResponseEvidence
+    from b24api.contracts.evidence import ResponseEvidence
 
 
 @dataclass(frozen=True, slots=True)

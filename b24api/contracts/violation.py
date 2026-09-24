@@ -6,13 +6,12 @@ from dataclasses import field as dataclass_field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from b24api.contracts.error_base import B24ApiError
 from b24api.contracts.policy import ReplayDisposition
 from b24api.redaction import DEFAULT_REDACTOR
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-
-    from b24api.errors import B24ApiError
 
 VIOLATION_CODE_MAXIMUM = 100
 VIOLATION_MESSAGE_MAXIMUM = 500
@@ -47,11 +46,8 @@ class Violation:
         object.__setattr__(self, "message", DEFAULT_REDACTOR.redact_text(self.message))
         if self.field is not None:
             object.__setattr__(self, "field", DEFAULT_REDACTOR.redact_text(self.field))
-        if self.error is not None:
-            from b24api.errors import B24ApiError  # noqa: PLC0415 - breaks the report/error import cycle
-
-            if not isinstance(self.error, B24ApiError):
-                raise TypeError("violation error must be a B24ApiError or None")
+        if self.error is not None and not isinstance(self.error, B24ApiError):
+            raise TypeError("violation error must be a B24ApiError or None")
         if not isinstance(self.replay_disposition, ReplayDisposition):
             raise TypeError("replay_disposition must be a ReplayDisposition")
         if not self.code or len(self.code) > VIOLATION_CODE_MAXIMUM:

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from b24api.contracts.error_base import BudgetExceededError
 from b24api.contracts.json import _is_plain_int
 
 if TYPE_CHECKING:
@@ -392,6 +393,4 @@ class BudgetCounters:
 
 
 def _raise_budget(message: str) -> None:
-    from b24api.errors import BudgetExceededError  # noqa: PLC0415
-
     raise BudgetExceededError(message)

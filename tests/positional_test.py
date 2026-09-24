@@ -27,6 +27,7 @@ from b24api import (
 )
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure
+from b24api.batch.stream import batch_outcome_stream
 from b24api.errors import CapabilityError
 from b24api.execution import Executor, HttpxTransport
 from b24api.testing import ScriptedTransport
@@ -258,7 +259,7 @@ async def test_positional_direct_request_sends_exact_json_array_and_batch_reject
         assert bodies == [b'[42,{},{},[],{"NAV_PARAMS":{"iNumPage":1}}]']
         assert request.positional is not None
         assert json.loads(bodies[0]) == request.positional.to_wire_slots()
-        outcomes = [outcome async for outcome in BatchExecutor(executor)._outcomes([request])]  # noqa: SLF001
+        outcomes = [outcome async for outcome in batch_outcome_stream(BatchExecutor(executor), [request])]
         assert len(outcomes) == 1
         assert isinstance(outcomes[0], BatchFailure)
         assert isinstance(outcomes[0].error, CapabilityError)

@@ -3,12 +3,14 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
 from b24api._error_types import ErrorOrigin, FailurePhase
+from b24api.contracts.error_base import B24ApiError, BudgetExceededError
+from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.keyset_capability import KeysetCapabilityReport, KeysetCapabilityVerdict, KeysetInconclusiveReason
 from b24api.contracts.policy import AmbiguityReason, IdentityCoercion, ReplayDisposition
-from b24api.contracts.response import ResponseEvidence, ResultCollectionShape
+from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.v3_codes import render_code
 from b24api.redaction import DEFAULT_REDACTOR, Redactor, SafeText
 
@@ -20,57 +22,6 @@ if TYPE_CHECKING:
     from b24api.contracts.reference import ReferenceOutcome
     from b24api.contracts.report import OperationReport
     from b24api.contracts.request import PathPart, RequestSummary, ResultSelector
-
-
-class B24ApiError(Exception):
-    """Base error whose default text and serialization contain safe evidence only."""
-
-    default_origin: ClassVar[ErrorOrigin | None] = None
-
-    def __init__(  # noqa: PLR0913
-        self,
-        message: str,
-        *,
-        origin: ErrorOrigin | None = None,
-        description: str | None = None,
-        request_summary: RequestSummary | None = None,
-        evidence: ResponseEvidence | None = None,
-        retryable: bool = False,
-        redactor: Redactor = DEFAULT_REDACTOR,
-        diagnostics: DiagnosticContext | None = None,
-    ) -> None:
-        """Render every text field once, through the request's diagnostic context when one is given."""
-        resolved_origin = origin or self.default_origin
-        if resolved_origin is None:
-            raise TypeError("origin is required for B24ApiError")
-        self.origin = resolved_origin
-        self.description = redactor.render_text(description, context=diagnostics) if description is not None else None
-        self.request_summary = request_summary
-        self.request = request_summary
-        self.evidence = evidence or ResponseEvidence()
-        self.retryable = retryable
-        super().__init__(redactor.render_text(message, context=diagnostics))
-
-    @property
-    def http_status(self) -> int | None:
-        """Return the http status."""
-        return self.evidence.http_status
-
-    def to_safe_dict(self) -> dict[str, object]:
-        """Serialize only bounded redacted fields."""
-        return {
-            "type": type(self).__name__,
-            "origin": self.origin.value,
-            "message": str(self),
-            "description": self.description,
-            "request": self.request_summary.to_dict() if self.request_summary else None,
-            "evidence": self.evidence.to_dict(),
-            "retryable": self.retryable,
-        }
-
-    def __repr__(self) -> str:
-        """Return a safe representation."""
-        return f"{type(self).__name__}({self.to_safe_dict()!r})"
 
 
 class TransportError(B24ApiError):
@@ -429,12 +380,6 @@ class KeysetCapabilityError(CapabilityError):
         return safe
 
 
-class BudgetExceededError(B24ApiError):
-    """Execution would exceed an explicit operational budget."""
-
-    default_origin = ErrorOrigin.BUDGET
-
-
 class ResponseTooLargeError(B24ApiError):
     """A decompressed response exceeded the configured byte ceiling."""
 
@@ -540,10 +485,29 @@ class ReferenceFailed[C](B24ApiError):  # noqa: N818 - normative public name
         super().__init__("Reference traversal did not complete", origin=ErrorOrigin.PAGINATION)
 
 
-_PUBLIC_ERROR_NAMES = (
-    "AmbiguousExecutionError ApiResponseError B24ApiError BatchCommandError BatchFailed BudgetExceededError "
-    "CapabilityError EnvelopeContractError ErrorOrigin FailurePhase HTTPGatewayError IdentityContractError "
-    "IncompleteTraversalError InputSourceError PaginationError ProtocolError ReferenceFailed ResponseTooLargeError "
-    "KeysetCapabilityError PageAdaptationError PageAdaptationViolation ResultShapeError TransportError ValidationIssue"
-)
-__all__ = tuple(_PUBLIC_ERROR_NAMES.split())
+__all__ = [
+    "AmbiguousExecutionError",
+    "ApiResponseError",
+    "B24ApiError",
+    "BatchCommandError",
+    "BatchFailed",
+    "BudgetExceededError",
+    "CapabilityError",
+    "EnvelopeContractError",
+    "ErrorOrigin",
+    "FailurePhase",
+    "HTTPGatewayError",
+    "IdentityContractError",
+    "IncompleteTraversalError",
+    "InputSourceError",
+    "KeysetCapabilityError",
+    "PageAdaptationError",
+    "PageAdaptationViolation",
+    "PaginationError",
+    "ProtocolError",
+    "ReferenceFailed",
+    "ResponseTooLargeError",
+    "ResultShapeError",
+    "TransportError",
+    "ValidationIssue",
+]

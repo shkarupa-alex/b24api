@@ -109,7 +109,7 @@ class _ResponseItemsVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def test_runtime_layer_import_boundaries_are_acyclic_and_evidence_free() -> None:
+def test_runtime_layers_stay_evidence_free_and_io_free() -> None:
     for path in _sources():
         imports = _imports(path)
         assert not any(name == "tools" or name.startswith("tools.") or "b24api_evidence" in name for name in imports)

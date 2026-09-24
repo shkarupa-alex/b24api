@@ -338,6 +338,20 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         )
 
 
+def batch_outcome_stream(
+    engine: BatchExecutor,
+    requests: BatchSource,
+    *,
+    batch_size: int | None = None,
+    policy: ExecutionPolicy | None = None,
+) -> _BatchOutcomeStream:
+    """Build the internal total-outcome stream that kernel tests drive directly."""
+    size = engine.portal_command_cap if batch_size is None else batch_size
+    if isinstance(size, bool) or not 1 <= size <= engine.portal_command_cap:
+        raise ValueError("batch_size must be within the portal command cap")
+    return _BatchOutcomeStream(engine, requests, batch_size=size, policy=policy or ExecutionPolicy())
+
+
 async def _iterate_source(source: BatchSource) -> AsyncGenerator[_BatchItem]:
     if isinstance(source, AsyncIterable):
         iterator = aiter(source)

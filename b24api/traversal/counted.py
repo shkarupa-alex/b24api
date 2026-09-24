@@ -24,11 +24,11 @@ from b24api.traversal.driver import PaginationDriver
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from b24api.contracts.evidence import ResponseEvidence
     from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.json import JsonValue
     from b24api.contracts.page import PageAdapter
     from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
-    from b24api.contracts.response import ResponseEvidence
     from b24api.execution import Executor
     from b24api.traversal.plans import CountedOffsetPlan
 

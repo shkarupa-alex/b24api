@@ -11,9 +11,9 @@ from b24api.contracts.request import Request, RequestSummary
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from b24api.contracts.error_base import B24ApiError
     from b24api.contracts.json import JsonValue
     from b24api.contracts.response import Response
-    from b24api.errors import B24ApiError
 
 
 @dataclass(frozen=True, slots=True)

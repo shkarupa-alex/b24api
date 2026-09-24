@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from b24api._error_types import ErrorOrigin
-from b24api.contracts.response import ResponseEvidence
+from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.v3_codes import NON_RETRYABLE_V3_ERROR_CODES
 from b24api.errors import (
     ApiResponseError,
