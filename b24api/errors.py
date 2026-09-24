@@ -485,7 +485,7 @@ class ReferenceFailed[C](B24ApiError):  # noqa: N818 - normative public name
         super().__init__("Reference traversal did not complete", origin=ErrorOrigin.PAGINATION)
 
 
-__all__ = [
+__all__ = (
     "AmbiguousExecutionError",
     "ApiResponseError",
     "B24ApiError",
@@ -510,4 +510,4 @@ __all__ = [
     "ResultShapeError",
     "TransportError",
     "ValidationIssue",
-]
+)
