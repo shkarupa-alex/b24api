@@ -1,10 +1,8 @@
 """Bounded fair scheduling for independent and paginated references."""
 
 from __future__ import annotations
-import asyncio
-import contextlib
 from collections.abc import AsyncGenerator, AsyncIterator
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Self
 
 from b24api.contracts.completion import CleanupState, StreamClosure
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
@@ -17,23 +15,23 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.report import Violation, ViolationSeverity, retain_page_trace
 from b24api.contracts.violation import retain_violations
-from b24api.execution import (
-    Executor,
-    await_cancellation_resistant,
-    await_cleanup_resistant,
-    rearm_cancellation,
+from b24api.execution.lifecycle import (
+    CleanupAttempt,
+    LifecycleHooks,
+    OperationRunner,
+    TerminalCause,
+    cleanup_failed,
+    failed_kernel_report,
+    kernel_terminal,
+    with_cleanup_attempt,
 )
-from b24api.execution.failure import EARLY_CLOSE_REASON, report_reason
-from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 from b24api.references.dispatch import (
-    _MISSING,
     ReferenceSource,
     ReferenceStreamItem,
 )
 from b24api.references.outcome import ReferenceItem
 from b24api.references.scheduler import ReferenceScheduler
-from b24api.references.support import _cleanup_failed_report
 from b24api.traversal import PaginationDriver
 from b24api.traversal.plans import (
     BatchDispatch,
@@ -47,8 +45,11 @@ from b24api.traversal.plans import (
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from b24api.contracts.page_stop import PageStopPolicy
     from b24api.contracts.request import ResultSelector, TraversalIdentity
+    from b24api.execution import Executor
 
 
 class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
@@ -64,15 +65,16 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         """Initialize instance state."""
         self._scheduler = scheduler
         self._source = source
-        self._runner: AsyncGenerator[ReferenceStreamItem] | None = None
-        self._prefetched: ReferenceStreamItem | object = _MISSING
-        self._closed = False
+        self._outcomes: AsyncGenerator[ReferenceStreamItem] | None = None
         self._emitted = 0
         self._unique_emitted = 0
         self._assurance = assurance
-        self._completion_cleanup_done = False
-        self._close_attempted = False
         self.report = KernelReport(assurance=assurance)
+        self._runner = OperationRunner(
+            self._run(),
+            LifecycleHooks(finalize=self._finalize, failure_report=_failure_report, cleanup=self._cleanup),
+            isolated_pulls=False,
+        )
 
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
@@ -83,13 +85,6 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         """Expose the reference scheduler's correlated completion gate."""
         return self._scheduler.completion.gate
 
-    def _finish_completion_cleanup(self) -> None:
-        if self._completion_cleanup_done or self.report.state is KernelState.NOT_STARTED:
-            return
-        failed = any(item.code == "cleanup_failure" for item in self.report.violations)
-        self._scheduler.completion.cleanup(CleanupState.FAILURE if failed else CleanupState.SUCCESS)
-        self._completion_cleanup_done = True
-
     @property
     def active_references_high_water(self) -> int:
         """Return the bounded scheduler admission high-water mark."""
@@ -97,173 +92,46 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
 
     async def __anext__(self) -> ReferenceStreamItem:
         """Return the next asynchronous item."""
-        if self._closed:
-            raise StopAsyncIteration
-        if self._prefetched is not _MISSING:
-            item = cast("ReferenceStreamItem", self._prefetched)
-            self._prefetched = _MISSING
-            self._record_delivery(item)
-            return item
-        if self._runner is None:
-            self._runner = self._run()
-        try:
-            item = await anext(self._runner)
-        except BaseException:
-            self._finish_completion_cleanup()
-            raise
-        self._record_delivery(item)
-        return item
-
-    def _record_delivery(self, item: ReferenceStreamItem) -> None:
-        if isinstance(item, ReferenceItem):
-            self._emitted += 1
-            if self._scheduler.record_delivery(item):
-                self._unique_emitted += 1
+        return await anext(self._runner)
 
     async def __aenter__(self) -> Self:
-        """Enter the asynchronous context."""
-        if self._closed:
-            raise RuntimeError("stream is closed")
-        if self._runner is None:
-            self._runner = self._run()
-            with contextlib.suppress(StopAsyncIteration):
-                self._prefetched = await anext(self._runner)
+        """Enter without reading an item."""
         return self
 
-    async def __aexit__(self, *_exc: object) -> None:
-        """Exit the asynchronous context."""
-        await self.aclose()
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close on exit without replacing the body's primary exception."""
+        await self._runner.__aexit__(exc_type, exc, traceback)
 
     async def aclose(self) -> None:
-        """Close owned asynchronous resources; a repeated close after a completed one does nothing."""
-        if self._close_attempted:
-            return
-        self._close_attempted = True
-        try:
-            await self._close_owned()
-        finally:
-            # Cleanup evidence is recorded even when closing fails, so the report is always published.
-            self._finish_completion_cleanup()
+        """Close owned resources once; the report is published after cleanup."""
+        await self._runner.aclose()
 
-    async def _close_owned(self) -> None:
-        if self._closed:
-            await self._observe_source_cleanup()
-            return
-        self._closed = True
-        try:
-            if self._runner is not None:
-                await self._runner.aclose()
-        except BaseException as error:
-            if self.report.state is KernelState.NOT_STARTED:
-                cancellation = await await_cancellation_resistant(
-                    self._finalize(KernelState.CANCELLED, "stream cleanup failed"),
-                )
-                if cancellation is not None:
-                    _attach_report(cancellation, self.report)
-                    raise cancellation from error
-            _attach_report(error, self.report)
-            raise
-        finally:
-            self._prefetched = _MISSING
-        await self._observe_source_cleanup()
-        if self.report.state is KernelState.NOT_STARTED and self._runner is not None:
-            await self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON)
+    async def _run(self) -> AsyncGenerator[ReferenceStreamItem]:
+        outcomes = self._outcomes = self._scheduler.outcomes(self._source)
+        async for outcome in outcomes:
+            if isinstance(outcome, ReferenceItem):
+                self._emitted += 1
+                if self._scheduler.record_delivery(outcome):
+                    self._unique_emitted += 1
+            yield outcome
 
-    async def _observe_source_cleanup(self) -> None:
-        try:
-            await self._scheduler.observe_source_cleanup()
-        except BaseException as error:
-            if self.report.state is KernelState.NOT_STARTED:
-                cancellation = await await_cancellation_resistant(
-                    self._finalize(KernelState.CANCELLED, "stream cleanup failed"),
-                )
-                if cancellation is not None:
-                    _attach_report(cancellation, self.report)
-                    raise cancellation from error
-            _attach_report(error, self.report)
-            raise
+    async def _cleanup(self) -> None:
+        # Closing the scheduler cancels and awaits in-flight reference work and closes the source,
+        # all before the terminal event is emitted.
+        if self._outcomes is not None:
+            await self._outcomes.aclose()
 
-    async def _run(self) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912, PLR0915
-        outcomes = self._scheduler.outcomes(self._source)
-        naturally_exhausted = False
-        primary_error: BaseException | None = None
-        pending_cancellation: asyncio.CancelledError | None = None
-        try:
-            async for outcome in outcomes:
-                yield outcome
-            naturally_exhausted = True
-            await self._finalize(KernelState.COMPLETED, "reference input exhausted")
-        except asyncio.CancelledError as error:
-            primary_error = error
-            repeated = await await_cancellation_resistant(
-                self._finalize(KernelState.CANCELLED, "iteration cancelled"),
-            )
-            if repeated is not None:
-                primary_error = repeated
-                _attach_report(repeated, self.report)
-                raise repeated from error
-            _attach_report(error, self.report)
-            raise
-        except GeneratorExit as error:
-            primary_error = error
-            cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON),
-            )
-            if cancellation is not None:
-                primary_error = cancellation
-                _attach_report(cancellation, self.report)
-                raise cancellation from error
-            _attach_report(error, self.report)
-            raise
-        except BaseException as error:
-            primary_error = error
-            cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.FAILED, report_reason(error)),
-            )
-            if cancellation is not None:
-                _attach_report(cancellation, self.report)
-                pending_cancellation = cancellation
-            _attach_report(error, self.report)
-            raise
-        finally:
-            preserve_primary = primary_error is not None and not isinstance(
-                primary_error,
-                asyncio.CancelledError | GeneratorExit,
-            )
-            cleanup = await await_cleanup_resistant(outcomes.aclose())
-            if cleanup.error is not None:
-                cleanup_error = cleanup.error
-                if preserve_primary:
-                    _attach_report(cleanup_error, self.report)
-                    if isinstance(cleanup_error, asyncio.CancelledError):
-                        pending_cancellation = cleanup_error
-                    if cleanup.cancellation is not None:
-                        pending_cancellation = cleanup.cancellation
-                else:
-                    await self._record_terminal_cleanup_failure(cleanup_error)
-                    rearm_cancellation(cleanup.cancellation)
-                    raise cleanup_error
-            if cleanup.cancellation is not None and not preserve_primary and cleanup.error is None:
-                _attach_report(cleanup.cancellation, self.report)
-                raise cleanup.cancellation
-            if cleanup.cancellation is not None and preserve_primary:
-                pending_cancellation = cleanup.cancellation
-            if not naturally_exhausted and self.report.state is KernelState.NOT_STARTED:
-                await self._finalize(KernelState.CANCELLED, "stream abandoned")
-            if self.report.state is not KernelState.NOT_STARTED:
-                self._closed = True
-            if preserve_primary:
-                rearm_cancellation(pending_cancellation)
-
-    async def _record_terminal_cleanup_failure(self, error: BaseException) -> None:
-        if self.report.state is KernelState.NOT_STARTED:
-            await self._finalize(KernelState.FAILED, "stream cleanup failed")
-        self.report = _cleanup_failed_report(self.report, error)
-        _attach_report(error, self.report)
-
-    async def _finalize(self, state: KernelState, reason: str) -> None:
-        if self.report.state is not KernelState.NOT_STARTED:
-            return
+    async def _finalize(self, cause: TerminalCause, failure: str | None, attempt: CleanupAttempt) -> KernelReport:
+        if self._outcomes is None:
+            return self.report
+        state, reason = kernel_terminal(cause, failure)
+        if cause is TerminalCause.EXHAUSTED:
+            reason = "reference input exhausted"
         snapshot = await self._scheduler.context.snapshot()
         consistency = self._scheduler.context.policy.consistency
         snapshot_state = (
@@ -319,6 +187,14 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             if state is KernelState.CANCELLED
             else StreamClosure.EARLY_CLOSE,
         )
+        self.report = with_cleanup_attempt(self.report, cause, attempt, subject="reference")
+        failed = cleanup_failed(cause, attempt)
+        self._scheduler.completion.cleanup(CleanupState.FAILURE if failed else CleanupState.SUCCESS)
+        return self.report
+
+
+def _failure_report(_cause: TerminalCause, reason: str, _attempt: CleanupAttempt) -> KernelReport:
+    return failed_kernel_report(reason)
 
 
 def fan_out(  # noqa: PLR0913

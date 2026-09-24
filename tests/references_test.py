@@ -1001,7 +1001,7 @@ async def test_cancellation_resistant_reference_pull_is_closed_after_late_comple
 
 
 @pytest.mark.asyncio
-async def test_late_reference_source_cleanup_error_is_observed_by_subsequent_close() -> None:
+async def test_late_reference_source_cleanup_error_does_not_reopen_the_published_report() -> None:
     release = asyncio.Event()
     closed = asyncio.Event()
 
@@ -1024,14 +1024,17 @@ async def test_late_reference_source_cleanup_error_is_observed_by_subsequent_clo
         policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.03),
     )
     assert isinstance(await anext(stream), ReferenceItem)
-    with pytest.raises(BudgetExceededError):
+    with pytest.raises(BudgetExceededError) as failed:
         await anext(stream)
+    report = stream.report
+    assert failed.value.__dict__["report"] is report
 
     release.set()
     await asyncio.wait_for(closed.wait(), timeout=0.2)
-    with pytest.raises(RuntimeError, match="late reference close boom") as captured:
-        await stream.aclose()
-    assert captured.value.__dict__["report"] is stream.report
+    # The report was published once, after the bounded cleanup; a repeated close changes nothing (§3.1).
+    await stream.aclose()
+    assert stream.report is report
+    assert report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -1682,7 +1685,12 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
     assert observed == [("reference close boom", 1), ("external-caller", 1)]
     assert independent_transport.requests == []
     assert stream.report.state is KernelState.FAILED
-    assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
+    # The source close failure and the caller cancellation that arrived during cleanup are both
+    # secondary to the raised failure, as in every stream family (§3.1).
+    assert [violation.message for violation in stream.report.violations] == [
+        "reference cleanup also failed (RuntimeError)",
+        "reference cleanup also failed (CancelledError)",
+    ]
 
 
 @pytest.mark.asyncio

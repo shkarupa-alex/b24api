@@ -70,7 +70,13 @@ def kernel_terminal(cause: TerminalCause, reason: str | None) -> tuple[KernelSta
     return KernelState.FAILED, reason or "stream failed"
 
 
-def with_cleanup_attempt(report: KernelReport, cause: TerminalCause, attempt: CleanupAttempt) -> KernelReport:
+def with_cleanup_attempt(
+    report: KernelReport,
+    cause: TerminalCause,
+    attempt: CleanupAttempt,
+    *,
+    subject: str = "batch",
+) -> KernelReport:
     """Record a cleanup result on a kernel report by the §3.1 table.
 
     Without a primary failure a cleanup failure turns the report FAILED ("stream cleanup failed"); a
@@ -78,10 +84,12 @@ def with_cleanup_attempt(report: KernelReport, cause: TerminalCause, attempt: Cl
     cleanup failure and a cleanup cancellation are secondary violations.
     """
     if cause is not TerminalCause.FAILED:
-        return report if attempt.error is None else with_cleanup_failure(report, attempt.error, terminal=True)
+        if attempt.error is None:
+            return report
+        return with_cleanup_failure(report, attempt.error, terminal=True, subject=subject)
     for failure in (attempt.error, attempt.cancellation):
         if failure is not None:
-            report = with_cleanup_failure(report, failure, terminal=False)
+            report = with_cleanup_failure(report, failure, terminal=False, subject=subject)
     return report
 
 

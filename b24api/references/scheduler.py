@@ -699,12 +699,3 @@ class ReferenceScheduler:
         """Record one delivered reference item."""
         stored = self._delivery_uniqueness.pop(id(item), None)
         return stored is not None and stored[0] is item and stored[1]
-
-    async def observe_source_cleanup(self) -> None:
-        """Observe completion of source cleanup."""
-        controller = self._source_controller
-        if controller is None:
-            return
-        await controller.aclose(
-            remaining=max(0.0, self.context.policy.max_elapsed - self.context.elapsed),
-        )
