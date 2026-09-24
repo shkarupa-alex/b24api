@@ -21,6 +21,7 @@ from b24api import (
     Request,
     Response,
     ResultSelector,
+    Settings,
 )
 from b24api.contracts import IdentityCoercion
 from b24api.contracts.request import RouteKind
@@ -196,6 +197,7 @@ async def test_every_readme_python_example_executes_exactly_without_io(monkeypat
             "parent_ids": (1, 2),
             "record_completion": lambda *_args: None,
             "request": Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+            "settings": Settings(webhook_url="https://example.invalid/rest/1/doc/"),
             "CommandSuccess": CommandSuccess,
             "IdentityCoercion": IdentityCoercion,
             "ReplaySafety": ReplaySafety,
