@@ -4,10 +4,12 @@ from __future__ import annotations
 import asyncio
 import gc
 import weakref
+from pathlib import Path
 
 import httpx
 import pytest
 
+import b24api
 from b24api import execution as execution_module
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import ReplaySafety, Request, RouteKind
@@ -201,6 +203,26 @@ class CancellationTransport(httpx.AsyncBaseTransport):
         raise AssertionError("unreachable")
 
 
+_LIBRARY_ROOT = Path(b24api.__file__).resolve().parent
+
+
+def _assert_library_frames_omit(error: BaseException, fragment: str) -> None:
+    """Assert no b24api traceback frame retains the fragment, and that such frames were inspected.
+
+    A suffix filter like ``/b24api/`` would also match this repository's parent directory, and the
+    former ``b24api/execution.py`` filter matched no file at all, so the loop inspected nothing.
+    """
+    checked_frames = 0
+    traceback = error.__traceback__
+    while traceback is not None:
+        if Path(traceback.tb_frame.f_code.co_filename).resolve().is_relative_to(_LIBRARY_ROOT):
+            checked_frames += 1
+            for value in traceback.tb_frame.f_locals.values():
+                assert fragment not in repr(value)
+        traceback = traceback.tb_next
+    assert checked_frames > 0
+
+
 def test_transport_constructor_drops_webhook_when_httpx_client_initialization_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -217,12 +239,7 @@ def test_transport_constructor_drops_webhook_when_httpx_client_initialization_fa
     error = captured.value
     assert error.__cause__ is None
     assert error.__context__ is None
-    traceback = error.__traceback__
-    while traceback is not None:
-        if traceback.tb_frame.f_code.co_filename.endswith("b24api/execution.py"):
-            for value in traceback.tb_frame.f_locals.values():
-                assert sensitive_fragment not in repr(value)
-        traceback = traceback.tb_next
+    _assert_library_frames_omit(error, sensitive_fragment)
 
 
 @pytest.mark.asyncio
@@ -864,12 +881,7 @@ async def test_out_of_range_socket_status_is_typed_and_drops_webhook_locals() ->
         error = captured.value
         assert error.__cause__ is None
         assert error.__context__ is None
-        traceback = error.__traceback__
-        while traceback is not None:
-            if traceback.tb_frame.f_code.co_filename.endswith("b24api/execution.py"):
-                for value in traceback.tb_frame.f_locals.values():
-                    assert sensitive_fragment not in repr(value)
-            traceback = traceback.tb_next
+        _assert_library_frames_omit(error, sensitive_fragment)
     finally:
         await transport.aclose()
         server.close()
