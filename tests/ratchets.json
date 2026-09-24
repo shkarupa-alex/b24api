@@ -1,23 +1,15 @@
 {
   "slf001_tests": 173,
   "slf001_package": 31,
-  "noqa_package": 167,
+  "noqa_package": 163,
   "long_functions": {
-    "b24api/references/scheduler.py::ReferenceScheduler._run_reference": {
-      "lines": 230,
-      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
-    },
     "b24api/testing/transport.py::_run_case": {
       "lines": 124,
-      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+      "justification": "one independent arm per ConformanceCase, read as a flat table next to the enum; not touched in Ф3"
     },
     "b24api/transport/httpx.py::HttpxTransport._send_wire_impl": {
       "lines": 141,
-      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
-    },
-    "b24api/transport/protocol.py::ProtocolCodec.error_from_http": {
-      "lines": 101,
-      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+      "justification": "keeps the credential-bearing httpx request and response in one frame so every exit clears them before raising (A2, W2); not touched in Ф3"
     }
   }
 }

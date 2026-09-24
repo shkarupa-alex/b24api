@@ -124,20 +124,11 @@ class ProtocolCodec:
             )
 
         if status_code >= HTTP_ERROR_MINIMUM:
-            safe_headers = self._safe_headers(headers or {})
-            preview = self._body_preview(body, diagnostics)
-            evidence = ResponseEvidence(
-                http_status=status_code,
-                request_id=dict(safe_headers).get("x-request-id"),
-                headers=safe_headers,
-                body_preview=preview,
-            )
-            return HTTPGatewayError(
-                f"HTTP gateway error {status_code}",
-                origin=ErrorOrigin.HTTP_GATEWAY,
-                request_summary=request_summary,
-                evidence=evidence,
-                redactor=self._redactor,
+            return self._gateway_error(
+                status_code,
+                request_summary,
+                self._safe_headers(headers or {}),
+                self._body_preview(body, diagnostics),
             )
 
         if malformed:
@@ -151,6 +142,27 @@ class ProtocolCodec:
                 body_preview=preview,
             )
         return None
+
+    def _gateway_error(
+        self,
+        status_code: int,
+        request_summary: RequestSummary | None,
+        safe_headers: tuple[tuple[str, str], ...],
+        preview: str | None,
+    ) -> HTTPGatewayError:
+        evidence = ResponseEvidence(
+            http_status=status_code,
+            request_id=dict(safe_headers).get("x-request-id"),
+            headers=safe_headers,
+            body_preview=preview,
+        )
+        return HTTPGatewayError(
+            f"HTTP gateway error {status_code}",
+            origin=ErrorOrigin.HTTP_GATEWAY,
+            request_summary=request_summary,
+            evidence=evidence,
+            redactor=self._redactor,
+        )
 
     def _bounded_v3_error(  # noqa: PLR0913
         self,
