@@ -35,7 +35,7 @@ from b24api.errors import (
 )
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse
 from tests.ledger_hold import LedgerHold
-from tests.scripting import ResponderTransport
+from tests.scripting import ResponderTransport, attached_report
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator
@@ -223,7 +223,7 @@ async def test_batch_list_result_uses_nested_decoded_row_weight() -> None:
     )
     with pytest.raises(BudgetExceededError, match="buffer") as captured:
         await anext(rejected)
-    assert captured.value.__dict__["report"] is rejected.report
+    assert attached_report(captured.value) is rejected.report
     assert rejected.report.state is KernelState.FAILED
     assert rejected.report.emitted_rows == 0
     assert rejected.report.buffered_rows_high_water == 0
@@ -272,7 +272,7 @@ async def test_batch_source_cleanup_error_carries_same_report() -> None:
     with pytest.raises(RuntimeError, match="batch source close boom") as captured:
         await stream.aclose()
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
 
@@ -326,7 +326,7 @@ async def test_blocking_sync_batch_source_close_obeys_cleanup_deadline() -> None
     with pytest.raises(BudgetExceededError, match="batch source cleanup") as captured:
         await asyncio.wait_for(stream.aclose(), timeout=0.2)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     release_close.set()
     assert await asyncio.to_thread(close_finished.wait, 0.2)
 
@@ -348,7 +348,7 @@ async def test_async_batch_input_pull_obeys_operation_elapsed_budget() -> None:
     with pytest.raises(BudgetExceededError, match="batch input") as captured:
         await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
 
 
@@ -378,7 +378,7 @@ async def test_cancellation_resistant_batch_pull_is_closed_after_late_completion
     assert isinstance(await anext(stream), BatchSuccess)
     with pytest.raises(BudgetExceededError) as captured:
         await asyncio.wait_for(anext(stream), timeout=0.15)
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert not closed.is_set()
 
     release.set()
@@ -412,7 +412,7 @@ async def test_late_batch_source_cleanup_error_does_not_reopen_the_published_rep
     with pytest.raises(BudgetExceededError) as failed:
         await anext(stream)
     report = stream.report
-    assert failed.value.__dict__["report"] is report
+    assert attached_report(failed.value) is report
 
     release.set()
     await asyncio.wait_for(closed.wait(), timeout=0.2)
@@ -481,7 +481,7 @@ async def test_partial_kernel_chunk_is_not_dispatched_before_source_error() -> N
     with pytest.raises(RuntimeError, match="batch source boom") as captured:
         await consume()
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert outcomes == []
     assert transport.requests == []
     assert stream.report.emitted_rows == 0
@@ -584,7 +584,7 @@ async def test_batch_cancellation_carries_same_terminal_report() -> None:
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.CANCELLED
 
 
@@ -624,7 +624,7 @@ async def test_shared_batch_page_reservations_roll_back_when_admission_is_cancel
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.CANCELLED
     assert context._page_reservations == {}
 
@@ -652,7 +652,7 @@ async def test_repeated_batch_cancellation_still_carries_final_report() -> None:
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.CANCELLED
 
 
@@ -694,7 +694,7 @@ async def test_batch_cancellation_during_failed_finalization_preserves_failure_r
         await task
 
     assert "batch source failed" in str(primary[0])
-    assert primary[0].__dict__["report"] is stream.report
+    assert attached_report(primary[0]) is stream.report
     assert post_failure_executed is False
     assert stream.report.state is KernelState.FAILED
 

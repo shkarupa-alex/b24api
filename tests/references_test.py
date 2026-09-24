@@ -49,7 +49,7 @@ from b24api.traversal.plans import (
     SingleResponsePlan,
 )
 from tests.ledger_hold import LedgerHold
-from tests.scripting import Blocker, ResponderTransport, replies
+from tests.scripting import Blocker, ResponderTransport, attached_report, replies
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator
@@ -313,7 +313,7 @@ async def test_invalid_reference_contract_refuses_even_empty_input(
     with pytest.raises(CapabilityError) as captured:
         await anext(stream)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert transport.requests == []
 
@@ -356,7 +356,7 @@ async def test_composite_reference_identity_refuses_before_source_pull_or_io(
     with pytest.raises(CapabilityError, match="composite identity") as captured:
         await anext(stream)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert not pulled.is_set()
     assert transport.requests == []
@@ -552,7 +552,7 @@ async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
     with pytest.raises(AmbiguousExecutionError) as captured:
         await anext(stream)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert request.replay_safety is ReplaySafety.UNKNOWN
     assert len(transport.requests) == 1
     assert transport.requests[0].replay_safety is ReplaySafety.UNKNOWN
@@ -620,7 +620,7 @@ async def test_fan_out_list_result_obeys_decoded_row_buffer(dispatch: DispatchPl
     with pytest.raises(BudgetExceededError, match="decoded page") as captured:
         await anext(stream)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert stream.report.emitted_rows == 0
     assert stream.report.buffered_rows_high_water == 0
@@ -839,7 +839,7 @@ async def test_fail_fast_reference_error_carries_same_terminal_report() -> None:
         await anext(stream)
 
     assert stream.report.state is KernelState.FAILED
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
 
 
 @pytest.mark.asyncio
@@ -915,7 +915,7 @@ async def test_async_reference_input_pull_obeys_operation_elapsed_budget() -> No
     with pytest.raises(BudgetExceededError, match="reference input") as captured:
         await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
 
 
@@ -949,7 +949,7 @@ async def test_cancellation_resistant_reference_pull_is_closed_after_late_comple
     assert isinstance(await anext(stream), KernelReferenceItem)
     with pytest.raises(BudgetExceededError) as captured:
         await asyncio.wait_for(anext(stream), timeout=0.15)
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert not closed.is_set()
 
     release.set()
@@ -983,7 +983,7 @@ async def test_late_reference_source_cleanup_error_does_not_reopen_the_published
     with pytest.raises(BudgetExceededError) as failed:
         await anext(stream)
     report = stream.report
-    assert failed.value.__dict__["report"] is report
+    assert attached_report(failed.value) is report
 
     release.set()
     await asyncio.wait_for(closed.wait(), timeout=0.2)
@@ -1060,7 +1060,7 @@ async def test_reference_source_failure_drains_all_admitted_outcomes(
     with pytest.raises(RuntimeError, match="reference source boom") as captured:
         await consume()
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert sorted(outcome.reference_key for outcome in outcomes) == ["a", "b"]
     assert len(transport.requests) == TWO_REFERENCES
     assert stream.report.state is KernelState.FAILED
@@ -1287,7 +1287,7 @@ async def test_reference_task_cancellation_closes_transport_and_buffer_state() -
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert blocker.cancelled.is_set()
     assert stream.report.state is KernelState.CANCELLED
     assert (await stream._scheduler.context.snapshot()).counters.buffered_rows == 0  # noqa: SLF001
@@ -1348,7 +1348,7 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
         loop.set_exception_handler(previous_handler)
 
     assert "reference source failed" in str(primary[0])
-    assert primary[0].__dict__["report"] is stream.report
+    assert attached_report(primary[0]) is stream.report
     assert cancelling_seen == [1]
     assert post_failure_executed is False
     assert stream.report.state is KernelState.FAILED
@@ -1424,7 +1424,7 @@ async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_
         await asyncio.gather(safety, return_exceptions=True)
     assert asyncio.get_running_loop().time() - started_at < CLEANUP_TEST_TIMEOUT
     frozen_report = stream.report
-    assert captured.value.__dict__["report"] is frozen_report
+    assert attached_report(captured.value) is frozen_report
     assert frozen_report.logical_pages == 0
 
     await asyncio.wait_for(returned.wait(), timeout=0.2)
@@ -1475,7 +1475,7 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
     finally:
         release.set()
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert stream.report.terminal_reason == "ProtocolError"
     cleanup = [violation for violation in stream.report.violations if violation.code == "cleanup_failure"]
@@ -1524,7 +1524,7 @@ async def test_closed_batch_worker_exits_after_transport_temporarily_resists_can
 
     with pytest.raises(BudgetExceededError) as captured:
         await asyncio.wait_for(task, timeout=0.2)
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
 
     dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
     worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001
@@ -1576,7 +1576,7 @@ async def test_source_close_failure_does_not_skip_owned_resource_cleanup() -> No
     with pytest.raises(RuntimeError, match="source cleanup failed") as captured:
         await stream.aclose()
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
     worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001
     assert worker is not None
@@ -1685,7 +1685,7 @@ async def test_stalled_source_cleanup_is_bounded_after_owned_resources_close() -
     with pytest.raises(BudgetExceededError, match="source cleanup") as captured:
         await asyncio.wait_for(stream.aclose(), timeout=0.2)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
     worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001
     assert worker is not None
@@ -1729,7 +1729,7 @@ async def test_blocking_sync_source_close_does_not_block_event_loop_or_cleanup_d
     elapsed = asyncio.get_running_loop().time() - started
 
     assert elapsed < CLEANUP_TEST_TIMEOUT
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream._scheduler.buffer._closed  # noqa: SLF001
     release_close.set()
     assert await asyncio.to_thread(close_finished.wait, 0.2)

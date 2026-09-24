@@ -55,7 +55,7 @@ from b24api.traversal.plans import (
     SingleResponsePlan,
 )
 from tests.ledger_hold import LedgerHold
-from tests.scripting import Blocker, ResponderTransport
+from tests.scripting import Blocker, ResponderTransport, attached_report
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
@@ -185,7 +185,7 @@ async def test_single_rejects_continuation_and_records_failure() -> None:
 
     assert stream.report.state is KernelState.FAILED
     assert stream.report.logical_pages == 1
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
 
 
 @pytest.mark.asyncio
@@ -335,7 +335,7 @@ async def test_selector_shape_failure_is_typed_and_reported() -> None:
     with pytest.raises(CapabilityError, match="must be a sequence") as captured:
         await _collect(stream)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
 
 
 @pytest.mark.asyncio
@@ -642,7 +642,7 @@ async def test_direct_fetch_failure_records_unknown_scheduled_page() -> None:
     with pytest.raises(ApiResponseError) as captured:
         await _collect(stream)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert len(stream.report.page_trace) == 1
     record = stream.report.page_trace[0]
     assert record.outcome is PageOutcome.UNKNOWN
@@ -1157,7 +1157,7 @@ async def test_cancellation_after_decoded_response_cannot_rollback_logical_page(
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.logical_pages == 1
     assert stream.report.state is KernelState.CANCELLED
 
@@ -1199,7 +1199,7 @@ async def test_cancellation_during_failed_finalization_preserves_failure_report(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert primary[0].__dict__["report"] is stream.report
+    assert attached_report(primary[0]) is stream.report
     assert post_failure_executed is False
     assert stream.report.state is KernelState.FAILED
 

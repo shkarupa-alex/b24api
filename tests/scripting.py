@@ -124,3 +124,8 @@ class Blocker:
         except asyncio.CancelledError:
             self.cancelled.set()
             raise
+
+
+def attached_report(error: BaseException) -> object:
+    """Return the report an operation attached to its exception, or ``None``."""
+    return getattr(error, "report", None)

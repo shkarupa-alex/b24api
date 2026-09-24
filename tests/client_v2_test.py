@@ -59,7 +59,7 @@ from b24api.errors import (
     TransportError,
 )
 from b24api.settings import Settings
-from tests.scripting import ResponderTransport, client_for
+from tests.scripting import ResponderTransport, attached_report, client_for
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator
@@ -1602,7 +1602,7 @@ async def test_public_aclose_is_permitted_during_an_inflight_pull_and_cancels_ow
 
     with pytest.raises(asyncio.CancelledError) as captured:
         await pull
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert transport.cancelled.is_set()
     assert stream.report is not None
     # aclose() owns termination, so the cause is an early close even though the read was cancelled.
