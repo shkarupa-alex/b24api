@@ -30,7 +30,9 @@ class ExecutionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class _PageReservation:
+class PageReservation:
+    """One reserved logical page, charged by ``commit_page`` or returned by ``release_page``."""
+
     sequence: int
     reference: str | None
 
@@ -58,7 +60,7 @@ class ExecutionContext:
         self._retries = 0
         self._cooldown_seconds = 0.0
         self._page_sequence = 0
-        self._page_reservations: dict[_PageReservation, None] = {}
+        self._page_reservations: dict[PageReservation, None] = {}
         self._retained_identity_keys = 0
         self._page_changed = asyncio.Event()
 
@@ -91,7 +93,7 @@ class ExecutionContext:
         """Record the cooldown."""
         self._cooldown_seconds += max(0.0, seconds)
 
-    async def reserve_page(self, *, reference: str | None = None) -> _PageReservation:
+    async def reserve_page(self, *, reference: str | None = None) -> PageReservation:
         """Reserve page capacity before I/O without charging the response counter."""
         try:
             async with asyncio.timeout(self.policy.max_elapsed - self.elapsed):
@@ -104,7 +106,7 @@ class ExecutionContext:
                     if reference is not None and committed >= self.policy.max_pages_per_reference:
                         raise BudgetExceededError("per-reference page budget exhausted")
                     if self.can_reserve_page(reference=reference):
-                        reservation = _PageReservation(self._page_sequence, reference)
+                        reservation = PageReservation(self._page_sequence, reference)
                         self._page_sequence += 1
                         self._page_reservations[reservation] = None
                         return reservation
@@ -125,7 +127,7 @@ class ExecutionContext:
         )
         return global_available and reference_available
 
-    async def reserve_pages(self, count: int) -> tuple[_PageReservation, ...]:
+    async def reserve_pages(self, count: int) -> tuple[PageReservation, ...]:
         """Atomically reserve a fixed operation-local page wave or fail immediately."""
         if not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise ValueError("page reservation count must be a positive integer")
@@ -134,12 +136,12 @@ class ExecutionContext:
         used = self._counters.logical_pages + len(self._page_reservations)
         if used + count > self.policy.max_pages:
             raise BudgetExceededError("logical page budget cannot fit the requested wave")
-        reservations = tuple(_PageReservation(self._page_sequence + offset, None) for offset in range(count))
+        reservations = tuple(PageReservation(self._page_sequence + offset, None) for offset in range(count))
         self._page_sequence += count
         self._page_reservations.update(dict.fromkeys(reservations))
         return reservations
 
-    def commit_page(self, reservation: _PageReservation) -> None:
+    def commit_page(self, reservation: PageReservation) -> None:
         """Atomically charge one decoded response with no cancellation point."""
         if reservation not in self._page_reservations:
             raise RuntimeError("page reservation is not active")
@@ -147,7 +149,7 @@ class ExecutionContext:
         self._page_reservations.pop(reservation)
         self._page_changed.set()
 
-    def release_page(self, reservation: _PageReservation) -> None:
+    def release_page(self, reservation: PageReservation) -> None:
         """Atomically release capacity when no decoded response was returned."""
         if reservation not in self._page_reservations:
             return

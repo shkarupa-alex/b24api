@@ -1,12 +1,8 @@
 {
   "slf001_tests": 173,
   "slf001_package": 31,
-  "noqa_package": 170,
+  "noqa_package": 167,
   "long_functions": {
-    "b24api/completion/gate.py::CompletionGate.emit": {
-      "lines": 162,
-      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
-    },
     "b24api/references/scheduler.py::ReferenceScheduler._run_reference": {
       "lines": 230,
       "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
@@ -21,14 +17,6 @@
     },
     "b24api/transport/protocol.py::ProtocolCodec.error_from_http": {
       "lines": 101,
-      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
-    },
-    "b24api/traversal/keyset_transactions.py::execute_finish_page": {
-      "lines": 114,
-      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
-    },
-    "b24api/traversal/keyset_transactions.py::execute_wave": {
-      "lines": 131,
       "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
     }
   }

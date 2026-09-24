@@ -3,7 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from b24api.contracts.completion import (
     BindingAdmitted,
@@ -34,6 +34,8 @@ from b24api.contracts.report import (
 from b24api.contracts.violation import retain_violations
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from b24api.execution.snapshot import KernelReport
 
 _MAX_ID_LENGTH = 128
@@ -99,6 +101,59 @@ class CompletionReportFacts:
     keyset_selection: KeysetSelectionSummary | None = None
 
 
+def _binding_closure_violation(binding: _Binding, event: BindingTerminal) -> str | None:
+    """Return why a binding's pages cannot witness the closure it claims, or None."""
+    closure = event.closure
+    checks = (
+        (
+            bool(binding.negative_pages) and closure not in {BindingClosure.FAILURE, BindingClosure.UNKNOWN},
+            "completion_negative_binding_claimed_success",
+        ),
+        (
+            bool(binding.unknown_pages) and closure is not BindingClosure.UNKNOWN,
+            "completion_unknown_binding_claimed_known",
+        ),
+        (
+            binding.last_page_id < 0
+            and closure not in {BindingClosure.CALLER_STOP, BindingClosure.FAILURE, BindingClosure.UNKNOWN},
+            "completion_terminal_lacks_page_witness",
+        ),
+        (
+            closure is BindingClosure.SOURCE_EMPTY and binding.last_acknowledged_rows != 0,
+            "completion_missing_empty_witness",
+        ),
+        (
+            closure is BindingClosure.QUALIFIED_TOTAL
+            and (
+                type(event.qualified_total) is not int
+                or event.qualified_total < 0
+                or binding.acknowledged_pages == 0
+                or binding.acknowledged_rows != event.qualified_total
+            ),
+            "completion_invalid_total_witness",
+        ),
+        (
+            closure is BindingClosure.SINGLE_RESPONSE and binding.acknowledged_pages != 1,
+            "completion_invalid_single_response_witness",
+        ),
+        (
+            closure in {BindingClosure.RAW_RANGE_COVERED, BindingClosure.BOUNDARY_SEEN}
+            and binding.acknowledged_pages == 0,
+            "completion_missing_range_witness",
+        ),
+        (
+            closure is BindingClosure.KEYSET_PLAN_COVERED
+            and (
+                type(event.qualified_witnesses) is not int
+                or event.qualified_witnesses < 1
+                or binding.acknowledged_pages == 0
+            ),
+            "completion_missing_keyset_plan_witness",
+        ),
+    )
+    return next((code for failed, code in checks if failed), None)
+
+
 class CompletionGate:
     """Accept ordered evidence with O(active bindings + in-flight pages) memory."""
 
@@ -148,7 +203,7 @@ class CompletionGate:
             self._violate("completion_unknown_page")
         return page
 
-    def emit(self, event: CompletionEvidence) -> None:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    def emit(self, event: CompletionEvidence) -> None:
         """Apply one immutable event or retain a bounded blocking violation."""
         if event.operation_id != self.operation_id or event.sequence <= self._sequence:
             self._violate("completion_event_order")
@@ -157,159 +212,133 @@ class CompletionGate:
         if self._cleanup is not None or (self._stream is not None and not isinstance(event, CleanupOutcome)):
             self._violate("completion_after_terminal")
             return
-        if isinstance(event, BindingAdmitted):
-            if not self._id(event.binding_id) or event.binding_id <= self._last_binding_id:
-                self._violate("completion_duplicate_binding")
-                return
-            self._last_binding_id = event.binding_id
-            self._bindings[event.binding_id] = _Binding()
-            self._admitted += 1
-        elif isinstance(event, PageScheduled):
-            binding = self._bindings.get(event.binding_id)
-            if binding is None or not self._id(event.page_id) or event.page_id <= binding.last_page_id:
-                self._violate("completion_duplicate_or_unbound_page")
-                return
-            binding.last_page_id = event.page_id
-            binding.open_pages += 1
-            self._pages[event.binding_id, event.page_id] = _Page()
-            self._scheduled += 1
-        elif isinstance(event, PageCommandOutcome):
-            page = self._page(event)
-            if page is None:
-                return
-            if page.stage is not _Stage.SCHEDULED or not isinstance(event.outcome, CommandSettlement):
-                self._violate("completion_invalid_command_settlement")
-                return
-            if event.outcome is CommandSettlement.SUCCESS:
-                page.stage = _Stage.SETTLED
-            else:
-                self._negative_pages += 1
-                self._bindings[event.binding_id].negative_pages += 1
-                if event.outcome is CommandSettlement.UNKNOWN:
-                    self._unknown += 1
-                    self._bindings[event.binding_id].unknown_pages += 1
-                self._retire_page(event.binding_id, event.page_id)
-        elif isinstance(event, PageValidated):
-            page = self._page(event)
-            if page is None:
-                return
-            if page.stage is not _Stage.SETTLED or type(event.row_count) is not int or event.row_count < 0:
-                self._violate("completion_invalid_validation")
-                return
-            page.stage = _Stage.VALIDATED
-            page.row_count = event.row_count
-        elif isinstance(event, PageDelivered):
-            page = self._page(event)
-            if page is None:
-                return
+        violation = self._apply(event)
+        if violation is not None:
+            self._violate(violation)
+
+    def _apply(self, event: CompletionEvidence) -> str | None:
+        """Apply an ordered event and return the violation code when the event breaks the protocol."""
+        handler = next((handle for kind, handle in self._HANDLERS if isinstance(event, kind)), None)
+        return "completion_unknown_event" if handler is None else handler(self, event)
+
+    def _admit_binding(self, event: BindingAdmitted) -> str | None:
+        if not self._id(event.binding_id) or event.binding_id <= self._last_binding_id:
+            return "completion_duplicate_binding"
+        self._last_binding_id = event.binding_id
+        self._bindings[event.binding_id] = _Binding()
+        self._admitted += 1
+        return None
+
+    def _schedule_page(self, event: PageScheduled) -> str | None:
+        binding = self._bindings.get(event.binding_id)
+        if binding is None or not self._id(event.page_id) or event.page_id <= binding.last_page_id:
+            return "completion_duplicate_or_unbound_page"
+        binding.last_page_id = event.page_id
+        binding.open_pages += 1
+        self._pages[event.binding_id, event.page_id] = _Page()
+        self._scheduled += 1
+        return None
+
+    def _settle_page(self, event: PageCommandOutcome) -> str | None:
+        page = self._page(event)
+        if page is None:
+            return None
+        if page.stage is not _Stage.SCHEDULED or not isinstance(event.outcome, CommandSettlement):
+            return "completion_invalid_command_settlement"
+        if event.outcome is CommandSettlement.SUCCESS:
+            page.stage = _Stage.SETTLED
+            return None
+        self._negative_pages += 1
+        self._bindings[event.binding_id].negative_pages += 1
+        if event.outcome is CommandSettlement.UNKNOWN:
+            self._unknown += 1
+            self._bindings[event.binding_id].unknown_pages += 1
+        self._retire_page(event.binding_id, event.page_id)
+        return None
+
+    def _advance_page(self, event: PageValidated | PageDelivered) -> str | None:
+        page = self._page(event)
+        if page is None:
+            return None
+        if isinstance(event, PageDelivered):
             if page.stage is not _Stage.VALIDATED:
-                self._violate("completion_delivery_before_validation")
-                return
+                return "completion_delivery_before_validation"
             page.stage = _Stage.DELIVERED
-        elif isinstance(event, PageAcknowledged):
-            page = self._page(event)
-            if page is None:
-                return
-            if page.stage is not _Stage.DELIVERED:
-                self._violate("completion_ack_before_delivery")
-                return
-            self._acknowledged += 1
-            binding = self._bindings[event.binding_id]
-            if page.row_count is None:
-                raise RuntimeError("acknowledged page lost validated row count")
-            binding.acknowledged_pages += 1
-            binding.acknowledged_rows += page.row_count
-            binding.last_acknowledged_rows = page.row_count
-            self._retire_page(event.binding_id, event.page_id)
-        elif isinstance(event, PageRejected):
-            page = self._page(event)
-            if page is None:
-                return
-            if page.stage is _Stage.DELIVERED:
-                self._violate("completion_rejection_after_delivery")
-                return
-            if page.stage is _Stage.SCHEDULED:
-                # A rejection is the negative result of a settled page; without the settlement the
-                # physical outcome is unknown and the page stays open for incomplete accounting.
-                self._violate("completion_rejection_before_settlement")
-                return
-            self._negative_pages += 1
-            self._bindings[event.binding_id].negative_pages += 1
-            self._retire_page(event.binding_id, event.page_id)
-        elif isinstance(event, BindingTerminal):
-            binding = self._bindings.get(event.binding_id)
-            if binding is None or binding.open_pages or not isinstance(event.closure, BindingClosure):
-                self._violate("completion_invalid_binding_terminal")
-                return
-            if binding.negative_pages and event.closure not in {BindingClosure.FAILURE, BindingClosure.UNKNOWN}:
-                self._violate("completion_negative_binding_claimed_success")
-                return
-            if binding.unknown_pages and event.closure is not BindingClosure.UNKNOWN:
-                self._violate("completion_unknown_binding_claimed_known")
-                return
-            if binding.last_page_id < 0 and event.closure not in {
-                BindingClosure.CALLER_STOP,
-                BindingClosure.FAILURE,
-                BindingClosure.UNKNOWN,
-            }:
-                self._violate("completion_terminal_lacks_page_witness")
-                return
-            if event.closure is BindingClosure.SOURCE_EMPTY and binding.last_acknowledged_rows != 0:
-                self._violate("completion_missing_empty_witness")
-                return
-            if event.closure is BindingClosure.QUALIFIED_TOTAL and (
-                type(event.qualified_total) is not int
-                or event.qualified_total < 0
-                or binding.acknowledged_pages == 0
-                or binding.acknowledged_rows != event.qualified_total
-            ):
-                self._violate("completion_invalid_total_witness")
-                return
-            if event.closure is BindingClosure.SINGLE_RESPONSE and binding.acknowledged_pages != 1:
-                self._violate("completion_invalid_single_response_witness")
-                return
-            if event.closure in {BindingClosure.RAW_RANGE_COVERED, BindingClosure.BOUNDARY_SEEN} and (
-                binding.acknowledged_pages == 0
-            ):
-                self._violate("completion_missing_range_witness")
-                return
-            if event.closure is BindingClosure.KEYSET_PLAN_COVERED and (
-                type(event.qualified_witnesses) is not int
-                or event.qualified_witnesses < 1
-                or binding.acknowledged_pages == 0
-            ):
-                self._violate("completion_missing_keyset_plan_witness")
-                return
-            if event.closure in {BindingClosure.FAILURE, BindingClosure.UNKNOWN}:
-                self._negative_bindings += 1
-                if event.closure is BindingClosure.UNKNOWN:
-                    self._unknown += 1
-            if event.closure is BindingClosure.CALLER_STOP:
-                self._caller_stops += 1
-            if event.closure is BindingClosure.BOUNDARY_SEEN:
-                self._bounded += 1
-            if event.closure is BindingClosure.SOURCE_EMPTY:
-                self._source_empty += 1
-            self._terminal += 1
-            del self._bindings[event.binding_id]
-        elif isinstance(event, StreamTerminal):
-            if not isinstance(event.closure, StreamClosure):
-                self._violate("completion_invalid_stream_terminal")
-                return
-            if type(event.empty_source) is not bool or (
-                event.empty_source and (event.closure is not StreamClosure.NATURAL or self._admitted != 0)
-            ):
-                self._violate("completion_invalid_empty_source_witness")
-                return
-            self._stream = event.closure
-            self._empty_source = event.empty_source
-        elif isinstance(event, CleanupOutcome):
-            if self._stream is None or not isinstance(event.state, CleanupState):
-                self._violate("completion_invalid_cleanup")
-                return
-            self._cleanup = event.state
-        else:
-            self._violate("completion_unknown_event")
+            return None
+        if page.stage is not _Stage.SETTLED or type(event.row_count) is not int or event.row_count < 0:
+            return "completion_invalid_validation"
+        page.stage = _Stage.VALIDATED
+        page.row_count = event.row_count
+        return None
+
+    def _acknowledge_page(self, event: PageAcknowledged) -> str | None:
+        page = self._page(event)
+        if page is None:
+            return None
+        if page.stage is not _Stage.DELIVERED:
+            return "completion_ack_before_delivery"
+        self._acknowledged += 1
+        binding = self._bindings[event.binding_id]
+        if page.row_count is None:
+            raise RuntimeError("acknowledged page lost validated row count")
+        binding.acknowledged_pages += 1
+        binding.acknowledged_rows += page.row_count
+        binding.last_acknowledged_rows = page.row_count
+        self._retire_page(event.binding_id, event.page_id)
+        return None
+
+    def _reject_page(self, event: PageRejected) -> str | None:
+        page = self._page(event)
+        if page is None:
+            return None
+        if page.stage is _Stage.DELIVERED:
+            return "completion_rejection_after_delivery"
+        if page.stage is _Stage.SCHEDULED:
+            # A rejection is the negative result of a settled page; without the settlement the
+            # physical outcome is unknown and the page stays open for incomplete accounting.
+            return "completion_rejection_before_settlement"
+        self._negative_pages += 1
+        self._bindings[event.binding_id].negative_pages += 1
+        self._retire_page(event.binding_id, event.page_id)
+        return None
+
+    def _close_binding(self, event: BindingTerminal) -> str | None:
+        binding = self._bindings.get(event.binding_id)
+        if binding is None or binding.open_pages or not isinstance(event.closure, BindingClosure):
+            return "completion_invalid_binding_terminal"
+        violation = _binding_closure_violation(binding, event)
+        if violation is not None:
+            return violation
+        if event.closure in {BindingClosure.FAILURE, BindingClosure.UNKNOWN}:
+            self._negative_bindings += 1
+            if event.closure is BindingClosure.UNKNOWN:
+                self._unknown += 1
+        if event.closure is BindingClosure.CALLER_STOP:
+            self._caller_stops += 1
+        if event.closure is BindingClosure.BOUNDARY_SEEN:
+            self._bounded += 1
+        if event.closure is BindingClosure.SOURCE_EMPTY:
+            self._source_empty += 1
+        self._terminal += 1
+        del self._bindings[event.binding_id]
+        return None
+
+    def _record_cleanup(self, event: CleanupOutcome) -> str | None:
+        if self._stream is None or not isinstance(event.state, CleanupState):
+            return "completion_invalid_cleanup"
+        self._cleanup = event.state
+        return None
+
+    def _close_stream(self, event: StreamTerminal) -> str | None:
+        if not isinstance(event.closure, StreamClosure):
+            return "completion_invalid_stream_terminal"
+        if type(event.empty_source) is not bool or (
+            event.empty_source and (event.closure is not StreamClosure.NATURAL or self._admitted != 0)
+        ):
+            return "completion_invalid_empty_source_witness"
+        self._stream = event.closure
+        self._empty_source = event.empty_source
+        return None
 
     def _retire_page(self, binding_id: int, page_id: int) -> None:
         del self._pages[binding_id, page_id]
@@ -480,6 +509,20 @@ class CompletionGate:
             return self._published
         self._report_facts = facts
         return self.finish()
+
+    # Each ordered event type and the method that applies it; the functions are called unbound.
+    _HANDLERS: ClassVar[tuple[tuple[type, Callable[[CompletionGate, Any], str | None]], ...]] = (
+        (BindingAdmitted, _admit_binding),
+        (PageScheduled, _schedule_page),
+        (PageCommandOutcome, _settle_page),
+        (PageValidated, _advance_page),
+        (PageDelivered, _advance_page),
+        (PageAcknowledged, _acknowledge_page),
+        (PageRejected, _reject_page),
+        (BindingTerminal, _close_binding),
+        (StreamTerminal, _close_stream),
+        (CleanupOutcome, _record_cleanup),
+    )
 
 
 _IDENTITY_STRENGTH = frozenset({TraversalAssurance.IDENTITY_EXACT, TraversalAssurance.IDENTITY_AND_COUNT_MATCHED})
