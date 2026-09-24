@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 _OWNED = "synthetic-owned-h2-secret-424242"
 _HOP = "synthetic-hop-h2-secret-515151"
 _FOREIGN = "synthetic-foreign-h2-secret-636363"
+_PROBE_MARKER = "synthetic-probe-secret-000000"
 _OK = 200
 _MOVED = 301
 _SEQUENTIAL_CLIENTS = 12
@@ -506,7 +507,7 @@ async def test_registered_secret_stays_scrubbed_while_the_injected_client_outliv
 
     # Closing the client drops its secret at once; the next shield lifecycle event removes both filters.
     assert _OWNED not in HTTPX_LOG_SHIELD.registered_secrets()
-    await HttpxTransport("https://portal.invalid/rest/1/synthetic-probe-secret-000000/").aclose()
+    await HttpxTransport(f"https://portal.invalid/rest/1/{_PROBE_MARKER}/").aclose()
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
     for name in HPACK_LOGGER_NAMES:
         assert HTTPX_LOG_SHIELD._hpack_filter not in logging.getLogger(name).filters  # noqa: SLF001

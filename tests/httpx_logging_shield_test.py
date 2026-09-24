@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 _OWNED_MARKER = "synthetic-owned-secret-123456"
 _FOREIGN_MARKER = "synthetic-foreign-secret-123456"
+_PROBE_MARKER = "synthetic-probe-secret-000000"
 _SUCCESS_STATUS = 200
 _RESPONSE_STATUS = 403
 _OWNED_RECORDS = 2
@@ -66,7 +67,7 @@ async def _assert_shield_released(logger: logging.Logger) -> None:
     lifecycle event removes it; a throwaway transport provides that event.
     """
     assert not {_OWNED_MARKER, _FOREIGN_MARKER} & set(HTTPX_LOG_SHIELD.registered_secrets())
-    await HttpxTransport("https://portal.invalid/rest/1/synthetic-probe-secret-000000/").aclose()
+    await HttpxTransport(f"https://portal.invalid/rest/1/{_PROBE_MARKER}/").aclose()
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
 
 
