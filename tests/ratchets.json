@@ -1,8 +1,8 @@
 {
   "slf001_tests": 234,
-  "slf001_package": 75,
+  "slf001_package": 84,
   "slf001_traversal": 54,
-  "noqa_package": 207,
+  "noqa_package": 206,
   "untyped_self_traversal": 9,
   "long_functions": {
     "b24api/batch/logical.py::LogicalBatchKernelStream._run": {
