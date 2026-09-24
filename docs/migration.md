@@ -1,4 +1,51 @@
-# Migrating to the issues architecture
+# Migration guide
+
+## Upgrading from 2.3 to 3.0
+
+3.0.0 changes only what the list below names. Work through it in order; each item links to the
+details.
+
+1. **Root imports.** The `b24api` root exports 51 names; 115 others moved to `b24api.contracts`,
+   `b24api.errors`, `b24api.transport` or `b24api.completion`. Old imports still work in 3.x with a
+   `DeprecationWarning`, and type checkers flag them. Run `python -m b24api.migration src/ tests/`
+   to list them; see [Root imports in 3.0](#root-imports-in-30).
+2. **Removed report vocabulary.** Values no code path produced are gone from `KeysetExecutionReport`,
+   `KeysetAssuranceSource`, `ReplayDisposition`, `CompletionAssurance`, `SnapshotState` and
+   `NotExecutedReason`, and `PageValidated` has no `identity_digest`. Drop those arms from exhaustive
+   matches; see [Removed intentionally](#removed-intentionally).
+3. **`EnvelopeContractError` is a `ProtocolError`.** `except ProtocolError` now also catches a 2xx
+   response without the result envelope; see
+   [Important semantic corrections](#important-semantic-corrections).
+4. **A logical batch closed early says so.** Closing `batch()` or `batch_outcomes()` before the input
+   is exhausted gives an `EARLY_CLOSED` report whose `terminal_reason` is
+   `"stream closed before exhaustion"` (previously `"GeneratorExit"`).
+5. **Reports name the public failure.** A fail-fast batch reports `terminal_reason="BatchCommandError"`
+   with the violation `batch_command_failure`, instead of a private carrier class and
+   `internal_failure`. Code that matched the old strings must match the new ones.
+6. **Fixed step refuses at once.** `OffsetContinuation.FIXED_STEP` without an exact qualified total
+   raises right after a short page instead of first requesting an unusable confirmation page, so such
+   a traversal sends one request fewer.
+7. **Stream lifecycle.** Every stream family now terminates through one lifecycle owner:
+   - reading a stream after `aclose()` ends the iteration with `StopAsyncIteration` and sends
+     nothing (previously `RuntimeError("stream was closed before exhaustion")`);
+   - `aclose()` during an in-flight read reports `EARLY_CLOSED` (previously `CANCELLED`): the close
+     owns termination, even though it cancels the read;
+   - a report is final once published, after cleanup; a later `aclose()` never raises a cleanup error
+     or changes it;
+   - when cleanup fails after the source was exhausted, the report records a `cleanup_failure`
+     violation and `CleanupState.FAILURE`, and the cleanup error is raised;
+   - a failure during cleanup that follows another failure is kept as a secondary `cleanup_failure`
+     violation (for example `reference cleanup also failed (RuntimeError)`), so a report can carry
+     more than one.
+
+Additions that need no change: `Request.bare()` and `Request.v3()`, `Bitrix24.from_webhook()`,
+`HttpxTransport` in the root, `ExecutionPolicy.from_settings()` and
+`OperationReport.keyset_selection`.
+
+The sections below describe the full current contract, including the 2.3 changes (a required
+`route=`, positional arguments, page stops) for code upgrading from earlier releases.
+
+## Migrating to the issues architecture (2.3)
 
 The route is now a required part of every `Request` and closed request mapping. Existing callers
 must choose `RouteKind.BARE`, `RouteKind.JSON` or `RouteKind.API_V3`; `with_parameters()` preserves

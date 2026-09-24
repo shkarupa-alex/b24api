@@ -23,6 +23,11 @@ PYTHON_BLOCK = re.compile(r"```python\n(.*?)\n```", re.DOTALL)
 
 
 _MARKDOWN_LINK = re.compile(r"\]\((?P<target>[^)\s]+)\)")
+# README links are absolute so they also work on PyPI (B19); these prefixes name files of this repository.
+_REPOSITORY_URLS = (
+    "https://github.com/shkarupa-alex/b24api/blob/master/",
+    "https://raw.githubusercontent.com/shkarupa-alex/b24api/master/",
+)
 
 
 def _local_links(path: Path) -> set[Path]:
@@ -30,9 +35,13 @@ def _local_links(path: Path) -> set[Path]:
     targets = set()
     for match in _MARKDOWN_LINK.finditer(path.read_text(encoding="utf-8")):
         target = match["target"].split("#", 1)[0]
-        if not target or "://" in target or target.startswith("mailto:"):
-            continue
-        targets.add((path.parent / target).resolve())
+        repository = next(
+            (target.removeprefix(prefix) for prefix in _REPOSITORY_URLS if target.startswith(prefix)), None
+        )
+        if repository is not None:
+            targets.add((ROOT / repository).resolve())
+        elif target and "://" not in target and not target.startswith("mailto:"):
+            targets.add((path.parent / target).resolve())
     return targets
 
 
@@ -40,6 +49,16 @@ def test_every_local_documentation_link_resolves() -> None:
     for path in (README, *sorted(DOCS.glob("*.md"))):
         for target in _local_links(path):
             assert target.exists(), f"{path.relative_to(ROOT)} links to missing {target}"
+
+
+def test_readme_links_are_absolute_so_they_work_on_pypi() -> None:
+    relative = [
+        match["target"]
+        for match in _MARKDOWN_LINK.finditer(README.read_text(encoding="utf-8"))
+        if "://" not in match["target"] and not match["target"].startswith(("#", "mailto:"))
+    ]
+
+    assert relative == []
 
 
 def test_every_maintained_doc_is_linked_and_specifications_are_an_archive() -> None:

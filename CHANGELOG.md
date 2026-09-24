@@ -1,6 +1,6 @@
 # Release notes
 
-## Unreleased
+## Unreleased (3.0.0)
 
 - **Breaking (3.0.0):** the `b24api` root exports 51 names instead of 165 (C7). The other 115 moved
   to `b24api.contracts`, `b24api.errors`, `b24api.transport` or `b24api.completion`, which export
@@ -57,6 +57,25 @@
   `total` as an observed empty source. The report completes and is exhausted with `mechanics_only`
   assurance (`identity_exact` with an identity) and never claims a count; `total: 0` keeps its
   count-matched result, and an explicit `ConsistencyPolicy` confirmation of `QUALIFIED_TOTAL` keeps such a page strict.
+
+## 2.3.0 — 2026-09-23
+
+- **Breaking:** `Request` requires `route=`, a `RouteKind` (`BARE`, `JSON` or `API_V3`). There is no
+  default route, so a V3 method can no longer reach the classic endpoint by accident. A transport
+  serves only the routes its `TransportCapabilities.routes` declare.
+- Added positional arguments (`PositionalArguments`, `PositionalLayout` and the slot markers) for
+  methods whose parameters are positional.
+- Added whole-page stops (`PageStopPolicy`, `CallerStop`, `ContinuePage`, `PageBoundary`), page index
+  and stride offsets (`PageIndex`, `PageStride`), sparse raw bounds (`SparseRawBound`,
+  `RawTotalSource`), `CursorDomain`, `BoundedIdentityRange`, `DuplicatePolicy` and the external
+  `IdentityStore`.
+- The completion gate and its events are public, and every report carries its cleanup outcome
+  (`CleanupState`, `CleanupOutcome`) and `ReplayDisposition`.
+- HTTPX log records of the client's own requests, including auth retries and redirects, are
+  attributed to that request and scrubbed of the webhook secret; other loggers' records are left alone.
+
+## 2.2.0 — 2026-09-12
+
 - Added `Bitrix24.iter_cursors()` with lazy one/many-parent scheduling, per-binding
   `Binding.start_cursor`, strict seed progression, shared physical batching and existing
   fail-fast/tolerant reference semantics. When cursor-control creation is disabled, the complete

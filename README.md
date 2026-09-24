@@ -1,4 +1,4 @@
-# b24api 2.x
+# b24api 3.x
 
 `b24api` is a thin asynchronous Bitrix24 REST client for Python 3.12+. It knows how to send
 requests, split logical batches, traverse lists, retry safely, preserve caller correlation and
@@ -184,7 +184,7 @@ exact `limit_path`; the client never guesses method-specific parameter names.
 
 ### List traversal comparison
 
-![List traversal comparison](list-traversal-comparison.svg)
+![List traversal comparison](https://raw.githubusercontent.com/shkarupa-alex/b24api/master/list-traversal-comparison.svg)
 
 ### Sequential offset
 
@@ -379,10 +379,10 @@ boundary, use an application-owned direct-call workflow or supply a unique tie-b
 For multiple parent-bound cursor chains, `iter_cursors()` keeps cursor progress and correlation
 isolated per binding while ready pages share the physical batch queue.
 
-![Cursor batching across independent chats](cursor-batching.svg)
+![Cursor batching across independent chats](https://raw.githubusercontent.com/shkarupa-alex/b24api/master/cursor-batching.svg)
 
-See [architecture](docs/architecture.md), [migration](docs/migration.md),
-[performance](docs/performance.md), and [endpoint recipes](docs/recipes.md) for the complete
+See [architecture](https://github.com/shkarupa-alex/b24api/blob/master/docs/architecture.md), [migration](https://github.com/shkarupa-alex/b24api/blob/master/docs/migration.md),
+[performance](https://github.com/shkarupa-alex/b24api/blob/master/docs/performance.md), and [endpoint recipes](https://github.com/shkarupa-alex/b24api/blob/master/docs/recipes.md) for the complete
 contracts and selection guidance.
 
 ### One list method across many parent entities
@@ -391,7 +391,7 @@ contracts and selection guidance.
 client remains unaware of entity types: a binding can represent a deal, lead, chat or any other
 caller-defined parent.
 
-![Reference batching across leads and deals](references-batching.svg)
+![Reference batching across leads and deals](https://raw.githubusercontent.com/shkarupa-alex/b24api/master/references-batching.svg)
 
 <!-- tested: tests/client_v2_test.py::test_bound_references_apply_nested_updates_off_wire_and_emit_exact_completion -->
 ```python
@@ -553,10 +553,10 @@ uv run --with memray memray stats /tmp/b24api.bin
 ```
 
 These deterministic fixtures characterize local resources and network shape; they are not live
-portal latency admission. See [docs/performance.md](docs/performance.md) for current measurements
-and [docs/architecture.md](docs/architecture.md) for guarantees and ownership boundaries.
+portal latency admission. See [docs/performance.md](https://github.com/shkarupa-alex/b24api/blob/master/docs/performance.md) for current measurements
+and [docs/architecture.md](https://github.com/shkarupa-alex/b24api/blob/master/docs/architecture.md) for guarantees and ownership boundaries.
 
-Projects moving from an earlier API surface can use [docs/migration.md](docs/migration.md).
+Projects moving from an earlier API surface can use [docs/migration.md](https://github.com/shkarupa-alex/b24api/blob/master/docs/migration.md).
 
 ## Verification
 

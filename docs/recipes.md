@@ -1,4 +1,4 @@
-# Endpoint recipes for b24api 2.x
+# Endpoint recipes for b24api 3.x
 
 The complete executable scenario index is in [examples/README.md](../examples/README.md). It links
 the 19 frozen public-API recipes to their independent offline oracles and records the evidence
