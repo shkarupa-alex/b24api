@@ -326,8 +326,7 @@ class Executor:
             throttle_delay = _retry_after_seconds(wire)
             if throttle_delay is not None:
                 merged = await context.coordinator.observe_throttle(
-                    throttle_delay,
-                    reason=_throttle_reason(response_error),
+                    throttle_delay, reason=_throttle_reason(response_error)
                 )
                 await context.record_cooldown(merged)
             _raise_for_pending_cancellation()

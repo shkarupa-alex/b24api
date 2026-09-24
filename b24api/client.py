@@ -86,14 +86,34 @@ class Bitrix24(_TraversalFacade):
                 raise ValueError("injected transport host does not match Settings")
             selected_transport = transport
             owned_transport = None
-        self._settings: Settings | None = resolved
-        self._transport = selected_transport
-        self._owned_transport = owned_transport
-        self._executor = Executor(selected_transport)
-        self._owned_coordinator: RateCoordinator | None = self._executor.coordinator
-        self._default_policy = policy or ExecutionPolicy(
-            max_retry_elapsed_per_request=float(resolved.http_timeout),
+        executor = Executor(selected_transport)
+        self._compose(
+            resolved,
+            executor,
+            owned_transport=owned_transport,
+            owned_coordinator=executor.coordinator,
+            policy=policy or ExecutionPolicy(max_retry_elapsed_per_request=float(resolved.http_timeout)),
+            host=host,
+            unknown_request_audit=unknown_request_audit,
         )
+
+    def _compose(  # noqa: PLR0913 - one assignment site for both constructors
+        self,
+        settings: Settings | None,
+        executor: Executor,
+        *,
+        owned_transport: HttpxTransport | None,
+        owned_coordinator: RateCoordinator | None,
+        policy: ExecutionPolicy,
+        host: str,
+        unknown_request_audit: UnknownRequestAudit | None,
+    ) -> None:
+        self._settings = settings
+        self._transport = executor.transport
+        self._owned_transport = owned_transport
+        self._executor = executor
+        self._owned_coordinator = owned_coordinator
+        self._default_policy = policy
         self._host = host
         self._closed = False
         self._unknown_request_audit = unknown_request_audit
@@ -111,17 +131,15 @@ class Bitrix24(_TraversalFacade):
     ) -> Bitrix24:
         """Construct over an injected deterministic executor for tests."""
         instance = cls.__new__(cls)
-        instance._settings = None
-        instance._transport = executor.transport
-        instance._owned_transport = None
-        instance._executor = executor
-        instance._owned_coordinator = None
-        instance._default_policy = policy or ExecutionPolicy()
-        instance._host = host
-        instance._closed = False
-        instance._unknown_request_audit = unknown_request_audit
-        instance._close_task = None
-        instance._streams = weakref.WeakSet()
+        instance._compose(
+            None,
+            executor,
+            owned_transport=None,
+            owned_coordinator=None,
+            policy=policy or ExecutionPolicy(),
+            host=host,
+            unknown_request_audit=unknown_request_audit,
+        )
         return instance
 
     @property
