@@ -30,8 +30,11 @@
   total (`TotalTermination.EXACT_QUALIFIED`) closes it raises `CapabilityError` before any request,
   instead of ending incomplete; with `TotalTermination.DISABLED` the suffix traversal still works
   (A9).
-- **Breaking (3.0.0):** `verify_keyset_capability()` returns an `UNSUPPORTED` report when the portal
-  answers a boundary read wrongly, instead of raising; the CLI exits with 6 (A10).
+- **Breaking (3.0.0):** when the portal answers a boundary read wrongly, `verify_keyset_capability()`
+  raises `KeysetCapabilityError` carrying an `UNSUPPORTED` report instead of a raw `PaginationError`.
+  The report marks `TWO_ROW_DESC` as `ORDER_INVALID`, `CAP_EXCEEDED` or `SHAPE_INVALID` and the other
+  checks as `NOT_EXECUTED`. `KeysetCapabilityError` is a `CapabilityError`, not a `PaginationError`.
+  The CLI exits with 6 (A10).
 - **Breaking (3.0.0):** closing a logical batch early reports `EARLY_CLOSED` with the reason
   `"stream closed before exhaustion"` (A12). A fail-fast batch reports `BatchCommandError` and the
   violation `batch_command_failure` instead of a private carrier class (A14). A failed source close
