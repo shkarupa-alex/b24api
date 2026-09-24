@@ -13,6 +13,7 @@ from b24api.batch.outcome import (
     BatchOutcome,
     BatchSuccess,
 )
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.policy import (
     ExecutionPolicy,
     ReplayDisposition,
@@ -27,7 +28,6 @@ from b24api.execution import (
     WorkClass,
 )
 from b24api.execution.executor import _raise_embedded_result_error
-from b24api.traversal.plans import PORTAL_BATCH_CAP
 
 if TYPE_CHECKING:
     from b24api.batch.stream import _BatchOutcomeStream

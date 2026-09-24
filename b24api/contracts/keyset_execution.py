@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal, TypedDict
 
-PORTAL_BATCH_CAP = 50
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
+
 MIN_WINDOW_WIDTH = 2
 MIN_TARGET_LANES = 2
 

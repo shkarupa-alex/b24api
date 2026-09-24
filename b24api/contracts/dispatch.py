@@ -5,7 +5,8 @@ import math
 from dataclasses import dataclass
 from enum import StrEnum
 
-_PORTAL_BATCH_CAP = 50
+# The Bitrix portal accepts at most 50 commands in one physical batch; every layer reads this constant.
+PORTAL_BATCH_CAP = 50
 
 
 class DeliveryOrder(StrEnum):
@@ -39,14 +40,14 @@ class DirectDispatch:
 class BatchDispatch:
     """Bounded independent physical Bitrix batch requests."""
 
-    batch_size: int = 50
+    batch_size: int = PORTAL_BATCH_CAP
     concurrency: int = 1
     output_order: DeliveryOrder = DeliveryOrder.READY
     coalesce_wait: float = 0.020
 
     def __post_init__(self) -> None:
         """Validate the discriminated batch controls."""
-        if not 1 <= _positive_plain_integer(self.batch_size, "batch_size") <= _PORTAL_BATCH_CAP:
+        if not 1 <= _positive_plain_integer(self.batch_size, "batch_size") <= PORTAL_BATCH_CAP:
             raise ValueError("batch_size must be between 1 and 50")
         _positive_plain_integer(self.concurrency, "concurrency")
         if not isinstance(self.output_order, DeliveryOrder):

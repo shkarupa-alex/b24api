@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
 
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.policy import (
     DuplicatePolicy,
     IdentityCoercion,
@@ -22,7 +23,6 @@ from b24api.contracts.traversal import CursorDomain, OffsetContinuation, PageStr
 if TYPE_CHECKING:
     from b24api.contracts.bounded_range import BoundedIdentityRange
 
-PORTAL_BATCH_CAP = 50
 _START_PATH = ParameterPath(("start",))
 _FILTER_PATH = ParameterPath(("filter",))
 _ORDER_PATH = ParameterPath(("order",))
@@ -279,7 +279,7 @@ class ItemCursorPlan(PlanContract):
 class BatchDispatch:
     """Explicit bounded batch dispatch."""
 
-    batch_size: int = 50
+    batch_size: int = PORTAL_BATCH_CAP
     concurrency: int = 1
     output_order: ReferenceOutputOrder = ReferenceOutputOrder.READY
     coalesce_wait: float = 0.020
