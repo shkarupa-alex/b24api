@@ -1,0 +1,7787 @@
+{
+ "recipe:binary_download": {
+  "evidence": {
+   "observed_count": 23,
+   "reports": []
+  },
+  "requests": [
+   [
+    {
+     "method": "crm.documentgenerator.document.getpdf",
+     "parameters": {
+      "id": "fixture-doc"
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "rest.file.get",
+     "parameters": {
+      "id": "fixture-file"
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "rest.file.get",
+     "parameters": {
+      "id": "denied-file"
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": []
+ },
+ "recipe:calendar_delta": {
+  "evidence": {
+   "observed_count": 2,
+   "reports": []
+  },
+  "requests": [
+   [
+    {
+     "method": "calendar.event.get",
+     "parameters": {
+      "from": "2026-09-01",
+      "modified_since": "2026-09-01T09:00:00+03:00",
+      "ownerId": 1,
+      "to": "2026-09-30",
+      "type": "user"
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "calendar.event.get",
+     "parameters": {
+      "from": "2026-09-01",
+      "modified_since": "2026-09-01T09:00:00+03:00",
+      "ownerId": 1,
+      "to": "2026-09-30",
+      "type": "user"
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "calendar.event.get",
+     "parameters": {
+      "from": "2026-09-01",
+      "modified_since": "2026-09-02T10:00:00+03:00",
+      "ownerId": 1,
+      "to": "2026-09-30",
+      "type": "user"
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": []
+ },
+ "recipe:chat_bounded_mirror": {
+  "evidence": {
+   "observed_count": 17,
+   "reports": [
+    {
+     "active_references_high_water": 4,
+     "admitted": 4,
+     "assurance": "bounded_prefix",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 6,
+     "emitted": 21,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 10,
+     "not_executed": 0,
+     "operation": "iter_references",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 10,
+     "retries": 0,
+     "state": "completed",
+     "successes": 4,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 17,
+     "unknown": 0,
+     "violations": []
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "A",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "B",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "A",
+      "LAST_ID": 108,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "B",
+      "LAST_ID": 114,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "C",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "D",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "B",
+      "LAST_ID": 112,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "C",
+      "LAST_ID": 119,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "D",
+      "LAST_ID": 129,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "D",
+      "LAST_ID": 127,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ],
+   [
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "A",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "B",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "A",
+      "LAST_ID": 108,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "B",
+      "LAST_ID": 114,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "C",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "A",
+      "LAST_ID": 2,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "D",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "B",
+      "LAST_ID": 112,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "C",
+      "LAST_ID": 119,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "A",
+      "LAST_ID": 1,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "D",
+      "LAST_ID": 129,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "B",
+      "LAST_ID": 1,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "D",
+      "LAST_ID": 127,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "D",
+      "LAST_ID": 1,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 21,
+     "sha256": "55584aa43beb1712b1fcf5faa3869f7a752616262d0aff44cbf942cc8897b3c5"
+    },
+    "report": {
+     "active_references_high_water": 4,
+     "admitted": 4,
+     "assurance": "bounded_prefix",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 6,
+     "emitted": 21,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 10,
+     "not_executed": 0,
+     "operation": "iter_references",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 10,
+     "retries": 0,
+     "state": "completed",
+     "successes": 4,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 17,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 22,
+     "sha256": "2e7af4a01ee5309758bb4a6ce97d4dc5b758d106e66097e5185fc544cc899cfd"
+    },
+    "report": {
+     "active_references_high_water": 4,
+     "admitted": 4,
+     "assurance": null,
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 7,
+     "emitted": 22,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 14,
+     "not_executed": 0,
+     "operation": "iter_references",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 14,
+     "retries": 0,
+     "state": "completed",
+     "successes": 4,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 18,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "recipe:chat_resume": {
+  "evidence": {
+   "observed_count": 8,
+   "reports": [
+    {
+     "active_references_high_water": 2,
+     "admitted": 1,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 3,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_references",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "early_closed",
+     "successes": 1,
+     "terminal_reason": "stream closed before exhaustion",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 2,
+     "admitted": 2,
+     "assurance": null,
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 4,
+     "emitted": 9,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 6,
+     "not_executed": 0,
+     "operation": "iter_references",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 6,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 7,
+     "unknown": 0,
+     "violations": []
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "A",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "B",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ],
+   [
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "A",
+      "LAST_ID": 105,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "B",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "A",
+      "LAST_ID": 103,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "A",
+      "LAST_ID": 101,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "B",
+      "LAST_ID": 114,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "B",
+      "LAST_ID": 113,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 3,
+     "sha256": "e0a2811028fe5752cbdc6a80bb331c80d3dc64213f93f4409c4300e9a18648a3"
+    },
+    "report": {
+     "active_references_high_water": 2,
+     "admitted": 1,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 3,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_references",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "early_closed",
+     "successes": 1,
+     "terminal_reason": "stream closed before exhaustion",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 9,
+     "sha256": "f178f2dc80bacae0ca19ed31a6449c5d4c156230842fb5aaf1a2c6e4b5d29bbf"
+    },
+    "report": {
+     "active_references_high_water": 2,
+     "admitted": 2,
+     "assurance": null,
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 4,
+     "emitted": 9,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 6,
+     "not_executed": 0,
+     "operation": "iter_references",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 6,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 7,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "recipe:content_viewers": {
+  "evidence": {
+   "observed_count": 13,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 13,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 10,
+     "emitted": 13,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       10
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 13,
+     "terminal_reason": "empty page confirmed terminal",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "socialnetwork.contentview.getlist",
+     "parameters": {
+      "params": {
+       "contentId": "TASK-42",
+       "page": 1
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "socialnetwork.contentview.getlist",
+     "parameters": {
+      "params": {
+       "contentId": "TASK-42",
+       "page": 2
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "socialnetwork.contentview.getlist",
+     "parameters": {
+      "params": {
+       "contentId": "TASK-42",
+       "page": 3
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "socialnetwork.contentview.getlist",
+     "parameters": {
+      "params": {
+       "contentId": "TASK-7",
+       "page": 1
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "socialnetwork.contentview.getlist",
+     "parameters": {
+      "params": {
+       "contentId": "TASK-999",
+       "page": 1
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 13,
+     "sha256": "5514ac98f9791237d7335c99dd4e1cf26265561006f375fb266b6e3932b02db3"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 13,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 10,
+     "emitted": 13,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       10
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 13,
+     "terminal_reason": "empty page confirmed terminal",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "recipe:crm_item_delta": {
+  "evidence": {
+   "observed_count": 3,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 2,
+     "not_executed": 0,
+     "operation": "iter_list_keyset",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "empty keyset confirmation",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 2,
+     "not_executed": 0,
+     "operation": "iter_list_keyset",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "empty keyset confirmation",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "crm.type.list",
+     "parameters": {},
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-01T00%3A00%3A00%2B03%3A00&order%5Bid%5D=ASC&start=-1",
+       "c000000000001": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-01T00%3A00%3A00%2B03%3A00&order%5Bid%5D=DESC&start=-1"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-01T00%3A00%3A00%2B03%3A00&filter%5B%3Eid%5D=0&filter%5B%3Cid%5D=1&order%5Bid%5D=ASC&start=-1",
+       "c000000000001": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-01T00%3A00%3A00%2B03%3A00&filter%5B%3Eid%5D=1&filter%5B%3Cid%5D=2&order%5Bid%5D=ASC&start=-1",
+       "c000000000002": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-01T00%3A00%3A00%2B03%3A00&filter%5B%3Eid%5D=0&filter%5B%3Cid%5D=2&order%5Bid%5D=ASC&start=-1",
+       "c000000000003": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-01T00%3A00%3A00%2B03%3A00&filter%5B%3Eid%5D=0&filter%5B%3Cid%5D=3&order%5Bid%5D=ASC&start=-1",
+       "c000000000004": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-01T00%3A00%3A00%2B03%3A00&filter%5B%3Eid%5D=0&filter%5B%3Cid%5D=3&order%5Bid%5D=DESC&start=-1"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.item.list",
+     "parameters": {
+      "entityTypeId": 1256,
+      "filter": {
+       ">=updatedTime": "2026-09-01T00:00:00+03:00"
+      },
+      "order": {
+       "id": "ASC"
+      },
+      "select": [
+       "id",
+       "updatedTime"
+      ],
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.item.list",
+     "parameters": {
+      "entityTypeId": 1256,
+      "filter": {
+       ">=updatedTime": "2026-09-01T00:00:00+03:00",
+       ">id": 2
+      },
+      "order": {
+       "id": "ASC"
+      },
+      "select": [
+       "id",
+       "updatedTime"
+      ],
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.item.list",
+     "parameters": {
+      "entityTypeId": 1256,
+      "filter": {
+       ">=updatedTime": "2026-09-01T00:00:00+03:00",
+       ">id": 2
+      },
+      "order": {
+       "id": "ASC"
+      },
+      "select": [
+       "id",
+       "updatedTime"
+      ],
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-02T09%3A59%3A59%2B03%3A00&order%5Bid%5D=ASC&start=-1",
+       "c000000000001": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-02T09%3A59%3A59%2B03%3A00&order%5Bid%5D=DESC&start=-1"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-02T09%3A59%3A59%2B03%3A00&filter%5B%3Eid%5D=0&filter%5B%3Cid%5D=1&order%5Bid%5D=ASC&start=-1",
+       "c000000000001": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-02T09%3A59%3A59%2B03%3A00&filter%5B%3Eid%5D=1&filter%5B%3Cid%5D=2&order%5Bid%5D=ASC&start=-1",
+       "c000000000002": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-02T09%3A59%3A59%2B03%3A00&filter%5B%3Eid%5D=0&filter%5B%3Cid%5D=2&order%5Bid%5D=ASC&start=-1",
+       "c000000000003": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-02T09%3A59%3A59%2B03%3A00&filter%5B%3Eid%5D=0&filter%5B%3Cid%5D=4&order%5Bid%5D=ASC&start=-1",
+       "c000000000004": "crm.item.list?entityTypeId=1256&select%5B0%5D=id&select%5B1%5D=updatedTime&filter%5B%3E%3DupdatedTime%5D=2026-09-02T09%3A59%3A59%2B03%3A00&filter%5B%3Eid%5D=0&filter%5B%3Cid%5D=4&order%5Bid%5D=DESC&start=-1"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.item.list",
+     "parameters": {
+      "entityTypeId": 1256,
+      "filter": {
+       ">=updatedTime": "2026-09-02T09:59:59+03:00"
+      },
+      "order": {
+       "id": "ASC"
+      },
+      "select": [
+       "id",
+       "updatedTime"
+      ],
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.item.list",
+     "parameters": {
+      "entityTypeId": 1256,
+      "filter": {
+       ">=updatedTime": "2026-09-02T09:59:59+03:00",
+       ">id": 3
+      },
+      "order": {
+       "id": "ASC"
+      },
+      "select": [
+       "id",
+       "updatedTime"
+      ],
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 2,
+     "sha256": "34da69da6c774df16483bfa7fdc92b2e29bade120d41348f65f4ee3fd1b1c6b7"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 2,
+     "not_executed": 0,
+     "operation": "iter_list_keyset",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "empty keyset confirmation",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 2,
+     "sha256": "ee408592e20e908e0a6aa2e7382a37c164d6747aa548c29de8def56870663896"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 2,
+     "not_executed": 0,
+     "operation": "iter_list_keyset",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "empty keyset confirmation",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "recipe:disk_mirror": {
+  "evidence": {
+   "observed_count": 60,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 53,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 1,
+     "batch_requests": 1,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 53,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 2,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       3
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 53,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 53,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 1,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 1,
+     "emitted": 1,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 1,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 1,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "disk.storage.getlist",
+     "parameters": {
+      "order": {
+       "ID": "ASC"
+      },
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "disk.folder.getchildren",
+     "parameters": {
+      "id": 100,
+      "order": {
+       "ID": "ASC"
+      },
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "disk.folder.getchildren?id=100&order%5BID%5D=ASC&start=50"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "disk.folder.getchildren",
+     "parameters": {
+      "id": 200,
+      "order": {
+       "ID": "ASC"
+      },
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "disk.folder.getchildren",
+     "parameters": {
+      "id": 120,
+      "order": {
+       "ID": "ASC"
+      },
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "disk.folder.getchildren",
+     "parameters": {
+      "id": 130,
+      "order": {
+       "ID": "ASC"
+      },
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 2,
+     "sha256": "6b4e036d97de230106673cace2af8d44bb163cbe750865187ec03284b88d7a3e"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 53,
+     "sha256": "fe68b1811f43406dbb67e691b8dd1ec039e9ff85700809ea2b0eb1af28c535e7"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 53,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 1,
+     "batch_requests": 1,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 53,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 2,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       3
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 53,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 53,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 1,
+     "sha256": "65f507e6d2c039dfd96d6c2df867b4e41756f4409a9ab60734c7361eff66c9f8"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 1,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 1,
+     "emitted": 1,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 1,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 1,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 2,
+     "sha256": "06b30027812b773250dbabe0c3e510dcd5d2903a4e813a6f857f67aad77a194f"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 2,
+     "sha256": "153a09336ce47a2068ac5b69c2009f59ecd2725e9244df99dae448eab4b92f2f"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "recipe:elapsed_task_items": {
+  "evidence": {
+   "observed_count": 53,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 53,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 53,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 53,
+     "terminal_reason": "empty page confirmed terminal",
+     "unique_rows": 53,
+     "unknown": 0,
+     "violations": []
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "task.elapseditem.getlist",
+     "parameters": null,
+     "positional": [
+      42,
+      {},
+      {},
+      [],
+      {
+       "NAV_PARAMS": {
+        "iNumPage": 1,
+        "nPageSize": 50
+       }
+      }
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "task.elapseditem.getlist",
+     "parameters": null,
+     "positional": [
+      42,
+      {},
+      {},
+      [],
+      {
+       "NAV_PARAMS": {
+        "iNumPage": 2,
+        "nPageSize": 50
+       }
+      }
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "task.elapseditem.getlist",
+     "parameters": null,
+     "positional": [
+      42,
+      {},
+      {},
+      [],
+      {
+       "NAV_PARAMS": {
+        "iNumPage": 3,
+        "nPageSize": 50
+       }
+      }
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 53,
+     "sha256": "f2360ad09eb1c706b6aa86c324f0ca713bb5c6424e0f0d860b305a8f6fad6239"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 53,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 53,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 53,
+     "terminal_reason": "empty page confirmed terminal",
+     "unique_rows": 53,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "recipe:message_cursor_direction": {
+  "evidence": {
+   "observed_count": 5,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 5,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 1,
+     "emitted": 5,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 6,
+     "not_executed": 0,
+     "operation": "iter_list_cursor",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 6,
+     "retries": 0,
+     "state": "completed",
+     "successes": 5,
+     "terminal_reason": "empty cursor confirmation",
+     "unique_rows": 5,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 5,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 3,
+     "emitted": 5,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list_cursor",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 5,
+     "terminal_reason": "empty cursor confirmation",
+     "unique_rows": 5,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 5,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 5,
+     "emitted": 5,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 2,
+     "not_executed": 0,
+     "operation": "iter_list_cursor",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       5
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 5,
+     "terminal_reason": "empty cursor confirmation",
+     "unique_rows": 5,
+     "unknown": 0,
+     "violations": []
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "FIRST_ID": 0,
+      "LIMIT": 3
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "FIRST_ID": 30211,
+      "LIMIT": 3
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ],
+   [
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "LIMIT": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "LAST_ID": 30211,
+      "LIMIT": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "LAST_ID": 29991,
+      "LIMIT": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "LAST_ID": 12561,
+      "LIMIT": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "LAST_ID": 3575,
+      "LIMIT": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "LAST_ID": 3573,
+      "LIMIT": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ],
+   [
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "LIMIT": 3
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "LAST_ID": 12561,
+      "LIMIT": 3
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "LAST_ID": 3573,
+      "LIMIT": 3
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ],
+   [
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "LIMIT": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat-1",
+      "LAST_ID": 3573,
+      "LIMIT": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 5,
+     "sha256": "4e700322c5ec83ee9f2b083077baf663538caa6a4018721f5a5ffecddf8eb591"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 5,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 1,
+     "emitted": 5,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 6,
+     "not_executed": 0,
+     "operation": "iter_list_cursor",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 6,
+     "retries": 0,
+     "state": "completed",
+     "successes": 5,
+     "terminal_reason": "empty cursor confirmation",
+     "unique_rows": 5,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 5,
+     "sha256": "4e700322c5ec83ee9f2b083077baf663538caa6a4018721f5a5ffecddf8eb591"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 5,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 3,
+     "emitted": 5,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list_cursor",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 5,
+     "terminal_reason": "empty cursor confirmation",
+     "unique_rows": 5,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 5,
+     "sha256": "4e700322c5ec83ee9f2b083077baf663538caa6a4018721f5a5ffecddf8eb591"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 5,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 5,
+     "emitted": 5,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 2,
+     "not_executed": 0,
+     "operation": "iter_list_cursor",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       5
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 5,
+     "terminal_reason": "empty cursor confirmation",
+     "unique_rows": 5,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "recipe:numerator_list": {
+  "evidence": {
+   "observed_count": 53,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 53,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 53,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "rejected",
+       "range_contradiction",
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "incomplete",
+     "successes": 53,
+     "terminal_reason": "PaginationError",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": [
+      [
+       "blocking",
+       "pagination_invariant"
+      ]
+     ]
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "documentgenerator.numerator.list",
+     "parameters": {
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "documentgenerator.numerator.list",
+     "parameters": {
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "documentgenerator.numerator.list",
+     "parameters": {
+      "start": 100
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": "IncompleteTraversalError",
+    "items": {
+     "count": 53,
+     "sha256": "7df3656cd61e44cc1fa91a71702a7641cb89e470a85f5eaacc828f9a688b320a"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 53,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 53,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "rejected",
+       "range_contradiction",
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "incomplete",
+     "successes": 53,
+     "terminal_reason": "PaginationError",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": [
+      [
+       "blocking",
+       "pagination_invariant"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ "recipe:page_index_members": {
+  "evidence": {
+   "observed_count": 13,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 13,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 10,
+     "emitted": 13,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       10
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 13,
+     "terminal_reason": "empty page confirmed terminal",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 13,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 10,
+     "emitted": 13,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       10
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 13,
+     "terminal_reason": "empty page confirmed terminal",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "socialnetwork.workgroup.getgridpopupmembers",
+     "parameters": {
+      "page": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "socialnetwork.workgroup.getgridpopupmembers",
+     "parameters": {
+      "page": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "socialnetwork.workgroup.getgridpopupmembers",
+     "parameters": {
+      "page": 3
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "socialnetwork.workgroup.getlistincomingusers",
+     "parameters": {
+      "pageNum": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "socialnetwork.workgroup.getlistincomingusers",
+     "parameters": {
+      "pageNum": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "socialnetwork.workgroup.getlistincomingusers",
+     "parameters": {
+      "pageNum": 3
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 13,
+     "sha256": "8d7c5fb8087b82586fb1ede2bbc436bbf4874356beecd5fc28187c7dad50fdce"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 13,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 10,
+     "emitted": 13,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       10
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 13,
+     "terminal_reason": "empty page confirmed terminal",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 13,
+     "sha256": "8d7c5fb8087b82586fb1ede2bbc436bbf4874356beecd5fc28187c7dad50fdce"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 13,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 10,
+     "emitted": 13,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       10
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 13,
+     "terminal_reason": "empty page confirmed terminal",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "recipe:recent_dialogs": {
+  "evidence": {
+   "observed_count": 4,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 5,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 5,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 4,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 4,
+     "retries": 0,
+     "state": "completed",
+     "successes": 5,
+     "terminal_reason": "empty page confirmed terminal",
+     "unique_rows": 4,
+     "unknown": 0,
+     "violations": [
+      [
+       "warning",
+       "duplicate_identity"
+      ]
+     ]
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "im.recent.list",
+     "parameters": {
+      "LIMIT": 2,
+      "OFFSET": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.recent.list",
+     "parameters": {
+      "LIMIT": 2,
+      "OFFSET": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.recent.list",
+     "parameters": {
+      "LIMIT": 2,
+      "OFFSET": 4
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.recent.list",
+     "parameters": {
+      "LIMIT": 2,
+      "OFFSET": 5
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 5,
+     "sha256": "fcdc81ef43340e7c15aa70d0e7203a9486322fd61167e25b9d890dc8ed709571"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 5,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 5,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 4,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 4,
+     "retries": 0,
+     "state": "completed",
+     "successes": 5,
+     "terminal_reason": "empty page confirmed terminal",
+     "unique_rows": 4,
+     "unknown": 0,
+     "violations": [
+      [
+       "warning",
+       "duplicate_identity"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ "recipe:requisite_links": {
+  "evidence": {
+   "observed_count": 582,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 582,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 582,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 12,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       32
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 12,
+     "retries": 0,
+     "state": "completed",
+     "successes": 582,
+     "terminal_reason": "qualified total reached",
+     "unique_rows": 582,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 582,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 11,
+     "batch_requests": 1,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 582,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 12,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       32
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 582,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 582,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 400,
+     "assurance": "mechanics_only",
+     "batch_commands": 11,
+     "batch_requests": 1,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 400,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 12,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "rejected",
+       "range_contradiction",
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "incomplete",
+     "successes": 400,
+     "terminal_reason": "CapabilityError",
+     "unique_rows": 400,
+     "unknown": 0,
+     "violations": [
+      [
+       "blocking",
+       "capability_rejected"
+      ]
+     ]
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 100
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 150
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 200
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 250
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 300
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 350
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 400
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 450
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 500
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 550
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ],
+   [
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=50",
+       "c000000000001": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=100",
+       "c000000000002": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=150",
+       "c000000000003": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=200",
+       "c000000000004": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=250",
+       "c000000000005": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=300",
+       "c000000000006": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=350",
+       "c000000000007": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=400",
+       "c000000000008": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=450",
+       "c000000000009": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=500",
+       "c000000000010": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=550"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ],
+   [
+    {
+     "method": "crm.requisitelink.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_TYPE_ID": 2
+      },
+      "order": {
+       "ENTITY_ID": "ASC"
+      },
+      "select": [
+       "ENTITY_TYPE_ID",
+       "ENTITY_ID"
+      ],
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=50",
+       "c000000000001": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=100",
+       "c000000000002": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=150",
+       "c000000000003": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=200",
+       "c000000000004": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=250",
+       "c000000000005": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=300",
+       "c000000000006": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=350",
+       "c000000000007": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=400",
+       "c000000000008": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=450",
+       "c000000000009": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=500",
+       "c000000000010": "crm.requisitelink.list?select%5B0%5D=ENTITY_TYPE_ID&select%5B1%5D=ENTITY_ID&filter%5BENTITY_TYPE_ID%5D=2&order%5BENTITY_ID%5D=ASC&start=550"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 582,
+     "sha256": "b7b39dd70d28cf17eedf3128d9ed117e4ec4de47a3f484937e503cc948dffd2f"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 582,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 582,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 12,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       32
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 12,
+     "retries": 0,
+     "state": "completed",
+     "successes": 582,
+     "terminal_reason": "qualified total reached",
+     "unique_rows": 582,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 582,
+     "sha256": "b7b39dd70d28cf17eedf3128d9ed117e4ec4de47a3f484937e503cc948dffd2f"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 582,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 11,
+     "batch_requests": 1,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 582,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 12,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       32
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 582,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 582,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": "IncompleteTraversalError",
+    "items": {
+     "count": 400,
+     "sha256": "dc29b2d44ee95d324b6156aaa4d0a5ec22863d5014684cafcdf351f5cf8f532f"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 400,
+     "assurance": "mechanics_only",
+     "batch_commands": 11,
+     "batch_requests": 1,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 400,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 12,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "rejected",
+       "range_contradiction",
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "incomplete",
+     "successes": 400,
+     "terminal_reason": "CapabilityError",
+     "unique_rows": 400,
+     "unknown": 0,
+     "violations": [
+      [
+       "blocking",
+       "capability_rejected"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ "recipe:search_chat_messages": {
+  "evidence": {
+   "observed_count": 3,
+   "reports": [
+    {
+     "active_references_high_water": 2,
+     "admitted": 3,
+     "assurance": null,
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 6,
+     "exhausted": false,
+     "failures": 1,
+     "logical_pages": 4,
+     "not_executed": 0,
+     "operation": "iter_reference_outcomes",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "unknown",
+       "command_failure",
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 5,
+     "retries": 0,
+     "state": "completed_with_failures",
+     "successes": 2,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 3,
+     "unknown": 0,
+     "violations": [
+      [
+       "warning",
+       "reference_failure"
+      ]
+     ]
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "im.dialog.messages.search",
+     "parameters": {
+      "CHAT_ID": 101,
+      "DATE_FROM": "2026-09-01T00:00:00+03:00",
+      "DATE_TO": "2026-09-22T23:59:59+03:00",
+      "LIMIT": 2,
+      "ORDER": {
+       "ID": "DESC"
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.search",
+     "parameters": {
+      "CHAT_ID": 102,
+      "DATE_FROM": "2026-09-01T00:00:00+03:00",
+      "DATE_TO": "2026-09-22T23:59:59+03:00",
+      "LIMIT": 2,
+      "ORDER": {
+       "ID": "DESC"
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.search",
+     "parameters": {
+      "CHAT_ID": 101,
+      "DATE_FROM": "2026-09-01T00:00:00+03:00",
+      "DATE_TO": "2026-09-22T23:59:59+03:00",
+      "LAST_ID": 10008,
+      "LIMIT": 2,
+      "ORDER": {
+       "ID": "DESC"
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.search",
+     "parameters": {
+      "CHAT_ID": 103,
+      "DATE_FROM": "2026-09-01T00:00:00+03:00",
+      "DATE_TO": "2026-09-22T23:59:59+03:00",
+      "LIMIT": 2,
+      "ORDER": {
+       "ID": "DESC"
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.search",
+     "parameters": {
+      "CHAT_ID": 101,
+      "DATE_FROM": "2026-09-01T00:00:00+03:00",
+      "DATE_TO": "2026-09-22T23:59:59+03:00",
+      "LAST_ID": 3,
+      "LIMIT": 2,
+      "ORDER": {
+       "ID": "DESC"
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 6,
+     "sha256": "c39e8c23880696828c7b4b922e22200c5e19c99af06ead7eb3c5405582e6713d"
+    },
+    "report": {
+     "active_references_high_water": 2,
+     "admitted": 3,
+     "assurance": null,
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 6,
+     "exhausted": false,
+     "failures": 1,
+     "logical_pages": 4,
+     "not_executed": 0,
+     "operation": "iter_reference_outcomes",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "unknown",
+       "command_failure",
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 5,
+     "retries": 0,
+     "state": "completed_with_failures",
+     "successes": 2,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 3,
+     "unknown": 0,
+     "violations": [
+      [
+       "warning",
+       "reference_failure"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ "recipe:sparse_user_search": {
+  "evidence": {
+   "observed_count": 2,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "raw_range_covered",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 1,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "qualified sparse raw range covered",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "im.search.user",
+     "parameters": {
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.search.user",
+     "parameters": {
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.search.user",
+     "parameters": {
+      "start": 100
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 2,
+     "sha256": "cb2f8803874fc838e4880c5a5cde3d4d6caf5ca7bb63af5d0bc999a8757c1532"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "raw_range_covered",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 1,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "qualified sparse raw range covered",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "recipe:task_comments": {
+  "evidence": {
+   "observed_count": 2,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 4,
+     "assurance": null,
+     "batch_commands": 4,
+     "batch_requests": 1,
+     "buffered_commands_high_water": 4,
+     "buffered_rows_high_water": 4,
+     "emitted": 4,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 0,
+     "not_executed": 0,
+     "operation": "batch_outcomes",
+     "page_trace": [],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 4,
+     "terminal_reason": "input exhausted",
+     "unique_rows": 4,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 2,
+     "admitted": 3,
+     "assurance": null,
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 5,
+     "exhausted": false,
+     "failures": 1,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_reference_outcomes",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "unknown",
+       "command_failure",
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 4,
+     "retries": 0,
+     "state": "completed_with_failures",
+     "successes": 2,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": [
+      [
+       "warning",
+       "reference_failure"
+      ]
+     ]
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 2,
+     "not_executed": 0,
+     "operation": "iter_list_keyset",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "empty keyset confirmation",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "im.chat.get?ENTITY_TYPE=TASKS_TASK&ENTITY_ID=42",
+       "c000000000001": "im.chat.get?ENTITY_TYPE=TASKS_TASK&ENTITY_ID=43",
+       "c000000000002": "im.chat.get?ENTITY_TYPE=TASKS_TASK&ENTITY_ID=44",
+       "c000000000003": "im.chat.get?ENTITY_TYPE=TASKS_TASK&ENTITY_ID=45"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat900",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat901",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat900",
+      "LAST_ID": 10008,
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "im.dialog.messages.get",
+     "parameters": {
+      "DIALOG_ID": "chat902",
+      "LIMIT": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "task.commentitem.getlist",
+     "parameters": null,
+     "positional": [
+      43,
+      {
+       "ID": "ASC"
+      },
+      {}
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "task.commentitem.getlist",
+     "parameters": null,
+     "positional": [
+      43,
+      {
+       "ID": "DESC"
+      },
+      {}
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "task.commentitem.getlist",
+     "parameters": null,
+     "positional": [
+      43,
+      {
+       "ID": "ASC"
+      },
+      {
+       "<ID": 1,
+       ">ID": 0
+      }
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "task.commentitem.getlist",
+     "parameters": null,
+     "positional": [
+      43,
+      {
+       "ID": "ASC"
+      },
+      {
+       "<ID": 2,
+       ">ID": 1
+      }
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "task.commentitem.getlist",
+     "parameters": null,
+     "positional": [
+      43,
+      {
+       "ID": "ASC"
+      },
+      {
+       "<ID": 2,
+       ">ID": 0
+      }
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "task.commentitem.getlist",
+     "parameters": null,
+     "positional": [
+      43,
+      {
+       "ID": "ASC"
+      },
+      {
+       "<ID": 3,
+       ">ID": 0
+      }
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "task.commentitem.getlist",
+     "parameters": null,
+     "positional": [
+      43,
+      {
+       "ID": "DESC"
+      },
+      {
+       "<ID": 3,
+       ">ID": 0
+      }
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "task.commentitem.getlist",
+     "parameters": null,
+     "positional": [
+      43,
+      {
+       "ID": "ASC"
+      },
+      {}
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "task.commentitem.getlist",
+     "parameters": null,
+     "positional": [
+      43,
+      {
+       "ID": "ASC"
+      },
+      {
+       ">ID": 2
+      }
+     ],
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 4,
+     "sha256": "2aacb9d7500a323730d97d0c90816f0fd7b15f6c4b712b86df6a783c877af315"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 4,
+     "assurance": null,
+     "batch_commands": 4,
+     "batch_requests": 1,
+     "buffered_commands_high_water": 4,
+     "buffered_rows_high_water": 4,
+     "emitted": 4,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 0,
+     "not_executed": 0,
+     "operation": "batch_outcomes",
+     "page_trace": [],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 4,
+     "terminal_reason": "input exhausted",
+     "unique_rows": 4,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 5,
+     "sha256": "d642473a2c8e574519fd063ef4b6ee33c846c72cee101da3452a28f0c53842d9"
+    },
+    "report": {
+     "active_references_high_water": 2,
+     "admitted": 3,
+     "assurance": null,
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 5,
+     "exhausted": false,
+     "failures": 1,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_reference_outcomes",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "unknown",
+       "command_failure",
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 4,
+     "retries": 0,
+     "state": "completed_with_failures",
+     "successes": 2,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": [
+      [
+       "warning",
+       "reference_failure"
+      ]
+     ]
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 2,
+     "sha256": "6d93aaf28b93fa0d2a8cf4e01f1cd63ad0d539b02a81b5d596cc0fdd3f357a3e"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 2,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 2,
+     "emitted": 2,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 2,
+     "not_executed": 0,
+     "operation": "iter_list_keyset",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       2
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "empty keyset confirmation",
+     "unique_rows": 2,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "recipe:task_role_union": {
+  "evidence": {
+   "observed_count": 932,
+   "reports": [
+    {
+     "active_references_high_water": 0,
+     "admitted": 932,
+     "assurance": "count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 932,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 19,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       32
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 19,
+     "retries": 0,
+     "state": "completed",
+     "successes": 932,
+     "terminal_reason": "qualified total reached",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 11,
+     "assurance": "count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 11,
+     "emitted": 11,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       11
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 11,
+     "terminal_reason": "qualified total reached",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 20,
+     "assurance": "count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 20,
+     "emitted": 20,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       20
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 20,
+     "terminal_reason": "qualified total reached",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    },
+    {
+     "active_references_high_water": 0,
+     "admitted": 3,
+     "assurance": "count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 3,
+     "emitted": 3,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 3,
+     "terminal_reason": "qualified total reached",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 100
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 150
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 200
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 250
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 300
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 350
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 400
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 450
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 500
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 550
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 600
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 650
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 700
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 750
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 800
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 850
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 900
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "CREATED_BY": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "ACCOMPLICE": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "AUDITOR": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "tasks.task.list",
+     "parameters": {
+      "filter": {
+       ">=CHANGED_DATE": "2026-09-01T00:00:00+03:00",
+       "RESPONSIBLE_ID": 7
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "CHANGED_DATE"
+      ],
+      "start": 932
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 932,
+     "sha256": "e107861f784d4ae3e625ba7b5820221b97b21da2c58133a02a234d613b755886"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 932,
+     "assurance": "count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 932,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 19,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       32
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 19,
+     "retries": 0,
+     "state": "completed",
+     "successes": 932,
+     "terminal_reason": "qualified total reached",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 11,
+     "sha256": "f767d995ff89b3caea305543e84d923d7ee604bf128eae5e066b467f8b51ae17"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 11,
+     "assurance": "count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 11,
+     "emitted": 11,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       11
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 11,
+     "terminal_reason": "qualified total reached",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 20,
+     "sha256": "df02c425df990050a5274eb904c81ad970a033f4d60f1b7459d4d973e801a432"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 20,
+     "assurance": "count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 20,
+     "emitted": 20,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       20
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 20,
+     "terminal_reason": "qualified total reached",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   },
+   {
+    "error": null,
+    "items": {
+     "count": 3,
+     "sha256": "3157c15001366061e9e6437e94fb1fc3ca3b6c8587d5fc8475813e15fe171a55"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 3,
+     "assurance": "count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 3,
+     "emitted": 3,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 3,
+     "terminal_reason": "qualified total reached",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "recipe:timeline_comments": {
+  "evidence": {
+   "observed_count": 53,
+   "reports": [
+    {
+     "active_references_high_water": 3,
+     "admitted": 3,
+     "assurance": null,
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 57,
+     "exhausted": false,
+     "failures": 1,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_reference_outcomes",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "unknown",
+       "command_failure",
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 4,
+     "retries": 0,
+     "state": "completed_with_failures",
+     "successes": 2,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 54,
+     "unknown": 0,
+     "violations": [
+      [
+       "warning",
+       "reference_failure"
+      ]
+     ]
+    }
+   ]
+  },
+  "requests": [
+   [
+    {
+     "method": "crm.timeline.comment.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_ID": 71,
+       "ENTITY_TYPE": "deal"
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "ENTITY_TYPE",
+       "ENTITY_ID",
+       "CREATED",
+       "COMMENT"
+      ],
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.timeline.comment.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_ID": 22,
+       "ENTITY_TYPE": "contact"
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "ENTITY_TYPE",
+       "ENTITY_ID",
+       "CREATED",
+       "COMMENT"
+      ],
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.timeline.comment.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_ID": 999,
+       "ENTITY_TYPE": "lead"
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "ENTITY_TYPE",
+       "ENTITY_ID",
+       "CREATED",
+       "COMMENT"
+      ],
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.timeline.comment.list",
+     "parameters": {
+      "filter": {
+       "ENTITY_ID": 71,
+       "ENTITY_TYPE": "deal"
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "ENTITY_TYPE",
+       "ENTITY_ID",
+       "CREATED",
+       "COMMENT"
+      ],
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "crm.timeline.comment.list",
+     "parameters": {
+      "filter": {
+       ">ID": 1052,
+       "ENTITY_ID": 71,
+       "ENTITY_TYPE": "deal"
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "select": [
+       "ID",
+       "ENTITY_TYPE",
+       "ENTITY_ID",
+       "CREATED",
+       "COMMENT"
+      ],
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 57,
+     "sha256": "f59fd300aac78e75d8446aa2c2cf9237afc34b6fe18d64ae3fea8cf33a6c24e4"
+    },
+    "report": {
+     "active_references_high_water": 3,
+     "admitted": 3,
+     "assurance": null,
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 57,
+     "exhausted": false,
+     "failures": 1,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_reference_outcomes",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "unknown",
+       "command_failure",
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       3
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 4,
+     "retries": 0,
+     "state": "completed_with_failures",
+     "successes": 2,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 54,
+     "unknown": 0,
+     "violations": [
+      [
+       "warning",
+       "reference_failure"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ "recipe:v3_task_results": {
+  "evidence": {
+   "observed_count": 1,
+   "reports": []
+  },
+  "requests": [
+   [
+    {
+     "method": "tasks.task.result.list",
+     "parameters": {
+      "filter": {
+       "taskId": 11
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "api_v3"
+    },
+    {
+     "method": "tasks.task.result.list",
+     "parameters": {
+      "filter": {
+       "taskId": -1
+      }
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "api_v3"
+    }
+   ]
+  ],
+  "streams": []
+ },
+ "scenario:batch_early_close": {
+  "requests": [
+   [
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=1",
+       "c000000000001": "golden.item.get?id=2",
+       "c000000000002": "golden.item.get?id=3",
+       "c000000000003": "golden.item.get?id=4"
+      },
+      "halt": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 1,
+     "sha256": "9924b73b630d941a10b24078c4969040e0216773ec8857fe8680d5085e7ea2ec"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 4,
+     "assurance": null,
+     "batch_commands": 4,
+     "batch_requests": 1,
+     "buffered_commands_high_water": 4,
+     "buffered_rows_high_water": 4,
+     "emitted": 1,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 0,
+     "not_executed": 0,
+     "operation": "batch",
+     "page_trace": [],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "early_closed",
+     "successes": 1,
+     "terminal_reason": "GeneratorExit",
+     "unique_rows": 1,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:batch_fail_fast": {
+  "requests": [
+   [
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=1",
+       "c000000000001": "golden.item.get?id=2",
+       "c000000000002": "golden.item.get?id=3",
+       "c000000000003": "golden.item.get?id=4"
+      },
+      "halt": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000004": "golden.item.get?id=5",
+       "c000000000005": "golden.item.get?id=6",
+       "c000000000006": "golden.item.get?id=7",
+       "c000000000007": "golden.item.get?id=8"
+      },
+      "halt": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": "BatchFailed",
+    "items": {
+     "count": 6,
+     "sha256": "d06869db50d93ea1753b5054b60ca6e352bf33003fb27f0a161682631345f89b"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 8,
+     "assurance": null,
+     "batch_commands": 8,
+     "batch_requests": 2,
+     "buffered_commands_high_water": 4,
+     "buffered_rows_high_water": 4,
+     "emitted": 6,
+     "exhausted": false,
+     "failures": 1,
+     "logical_pages": 0,
+     "not_executed": 0,
+     "operation": "batch",
+     "page_trace": [],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "failed",
+     "successes": 7,
+     "terminal_reason": "_BatchWindowError",
+     "unique_rows": 6,
+     "unknown": 0,
+     "violations": [
+      [
+       "blocking",
+       "internal_failure"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ "scenario:batch_outcomes": {
+  "requests": [
+   [
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=1",
+       "c000000000001": "golden.item.get?id=2",
+       "c000000000002": "golden.item.get?id=3",
+       "c000000000003": "golden.item.get?id=4"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000004": "golden.item.get?id=5",
+       "c000000000005": "golden.item.get?id=6",
+       "c000000000006": "golden.item.get?id=7",
+       "c000000000007": "golden.item.get?id=8"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000008": "golden.item.get?id=9",
+       "c000000000009": "golden.item.get?id=10",
+       "c000000000010": "golden.item.get?id=11"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 11,
+     "sha256": "d84cec82fd8775155f67fda7d4e03baa5a6ea38a9aac1c55785d306304abc3a5"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 11,
+     "assurance": null,
+     "batch_commands": 11,
+     "batch_requests": 3,
+     "buffered_commands_high_water": 4,
+     "buffered_rows_high_water": 4,
+     "emitted": 11,
+     "exhausted": false,
+     "failures": 1,
+     "logical_pages": 0,
+     "not_executed": 0,
+     "operation": "batch_outcomes",
+     "page_trace": [],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed_with_failures",
+     "successes": 10,
+     "terminal_reason": "input exhausted",
+     "unique_rows": 11,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:batch_success": {
+  "requests": [
+   [
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=1",
+       "c000000000001": "golden.item.get?id=2",
+       "c000000000002": "golden.item.get?id=3",
+       "c000000000003": "golden.item.get?id=4"
+      },
+      "halt": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000004": "golden.item.get?id=5",
+       "c000000000005": "golden.item.get?id=6"
+      },
+      "halt": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 6,
+     "sha256": "d06869db50d93ea1753b5054b60ca6e352bf33003fb27f0a161682631345f89b"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 6,
+     "assurance": null,
+     "batch_commands": 6,
+     "batch_requests": 2,
+     "buffered_commands_high_water": 4,
+     "buffered_rows_high_water": 4,
+     "emitted": 6,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 0,
+     "not_executed": 0,
+     "operation": "batch",
+     "page_trace": [],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 6,
+     "terminal_reason": "input exhausted",
+     "unique_rows": 6,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:fan_out_direct": {
+  "requests": [
+   [
+    {
+     "method": "golden.item.get",
+     "parameters": {
+      "id": 1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.get",
+     "parameters": {
+      "id": 2
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.get",
+     "parameters": {
+      "id": 3
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.get",
+     "parameters": {
+      "id": 4
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.get",
+     "parameters": {
+      "id": 5
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 5,
+     "sha256": "c3f7446e76e268aa8792b671c9a145841e4972afa4f6eb89e5422623194eba18"
+    },
+    "report": {
+     "active_references_high_water": 2,
+     "admitted": 5,
+     "assurance": null,
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 1,
+     "emitted": 5,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 5,
+     "not_executed": 0,
+     "operation": "fan_out",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       1
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 5,
+     "retries": 0,
+     "state": "completed",
+     "successes": 5,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:fan_out_outcomes_batch": {
+  "requests": [
+   [
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=1"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=2"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=3"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=4"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=5"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=6"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=7"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=8"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=9"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=10"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.get?id=11"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 11,
+     "sha256": "d84cec82fd8775155f67fda7d4e03baa5a6ea38a9aac1c55785d306304abc3a5"
+    },
+    "report": {
+     "active_references_high_water": 2,
+     "admitted": 11,
+     "assurance": null,
+     "batch_commands": 11,
+     "batch_requests": 11,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 1,
+     "emitted": 11,
+     "exhausted": false,
+     "failures": 1,
+     "logical_pages": 10,
+     "not_executed": 0,
+     "operation": "fan_out_outcomes",
+     "page_trace": [
+      [
+       "batch",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "batch",
+       "unknown",
+       "command_failure",
+       0
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       1
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       1
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 11,
+     "retries": 0,
+     "state": "completed_with_failures",
+     "successes": 10,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 0,
+     "unknown": 0,
+     "violations": [
+      [
+       "warning",
+       "reference_failure"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ "scenario:iter_list_counted": {
+  "requests": [
+   [
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.list?start=50",
+       "c000000000001": "golden.item.list?start=100"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 130,
+     "sha256": "4f3e4a53a11404602c0752a0effc0adcba34921c4541129d383c414de0157216"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 130,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 2,
+     "batch_requests": 1,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 80,
+     "emitted": 130,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list_counted",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       30
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 130,
+     "terminal_reason": "counted traversal completed exactly",
+     "unique_rows": 130,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:iter_list_cursor": {
+  "requests": [
+   [
+    {
+     "method": "golden.cursor.list",
+     "parameters": {},
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.cursor.list",
+     "parameters": {
+      "LAST_ID": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.cursor.list",
+     "parameters": {
+      "LAST_ID": 100
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.cursor.list",
+     "parameters": {
+      "LAST_ID": 130
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 130,
+     "sha256": "4f3e4a53a11404602c0752a0effc0adcba34921c4541129d383c414de0157216"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 130,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 130,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 4,
+     "not_executed": 0,
+     "operation": "iter_list_cursor",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       30
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 4,
+     "retries": 0,
+     "state": "completed",
+     "successes": 130,
+     "terminal_reason": "empty cursor confirmation",
+     "unique_rows": 130,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:iter_list_early_close": {
+  "requests": [
+   [
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 1,
+     "sha256": "a6e92e4f46e3d59f92c12cc7ac988a981cd61cdd341407ed3d1ba218aff04496"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 1,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 1,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "early_closed",
+     "successes": 1,
+     "terminal_reason": "stream closed before exhaustion",
+     "unique_rows": 1,
+     "unknown": 0,
+     "violations": [
+      [
+       "blocking",
+       "completion_invalid_binding_terminal"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ "scenario:iter_list_exact_total": {
+  "requests": [
+   [
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 100
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 130,
+     "sha256": "4f3e4a53a11404602c0752a0effc0adcba34921c4541129d383c414de0157216"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 130,
+     "assurance": "identity_and_count_matched",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 130,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 3,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       30
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 3,
+     "retries": 0,
+     "state": "completed",
+     "successes": 130,
+     "terminal_reason": "qualified total reached",
+     "unique_rows": 130,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:iter_list_keyset_auto": {
+  "requests": [
+   [
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.list?order%5BID%5D=ASC&start=-1",
+       "c000000000001": "golden.item.list?order%5BID%5D=DESC&start=-1"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "filter": {
+       ">ID": 50
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "filter": {
+       ">ID": 100
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "filter": {
+       ">ID": 130
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 130,
+     "sha256": "4f3e4a53a11404602c0752a0effc0adcba34921c4541129d383c414de0157216"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 130,
+     "assurance": "identity_exact",
+     "batch_commands": 2,
+     "batch_requests": 1,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 100,
+     "emitted": 130,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 5,
+     "not_executed": 0,
+     "operation": "iter_list_keyset",
+     "page_trace": [
+      [
+       "batch",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       30
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 4,
+     "retries": 0,
+     "state": "completed",
+     "successes": 130,
+     "terminal_reason": "fast keyset traversal completed",
+     "unique_rows": 130,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:iter_list_keyset_sequential": {
+  "requests": [
+   [
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "order": {
+       "ID": "ASC"
+      },
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "filter": {
+       ">ID": 50
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "filter": {
+       ">ID": 100
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "filter": {
+       ">ID": 130
+      },
+      "order": {
+       "ID": "ASC"
+      },
+      "start": -1
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 130,
+     "sha256": "4f3e4a53a11404602c0752a0effc0adcba34921c4541129d383c414de0157216"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 130,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 130,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 4,
+     "not_executed": 0,
+     "operation": "iter_list_keyset",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       30
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 4,
+     "retries": 0,
+     "state": "completed",
+     "successes": 130,
+     "terminal_reason": "empty keyset confirmation",
+     "unique_rows": 130,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:iter_list_offset": {
+  "requests": [
+   [
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 100
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 130
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 130,
+     "sha256": "4f3e4a53a11404602c0752a0effc0adcba34921c4541129d383c414de0157216"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 130,
+     "assurance": "identity_exact",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 130,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 4,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       30
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 4,
+     "retries": 0,
+     "state": "completed",
+     "successes": 130,
+     "terminal_reason": "empty page confirmed terminal",
+     "unique_rows": 130,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:iter_list_page_stop": {
+  "requests": [
+   [
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 50,
+     "sha256": "db876f09cd5b20504fe7672a83b8ac9137268abbb776e7b959eaaaa3ca6b7805"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 50,
+     "assurance": "bounded_prefix",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 50,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 1,
+     "retries": 0,
+     "state": "completed",
+     "successes": 50,
+     "terminal_reason": "first page committed",
+     "unique_rows": 50,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:iter_list_transport_failure": {
+  "requests": [
+   [
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "start": 50
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": "BudgetExceededError",
+    "items": {
+     "count": 50,
+     "sha256": "db876f09cd5b20504fe7672a83b8ac9137268abbb776e7b959eaaaa3ca6b7805"
+    },
+    "report": {
+     "active_references_high_water": 0,
+     "admitted": 50,
+     "assurance": "mechanics_only",
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 50,
+     "emitted": 50,
+     "exhausted": false,
+     "failures": 0,
+     "logical_pages": 1,
+     "not_executed": 0,
+     "operation": "iter_list",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       50
+      ],
+      [
+       "direct",
+       "unknown",
+       "command_failure",
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 6,
+     "retries": 4,
+     "state": "incomplete",
+     "successes": 50,
+     "terminal_reason": "BudgetExceededError",
+     "unique_rows": 50,
+     "unknown": 0,
+     "violations": [
+      [
+       "blocking",
+       "budget_exhausted"
+      ]
+     ]
+    }
+   }
+  ]
+ },
+ "scenario:references_counted": {
+  "requests": [
+   [
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.list?filter%5BOWNER%5D=1&start=0"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "batch",
+     "parameters": {
+      "cmd": {
+       "c000000000000": "golden.item.list?filter%5BOWNER%5D=2&start=0"
+      },
+      "halt": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 89,
+     "sha256": "03c7004f2a8c08f290550dc5488e86f15fe2855a4e7a5f65156ee3f05cf2ded3"
+    },
+    "report": {
+     "active_references_high_water": 2,
+     "admitted": 2,
+     "assurance": null,
+     "batch_commands": 2,
+     "batch_requests": 2,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 84,
+     "emitted": 89,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 2,
+     "not_executed": 0,
+     "operation": "iter_reference_outcomes",
+     "page_trace": [
+      [
+       "batch",
+       "committed",
+       null,
+       44
+      ],
+      [
+       "batch",
+       "committed",
+       null,
+       43
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 2,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 87,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ },
+ "scenario:references_sequential": {
+  "requests": [
+   [
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "filter": {
+       "OWNER": 1
+      },
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "filter": {
+       "OWNER": 2
+      },
+      "start": 0
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "filter": {
+       "OWNER": 1
+      },
+      "start": 44
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    },
+    {
+     "method": "golden.item.list",
+     "parameters": {
+      "filter": {
+       "OWNER": 2
+      },
+      "start": 43
+     },
+     "positional": null,
+     "replay_safety": "safe",
+     "route": "bare"
+    }
+   ]
+  ],
+  "streams": [
+   {
+    "error": null,
+    "items": {
+     "count": 89,
+     "sha256": "03c7004f2a8c08f290550dc5488e86f15fe2855a4e7a5f65156ee3f05cf2ded3"
+    },
+    "report": {
+     "active_references_high_water": 2,
+     "admitted": 2,
+     "assurance": null,
+     "batch_commands": 0,
+     "batch_requests": 0,
+     "buffered_commands_high_water": 0,
+     "buffered_rows_high_water": 85,
+     "emitted": 89,
+     "exhausted": true,
+     "failures": 0,
+     "logical_pages": 4,
+     "not_executed": 0,
+     "operation": "iter_references",
+     "page_trace": [
+      [
+       "direct",
+       "committed",
+       null,
+       44
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       43
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ],
+      [
+       "direct",
+       "committed",
+       null,
+       0
+      ]
+     ],
+     "page_trace_truncated": false,
+     "physical_requests": 4,
+     "retries": 0,
+     "state": "completed",
+     "successes": 2,
+     "terminal_reason": "reference input exhausted",
+     "unique_rows": 87,
+     "unknown": 0,
+     "violations": []
+    }
+   }
+  ]
+ }
+}
