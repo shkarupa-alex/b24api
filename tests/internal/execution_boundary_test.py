@@ -741,9 +741,16 @@ async def test_strict_only_defect_in_a_success_error_body_is_an_envelope_contrac
 
 
 @pytest.mark.asyncio
-async def test_closed_default_transport_refuses_before_dispatch_without_implying_acceptance() -> None:
-    # A closed HttpxTransport refuses before any byte leaves the process: NOT_DISPATCHED, never ambiguous,
-    # never retried. Only a foreign transport's arbitrary exception keeps the conservative classification.
+@pytest.mark.parametrize(
+    ("closed", "refusal"),
+    [("transport", "transport is closed"), ("injected client", "HTTP client is closed")],
+)
+async def test_closed_default_transport_refuses_before_dispatch_without_implying_acceptance(
+    closed: str, refusal: str
+) -> None:
+    # A closed HttpxTransport, or an open one over an injected client closed before the call, refuses before
+    # any byte leaves the process: NOT_DISPATCHED, never ambiguous, never retried. Only a foreign transport's
+    # arbitrary exception keeps the conservative classification.
     sends: list[httpx.Request] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -753,18 +760,28 @@ async def test_closed_default_transport_refuses_before_dispatch_without_implying
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
     transport = HttpxTransport(f"https://{HOST}/rest/1/token/", client=http_client)
     client = _client(transport)
-    await transport.aclose()
     try:
+        # Control: the same pair sends while both are open.
+        assert await client.call(_request(ReplaySafety.UNSAFE), policy=_policy()) == 1
+        assert len(sends) == 1
+        sends.clear()
+        await (transport.aclose() if closed == "transport" else http_client.aclose())
         for safety in (ReplaySafety.UNSAFE, ReplaySafety.SAFE):
-            with pytest.raises(TransportError, match="transport is closed") as refused:
+            with pytest.raises(TransportError, match=refusal) as refused:
                 await client.call(_request(safety), policy=_policy())
             assert refused.value.phase is FailurePhase.NOT_DISPATCHED
             assert refused.value.retryable is False
         outcomes = await _drain(
             client.batch_outcomes([Command(_request(ReplaySafety.UNSAFE), index) for index in range(2)])
         )
-        assert outcomes
-        assert not any(isinstance(outcome, CommandOutcomeUnknown) for outcome in outcomes)
+        # A refused chunk is a correlated failure of every command, as for any NOT_DISPATCHED transport error.
+        assert len(outcomes) == 2  # noqa: PLR2004
+        for outcome in outcomes:
+            assert isinstance(outcome, CommandFailure)
+            assert isinstance(outcome.error, TransportError)
+            assert outcome.error.phase is FailurePhase.NOT_DISPATCHED
+            assert outcome.error.retryable is False
         assert sends == []
     finally:
+        await transport.aclose()
         await http_client.aclose()

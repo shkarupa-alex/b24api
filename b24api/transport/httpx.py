@@ -117,9 +117,10 @@ def _method_url(webhook_url: str, request: WireRequest) -> str:
     return str(parsed.copy_with(path=f"{path}{request.method}{suffix}"))
 
 
-def _closed_refusal() -> TransportError:
-    """A closed transport refuses before any I/O; the request never left the process."""
-    return TransportError("transport is closed", phase=FailurePhase.NOT_DISPATCHED, retryable=False)
+def _closed_refusal(*, transport_closed: bool) -> TransportError:
+    """A closed transport or injected client refuses before any I/O; the request never left the process."""
+    message = "transport is closed" if transport_closed else "HTTP client is closed"
+    return TransportError(message, phase=FailurePhase.NOT_DISPATCHED, retryable=False)
 
 
 class HttpxTransport:
@@ -192,8 +193,8 @@ class HttpxTransport:
         max_response_bytes: int,
     ) -> WireResponse:
         """Protect the emitting HTTPX logger for one owned request."""
-        if self._closed:
-            raise _closed_refusal()
+        if self._closed or self._client.is_closed:
+            raise _closed_refusal(transport_closed=self._closed)
         HTTPX_LOG_SHIELD.admit_send(self._client)
         method_url = _method_url(_webhook_for(self._webhook_handle), request)
         try:
@@ -230,8 +231,8 @@ class HttpxTransport:
         max_response_bytes: int,
     ) -> WireResponse:
         """Send one explicitly represented transport request attempt."""
-        if self._closed:
-            raise _closed_refusal()
+        if self._closed or self._client.is_closed:
+            raise _closed_refusal(transport_closed=self._closed)
         if isinstance(max_response_bytes, bool) or max_response_bytes < 1:
             raise ValueError("max_response_bytes must be a positive integer")
         tracker = _PhaseTracker()

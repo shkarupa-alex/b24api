@@ -22,8 +22,8 @@
   A transport failure marked `retryable=False` is raised once instead of exhausting the attempt budget.
   An arbitrary exception from an injected transport becomes
   `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause, and a
-  closed `HttpxTransport` refuses with `TransportError(phase=NOT_DISPATCHED, retryable=False)`
-  instead of `RuntimeError` (A13). A response over `max_response_bytes` from an injected transport is refused before decoding, and on
+  closed `HttpxTransport`, or one whose injected `httpx.AsyncClient` was closed before the call,
+  refuses with `TransportError(phase=NOT_DISPATCHED, retryable=False)` instead of `RuntimeError` (A13). A response over `max_response_bytes` from an injected transport is refused before decoding, and on
   any transport, the bundled one included, every command of a physical batch whose response is
   refused becomes `CommandOutcomeUnknown` instead of a `CommandFailure` (B29).
 - **Breaking (3.0.0):** error rendering is contextual. Known V3 error codes are shown verbatim, field
