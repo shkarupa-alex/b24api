@@ -413,6 +413,21 @@ class CompletionGate:
             )
         )
 
+    def close_after_failure(self, cleanup: CleanupState) -> None:
+        """Close a gate whose producer's finalizer failed before it recorded terminal or cleanup evidence.
+
+        The terminal is conservative (never a natural exhaustion) and the cleanup outcome is the actual one;
+        evidence the producer already recorded is kept, so the gate can publish its one fallback report.
+        """
+        sequence = self._sequence + 1
+        if self._stream is None:
+            self.emit(
+                StreamTerminal(operation_id=self.operation_id, sequence=sequence, closure=StreamClosure.CANCELLED)
+            )
+            sequence += 1
+        if self._cleanup is None:
+            self.emit(CleanupOutcome(operation_id=self.operation_id, sequence=sequence, state=cleanup))
+
     def _witness_mismatch(self, source: KernelReport) -> tuple[Violation, ...]:
         """Refuse a report empty-source witness that no source-empty binding closure backs."""
         if source.empty_source_witness is None or self._source_empty:

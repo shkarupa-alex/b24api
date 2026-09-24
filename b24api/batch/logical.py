@@ -190,7 +190,7 @@ class LogicalBatchKernelStream[C]:
         self._source_taken = False
         self._runner = OperationRunner(
             self._run(),
-            LifecycleHooks(finalize=self._finalize, failure_report=_failure_report, cleanup=self._cleanup),
+            LifecycleHooks(finalize=self._finalize, failure_report=self._failure_report, cleanup=self._cleanup),
             isolated_pulls=False,
         )
         self._emitted = 0
@@ -383,9 +383,14 @@ class LogicalBatchKernelStream[C]:
         self._completion.cleanup(CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS)
         return self.report
 
-
-def _failure_report(cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
-    return failed_kernel_report(cause, reason, attempt)
+    def _failure_report(self, cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
+        # The finalizer raised: publish the fallback as this kernel's report and close its completion gate,
+        # so a public adapter over it can still publish its one FAILED report.
+        self.report = failed_kernel_report(cause, reason, attempt)
+        self._completion.gate.close_after_failure(
+            CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS
+        )
+        return self.report
 
 
 __all__ = ["CommandSource", "LogicalBatchKernelStream", "_BatchWindowError"]

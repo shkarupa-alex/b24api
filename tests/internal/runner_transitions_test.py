@@ -560,3 +560,72 @@ async def test_failing_finalizer_keeps_a_simultaneous_cleanup_failure(
     await harness.stream.aclose()
     assert harness.runner.report is report
     assert harness.finalize_calls == 1
+
+
+def _public(family: str, client: Bitrix24) -> Any:  # noqa: ANN401 - each public family has its own stream type
+    if family == "batch_outcomes":
+        return client.batch_outcomes(_commands(), batch_size=2)
+    if family == "fan_out_outcomes":
+        return client.fan_out_outcomes(_commands())
+    return client.iter_list(Request("crm.item.list", route=RouteKind.BARE))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ["batch_outcomes", "fan_out_outcomes", "iter_list"])
+@pytest.mark.parametrize("cleanup", ["ok", "fail"])
+async def test_failing_kernel_finalizer_still_publishes_one_public_fallback_report(
+    family: str, cleanup: CleanupMode, client: Bitrix24
+) -> None:
+    # The source kernel's own finalizer raises before it records terminal or cleanup evidence on the shared
+    # completion gate; the public stream must still publish one FAILED report and close promptly.
+    stream = _public(family, client)
+    kernel_runner: OperationRunner[Any, Any] = stream._source._runner  # noqa: SLF001 - scripts the source kernel
+    hooks = kernel_runner._hooks  # noqa: SLF001
+    original_cleanup: Callable[[], Awaitable[None]] = hooks.cleanup
+
+    async def scripted_cleanup() -> None:
+        await original_cleanup()
+        if cleanup == "fail":
+            raise _CleanupFailedError
+
+    def failing_finalize(*_args: Any) -> Any:  # noqa: ANN401
+        raise _FinalizeFailedError
+
+    kernel_runner._hooks = dataclasses.replace(hooks, cleanup=scripted_cleanup, finalize=failing_finalize)  # noqa: SLF001
+
+    await anext(stream)
+    error = await _outcome(asyncio.create_task(_drain(stream)))
+
+    if family == "iter_list":
+        # The scripted portal repeats its page, so the traversal's own rejection is the primary failure and
+        # the finalization failure is secondary; the primary stays the raised error.
+        assert error is not None
+        assert not isinstance(error, RuntimeError)
+    else:
+        assert isinstance(error, _FinalizeFailedError)
+    report = stream.report
+    assert report is not None
+    assert report.state.value in {"failed", "incomplete"}
+    codes = {violation.code for violation in report.violations}
+    assert getattr(error, "report", None) is report
+    assert "report_finalize_failure" in codes
+    assert ("cleanup_failure" in codes) is (cleanup == "fail")
+    await asyncio.wait_for(stream.aclose(), timeout=1)
+    assert stream.report is report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_failing_fallback_hook_still_ends_publication(family: Family, client: Bitrix24) -> None:
+    harness = _harness(family, client, body="exhaust", cleanup="ok", finalize_fails=True)
+
+    def failing_fallback(*_args: Any) -> Any:  # noqa: ANN401
+        raise _CleanupFailedError
+
+    harness.runner._hooks = dataclasses.replace(harness.runner._hooks, failure_report=failing_fallback)  # noqa: SLF001
+
+    error = await _outcome(asyncio.create_task(_drain(harness.stream)))
+
+    assert error is not None
+    # Publication ended with the failure, so a later close returns instead of waiting for a report.
+    await asyncio.wait_for(harness.stream.aclose(), timeout=1)

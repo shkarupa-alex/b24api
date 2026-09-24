@@ -304,7 +304,13 @@ class OperationRunner[T, R]:
 
         outcome = await await_cleanup_resistant(finalize())
         failed = outcome.error is not None and not published
-        report = published[0] if published else self._hooks.failure_report(cause, reason or cause.value, attempt)
+        try:
+            report = published[0] if published else self._hooks.failure_report(cause, reason or cause.value, attempt)
+        except BaseException:
+            # Even a failing fallback ends publication, so no later close waits for a report that never comes.
+            self._phase = _Phase.CLOSED
+            self._published.set()
+            raise
         self._report = report
         self._phase = _Phase.CLOSED
         self._published.set()

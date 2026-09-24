@@ -104,7 +104,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             self._run(),
             LifecycleHooks(
                 finalize=self._finalize,
-                failure_report=_failure_report,
+                failure_report=self._failure_report,
                 cleanup=self._cleanup,
                 propagate=self._propagate,
             ),
@@ -258,9 +258,15 @@ class ItemStream(AsyncIterator[JsonValue]):
             self._completion.cleanup(CleanupState.FAILURE if failed else CleanupState.SUCCESS)
         return self.report
 
-
-def _failure_report(cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
-    return failed_kernel_report(cause, reason, attempt, subject="pagination")
+    def _failure_report(self, cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
+        # The finalizer raised: publish the fallback as this kernel's report and close its completion gate,
+        # so a public adapter over it can still publish its one FAILED report.
+        self.report = failed_kernel_report(cause, reason, attempt, subject="pagination")
+        if self._completion is not None:
+            self._completion.gate.close_after_failure(
+                CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS
+            )
+        return self.report
 
 
 def iter_list(  # noqa: PLR0913
