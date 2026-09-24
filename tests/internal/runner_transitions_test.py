@@ -196,7 +196,7 @@ def _harness(
 
 @pytest.fixture
 def client() -> Bitrix24:
-    return Bitrix24(Settings(webhook_url=f"https://{HOST}/rest/1/runner/"), transport=_Portal())
+    return Bitrix24(Settings(webhook_url=f"https://{HOST}/rest/1/token/"), transport=_Portal())
 
 
 async def _drain(stream: Any) -> None:  # noqa: ANN401
