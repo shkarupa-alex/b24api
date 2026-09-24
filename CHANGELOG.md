@@ -12,6 +12,12 @@
 - A JSON success body is parsed once, strictly, instead of once by the error codec and again by the
   envelope decoder. Structured errors and malformed bodies keep their previous classification; a
   16 MiB call decodes about 15% faster (B8).
+- A public operation stream's report now always carries its own cleanup result: a cleanup failure
+  that the underlying kernel did not record is added as a `cleanup_failure` violation, by the same
+  §3.1 rules as the kernel reports. Each of the five stream families has a barrier-driven test for
+  every row of the §3.1 transition table.
+- The rate coordinator and the execution ledger no longer take locks; every state change is
+  synchronous between awaits, which a test pins (C8).
 - Internal kernel copies of public values carry a `Kernel` prefix (`KernelReferenceItem`,
   `KernelReferenceFailure`, `KernelBatchDispatch`, `KernelDirectDispatch`), so every public class name
   has one definition; an architecture test keeps it that way (D30).

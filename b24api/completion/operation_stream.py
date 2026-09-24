@@ -17,7 +17,13 @@ from b24api.contracts.report import (
 )
 from b24api.errors import IncompleteTraversalError
 from b24api.execution.failure import finalize_failure
-from b24api.execution.lifecycle import CleanupAttempt, LifecycleHooks, OperationRunner, TerminalCause
+from b24api.execution.lifecycle import (
+    CleanupAttempt,
+    LifecycleHooks,
+    OperationRunner,
+    TerminalCause,
+    with_cleanup_attempt,
+)
 from b24api.execution.snapshot import KernelReport
 
 if TYPE_CHECKING:
@@ -80,6 +86,7 @@ class MappedOperationStream[S, T]:
         self._deregister = deregister
         self._report: OperationReport | None = None
         self._early_closed = False
+        self._cleanup: tuple[TerminalCause, CleanupAttempt] | None = None
         self._admitted = 0
         self._emitted = 0
         self._successes = 0
@@ -144,7 +151,8 @@ class MappedOperationStream[S, T]:
             self._record_variant(item)
             yield item
 
-    def _finalize(self, cause: TerminalCause, _reason: str | None, _attempt: CleanupAttempt) -> OperationReport:
+    def _finalize(self, cause: TerminalCause, _reason: str | None, attempt: CleanupAttempt) -> OperationReport:
+        self._cleanup = (cause, attempt)
         error = self._runner.primary_error
         if cause is TerminalCause.EARLY_CLOSED:
             self._early_closed = True
@@ -164,7 +172,8 @@ class MappedOperationStream[S, T]:
         self._report = report
         return report
 
-    def _failure_report(self, _cause: TerminalCause, reason: str, _attempt: CleanupAttempt) -> OperationReport:
+    def _failure_report(self, cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> OperationReport:
+        self._cleanup = (cause, attempt)
         if self._report is not None:
             return self._report
         failed = KernelReport(state=KernelState.FAILED, terminal_reason=reason)
@@ -227,10 +236,18 @@ class MappedOperationStream[S, T]:
         gate = self._gate()
         if self._source.report.state is KernelState.NOT_STARTED:
             gate.abort_unstarted()
-        gate.attach_report(self._facts(self._source.report, forced_state=forced_state))
+        gate.attach_report(self._facts(self._source_report(), forced_state=forced_state))
         self._report = gate.finish()
         self._terminated()
         return self._report
+
+    def _source_report(self) -> KernelReport:
+        """Return the source's report with this stream's own cleanup result when the source lacks one."""
+        report = self._source.report
+        if self._cleanup is None or any(violation.code == "cleanup_failure" for violation in report.violations):
+            return report
+        cause, attempt = self._cleanup
+        return with_cleanup_attempt(report, cause, attempt, subject="stream")
 
     def _terminated(self) -> None:
         if self._deregister is not None:
