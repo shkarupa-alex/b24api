@@ -1,7 +1,7 @@
 {
   "slf001_tests": 234,
   "slf001_package": 83,
-  "slf001_traversal": 54,
+  "slf001_traversal": 49,
   "noqa_package": 201,
   "untyped_self_traversal": 9,
   "long_functions": {
