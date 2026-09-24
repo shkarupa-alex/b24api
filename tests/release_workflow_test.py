@@ -453,7 +453,11 @@ def test_httpx_latest_is_non_blocking_evidence_on_the_latest_httpx() -> None:
     assert jobs["httpx-latest"]["continue-on-error"] is True
     assert "httpx-latest" not in jobs["gate"]["needs"]
     assert 'uv pip install --upgrade "httpx[http2]"' in runs
-    assert "uv run --no-sync pytest tests/httpx_logging_shield_test.py" in runs
+    # The §3.8 shield, its hpack matrix (A20) and the LivePortal shield (A1) all run on the latest stack.
+    assert (
+        "uv run --no-sync pytest tests/httpx_logging_shield_test.py"
+        " tests/internal/httpx_log_shield_matrix_test.py tools/b24api_evidence/harness/live_test.py"
+    ) in runs
     assert not any(job.get("continue-on-error") for name, job in jobs.items() if name != "httpx-latest")
 
 
@@ -492,6 +496,17 @@ def test_wheel_typing_expects_the_real_request_location_revealed_by_the_smoke_co
 
     assert "reveal_type(Request(" in smoke
     assert f"grep -F '{revealed}' mypy.txt" in _runs("wheel-typing")
+
+
+def test_wheel_typing_runs_the_migration_doc_tests_against_the_installed_wheel() -> None:
+    runs = _runs("wheel-typing")
+
+    # §6.1 item 4: the B13 doc-tests pass on the installed wheel, not on the source tree.
+    assert 'rm -rf "$consumer/src/b24api"' in runs
+    assert "assert '/site-packages/' in b24api.__file__" in runs
+    for suite in ("tests/readme_test.py", "tests/documentation_test.py", "tests/root_surface_test.py"):
+        assert suite in runs
+    assert runs.index('rm -rf "$consumer/src/b24api"') < runs.index("tests/readme_test.py")
 
 
 def test_coverage_floor_has_one_source_in_pyproject() -> None:

@@ -10,6 +10,48 @@
   full table, generated from `b24api.migration.ROOT_MOVES`. `KeysetSelectionSummary` is exported
   only by `b24api.contracts`.
 - `HttpxTransport` is exported from the root.
+- **Breaking (3.0.0):** response bodies are decompressed inside a bounded decoder. Only identity or
+  one `gzip`/`deflate` coding is accepted; stacked, unknown, `br` and `zstd` codings are refused
+  before decompression as a body-read transport failure. Library-owned requests send
+  `Accept-Encoding: gzip, deflate`; a header set by the caller or an injected client is kept (A2).
+- **Breaking (3.0.0):** a physical batch that may have been accepted is never replayed, even when
+  every command is `SAFE`; each admitted command becomes `CommandOutcomeUnknown` with its own
+  `AmbiguousExecutionError` (A3). A transport failure marked `retryable=False` is raised once
+  instead of exhausting the attempt budget. An arbitrary exception from an injected transport
+  becomes `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause
+  (A13), and a response over `max_response_bytes` from an injected transport is refused before
+  decoding (B29).
+- **Breaking (3.0.0):** error rendering is contextual. Known V3 error codes are shown verbatim, field
+  names taken from the request render as `field#N` aliases, the request's own sensitive values are
+  exact secrets, and distinct hidden mapping keys become `[REDACTED#1]`, `[REDACTED#2]`, … instead
+  of merging into one key. `str()`, `repr()`, `to_safe_dict()`, reports and the CLI show the same
+  text (A7).
+- **Breaking (3.0.0):** an offset traversal that starts mid-collection while a caller-qualified exact
+  total (`TotalTermination.EXACT_QUALIFIED`) closes it raises `CapabilityError` before any request,
+  instead of ending incomplete; with `TotalTermination.DISABLED` the suffix traversal still works
+  (A9).
+- **Breaking (3.0.0):** `verify_keyset_capability()` returns an `UNSUPPORTED` report when the portal
+  answers a boundary read wrongly, instead of raising; the CLI exits with 6 (A10).
+- **Breaking (3.0.0):** closing a logical batch early reports `EARLY_CLOSED` with the reason
+  `"stream closed before exhaustion"` (A12). A fail-fast batch reports `BatchCommandError` and the
+  violation `batch_command_failure` instead of a private carrier class (A14). A failed source close
+  after an early close publishes exactly one report (A11).
+- **Breaking (3.0.0):** `OffsetContinuation.FIXED_STEP` without an exact qualified total fails right
+  after a short page, without the unusable confirmation request (B10).
+- **Breaking (3.0.0):** `EnvelopeContractError` is also a `ProtocolError` with gateway origin (B20).
+- The HTTPX log shield drops every `hpack.hpack` and `hpack.table` record while a library HTTPX
+  client is open. An HTTP/2 send is refused before I/O with `CapabilityError` when that filter was
+  removed or an injected client cannot be registered (A20).
+- Every keyset traversal reports `OperationReport.keyset_selection`;
+  `KeysetSelectionReason` gains `EXPLICIT_SEQUENTIAL` and `PAGE_STOP`, which exhaustive matches must
+  handle (B9).
+- `ExecutionPolicy.from_settings(settings)` returns the client's default policy; a `policy=` argument
+  replaces it wholesale (B18).
+- `X-Bitrix-RateLimit-Reset` accepts epoch seconds (≥ 1e9, against the wall clock) besides delta
+  seconds and HTTP-dates; the delay stays capped, and an unusable header never starts a cooldown (A19).
+- The client closes the rate coordinator it owns, and permits release synchronously (A5, B0). An
+  admission audit retains at most 128 violations, like a report (A16).
+- The wheel ships `py.typed` (A6), and the minimum pydantic is 2.12.0 (A4).
 - Development: `pytest-httpx` is no longer a dev dependency. Tests share one offline responder
   transport and build clients through the public constructor, and the README, recipe and migration
   examples are bound against the real `Bitrix24` signatures (B13, B15).

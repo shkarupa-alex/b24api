@@ -186,12 +186,14 @@ exact `limit_path`; the client never guesses method-specific parameter names.
 
 ![List traversal comparison](https://raw.githubusercontent.com/shkarupa-alex/b24api/master/list-traversal-comparison.svg)
 
-The animation replays real traces for 1,000 dense IDs at 50 rows per page. `iter_list` sends 20
-pages and one empty confirmation (21 HTTP). `iter_list_counted` sends the head and one batch of 19
-pages (2 HTTP). `iter_list_keyset` in auto mode reads both ends of the range in one batch, the 19
-ranges between them in a second, and confirms the end with one call for `ID > 1000` (3 HTTP). A
-`BoundedIdentityRange` with a qualified upper ID needs no confirmation: sequential execution stops
-when it receives that ID.
+The animation replays traces executed against a scripted portal with 1,000 dense IDs at 50 rows
+per page. `iter_list` sends 20 pages and one empty confirmation (21 HTTP). `iter_list_counted` sends
+the head and one batch of 19 pages (2 HTTP). `iter_list_keyset` in auto mode selects range
+execution: it reads both ends of the range in one batch, the 19 ranges between them in a second, and
+confirms the end with one call for `ID > 1000` (3 HTTP). A `BoundedIdentityRange` with a qualified
+upper ID needs no confirmation: sequential execution stops when it receives that ID. On a real portal
+auto chooses from the observed geometry, so the plan and its request count can differ; the report's
+`keyset_selection` says which plan ran.
 
 ### Sequential offset
 

@@ -27,12 +27,14 @@ from b24api import (
     SequentialKeysetExecution,
     TraversalAssurance,
 )
+from b24api.contracts import ClosureWitness, KeysetExecutionKind, KeysetSelectionReason, KeysetSelectionSummary
 from tests.scripting import ResponderTransport, client_for
 
 ROOT = Path(__file__).resolve().parents[1]
 SVG = ROOT / "list-traversal-comparison.svg"
 IDS = tuple(range(1, 1001))
 PAGE = 50
+PAGES = len(IDS) // PAGE
 REQUEST = Request.bare("item.list")
 IDENTITY = IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER)
 KEYSET = KeysetSpec(limit_path=ParameterPath(("limit",)))
@@ -161,6 +163,15 @@ async def _lanes() -> dict[str, ResponderTransport]:
         assert stream.report is not None
         assert stream.report.exhausted
         assert stream.report.assurance is TraversalAssurance.IDENTITY_EXACT
+        # The execution kind and the witnesses the animation draws: 19 range windows, each closed by a full
+        # lattice, then the empty finishing call asserted below.
+        assert stream.report.keyset_selection == KeysetSelectionSummary(
+            KeysetExecutionKind.AUTO, KeysetExecutionKind.RANGE, KeysetSelectionReason.RANGE_WITHIN_WAVE_BUDGET
+        )
+        execution = stream.report.keyset_execution
+        assert execution is not None
+        assert execution.range_window_count == PAGES - 1
+        assert dict(execution.closure_witness_counts)[ClosureWitness.LATTICE_FULL] == PAGES - 1
     return lanes
 
 

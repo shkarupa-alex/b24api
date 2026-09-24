@@ -38,6 +38,28 @@ details.
      violation (for example `reference cleanup also failed (RuntimeError)`), so a report can carry
      more than one.
 
+8. **Compressed responses.** Only identity, `gzip` and `deflate` bodies are decoded; `br`, `zstd`,
+   stacked and unknown codings are refused as a transport failure. Library-owned requests send
+   `Accept-Encoding: gzip, deflate`. If you inject an HTTPX client that asks for `br` or `zstd`,
+   remove that header.
+9. **Possibly accepted batches are not replayed.** A physical batch that may have reached Bitrix is
+   never retried, even when every command is `SAFE`; its commands arrive as
+   `CommandOutcomeUnknown`. Reconcile them as you would an ambiguous direct call.
+10. **Error text.** Error descriptions show field names from your request as `field#N`, known V3
+    codes verbatim, and distinct hidden mapping keys as `[REDACTED#1]`, `[REDACTED#2]`, … Code that
+    parses error strings must accept these forms.
+11. **Mid-collection start with an exact total.** An offset traversal whose initial `start` differs
+    from the plan's first offset raises `CapabilityError` before any request when
+    `TotalTermination.EXACT_QUALIFIED` closes it. Start from the beginning, or use
+    `TotalTermination.DISABLED` to walk a suffix.
+12. **Keyset verification.** `verify_keyset_capability()` returns an `UNSUPPORTED` report instead of
+    raising when a boundary read is answered wrongly.
+13. **Keyset selection reasons.** `KeysetSelectionReason` gains `EXPLICIT_SEQUENTIAL` and
+    `PAGE_STOP`; handle them in exhaustive matches.
+14. **HTTP/2 and hpack logging.** While a library HTTPX client is open, `hpack.hpack` and
+    `hpack.table` records are dropped. Removing that filter makes the next HTTP/2 send raise
+    `CapabilityError` before I/O.
+
 Additions that need no change: `Request.bare()` and `Request.v3()`, `Bitrix24.from_webhook()`,
 `HttpxTransport` in the root, `ExecutionPolicy.from_settings()` and
 `OperationReport.keyset_selection`.

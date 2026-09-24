@@ -50,6 +50,7 @@ from b24api.traversal import counted_batch, sequential
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from b24api.contracts import JsonValue
     from b24api.transport import WireResponse
     from b24api.traversal.counted_rules import CountedPageFacts, CountedVerdict
 
@@ -108,11 +109,9 @@ def _header_facts(headers: httpx.Headers | dict[str, str]) -> dict[str, object]:
     ]
     return {
         "content_encoding": headers.get("content-encoding"),
-        "rate_headers": {
-            name: headers.get(name) if name != "x-bitrix-ratelimit-reset" else None for name in limit_names
-        },
+        "rate_header_names": limit_names,
         "reset": _reset_shape(headers.get("x-bitrix-ratelimit-reset"), time.time()),
-        "retry_after_present": "retry-after" in names,
+        "retry_after": _reset_shape(headers.get("retry-after"), time.time()),
     }
 
 
@@ -165,12 +164,15 @@ class RecordingTransport:
 
     async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Send one allowlisted read through the delegate and record the response headers."""
-        if request.method not in READ_METHODS:
-            raise PermissionError(f"{request.method} is not an allowlisted read method")
+        commands = request.copy_parameters().get("cmd")
+        methods = {request.method}
+        if isinstance(commands, dict):
+            methods |= {str(command).partition("?")[0] for command in commands.values()}
+        if not methods <= READ_METHODS:
+            raise PermissionError(f"{sorted(methods - READ_METHODS)} are not allowlisted read methods")
         response = await self.inner.send(
             request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes
         )
-        commands = request.copy_parameters().get("cmd")
         self.sends.append(
             {
                 "method": request.method,
@@ -205,7 +207,9 @@ class VerdictLog:
             ) -> CountedVerdict:
                 verdict = _original(facts)
                 outcome = verdict.contradiction.value if verdict.contradiction else "none"
-                self.verdicts[f"{_path.rsplit('.', 1)[-1]}:terminal={verdict.terminal}:contradiction={outcome}"] += 1
+                path = _path.rsplit(".", 1)[-1]
+                label = f"{path}:{facts.continuation.value}:terminal={verdict.terminal}:contradiction={outcome}"
+                self.verdicts[label] += 1
                 return verdict
 
             vars(module)["judge_counted_page"] = judged
@@ -304,9 +308,9 @@ async def library_probes(webhook: str) -> list[dict[str, object]]:
         tasks = _read("tasks.task.list", {"select": ["ID"], "order": {"ID": "asc"}})
         task_identity = IdentitySpec(("id",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER)
         counted = (
-            ("crm.deal.list", client.iter_list_counted(deals, identity=_ID)),
+            ("crm.deal.list (no recipe)", client.iter_list_counted(deals, identity=_ID)),
             (
-                "tasks.task.list",
+                "tasks.task.list (no recipe)",
                 client.iter_list_counted(tasks, selector=ResultSelector(("tasks",)), identity=task_identity),
             ),
             (
@@ -317,7 +321,7 @@ async def library_probes(webhook: str) -> list[dict[str, object]]:
         for label, stream in counted:
             rows.append(await _traverse(f"L3 counted {label}", stream, transport, log))
         sequential_paths = (
-            ("crm.deal.list", client.iter_list(deals, identity=_ID, offset=_QUALIFIED)),
+            ("crm.deal.list (no recipe)", client.iter_list(deals, identity=_ID, offset=_QUALIFIED)),
             (
                 "crm.requisitelink.list (scenario 14)",
                 client.iter_list(_LINKS, selector=_LINK_SELECTOR, identity=_LINK_IDENTITY, offset=_FIXED),
@@ -334,20 +338,44 @@ async def library_probes(webhook: str) -> list[dict[str, object]]:
             )
             stream = client.iter_list_counted(comments, identity=_ID, offset=_FIXED)
             rows.append(await _traverse("L3 counted crm.timeline.comment.list (scenario 10)", stream, transport, log))
+            stream = client.iter_list_counted(comments, identity=_ID)
+            label = "L3 counted crm.timeline.comment.list, default continuation"
+            rows.append(await _traverse(label, stream, transport, log))
 
-        # Counted reference traversals: R2 per binding, batched (BatchDispatch is required).
+        # Counted reference traversals: R2 per binding, batched (BatchDispatch is required). R2 applies only
+        # where the continuation is not FIXED_STEP, so each recipe also runs with the default continuation
+        # (SERVER_NEXT_OR_OBSERVED_COUNT), whose terminal pages R2 must accept.
+        comments = _read("crm.timeline.comment.list", {"filter": {"ENTITY_TYPE": "deal"}, "select": ["ID"]})
+        by_deal: list[tuple[JsonValue, ParameterPath]] = [
+            (deal_id, ParameterPath(("filter", "ENTITY_ID"))) for deal_id in deal_ids[:5]
+        ]
+        by_type: list[tuple[JsonValue, ParameterPath]] = [
+            (entity_type, ParameterPath(("filter", "entityTypeId"))) for entity_type in (2, 3, 4)
+        ]
         references = (
             (
                 "crm.timeline.comment.list by deal (scenario 10)",
-                _read("crm.timeline.comment.list", {"filter": {"ENTITY_TYPE": "deal"}, "select": ["ID"]}),
-                [(deal_id, ParameterPath(("filter", "ENTITY_ID"))) for deal_id in deal_ids[:5]],
+                comments,
+                by_deal,
                 CountedTraversal(identity=_ID, offset=_FIXED),
             ),
             (
                 "crm.requisitelink.list by entity type (scenario 14)",
                 _LINKS,
-                [(entity_type, ParameterPath(("filter", "entityTypeId"))) for entity_type in (2, 3, 4)],
+                by_type,
                 CountedTraversal(identity=_LINK_IDENTITY, selector=_LINK_SELECTOR, offset=_FIXED),
+            ),
+            (
+                "crm.timeline.comment.list by deal, default continuation",
+                comments,
+                by_deal,
+                CountedTraversal(identity=_ID),
+            ),
+            (
+                "crm.requisitelink.list by entity type, default continuation",
+                _LINKS,
+                by_type,
+                CountedTraversal(identity=_LINK_IDENTITY, selector=_LINK_SELECTOR),
             ),
         )
         for label, base, keys, traversal in references:

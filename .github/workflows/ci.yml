@@ -103,6 +103,20 @@ jobs:
           cat negative.txt
           test "$(grep -c ': error: ' negative.txt)" = 1
           grep -F 'Module "b24api" has no attribute "CommandSuccess"  [attr-defined]' negative.txt
+      - name: Run the README and migration doc-tests against the installed wheel
+        shell: bash
+        run: |
+          consumer="$RUNNER_TEMP/consumer"
+          mkdir -p "$consumer/src"
+          # The committed tree without the package, so every import resolves to the installed wheel.
+          git archive HEAD | tar -x -C "$consumer/src"
+          rm -rf "$consumer/src/b24api"
+          uv export --locked --no-emit-project --no-hashes --only-group dev --output-file "$consumer/dev.txt"
+          uv pip install --python "$consumer/.venv" --constraint "$consumer/constraints.txt" -r "$consumer/dev.txt"
+          cd "$consumer/src"
+          ../.venv/bin/python -c "import b24api; assert '/site-packages/' in b24api.__file__, b24api.__file__"
+          ../.venv/bin/python -m pytest -p no:cacheprovider tests/readme_test.py tests/documentation_test.py \
+            tests/root_surface_test.py --deselect tests/root_surface_test.py::test_repository_uses_no_deprecated_root_alias
 
   slow:
     runs-on: ubuntu-latest
@@ -129,8 +143,10 @@ jobs:
           uv sync --locked
           uv pip install --upgrade "httpx[http2]" httpcore h2 hpack
           uv pip list | grep -Ei '^(httpx|httpcore|h2|hpack) ' | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Run the logging-shield matrix
-        run: uv run --no-sync pytest tests/httpx_logging_shield_test.py
+      - name: Run the logging-shield and hpack matrices
+        run: >-
+          uv run --no-sync pytest tests/httpx_logging_shield_test.py
+          tests/internal/httpx_log_shield_matrix_test.py tools/b24api_evidence/harness/live_test.py
 
   gate:
     name: ci
