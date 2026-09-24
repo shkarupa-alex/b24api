@@ -767,7 +767,8 @@ async def test_fast_source_fills_initial_and_continuation_batches() -> None:
         selector=ResultSelector.root(),
         cursor=_cursor(),
         page_size=1,
-        dispatch=BatchDispatch(batch_size=count),
+        # Full waves dispatch at once; the widest wait keeps a slow host (coverage, CI) from splitting them.
+        dispatch=BatchDispatch(batch_size=count, coalesce_wait=_UNREACHABLE_COALESCE_WAIT),
     )
 
     assert len([event async for event in stream]) == 2 * count
