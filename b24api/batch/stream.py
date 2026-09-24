@@ -4,10 +4,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterator
-from typing import Protocol, Self, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, Self, cast, runtime_checkable
 
 from b24api.batch.engine import (
-    _MISSING,
     _SYNC_EXHAUSTED,
     BatchExecutor,
     BatchSource,
@@ -32,18 +31,20 @@ from b24api.contracts.request import Request
 from b24api.execution import (
     AsyncIteratorController,
     ExecutionContext,
-    await_cancellation_resistant,
-    await_cleanup_resistant,
-    rearm_cancellation,
 )
-from b24api.execution.failure import (
-    CLEANUP_FAILED_REASON,
-    EARLY_CLOSE_REASON,
-    report_reason,
-    with_cleanup_failure,
+from b24api.execution.lifecycle import (
+    CleanupAttempt,
+    LifecycleHooks,
+    OperationRunner,
+    TerminalCause,
+    failed_kernel_report,
+    kernel_terminal,
+    with_cleanup_attempt,
 )
-from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
+
+if TYPE_CHECKING:
+    from types import TracebackType
 
 
 @runtime_checkable
@@ -77,14 +78,17 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             raise ValueError("shared batch context must use the exact stream policy")
         self._context = context or batch_executor.executor.context(policy)
         self._logical_page_per_command = logical_page_per_command
-        self._runner: AsyncGenerator[BatchStreamItem] | None = None
         self._source_controller: AsyncIteratorController[_BatchItem] | None = None
-        self._prefetched: BatchStreamItem | object = _MISSING
-        self._closed = False
+        self._started = False
         self._batch_requests = 0
         self._batch_commands = 0
         self._emitted = 0
         self.report = KernelReport()
+        self._runner = OperationRunner(
+            self._run(),
+            LifecycleHooks(finalize=self._finalize, failure_report=_failure_report, cleanup=self._cleanup),
+            isolated_pulls=False,
+        )
 
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
@@ -92,59 +96,27 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
 
     async def __anext__(self) -> BatchStreamItem:
         """Return the next asynchronous item."""
-        if self._closed:
-            raise StopAsyncIteration
-        if self._prefetched is not _MISSING:
-            item = cast("BatchStreamItem", self._prefetched)
-            self._prefetched = _MISSING
-            self._emitted += 1
-            return item
-        if self._runner is None:
-            self._runner = self._run()
-        item = await anext(self._runner)
-        self._emitted += 1
-        return item
+        return await anext(self._runner)
 
     async def __aenter__(self) -> Self:
-        """Enter the asynchronous context."""
-        if self._closed:
-            raise RuntimeError("stream is closed")
-        if self._runner is None:
-            self._runner = self._run()
-            with contextlib.suppress(StopAsyncIteration):
-                self._prefetched = await anext(self._runner)
+        """Enter without reading an item."""
         return self
 
-    async def __aexit__(self, *_exc: object) -> None:
-        """Exit the asynchronous context."""
-        await self.aclose()
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close on exit without replacing the body's primary exception."""
+        await self._runner.__aexit__(exc_type, exc, traceback)
 
     async def aclose(self) -> None:
-        """Close owned asynchronous resources."""
-        if self._closed:
-            await self._observe_source_cleanup()
-            return
-        self._closed = True
-        try:
-            if self._runner is not None:
-                await self._runner.aclose()
-        except BaseException as error:
-            if self.report.state is KernelState.NOT_STARTED:
-                cancellation = await await_cancellation_resistant(
-                    self._finalize(KernelState.CANCELLED, "stream cleanup failed"),
-                )
-                if cancellation is not None:
-                    _attach_report(cancellation, self.report)
-                    raise cancellation from error
-            _attach_report(error, self.report)
-            raise
-        finally:
-            self._prefetched = _MISSING
-        await self._observe_source_cleanup()
-        if self.report.state is KernelState.NOT_STARTED and self._runner is not None:
-            await self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON)
+        """Close owned asynchronous resources; the report is published after cleanup."""
+        await self._runner.aclose()
 
-    async def _run(self) -> AsyncGenerator[BatchStreamItem]:  # noqa: C901, PLR0912, PLR0915
+    async def _run(self) -> AsyncGenerator[BatchStreamItem]:
+        self._started = True
         await self._context.start()
         source = AsyncIteratorController(
             _iterate_source(self._source),
@@ -153,153 +125,67 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         )
         self._source_controller = source
         next_index = 0
-        naturally_exhausted = False
-        primary_error: BaseException | None = None
-        pending_cancellation: asyncio.CancelledError | None = None
-        try:
-            while True:
-                chunk = await _next_chunk(
-                    source,
-                    min(
-                        self._batch_size,
-                        self._context.policy.max_buffered_commands,
-                        self._context.policy.max_buffered_rows,
-                    ),
-                    start_index=next_index,
-                    context=self._context,
-                )
-                if not chunk.commands:
-                    break
-                next_index += len(chunk.commands)
-                if chunk.source_error is not None:
-                    _raise_source_error(chunk.source_error)
-                if self._executor._will_dispatch_commands(chunk.commands, halt=False):  # noqa: SLF001
-                    self._batch_requests += 1
-                self._batch_commands += len(chunk.commands)
-                reservations = []
-                try:
-                    if self._logical_page_per_command:
-                        for _ in chunk.commands:
-                            reservation = await self._context.reserve_page()
-                            reservations.append(reservation)
-                    outcomes = await self._executor._execute_chunk(  # noqa: SLF001
-                        chunk.commands,
-                        context=self._context,
-                        halt=False,
-                    )
-                except BaseException:
-                    for reservation in reservations:
-                        self._context.release_page(reservation)
-                    raise
-                if reservations:
-                    for reservation, outcome in zip(reservations, outcomes, strict=True):
-                        if isinstance(outcome, BatchSuccess):
-                            self._context.commit_page(reservation)
-                        else:
-                            self._context.release_page(reservation)
-                buffered_rows = sum(_batch_outcome_row_weight(outcome) for outcome in outcomes)
+        while True:
+            chunk = await _next_chunk(
+                source,
+                min(
+                    self._batch_size,
+                    self._context.policy.max_buffered_commands,
+                    self._context.policy.max_buffered_rows,
+                ),
+                start_index=next_index,
+                context=self._context,
+            )
+            if not chunk.commands:
+                break
+            next_index += len(chunk.commands)
+            if chunk.source_error is not None:
+                _raise_source_error(chunk.source_error)
+            if self._executor._will_dispatch_commands(chunk.commands, halt=False):  # noqa: SLF001
+                self._batch_requests += 1
+            self._batch_commands += len(chunk.commands)
+            outcomes = await self._execute(chunk.commands)
+            buffered_rows = sum(_batch_outcome_row_weight(outcome) for outcome in outcomes)
+            await self._context.set_buffered_rows(buffered_rows)
+            for outcome in outcomes:
+                outcome_rows = _batch_outcome_row_weight(outcome)
+                self._emitted += 1
+                yield outcome
+                buffered_rows -= outcome_rows
                 await self._context.set_buffered_rows(buffered_rows)
-                for outcome in outcomes:
-                    outcome_rows = _batch_outcome_row_weight(outcome)
-                    yield outcome
-                    buffered_rows -= outcome_rows
-                    await self._context.set_buffered_rows(buffered_rows)
-            naturally_exhausted = True
-            await self._finalize(KernelState.COMPLETED, "input exhausted")
-        except asyncio.CancelledError as error:
-            primary_error = error
-            repeated = await await_cancellation_resistant(
-                self._finalize(KernelState.CANCELLED, "iteration cancelled"),
-            )
-            if repeated is not None:
-                primary_error = repeated
-                _attach_report(repeated, self.report)
-                raise repeated from error
-            _attach_report(error, self.report)
-            raise
-        except GeneratorExit as error:
-            primary_error = error
-            cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON),
-            )
-            if cancellation is not None:
-                primary_error = cancellation
-                _attach_report(cancellation, self.report)
-                raise cancellation from error
-            _attach_report(error, self.report)
-            raise
-        except BaseException as error:
-            primary_error = error
-            cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.FAILED, report_reason(error)),
-            )
-            if cancellation is not None:
-                _attach_report(cancellation, self.report)
-                pending_cancellation = cancellation
-            _attach_report(error, self.report)
-            raise
-        finally:
-            cleanup = await await_cleanup_resistant(self._cleanup_source(source))
-            if cleanup.error is not None:
-                cleanup_error = cleanup.error
-                if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                    await self._record_terminal_cleanup_failure(cleanup_error)
-                    pending = cleanup.cancellation
-                    if pending is None and isinstance(primary_error, asyncio.CancelledError):
-                        pending = primary_error
-                    rearm_cancellation(pending)
-                    raise cleanup_error
-                self._record_cleanup_failure(cleanup_error, primary_error)
-                pending_cancellation = cleanup.cancellation
-                if pending_cancellation is None and isinstance(cleanup_error, asyncio.CancelledError):
-                    pending_cancellation = cleanup_error
-            elif cleanup.cancellation is not None and (
-                primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit)
-            ):
-                _attach_report(cleanup.cancellation, self.report)
-                raise cleanup.cancellation
-            elif cleanup.cancellation is not None and primary_error is not None:
-                self._record_cleanup_failure(cleanup.cancellation, primary_error)
-                pending_cancellation = cleanup.cancellation
-            if not naturally_exhausted and self.report.state is KernelState.NOT_STARTED:
-                await self._finalize(KernelState.CANCELLED, "stream abandoned")
-            if self.report.state is not KernelState.NOT_STARTED:
-                self._closed = True
-            if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                rearm_cancellation(pending_cancellation)
 
-    async def _cleanup_source(self, source: AsyncIteratorController[_BatchItem]) -> None:
-        await self._context.set_buffered_rows(0)
-        await source.aclose(
-            remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed),
-        )
-
-    async def _observe_source_cleanup(self) -> None:
-        controller = self._source_controller
-        if controller is None:
-            return
+    async def _execute(self, commands: tuple[_Command, ...]) -> tuple[BatchStreamItem, ...]:
+        """Execute one chunk; a page per command is reserved first and settled by its outcome."""
+        reservations = []
         try:
-            await self._cleanup_source(controller)
-        except BaseException as error:
-            if self.report.state is not KernelState.FAILED:
-                await self._record_terminal_cleanup_failure(error)
-            else:
-                _attach_report(error, self.report)
+            if self._logical_page_per_command:
+                for _ in commands:
+                    reservation = await self._context.reserve_page()
+                    reservations.append(reservation)
+            outcomes = await self._executor._execute_chunk(commands, context=self._context, halt=False)  # noqa: SLF001
+        except BaseException:
+            for reservation in reservations:
+                self._context.release_page(reservation)
             raise
+        if reservations:
+            for reservation, outcome in zip(reservations, outcomes, strict=True):
+                if isinstance(outcome, BatchSuccess):
+                    self._context.commit_page(reservation)
+                else:
+                    self._context.release_page(reservation)
+        return outcomes
 
-    def _record_cleanup_failure(self, error: BaseException, primary_error: BaseException) -> None:
-        self.report = with_cleanup_failure(self.report, error, terminal=False)
-        _attach_report(primary_error, self.report)
-
-    async def _record_terminal_cleanup_failure(self, error: BaseException) -> None:
-        if self.report.state is KernelState.NOT_STARTED:
-            await self._finalize(KernelState.FAILED, CLEANUP_FAILED_REASON)
-        self.report = with_cleanup_failure(self.report, error, terminal=True)
-        _attach_report(error, self.report)
-
-    async def _finalize(self, state: KernelState, reason: str) -> None:
-        if self.report.state is not KernelState.NOT_STARTED:
+    async def _cleanup(self) -> None:
+        source = self._source_controller
+        if source is None:
             return
+        await self._context.set_buffered_rows(0)
+        await source.aclose(remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed))
+
+    async def _finalize(self, cause: TerminalCause, failure: str | None, attempt: CleanupAttempt) -> KernelReport:
+        if not self._started:
+            return self.report
+        state, reason = kernel_terminal(cause, failure)
         snapshot = await self._context.snapshot()
         consistency = self._context.policy.consistency
         snapshot_state = (
@@ -336,6 +222,12 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             violations=violations,
             terminal_reason=reason,
         )
+        self.report = with_cleanup_attempt(self.report, cause, attempt)
+        return self.report
+
+
+def _failure_report(_cause: TerminalCause, reason: str, _attempt: CleanupAttempt) -> KernelReport:
+    return failed_kernel_report(reason)
 
 
 def batch_outcome_stream(

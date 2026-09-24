@@ -263,16 +263,16 @@ async def test_batch_list_result_uses_nested_decoded_row_weight() -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_entry_starts_batch_execution_without_counting_prefetch_as_emitted() -> None:
+async def test_context_entry_reads_nothing_and_an_unstarted_close_reports_nothing() -> None:
     transport = CallbackTransport(_echo_batch)
     stream = batch_outcome_stream(
         BatchExecutor(Executor(transport)), [Request("profile", route=RouteKind.BARE)], batch_size=1
     )
 
     async with stream:
-        assert len(transport.requests) == 1
+        assert transport.requests == []
 
-    assert stream.report.state is KernelState.CANCELLED
+    assert stream.report.state is KernelState.NOT_STARTED
     assert stream.report.emitted_rows == 0
 
 
@@ -405,7 +405,7 @@ async def test_cancellation_resistant_batch_pull_is_closed_after_late_completion
 
 
 @pytest.mark.asyncio
-async def test_late_batch_source_cleanup_error_is_observed_by_subsequent_close() -> None:
+async def test_late_batch_source_cleanup_error_does_not_reopen_the_published_report() -> None:
     release = asyncio.Event()
     closed = asyncio.Event()
 
@@ -428,14 +428,17 @@ async def test_late_batch_source_cleanup_error_is_observed_by_subsequent_close()
         policy=ExecutionPolicy(max_elapsed=0.03),
     )
     assert isinstance(await anext(stream), BatchSuccess)
-    with pytest.raises(BudgetExceededError):
+    with pytest.raises(BudgetExceededError) as failed:
         await anext(stream)
+    report = stream.report
+    assert failed.value.__dict__["report"] is report
 
     release.set()
     await asyncio.wait_for(closed.wait(), timeout=0.2)
-    with pytest.raises(RuntimeError, match="late batch close boom") as captured:
-        await stream.aclose()
-    assert captured.value.__dict__["report"] is stream.report
+    # The report was published once, after the bounded cleanup; a repeated close changes nothing (§3.1).
+    await stream.aclose()
+    assert stream.report is report
+    assert report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
