@@ -5,6 +5,7 @@ import base64
 import gc
 import gzip
 import json
+import logging
 import tracemalloc
 import weakref
 import zlib
@@ -12,6 +13,8 @@ from typing import TYPE_CHECKING
 
 import httpx
 import pytest
+
+from b24api.transport.logging_shield import HTTPX_LOG_SHIELD
 
 from . import cli as cli_module
 from . import live as live_module
@@ -640,3 +643,83 @@ def test_live_portal_advertises_only_bounded_codings(monkeypatch: pytest.MonkeyP
     with _portal(monkeypatch, handler) as portal:
         portal.call("scope")
     assert seen == ["gzip, deflate"]
+
+
+_LIVE_TOKEN = "not-a-secret"  # noqa: S105 - the synthetic webhook token of ``_portal``
+_FOREIGN_LIVE_URL = "https://other.invalid" + "/rest/7/" + "synthetic-foreign-live-secret/profile"
+
+
+def test_live_portal_httpx_info_record_carries_no_webhook_token(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="httpx")
+
+    with _portal(monkeypatch, lambda _request: httpx.Response(200, json={"result": []})) as portal:
+        portal.call("profile")
+
+    records = [record for record in caplog.records if record.name == "httpx"]
+    assert len(records) == 1
+    record = records[0]
+    assert record.pathname.endswith("httpx/_client.py")
+    assert _LIVE_TOKEN not in f"{record.msg!r} {record.args!r} {record.__dict__!r}"
+    assert _LIVE_TOKEN not in record.getMessage()
+    assert "[REDACTED]" in record.getMessage()
+    assert _LIVE_TOKEN not in caplog.text
+
+
+def test_live_portal_sync_attribution_leaves_foreign_records_on_the_same_logger_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A foreign send from inside the owned one: only attribution by the sync client's ``_send_handling_auth``
+    # root can tell its record apart; without it the record would be scrubbed like an owned hop.
+    caplog.set_level(logging.INFO, logger="httpx")
+    logger = logging.getLogger("httpx")
+    failure = RuntimeError("foreign failure without any registered secret")
+
+    def foreign_hook(_response: httpx.Response) -> None:
+        logger.error("foreign %s", _FOREIGN_LIVE_URL, exc_info=(RuntimeError, failure, None))
+
+    foreign = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)),
+        event_hooks={"response": [foreign_hook]},
+    )
+
+    def hook(_request: httpx.Request) -> None:
+        foreign.get(_FOREIGN_LIVE_URL)
+
+    with _portal(monkeypatch, lambda _request: httpx.Response(200, json={"result": []})) as portal:
+        portal._client.event_hooks["request"] = [hook]  # noqa: SLF001 - inject a foreign send into the owned one
+        portal.call("profile")
+    foreign.close()
+
+    records = [record for record in caplog.records if record.name == "httpx"]
+    assert len(records) == 3  # noqa: PLR2004 - foreign send, foreign error, owned send
+    foreign_send, foreign_error, owned_send = records
+    assert isinstance(foreign_send.args, tuple)
+    assert isinstance(foreign_send.args[1], httpx.URL)
+    assert str(foreign_send.args[1]) == _FOREIGN_LIVE_URL
+    assert foreign_error.args == (_FOREIGN_LIVE_URL,)
+    assert foreign_error.exc_info == (RuntimeError, failure, None)
+    assert _FOREIGN_LIVE_URL in caplog.text
+    assert _LIVE_TOKEN not in owned_send.getMessage()
+    assert _LIVE_TOKEN not in caplog.text
+
+
+def test_live_portal_holds_its_shield_registration_exactly_for_its_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial = HTTPX_LOG_SHIELD._transports  # noqa: SLF001 - registration lifecycle control
+    portal = _portal(monkeypatch, lambda _request: httpx.Response(200, json={"result": []}))
+    assert HTTPX_LOG_SHIELD._transports == initial + 1  # noqa: SLF001
+    portal.close()
+    assert HTTPX_LOG_SHIELD._transports == initial  # noqa: SLF001
+
+    def fail_client(*_args: object, **_kwargs: object) -> httpx.Client:
+        raise httpx.InvalidURL("synthetic client initialization failure")
+
+    monkeypatch.setattr(httpx, "Client", fail_client)
+    with pytest.raises(LiveUnavailableError, match="client configuration"):
+        LivePortal(role="admin_full")
+    assert HTTPX_LOG_SHIELD._transports == initial  # noqa: SLF001 - a failed initialization leaves none
