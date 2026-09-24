@@ -21,28 +21,34 @@ MIGRATION = DOCS / "migration.md"
 PYTHON_BLOCK = re.compile(r"```python\n(.*?)\n```", re.DOTALL)
 
 
-def test_docs_are_flat_compact_and_linked_from_readme() -> None:
-    tracked_docs = sorted(path.relative_to(ROOT).as_posix() for path in DOCS.rglob("*") if path.is_file())
+_MARKDOWN_LINK = re.compile(r"\]\((?P<target>[^)\s]+)\)")
 
-    assert tracked_docs == [
-        "docs/architecture.md",
-        "docs/migration.md",
-        "docs/performance.md",
-        "docs/recipes.md",
-        "docs/specifications/b24api-issues-architecture/decision-ledger.md",
-        "docs/specifications/b24api-issues-architecture/examples-contracts.md",
-        "docs/specifications/b24api-issues-architecture/registry-contracts.md",
-        "docs/specifications/b24api-issues-architecture/specification.md",
-        "docs/specifications/b24api-issues-architecture/synthesis.md",
-        "docs/specifications/b24api-issues-architecture/transport-and-errors.md",
-        "docs/specifications/b24api-issues-architecture/traversal-contracts.md",
-        "docs/specifications/b24api-open-issues-release-ci/specification.md",
-    ]
-    text = README.read_text(encoding="utf-8")
-    assert "docs/architecture.md" in text
-    assert "docs/performance.md" in text
-    assert "docs/migration.md" in text
-    assert "docs/recipes.md" in text
+
+def _local_links(path: Path) -> set[Path]:
+    """Return the repository files a Markdown document links to, ignoring URLs and anchors."""
+    targets = set()
+    for match in _MARKDOWN_LINK.finditer(path.read_text(encoding="utf-8")):
+        target = match["target"].split("#", 1)[0]
+        if not target or "://" in target or target.startswith("mailto:"):
+            continue
+        targets.add((path.parent / target).resolve())
+    return targets
+
+
+def test_every_local_documentation_link_resolves() -> None:
+    for path in (README, *sorted(DOCS.glob("*.md"))):
+        for target in _local_links(path):
+            assert target.exists(), f"{path.relative_to(ROOT)} links to missing {target}"
+
+
+def test_every_maintained_doc_is_linked_and_specifications_are_an_archive() -> None:
+    linked = _local_links(README)
+    for path in DOCS.glob("*.md"):
+        linked |= _local_links(path)
+    for path in sorted(DOCS.rglob("*")):
+        if not path.is_file() or path.is_relative_to(DOCS / "specifications"):
+            continue
+        assert path.resolve() in linked, f"{path.relative_to(ROOT)} is neither linked nor archived"
     assert MIGRATION.is_file()
 
 
@@ -71,13 +77,12 @@ def test_migration_covers_changed_completion_stop_keyset_and_replay_contracts() 
     text = MIGRATION.read_text(encoding="utf-8")
     for public_contract in ("exhausted", "partial", "page_stop", "BoundedIdentityRange", "ReplayDisposition"):
         assert public_contract in text
-    bounded = next(paragraph for paragraph in text.split("\n\n") if "BoundedIdentityRange" in paragraph)
+    paragraphs = [" ".join(paragraph.split()) for paragraph in text.split("\n\n")]
+    bounded = next(paragraph for paragraph in paragraphs if "BoundedIdentityRange" in paragraph)
     assert "SequentialKeysetExecution" in bounded
-    assert "consumes that\nboundary" in bounded
+    assert "consumes that boundary" in bounded
     assert "RangeKeysetExecution`, `PartitionedKeysetExecution`, and auto execution reject" in bounded
-    reference = next(
-        paragraph for paragraph in text.split("\n\n") if "per-reference `IncompleteTraversalError`" in paragraph
-    )
+    reference = next(paragraph for paragraph in paragraphs if "per-reference `IncompleteTraversalError`" in paragraph)
     assert "`report=None`" in reference
     assert "partial_rows" in reference
 
