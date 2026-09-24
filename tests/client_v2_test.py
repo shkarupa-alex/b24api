@@ -1115,10 +1115,12 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
             Command(Request("test.get", {"value": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
             for index in range(FANOUT_COMMANDS)
         ],
+        # Full windows must not depend on host speed: the widest coalescing wait never splits a window.
         dispatch=BatchDispatch(
             batch_size=FANOUT_BATCH_SIZE,
             concurrency=concurrency,
             output_order=DeliveryOrder.READY,
+            coalesce_wait=1,
         ),
     )
 
