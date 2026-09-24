@@ -114,7 +114,7 @@ _BREAKING_MIGRATION_ITEMS = {
     "A2": ("Compressed responses.",),
     "A3": ("Possibly accepted batches are not replayed after a transport failure.", "Permanent transport refusals."),
     "A13": ("Exceptions from an injected transport.",),
-    "B29": ("Oversized responses from an injected transport.",),
+    "B29": ("Oversized responses.",),
     "A7": ("Error text.",),
     "A9": ("Mid-collection start with an exact total.",),
     "A10": ("Keyset verification.",),
@@ -142,6 +142,30 @@ def test_every_breaking_release_note_has_a_migration_item() -> None:
     assert breaking == set(_BREAKING_MIGRATION_ITEMS)
     for identifier, items in _BREAKING_MIGRATION_ITEMS.items():
         assert set(items) <= titles, f"{identifier}: {sorted(set(items) - titles)}"
+
+
+# Report fields and enum members 3.0.0 removed (B11, B12); only the migration guide, which describes their
+# removal, and the release notes may still name them.
+_REMOVED_REPORT_VOCABULARY = (
+    "canary_requests",
+    "canary_commands",
+    "canary_rows",
+    "canary counters",
+    "CANARY_VERIFIED_BOUNDS",
+    "identity_digest",
+    "SCHEDULER_STOPPED",
+    "REPLAYED_DIRECT",
+    "ORACLE_VERIFIED",
+)
+
+
+def test_maintained_documentation_does_not_describe_removed_report_vocabulary_as_current() -> None:
+    for path in (README, *sorted(DOCS.glob("*.md"))):
+        if path == MIGRATION:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for term in _REMOVED_REPORT_VOCABULARY:
+            assert term not in text, f"{path.relative_to(ROOT)} names removed {term}"
 
 
 def test_every_test_the_review_outcome_registry_cites_exists() -> None:

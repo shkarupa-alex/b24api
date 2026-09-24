@@ -125,9 +125,14 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         # all before the terminal event is emitted.
         if self._outcomes is not None:
             await self._outcomes.aclose()
+            return
+        # Closed before the first pull: the scheduler never took the source this stream opened, so the
+        # stream closes it itself. OwnedSource.aclose is idempotent for a family that closes it too.
+        (await self._source.aclose()).raise_failure()
 
     async def _finalize(self, cause: TerminalCause, failure: str | None, attempt: CleanupAttempt) -> KernelReport:
         if self._outcomes is None:
+            self.report = with_cleanup_attempt(self.report, cause, attempt, subject="reference")
             return self.report
         state, reason = kernel_terminal(cause, failure)
         if cause is TerminalCause.EXHAUSTED:

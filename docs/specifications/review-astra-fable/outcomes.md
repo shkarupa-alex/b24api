@@ -23,7 +23,7 @@ Test paths are `file::test`. The last section lists what remains for the owner.
 | A8 | Done; L3 confirmed | `306cde0` | `tests/counted_rules_test.py::test_table_r_batched_counted_path`, `::test_table_r_sequential_counted_path`; [L3](live-probes.md#l3-a8-the-counted-validator-on-real-responses) |
 | A9 | Done; L5 confirmed | `6cb745f` | `tests/offset_preflight_test.py::test_exact_qualified_total_refuses_a_nonzero_start_before_io`, `::test_disabled_total_termination_keeps_the_suffix_traversal`; [L5](live-probes.md#l5-a9-no-start--0-with-total-only-closure-in-examples-and-documentation) |
 | A10 | Done | `d54dda7` | `tests/keyset_verifier_boundary_test.py::test_failed_boundary_read_is_an_unsupported_report` |
-| A11 | Done | `37c3de2` | `tests/stream_lifecycle_test.py::test_early_close_with_failing_source_close_publishes_one_report` |
+| A11 | Done | `37c3de2` | `tests/stream_lifecycle_test.py::test_early_close_with_failing_source_close_publishes_one_report`; `tests/references_test.py::test_close_before_the_first_pull_closes_the_opened_async_source_once`, `::test_failing_source_close_before_the_first_pull_is_a_cleanup_failure` |
 | A12 | Done; breaking, in the migration guide | `37c3de2` | `tests/stream_lifecycle_test.py::test_early_close_is_reported_as_closed_before_exhaustion`; golden delta A12 |
 | A13 | Done; breaking, in the migration guide | `228d0f8` | `tests/internal/execution_boundary_test.py::test_unknown_transport_exception_is_a_non_retryable_dispatch_started_failure`, `::test_unknown_transport_exception_is_ambiguous_for_unproven_direct_requests`, `::test_batch_outcomes_are_total_after_an_unknown_transport_exception` |
 | A14 | Done | `37c3de2` | `tests/stream_lifecycle_test.py::test_fail_fast_batch_reports_the_command_failure_not_its_carrier`; golden delta A14 |
@@ -50,10 +50,10 @@ each A12, A14 and B10 test rejects.
 | B4 | Done | `7db6793` | `pyproject.toml` has no `fix`/`unsafe-fixes`; the `lint` job runs `ruff check --no-fix` |
 | B6 | Done | `2991260`, `97dd73b` | `tests/import_graph_test.py::test_package_import_graph_respects_layers` |
 | B7 | Done | `ff7bf49` | the single `PORTAL_BATCH_CAP` in `b24api/contracts/dispatch.py`, read by every batch capacity computation: `tests/architecture_test.py::test_batch_and_traversal_read_the_portal_batch_cap_from_its_one_owner` |
-| B8 | Done | `db3c529` | `tests/internal/execution_boundary_test.py::test_json_success_body_is_parsed_exactly_once`; [16 MiB benchmark](b8-b12-benchmark.md) |
+| B8 | Done | `db3c529` | `tests/internal/execution_boundary_test.py::test_json_success_body_is_parsed_exactly_once`, `::test_structured_error_in_success_status_keeps_the_codec_classification`, `::test_strict_only_defect_in_a_success_error_body_is_an_envelope_contract_error`; [16 MiB benchmark](b8-b12-benchmark.md) |
 | B9 | Done | `8cade30` | `tests/page_stop_test.py::test_default_auto_keyset_uses_sequential_path_for_page_stop` (auto with `page_stop` reports AUTO → SEQUENTIAL with `PAGE_STOP`); `::test_explicit_sequential_keyset_reports_its_selection` |
 | B10 | Done | `79f4e6c` | `tests/client_findings_3_test.py::test_fixed_step_rejects_any_closure_after_a_short_unqualified_window`; golden deltas B10 |
-| B11 | Done; breaking, in the migration guide | `357dc07`, `1640fb8` | [vulture outcomes](b11-dead-code.md) |
+| B11 | Done; breaking, in the migration guide | `357dc07`, `1640fb8` | [vulture outcomes](b11-dead-code.md); `tests/documentation_test.py::test_maintained_documentation_does_not_describe_removed_report_vocabulary_as_current` |
 | B12 | Done; breaking, in the migration guide | `db3c529` | `tests/completion_gate_test.py::test_page_validated_carries_no_identity_digest` |
 | B13 | Done | `aa2690c`, `3b0c9c9` | `tests/real_signature.py` binds the README and migration stubs to the real `Bitrix24` signatures. The `wheel-typing` job runs `tests/readme_test.py`, `tests/documentation_test.py` and `tests/root_surface_test.py` against the installed wheel (§6.1 item 4): `tests/release_workflow_test.py::test_wheel_typing_runs_the_migration_doc_tests_against_the_installed_wheel`. The same steps run locally: 147 passed, with `b24api` imported from site-packages. |
 | B14 | Done | `467ef2f` | `tests/documentation_test.py::test_every_local_documentation_link_resolves` |
@@ -70,7 +70,7 @@ each A12, A14 and B10 test rejects.
 | B25 | Done | `68e67e4`, `d7c4a48`, `2f35f25` | `tests/ratchet_test.py::test_long_functions_only_shrink`; the two remaining long functions carry recorded justifications in `tests/ratchets.json` |
 | B26 | Done | `c601960` | `tests/readme_test.py::test_quickstart_runs_exactly_against_a_scripted_portal` |
 | B27 | Done | `de451d5` | `tests/release_workflow_test.py::test_coverage_floor_has_one_source_in_pyproject` |
-| B29 | Done; breaking, in the migration guide | `228d0f8` | `tests/internal/execution_boundary_test.py::test_oversized_injected_response_is_rejected_before_decoding_for_safe_direct`, `::test_oversized_injected_batch_response_makes_every_command_unknown` |
+| B29 | Done; breaking, in the migration guide | `228d0f8` | `tests/internal/execution_boundary_test.py::test_oversized_injected_response_is_rejected_before_decoding_for_safe_direct`, `::test_oversized_injected_batch_response_makes_every_command_unknown`, `::test_oversized_batch_response_from_the_default_transport_makes_every_command_unknown` |
 
 B5 and B28 were never assigned (see §2).
 
@@ -108,6 +108,11 @@ B5 and B28 were never assigned (see §2).
   hpack matrix on hpack 4.2.0, newer than the locked 4.1.0 (§9.7).
 - **Result.** Only 0.28.x exists, so by the rule in §2.3 the bound stays `httpx[http2]>=0.28.1,<0.29`.
   The CI job itself runs on the first push.
+- **hpack and h2 bounds.** The shield filters a fixed set of hpack logger names, so the package also
+  declares `h2>=4.3.0,<4.5` and `hpack>=4.1.0,<4.3`: the locked line up to the newest release the
+  matrix ran on. Widening either bound means running the `httpx-latest` matrix on the new line first.
+  `tests/httpx_logging_shield_test.py::test_hpack_stack_is_bounded_to_the_verified_line` pins the
+  bounds against the verified versions.
 
 ### C9: public archive
 

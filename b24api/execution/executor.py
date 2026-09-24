@@ -345,14 +345,20 @@ class Executor:
         if success and mode is _BodyMode.BINARY:
             return None, None
         parsed = None
+        body: bytes | Mapping[str, object] | None = wire.body
         if success:
             parsed = _parse_success_body(wire.body, strict_members=mode is _BodyMode.JSON_STRICT_MEMBERS)
-            # A cleanly parsed body without a top-level error is exactly what the codec passes through;
-            # structured errors and parse failures keep the codec's raw-body classification and preview.
-            if parsed.failure is None and not (isinstance(parsed.payload, Mapping) and "error" in parsed.payload):
+            if parsed.failure is not None and not isinstance(parsed.failure, json.JSONDecodeError):
+                # Invalid UTF-8, a non-finite number or a duplicate correlation key is a defect only the
+                # strict parse sees; a lenient second parse must not turn it into a structured API error.
                 return None, parsed
+            if parsed.failure is None:
+                payload = parsed.payload
+                if not (isinstance(payload, Mapping) and "error" in payload):
+                    return None, parsed
+                # The codec classifies the structured error from the one strict parse, not a second one.
+                body = payload
         content_type = (wire.content_type or "").split(";", 1)[0].strip().casefold()
-        body: bytes | None = wire.body
         if mode is _BodyMode.BINARY and content_type != "application/json" and not content_type.endswith("+json"):
             body = None
         if wire.status_code < _HTTP_SUCCESS_MINIMUM or (

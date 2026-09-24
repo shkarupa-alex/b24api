@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import json
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import httpx
@@ -18,6 +19,7 @@ from b24api.errors import (
     ApiResponseError,
     BudgetExceededError,
     CapabilityError,
+    EnvelopeContractError,
     HTTPGatewayError,
     ResponseTooLargeError,
     TransportError,
@@ -552,6 +554,39 @@ async def test_oversized_injected_batch_response_makes_every_command_unknown(
 
 
 @pytest.mark.asyncio
+async def test_oversized_batch_response_from_the_default_transport_makes_every_command_unknown() -> None:
+    # The bundled HttpxTransport enforces the same ceiling: a SAFE physical batch whose response is refused
+    # may have run, so every command is unknown rather than a shared CommandFailure (2.3 behavior).
+    sends: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sends.append(request)
+        return httpx.Response(HTTP_OK, headers={"content-type": "application/json"}, content=b" " * 4 * CEILING)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    client = _client(HttpxTransport(f"https://{HOST}/rest/1/token/", client=http_client))
+    policy = _policy(max_response_bytes=4 * CEILING - 1)
+    try:
+        outcomes = await _drain(
+            client.batch_outcomes(
+                [Command(_request(ReplaySafety.SAFE), index) for index in range(SEVERAL)], policy=policy
+            )
+        )
+        assert len(sends) == 1
+        for outcome in outcomes:
+            assert isinstance(outcome, CommandOutcomeUnknown)
+            assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+            assert isinstance(outcome.error.__cause__, ResponseTooLargeError)
+
+        # A direct SAFE request through the same transport still raises the refusal itself.
+        with pytest.raises(ResponseTooLargeError):
+            await client.call(_request(ReplaySafety.SAFE), policy=policy)
+        assert len(sends) == 2  # noqa: PLR2004 - one batch send, one direct send
+    finally:
+        await http_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_response_of_exactly_the_ceiling_is_accepted() -> None:
     transport = _Script([_sized(CEILING)])
 
@@ -600,7 +635,9 @@ class _ParseCounter:
             return original_strict(*args, **kwargs)  # type: ignore[arg-type]
 
         def codec(body: object) -> object:
-            self.codec += 1
+            # Only a text body is parsed; a mapping handed over from the strict parse is not parsed again.
+            if not isinstance(body, Mapping):
+                self.codec += 1
             return original_codec(body)  # type: ignore[arg-type]
 
         monkeypatch.setattr(executor_module, "_parse_success_body", strict)
@@ -645,4 +682,29 @@ async def test_structured_error_in_success_status_keeps_the_codec_classification
         await _client(transport).call(_request(ReplaySafety.SAFE))
 
     assert captured.value.normalized_code == "access_denied"
-    assert (counter.strict, counter.codec) == (1, 1)
+    assert captured.value.evidence.body_preview is not None
+    assert "denied" in captured.value.evidence.body_preview
+    assert (counter.strict, counter.codec) == (1, 0)
+    assert transport.entered == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [b'{"error":"ACCESS_DENIED","junk":NaN}', b'{"error":"ACCESS_DENIED","description":"\xff"}'],
+    ids=["non-finite-number", "invalid-utf8"],
+)
+async def test_strict_only_defect_in_a_success_error_body_is_an_envelope_contract_error(
+    monkeypatch: pytest.MonkeyPatch,
+    body: bytes,
+) -> None:
+    # A lenient second parse would accept these bytes and report the embedded error; B8 keeps the one
+    # strict parse authoritative, so the response is malformed rather than a structured API error.
+    counter = _ParseCounter(monkeypatch)
+    transport = _Script([lambda _request: WireResponse(HTTP_OK, (("content-type", "application/json"),), body)])
+
+    with pytest.raises(EnvelopeContractError):
+        await _client(transport).call(_request(ReplaySafety.SAFE))
+
+    assert (counter.strict, counter.codec) == (1, 0)
+    assert transport.entered == 1

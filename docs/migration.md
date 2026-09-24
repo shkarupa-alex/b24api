@@ -78,10 +78,14 @@ details.
     send; a direct `UNKNOWN` or `UNSAFE` request raises `AmbiguousExecutionError`; every admitted
     command of a physical batch arrives as `CommandOutcomeUnknown`. Catch these instead of your own
     exception class, and read `__cause__` for the original.
-17. **Oversized responses from an injected transport.** A response larger than
-    `ExecutionPolicy.max_response_bytes` is refused before decoding: a direct `SAFE` request raises
-    `ResponseTooLargeError`, a direct `UNKNOWN` or `UNSAFE` request raises `AmbiguousExecutionError`,
-    and every command of a physical batch arrives as `CommandOutcomeUnknown`.
+17. **Oversized responses.** A response larger than `ExecutionPolicy.max_response_bytes` is refused
+    before decoding. An injected transport is now held to the same ceiling as the bundled one: a
+    direct `SAFE` request raises `ResponseTooLargeError`, and a direct `UNKNOWN` or `UNSAFE` request
+    raises `AmbiguousExecutionError`. For a physical batch the change applies to every transport,
+    the bundled `HttpxTransport` included: each command arrives as `CommandOutcomeUnknown` with the
+    `ResponseTooLargeError` as the cause, where 2.3 gave a `CommandFailure`, and a keyset page trace
+    records the page as an ambiguous execution rather than a command failure. Code that retried
+    such commands with a smaller `select` must now treat them as possibly executed.
 
 Additions that need no change: `Request.bare()` and `Request.v3()`, `Bitrix24.from_webhook()`,
 `HttpxTransport` in the root, `ExecutionPolicy.from_settings()` and

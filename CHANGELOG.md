@@ -20,8 +20,10 @@
   transient HTTP status and no Bitrix envelope is still replayed within the budget, as in 2.3. A
   transport failure marked `retryable=False` is raised once instead of exhausting the attempt budget.
   An arbitrary exception from an injected transport becomes
-  `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause (A13), and
-  a response over `max_response_bytes` from an injected transport is refused before decoding (B29).
+  `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause (A13). A
+  response over `max_response_bytes` from an injected transport is refused before decoding, and on
+  any transport, the bundled one included, every command of a physical batch whose response is
+  refused becomes `CommandOutcomeUnknown` instead of a `CommandFailure` (B29).
 - **Breaking (3.0.0):** error rendering is contextual. Known V3 error codes are shown verbatim, field
   names taken from the request render as `field#N` aliases, the request's own sensitive values are
   exact secrets, and distinct hidden mapping keys become `[REDACTED#1]`, `[REDACTED#2]`, … instead
@@ -87,8 +89,10 @@
 - **Breaking (3.0.0):** `PageValidated` no longer carries `identity_digest`, and the recorders no
   longer hash identities per page; the gate checks event order and `row_count` as before (B12).
 - A JSON success body is parsed once, strictly, instead of once by the error codec and again by the
-  envelope decoder. Structured errors and malformed bodies keep their previous classification; a
-  16 MiB call decodes about 15% faster (B8).
+  envelope decoder. Structured errors and malformed bodies keep their previous classification, except
+  that a body with a top-level `error` which only the strict parse rejects (invalid UTF-8, a
+  non-finite number, a duplicate correlation key) is now an `EnvelopeContractError` rather than an
+  `ApiResponseError`; a 16 MiB call decodes about 15% faster (B8).
 - A public operation stream's report now always carries its own cleanup result: a cleanup failure
   that the underlying kernel did not record is added as a `cleanup_failure` violation, by the same
   §3.1 rules as the kernel reports. Each of the five stream families has a barrier-driven test for

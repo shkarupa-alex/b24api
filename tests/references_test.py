@@ -1749,3 +1749,83 @@ def test_batch_reference_stream_construction_is_lazy_outside_an_event_loop() -> 
 
 async def _collect(stream: object) -> list[KernelReferenceItem | KernelReferenceFailure]:
     return [outcome async for outcome in stream]  # type: ignore[attr-defined]
+
+
+class _ClosableReferences:
+    """An iterable whose iterator counts pulls and closes and yields nothing until pulled."""
+
+    def __init__(self) -> None:
+        self.pulls = 0
+        self.closes = 0
+
+    def __iter__(self) -> _ClosableReferences:
+        return self
+
+    def __next__(self) -> ReferenceRequest:
+        self.pulls += 1
+        raise StopIteration
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+class _AsyncClosableReferences:
+    """The asynchronous counterpart, whose ``aclose`` can fail."""
+
+    def __init__(self, *, close_fails: bool = False) -> None:
+        self.pulls = 0
+        self.closes = 0
+        self.close_fails = close_fails
+
+    def __aiter__(self) -> _AsyncClosableReferences:
+        return self
+
+    async def __anext__(self) -> ReferenceRequest:
+        self.pulls += 1
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closes += 1
+        if self.close_fails:
+            raise RuntimeError("reference source close failed")
+
+
+@pytest.mark.asyncio
+async def test_close_before_the_first_pull_closes_the_opened_sync_source_once() -> None:
+    transport = ResponderTransport(lambda _request: {"result": []})
+    source = _ClosableReferences()
+    stream = fan_out(Executor(transport), source, dispatch=KernelDirectDispatch())
+
+    await stream.aclose()
+    await stream.aclose()
+
+    assert (source.pulls, source.closes) == (0, 1)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_close_before_the_first_pull_closes_the_opened_async_source_once() -> None:
+    source = _AsyncClosableReferences()
+    stream = fan_out(
+        Executor(ResponderTransport(lambda _request: {"result": []})), source, dispatch=KernelDirectDispatch()
+    )
+
+    await stream.aclose()
+    await stream.aclose()
+
+    assert (source.pulls, source.closes) == (0, 1)
+
+
+@pytest.mark.asyncio
+async def test_failing_source_close_before_the_first_pull_is_a_cleanup_failure() -> None:
+    source = _AsyncClosableReferences(close_fails=True)
+    stream = fan_out(
+        Executor(ResponderTransport(lambda _request: {"result": []})), source, dispatch=KernelDirectDispatch()
+    )
+
+    with pytest.raises(RuntimeError, match="reference source close failed"):
+        await stream.aclose()
+
+    assert source.closes == 1
+    assert stream.report is not None
+    assert "cleanup_failure" in [violation.code for violation in stream.report.violations]

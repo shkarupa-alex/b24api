@@ -30,11 +30,14 @@ on the same machine, with the baseline imported from a detached worktree through
 A JSON success body goes through one strict `json.loads` of its UTF-8 text, which rejects NaN and
 Infinity and, for physical batches, duplicate correlation keys. A body without a top-level `error`
 skips the error codec, which would have returned no error for it anyway. A body with a top-level
-`error`, and a body that fails the strict parse, still go to the codec with the raw bytes. So
-structured errors keep their preview, syntax errors stay a `ProtocolError`, and defects only the
-strict parse catches (invalid UTF-8, non-finite numbers, duplicate correlation keys) stay an
-`EnvelopeContractError`. `tests/internal/execution_boundary_test.py` pins one parse per success
-body for a direct call and for a batch.
+`error` goes to the codec as the mapping the strict parse produced, so the codec classifies it and
+keeps its preview without parsing it again. A body that fails the strict parse with a syntax error
+goes to the codec with the raw bytes and stays a `ProtocolError`. A defect only the strict parse
+catches (invalid UTF-8, a non-finite number, a duplicate correlation key) is an
+`EnvelopeContractError` at once, even when the body holds a top-level `error`: a lenient second
+parse would otherwise report it as a structured API error. `tests/internal/execution_boundary_test.py`
+pins one parse per success body for a direct call and for a batch, no second parse of a structured
+error, and the strict-only defects.
 
 ## Script
 

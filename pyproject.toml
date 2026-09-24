@@ -34,6 +34,10 @@ classifiers = [
 ]
 dependencies = [
     "httpx[http2]>=0.28.1,<0.29",
+    # The hpack logging shield filters a fixed set of logger names; h2 and hpack stay on the line it was
+    # verified against, and widening either bound reruns the hpack matrix (httpx-latest job).
+    "h2>=4.3.0,<4.5",
+    "hpack>=4.1.0,<4.3",
     "pydantic>=2.12.0",
     "pydantic-settings>=2.10.1",
 ]

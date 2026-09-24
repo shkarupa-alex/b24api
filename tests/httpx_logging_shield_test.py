@@ -5,11 +5,14 @@ import asyncio
 import io
 import logging
 import tomllib
+from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 from b24api import Request, RouteKind
 from b24api.contracts import BodyEncoding
@@ -33,6 +36,27 @@ def test_httpx_dependency_range_matches_the_positive_controlled_minor() -> None:
     project = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
 
     assert "httpx[http2]>=0.28.1,<0.29" in project["project"]["dependencies"]
+
+
+# The newest h2 and hpack the hpack logger matrix ran on (outcomes.md, C2). The shield filters a fixed set of
+# hpack logger names, so a consumer must not resolve a newer, unverified line.
+_VERIFIED_HPACK_STACK = {"h2": Version("4.4.1"), "hpack": Version("4.2.0")}
+
+
+@pytest.mark.parametrize("name", sorted(_VERIFIED_HPACK_STACK))
+def test_hpack_stack_is_bounded_to_the_verified_line(name: str) -> None:
+    project = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    requirements = [Requirement(line) for line in project["project"]["dependencies"]]
+    specifier = next(requirement.specifier for requirement in requirements if requirement.name == name)
+    upper = [spec for spec in specifier if spec.operator == "<"]
+
+    verified = _VERIFIED_HPACK_STACK[name]
+    next_minor = Version(f"{verified.major}.{verified.minor + 1}")
+
+    assert upper, f"{name} has no upper bound"
+    assert verified in specifier
+    assert all(Version(spec.version) <= next_minor for spec in upper)
+    assert metadata.version(name) in specifier
 
 
 class _CollectingHandler(logging.StreamHandler[io.StringIO]):
