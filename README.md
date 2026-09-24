@@ -15,16 +15,42 @@ export BITRIX24_API_WEBHOOK_URL='https://portal.example/rest/.../'
 Keep the webhook out of source, logs and command arguments. Reuse one client for a related unit of
 work so its HTTP/2 connection pool and rate state are reused.
 
-<!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
-```python
-from b24api import Bitrix24, Request, RouteKind
+## Quickstart
 
-async with Bitrix24() as client:
-    profile = await client.call(Request("profile", route=RouteKind.BARE))
+<!-- tested: tests/readme_test.py::test_quickstart_runs_exactly_against_a_scripted_portal -->
+```python
+import os
+
+from b24api import Bitrix24, Request
+
+async with Bitrix24.from_webhook(os.environ["BITRIX24_API_WEBHOOK_URL"]) as client:
+    deals = client.iter_list(Request.bare("crm.deal.list", {"select": ["ID", "TITLE"]}))
+    async for deal in deals:
+        print(deal["ID"], deal["TITLE"])
+    print(deals.report.state)
 ```
 
-The client owns its default transport. An injected transport remains caller-owned. `aclose()` is
-idempotent and closes active streams before the owned transport.
+Four things are at work:
+
+- **The client.** `Bitrix24.from_webhook()` checks the URL and owns the connection pool it opens;
+  `async with` closes it. `Bitrix24()` reads the same URL from the environment.
+- **The request.** `Request.bare()` names a REST method and its parameters and sends them to the
+  classic `/rest/` endpoint. The route is always explicit: `Request.v3()` targets the V3 API.
+- **`iter_list()`.** It walks the list page by page and reads one more, empty, page to confirm
+  the end.
+- **The report.** `deals.report` says how the traversal ended. `completed` means every page was
+  read; a traversal that stops early or fails records why.
+
+A single call returns the decoded `result`:
+
+<!-- tested: tests/readme_test.py::test_quickstart_runs_exactly_against_a_scripted_portal -->
+```python
+users = await client.call(Request.bare("user.get", {"ID": 1}))
+```
+
+The client owns the transport it creates. An injected transport remains caller-owned. `aclose()` is
+idempotent and closes active streams before the owned transport. To prove that no row is missing or
+repeated, give the traversal an identity (see [Choosing a list operation](#choosing-a-list-operation)).
 
 ## Direct calls
 

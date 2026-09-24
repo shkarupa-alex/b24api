@@ -19,6 +19,8 @@
 - `Bitrix24.from_webhook(url, *, http_timeout=None, policy=None)` validates the URL through
   `Settings` and owns the transport and coordinator it creates; `http_timeout=None` keeps the
   `Settings` default.
+- The README opens with a quickstart on `crm.deal.list` and `user.get` that needs four concepts:
+  the client, a request, `iter_list()` and the report. It runs in a doc-test on the real client (B26).
 - **Breaking (3.0.0):** removed never-produced report vocabulary: the `canary_requests`,
   `canary_commands` and `canary_rows` fields of `KeysetExecutionReport`,
   `KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS`, `ReplayDisposition.REPLAYED_DIRECT` and
