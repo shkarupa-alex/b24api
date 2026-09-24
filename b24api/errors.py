@@ -21,7 +21,8 @@ if TYPE_CHECKING:
     from b24api.contracts.command import CommandOutcome
     from b24api.contracts.reference import ReferenceOutcome
     from b24api.contracts.report import OperationReport
-    from b24api.contracts.request import PathPart, RequestSummary, ResultSelector
+    from b24api.contracts.request import PathPart, ResultSelector
+    from b24api.contracts.request_summary import RequestSummary
 
 
 class TransportError(B24ApiError):

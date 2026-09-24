@@ -6,7 +6,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from b24api.contracts.json import FrozenMapping, JsonValue, _thaw_json
-from b24api.contracts.request import ReplaySafety, Request, RequestSummary, ResultErrorSpec, RouteKind
+from b24api.contracts.request import ReplaySafety, Request, ResultErrorSpec
+from b24api.contracts.request_summary import RequestSummary, RouteKind
 from b24api.contracts.response import _safe_media_type
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 from b24api.errors import CapabilityError

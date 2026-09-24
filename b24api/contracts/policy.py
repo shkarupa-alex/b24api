@@ -11,7 +11,7 @@ from b24api.contracts.error_base import BudgetExceededError
 from b24api.contracts.json import _is_plain_int
 
 if TYPE_CHECKING:
-    from b24api.contracts.request import RequestSummary
+    from b24api.contracts.request_summary import RequestSummary
     from b24api.settings import Settings
 
 HTTP_STATUS_MINIMUM = 100

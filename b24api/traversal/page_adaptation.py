@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from b24api.contracts.json import FrozenJson
-    from b24api.contracts.request import RequestSummary
+    from b24api.contracts.request_summary import RequestSummary
     from b24api.contracts.response import Response
 
 type _IdentityTokenSpec = tuple[tuple[str | int, ...], IdentityCoercion]

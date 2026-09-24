@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, cast
 import httpx
 
 from b24api._error_types import FailurePhase
-from b24api.contracts.request import RouteKind
+from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.wire import BodyEncoding, _validate_headers
 from b24api.encoding import encode_php_query
 from b24api.errors import (

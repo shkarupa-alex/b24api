@@ -33,7 +33,7 @@ from b24api.contracts.keyset_execution import KeysetExecutionJson
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from b24api.contracts.request import RouteKind
+    from b24api.contracts.request_summary import RouteKind
 
 _CONTRACT_VERSION = 1
 _DEFAULT_AUTO_KEYSET_EXECUTION = AutoKeysetExecution(StableIntegerKeysetContract())

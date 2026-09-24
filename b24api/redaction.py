@@ -15,10 +15,16 @@ import json
 import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any, Protocol
 
-if TYPE_CHECKING:
-    from b24api._diagnostics import DiagnosticContext
+
+class _RequestScope(Protocol):
+    """Request-scoped aliasing and exact secrets; ``_diagnostics.DiagnosticContext`` implements it."""
+
+    def alias_text(self, text: str) -> str: ...
+
+    def replace_secrets(self, text: str) -> str: ...
+
 
 REDACTED = "[REDACTED]"
 TRUNCATED = "[TRUNCATED]"
@@ -112,7 +118,7 @@ def replace_secrets(text: str, secrets: frozenset[str]) -> str:
 class _RenderState:
     """State of one rendering call: the recursion guard and this call's hidden-key numbering."""
 
-    context: DiagnosticContext | None
+    context: _RequestScope | None
     active: set[int] = field(default_factory=set)
     hidden: dict[str, int] = field(default_factory=dict)
     next_hidden: int = 1
@@ -159,7 +165,7 @@ class Redactor:
         """Scrub credential-bearing textual forms and apply a hard length bound."""
         return self.render_text(value)
 
-    def render_text(self, value: str, *, context: DiagnosticContext | None = None) -> str:
+    def render_text(self, value: str, *, context: _RequestScope | None = None) -> str:
         """Render free text: exact secrets, then request field aliases, then the bare-credential heuristic."""
         if isinstance(value, SafeText):
             return value
@@ -183,7 +189,7 @@ class Redactor:
         keep = self.max_string - len(TRUNCATED)
         return scrubbed[:keep] + TRUNCATED
 
-    def redact(self, value: Any, *, context: DiagnosticContext | None = None) -> Any:
+    def redact(self, value: Any, *, context: _RequestScope | None = None) -> Any:
         """Return a detached JSON-compatible redacted representation."""
         return self._redact(value, path=(), depth=0, state=_RenderState(context))
 
@@ -192,7 +198,7 @@ class Redactor:
         body: bytes | str | None,
         *,
         max_chars: int = 500,
-        context: DiagnosticContext | None = None,
+        context: _RequestScope | None = None,
     ) -> str | None:
         """Create a bounded redacted body preview without retaining the raw body."""
         if body is None:
@@ -267,7 +273,7 @@ class Redactor:
         finally:
             state.active.remove(identity)
 
-    def _render_key(self, raw: str, context: DiagnosticContext | None) -> tuple[str | None, str]:
+    def _render_key(self, raw: str, context: _RequestScope | None) -> tuple[str | None, str]:
         """Return the shown label, or None for a key that must be hidden, and the historical key text."""
         historical = self.render_text(raw)
         if context is None:

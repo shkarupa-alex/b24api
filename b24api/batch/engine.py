@@ -18,7 +18,8 @@ from b24api.contracts.policy import (
     AmbiguityReason,
     ReplayDisposition,
 )
-from b24api.contracts.request import ReplaySafety, Request, RouteKind, diagnostic_context
+from b24api.contracts.request import ReplaySafety, Request, diagnostic_context
+from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.response import Response
 from b24api.encoding import encode_php_query
 from b24api.errors import (

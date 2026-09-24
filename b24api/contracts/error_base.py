@@ -12,7 +12,7 @@ from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 if TYPE_CHECKING:
     from b24api._diagnostics import DiagnosticContext
-    from b24api.contracts.request import RequestSummary
+    from b24api.contracts.request_summary import RequestSummary
 
 
 class B24ApiError(Exception):

@@ -24,14 +24,8 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.contracts.report import KeysetSelectionSummary, TraversalAssurance, Violation
-from b24api.contracts.request import (
-    IdentitySpec,
-    RequestLike,
-    ResultSelector,
-    RouteKind,
-    TraversalIdentity,
-    canonical_request,
-)
+from b24api.contracts.request import IdentitySpec, RequestLike, ResultSelector, TraversalIdentity, canonical_request
+from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.traversal import OffsetContinuation, TotalTermination
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError

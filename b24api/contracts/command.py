@@ -6,13 +6,14 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from b24api.contracts.policy import ReplayDisposition
-from b24api.contracts.request import Request, RequestSummary
+from b24api.contracts.request import Request
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from b24api.contracts.error_base import B24ApiError
     from b24api.contracts.json import JsonValue
+    from b24api.contracts.request_summary import RequestSummary
     from b24api.contracts.response import Response
 
 

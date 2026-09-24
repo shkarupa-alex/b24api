@@ -16,7 +16,7 @@ from b24api._error_types import FailurePhase
 from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.json import _json_type_name
 from b24api.contracts.policy import AmbiguityReason, ExecutionPolicy
-from b24api.contracts.request import ReplaySafety, Request, RequestSummary, ResultErrorShape, diagnostic_context
+from b24api.contracts.request import ReplaySafety, Request, ResultErrorShape, diagnostic_context
 from b24api.contracts.response import (
     BinaryEvidence,
     BinaryResponse,
@@ -48,6 +48,7 @@ from b24api.transport.base import WireRequest, WireTransport, preflight_transpor
 from b24api.transport.protocol import ProtocolCodec
 
 if TYPE_CHECKING:
+    from b24api.contracts.request_summary import RequestSummary
     from b24api.transport.base import Transport, WireResponse
 
 type Clock = Callable[[], float]

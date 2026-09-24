@@ -47,16 +47,6 @@ _ROOT_FILE_LAYERS = {
 # The root ``b24api/__init__.py`` is the public aggregator, outside every layer.
 _AGGREGATOR = "b24api"
 
-# Type-only cycles that remain, each with the reason it cannot go yet. A new cycle fails the gate;
-# a removed one must be deleted here, so the baseline only shrinks.
-_TYPE_ONLY_CYCLE_BASELINE = {
-    # The redactor renders through an optional DiagnosticContext that is built from redaction rules.
-    ("_diagnostics", "redaction"),
-    # The error base annotates RequestSummary; request needs policy enums; policy raises the budget error.
-    ("contracts.error_base", "contracts.request", "contracts.policy"),
-    # Policy annotates RequestSummary in ambiguity decisions; request coerces identities by policy enums.
-    ("contracts.policy", "contracts.request"),
-}
 # Only the client composes reference traversal; no lower layer reaches into it.
 _REFERENCES_IMPORTERS = {"b24api.client"}
 
@@ -174,13 +164,10 @@ def test_package_import_graph_respects_layers() -> None:
     assert not cycles, f"runtime import cycles: {cycles}"
 
 
-def test_type_checking_cycles_do_not_grow() -> None:
+def test_no_import_cycle_even_through_type_checking_imports() -> None:
     _runtime, full = _graphs()
-    cycles = {_short(cycle) for cycle in _elementary_cycles(full)}
-    assert not cycles - _TYPE_ONLY_CYCLE_BASELINE, f"new import cycles: {sorted(cycles - _TYPE_ONLY_CYCLE_BASELINE)}"
-    assert not _TYPE_ONLY_CYCLE_BASELINE - cycles, (
-        f"remove resolved cycles from the baseline: {sorted(_TYPE_ONLY_CYCLE_BASELINE - cycles)}"
-    )
+    cycles = sorted(_short(cycle) for cycle in _elementary_cycles(full))
+    assert not cycles, f"import cycles, counting TYPE_CHECKING imports: {cycles}"
 
 
 def test_no_cycle_passes_through_errors() -> None:

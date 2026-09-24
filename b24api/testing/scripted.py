@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
-from b24api.contracts.request import ReplaySafety, Request, RouteKind
+from b24api.contracts.request import ReplaySafety, Request
+from b24api.contracts.request_summary import RouteKind
 from b24api.encoding import encode_php_query
 from b24api.transport.base import TransportCapabilities, WireRequest, WireResponse
 

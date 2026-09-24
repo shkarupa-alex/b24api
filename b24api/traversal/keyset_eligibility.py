@@ -18,7 +18,7 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     TotalSemantics,
 )
-from b24api.contracts.request import RouteKind
+from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.identity import _child_path, _request_with_controls
