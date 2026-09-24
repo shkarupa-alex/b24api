@@ -382,16 +382,16 @@ def test_module_sizes_are_recorded(record_property: Callable[[str, object], None
 
 def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
     fast_sources = tuple(sorted((PACKAGE / "traversal").glob("keyset_*.py")))
-    # Protective (B21): the scheduler is the only owner of the fast buffered-row counter.
+    # Protective (B21): the runtime is the only owner of the fast buffered-row counter.
     delta_callers = {path.name for path in fast_sources if "adjust_buffered_rows(" in path.read_text(encoding="utf-8")}
-    assert delta_callers == {"keyset_scheduler.py"}
+    assert delta_callers == {"keyset_runtime.py"}
     assert all("set_buffered_rows(" not in path.read_text(encoding="utf-8") for path in fast_sources)
     # Protective (B21, §3.6): the transaction host is a protocol, never a shared scheduler-state bag.
     assert not (PACKAGE / "traversal" / "keyset_scheduler_support.py").exists()
     assert not (PACKAGE / "traversal" / "keyset_scheduler_state.py").exists()
     assert all("SchedulerState" not in path.read_text(encoding="utf-8") for path in fast_sources)
     # Sequential and fast keyset build every page request through the one shared step.
-    for name in ("keyset.py", "keyset_scheduler.py"):
+    for name in ("keyset.py", "keyset_runtime.py"):
         path = PACKAGE / "traversal" / name
         tree = ast.parse(path.read_text(encoding="utf-8"))
         assert any(

@@ -200,7 +200,7 @@ class Bitrix24(_TraversalFacade):
         self._require_open()
         canonical = canonical_request(request)
         self._audit_unknown(canonical)
-        self._executor._preflight_request(canonical)
+        self._executor.preflight_request(canonical)
         return await _verify_keyset_capability(
             self._executor,
             canonical,

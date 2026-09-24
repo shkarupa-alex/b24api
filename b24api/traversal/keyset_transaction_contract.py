@@ -1,9 +1,9 @@
-"""Explicit state and construction boundary for fast-keyset transactions."""
+"""Explicit state, host protocol and construction boundary for fast-keyset transactions."""
 
 from __future__ import annotations
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.keyset_execution import KeysetPhase
@@ -11,13 +11,27 @@ from b24api.traversal import keyset_step
 from b24api.traversal.keyset_page_validation import LaneCommandPlan
 
 if TYPE_CHECKING:
+    from b24api.batch.engine import BatchExecutor
     from b24api.batch.outcome import BatchOutcome
+    from b24api.completion.fast_recorder import FastCompletionRecorder
     from b24api.contracts.json import FrozenJson
-    from b24api.contracts.keyset_execution import ClosureWitness
-    from b24api.contracts.request import Request
-    from b24api.contracts.response import Response
+    from b24api.contracts.keyset_execution import (
+        AutoKeysetExecution,
+        ClosureWitness,
+        KeysetPageCompletion,
+        PartitionedKeysetExecution,
+        RangeKeysetExecution,
+    )
+    from b24api.contracts.page import PageAdapter
+    from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode, Violation
+    from b24api.contracts.request import IdentitySpec, Request, ResultSelector
+    from b24api.contracts.response import Response, ResultCollectionShape
+    from b24api.contracts.traversal import KeysetSpec
+    from b24api.execution import ExecutionContext, Executor
     from b24api.traversal.keyset_fast_plan import LaneBounds, LaneState
-    from b24api.traversal.keyset_scheduler import KeysetFastScheduler
+    from b24api.traversal.keyset_observation import FastTraceRecorder
+    from b24api.traversal.keyset_ordered_admission import OrderedAdmissionState
+    from b24api.traversal.keyset_page_validation import LaneReceipt
 
 
 @dataclass(slots=True)
@@ -49,6 +63,73 @@ class KeysetTransactionState:
     )
 
 
+class KeysetTransactionHost(Protocol):
+    """Everything the planner and the stateless transactions need from the runtime that owns them."""
+
+    executor: Executor
+    request: Request
+    identity: IdentitySpec
+    keyset: KeysetSpec
+    selector: ResultSelector
+    collection_shape: ResultCollectionShape
+    page_size: int
+    effective_page_cap: int
+    execution: RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution
+    context: ExecutionContext
+    engine: BatchExecutor
+    trace: FastTraceRecorder
+    page_adapter: PageAdapter
+    completion_recorder: FastCompletionRecorder
+    completion: KeysetPageCompletion
+    batch_capacity: int
+    admission: OrderedAdmissionState
+    violations: list[Violation]
+    batch_requests: int
+    batch_commands: int
+    transactions: KeysetTransactionState
+
+    def next_command_id(self, phase: KeysetPhase) -> str:
+        """Allocate a unique command identifier for a transaction phase."""
+        ...
+
+    async def adjust_buffer(self, delta: int) -> None:
+        """Apply a row-buffer accounting delta for a transaction."""
+        ...
+
+    def record_page(  # noqa: PLR0913 - mirrors the one page observation record
+        self,
+        plan: LaneCommandPlan,
+        *,
+        index: int | None,
+        selected: int,
+        admitted: int,
+        outcome: PageOutcome = ...,
+        rejection: PageRejectionCode | None = None,
+        violation: Violation | None = None,
+        response: Response | None = None,
+        witness: ClosureWitness | None = None,
+        dispatch: PageDispatch = ...,
+    ) -> None:
+        """Record one transaction page observation."""
+        ...
+
+    async def execute_wave(self, plans: tuple[LaneCommandPlan, ...]) -> tuple[LaneReceipt, ...]:
+        """Execute one correlated transaction wave."""
+        ...
+
+    def drain_admission_frontier(self) -> None:
+        """Admit all complete lanes at the ordered frontier."""
+        ...
+
+    def add_pending_owner(self, owners: tuple[tuple[str, int], ...]) -> None:
+        """Queue the command owners of the admitted row group appended last."""
+        ...
+
+    def record_completion_witness(self) -> None:
+        """Count one terminal closure witness that no lane recorded."""
+        ...
+
+
 def boundary_totals(
     plans: tuple[LaneCommandPlan, ...],
     outcomes: tuple[BatchOutcome, ...],
@@ -64,7 +145,7 @@ def boundary_totals(
 
 
 def build_lane_plan(  # noqa: PLR0913
-    scheduler: KeysetFastScheduler,
+    host: KeysetTransactionHost,
     lane: LaneState,
     *,
     phase: KeysetPhase,
@@ -75,16 +156,16 @@ def build_lane_plan(  # noqa: PLR0913
     """Build one correlated lane-command reservation."""
     return LaneCommandPlan(
         lane.spec.ordinal,
-        scheduler.next_command_id(phase),
+        host.next_command_id(phase),
         phase,
         request,
-        reserve or scheduler.effective_page_cap,
+        reserve or host.effective_page_cap,
         single,
     )
 
 
 def build_controlled_request(  # noqa: PLR0913
-    scheduler: KeysetFastScheduler,
+    host: KeysetTransactionHost,
     *,
     direction: str,
     lower: int | None = None,
@@ -94,9 +175,9 @@ def build_controlled_request(  # noqa: PLR0913
 ) -> Request:
     """Build one keyset request from transaction bounds."""
     return keyset_step.bounded_keyset_request(
-        scheduler.request,
-        keyset=scheduler.keyset,
-        identity=scheduler.identity,
+        host.request,
+        keyset=host.keyset,
+        identity=host.identity,
         direction=direction,
         lower=lower,
         upper=upper,
@@ -105,4 +186,10 @@ def build_controlled_request(  # noqa: PLR0913
     )
 
 
-__all__ = ["KeysetTransactionState", "boundary_totals", "build_controlled_request", "build_lane_plan"]
+__all__ = [
+    "KeysetTransactionHost",
+    "KeysetTransactionState",
+    "boundary_totals",
+    "build_controlled_request",
+    "build_lane_plan",
+]

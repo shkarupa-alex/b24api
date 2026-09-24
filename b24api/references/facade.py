@@ -316,7 +316,7 @@ def kernel_reference_stream[C](
         page_adapter=traversal.page_adapter,
     )
     preflight._validate_capabilities()  # noqa: SLF001 - reject base controls before consuming caller input
-    executor._preflight_request(base)  # noqa: SLF001 - reject transport representation before caller input
+    executor.preflight_request(base)
     dispatch_plan = kernel_dispatch(dispatch, policy)
     stream = _iter_references(
         executor,

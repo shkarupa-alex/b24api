@@ -7,11 +7,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from b24api.contracts.json import FrozenJson
-    from b24api.contracts.keyset_execution import ClosureWitness, KeysetExecutionKind, KeysetPageCompletion
-    from b24api.contracts.request import IdentitySpec
-    from b24api.contracts.response import ResultCollectionShape
-    from b24api.contracts.traversal import KeysetSpec
-    from b24api.traversal.keyset_auto import FinalSelection, Preselection
+    from b24api.contracts.keyset_execution import ClosureWitness
 
 type Identity = int
 MIN_WINDOW_WIDTH = 2
@@ -133,31 +129,6 @@ class LazyRangePlan:
             self.append_next(lanes, rows, identities, commands)
 
 
-@dataclass(frozen=True, slots=True)
-class FastKeysetPlan:
-    """Selected scheduler plan."""
-
-    kind: KeysetExecutionKind
-    lanes: tuple[LaneSpec, ...]
-    page_size: int
-    effective_page_cap: int
-    batch_capacity: int
-    completion: KeysetPageCompletion
-    identity: IdentitySpec
-    keyset: KeysetSpec
-    collection_shape: ResultCollectionShape
-    finish_cursor: Identity | None
-
-
-@dataclass(frozen=True, slots=True)
-class PlanOutcome:
-    """Freeze the selected plan together with automatic-selection evidence."""
-
-    plan: FastKeysetPlan
-    preselection: Preselection | None
-    final: FinalSelection | None
-
-
 def plan_windows(*, lo: Identity, upper_exclusive: Identity, width: int) -> tuple[LaneSpec, ...]:
     """Partition ``(lo, upper_exclusive)`` into exact disjoint windows."""
     if any(not isinstance(value, int) or isinstance(value, bool) for value in (lo, upper_exclusive, width)):
@@ -264,7 +235,6 @@ def fit_wave[T](plans: tuple[T, ...], *, reserves: tuple[int, ...], commands: in
 
 
 __all__ = [
-    "FastKeysetPlan",
     "Identity",
     "LaneBounds",
     "LaneKind",
@@ -272,7 +242,6 @@ __all__ = [
     "LaneState",
     "LaneStatus",
     "LazyRangePlan",
-    "PlanOutcome",
     "fit_wave",
     "plan_lanes_from_anchors",
     "plan_windows",

@@ -88,9 +88,12 @@ Fast keyset execution has a planning barrier before emission. Boundary-only and 
 sequential continuation rely on the same ordered-prefix assurance as sequential traversal; numeric
 range and partition plans are caller-asserted and retain positive bound validation on every page.
 The separate verifier owns diagnostic canaries and never changes runtime mode. Advisory totals are isolated from
-completion and admission. One scheduler owns wave correlation, ordered admission, row-buffer deltas,
-finishing continuation, cleanup, and the immutable selection report. Stateless transaction functions
-execute its batch/body/finish I/O but define no scheduler class or persistent state of their own.
+completion and admission. A planner (`keyset_plan.py`) owns boundary analysis, automatic selection
+and anchor probing, and freezes a plan of kind, reason and bounds; the pure integer geometry behind
+it lives in `keyset_geometry.py`. One runtime (`keyset_runtime.py`) owns wave correlation, ordered
+admission, row-buffer deltas, finishing continuation, cleanup, and the immutable selection report.
+The planner and the stateless transaction functions reach the runtime only through the
+`KeysetTransactionHost` protocol and define no persistent state of their own.
 
 Selection and validation operate on the response's existing frozen tree. A synchronous `PageAdapter`
 is invoked once at the two canonical row funnels (driver and fast-keyset receipt) before commit;

@@ -56,16 +56,6 @@ _TYPE_ONLY_CYCLE_BASELINE = {
     ("contracts.error_base", "contracts.request", "contracts.policy"),
     # Policy annotates RequestSummary in ambiguity decisions; request coerces identities by policy enums.
     ("contracts.policy", "contracts.request"),
-    # Keyset planning and runtime modules see each other's types; removed by keyset consolidation (C5).
-    ("traversal.keyset_auto", "traversal.keyset_geometry", "traversal.keyset_fast_plan"),
-    ("traversal.keyset_fast_stream", "traversal.keyset_observation", "traversal.keyset_scheduler"),
-    ("traversal.keyset_fast_stream", "traversal.keyset_scheduler"),
-    ("traversal.keyset_observation", "traversal.keyset_scheduler"),
-    ("traversal.keyset_observation", "traversal.keyset_scheduler", "traversal.keyset_transactions"),
-    ("traversal.keyset_reporting", "traversal.keyset_scheduler"),
-    ("traversal.keyset_scheduler", "traversal.keyset_transaction_contract"),
-    ("traversal.keyset_scheduler", "traversal.keyset_transactions"),
-    ("traversal.keyset_scheduler", "traversal.keyset_transactions", "traversal.keyset_transaction_contract"),
 }
 # Only the client composes reference traversal; no lower layer reaches into it.
 _REFERENCES_IMPORTERS = {"b24api.client"}

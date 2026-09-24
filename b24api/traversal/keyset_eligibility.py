@@ -193,7 +193,7 @@ def validate_fast_keyset(  # noqa: C901, PLR0912, PLR0913
     if keyset.limit_path is not None:
         updates[keyset.limit_path] = effective_cap
     _request_with_controls(request, updates, allow_create=keyset.allow_create_controls)
-    executor._preflight_request(request)  # noqa: SLF001 - synchronous operation-wide preflight
+    executor.preflight_request(request)
     return effective_cap
 
 

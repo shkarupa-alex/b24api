@@ -52,12 +52,11 @@ from b24api.contracts.report import OperationReport, PageDispatch
 from b24api.contracts.request import RouteKind
 from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError, ResultShapeError
 from b24api.execution import Executor, WireResponse
-from b24api.traversal import keyset_page_validation, keyset_scheduler
+from b24api.traversal import keyset_page_validation, keyset_plan
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
-from b24api.traversal.keyset_fast_stream import FastTraceRecorder
 from b24api.traversal.keyset_geometry import anchor_guesses, estimates
-from b24api.traversal.keyset_observation import PageObservation
+from b24api.traversal.keyset_observation import FastTraceRecorder, PageObservation
 
 if TYPE_CHECKING:
     from b24api.contracts import JsonValue
@@ -911,7 +910,7 @@ async def test_boundary_overlap_releases_duplicate_row_capacity_immediately() ->
 
     assert (await anext(source))["id"] == 1
 
-    scheduler = source._scheduler
+    scheduler = source._runtime
     assert scheduler.counters.boundary_overlap_rows == 3
     assert scheduler.transactions.buffer_balance == 7
     await source.aclose()
@@ -989,7 +988,7 @@ async def test_partition_transfers_anchor_ownership_without_retaining_payload() 
         KeysetTransport(tuple(range(1, 101))),
         PartitionedKeysetExecution(StableIntegerKeysetContract(), target_lanes=3),
     )
-    scheduler = stream._source._scheduler
+    scheduler = stream._source._runtime
     await scheduler.plan_barrier()
     assert scheduler.transactions.anchor_rows
 
@@ -1005,7 +1004,7 @@ async def test_partition_transfers_anchor_ownership_without_retaining_payload() 
 async def test_auto_discards_precharged_anchor_objects_when_post_probe_gain_is_lost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original = keyset_scheduler.finalize
+    original = keyset_plan.finalize
 
     def force_sequential(*args: object, **kwargs: object):
         return replace(
@@ -1014,16 +1013,16 @@ async def test_auto_discards_precharged_anchor_objects_when_post_probe_gain_is_l
             reason=KeysetSelectionReason.POST_PROBE_GAIN_LOST,
         )
 
-    monkeypatch.setattr(keyset_scheduler, "finalize", force_sequential)
+    monkeypatch.setattr(keyset_plan, "finalize", force_sequential)
     stream = _stream(
         KeysetTransport(tuple(range(1, 5_001))),
         AutoKeysetExecution(StableIntegerKeysetContract(), target_lanes=20),
     )
 
     assert (await anext(stream))["id"] == 1
-    scheduler = stream._source._scheduler
-    assert scheduler._selected is KeysetExecutionKind.SEQUENTIAL
-    assert scheduler._anchor_count > 0
+    scheduler = stream._source._runtime
+    assert scheduler.planner.facts.selected is KeysetExecutionKind.SEQUENTIAL
+    assert scheduler.planner.facts.anchor_count > 0
     assert scheduler.transactions.anchor_rows == scheduler.transactions.anchor_commands == {}
     assert scheduler.transactions.boundary_totals == {}
     assert scheduler.transactions.buffer_balance == PAGE_SIZE
@@ -1127,7 +1126,7 @@ async def test_boundary_direction_contradiction_fails_before_emission() -> None:
     assert stream.report is not None
     assert stream.report.emitted == 0
     assert stream.report.state is TerminalState.INCOMPLETE
-    assert stream._source._scheduler.transactions.boundary_totals == {}
+    assert stream._source._runtime.transactions.boundary_totals == {}
 
 
 @pytest.mark.asyncio
@@ -1304,9 +1303,9 @@ async def test_fast_bounded_consumption_freezes_an_early_close_report(operation:
     assert partial.report.emitted == expected
     assert partial.report.unique_rows == expected
     assert partial.report.buffered_rows_high_water <= ExecutionPolicy().max_buffered_rows
-    assert stream._source._scheduler._plan_outcome is None
+    assert stream._source._runtime.plan is None
     assert not stream._source._buffer
-    assert stream._source._scheduler.transactions.anchor_rows == {}
+    assert stream._source._runtime.transactions.anchor_rows == {}
 
 
 @pytest.mark.asyncio
@@ -1339,7 +1338,7 @@ async def test_fast_close_finishes_cleanup_before_propagating_cancellation(
     )
     source = stream._source
     await anext(source)
-    scheduler = source._scheduler
+    scheduler = source._runtime
     original = scheduler.adjust_buffer
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -1359,7 +1358,7 @@ async def test_fast_close_finishes_cleanup_before_propagating_cancellation(
     with pytest.raises(asyncio.CancelledError):
         await closing
 
-    assert scheduler._closed is True
+    assert scheduler.closed is True
     assert source._closed is True
     assert scheduler.transactions.buffer_balance == 0
     assert not source._buffer
@@ -1458,7 +1457,7 @@ async def test_partition_anchor_waves_discard_unneeded_rows_before_the_next_wave
             batch_size=1,
         ),
     )
-    scheduler = stream._source._scheduler
+    scheduler = stream._source._runtime
     await scheduler.plan_barrier()
 
     assert scheduler.transactions.boundary_totals == {}
@@ -1599,11 +1598,13 @@ async def test_range_windows_are_materialized_one_bounded_group_at_a_time() -> N
         KeysetTransport(identities),
         RangeKeysetExecution(StableIntegerKeysetContract()),
     )
-    scheduler = stream._source._scheduler
+    scheduler = stream._source._runtime
 
     await scheduler.plan_barrier()
 
-    assert scheduler._window_count == 249_999
+    assert scheduler.plan is not None
+    assert scheduler.plan.range_bounds is not None
+    assert scheduler.plan.range_bounds.count == 249_999
     assert len(scheduler.transactions.lanes) == scheduler.batch_capacity
     assert len(scheduler.transactions.lane_rows) == scheduler.batch_capacity
     await stream.aclose()
@@ -1742,7 +1743,7 @@ async def test_later_anchor_wave_failure_accounts_for_prior_compacted_rows() -> 
     with pytest.raises(IncompleteTraversalError):
         await anext(stream)
     assert stream.report.keyset_execution is not None
-    assert stream._source._scheduler.counters.raw_rows == 13
+    assert stream._source._runtime.counters.raw_rows == 13
     assert stream.report.keyset_execution.probe_rows_discarded == 13
 
 
@@ -1790,15 +1791,15 @@ async def test_later_partition_lanes_are_not_rescheduled_while_frontier_is_open(
         KeysetTransport(tuple(range(1, 201))),
         PartitionedKeysetExecution(StableIntegerKeysetContract(), target_lanes=3),
     )
-    scheduler = stream._source._scheduler
+    scheduler = stream._source._runtime
     await scheduler.plan_barrier()
 
-    await scheduler._body_wave()
+    await scheduler.body_wave()
     frontier = scheduler.transactions.lane_index
     frontier_ordinal = scheduler.transactions.lanes[frontier].spec.ordinal
     first_rounds = {lane.spec.ordinal: lane.rounds for lane in scheduler.transactions.lanes}
     assert scheduler.transactions.lanes[frontier].status.value == "open"
-    await scheduler._body_wave()
+    await scheduler.body_wave()
     second_rounds = {lane.spec.ordinal: lane.rounds for lane in scheduler.transactions.lanes}
 
     assert second_rounds[frontier_ordinal] > first_rounds[frontier_ordinal]

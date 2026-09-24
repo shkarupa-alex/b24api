@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from b24api.completion.closure import QUALIFIED_TOTAL_REACHED, SINGLE_RESPONSE_COMPLETE
 from b24api.contracts.report import PageDispatch, PageRejectionCode
+from b24api.contracts.response import result_snapshot
 from b24api.contracts.traversal import OffsetContinuation
 from b24api.errors import BudgetExceededError, CapabilityError, PaginationError
 from b24api.traversal import offset_rules
@@ -64,7 +65,7 @@ class SingleResponseStrategy:
         items: tuple[FrozenJson, ...] = ()
         whole = ctx.single_result_as_item and ctx.selector.path == ()
         try:
-            frozen_result = response._frozen_result()  # noqa: SLF001 - whole-result fan-out stays immutable internally
+            frozen_result = result_snapshot(response)
             qualified_count = len(frozen_result) if whole and isinstance(frozen_result, tuple) else None
             items = (frozen_result,) if whole else ctx.select_page(response, single=True)
             if qualified_count is None:

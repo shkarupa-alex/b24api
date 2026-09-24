@@ -58,7 +58,8 @@ def test_private_member_access_only_goes_down() -> None:
     # Tests of internal components belong in tests/internal/, whose files justify the access.
     _assert_ratchet("slf001_tests", _private_member_accesses("tests", exclude="tests/internal"))
     _assert_ratchet("slf001_package", _private_member_accesses("b24api"))
-    _assert_ratchet("slf001_traversal", _private_member_accesses("b24api/traversal"))
+    # Traversal modules talk through protocols and public accessors only (C5): a hard invariant, not a ratchet.
+    assert _private_member_accesses("b24api/traversal") == 0
 
 
 def test_package_noqa_and_untyped_self_only_go_down() -> None:

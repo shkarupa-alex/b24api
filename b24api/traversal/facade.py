@@ -38,8 +38,9 @@ from b24api.errors import CapabilityError
 from b24api.traversal.counted import CountedItemStream
 from b24api.traversal.facade_support import _checked_identity_store, _collection_selector, _direction
 from b24api.traversal.keyset_eligibility import validate_fast_keyset
-from b24api.traversal.keyset_fast_stream import FastTraceRecorder, KeysetFastStream
-from b24api.traversal.keyset_scheduler import KeysetFastScheduler
+from b24api.traversal.keyset_fast_stream import KeysetFastStream
+from b24api.traversal.keyset_observation import FastTraceRecorder
+from b24api.traversal.keyset_runtime import KeysetRuntime
 from b24api.traversal.keyset_step import sequential_keyset_plan
 from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import (
@@ -183,7 +184,7 @@ def keyset_stream(  # noqa: PLR0913
         )
         context = executor.context(policy)
         trace = FastTraceRecorder(policy.page_trace_limit)
-        scheduler = KeysetFastScheduler(
+        runtime = KeysetRuntime(
             executor=executor,
             request=canonical,
             identity=identity,
@@ -199,7 +200,7 @@ def keyset_stream(  # noqa: PLR0913
             page_adapter=page_adapter,
         )
         return _mapped_stream(
-            KeysetFastStream(scheduler),
+            KeysetFastStream(runtime),
             operation="iter_list_keyset",
             assurance=TraversalAssurance.IDENTITY_EXACT,
             deregister=deregister,
@@ -264,7 +265,7 @@ def counted_stream(  # noqa: PLR0913
         or canonical.positional is not None
     ):
         raise CapabilityError("counted traversal supports JSON requests without scoped headers")
-    executor._preflight_request(canonical)  # noqa: SLF001 - operation-wide preflight before stream construction
+    executor.preflight_request(canonical)
     plan = CountedOffsetPlan(
         offset_path=offset.parameter_path,
         limit_path=offset.limit_path,

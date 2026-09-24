@@ -256,3 +256,8 @@ def _case_insensitive_key(mapping: Mapping[str, object], requested: str) -> str 
     if len(matches) > 1:
         raise ValueError(f"ambiguous case-insensitive control key: {requested}")
     return matches[0] if matches else None
+
+
+def result_snapshot(response: Response) -> FrozenJson:
+    """Return a response's immutable result snapshot to operation-internal readers without a thaw."""
+    return response._frozen_result()  # noqa: SLF001 - the owning module exposes the snapshot to its package

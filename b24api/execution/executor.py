@@ -127,7 +127,7 @@ class Executor:
         self._sleep = sleep
         self._random = random_source
 
-    def _preflight_request(self, request: Request) -> None:
+    def preflight_request(self, request: Request) -> None:
         """Validate transport representation without reserving budget or dispatching."""
         preflight_transport(self._wire_transport, request)
 
@@ -241,7 +241,7 @@ class Executor:
         on_dispatch: Callable[[], None],
     ) -> tuple[WireResponse, _ParsedBody | None]:
         """Run the shared attempt loop and return one conclusive raw response."""
-        self._preflight_request(request)
+        self.preflight_request(request)
         wire_request = WireRequest(request) if self._wire_transport is not None else None
         await _checkpoint_pending_cancellation()
         await context.start()
