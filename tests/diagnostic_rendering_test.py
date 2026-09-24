@@ -311,3 +311,17 @@ def test_c11_foreign_response_token_is_covered_only_by_the_heuristic() -> None:
     assert not codec.redactor.is_known_secret(foreign)
     assert not diagnostic_context(request).is_known_secret(foreign)
     assert foreign not in _channels(error)
+
+
+def test_alias_words_as_field_names_are_aliased_exactly_once() -> None:
+    request = Request("x.list", {"select": ["field", "REDACTED"]}, route=RouteKind.BARE)
+    error = ProtocolCodec().error_from_http(
+        status_code=400,
+        body={"error": "BAD", "error_description": "field and REDACTED", "echo": {"field": 1, USER_FIELD: 2}},
+        diagnostics=diagnostic_context(request),
+    )
+
+    assert isinstance(error, ApiResponseError)
+    assert error.description == "field#1 and field#2"
+    assert error.evidence.body_preview is not None
+    assert '"echo":{"[REDACTED#1]":2,"field#1":1}' in error.evidence.body_preview

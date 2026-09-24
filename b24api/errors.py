@@ -184,7 +184,8 @@ class ApiResponseError(B24ApiError):
             http_status=http_status,
             request_id=dict(safe_headers).get("x-request-id"),
             headers=safe_headers,
-            body_preview=redactor.render_text(body_preview, context=diagnostics) if body_preview is not None else None,
+            # The codec already rendered the preview through the request context; aliases must not be re-aliased.
+            body_preview=redactor.redact_text(body_preview) if body_preview is not None else None,
         )
         super().__init__(
             SafeText(message),  # every part above is already rendered; a second pass would hide the known code
