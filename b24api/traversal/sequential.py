@@ -36,6 +36,19 @@ if TYPE_CHECKING:
         SingleResponsePlan,
     )
 
+_SHORT_WINDOW_UNPROVEN = "fixed-step traversal cannot prove closure after a short page"
+
+
+def _opens_short_window(plan: OffsetSequentialPlan, rows: int) -> bool:
+    """Report whether a non-terminal fixed-step page is shorter than its window, leaving closure unproven."""
+    width = plan.short_page_width or plan.fixed_step
+    return (
+        plan.page_stride is None
+        and plan.continuation is OffsetContinuation.FIXED_STEP
+        and width is not None
+        and rows < width
+    )
+
 
 class _SequentialMixin:
     terminal_reason: str | None
@@ -86,7 +99,6 @@ class _SequentialMixin:
             raise CapabilityError("sparse raw traversal requires the complete range from offset zero")
         expected_raw_total: int | None = None
         pending_short_window = False
-        short_page_width = plan.short_page_width or plan.fixed_step
         self.cursor_state = offset
         visited_offsets: set[int] = set()
         while True:
@@ -111,8 +123,8 @@ class _SequentialMixin:
             items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
-                if pending_short_window and (items or not plan.allow_empty_after_short_window):
-                    raise PaginationError("fixed-step traversal cannot prove closure after a short page")
+                if pending_short_window and items:
+                    raise PaginationError(_SHORT_WINDOW_UNPROVEN)
                 if sparse is None:
                     terminal = _offset_terminal(
                         plan,
@@ -136,15 +148,9 @@ class _SequentialMixin:
                     and len(items) < plan.page_stride.max_decoded_rows
                 ):
                     raise PaginationError("fixed-stride traversal observed an unexplained short page")
-                if (
-                    sparse is None
-                    and plan.page_stride is None
-                    and plan.continuation is OffsetContinuation.FIXED_STEP
-                    and terminal is None
-                    and short_page_width is not None
-                    and len(items) < short_page_width
-                ):
-                    pending_short_window = True
+                pending_short_window = pending_short_window or (
+                    sparse is None and terminal is None and _opens_short_window(plan, len(items))
+                )
                 next_offset = (
                     None if terminal is not None else _next_offset(plan, response, current=offset, observed=len(items))
                 )
@@ -160,6 +166,9 @@ class _SequentialMixin:
             if terminal is not None:
                 self.terminal_reason = terminal
                 return
+            if pending_short_window and not plan.allow_empty_after_short_window:
+                # Only an empty page could close the window and this plan accepts none: refuse without asking.
+                raise PaginationError(_SHORT_WINDOW_UNPROVEN)
             if next_offset is None:
                 raise RuntimeError("non-terminal offset page lacks its validated next offset")
             offset = next_offset

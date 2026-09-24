@@ -653,19 +653,14 @@ async def test_fixed_step_ignores_relative_next_and_exact_total_can_terminate() 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("second_page", [[{"ID": 2}], []])
-async def test_fixed_step_rejects_any_closure_after_a_short_unqualified_window(
-    second_page: list[dict[str, int]],
-) -> None:
+async def test_fixed_step_rejects_any_closure_after_a_short_unqualified_window() -> None:
     step = 2
 
     def handler(request: Request) -> WireResponse:
-        start = request.copy_parameters().get("start", 0)
-        if start == 0:
+        if request.copy_parameters().get("start", 0) == 0:
             return _response([{"ID": 1}])
-        if start == step:
-            return _response(second_page)
-        raise AssertionError("fixed-step traversal used an undeclared offset")
+        # No answer here could close the window: rows contradict it and an empty page is not accepted (B10).
+        raise AssertionError("fixed-step traversal requested a confirmation it cannot use")
 
     transport = _Transport(handler)
     stream = _client(transport).iter_list(
@@ -680,7 +675,7 @@ async def test_fixed_step_rejects_any_closure_after_a_short_unqualified_window(
 
     assert isinstance(captured.value.__cause__, PaginationError)
     assert "cannot prove closure after a short page" in str(captured.value.__cause__)
-    assert [request.copy_parameters()["start"] for request in transport.requests] == [0, step]
+    assert [request.copy_parameters()["start"] for request in transport.requests] == [0]
 
 
 @pytest.mark.asyncio

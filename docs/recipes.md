@@ -33,9 +33,10 @@ Without `EXACT_QUALIFIED` a fixed step has no closure witness after a short page
 treats `next` as non-canonical and completes, with `mechanics_only` assurance (`identity_exact` when
 an `IdentitySpec` is declared), only when every page is a full step and a confirming empty page follows. After a short page it fails closed with
 `IncompleteTraversalError` whose cause is `PaginationError("fixed-step traversal cannot prove closure
-after a short page")`, whether the next window is empty or not: under a rounded server stride a short
-page does not distinguish the end of the source from a skipped or repeated window. Rows already
-yielded stay yielded; the report is not exhausted.
+after a short page")` right after yielding that page, without requesting the next window: under a
+rounded server stride a short page does not distinguish the end of the source from a skipped or
+repeated window, so no answer could close it. Rows already yielded stay yielded; the report is not
+exhausted.
 
 For endpoints with drifting or known-inexact totals, choose a contract that can prove closure:
 

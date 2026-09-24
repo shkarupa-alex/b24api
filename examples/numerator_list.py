@@ -1,8 +1,9 @@
-"""Scenario 17: numerator offsets 0/50/100 ignore misleading page-local total.
+"""Scenario 17: numerator offsets 0/50 ignore misleading page-local total.
 
 Offline fixture for `documentgenerator.numerator.list`: 53 independently
-expected IDs, local totals 50/3/0, no `next`. A fixed wire step of 50 reaches
-an empty response after a short window and therefore fails closed. The report
+expected IDs, local totals 50/3, no `next`. A fixed wire step of 50 observes a
+short window that no further answer could close, so it fails closed without a
+confirming request. The report
 proves observed mechanics only; a mutable portal snapshot is not verified. Run:
 `uv run python -m examples.numerator_list`.
 """
@@ -37,7 +38,7 @@ def _request(offset: int) -> Request:
 
 
 def _fixture() -> ScriptedTransport:
-    pages = ((0, EXPECTED_IDS[:50]), (50, EXPECTED_IDS[50:]), (100, ()))
+    pages = ((0, EXPECTED_IDS[:50]), (50, EXPECTED_IDS[50:]))
     return ScriptedTransport(
         tuple(
             ScriptedExchange.json(
@@ -77,7 +78,7 @@ async def run() -> RecipeEvidence:
         if stream.report.assurance is not TraversalAssurance.MECHANICS_ONLY:
             raise AssertionError("scenario 17 falsely promoted page-local total assurance")
     transport.assert_exhausted()
-    if tuple(request.copy_parameters()["start"] for request in transport.calls) != (0, 50, 100):
+    if tuple(request.copy_parameters()["start"] for request in transport.calls) != (0, 50):
         raise AssertionError("scenario 17 did not cover all fixed wire offsets")
     report = stream.report
     if report is None:
