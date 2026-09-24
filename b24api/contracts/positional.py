@@ -13,6 +13,24 @@ type SlotPathPart = str | int
 _LAYOUT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
 
 
+class PositionalControlFault(StrEnum):
+    """Value-free reason a traversal control could not be written into positional slots."""
+
+    UNDECLARED_PATH = "control path is not declared by this positional layout"
+    ABSENT_SLOT = "nested control requires a present slot"
+    MISSING_PARENT = "positional control path does not exist"
+    NEAR_MATCH_CASING = "positional control path has near-match casing"
+
+
+class PositionalControlError(ValueError):
+    """A declared positional control write that the caller's slots cannot accept."""
+
+    def __init__(self, fault: PositionalControlFault) -> None:
+        """Keep the closed reason next to its stable message."""
+        super().__init__(fault.value)
+        self.fault = fault
+
+
 class SlotShape(StrEnum):
     """Top-level JSON shape admitted by a PHP positional slot."""
 
@@ -170,14 +188,14 @@ class PositionalArguments:
         """Return a new value when its declared parent path already exists."""
         path = tuple(path)
         if path not in self.layout.control_paths:
-            raise ValueError("control path is not declared by this positional layout")
+            raise PositionalControlError(PositionalControlFault.UNDECLARED_PATH)
         slot_index = cast("int", path[0])
         if len(path) == 1:
             replacement = Present(value)
         else:
             original = self.slots[slot_index]
             if not isinstance(original, Present):
-                raise ValueError("nested control requires a present slot")
+                raise PositionalControlError(PositionalControlFault.ABSENT_SLOT)
             root = original.value
             parent: JsonValue = root
             for part in path[1:-1]:
@@ -215,22 +233,22 @@ def _existing_child(parent: JsonValue, part: SlotPathPart) -> JsonValue:
     if type(part) is str and isinstance(parent, dict):
         near_matches = tuple(key for key in parent if key != part and key.casefold() == part.casefold())
         if near_matches:
-            raise ValueError("positional control path has near-match casing")
+            raise PositionalControlError(PositionalControlFault.NEAR_MATCH_CASING)
         if part in parent:
             return parent[part]
     if type(part) is int and isinstance(parent, list) and 0 <= part < len(parent):
         return parent[part]
-    raise ValueError("positional control path does not exist")
+    raise PositionalControlError(PositionalControlFault.MISSING_PARENT)
 
 
 def _set_existing_child(parent: JsonValue, part: SlotPathPart, value: JsonValue) -> None:
     if type(part) is str and isinstance(parent, dict):
         near_matches = tuple(key for key in parent if key != part and key.casefold() == part.casefold())
         if near_matches:
-            raise ValueError("positional control path has near-match casing")
+            raise PositionalControlError(PositionalControlFault.NEAR_MATCH_CASING)
         parent[part] = value
         return
     if type(part) is int and isinstance(parent, list) and 0 <= part < len(parent):
         parent[part] = value
         return
-    raise ValueError("positional control path does not exist")
+    raise PositionalControlError(PositionalControlFault.MISSING_PARENT)

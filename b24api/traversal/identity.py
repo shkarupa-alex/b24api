@@ -13,6 +13,7 @@ from b24api.contracts.policy import (
     OrderSemantics,
     TotalSemantics,
 )
+from b24api.contracts.positional import PositionalControlError
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, TraversalIdentity
 from b24api.contracts.response import Response, inject_controls
 from b24api.errors import CapabilityError, PaginationError
@@ -169,7 +170,12 @@ def _request_with_controls(
             for path, value in updates.items():
                 positional = positional.write_control(path.path, value)
         except (KeyError, TypeError, ValueError) as error:
-            raise CapabilityError("positional request conflicts with declared traversal controls") from error
+            reason = (
+                error.fault.value
+                if isinstance(error, PositionalControlError)
+                else "control value does not satisfy its slot contract"
+            )
+            raise CapabilityError(f"positional request conflicts with declared traversal controls: {reason}") from error
         return Request(
             request.method,
             parameters=positional,
