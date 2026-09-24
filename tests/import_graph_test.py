@@ -56,8 +56,6 @@ _TYPE_ONLY_CYCLE_BASELINE = {
     ("contracts.error_base", "contracts.request", "contracts.policy"),
     # Policy annotates RequestSummary in ambiguity decisions; request coerces identities by policy enums.
     ("contracts.policy", "contracts.request"),
-    # The driver and its control preflight share plan types; removed by the StrategyContext split (§3.6).
-    ("traversal.control_preflight", "traversal.driver"),
     # Keyset planning and runtime modules see each other's types; removed by keyset consolidation (C5).
     ("traversal.keyset_auto", "traversal.keyset_costs", "traversal.keyset_range", "traversal.keyset_fast_plan"),
     ("traversal.keyset_fast_stream", "traversal.keyset_observation", "traversal.keyset_scheduler"),

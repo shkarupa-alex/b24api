@@ -3,7 +3,7 @@
 # ruff: noqa: TRY301 - rejected-page evidence is recorded at this transaction boundary
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
 from b24api.completion.closure import QUALIFIED_TOTAL_REACHED, SINGLE_RESPONSE_COMPLETE
 from b24api.contracts.completion import CommandSettlement
@@ -35,6 +35,8 @@ if TYPE_CHECKING:
         OffsetSequentialPlan,
         SingleResponsePlan,
     )
+    from b24api.traversal.strategy_context import StrategyContext
+    from b24api.traversal.values import IdentityValue
 
 _SHORT_WINDOW_UNPROVEN = "fixed-step traversal cannot prove closure after a short page"
 
@@ -52,22 +54,22 @@ def _opens_short_window(plan: OffsetSequentialPlan, rows: int) -> bool:
 
 class _SequentialMixin:
     terminal_reason: str | None
-    cursor_state: JsonValue
+    cursor_state: JsonValue | IdentityValue
 
-    async def _single(self: Any, plan: SingleResponsePlan) -> AsyncGenerator[_Page]:
-        response = await self._fetch(self.request)
+    async def _single(self: StrategyContext, plan: SingleResponsePlan) -> AsyncGenerator[_Page]:
+        response = await self.fetch(self.request)
         trace_count = self.page_trace_count
         items: tuple[FrozenJson, ...] = ()
         try:
             frozen_result = response._frozen_result()  # noqa: SLF001 - whole-result fan-out stays immutable internally
             qualified_count = (
                 len(frozen_result)
-                if self._single_result_as_item and self.selector.path == () and isinstance(frozen_result, tuple)
+                if self.single_result_as_item and self.selector.path == () and isinstance(frozen_result, tuple)
                 else None
             )
             items = (
                 (frozen_result,)
-                if self._single_result_as_item and self.selector.path == ()
+                if self.single_result_as_item and self.selector.path == ()
                 else self.select_page(response, single=True)
             )
             if qualified_count is None:
@@ -80,17 +82,17 @@ class _SequentialMixin:
                 and response.total > qualified_count
             ):
                 raise CapabilityError("single-response plan observed a larger qualified total")
-            self._validate_page(items, response=response, qualified_count=qualified_count, terminal=True)
+            self.validate_page(items, response=response, qualified_count=qualified_count, terminal=True)
         except BaseException as error:
             if self.page_trace_count == trace_count:
                 self.reject_external_page(items, response, error)
             raise
         self.terminal_reason = SINGLE_RESPONSE_COMPLETE
-        item_weights = (qualified_count,) if self._single_result_as_item else (1,) * len(items)
+        item_weights = (qualified_count,) if self.single_result_as_item else (1,) * len(items)
         yield _Page(tuple(items), response, item_weights, continuing=False)
 
     async def _offset(  # noqa: C901, PLR0912 - one ordered page transaction with two closure variants
-        self: Any,
+        self: StrategyContext,
         plan: OffsetSequentialPlan,
     ) -> AsyncGenerator[_Page]:
         offset = _initial_offset(self.request, plan.offset_path, default=plan.initial_control)
@@ -111,7 +113,7 @@ class _SequentialMixin:
             updates: dict[ParameterPath, object] = {plan.offset_path: offset}
             if plan.limit_path is not None and plan.requested_page_size is not None:
                 updates[plan.limit_path] = plan.requested_page_size
-            response = await self._fetch(
+            response = await self.fetch(
                 _request_with_controls(
                     self.request,
                     updates,
@@ -131,7 +133,7 @@ class _SequentialMixin:
                         response,
                         page_size=len(items),
                         accepted=self.validated_rows + len(items),
-                        confirmation=self._confirmation_policy,
+                        confirmation=self.confirmation_policy,
                     )
                 else:
                     terminal, expected_raw_total = sparse_page_terminal(
@@ -156,7 +158,7 @@ class _SequentialMixin:
                 )
                 if next_offset is not None and next_offset <= offset:
                     raise PaginationError("offset did not advance")
-                self._validate_page(items, response=response, terminal=terminal is not None)
+                self.validate_page(items, response=response, terminal=terminal is not None)
             except BaseException as error:
                 if self.page_trace_count == trace_count:
                     self.reject_external_page(items, response, error)
@@ -174,7 +176,7 @@ class _SequentialMixin:
             offset = next_offset
             self.cursor_state = offset
 
-    async def _counted(self: Any, plan: CountedOffsetPlan) -> AsyncGenerator[_Page]:  # noqa: C901
+    async def _counted(self: StrategyContext, plan: CountedOffsetPlan) -> AsyncGenerator[_Page]:  # noqa: C901
         offset = 0
         self.cursor_state = offset
         visited_offsets: set[int] = set()
@@ -186,7 +188,7 @@ class _SequentialMixin:
             updates: dict[ParameterPath, object] = {plan.offset_path: offset}
             if plan.limit_path is not None and plan.requested_page_size is not None:
                 updates[plan.limit_path] = plan.requested_page_size
-            response = await self._fetch(
+            response = await self.fetch(
                 _request_with_controls(
                     self.request,
                     updates,
@@ -198,7 +200,7 @@ class _SequentialMixin:
             try:
                 items = self.select_page(response)
                 effective_total = (
-                    response.total if response.total is not None and response.total >= 0 else self._expected_total
+                    response.total if response.total is not None and response.total >= 0 else self.expected_total
                 )
                 verdict = judge_counted_page(
                     CountedPageFacts(
@@ -221,14 +223,14 @@ class _SequentialMixin:
                 next_offset = None if terminal else _next_offset(plan, response, current=offset, observed=len(items))
                 if next_offset is not None and next_offset <= offset:
                     raise PaginationError("counted offset did not advance")
-                self._validate_page(items, response=response, terminal=terminal)
+                self.validate_page(items, response=response, terminal=terminal)
             except BaseException as error:
                 if self.page_trace_count == trace_count:
                     self.reject_external_page(items, response, error)
                 raise
             if items:
                 yield _Page(tuple(items), response, (1,) * len(items), not terminal)
-            if self._expected_total is not None and self.validated_rows == self._expected_total:
+            if self.expected_total is not None and self.validated_rows == self.expected_total:
                 self.terminal_reason = QUALIFIED_TOTAL_REACHED
                 return
             if next_offset is None:
@@ -236,9 +238,9 @@ class _SequentialMixin:
             offset = next_offset
             self.cursor_state = offset
 
-    async def _fetch(self: Any, request: Request) -> Response:
-        if self._fetch_override is not None:
-            return cast("Response", await self._fetch_override(request))
+    async def fetch(self: StrategyContext, request: Request) -> Response:
+        if self.fetch_override is not None:
+            return await self.fetch_override(request)
         recorder = self.completion_recorder
         if recorder is not None:
             recorder.scheduled()
@@ -270,4 +272,4 @@ class _SequentialMixin:
                     error=error,
                 )
             raise
-        return cast("Response", response)
+        return response

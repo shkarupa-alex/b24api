@@ -166,15 +166,14 @@ async def test_source_close_failure_after_exhaustion_is_a_cleanup_failure_not_a_
     # The owned source is closed by its owner's cleanup, not inside the final pull (§3.2), so every
     # command is still delivered and the close failure never masquerades as a failed input source.
     source = _Source(close_fails=True)
-    delivered = 0
     async with _client(_Portal()) as client:
         stream = _stream(client, family, source)
+        for _ in range(COMMANDS):
+            await anext(stream)
         with pytest.raises(_CloseFailedError) as raised:
-            async for _ in stream:
-                delivered += 1
+            await anext(stream)
 
     report = _published(raised.value)
-    assert delivered == COMMANDS
     assert report.state is TerminalState.FAILED
     assert "cleanup_failure" in _codes(report)
     assert "source_failure" not in _codes(report)

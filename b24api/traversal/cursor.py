@@ -3,7 +3,7 @@
 # ruff: noqa: TRY301 - rejected-page evidence is recorded at this transaction boundary
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from b24api.errors import PaginationError
 from b24api.traversal.cursor_domain import validate_cursor_progression, validate_cursor_value, validate_initial_cursor
@@ -13,7 +13,6 @@ from b24api.traversal.identity import (
     _request_with_controls,
 )
 from b24api.traversal.values import (
-    IdentityValue,
     _compare_identities,
     _cursor_values,
     _take_cursor,
@@ -28,15 +27,17 @@ if TYPE_CHECKING:
     from b24api.traversal.plans import (
         ItemCursorPlan,
     )
+    from b24api.traversal.strategy_context import StrategyContext
+    from b24api.traversal.values import IdentityValue
 
 
 class _CursorMixin:
     terminal_reason: str | None
-    cursor_state: JsonValue
+    cursor_state: JsonValue | IdentityValue
     initial_cursor: IdentityValue | None
 
-    async def _cursor(self: Any, plan: ItemCursorPlan) -> AsyncGenerator[_Page]:  # noqa: C901, PLR0912, PLR0915
-        self._require_identity("item cursor")
+    async def _cursor(self: StrategyContext, plan: ItemCursorPlan) -> AsyncGenerator[_Page]:  # noqa: C901, PLR0912, PLR0915
+        self.require_identity("item cursor")
         request_cursor = validate_initial_cursor(self.request, plan)
         cursor = self.initial_cursor if self.initial_cursor is not None else request_cursor
         if cursor is not None:
@@ -66,7 +67,7 @@ class _CursorMixin:
                     ),
                 )
             )
-            response = await self._fetch(request)
+            response = await self.fetch(request)
             first_page = False
             trace_count = self.page_trace_count
             items: tuple[FrozenJson, ...] = ()
@@ -84,7 +85,7 @@ class _CursorMixin:
                     if plan.direction == "desc" and comparison >= 0:
                         raise PaginationError("item cursor page ignored its upper bound")
                 terminal = _cursor_terminal(plan, len(items))
-                self._validate_page(items, response=response, terminal=terminal is not None)
+                self.validate_page(items, response=response, terminal=terminal is not None)
             except BaseException as error:
                 if self.page_trace_count == trace_count:
                     self.reject_external_page(items, response, error)

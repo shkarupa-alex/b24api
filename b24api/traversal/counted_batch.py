@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 import asyncio
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from b24api.completion.recorder import CountedCompletionRecorder
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import ConfirmationPolicy, KernelState
 from b24api.contracts.report import PageDispatch
@@ -34,6 +35,61 @@ if TYPE_CHECKING:
     from b24api.contracts.request import ParameterPath
     from b24api.contracts.response import Response
     from b24api.execution.snapshot import KernelReport
+    from b24api.traversal.strategy_context import StrategyContext
+
+
+def _counted_head_range(  # noqa: C901 - one closed set of head range contradictions
+    plan: CountedOffsetPlan,
+    head: Response,
+    head_items: tuple[FrozenJson, ...],
+    page_size: int,
+) -> tuple[int, int]:
+    """Return the exact total and stride a counted head qualifies, or reject the head."""
+    total = head.total
+    if total is None or total < 0:
+        raise CapabilityError("parallel counted traversal requires a non-negative total")
+    if total < len(head_items):
+        raise CapabilityError("parallel counted traversal observed total below the head page")
+    stride: int | None
+    if total == 0 and not head_items:
+        stride = page_size
+    elif plan.mode is CountedOffsetMode.PARALLEL_FIXED_STRIDE:
+        stride = plan.fixed_stride
+    elif plan.continuation is OffsetContinuation.SERVER_NEXT:
+        stride = head.next
+    elif plan.continuation is OffsetContinuation.OBSERVED_COUNT:
+        stride = len(head_items)
+    else:
+        stride = head.next if head.next is not None and head.next > 0 else len(head_items)
+    if not isinstance(stride, int) or isinstance(stride, bool) or stride < 1:
+        raise CapabilityError("parallel counted traversal requires a positive in-band stride")
+    if len(head_items) != min(stride, total):
+        raise CapabilityError("parallel counted head length contradicts the planned exact range")
+    if total > len(head_items) and head.next is None and plan.continuation is OffsetContinuation.SERVER_NEXT:
+        raise CapabilityError("parallel counted traversal has no in-band tail stride")
+    if (
+        plan.continuation in {OffsetContinuation.SERVER_NEXT, OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT}
+        and head.next is not None
+        and head.next > 0
+        and head.next != stride
+    ):
+        raise CapabilityError("parallel counted head continuation contradicts its row count")
+    verdict = judge_counted_page(
+        CountedPageFacts(0, len(head_items), 0, total, head.next, plan.continuation),
+    )
+    if verdict.contradiction is CountedContradiction.CONTINUATION_AFTER_TOTAL:
+        raise CapabilityError("parallel counted traversal completed while continuation remained")
+    return total, stride
+
+
+def _counted_parts(ctx: StrategyContext) -> tuple[CountedOffsetPlan, CountedCompletionRecorder | None]:
+    """Return the counted plan and its page-reserving recorder, or reject any other traversal."""
+    plan, recorder = ctx.plan, ctx.completion_recorder
+    if not isinstance(plan, CountedOffsetPlan):
+        raise TypeError("counted batch traversal requires CountedOffsetPlan")
+    if recorder is not None and not isinstance(recorder, CountedCompletionRecorder):
+        raise TypeError("counted batch traversal requires a counted completion recorder")
+    return plan, recorder
 
 
 class _CountedBatchMixin:
@@ -41,7 +97,7 @@ class _CountedBatchMixin:
     batch_report: KernelReport | None
 
     def empty_source_head_eligible(
-        self: Any,
+        self: StrategyContext,
         response: Response,
         source: tuple[FrozenJson, ...],
         adapted: tuple[FrozenJson, ...],
@@ -55,62 +111,19 @@ class _CountedBatchMixin:
         return (
             isinstance(self.plan, CountedOffsetPlan)
             and self.plan.continuation is not OffsetContinuation.FIXED_STEP
-            and self._confirmation_policy is not ConfirmationPolicy.QUALIFIED_TOTAL
-            and self._page_offset == 0
+            and self.confirmation_policy is not ConfirmationPolicy.QUALIFIED_TOTAL
+            and self.page_offset == 0
             and self.page_trace_count == 0
             and self.validated_rows == 0
-            and self._expected_total is None
+            and self.expected_total is None
             and not source
             and not adapted
             and response.total in {None, -1}
             and response.next is None
         )
 
-    def _counted_head_range(  # noqa: C901 - one closed set of head range contradictions
-        self: Any,
-        head: Response,
-        head_items: tuple[FrozenJson, ...],
-        page_size: int,
-    ) -> tuple[int, int]:
-        """Return the exact total and stride a counted head qualifies, or reject the head."""
-        total = head.total
-        if total is None or total < 0:
-            raise CapabilityError("parallel counted traversal requires a non-negative total")
-        if total < len(head_items):
-            raise CapabilityError("parallel counted traversal observed total below the head page")
-        stride: int | None
-        if total == 0 and not head_items:
-            stride = page_size
-        elif self.plan.mode is CountedOffsetMode.PARALLEL_FIXED_STRIDE:
-            stride = self.plan.fixed_stride
-        elif self.plan.continuation is OffsetContinuation.SERVER_NEXT:
-            stride = head.next
-        elif self.plan.continuation is OffsetContinuation.OBSERVED_COUNT:
-            stride = len(head_items)
-        else:
-            stride = head.next if head.next is not None and head.next > 0 else len(head_items)
-        if not isinstance(stride, int) or isinstance(stride, bool) or stride < 1:
-            raise CapabilityError("parallel counted traversal requires a positive in-band stride")
-        if len(head_items) != min(stride, total):
-            raise CapabilityError("parallel counted head length contradicts the planned exact range")
-        if total > len(head_items) and head.next is None and self.plan.continuation is OffsetContinuation.SERVER_NEXT:
-            raise CapabilityError("parallel counted traversal has no in-band tail stride")
-        if (
-            self.plan.continuation in {OffsetContinuation.SERVER_NEXT, OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT}
-            and head.next is not None
-            and head.next > 0
-            and head.next != stride
-        ):
-            raise CapabilityError("parallel counted head continuation contradicts its row count")
-        verdict = judge_counted_page(
-            CountedPageFacts(0, len(head_items), 0, total, head.next, self.plan.continuation),
-        )
-        if verdict.contradiction is CountedContradiction.CONTINUATION_AFTER_TOTAL:
-            raise CapabilityError("parallel counted traversal completed while continuation remained")
-        return total, stride
-
     async def counted_batch_pages(  # noqa: C901, PLR0912, PLR0915
-        self: Any,
+        self: StrategyContext,
         *,
         batch_size: int,
         page_size: int,
@@ -120,16 +133,14 @@ class _CountedBatchMixin:
         from b24api.batch.outcome import BatchFailure, BatchSuccess  # noqa: PLC0415
         from b24api.batch.stream import _BatchOutcomeStream  # noqa: PLC0415
 
-        if not isinstance(self.plan, CountedOffsetPlan):
-            raise TypeError("counted batch traversal requires CountedOffsetPlan")
+        plan, recorder = _counted_parts(self)
         self.begin_external_validation()
         outcomes: _BatchOutcomeStream | None = None
         try:
-            head_controls: dict[ParameterPath, object] = {self.plan.offset_path: 0}
-            if self.plan.limit_path is not None:
-                head_controls[self.plan.limit_path] = page_size
+            head_controls: dict[ParameterPath, object] = {plan.offset_path: 0}
+            if plan.limit_path is not None:
+                head_controls[plan.limit_path] = page_size
             self.schedule_page(offset=0, dispatch=PageDispatch.DIRECT)
-            recorder = self.completion_recorder
             if recorder is not None:
                 recorder.activate(recorder.reserve())
             head_reservation = None
@@ -139,7 +150,7 @@ class _CountedBatchMixin:
                     _request_with_controls(
                         self.request,
                         head_controls,
-                        allow_create=self.plan.allow_create_controls,
+                        allow_create=plan.allow_create_controls,
                     ),
                     context=self.context,
                 )
@@ -170,7 +181,7 @@ class _CountedBatchMixin:
                 await self.context.set_buffered_rows(len(head_items))
                 empty_source = self.empty_source_head_eligible(head, self.source_page.current(head_items), head_items)
                 if not empty_source:
-                    total, stride = self._counted_head_range(head, head_items, page_size)
+                    total, stride = _counted_head_range(plan, head, head_items, page_size)
             except BaseException as error:
                 if self.page_trace_count == trace_count:
                     self.reject_external_page(head_items, head, error)
@@ -209,10 +220,10 @@ class _CountedBatchMixin:
                         _request_with_controls(
                             self.request,
                             {
-                                self.plan.offset_path: start,
-                                **({self.plan.limit_path: page_size} if self.plan.limit_path is not None else {}),
+                                plan.offset_path: start,
+                                **({plan.limit_path: page_size} if plan.limit_path is not None else {}),
                             },
-                            allow_create=self.plan.allow_create_controls,
+                            allow_create=plan.allow_create_controls,
                         ),
                     )
 
@@ -278,10 +289,10 @@ class _CountedBatchMixin:
                     if response.total not in {None, -1} and response.total != total:
                         raise CapabilityError("parallel counted page total contradicts the head total")
                     expected_next = expected_counted_next(start, stride, total)
-                    if self.plan.continuation.value == "server_next" and response.next != expected_next:
+                    if plan.continuation.value == "server_next" and response.next != expected_next:
                         raise CapabilityError("parallel counted continuation contradicts the planned exact range")
                     if (
-                        self.plan.continuation.value == "server_next_or_observed_count"
+                        plan.continuation.value == "server_next_or_observed_count"
                         and response.next is not None
                         and response.next != expected_next
                     ):

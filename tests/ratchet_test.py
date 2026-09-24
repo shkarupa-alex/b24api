@@ -64,8 +64,13 @@ def test_private_member_access_only_goes_down() -> None:
 def test_package_noqa_and_untyped_self_only_go_down() -> None:
     sources = [path.read_text(encoding="utf-8") for path in sorted(PACKAGE.rglob("*.py"))]
     _assert_ratchet("noqa_package", sum(source.count("noqa") for source in sources))
-    traversal = [path.read_text(encoding="utf-8") for path in sorted((PACKAGE / "traversal").rglob("*.py"))]
-    _assert_ratchet("untyped_self_traversal", sum(source.count("self: Any") for source in traversal))
+    # Strategies are typed against StrategyContext (§3.6), so an untyped self is never needed again.
+    untyped = sorted(
+        str(path.relative_to(PACKAGE))
+        for path in (PACKAGE / "traversal").rglob("*.py")
+        if "self: Any" in path.read_text()
+    )
+    assert not untyped, f"type strategy self as StrategyContext in {untyped}"
 
 
 def test_long_functions_only_shrink() -> None:

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         BatchDispatch,
         DirectDispatch,
     )
+    from b24api.traversal.values import IdentityValue
 
 type ReferenceSource = Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]
 type _WaitFirst = Callable[[tuple[asyncio.Future[object], ...], float], Awaitable[None]]
@@ -88,7 +89,7 @@ class _DoneEvent:
 class _FailureEvent:
     work: _Work
     error: BaseException
-    cursor: JsonValue
+    cursor: JsonValue | IdentityValue
     page_state: int
     partial_rows: int
     violations: tuple[Violation, ...]

@@ -491,7 +491,7 @@ class ReferenceScheduler:
                     ),
                     stopped_reason,
                     driver.terminal_reason,
-                    driver._expected_total,  # noqa: SLF001 - source driver owns qualified-total witness
+                    driver.expected_total,
                 ),
             )
         except asyncio.CancelledError:

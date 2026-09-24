@@ -226,7 +226,7 @@ class CountedItemStream:
         self._completion.terminal(
             closure,
             stream,
-            qualified_total=self._driver._expected_total if closure is BindingClosure.QUALIFIED_TOTAL else None,  # noqa: SLF001
+            qualified_total=self._driver.expected_total if closure is BindingClosure.QUALIFIED_TOTAL else None,
         )
 
 

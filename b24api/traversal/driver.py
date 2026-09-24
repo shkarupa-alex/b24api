@@ -121,9 +121,9 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self.selector = plan.selector or selector or ResultSelector.root()
         self.identity = identity
         self.context = context
-        self._fetch_override = fetch
+        self.fetch_override = fetch
         self.completion_recorder = completion_recorder
-        self._single_result_as_item = single_result_as_item
+        self.single_result_as_item = single_result_as_item
         if page_cap_hint is not None and (
             not isinstance(page_cap_hint, int) or isinstance(page_cap_hint, bool) or page_cap_hint < 1
         ):
@@ -132,7 +132,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self.page_adapter = page_adapter
         self.terminal_reason: str | None = None
         self.initial_cursor = initial_cursor
-        self.cursor_state: JsonValue = cast("JsonValue", initial_cursor)
+        self.cursor_state: JsonValue | IdentityValue = initial_cursor
         self.violations: list[Violation] = []
         self.validated_rows = 0
         self._fingerprints: set[str] = set()
@@ -208,7 +208,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         """Validate one externally dispatched page with the canonical traversal state machine."""
         if self._identity_store is None:
             raise RuntimeError("page validation is not active")
-        self._validate_page(items, response=response, terminal=terminal, empty_source=empty_source)
+        self.validate_page(items, response=response, terminal=terminal, empty_source=empty_source)
 
     def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:
         """Select one scheduled page and retain value-free evidence on shape rejection."""
@@ -322,7 +322,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             consistency.confirmation_policy,
         )
 
-    def _require_identity(self, plan_name: str) -> IdentitySpec:
+    def require_identity(self, plan_name: str) -> IdentitySpec:
+        """Return the scalar identity a plan requires, or reject the plan."""
         if not isinstance(self.identity, IdentitySpec):
             raise CapabilityError(f"{plan_name} traversal requires IdentitySpec")
         return self.identity
@@ -339,7 +340,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._confirmation_policy = effective.confirmation_policy
         preflight_controls(self)
 
-    def _validate_page(  # noqa: PLR0913
+    def validate_page(  # noqa: PLR0913
         self,
         items: tuple[FrozenJson, ...],
         *,
@@ -439,7 +440,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             self._fingerprints.update((fingerprint,) if track_fingerprint else ())
             self._record_committed_page(items, response)
             return []
-        identities = self._extract_identities(items) if identities is None else identities
+        identities = self.extract_identities(items) if identities is None else identities
         if self._order_direction is not None:
             _validate_order(identities, self._order_direction)
             if self._last_identity is not None and identities:
@@ -594,7 +595,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         if self.completion_recorder is not None:
             self.completion_recorder.rejected(code.value)
 
-    def _extract_identities(self, items: tuple[FrozenJson, ...]) -> list[IdentityValue]:
+    def extract_identities(self, items: tuple[FrozenJson, ...]) -> list[IdentityValue]:
+        """Return the identities of the page's items."""
         if self.identity is None:
             return []
         composite = isinstance(self.identity, CompositeIdentitySpec)
@@ -693,6 +695,21 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         )
         self.page_trace[:] = retained
         self.page_trace_truncated = self.page_trace_truncated or truncated
+
+    @property
+    def expected_total(self) -> int | None:
+        """Return the exact total the traversal has committed to, if any."""
+        return self._expected_total
+
+    @property
+    def confirmation_policy(self) -> ConfirmationPolicy:
+        """Return the effective completion confirmation policy."""
+        return self._confirmation_policy
+
+    @property
+    def page_offset(self) -> int | None:
+        """Return the logical offset of the scheduled page."""
+        return self._page_offset
 
     @property
     def page_trace_count(self) -> int:

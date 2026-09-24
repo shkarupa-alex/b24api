@@ -389,7 +389,7 @@ def test_empty_source_eligibility_is_pure_and_the_transaction_owns_the_witness()
 
     assert driver.empty_source_witness is EMPTY_SOURCE_WITNESS
     assert driver.terminal_reason == EMPTY_SOURCE_WITNESS.terminal_reason
-    assert driver._expected_total is None  # noqa: SLF001 - no synthesized zero total
+    assert driver.expected_total is None  # no synthesized zero total
     assert [record.outcome for record in driver.page_trace] == [PageOutcome.COMMITTED]
     assert not driver.empty_source_head_eligible(response, (), ())
 
