@@ -17,7 +17,9 @@ details.
    response without the result envelope; see
    [Important semantic corrections](#important-semantic-corrections). When such a response answers
    the physical batch of a fast keyset wave, `page_trace` records `PageRejectionCode.BATCH_ENVELOPE`
-   for its pages (previously `COMMAND_FAILURE`).
+   for its pages (previously `COMMAND_FAILURE`). A 2xx body with a top-level `error` that is not
+   strict JSON (invalid UTF-8, `NaN` or `Infinity`, a duplicate batch correlation key) is now an
+   `EnvelopeContractError` too, where 2.3 reported the embedded error as `ApiResponseError`.
 4. **A logical batch closed early says so.** Closing `batch()` or `batch_outcomes()` before the input
    is exhausted gives an `EARLY_CLOSED` report whose `terminal_reason` is
    `"stream closed before exhaustion"` (previously `"GeneratorExit"`).

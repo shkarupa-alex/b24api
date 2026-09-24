@@ -124,6 +124,7 @@ _BREAKING_MIGRATION_ITEMS = {
     "B10": ("Fixed step refuses at once.",),
     "B11": ("Removed report vocabulary.",),
     "B12": ("Removed report vocabulary.",),
+    "B8": ("`EnvelopeContractError` is a `ProtocolError`.",),
     "B20": ("`EnvelopeContractError` is a `ProtocolError`.",),
 }
 

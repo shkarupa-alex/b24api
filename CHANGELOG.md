@@ -49,7 +49,9 @@
   after a short page, without the unusable confirmation request (B10).
 - **Breaking (3.0.0):** `EnvelopeContractError` is also a `ProtocolError` with gateway origin (B20).
   A fast keyset wave whose physical batch gets such a response records `BATCH_ENVELOPE` in
-  `page_trace` instead of `COMMAND_FAILURE`.
+  `page_trace` instead of `COMMAND_FAILURE`. A 2xx body with a top-level `error` that only the strict
+  parse rejects (invalid UTF-8, a non-finite number, a duplicate correlation key) is an
+  `EnvelopeContractError` instead of an `ApiResponseError` (B8).
 - The HTTPX log shield drops every `hpack.hpack` and `hpack.table` record while a library HTTPX
   client is open. An HTTP/2 send is refused before I/O with `CapabilityError` when that filter was
   removed or an injected client cannot be registered (A20).
@@ -90,10 +92,8 @@
 - **Breaking (3.0.0):** `PageValidated` no longer carries `identity_digest`, and the recorders no
   longer hash identities per page; the gate checks event order and `row_count` as before (B12).
 - A JSON success body is parsed once, strictly, instead of once by the error codec and again by the
-  envelope decoder. Structured errors and malformed bodies keep their previous classification, except
-  that a body with a top-level `error` which only the strict parse rejects (invalid UTF-8, a
-  non-finite number, a duplicate correlation key) is now an `EnvelopeContractError` rather than an
-  `ApiResponseError`; a 16 MiB call decodes about 15% faster (B8).
+  envelope decoder. Structured errors and malformed bodies keep their previous classification, apart
+  from the strict-only defects listed under B20; a 16 MiB call decodes about 15% faster (B8).
 - A public operation stream's report now always carries its own cleanup result: a cleanup failure
   that the underlying kernel did not record is added as a `cleanup_failure` violation, by the same
   §3.1 rules as the kernel reports. Each of the five stream families has a barrier-driven test for
