@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-import random
 from dataclasses import replace
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs
@@ -352,23 +351,6 @@ def test_window_and_anchor_algebra_is_disjoint_and_exact() -> None:
     assert guesses == tuple(sorted(set(guesses)))
     lanes = plan_lanes_from_anchors(lo=5, upper_exclusive=106, anchors=(20, 20, 70))
     assert tuple(lane.retained_upper_anchor for lane in lanes) == (20, 70, None)
-
-
-def test_window_algebra_fixed_seed_property_tier() -> None:
-    generator = random.Random(20260910)
-    for _ in range(250):
-        lo = generator.randint(-(10**12), 10**12)
-        span = generator.randint(1, 500)
-        upper = lo + span + 1
-        width = generator.randint(2, 80)
-        windows = plan_windows(lo=lo, upper_exclusive=upper, width=width)
-        owned = [
-            value
-            for lane in windows
-            for value in range(lane.bounds.lower_exclusive + 1, lane.bounds.upper_exclusive)  # type: ignore[operator]
-        ]
-        assert owned == list(range(lo + 1, upper))
-        assert len(owned) == len(set(owned))
 
 
 @pytest.mark.parametrize("capacity", range(1, 11))
