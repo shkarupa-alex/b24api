@@ -1,10 +1,9 @@
 """Synchronous no-I/O admission checks for fast integer-keyset execution."""
 
-# ruff: noqa: PLR2004
-
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     KeysetPageCompletion,
@@ -29,6 +28,9 @@ if TYPE_CHECKING:
     from b24api.contracts.request import IdentitySpec, ParameterPath, Request
     from b24api.contracts.traversal import KeysetSpec
     from b24api.execution.executor import Executor
+
+# A bounded keyset reads both boundaries (ascending and descending) before it plans.
+_BOUNDARY_READS = 2
 
 
 def _path_lookup(
@@ -165,12 +167,14 @@ def validate_fast_keyset(  # noqa: C901, PLR0912, PLR0913
         and policy.max_buffered_rows < 3 * effective_cap + retained_anchors
     ):
         raise CapabilityError("execution policy cannot retain boundaries and plan a bounded keyset")
-    requested_batch = execution.batch_size or 50
-    capacity = min(requested_batch, 50, policy.max_buffered_commands, policy.max_buffered_rows // effective_cap)
+    requested_batch = execution.batch_size or PORTAL_BATCH_CAP
+    capacity = min(
+        requested_batch, PORTAL_BATCH_CAP, policy.max_buffered_commands, policy.max_buffered_rows // effective_cap
+    )
     if (
         capacity < 1
-        or policy.max_buffered_commands < 2
-        or policy.max_pages < 2
+        or policy.max_buffered_commands < _BOUNDARY_READS
+        or policy.max_pages < _BOUNDARY_READS
         or policy.max_requests < 1
         or policy.max_buffered_rows < 2 * effective_cap
     ):

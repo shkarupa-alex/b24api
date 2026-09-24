@@ -1,7 +1,5 @@
 """Pure integer geometry and cost arithmetic for automatic keyset selection."""
 
-# ruff: noqa: FBT003
-
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -50,10 +48,10 @@ class CostEstimate:
     kind: KeysetExecutionKind
     requests: int
     eligible: bool
-    window_width: int | None
-    window_count: int | None
-    lane_count: int | None
-    depth: int | None
+    window_width: int | None = None
+    window_count: int | None = None
+    lane_count: int | None = None
+    depth: int | None = None
     rows_per_window: int | None = None
     groups: int | None = None
     planning_waves: int | None = None
@@ -124,15 +122,11 @@ def estimates(
     sequential = CostEstimate(
         KeysetExecutionKind.SEQUENTIAL,
         max(1, ceil_div(max(0, all_rows - admitted_head_rows), cap)) + finish_requests,
-        True,
-        None,
-        None,
-        None,
-        None,
+        eligible=True,
     )
     if capacity < 1:
-        unavailable = CostEstimate(KeysetExecutionKind.RANGE, 0, False, None, None, None, None)
-        partition = CostEstimate(KeysetExecutionKind.PARTITIONED, 0, False, None, None, None, None)
+        unavailable = CostEstimate(KeysetExecutionKind.RANGE, 0, eligible=False)
+        partition = CostEstimate(KeysetExecutionKind.PARTITIONED, 0, eligible=False)
         return sequential, unavailable, partition, (span, numerator, denominator, interior_rows, all_rows)
     width = range_window_width(
         completion=inputs.completion,
@@ -170,14 +164,11 @@ def estimates(
     partition = CostEstimate(
         KeysetExecutionKind.PARTITIONED,
         planning_waves + ceil_div(lanes, capacity) * partition_depth + finish_requests,
-        True,
-        None,
-        None,
-        lanes,
-        partition_depth,
-        None,
-        ceil_div(lanes, capacity),
-        planning_waves,
+        eligible=True,
+        lane_count=lanes,
+        depth=partition_depth,
+        groups=ceil_div(lanes, capacity),
+        planning_waves=planning_waves,
     )
     return sequential, range_estimate, partition, (span, numerator, denominator, interior_rows, all_rows)
 

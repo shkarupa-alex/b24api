@@ -1,7 +1,5 @@
 """Pure deterministic automatic keyset execution selector."""
 
-# ruff: noqa: FBT003
-
 from __future__ import annotations
 import itertools
 from dataclasses import dataclass, replace
@@ -158,11 +156,9 @@ def finalize(inputs: SelectorInputs, preselection: Preselection, anchors: Anchor
     part = CostEstimate(
         KeysetExecutionKind.PARTITIONED,
         part_remaining,
-        True,
-        None,
-        None,
-        lane_count,
-        depth,
+        eligible=True,
+        lane_count=lane_count,
+        depth=depth,
         groups=ceil_div(lane_count, inputs.batch_capacity),
     )
     sequential_requests = preselection.sequential_estimate.requests
@@ -180,13 +176,12 @@ def finalize(inputs: SelectorInputs, preselection: Preselection, anchors: Anchor
             estimate = CostEstimate(
                 KeysetExecutionKind.RANGE,
                 remaining,
-                True,
-                range_estimate.window_width,
-                range_estimate.window_count,
-                None,
-                range_estimate.depth,
-                range_estimate.rows_per_window,
-                range_estimate.groups,
+                eligible=True,
+                window_width=range_estimate.window_width,
+                window_count=range_estimate.window_count,
+                depth=range_estimate.depth,
+                rows_per_window=range_estimate.rows_per_window,
+                groups=range_estimate.groups,
             )
             return FinalSelection(
                 KeysetExecutionKind.RANGE,
@@ -211,7 +206,7 @@ def normalize_total_hint(*, requested: bool, head: object, tail: object, maximum
     consistent = valid_head and valid_tail and head == tail
     observed = head if consistent and isinstance(head, int) and not isinstance(head, bool) else None
     plausible = observed is not None and observed <= maximum
-    return TotalHintState(requested, observed, plausible, False)
+    return TotalHintState(requested, observed, plausible, used=False)
 
 
 __all__ = [

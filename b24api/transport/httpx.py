@@ -200,6 +200,18 @@ class HttpxTransport:
         finally:
             method_url = ""
 
+    def _with_bounded_accept_encoding(self, headers: dict[str, str]) -> dict[str, str]:
+        """Advertise only what the bounded decoder can inflate.
+
+        A caller's header, or one an injected client was configured with, is kept; a coding it admits
+        is then refused on arrival.
+        """
+        if "accept-encoding" not in headers and (
+            self._owns_client or self._client.headers.get("accept-encoding") == _httpx_default_accept_encoding()
+        ):
+            headers["accept-encoding"] = BOUNDED_ACCEPT_ENCODING
+        return headers
+
     async def _send_wire_impl(  # noqa: C901, PLR0912, PLR0915
         self,
         request: WireRequest,
@@ -219,13 +231,7 @@ class HttpxTransport:
         cancellation_args: tuple[object, ...] | None = None
         http_request: httpx.Request | None = None
         try:
-            request_headers = dict(_validate_headers(request.headers.items))
-            if "accept-encoding" not in request_headers and (
-                self._owns_client or self._client.headers.get("accept-encoding") == _httpx_default_accept_encoding()
-            ):
-                # Advertise only what the bounded decoder can inflate. A caller's header, or one an injected
-                # client was configured with, is kept; a coding it admits is then refused on arrival.
-                request_headers["accept-encoding"] = BOUNDED_ACCEPT_ENCODING
+            request_headers = self._with_bounded_accept_encoding(dict(_validate_headers(request.headers.items)))
             if request.encoding is BodyEncoding.JSON:
                 request_headers["content-type"] = "application/json"
                 if request.positional is not None:

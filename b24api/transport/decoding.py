@@ -148,14 +148,12 @@ class BodyReadOutcome:
     too_large: bool = False
 
 
-async def read_bounded_body(response: httpx.Response, maximum: int) -> BodyReadOutcome:  # noqa: PLR0911 - one outcome per failure class
+async def read_bounded_body(response: httpx.Response, maximum: int) -> BodyReadOutcome:
     """Decode raw bytes under the ceiling without propagating credential-bearing HTTPX exceptions."""
-    try:
-        decoder = _BoundedDecoder.for_encoding(response.headers.get("content-encoding"), limit=maximum)
-    except _DecodeRefusedError:
-        return BodyReadOutcome(transport_failure=BODY_READ_FAILURE)
     body = bytearray()
     try:
+        # A refused coding fails here, before any body byte is read.
+        decoder = _BoundedDecoder.for_encoding(response.headers.get("content-encoding"), limit=maximum)
         if response.is_stream_consumed:
             # An in-memory response (a mock or custom transport) arrives already read and decoded; its
             # allocation happened inside that transport, so only the ceiling remains to enforce.
@@ -169,7 +167,14 @@ async def read_bounded_body(response: httpx.Response, maximum: int) -> BodyReadO
         return BodyReadOutcome(too_large=True)
     except asyncio.CancelledError as error:
         return BodyReadOutcome(cancellation_args=error.args)
-    except (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.DecodingError, zlib.error):
+    except (
+        _DecodeRefusedError,
+        httpx.ReadError,
+        httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
+        httpx.DecodingError,
+        zlib.error,
+    ):
         return BodyReadOutcome(transport_failure=BODY_READ_FAILURE)
     except httpx.TransportError:
         return BodyReadOutcome(transport_failure="Unclassified transport failure while reading the response body")

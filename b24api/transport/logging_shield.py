@@ -197,7 +197,8 @@ class _HpackRecordFilter(logging.Filter):
         super().__init__()
         self._active = active
 
-    def filter(self, record: logging.LogRecord) -> bool:  # noqa: ARG002 - the decision never reads the record
+    def filter(self, record: logging.LogRecord) -> bool:
+        del record  # the decision never reads the record
         return not self._active()
 
 

@@ -169,6 +169,11 @@ class KeysetFastScheduler:
         return self.admission.snapshot_counters()
 
     @property
+    def closed(self) -> bool:
+        """Return whether the scheduler has released its lanes and stopped planning."""
+        return self._closed
+
+    @property
     def terminal(self) -> bool:
         """Return whether traversal has reached a terminal state."""
         return self.transactions.terminal

@@ -193,7 +193,7 @@ class KeysetFastStream:
                 rows = await self._scheduler.next_rows()
                 if not rows:
                     await self._terminate(KernelState.COMPLETED, "fast keyset traversal completed")
-                    self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
+                    self._closed = self._scheduler.closed
                     raise StopAsyncIteration
                 self._buffer.extend(rows)
             item = self._buffer.popleft()
@@ -204,7 +204,7 @@ class KeysetFastStream:
         except asyncio.CancelledError as error:
             await self._terminate(KernelState.CANCELLED, "iteration cancelled", primary=error)
             _attach_report(error, self.report)
-            self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
+            self._closed = self._scheduler.closed
             raise
         except (IncompleteTraversalError, PaginationError, BudgetExceededError) as error:
             await self._terminate(KernelState.INCOMPLETE, type(error).__name__, primary=error)
@@ -218,12 +218,12 @@ class KeysetFastStream:
                     else getattr(error, "replay_disposition", ReplayDisposition.NOT_ELIGIBLE)
                 ),
             )
-            self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
+            self._closed = self._scheduler.closed
             raise incomplete from cause
         except BaseException as error:
             await self._terminate(KernelState.FAILED, type(error).__name__, primary=error)
             _attach_report(error, self.report)
-            self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
+            self._closed = self._scheduler.closed
             raise
 
     async def aclose(self) -> None:
@@ -244,7 +244,7 @@ class KeysetFastStream:
             state, reason = KernelState.FAILED, "fast keyset cleanup failed"
         finalize_cancellation = await await_cancellation_resistant(self._finalize(state, reason))
         cancellation = finalize_cancellation or outcome.cancellation
-        self._closed = self._scheduler._closed  # noqa: SLF001 - lifecycle shell owns its scheduler
+        self._closed = self._scheduler.closed
         if cleanup is not None and primary is not None:
             primary.add_note(f"fast keyset cleanup also failed ({type(cleanup).__name__})")
         if cleanup is not None and primary is None:
