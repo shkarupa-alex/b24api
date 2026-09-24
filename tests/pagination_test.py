@@ -201,12 +201,12 @@ async def test_single_stream_is_lazy_and_reports_scalar_completion() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_context_entry_starts_execution_without_delivering_prefetched_item() -> None:
+async def test_async_context_entry_reads_nothing_until_the_first_pull() -> None:
     transport = FunctionTransport(lambda _request: {"result": {"ID": 7}})
     stream = iter_list(Executor(transport), Request("crm.item.get", route=RouteKind.BARE), plan=SingleResponsePlan())
 
     async with stream as entered:
-        assert len(transport.requests) == 1
+        assert transport.requests == []
         assert entered.report.state is KernelState.NOT_STARTED
         assert await _collect(entered) == [{"ID": 7}]
 
