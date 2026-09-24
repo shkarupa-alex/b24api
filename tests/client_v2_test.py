@@ -83,6 +83,7 @@ FANOUT_BATCH_REQUESTS = 6
 LARGE_COUNTED_ROWS = 100_001
 LARGE_LOGICAL_BATCH_COMMANDS = 100_000
 LARGE_LOGICAL_BATCH_REQUESTS = 2_000
+BOUNDED_LOOKAHEAD_COMMANDS = 2_000
 CUSTOM_INITIAL_OFFSET = 10
 CUSTOM_NEXT_OFFSET = 12
 
@@ -391,6 +392,38 @@ async def test_public_keyset_above_100k_uses_monotonic_progression_without_ident
     assert stream.report.assurance is TraversalAssurance.IDENTITY_EXACT
 
 
+@pytest.mark.asyncio
+async def test_logical_batch_pulls_its_generator_with_bounded_lookahead() -> None:
+    """The input is never materialized: at every outcome the source is ahead by at most one window."""
+    pulled = 0
+
+    def commands() -> Iterator[Command[int]]:
+        nonlocal pulled
+        for index in range(BOUNDED_LOOKAHEAD_COMMANDS):
+            pulled += 1
+            yield Command(Request("test.get", {"index": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
+
+    def handler(request: Request) -> object:
+        batch = request.copy_parameters()["cmd"]
+        assert isinstance(batch, dict)
+        return {"result": {"result": {key: int(key[1:]) for key in batch}, "result_error": {}}}
+
+    stream = _client(FunctionTransport(handler)).batch(commands(), batch_size=PAGE_SIZE)
+    count = 0
+    lookahead = 0
+    async for outcome in stream:
+        assert outcome.correlation == count
+        count += 1
+        lookahead = max(lookahead, pulled - count)
+
+    assert count == BOUNDED_LOOKAHEAD_COMMANDS
+    # One physical window of batch_size commands is pulled before its outcomes are yielded.
+    assert lookahead <= PAGE_SIZE
+    assert stream.report is not None
+    assert stream.report.buffered_commands_high_water == PAGE_SIZE
+
+
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_public_logical_batch_accepts_100k_generator_without_input_materialization() -> None:
     def handler(request: Request) -> object:
