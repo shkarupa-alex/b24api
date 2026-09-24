@@ -249,8 +249,13 @@ latency-oriented workloads. The dispatcher shutdown remains cancellation-based; 
   text was truthy to PHP.
 - `None` values are omitted from form and physical-batch bracket encoding, matching PHP query conventions;
   JSON encoding continues to send them as `null`.
-- A 2xx response missing the canonical result envelope raises `EnvelopeContractError`, still a
-  subclass of `HTTPGatewayError`. Malformed non-empty JSON remains `ProtocolError`.
+- A 2xx response missing the canonical result envelope raises `EnvelopeContractError`. It is a
+  subclass of both `HTTPGatewayError` and `ProtocolError`, so `except ProtocolError` now catches it
+  too; its origin stays `http_gateway`, it is never retried, and reports still classify it as
+  `envelope_contract`. Malformed non-empty JSON remains a plain `ProtocolError`.
+- `ExecutionPolicy.from_settings(settings)` returns the client's default policy (the library
+  defaults with `max_retry_elapsed_per_request = settings.http_timeout`). A `policy=` argument still
+  replaces that default wholesale; derive it with `dataclasses.replace` to keep the timeout.
 - Counted identity is optional. Without it, matching a qualified total yields count-only assurance;
   with it, the report records identity-and-count assurance.
 - `iter_list_counted()` no longer fails when the first page has no rows, no `next`, and no usable

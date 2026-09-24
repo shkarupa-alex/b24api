@@ -269,6 +269,18 @@ class KeysetSelectionSummary:
         return cls(report.requested_kind, report.selected_kind, reason)
 
 
+def _validate_keyset_evidence(execution: object, selection: object) -> None:
+    keyset = ((execution, KeysetExecutionReport), (selection, KeysetSelectionSummary))
+    if any(value is not None and not isinstance(value, kind) for value, kind in keyset):
+        raise TypeError("keyset_execution and keyset_selection must be their report types or None")
+    if (
+        isinstance(execution, KeysetExecutionReport)
+        and isinstance(selection, KeysetSelectionSummary)
+        and (execution.requested_kind, execution.selected_kind) != (selection.requested_kind, selection.selected_kind)
+    ):
+        raise ValueError("keyset_selection must name the same requested and selected kinds as keyset_execution")
+
+
 def _validated_exhausted(state: TerminalState, *, value: bool | None) -> bool:
     if value is None:
         return state is TerminalState.COMPLETED
@@ -344,9 +356,7 @@ class OperationReport:
             raise TypeError("page_trace must contain PageRecord values")
         if not isinstance(self.page_trace_truncated, bool):
             raise TypeError("page_trace_truncated must be a bool")
-        keyset = ((self.keyset_execution, KeysetExecutionReport), (self.keyset_selection, KeysetSelectionSummary))
-        if any(value is not None and not isinstance(value, kind) for value, kind in keyset):
-            raise TypeError("keyset_execution and keyset_selection must be their report types or None")
+        _validate_keyset_evidence(self.keyset_execution, self.keyset_selection)
         if self.successful and any(item.severity is ViolationSeverity.BLOCKING for item in self.violations):
             raise ValueError("successful report cannot contain blocking violations")
 

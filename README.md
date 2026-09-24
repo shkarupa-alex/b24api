@@ -75,6 +75,22 @@ one_attempt = ExecutionPolicy(max_attempts_per_request=1)
 result = await client.call(request, policy=one_attempt)
 ```
 
+A `policy=` argument replaces the client's default policy wholesale; fields are never merged. The
+client default is `ExecutionPolicy.from_settings(settings)`: the library defaults with
+`max_retry_elapsed_per_request` taken from `Settings.http_timeout` (30 s by default, while a bare
+`ExecutionPolicy()` allows 120 s). To change one field and keep the configured timeout, derive the
+per-call policy from that default:
+
+<!-- tested: tests/settings_test.py::test_a_per_call_policy_replaces_the_client_default_without_merging -->
+```python
+import dataclasses
+
+from b24api import ExecutionPolicy
+
+one_attempt = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_attempts_per_request=1)
+result = await client.call(request, policy=one_attempt)
+```
+
 ## Logical batch and correlation
 
 `batch()` accepts an arbitrary-length synchronous or asynchronous command source. It consumes the

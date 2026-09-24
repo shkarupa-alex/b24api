@@ -1,6 +1,7 @@
 """Credential-safe v2 settings behavior."""
 
 from __future__ import annotations
+import dataclasses
 import json
 import pickle
 from pathlib import Path
@@ -8,8 +9,9 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from b24api import Bitrix24, Settings
+from b24api import Bitrix24, ExecutionPolicy, Request, RouteKind, Settings
 from b24api.settings import api_settings
+from b24api.transport import WireResponse
 
 _WEBHOOK = "https://bitrix24.com/rest/0/test/"
 _TIMEOUT = 17.5
@@ -103,3 +105,48 @@ async def test_settings_timeout_becomes_the_default_per_request_elapsed_ceiling(
         assert client._default_policy.max_retry_elapsed_per_request == _TIMEOUT  # noqa: SLF001 - composition proof
     finally:
         await client.aclose()
+
+
+class _RecordingTransport:
+    """Answer every call and record the ceilings the executor passed to the wire."""
+
+    host = "bitrix24.com"
+
+    def __init__(self) -> None:
+        self.ceilings: list[tuple[float, int]] = []
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del request
+        self.ceilings.append((attempt_timeout, max_response_bytes))
+        return WireResponse(200, (), b'{"result": true}')
+
+    async def aclose(self) -> None:
+        return None
+
+
+def test_policy_from_settings_is_the_library_default_with_the_settings_timeout() -> None:
+    policy = ExecutionPolicy.from_settings(Settings(webhook_url=_WEBHOOK, http_timeout=_TIMEOUT))
+
+    assert policy == dataclasses.replace(ExecutionPolicy(), max_retry_elapsed_per_request=_TIMEOUT)
+
+
+@pytest.mark.asyncio
+async def test_a_per_call_policy_replaces_the_client_default_without_merging() -> None:
+    transport = _RecordingTransport()
+    settings = Settings(webhook_url=_WEBHOOK, http_timeout=_TIMEOUT)
+    small = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_response_bytes=4096)
+
+    async with Bitrix24(settings, transport=transport) as client:
+        await client.call(Request("server.time", route=RouteKind.BARE))
+        await client.call(Request("server.time", route=RouteKind.BARE), policy=ExecutionPolicy())
+        await client.call(Request("server.time", route=RouteKind.BARE), policy=small)
+
+    (default_timeout, default_bytes), (replaced_timeout, replaced_bytes), (derived_timeout, derived_bytes) = (
+        transport.ceilings
+    )
+    # The client default carries the settings timeout; a bare per-call policy drops it (no hidden merge).
+    assert default_timeout <= _TIMEOUT < replaced_timeout
+    assert default_bytes == replaced_bytes == ExecutionPolicy().max_response_bytes
+    # Deriving the per-call policy from the settings keeps the timeout and changes only what it names.
+    assert derived_timeout <= _TIMEOUT
+    assert derived_bytes == small.max_response_bytes

@@ -107,9 +107,7 @@ class TransportError(B24ApiError):
 
     def to_safe_dict(self) -> dict[str, object]:
         """Return the to safe dict representation."""
-        safe = super().to_safe_dict()
-        safe.update({"phase": self.phase.value, "possible_acceptance": self.possible_acceptance})
-        return safe
+        return {**super().to_safe_dict(), "phase": self.phase.value, "possible_acceptance": self.possible_acceptance}
 
 
 class HTTPGatewayError(B24ApiError):
@@ -118,14 +116,16 @@ class HTTPGatewayError(B24ApiError):
     default_origin = ErrorOrigin.HTTP_GATEWAY
 
 
-class EnvelopeContractError(HTTPGatewayError):
-    """A 2xx response violated the canonical Bitrix envelope contract."""
-
-
 class ProtocolError(B24ApiError):
     """Malformed or contradictory protocol envelope."""
 
     default_origin = ErrorOrigin.PROTOCOL
+
+
+class EnvelopeContractError(HTTPGatewayError, ProtocolError):
+    """A 2xx body is not a Bitrix envelope: a gateway-origin failure that ``except ProtocolError`` catches."""
+
+    default_origin = ErrorOrigin.HTTP_GATEWAY
 
 
 @dataclass(frozen=True, slots=True)
@@ -544,7 +544,6 @@ _PUBLIC_ERROR_NAMES = (
     "AmbiguousExecutionError ApiResponseError B24ApiError BatchCommandError BatchFailed BudgetExceededError "
     "CapabilityError EnvelopeContractError ErrorOrigin FailurePhase HTTPGatewayError IdentityContractError "
     "IncompleteTraversalError InputSourceError PaginationError ProtocolError ReferenceFailed ResponseTooLargeError "
-    "KeysetCapabilityError PageAdaptationError PageAdaptationViolation ResultShapeError TransportError"
-    " ValidationIssue"
+    "KeysetCapabilityError PageAdaptationError PageAdaptationViolation ResultShapeError TransportError ValidationIssue"
 )
 __all__ = tuple(_PUBLIC_ERROR_NAMES.split())

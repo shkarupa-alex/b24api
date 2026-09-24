@@ -98,9 +98,7 @@ class Bitrix24(_TraversalFacade):
         codec = ProtocolCodec(redactor=Redactor(known_secrets=webhook_secrets(str(resolved.webhook_url))))
         self._executor = Executor(selected_transport, codec=codec)
         self._owned_coordinator = self._executor.coordinator
-        self._default_policy = policy or ExecutionPolicy(
-            max_retry_elapsed_per_request=float(resolved.http_timeout),
-        )
+        self._default_policy = policy or ExecutionPolicy.from_settings(resolved)
         self._host = host
         self._closed = False
         self._unknown_request_audit = unknown_request_audit

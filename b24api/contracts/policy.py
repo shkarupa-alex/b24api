@@ -11,6 +11,7 @@ from b24api.contracts.json import _is_plain_int
 
 if TYPE_CHECKING:
     from b24api.contracts.request import RequestSummary
+    from b24api.settings import Settings
 
 HTTP_STATUS_MINIMUM = 100
 HTTP_STATUS_MAXIMUM = 599
@@ -263,6 +264,16 @@ class ExecutionPolicy:
     binary_digest: bool = False
     page_trace_limit: int = 64
     debug_evidence: bool = False
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> ExecutionPolicy:
+        """Return the policy a client built from ``settings`` uses when a call passes none.
+
+        It is ``ExecutionPolicy()`` with ``max_retry_elapsed_per_request`` set to
+        ``settings.http_timeout``. A ``policy=`` argument, on the client or on one call, replaces the
+        default wholesale; derive it from this value with ``dataclasses.replace`` to keep the timeout.
+        """
+        return cls(max_retry_elapsed_per_request=float(settings.http_timeout))
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""

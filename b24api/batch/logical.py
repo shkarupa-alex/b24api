@@ -29,7 +29,14 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     SnapshotState,
 )
-from b24api.errors import AmbiguousExecutionError, B24ApiError, BatchCommandError, InputSourceError, ProtocolError
+from b24api.errors import (
+    AmbiguousExecutionError,
+    B24ApiError,
+    BatchCommandError,
+    EnvelopeContractError,
+    InputSourceError,
+    ProtocolError,
+)
 from b24api.execution import (
     AsyncIteratorController,
     Executor,
@@ -161,7 +168,8 @@ def _public_outcomes(
                 ),
             )
             continue
-        if halt and halted and isinstance(error, ProtocolError):
+        # A malformed 2xx envelope may follow execution, so it is never reported as halted.
+        if halt and halted and isinstance(error, ProtocolError) and not isinstance(error, EnvelopeContractError):
             converted.append(
                 CommandNotExecuted(
                     outcome.command_index,

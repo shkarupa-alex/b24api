@@ -70,6 +70,8 @@ from b24api.encoding import encode_php_query
 from b24api.errors import (
     ApiResponseError,
     CapabilityError,
+    ErrorOrigin,
+    HTTPGatewayError,
     IncompleteTraversalError,
     PaginationError,
     ProtocolError,
@@ -374,6 +376,22 @@ async def test_success_envelope_defects_remain_envelope_contract_errors(body: by
         await Executor(transport).execute(
             Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         )
+
+
+@pytest.mark.asyncio
+async def test_envelope_contract_error_is_a_gateway_origin_protocol_error_and_is_not_retried() -> None:
+    transport = _Transport(lambda _request: WireResponse(200, (), b"{}"))
+
+    with pytest.raises(ProtocolError) as captured:
+        await Executor(transport).execute(
+            Request("example.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        )
+
+    error = captured.value
+    assert isinstance(error, EnvelopeContractError)
+    assert isinstance(error, HTTPGatewayError)
+    assert error.origin is ErrorOrigin.HTTP_GATEWAY
+    assert len(transport.requests) == 1
 
 
 @pytest.mark.asyncio

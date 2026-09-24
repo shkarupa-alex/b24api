@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import inspect
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 from typing import is_typeddict
 
 import pytest
@@ -519,3 +519,15 @@ def test_operation_report_terminal_properties_are_explicit() -> None:
     with_failures = OperationReport(TerminalState.COMPLETED_WITH_FAILURES, "batch", "some commands failed")
     assert not with_failures.exhausted
     assert with_failures.partial
+
+
+def test_keyset_selection_summary_is_a_closed_optional_report_field() -> None:
+    report = b24api.OperationReport(b24api.TerminalState.COMPLETED, "iter_list_keyset", "completed")
+    summary = b24api.KeysetSelectionSummary(
+        b24api.KeysetExecutionKind.AUTO,
+        b24api.KeysetExecutionKind.SEQUENTIAL,
+        b24api.KeysetSelectionReason.PAGE_STOP,
+    )
+    assert replace(report, keyset_selection=summary).keyset_selection == summary
+    with pytest.raises(TypeError, match="KeysetExecutionKind"):
+        b24api.KeysetSelectionSummary("auto", "sequential", b24api.KeysetSelectionReason.PAGE_STOP)  # type: ignore[arg-type]

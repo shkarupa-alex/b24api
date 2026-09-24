@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 import asyncio
+import dataclasses
 import json
 import random
 from dataclasses import replace
@@ -930,6 +931,13 @@ async def test_explicit_partitioned_reports_degenerate_single_lane() -> None:
         KeysetExecutionKind.PARTITIONED,
         KeysetSelectionReason.DEGENERATE_SINGLE_LANE,
     )
+    disagreeing = KeysetSelectionSummary(
+        KeysetExecutionKind.AUTO,
+        KeysetExecutionKind.SEQUENTIAL,
+        KeysetSelectionReason.PAGE_STOP,
+    )
+    with pytest.raises(ValueError, match="same requested and selected kinds"):
+        dataclasses.replace(stream.report, keyset_selection=disagreeing)
 
 
 @pytest.mark.asyncio

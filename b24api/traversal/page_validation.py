@@ -16,7 +16,6 @@ from b24api.errors import (
     AmbiguousExecutionError,
     B24ApiError,
     CapabilityError,
-    EnvelopeContractError,
     PageAdaptationError,
     PaginationError,
     ProtocolError,
@@ -116,7 +115,7 @@ def classify_rejection(outcome: BatchOutcome) -> tuple[PageOutcome, PageRejectio
     error = outcome.error
     if isinstance(error, AmbiguousExecutionError):
         return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION
-    if isinstance(error, ProtocolError | EnvelopeContractError):
+    if isinstance(error, ProtocolError):
         summary = error.request_summary
         if summary is not None and summary.method == "batch":
             return PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE
