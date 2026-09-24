@@ -1,0 +1,3 @@
+# mypy error count over tests/ (B17 ratchet). It may only decrease: fix errors, then lower it with
+#   uv run python .github/scripts/mypy_ratchet.py --update
+385

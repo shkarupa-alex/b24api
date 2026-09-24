@@ -3,8 +3,11 @@
 
 ``tag`` validates ``GITHUB_REF_NAME`` before the build backend runs. ``dists DIR`` checks that the
 directory holds exactly one wheel and one sdist whose filenames and embedded metadata carry the
-validated tag as their version. The package version itself stays owned by setuptools-git-versioning;
-this gate only compares what the build produced with the tag that triggered it.
+validated tag as their version, and that the wheel passes the ``wheel`` check. ``wheel FILE`` needs
+no tag: it checks that a built wheel carries the ``b24api/py.typed`` marker and ships nothing beside
+the package and its ``.dist-info`` (no ``docs/``, ``tests/``, ``tools/`` or ``examples/``). The
+package version itself stays owned by setuptools-git-versioning; this gate only compares what the
+build produced with the tag that triggered it.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ ACCEPTED_FORM = (
     "without a prefix such as v or fix-, leading zeros, or a prerelease or build suffix"
 )
 _WHEEL_PARTS = (5, 6)
+TYPING_MARKER = f"{PROJECT}/py.typed"
 
 
 class ReleaseGateError(Exception):
@@ -65,8 +69,33 @@ def verify_distributions(dist: Path, version: str) -> tuple[Path, Path]:
     if len(parts) not in _WHEEL_PARTS or parts[:2] != [PROJECT, version]:
         raise ReleaseGateError("Version mismatch", f"wheel filename {wheel.name} does not carry version {version}")
     _check_metadata(_wheel_metadata(wheel, version), version, wheel.name)
+    verify_wheel_contents(wheel)
     _check_metadata(_sdist_metadata(sdist, version), version, sdist.name)
     return sdist, wheel
+
+
+def verify_wheel_contents(wheel: Path) -> None:
+    """Require the typing marker and refuse any top-level entry beside the package and its dist-info."""
+    parts = wheel.name.removesuffix(".whl").split("-")
+    if not wheel.name.endswith(".whl") or len(parts) not in _WHEEL_PARTS or parts[0] != PROJECT:
+        raise ReleaseGateError("Unexpected release artifacts", f"{wheel.name} is not a {PROJECT} wheel")
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            names = archive.namelist()
+    except (OSError, zipfile.BadZipFile) as error:
+        raise ReleaseGateError("Invalid wheel", f"{wheel.name} is not a readable wheel") from error
+    if TYPING_MARKER not in names:
+        raise ReleaseGateError(
+            "Missing typing marker",
+            f"{wheel.name} lacks {TYPING_MARKER}; declare it in [tool.setuptools.package-data]",
+        )
+    allowed = {PROJECT, f"{PROJECT}-{parts[1]}.dist-info"}
+    unexpected = sorted({name.split("/", 1)[0] for name in names} - allowed)
+    if unexpected:
+        raise ReleaseGateError(
+            "Unexpected wheel contents",
+            f"{wheel.name} ships {', '.join(unexpected)} beside the {PROJECT} package and its dist-info",
+        )
 
 
 def _wheel_metadata(wheel: Path, version: str) -> str:
@@ -106,8 +135,14 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("tag", help="validate GITHUB_REF_NAME before building")
     dists = commands.add_parser("dists", help="verify built distributions against GITHUB_REF_NAME")
     dists.add_argument("directory", type=Path)
+    wheel_check = commands.add_parser("wheel", help="verify the contents of one built wheel; needs no tag")
+    wheel_check.add_argument("file", type=Path)
     arguments = parser.parse_args(argv)
     try:
+        if arguments.command == "wheel":
+            verify_wheel_contents(arguments.file)
+            sys.stdout.write(f"verified the contents of {arguments.file.name}\n")
+            return 0
         version = release_version(os.environ)
         if arguments.command == "dists":
             sdist, wheel = verify_distributions(arguments.directory, version)
