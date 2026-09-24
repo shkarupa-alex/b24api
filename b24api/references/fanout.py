@@ -5,7 +5,7 @@ from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, It
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, Self, cast, runtime_checkable
 
-from b24api._stream import MappedOperationStream
+from b24api.completion.operation_stream import MappedOperationStream
 from b24api.contracts.command import (
     Command,
     CommandFailure,

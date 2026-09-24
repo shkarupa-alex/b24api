@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "b24api"
 
 _STATE_MACHINES = {
-    "_stream.py",
+    "completion/operation_stream.py",
     "completion/gate.py",
     "batch/engine.py",
     "batch/logical.py",
@@ -254,7 +254,7 @@ def test_failure_classification_importers_stay_inside_state_machine_layers() -> 
         if owner not in _imports(path):
             continue
         relative = path.relative_to(PACKAGE)
-        assert relative == Path("_stream.py") or relative.parts[0] in {
+        assert relative == Path("completion/operation_stream.py") or relative.parts[0] in {
             "batch",
             "execution",
             "references",

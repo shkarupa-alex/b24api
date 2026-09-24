@@ -4,8 +4,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterable, Callable, Iterable
 from typing import TYPE_CHECKING, cast
 
-from b24api._stream import MappedOperationStream
 from b24api.batch.logical import LogicalBatchKernelStream, _BatchWindowError
+from b24api.completion.operation_stream import MappedOperationStream
 from b24api.contracts.command import (
     Command,
     CommandFailure,

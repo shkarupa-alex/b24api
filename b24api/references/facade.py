@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
-from b24api._stream import MappedOperationStream
+from b24api.completion.operation_stream import MappedOperationStream
 from b24api.contracts.dispatch import DirectDispatch, DispatchSpec
 from b24api.contracts.keyset_execution import SequentialKeysetExecution
 from b24api.contracts.policy import (

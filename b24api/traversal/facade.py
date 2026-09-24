@@ -4,9 +4,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
-from b24api._stream import MappedOperationStream, _ClosableIterator
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.facade import resolve_batch_size
+from b24api.completion.operation_stream import MappedOperationStream, _ClosableIterator
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     KeysetExecution,
