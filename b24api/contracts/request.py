@@ -362,7 +362,7 @@ def diagnostic_context(request: Request) -> DiagnosticContext:
     adds no per-request cost and is never stored on the request, a shared context or a report.
     Positional PHP arguments carry no named field positions and get an empty alias map.
     """
-    parameters = request._parameters if request._positional is None else None  # noqa: SLF001 - owning module
+    parameters = request.copy_parameters() if request.positional is None else None
     return DiagnosticContext(parameters, headers=request.headers.items)
 
 

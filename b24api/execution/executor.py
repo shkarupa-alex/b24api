@@ -242,9 +242,7 @@ class Executor:
             try:
                 async with asyncio.timeout(remaining):
                     permit = await context.coordinator.acquire(
-                        scheduled_class,
-                        methods=methods,
-                        budget=DeadlineBudget(self._clock() + remaining),
+                        scheduled_class, methods=methods, budget=DeadlineBudget(self._clock() + remaining)
                     )
             except TimeoutError as error:
                 raise BudgetExceededError("permit wait exhausted execution time budget") from (last_error or error)

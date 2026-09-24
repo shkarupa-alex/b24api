@@ -60,11 +60,7 @@ class ProtocolCodec:
         retry_codes: Collection[str] = (),
         diagnostics: DiagnosticContext | None = None,
     ) -> B24ApiError | None:
-        """Return a structured error before considering generic HTTP status.
-
-        ``diagnostics`` is the private context of the one request this response answers; it renders
-        that request's field names as local aliases and is not retained by the returned error.
-        """
+        """Return a structured error before generic HTTP status; ``diagnostics`` aliases the request's fields."""
         parsed, malformed = self._parse_body(body)
 
         if isinstance(parsed, Mapping) and "error" in parsed:
@@ -87,8 +83,8 @@ class ProtocolCodec:
                         body_preview=preview,
                     )
             else:
-                raw_description = parsed.get("error_description")
-                description = str(raw_description) if raw_description is not None else None
+                raw = parsed.get("error_description")
+                description = None if raw is None else str(raw)
             if not isinstance(original_code, str | int):
                 return self._protocol_error(
                     "Structured error code must be a string or integer",
@@ -97,14 +93,12 @@ class ProtocolCodec:
                     headers=safe_headers,
                     body_preview=preview,
                 )
-            normalized = str(original_code).strip().casefold()
-            normalized_retry_codes = {code.casefold() for code in retry_codes}
-            retryable = normalized in normalized_retry_codes
-            if code_is_exact and original_code in NON_RETRYABLE_V3_ERROR_CODES:
-                retryable = False
+            retryable = str(original_code).strip().casefold() in {code.casefold() for code in retry_codes} and not (
+                code_is_exact and original_code in NON_RETRYABLE_V3_ERROR_CODES
+            )
             if code_is_exact:
                 return self._bounded_v3_error(
-                    code=original_code,
+                    code=str(original_code),
                     description=description,
                     validation=validation,
                     truncated=truncated,
@@ -124,7 +118,6 @@ class ProtocolCodec:
                 body_preview=preview,
                 validation=validation,
                 truncated=truncated,
-                code_is_exact=code_is_exact,
                 retryable=retryable,
                 redactor=self._redactor,
                 diagnostics=diagnostics,
