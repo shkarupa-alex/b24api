@@ -18,6 +18,7 @@ _HTTP_STATUS_MINIMUM = 100
 _HTTP_STATUS_MAXIMUM = 599
 _RETRY_AFTER_CAP_SECONDS = 3_600.0
 _METHOD_LIMIT_CAP = 1_024
+_WAKE_TASK_NAME = "b24api-rate-wake"
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,10 +92,14 @@ class _Permit:
         await self.release()
 
     async def release(self) -> None:
+        self.release_now()
+
+    def release_now(self) -> None:
+        """Return capacity synchronously and only then mark the permit released."""
         if self._released:
             return
+        self._coordinator._release_now()  # noqa: SLF001
         self._released = True
-        await self._coordinator._release()  # noqa: SLF001
 
 
 class RateCoordinator:
@@ -233,19 +238,23 @@ class RateCoordinator:
             return max(0.0, self._cooldown_until - self._clock())
 
     async def close(self) -> None:
-        """Close owned resources."""
+        """Reject queued and future admission, then cancel and await the cooldown wake task."""
         async with self._condition:
-            if self._state is CoordinatorState.CLOSED:
-                return
-            self._state = CoordinatorState.CLOSED
-            if self._wake_task is not None:
-                self._wake_task.cancel()
-                self._wake_task = None
-            for queue in self._queues.values():
-                while queue:
-                    future = queue.popleft().future
-                    if not future.done():
-                        future.set_exception(CoordinatorClosedError("rate coordinator is closed"))
+            wake_task, self._wake_task = self._wake_task, None
+            if self._state is not CoordinatorState.CLOSED:
+                self._state = CoordinatorState.CLOSED
+                for queue in self._queues.values():
+                    while queue:
+                        future = queue.popleft().future
+                        if not future.done():
+                            future.set_exception(CoordinatorClosedError("rate coordinator is closed"))
+        if wake_task is not None:
+            wake_task.cancel()
+            await asyncio.gather(wake_task, return_exceptions=True)
+
+    async def aclose(self) -> None:
+        """Close the coordinator; alias of :meth:`close` for owned-resource cleanup."""
+        await self.close()
 
     async def snapshot(self) -> CoordinatorSnapshot:
         """Return the current immutable snapshot."""
@@ -261,12 +270,16 @@ class RateCoordinator:
             )
 
     async def _release(self) -> None:
-        async with self._condition:
-            if self._active < 1:
-                raise RuntimeError("permit accounting underflow")
-            self._active -= 1
-            self._refresh_cooldown_locked()
-            self._grant_locked()
+        self._release_now()
+
+    def _release_now(self) -> None:
+        """Return one permit without an await, so cancellation cannot interrupt the accounting."""
+        # The condition lock is never held across an await, so a synchronous update cannot interleave.
+        if self._active < 1:
+            raise RuntimeError("permit accounting underflow")
+        self._active -= 1
+        self._refresh_cooldown_locked()
+        self._grant_locked()
 
     def _return_granted_locked(self) -> None:
         if self._active < 1:
@@ -316,7 +329,7 @@ class RateCoordinator:
     def _schedule_wake_locked(self) -> None:
         if self._wake_task is not None:
             self._wake_task.cancel()
-        self._wake_task = asyncio.create_task(self._wake_after_cooldown())
+        self._wake_task = asyncio.create_task(self._wake_after_cooldown(), name=_WAKE_TASK_NAME)
 
     async def _wake_after_cooldown(self) -> None:
         while True:

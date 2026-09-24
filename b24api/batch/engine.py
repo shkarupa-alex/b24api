@@ -15,13 +15,22 @@ from b24api.batch.outcome import (
 )
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.policy import (
+    AmbiguityReason,
     ExecutionPolicy,
     ReplayDisposition,
 )
 from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.contracts.response import Response
 from b24api.encoding import encode_php_query
-from b24api.errors import B24ApiError, BatchCommandError, CapabilityError, ProtocolError
+from b24api.errors import (
+    AmbiguousExecutionError,
+    B24ApiError,
+    BatchCommandError,
+    CapabilityError,
+    ProtocolError,
+    ResponseTooLargeError,
+    TransportError,
+)
 from b24api.execution import (
     ExecutionContext,
     Executor,
@@ -165,7 +174,10 @@ class BatchExecutor:
                 )
                 scoped_error.__cause__ = error
                 error = scoped_error
-            failures = tuple(_shared_failure(command, error) for command in eligible)
+            if _possibly_executed(error):
+                failures = tuple(_unknown_failure(command, error) for command in eligible)
+            else:
+                failures = tuple(_shared_failure(command, error) for command in eligible)
             return _merge_outcomes(commands, failures, rejected)
 
         outcomes = tuple(
@@ -519,6 +531,36 @@ def _shared_failure(command: _Command, error: B24ApiError) -> BatchFailure:
         error,
         evidence=BatchCommandEvidence(command.index, command.stable_key),
     )
+
+
+def _possibly_executed(error: B24ApiError) -> bool:
+    """Return whether a failed physical batch may have executed its admitted commands."""
+    if isinstance(error, TransportError):
+        return error.possible_acceptance
+    return isinstance(error, AmbiguousExecutionError | ResponseTooLargeError)
+
+
+def _unknown_failure(command: _Command, error: B24ApiError) -> BatchFailure:
+    """Give one admitted command its own possible-execution outcome; the batch is never replayed."""
+    if isinstance(error, AmbiguousExecutionError):
+        reason = error.reason
+    elif isinstance(error, ResponseTooLargeError):
+        reason = AmbiguityReason.RESPONSE_LIMIT_AFTER_DISPATCH
+    elif isinstance(error.__cause__, TimeoutError):
+        reason = AmbiguityReason.DEADLINE_AFTER_DISPATCH
+    else:
+        reason = AmbiguityReason.CONNECTION_LOST_AFTER_DISPATCH
+    ambiguous = AmbiguousExecutionError(
+        "Physical batch may have executed this command; automatic replay is forbidden",
+        reason=reason,
+        declared_unsafe=command.request.replay_safety is ReplaySafety.UNSAFE,
+        request_summary=command.request.summary,
+        evidence=error.evidence,
+    )
+    # Keep the original failure as the cause instead of the executor's batch-scoped ambiguity wrapper.
+    original = error.__cause__ if isinstance(error, AmbiguousExecutionError) else None
+    ambiguous.__cause__ = original if isinstance(original, BaseException) else error
+    return _shared_failure(command, ambiguous)
 
 
 def _raise_source_error(error: Exception) -> None:

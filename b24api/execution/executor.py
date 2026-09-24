@@ -27,13 +27,13 @@ from b24api.errors import (
     B24ApiError,
     BatchCommandError,
     BudgetExceededError,
-    CapabilityError,
     EnvelopeContractError,
     HTTPGatewayError,
     ProtocolError,
     ResponseTooLargeError,
     TransportError,
 )
+from b24api.execution.boundary import send_transport
 from b24api.execution.context import (
     ExecutionContext,
     _checkpoint_pending_cancellation,
@@ -41,7 +41,7 @@ from b24api.execution.context import (
 )
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
-from b24api.transport.base import TransportCapabilities, WireRequest, WireTransport, preflight_transport
+from b24api.transport.base import WireRequest, WireTransport, preflight_transport
 from b24api.transport.protocol import ProtocolCodec
 
 if TYPE_CHECKING:
@@ -255,7 +255,7 @@ class Executor:
                     on_dispatch()
                     try:
                         async with asyncio.timeout(remaining):
-                            wire = await _send_transport(
+                            wire = await send_transport(
                                 self.transport,
                                 self._wire_transport,
                                 request,
@@ -278,6 +278,7 @@ class Executor:
                     context=context,
                     retry_started=retry_started,
                     attempts=attempts,
+                    physical_batch=work_class is WorkClass.BATCH,
                 )
                 last_error = error
                 attempts += 1
@@ -354,6 +355,7 @@ class Executor:
         attempts: int,
         wire: WireResponse | None = None,
         method_cooldown: float = 0.0,
+        physical_batch: bool = False,
     ) -> None:
         safety = request.replay_safety or ReplaySafety.UNKNOWN
         if isinstance(error, ResponseTooLargeError) and safety is not ReplaySafety.SAFE:
@@ -393,6 +395,9 @@ class Executor:
                 evidence=error.evidence,
             ) from error
 
+        if physical_batch and isinstance(error, TransportError) and error.possible_acceptance:
+            # A physical batch that may have been accepted is never replayed as a whole, even when SAFE.
+            raise error
         retryable = _is_retryable(error, safety=safety, policy=context.policy)
         if not retryable:
             raise error
@@ -414,7 +419,7 @@ class Executor:
 
 def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: ExecutionPolicy) -> bool:
     if isinstance(error, TransportError):
-        return not error.possible_acceptance or safety is ReplaySafety.SAFE
+        return error.retryable and (not error.possible_acceptance or safety is ReplaySafety.SAFE)
     if safety is not ReplaySafety.SAFE:
         return False
     if isinstance(error, ApiResponseError) and error.retryable:
@@ -425,33 +430,6 @@ def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: Execution
         and error.http_status is not None
         and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
         and error.http_status in policy.retry.transient_http_statuses
-    )
-
-
-async def _send_transport(  # noqa: PLR0913 - keeps legacy and wire boundaries explicit
-    transport: Transport,
-    wire_transport: WireTransport | None,
-    request: Request,
-    *,
-    wire_request: WireRequest | None,
-    attempt_timeout: float,
-    max_response_bytes: int,
-) -> WireResponse:
-    if wire_transport is not None:
-        capabilities = wire_transport.capabilities
-        if not isinstance(capabilities, TransportCapabilities):
-            raise CapabilityError("transport exposes malformed capabilities")
-        if wire_request is None or wire_request.route is not request.route or wire_request.method != request.method:
-            raise CapabilityError("wire request differs from canonical request", request_summary=request.summary)
-        return await wire_transport.send_wire(
-            wire_request,
-            attempt_timeout=attempt_timeout,
-            max_response_bytes=max_response_bytes,
-        )
-    return await transport.send(
-        request,
-        attempt_timeout=attempt_timeout,
-        max_response_bytes=max_response_bytes,
     )
 
 
