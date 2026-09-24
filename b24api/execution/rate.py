@@ -269,9 +269,6 @@ class RateCoordinator:
                 method_cooldowns=len(self._method_until),
             )
 
-    async def _release(self) -> None:
-        self._release_now()
-
     def _release_now(self) -> None:
         """Return one permit without an await, so cancellation cannot interrupt the accounting."""
         # The condition lock is never held across an await, so a synchronous update cannot interleave.

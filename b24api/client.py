@@ -92,7 +92,6 @@ class Bitrix24(_TraversalFacade):
                 raise ValueError("injected transport host does not match Settings")
             selected_transport = transport
             owned_transport = None
-        self._settings: Settings | None = resolved
         self._transport = selected_transport
         self._owned_transport = owned_transport
         # The configured webhook credential is an exact secret for every error this client renders.
@@ -117,7 +116,6 @@ class Bitrix24(_TraversalFacade):
     ) -> Bitrix24:
         """Construct over an injected deterministic executor for tests."""
         instance = cls.__new__(cls)
-        instance._settings = None
         instance._transport = executor.transport
         instance._owned_transport = None
         instance._executor = executor

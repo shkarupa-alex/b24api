@@ -52,10 +52,6 @@ class DiagnosticContext:
         """Refuse serialization: the context holds raw caller field names."""
         raise TypeError("DiagnosticContext cannot be serialized")
 
-    def alias(self, name: str) -> str | None:
-        """Return the local alias of one raw field name, if the request declared it."""
-        return self._resolved().get(name)
-
     def alias_text(self, text: str) -> str:
         """Replace whole-token occurrences of declared field names with their aliases."""
         aliases = self._resolved()

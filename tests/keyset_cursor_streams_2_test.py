@@ -734,7 +734,6 @@ def test_fast_keyset_lane_applies_adapter_only_to_publishable_phases() -> None:
         )
 
     assert not isinstance(validate(KeysetPhase.ANCHOR_PROBE), ReceiptRejection)
-    assert not isinstance(validate(KeysetPhase.CANARY), ReceiptRejection)
     rejected = validate(KeysetPhase.BODY)
     assert isinstance(rejected, ReceiptRejection)
     assert isinstance(rejected.error, PageAdaptationError)
@@ -774,7 +773,6 @@ async def test_fast_source_fills_initial_and_continuation_batches() -> None:
     state = stream._source._scheduler.producer_state
     assert state.runnable == state.admitting == state.pending_continuations == set()
     assert not state.source_pull_in_flight
-    assert state.source_terminal
 
 
 @pytest.mark.asyncio
@@ -1064,7 +1062,7 @@ async def test_exhausted_single_producer_skips_wait_for_one_hundred_sequential_w
         ExecutionPolicy(max_pages=150, max_pages_per_reference=150, max_buffered_rows=2),
     )
     await context.start()
-    state = _ProducerState({"r0"}, {"r0": 0}, source_terminal=True)
+    state = _ProducerState({"r0"}, {"r0": 0})
     buffer = _RowBuffer(2, context, producer_state=state)
     dispatcher = _BatchPageDispatcher(
         executor,
@@ -1217,7 +1215,7 @@ async def test_producer_state_broadcast_and_capacity_predicate_parity() -> None:
     await buffer.close()
     assert not buffer.can_reserve(0, 1)
 
-    blocked_state = _ProducerState(set(), {"r0": 0, "r1": 1}, admitting={"r1"}, source_terminal=True)
+    blocked_state = _ProducerState(set(), {"r0": 0, "r1": 1}, admitting={"r1"})
     blocked_buffer = _RowBuffer(1, context, producer_state=blocked_state)
     held = await blocked_buffer.reserve(1, 1)
     dispatcher = _BatchPageDispatcher(
@@ -1232,7 +1230,7 @@ async def test_producer_state_broadcast_and_capacity_predicate_parity() -> None:
     await blocked_buffer.abort(held)
     await blocked_buffer.close()
 
-    settling_state = _ProducerState(set(), {"r0": 0}, source_terminal=False)
+    settling_state = _ProducerState(set(), {"r0": 0})
     settling_buffer = _RowBuffer(1, context, producer_state=settling_state)
     settling_dispatcher = _BatchPageDispatcher(
         executor,
@@ -1271,7 +1269,7 @@ async def test_settling_wave_counts_only_a_concrete_capacity_blocked_admission()
         ExecutionPolicy(max_pages=2, max_pages_per_reference=2, max_buffered_rows=1),
     )
     await context.start()
-    state = _ProducerState(set(), {"r0": 0}, admitting={"r0"}, source_terminal=True)
+    state = _ProducerState(set(), {"r0": 0}, admitting={"r0"})
     buffer = _RowBuffer(1, context, producer_state=state)
     held = await buffer.reserve(0, 1)
     dispatcher = _BatchPageDispatcher(
@@ -1286,7 +1284,6 @@ async def test_settling_wave_counts_only_a_concrete_capacity_blocked_admission()
     dispatcher._settling_waves = 1
     assert dispatcher._potential({"other"}) == 1
     state.admitting.clear()
-    state.source_terminal = False
     assert dispatcher._potential({"other"}) == 0
     await buffer.abort(held)
     await buffer.close()

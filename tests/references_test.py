@@ -35,7 +35,7 @@ from b24api.errors import (
 )
 from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.references.outcome import ReferenceFailure, ReferenceItem, ReferenceRequest
-from b24api.references.stream import fan_out, iter_references
+from b24api.references.stream import iter_references
 from b24api.traversal.plans import (
     BatchDispatch,
     CountedOffsetPlan,
@@ -52,6 +52,8 @@ from b24api.traversal.plans import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterator
 
+    from b24api.references.stream import ReferenceStream
+
 PAGE_SIZE = 1
 TWO_REFERENCES = 2
 EXPECTED_LOGICAL_PAGES = 4
@@ -59,6 +61,11 @@ CLEANUP_TEST_TIMEOUT = 0.2
 PULL_TEST_TIMEOUT = 0.15
 REFERENCE_FAILURE_COUNT = 140
 RETAINED_VIOLATION_LIMIT = 128
+
+
+def fan_out(executor: Executor, requests: object, **options: object) -> ReferenceStream:
+    """Schedule requests as whole-result single-response references through the reference kernel."""
+    return iter_references(executor, requests, plan=SingleResponsePlan(), _whole_result=True, **options)  # type: ignore[arg-type]
 
 
 class AsyncFunctionTransport:
@@ -1574,7 +1581,7 @@ async def test_closed_batch_worker_exits_after_transport_temporarily_resists_can
     assert captured.value.__dict__["report"] is stream.report
 
     dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
-    worker = dispatcher._worker  # type: ignore[union-attr]  # noqa: SLF001
+    worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001
     assert worker is not None
     assert not worker.done()
     release.set()
@@ -1625,7 +1632,7 @@ async def test_source_close_failure_does_not_skip_owned_resource_cleanup() -> No
 
     assert captured.value.__dict__["report"] is stream.report
     dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
-    worker = dispatcher._worker  # type: ignore[union-attr]  # noqa: SLF001
+    worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001
     assert worker is not None
     assert worker.done()
     assert stream._scheduler.buffer._closed  # noqa: SLF001
@@ -1734,7 +1741,7 @@ async def test_stalled_source_cleanup_is_bounded_after_owned_resources_close() -
 
     assert captured.value.__dict__["report"] is stream.report
     dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
-    worker = dispatcher._worker  # type: ignore[union-attr]  # noqa: SLF001
+    worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001
     assert worker is not None
     assert worker.done()
     assert stream._scheduler.buffer._closed  # noqa: SLF001

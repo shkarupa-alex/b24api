@@ -147,7 +147,6 @@ class _ProducerState:
     next_key: str | None = None
     next_index: int | None = None
     source_pull_in_flight: bool = False
-    source_terminal: bool = False
     closing: bool = False
     revision: int = 0
     _waiters: list[asyncio.Future[None]] = field(default_factory=list)
@@ -389,7 +388,6 @@ class _BatchPageDispatcher:
         self._page_cap = page_cap
         self._pending_continuations_can_progress = pending_continuations_can_progress
         self._assembler: asyncio.Task[None] | None = None
-        self._worker: asyncio.Task[None] | None = None
         self._workers: tuple[asyncio.Task[None], ...] = ()
         self._settlement_workers: set[asyncio.Task[None]] = set()
         self._closed = False
@@ -459,7 +457,6 @@ class _BatchPageDispatcher:
         concurrency = min(self.plan.concurrency, self.context.policy.max_active_references)
         self._assembler = asyncio.create_task(self._run())
         senders = tuple(asyncio.create_task(self._send_run()) for _index in range(concurrency))
-        self._worker = senders[0]
         self._workers = (self._assembler, *senders)
 
     async def _run(self) -> None:  # noqa: C901, PLR0912, PLR0915

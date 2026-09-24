@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 import math
-import warnings
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -128,10 +127,7 @@ class KeysetExecutionReport:
     assurance_source: KeysetAssuranceSource
     planning_requests: int
     boundary_requests: int
-    canary_requests: int
     anchor_probe_requests: int
-    canary_commands: int
-    canary_rows: int
     anchor_probe_commands: int
     anchor_count: int
     empty_anchor_probes: int
@@ -163,12 +159,6 @@ class KeysetExecutionReport:
 
     def __post_init__(self) -> None:
         """Validate closed aggregate report fields."""
-        if self.assurance_source is KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS:
-            warnings.warn(
-                "CANARY_VERIFIED_BOUNDS is retained only for legacy report compatibility",
-                DeprecationWarning,
-                stacklevel=2,
-            )
         enum_values = (
             (self.requested_kind, KeysetExecutionKind),
             (self.selected_kind, KeysetExecutionKind),
@@ -185,10 +175,7 @@ class KeysetExecutionReport:
         integers = (
             self.planning_requests,
             self.boundary_requests,
-            self.canary_requests,
             self.anchor_probe_requests,
-            self.canary_commands,
-            self.canary_rows,
             self.anchor_probe_commands,
             self.anchor_count,
             self.empty_anchor_probes,

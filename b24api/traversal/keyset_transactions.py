@@ -108,7 +108,7 @@ async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation tran
         scheduler.transactions.boundary_totals = boundary_totals(plans, outcomes)
         scheduler.batch_requests += 1
         scheduler.batch_commands += len(plans)
-        planning = {KeysetPhase.BOUNDARY, KeysetPhase.CANARY, KeysetPhase.ANCHOR_PROBE}
+        planning = {KeysetPhase.BOUNDARY, KeysetPhase.ANCHOR_PROBE}
         phases = {plan.phase for plan in plans}
         scheduler.transactions.planning_physical_requests += int(bool(phases & planning))
         for phase in phases & planning:
@@ -186,7 +186,7 @@ async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation tran
                     ) from cause
                 raise cause
             raise PaginationError("fast keyset wave validation failed")
-        stage_semantics = bool(phases & {KeysetPhase.BOUNDARY, KeysetPhase.CANARY})
+        stage_semantics = KeysetPhase.BOUNDARY in phases
         for index, (plan, receipt) in enumerate(zip(plans, receipts, strict=True)):
             outcome = outcomes[index]
             response = outcome.response if isinstance(outcome, BatchSuccess) else None

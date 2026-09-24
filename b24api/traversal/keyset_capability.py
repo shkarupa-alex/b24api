@@ -365,7 +365,7 @@ def lane_for_command(
             0,
             plan.reserved_rows,
         )
-    if plan.phase in {KeysetPhase.CANARY, KeysetPhase.ANCHOR_PROBE}:
+    if plan.phase is KeysetPhase.ANCHOR_PROBE:
         bounds = planning_bounds[plan.command_id]
         descending = planning_descending.get(plan.command_id, False)
         return LaneState(

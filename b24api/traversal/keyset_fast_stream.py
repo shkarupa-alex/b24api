@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 import asyncio
-from collections import Counter, deque
+from collections import deque
 from dataclasses import replace
 from typing import TYPE_CHECKING, Self
 
@@ -60,8 +60,6 @@ class FastTraceRecorder:
         self._dropped: dict[TraceClass, int] = dict.fromkeys(TraceClass, 0)
         self._command_sequences: dict[str, int] = {}
         self._sequence_commands: dict[int, str] = {}
-        self._phase_commands: Counter[KeysetPhase] = Counter()
-        self._phase_rows: Counter[KeysetPhase] = Counter()
 
     @staticmethod
     def classify(observation: PageObservation) -> TraceClass:
@@ -72,7 +70,7 @@ class FastTraceRecorder:
             or observation.rejection_code is not None
         ):
             return TraceClass.ANOMALY
-        if observation.phase in {KeysetPhase.BOUNDARY, KeysetPhase.CANARY, KeysetPhase.ANCHOR_PROBE}:
+        if observation.phase in {KeysetPhase.BOUNDARY, KeysetPhase.ANCHOR_PROBE}:
             return TraceClass.PLANNING
         if observation.phase is KeysetPhase.FINISH:
             return TraceClass.TERMINAL
@@ -82,8 +80,6 @@ class FastTraceRecorder:
         """Convert and retain one finalized observation exactly once."""
         trace_class = self.classify(observation)
         observation = replace(observation, trace_class=trace_class)
-        self._phase_commands[observation.phase] += 1
-        self._phase_rows[observation.phase] += observation.rows_selected
         record = PageRecord(
             sequence=observation.ordinal,
             offset=None,
@@ -134,14 +130,6 @@ class FastTraceRecorder:
                 if record.sequence == sequence:
                     records[index] = replace(record, rows_admitted=rows)
                     return
-
-    def phase_commands(self, phase: KeysetPhase) -> int:
-        """Return observed command count for one phase."""
-        return self._phase_commands[phase]
-
-    def phase_rows(self, phase: KeysetPhase) -> int:
-        """Return selected row count for one phase."""
-        return self._phase_rows[phase]
 
     def snapshot(self) -> tuple[tuple[PageRecord, ...], Mapping[TraceClass, int]]:
         """Return retained records and exact per-class drop counts."""

@@ -134,9 +134,10 @@ The earlier 2.x keyset migration notes below remain as historical guidance for t
 ## Keyset verification, cursor fan-out, and page adaptation
 
 Normal `iter_list_keyset()` no longer sends the five diagnostic canary commands. Range and
-partitioned reports use `KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS`; the legacy
-`CANARY_VERIFIED_BOUNDS`, `KeysetPhase.CANARY`, and canary report counters remain readable for
-compatibility, but normal traversal never produces that assurance and its canary counters are zero.
+partitioned reports use `KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS`. 3.0.0 removes the legacy
+`KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS` and the always-zero `canary_requests`,
+`canary_commands` and `canary_rows` fields of `KeysetExecutionReport`; `KeysetPhase.CANARY` remains
+because `verify_keyset_capability()` still records its canary wave under that phase.
 This reduces every bounded runtime estimate by the former canary waves, but a broken endpoint can
 now emit a partial prefix before later bound validation raises typed `IncompleteTraversalError`.
 
@@ -311,6 +312,12 @@ preserving names or return-shaping flags.
 - permissive cursor de-duplication that could hide missing rows;
 - automatic unsafe direct fallback;
 - public low-level execution plans and compatibility data models.
+- report values no code path produced (3.0.0): `ReplayDisposition.REPLAYED_DIRECT` and
+  `DIRECT_REPLAY_FAILED` (a physical batch is never replayed as direct calls),
+  `CompletionAssurance.ORACLE_VERIFIED`, `SnapshotState.VERIFIED` and `SnapshotState.CHANGED`
+  (no snapshot oracle exists; a required snapshot reports `UNVERIFIED`), and
+  `NotExecutedReason.SCHEDULER_STOPPED`. Drop those arms from exhaustive matches; the enum inputs
+  `SnapshotRequirement` and `ConfirmationPolicy` keep every member.
 
 There is no assumption-free fast no-count shortcut. Direct `Bitrix24.iter_list_keyset()` calls and
 CLI keyset contracts that omit `execution` now assert the default `StableIntegerKeysetContract` and

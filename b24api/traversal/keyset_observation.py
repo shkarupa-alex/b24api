@@ -163,9 +163,7 @@ def abort_staged_observations(
     if not staged:
         return
     boundary = sum(item[2] for item in staged if item[0].phase.value == "boundary")
-    canary = sum(item[2] for item in staged if item[0].phase.value == "canary")
     admission.record_discarded(boundary)
-    admission.record_raw(canary, discarded=True)
     violation = (
         violations[-1]
         if violations

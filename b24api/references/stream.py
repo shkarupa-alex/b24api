@@ -40,7 +40,6 @@ from b24api.traversal.plans import (
     DispatchPlan,
     ListPlan,
     ReferenceOutputOrder,
-    SingleResponsePlan,
 )
 
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
@@ -206,28 +205,6 @@ def own_reference_source(source: ReferenceSource | OwnedSource[ReferenceRequest]
     if isinstance(source, OwnedSource):
         return cast("OwnedSource[ReferenceRequest]", source)
     return OwnedSource.adapt(source, accept=_accept_reference, inline_sequences=True)
-
-
-def fan_out(  # noqa: PLR0913
-    executor: Executor,
-    requests: ReferenceSource | OwnedSource[ReferenceRequest],
-    *,
-    dispatch: DispatchPlan,
-    output_order: ReferenceOutputOrder = ReferenceOutputOrder.READY,
-    tolerant: bool = False,
-    policy: ExecutionPolicy | None = None,
-) -> ReferenceStream:
-    """Schedule independent requests as single-response reference traversals."""
-    return iter_references(
-        executor,
-        requests,
-        plan=SingleResponsePlan(),
-        dispatch=dispatch,
-        output_order=output_order,
-        tolerant=tolerant,
-        policy=policy,
-        _whole_result=True,
-    )
 
 
 def iter_references(  # noqa: PLR0913

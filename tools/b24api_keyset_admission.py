@@ -401,7 +401,6 @@ def _record(
         "selected_requests_estimate": execution.selected_requests_estimate if execution is not None else None,
         "planning_requests": execution.planning_requests if execution is not None else 0,
         "boundary_requests": execution.boundary_requests if execution is not None else 0,
-        "canary_requests": execution.canary_requests if execution is not None else 0,
         "anchor_probe_requests": execution.anchor_probe_requests if execution is not None else 0,
         "total_hint_requested": execution.total_hint_requested if execution is not None else False,
         "total_hint_observed": execution.total_hint_observed if execution is not None else None,

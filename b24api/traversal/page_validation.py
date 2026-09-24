@@ -148,7 +148,7 @@ def validate_lane_receipt(  # noqa: PLR0913
     rows: tuple[FrozenJson, ...] = ()
     try:
         rows = _response_items(outcome.response, selector or ResultSelector.root())
-        if plan.phase not in {KeysetPhase.ANCHOR_PROBE, KeysetPhase.CANARY}:
+        if plan.phase is not KeysetPhase.ANCHOR_PROBE:
             rows = adapt_page(
                 outcome.response,
                 rows,

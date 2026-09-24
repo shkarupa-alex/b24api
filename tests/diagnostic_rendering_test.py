@@ -282,8 +282,6 @@ def test_v3_list_filters_and_operator_prefixes_share_one_alias_map() -> None:
     classic = diagnostic_context(Request("crm.item.list", {"filter": {"!=STATUS": 1, ">=ID": 2}}, route=RouteKind.BARE))
 
     assert context.alias_text("ID TITLE NAME IDX *") == "field#1 field#2 field#3 IDX *"
-    assert context.alias("ID") == "field#1"
-    assert context.alias("*") is None
     assert classic.alias_text("STATUS !=STATUS >=ID") == "field#1 !=field#1 >=field#2"
 
 

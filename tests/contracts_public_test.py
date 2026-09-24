@@ -89,10 +89,7 @@ def test_keyset_execution_report_declaration_snapshot() -> None:
         ("assurance_source", "KeysetAssuranceSource"),
         ("planning_requests", "int"),
         ("boundary_requests", "int"),
-        ("canary_requests", "int"),
         ("anchor_probe_requests", "int"),
-        ("canary_commands", "int"),
-        ("canary_rows", "int"),
         ("anchor_probe_commands", "int"),
         ("anchor_count", "int"),
         ("empty_anchor_probes", "int"),
@@ -365,7 +362,6 @@ def test_not_executed_reason_is_the_exact_frozen_enum() -> None:
         "halted",
         "source_failed",
         "local_validation_failed",
-        "scheduler_stopped",
     )
 
 
@@ -455,7 +451,7 @@ def test_reference_partition_retains_items_empty_completion_and_negative_variant
         ReferenceItem(0, correlation, 0, {"id": 1}),
         ReferenceComplete(0, correlation, 1),
         ReferenceFailure(1, correlation, _error(), 2),
-        ReferenceNotExecuted(2, correlation, NotExecutedReason.SCHEDULER_STOPPED),
+        ReferenceNotExecuted(2, correlation, NotExecutedReason.HALTED),
         ReferenceOutcomeUnknown(3, correlation, _error(), 0),
     )
 

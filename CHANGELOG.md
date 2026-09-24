@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Breaking (3.0.0):** removed never-produced report vocabulary: the `canary_requests`,
+  `canary_commands` and `canary_rows` fields of `KeysetExecutionReport`,
+  `KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS`, `ReplayDisposition.REPLAYED_DIRECT` and
+  `DIRECT_REPLAY_FAILED`, `CompletionAssurance.ORACLE_VERIFIED`, `SnapshotState.VERIFIED` and
+  `CHANGED`, and `NotExecutedReason.SCHEDULER_STOPPED` (B11). See the migration guide.
 - The PyPI release workflow accepts only canonical stable tags `MAJOR.MINOR.PATCH` (for example
   `2.2.1`, with no `fix-` or `v` prefix) and rejects any other tag before the build backend runs. It
   then requires exactly one sdist and one wheel whose filenames and metadata carry that version, and

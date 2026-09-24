@@ -24,8 +24,6 @@ class ReplayDisposition(StrEnum):
 
     NOT_ELIGIBLE = "not_eligible"
     ELIGIBLE = "eligible"
-    REPLAYED_DIRECT = "replayed_direct"
-    DIRECT_REPLAY_FAILED = "direct_replay_failed"
 
 
 class IdentityCoercion(StrEnum):
@@ -101,7 +99,6 @@ class KernelState(StrEnum):
 class CompletionAssurance(StrEnum):
     """Strength of evidence supporting completion."""
 
-    ORACLE_VERIFIED = "oracle_verified"
     CALLER_ASSERTED = "caller_asserted"
 
 
@@ -109,9 +106,7 @@ class SnapshotState(StrEnum):
     """Observed snapshot condition."""
 
     NOT_REQUESTED = "not_requested"
-    VERIFIED = "verified"
     UNVERIFIED = "unverified"
-    CHANGED = "changed"
 
 
 class AmbiguityReason(StrEnum):

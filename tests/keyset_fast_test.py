@@ -48,7 +48,7 @@ from b24api import (
 )
 from b24api.cli import _report_json
 from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSemantics
-from b24api.contracts.report import PageDispatch
+from b24api.contracts.report import OperationReport, PageDispatch
 from b24api.contracts.request import RouteKind
 from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError, ResultShapeError
 from b24api.execution import Executor, WireResponse
@@ -292,6 +292,12 @@ class NthBatchMissingResultTransport(KeysetTransport):
             response.headers,
             json.dumps(payload, separators=(",", ":")).encode(),
         )
+
+
+def _sends_no_canary(report: OperationReport | None) -> bool:
+    """Fast traversal never schedules a canary page: every recorded page belongs to another phase."""
+    assert report is not None
+    return all(record.phase is not KeysetPhase.CANARY for record in report.page_trace)
 
 
 def _client(transport: KeysetTransport, *, policy: ExecutionPolicy | None = None) -> Bitrix24:
@@ -657,8 +663,7 @@ async def test_explicit_modes_match_sparse_ordered_oracle(direction: str, kind: 
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind(kind)
-    assert stream.report.keyset_execution.canary_commands == 0
-    assert stream.report.keyset_execution.canary_requests == 0
+    assert _sends_no_canary(stream.report)
     assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS
     assert all(
         record.rows_admitted == record.rows_selected
@@ -796,7 +801,7 @@ async def test_auto_sequential_has_request_parity_and_no_canaries() -> None:
     report = stream.report.keyset_execution
     assert report.selected_kind is KeysetExecutionKind.SEQUENTIAL
     assert report.preselection_reason is KeysetSelectionReason.INSUFFICIENT_PREDICTED_GAIN
-    assert report.canary_commands == 0
+    assert _sends_no_canary(stream.report)
     assert stream.report.physical_requests == 5
 
 
@@ -874,7 +879,7 @@ async def test_adjacent_boundaries_select_prefix_assured_boundary_only() -> None
     assert report.selected_kind is KeysetExecutionKind.BOUNDARY_ONLY
     assert report.preselection_reason is KeysetSelectionReason.ADJACENT_BOUNDARIES
     assert report.assurance_source is KeysetAssuranceSource.ORDERED_PREFIX_ONLY
-    assert report.canary_commands == 0
+    assert _sends_no_canary(stream.report)
 
 
 def test_post_probe_range_preferred_transition_is_pinned() -> None:
@@ -1179,8 +1184,7 @@ async def test_ignored_numeric_bounds_fail_late_without_runtime_canaries() -> No
     assert stream.report.emitted > 0
     assert stream.report.state is TerminalState.INCOMPLETE
     assert stream.report.keyset_execution is not None
-    assert stream.report.keyset_execution.canary_rows == 0
-    assert stream.report.keyset_execution.canary_commands == 0
+    assert _sends_no_canary(stream.report)
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.RANGE
     assert stream.report.keyset_execution.preselection_reason is KeysetSelectionReason.EXPLICIT_RANGE
     assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS
@@ -1201,7 +1205,7 @@ async def test_small_batch_runtime_still_emits_no_canary_observations() -> None:
     canaries = [record for record in stream.report.page_trace if record.phase is KeysetPhase.CANARY]
     assert canaries == []
     assert stream.report.keyset_execution is not None
-    assert stream.report.keyset_execution.canary_commands == 0
+    assert _sends_no_canary(stream.report)
 
 
 @pytest.mark.asyncio
@@ -1391,12 +1395,6 @@ async def test_keyset_report_rejects_boolean_total_hint_observation() -> None:
 
     with pytest.raises(ValueError, match="optional keyset report counters"):
         replace(stream.report.keyset_execution, total_hint_observed=True)
-    with pytest.warns(DeprecationWarning, match="legacy report compatibility"):
-        legacy = replace(
-            stream.report.keyset_execution,
-            assurance_source=KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS,
-        )
-    assert legacy.assurance_source is KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS
     nested = _report_json(stream.report)["keyset_execution"]
     assert isinstance(nested, dict)
     assert nested["selected_kind"] == stream.report.keyset_execution.selected_kind
@@ -1648,7 +1646,7 @@ async def test_page_cap_one_can_select_range_without_canary_prefix_requirement()
     assert [row["id"] async for row in stream] == list(identities)
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.RANGE
-    assert stream.report.keyset_execution.canary_commands == 0
+    assert _sends_no_canary(stream.report)
 
 
 @pytest.mark.asyncio
@@ -1664,7 +1662,7 @@ async def test_explicit_range_with_page_cap_one_needs_no_canary_pair() -> None:
 
     assert [row["id"] async for row in stream] == list(range(1, 41))
     assert stream.report.keyset_execution is not None
-    assert stream.report.keyset_execution.canary_commands == 0
+    assert _sends_no_canary(stream.report)
 
 
 @pytest.mark.asyncio
@@ -1704,7 +1702,7 @@ async def test_auto_uses_asymmetric_boundary_without_runtime_canaries() -> None:
     assert [row["id"] async for row in stream] == list(identities)
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is not KeysetExecutionKind.SEQUENTIAL
-    assert stream.report.keyset_execution.canary_commands == 0
+    assert _sends_no_canary(stream.report)
 
 
 @pytest.mark.asyncio

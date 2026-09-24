@@ -35,7 +35,6 @@ class NotExecutedReason(StrEnum):
     HALTED = "halted"
     SOURCE_FAILED = "source_failed"
     LOCAL_VALIDATION_FAILED = "local_validation_failed"
-    SCHEDULER_STOPPED = "scheduler_stopped"
 
 
 @dataclass(frozen=True, slots=True)

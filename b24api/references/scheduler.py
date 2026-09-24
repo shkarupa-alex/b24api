@@ -272,7 +272,6 @@ class ReferenceScheduler:
                     reference = await iterator.get(self.context)
                 except StopAsyncIteration:
                     self.producer_state.source_pull_in_flight = False
-                    self.producer_state.source_terminal = True
                     self.producer_state.next_key = None
                     self.producer_state.next_index = None
                     self.producer_state.touch()
@@ -304,7 +303,6 @@ class ReferenceScheduler:
                 admission.changed.set()
         finally:
             self.producer_state.source_pull_in_flight = False
-            self.producer_state.source_terminal = True
             self.producer_state.next_key = None
             self.producer_state.next_index = None
             self.producer_state.touch()
