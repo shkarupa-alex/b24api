@@ -29,6 +29,7 @@ def test_docs_are_flat_compact_and_linked_from_readme() -> None:
         "docs/migration.md",
         "docs/performance.md",
         "docs/recipes.md",
+        "docs/specifications/README.md",
         "docs/specifications/b24api-issues-architecture/decision-ledger.md",
         "docs/specifications/b24api-issues-architecture/examples-contracts.md",
         "docs/specifications/b24api-issues-architecture/registry-contracts.md",
