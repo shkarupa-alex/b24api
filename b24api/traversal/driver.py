@@ -5,7 +5,7 @@ import contextlib
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
-from b24api.contracts.completion import EMPTY_SOURCE_WITNESS, EmptySourceWitness
+from b24api.contracts.completion import EMPTY_SOURCE_WITNESS, CommandSettlement, EmptySourceWitness
 from b24api.contracts.json import FrozenJson, _json_type_name
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import (
@@ -42,9 +42,10 @@ from b24api.errors import (
     PaginationError,
     ResultShapeError,
 )
+from b24api.execution import WorkClass
 from b24api.traversal.control_preflight import preflight_controls
-from b24api.traversal.counted_batch import _CountedBatchMixin
-from b24api.traversal.cursor import _CursorMixin
+from b24api.traversal.counted_batch import CountedBatchStrategy, empty_source_head_eligible
+from b24api.traversal.cursor import ItemCursorStrategy
 from b24api.traversal.identity import (
     _PLAN_TYPES,
     PageFetch,
@@ -58,7 +59,7 @@ from b24api.traversal.identity import (
     _PageRejectionError,
     _validate_confirmation_policy,
 )
-from b24api.traversal.keyset import _KeysetMixin
+from b24api.traversal.keyset import KeysetStrategy
 from b24api.traversal.page_adaptation import _SourcePageState, adapt_page
 from b24api.traversal.plans import (
     CountedOffsetPlan,
@@ -69,7 +70,8 @@ from b24api.traversal.plans import (
     OffsetSequentialPlan,
     SingleResponsePlan,
 )
-from b24api.traversal.sequential import _SequentialMixin
+from b24api.traversal.sequential import CountedStrategy, OffsetStrategy, SingleResponseStrategy
+from b24api.traversal.strategy_context import PagedStrategy, PageStop, SequentialPageStrategy
 from b24api.traversal.values import (
     IdentityValue,
     _coerce_identity,
@@ -94,7 +96,20 @@ if TYPE_CHECKING:
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 
-class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _CursorMixin):
+def _strategy(plan: ListPlan) -> SequentialPageStrategy | PagedStrategy:
+    """Compose the strategy that owns a validated plan's requests and verdicts."""
+    if isinstance(plan, SingleResponsePlan):
+        return SingleResponseStrategy(plan)
+    if isinstance(plan, OffsetSequentialPlan):
+        return OffsetStrategy(plan)
+    if isinstance(plan, CountedOffsetPlan):
+        return CountedStrategy(plan)
+    if isinstance(plan, KeysetPlan):
+        return KeysetStrategy(plan)
+    return ItemCursorStrategy(plan)
+
+
+class PaginationDriver:
     """One operation-local state machine over an explicit immutable plan."""
 
     def __init__(  # noqa: PLR0913
@@ -162,33 +177,94 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self.empty_source_witness: EmptySourceWitness | None = None
         self._empty_source_allowance = False
 
-    async def pages(self) -> AsyncGenerator[_Page]:  # noqa: C901
+    async def pages(self) -> AsyncGenerator[_Page]:
         """Yield validated traversal pages."""
         self.begin_external_validation()
         try:
-            if isinstance(self.plan, SingleResponsePlan):
-                async for page in self._single(self.plan):
-                    yield page
-                return
-            if isinstance(self.plan, OffsetSequentialPlan):
-                async for page in self._offset(self.plan):
-                    yield page
-                return
-            if isinstance(self.plan, CountedOffsetPlan):
-                async for page in self._counted(self.plan):
-                    yield page
-                return
-            if isinstance(self.plan, KeysetPlan):
-                async for page in self._keyset(self.plan):
-                    yield page
-                return
-            if isinstance(self.plan, ItemCursorPlan):
-                async for page in self._cursor(self.plan):
-                    yield page
-                return
-            raise AssertionError("validated list plan was not dispatched")
+            strategy = _strategy(self.plan)
+            pages = strategy.pages(self) if isinstance(strategy, PagedStrategy) else self._sequential(strategy)
+            async for page in pages:
+                yield page
         finally:
             self.close_external_validation()
+
+    async def _sequential(self, strategy: SequentialPageStrategy) -> AsyncGenerator[_Page]:
+        """Own each page transaction: fetch, select, judge, validate, record the rejection or yield."""
+        request = strategy.first_request(self)
+        while True:
+            response = await self.fetch(request)
+            trace_count = self.page_trace_count
+            items: tuple[FrozenJson, ...] = ()
+            try:
+                items = self.select_page(response)
+                verdict = strategy.judge(self, response, items)
+                identities = self.validate_page(
+                    items,
+                    response=response,
+                    terminal=verdict.terminal,
+                    identities=verdict.identities,
+                )
+            except BaseException as error:
+                if self.page_trace_count == trace_count:
+                    self.reject_external_page(items, response, error)
+                raise
+            if items:
+                yield _Page(tuple(items), response, (1,) * len(items), not verdict.terminal)
+            step = strategy.advance(self, identities)
+            if isinstance(step, PageStop):
+                self.terminal_reason = step.reason
+                return
+            request = step
+
+    def counted_batch_pages(self, *, batch_size: int, page_size: int) -> AsyncGenerator[_Page]:
+        """Execute the committed direct-head/batched-tail counted traversal."""
+        return CountedBatchStrategy(batch_size=batch_size, page_size=page_size).pages(self)
+
+    def empty_source_head_eligible(
+        self,
+        response: Response,
+        source: tuple[FrozenJson, ...],
+        adapted: tuple[FrozenJson, ...],
+    ) -> bool:
+        """Return, without side effects, whether an unvalidated head may witness an empty source."""
+        return empty_source_head_eligible(self, response, source, adapted)
+
+    async def fetch(self, request: Request) -> Response:
+        """Fetch one page directly, accounting for it in the operation budget."""
+        if self.fetch_override is not None:
+            return await self.fetch_override(request)
+        recorder = self.completion_recorder
+        if recorder is not None:
+            recorder.scheduled()
+        reservation = None
+        try:
+            reservation = await self.context.reserve_page()
+            response = await self.executor.execute(
+                request,
+                context=self.context,
+                work_class=WorkClass.TRAVERSAL_DIRECT,
+            )
+            self.context.commit_page(reservation)
+            if recorder is not None:
+                recorder.settled(CommandSettlement.SUCCESS)
+        except BaseException as error:
+            if recorder is not None:
+                recorder.settled(
+                    CommandSettlement.UNKNOWN
+                    if bool(getattr(error, "_b24api_dispatch_started", False))
+                    else CommandSettlement.NOT_EXECUTED,
+                )
+            if reservation is not None:
+                self.context.release_page(reservation)
+            if bool(getattr(error, "_b24api_dispatch_started", False)):
+                self.set_page_dispatch(dispatch=PageDispatch.DIRECT)
+                self.record_unknown_page(
+                    dispatch=PageDispatch.DIRECT,
+                    batch_index=None,
+                    error=error,
+                )
+            raise
+        return response
 
     def begin_external_validation(self) -> None:
         """Start canonical contract and identity validation for an external page dispatcher."""

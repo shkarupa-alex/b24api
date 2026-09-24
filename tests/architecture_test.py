@@ -449,3 +449,21 @@ def test_closure_reason_constants_map_to_their_qualified_closure() -> None:
     assert closure.qualified_closure(closure.ADMITTED_UPPER_BOUNDARY_REACHED) is BindingClosure.BOUNDARY_SEEN
     assert closure.qualified_closure("source exhausted") is None
     assert closure.qualified_closure(None) is None
+
+
+def test_pagination_driver_composes_strategies_instead_of_inheriting_them() -> None:
+    # The driver owns the page transaction and composes one strategy per plan (§3.6 step 2).
+    from b24api.traversal.counted_batch import CountedBatchStrategy  # noqa: PLC0415
+    from b24api.traversal.driver import PaginationDriver  # noqa: PLC0415
+    from b24api.traversal.strategy_context import PagedStrategy  # noqa: PLC0415
+
+    assert PaginationDriver.__bases__ == (object,)
+    assert isinstance(CountedBatchStrategy(batch_size=1, page_size=1), PagedStrategy)
+    strategy_modules = ("sequential", "keyset", "cursor", "counted_batch")
+    mixins = [
+        node.name
+        for module in strategy_modules
+        for node in ast.parse((PACKAGE / "traversal" / f"{module}.py").read_text(encoding="utf-8")).body
+        if isinstance(node, ast.ClassDef) and node.name.endswith("Mixin")
+    ]
+    assert not mixins

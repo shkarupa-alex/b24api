@@ -1,9 +1,17 @@
-"""The driver surface that page strategies use, so mypy checks every strategy call (§3.6 step 1)."""
+"""Page strategies and the driver surface they use, so mypy checks every strategy call (§3.6).
+
+A strategy takes one of two forms. A sequential strategy only builds requests and judges pages:
+the driver owns each page transaction (fetch, select, judge, validate, record, yield). A paged
+strategy owns its own page flow, such as the single-response page or the counted batched tail.
+"""
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, Protocol
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from b24api.completion.recorder import CompletionSink
     from b24api.contracts.json import FrozenJson, JsonValue
     from b24api.contracts.policy import ConfirmationPolicy
@@ -12,7 +20,7 @@ if TYPE_CHECKING:
     from b24api.contracts.response import Response
     from b24api.execution import ExecutionContext, Executor
     from b24api.execution.snapshot import KernelReport
-    from b24api.traversal.identity import PageFetch
+    from b24api.traversal.identity import PageFetch, _Page
     from b24api.traversal.page_adaptation import _SourcePageState
     from b24api.traversal.plans import ListPlan
     from b24api.traversal.values import IdentityValue
@@ -130,4 +138,44 @@ class StrategyContext(Protocol):
         ...
 
 
-__all__ = ["StrategyContext"]
+@dataclass(frozen=True, slots=True)
+class PageVerdict:
+    """A judged page before its commit: whether it closes the traversal and its pre-read identities."""
+
+    terminal: bool
+    identities: list[IdentityValue] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PageStop:
+    """The traversal closed after its last committed page, for the recorded reason."""
+
+    reason: str
+
+
+class SequentialPageStrategy(Protocol):
+    """Build the requests of a page sequence and judge each page; the driver owns the transaction."""
+
+    def first_request(self, ctx: StrategyContext) -> Request:
+        """Return the first page request, rejecting an unusable caller request."""
+        ...
+
+    def judge(self, ctx: StrategyContext, response: Response, items: tuple[FrozenJson, ...]) -> PageVerdict:
+        """Judge a selected page before its commit; raising rejects the page."""
+        ...
+
+    def advance(self, ctx: StrategyContext, identities: list[IdentityValue]) -> Request | PageStop:
+        """After the page is committed and delivered, return the next request or the stop."""
+        ...
+
+
+@runtime_checkable
+class PagedStrategy(Protocol):
+    """Own a whole page flow, validating through the context."""
+
+    def pages(self, ctx: StrategyContext) -> AsyncGenerator[_Page]:
+        """Yield validated pages."""
+        ...
+
+
+__all__ = ["PageStop", "PageVerdict", "PagedStrategy", "SequentialPageStrategy", "StrategyContext"]
