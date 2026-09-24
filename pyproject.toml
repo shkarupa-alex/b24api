@@ -15,17 +15,43 @@ dynamic = ["version"]
 description = "Bitrix24 API"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Shkarupa Alex", email = "shkarupa.alex@gmail.com" }]
+keywords = ["bitrix24", "rest", "api", "client", "async", "httpx", "batch", "pagination"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = [
     "httpx[http2]>=0.28.1,<0.29",
-    "pydantic>=2.11.7",
+    "pydantic>=2.12.0",
     "pydantic-settings>=2.10.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/shkarupa-alex/b24api"
+Repository = "https://github.com/shkarupa-alex/b24api"
+Issues = "https://github.com/shkarupa-alex/b24api/issues"
+Changelog = "https://github.com/shkarupa-alex/b24api/blob/master/CHANGELOG.md"
 
 [project.scripts]
 b24api = "b24api.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["b24api*"]
+
+[tool.setuptools.package-data]
+b24api = ["py.typed"]
 
 [dependency-groups]
 dev = [
