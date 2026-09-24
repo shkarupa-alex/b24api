@@ -54,7 +54,7 @@ details.
     `TotalTermination.DISABLED` to walk a suffix.
 12. **Keyset verification.** When a boundary read is answered wrongly, `verify_keyset_capability()`
     raises `KeysetCapabilityError` with an `UNSUPPORTED` report (`error.report`) instead of a raw
-    `PaginationError`. Code that caught `PaginationError` there must catch `KeysetCapabilityError`
+    `PaginationError` (order, page cap) or `CapabilityError` (identity shape). Code that caught `PaginationError` there must catch `KeysetCapabilityError`
     or `CapabilityError`.
 13. **Keyset selection reasons.** `KeysetSelectionReason` gains `EXPLICIT_SEQUENTIAL` and
     `PAGE_STOP`; handle them in exhaustive matches.
