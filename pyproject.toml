@@ -15,11 +15,34 @@ dynamic = ["version"]
 description = "Bitrix24 API"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Shkarupa Alex", email = "shkarupa.alex@gmail.com" }]
+keywords = ["bitrix24", "rest", "api", "client", "async", "httpx", "batch", "pagination"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = [
     "httpx[http2]>=0.28.1,<0.29",
-    "pydantic>=2.11.7",
+    "pydantic>=2.12.0",
     "pydantic-settings>=2.10.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/shkarupa-alex/b24api"
+Repository = "https://github.com/shkarupa-alex/b24api"
+Issues = "https://github.com/shkarupa-alex/b24api/issues"
+Changelog = "https://github.com/shkarupa-alex/b24api/blob/master/CHANGELOG.md"
 
 [project.scripts]
 b24api = "b24api.cli:main"
@@ -27,19 +50,25 @@ b24api = "b24api.cli:main"
 [tool.setuptools.packages.find]
 include = ["b24api*"]
 
+[tool.setuptools.package-data]
+b24api = ["py.typed"]
+
 [dependency-groups]
 dev = [
     "cryptography>=50.0.1",
     "jsonschema>=4.25.1",
     "mypy>=1.15.0",
     "pytest-asyncio>=1.1.0",
+    "pytest-cov>=7.1.0",
     "pytest-env>=1.1.5",
     "pytest-httpx>=0.35.0",
     "pytest-mock>=3.14.1",
+    "pyyaml>=6.0.3",
     "ruff>=0.15.5",
     "setuptools>=80.9.0",
     "setuptools-git-versioning>=2.1.0",
     "types-jsonschema>=4.26.0.20260113",
+    "types-pyyaml>=6.0.12.20260906",
     "wheel>=0.45.1",
 ]
 
@@ -94,4 +123,7 @@ BITRIX24_API_WEBHOOK_URL = "https://bitrix24.com/rest/0/test/"
 
 
 [tool.coverage.report]
+# Line-coverage floor for the CI tests job (B27): measured 90.58% on 3.12/3.13 at 7db6793 with
+# pytest -m "not slow" --cov=b24api, rounded down. Lowering it requires a written justification.
+fail_under = 90
 exclude_also = ["if typing.TYPE_CHECKING:"]

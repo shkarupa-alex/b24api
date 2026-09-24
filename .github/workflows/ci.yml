@@ -1,0 +1,135 @@
+name: ci
+
+# Branch protection requires the single check named `ci`, produced by the `gate` job below. Every
+# blocking job must be listed in the gate's `needs`; tests/release_workflow_test.py derives the
+# expected set from this file, so a new job that is not wired into the gate fails the test suite.
+# The publish workflow calls this file through workflow_call and releases only after the gate.
+
+on: [push, pull_request, workflow_call]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Lint without rewriting sources
+        run: uv run --locked ruff check --no-fix
+      - name: Check formatting
+        run: uv run --locked ruff format --check
+
+  types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Type-check the library strictly
+        run: uv run --locked mypy b24api
+      - name: Ratchet mypy errors over tests against the baseline
+        run: uv run --locked python .github/scripts/mypy_ratchet.py
+
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run the default suite with the coverage floor
+        # The floor is [tool.coverage.report] fail_under in pyproject.toml, the single source.
+        run: uv run --locked pytest -m "not slow" --cov=b24api --cov-report=term
+
+  min-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Install the lowest direct dependency versions
+        run: |
+          uv venv
+          uv pip install --resolution lowest-direct -e . --group dev
+          uv pip list
+      - name: Run the full suite on the lowest versions
+        run: .venv/bin/python -m pytest
+
+  wheel-typing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Build the wheel into a temporary directory
+        run: uv build --wheel --out-dir "$RUNNER_TEMP/dist"
+      - name: Verify the wheel contents
+        run: uv run --no-project python .github/scripts/verify_release.py wheel "$RUNNER_TEMP"/dist/*.whl
+      - name: Type-check a consumer against the installed wheel
+        shell: bash
+        run: |
+          consumer="$RUNNER_TEMP/consumer"
+          mkdir -p "$consumer"
+          uv export --locked --no-emit-project --no-hashes --all-groups --output-file "$consumer/constraints.txt"
+          uv venv "$consumer/.venv"
+          uv pip install --python "$consumer/.venv" --constraint "$consumer/constraints.txt" \
+            "$RUNNER_TEMP"/dist/*.whl mypy
+          cp tests/typing_smoke/app.py "$consumer/app.py"
+          cd "$consumer"
+          .venv/bin/python -m mypy --strict --no-incremental app.py | tee mypy.txt
+          grep -F 'Revealed type is "b24api.contracts.request.Request"' mypy.txt
+          if grep -F 'import-untyped' mypy.txt; then
+            echo "::error title=wheel typing::the installed wheel is reported as untyped"
+            exit 1
+          fi
+
+  slow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Run the slow suite
+        run: uv run --locked pytest -m slow
+
+  httpx-latest:
+    # Non-blocking evidence for the httpx pin decision (C2): the logging-shield matrix on the
+    # latest released httpx and HTTP/2 stack. Deliberately absent from the gate's needs.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Install the locked environment, then the latest httpx stack
+        run: |
+          uv sync --locked
+          uv pip install --upgrade "httpx[http2]" httpcore h2 hpack
+          uv pip list | grep -Ei '^(httpx|httpcore|h2|hpack) ' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Run the logging-shield matrix
+        run: uv run --no-sync pytest tests/httpx_logging_shield_test.py
+
+  gate:
+    name: ci
+    needs: [lint, types, tests, min-deps, wheel-typing, slow]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require every blocking job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 .github/scripts/ci_gate.py
