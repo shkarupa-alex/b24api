@@ -48,7 +48,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Run the default suite with the coverage floor
         # The floor is [tool.coverage.report] fail_under in pyproject.toml, the single source.
-        run: uv run --locked pytest -m "not slow" --cov=b24api --cov-report=term
+        run: uv run --locked pytest -m "not slow and not benchmark" --cov=b24api --cov-report=term
 
   min-deps:
     runs-on: ubuntu-latest
@@ -62,7 +62,7 @@ jobs:
           uv venv
           uv pip install --resolution lowest-direct -e . --group dev
           uv pip list
-      - name: Run the full suite on the lowest versions
+      - name: Run the default suite on the lowest versions
         run: .venv/bin/python -m pytest
 
   wheel-typing:

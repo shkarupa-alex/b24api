@@ -465,7 +465,7 @@ def test_blocking_jobs_run_the_specified_checks() -> None:
     assert "uv run --locked mypy b24api" in _runs("types")
     assert "python .github/scripts/mypy_ratchet.py" in _runs("types")
     assert jobs["tests"]["strategy"]["matrix"]["python-version"] == ["3.12", "3.13"]
-    assert 'pytest -m "not slow" --cov=b24api' in _runs("tests")
+    assert 'pytest -m "not slow and not benchmark" --cov=b24api' in _runs("tests")
     assert "--resolution lowest-direct" in _runs("min-deps")
     assert "-m pytest" in _runs("min-deps")
     assert "not slow" not in _runs("min-deps")
