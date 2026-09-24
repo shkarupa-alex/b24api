@@ -1,0 +1,61 @@
+{
+  "slf001_tests": 234,
+  "slf001_package": 84,
+  "slf001_traversal": 54,
+  "noqa_package": 207,
+  "untyped_self_traversal": 9,
+  "long_functions": {
+    "b24api/batch/logical.py::LogicalBatchKernelStream._run": {
+      "lines": 117,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/batch/stream.py::_BatchOutcomeStream._run": {
+      "lines": 123,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/completion/gate.py::CompletionGate.emit": {
+      "lines": 167,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/execution/executor.py::Executor._execute_wire_attempts": {
+      "lines": 129,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/references/scheduler.py::ReferenceScheduler._run_reference": {
+      "lines": 230,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/testing/transport.py::_run_case": {
+      "lines": 124,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/transport/httpx.py::HttpxTransport._send_wire_impl": {
+      "lines": 141,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/transport/protocol.py::ProtocolCodec.error_from_http": {
+      "lines": 101,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/traversal/counted_batch.py::_CountedBatchMixin.counted_batch_pages": {
+      "lines": 221,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/traversal/keyset_scheduler.py::KeysetFastScheduler.plan_barrier": {
+      "lines": 189,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/traversal/keyset_transactions.py::execute_finish_page": {
+      "lines": 115,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/traversal/keyset_transactions.py::execute_wave": {
+      "lines": 133,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    },
+    "b24api/traversal/stream.py::ItemStream._run": {
+      "lines": 115,
+      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
+    }
+  }
+}
