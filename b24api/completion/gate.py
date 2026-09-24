@@ -126,6 +126,7 @@ class CompletionGate:
         self._cleanup: CleanupState | None = None
         self._violations: list[Violation] = []
         self._report_facts: CompletionReportFacts | None = None
+        self._published: OperationReport | None = None
 
     def _violate(self, code: str) -> None:
         if len(self._violations) < _MAX_VIOLATIONS:
@@ -443,7 +444,7 @@ class CompletionGate:
             raise ValueError("forced terminal state cannot claim successful completion")
         if facts.forced_state is not None:
             state = facts.forced_state
-        return OperationReport(
+        report = OperationReport(
             state=state,
             operation=facts.operation,
             terminal_reason=source.terminal_reason or state.value,
@@ -475,6 +476,15 @@ class CompletionGate:
                 else facts.keyset_selection
             ),
         )
+        self._published = report
+        return report
+
+    def publish_failure(self, facts: CompletionReportFacts) -> OperationReport:
+        """Publish one minimal FAILED report when a finalizer raised; an earlier publication stands."""
+        if self._published is not None:
+            return self._published
+        self._report_facts = facts
+        return self.finish()
 
 
 _IDENTITY_STRENGTH = frozenset({TraversalAssurance.IDENTITY_EXACT, TraversalAssurance.IDENTITY_AND_COUNT_MATCHED})

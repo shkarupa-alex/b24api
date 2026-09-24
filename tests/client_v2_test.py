@@ -1536,8 +1536,12 @@ async def test_partial_helper_closes_without_claiming_completion() -> None:
     assert partial.value == ({"ID": 1},)
     assert partial.report.state is TerminalState.EARLY_CLOSED
     assert stream.report is partial.report
-    with pytest.raises(RuntimeError, match="closed before exhaustion"):
+    sent = len(transport.requests)
+    # A read after close starts no work and ends the iteration (§3.1).
+    with pytest.raises(StopAsyncIteration):
         await anext(stream)
+    assert len(transport.requests) == sent
+    assert stream.report is partial.report
 
 
 @pytest.mark.asyncio
@@ -1623,7 +1627,8 @@ async def test_public_aclose_is_permitted_during_an_inflight_pull_and_cancels_ow
     assert captured.value.__dict__["report"] is stream.report
     assert transport.cancelled.is_set()
     assert stream.report is not None
-    assert stream.report.state is TerminalState.CANCELLED
+    # aclose() owns termination, so the cause is an early close even though the read was cancelled.
+    assert stream.report.state is TerminalState.EARLY_CLOSED
 
 
 @pytest.mark.asyncio
@@ -1633,7 +1638,7 @@ async def test_concurrent_public_pulls_reject_without_stealing_the_owned_pull() 
     owned_pull = asyncio.create_task(anext(stream))
     await transport.started.wait()
 
-    with pytest.raises(RuntimeError, match="concurrent stream pulls"):
+    with pytest.raises(RuntimeError, match="concurrent stream pull"):
         await anext(stream)
 
     await stream.aclose()
