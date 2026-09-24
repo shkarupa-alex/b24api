@@ -13,6 +13,7 @@ from b24api.errors import BudgetExceededError, CapabilityError, PaginationError
 from b24api.execution import (
     WorkClass,
 )
+from b24api.traversal.counted_rules import CountedContradiction, CountedPageFacts, judge_counted_page
 from b24api.traversal.identity import (
     _initial_offset,
     _next_offset,
@@ -187,16 +188,27 @@ class _SequentialMixin:
             items: tuple[FrozenJson, ...] = ()
             try:
                 items = self.select_page(response)
-                prospective_rows = self.validated_rows + len(items)
                 effective_total = (
                     response.total if response.total is not None and response.total >= 0 else self._expected_total
                 )
-                terminal = effective_total is not None and prospective_rows == effective_total
+                verdict = judge_counted_page(
+                    CountedPageFacts(
+                        offset,
+                        len(items),
+                        self.validated_rows,
+                        effective_total,
+                        response.next,
+                        plan.continuation,
+                    ),
+                )
+                terminal = verdict.terminal
                 if not terminal and not items:
                     raise _PageRejectionError(
                         "counted traversal ended before its exact total",
                         PageRejectionCode.RANGE_CONTRADICTION,
                     )
+                if verdict.contradiction is CountedContradiction.CONTINUATION_AFTER_TOTAL:
+                    raise CapabilityError("counted traversal completed while continuation remained")
                 next_offset = None if terminal else _next_offset(plan, response, current=offset, observed=len(items))
                 if next_offset is not None and next_offset <= offset:
                     raise PaginationError("counted offset did not advance")

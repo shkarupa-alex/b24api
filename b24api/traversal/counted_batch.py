@@ -15,6 +15,12 @@ from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
 )
+from b24api.traversal.counted_rules import (
+    CountedContradiction,
+    CountedPageFacts,
+    expected_counted_next,
+    judge_counted_page,
+)
 from b24api.traversal.identity import _Page, _request_with_controls
 from b24api.traversal.plans import (
     CountedOffsetMode,
@@ -96,12 +102,10 @@ class _CountedBatchMixin:
             and head.next != stride
         ):
             raise CapabilityError("parallel counted head continuation contradicts its row count")
-        if (
-            total == len(head_items)
-            and head.next is not None
-            and head.next > 0
-            and self.plan.continuation is not OffsetContinuation.FIXED_STEP
-        ):
+        verdict = judge_counted_page(
+            CountedPageFacts(0, len(head_items), 0, total, head.next, self.plan.continuation),
+        )
+        if verdict.contradiction is CountedContradiction.CONTINUATION_AFTER_TOTAL:
             raise CapabilityError("parallel counted traversal completed while continuation remained")
         return total, stride
 
@@ -273,7 +277,7 @@ class _CountedBatchMixin:
                         raise CapabilityError("parallel counted page length contradicts the planned exact range")
                     if response.total not in {None, -1} and response.total != total:
                         raise CapabilityError("parallel counted page total contradicts the head total")
-                    expected_next = start + stride if start + stride < total else None
+                    expected_next = expected_counted_next(start, stride, total)
                     if self.plan.continuation.value == "server_next" and response.next != expected_next:
                         raise CapabilityError("parallel counted continuation contradicts the planned exact range")
                     if (
