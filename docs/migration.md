@@ -318,6 +318,9 @@ preserving names or return-shaping flags.
   (no snapshot oracle exists; a required snapshot reports `UNVERIFIED`), and
   `NotExecutedReason.SCHEDULER_STOPPED`. Drop those arms from exhaustive matches; the enum inputs
   `SnapshotRequirement` and `ConfirmationPolicy` keep every member.
+- `PageValidated.identity_digest` (3.0.0). The gate only ever checked that the digest was non-empty,
+  so every recorder paid a SHA-256 per page for no guarantee. The gate still checks event order and
+  `row_count`; a custom recorder or test that builds `PageValidated` drops the argument.
 
 There is no assumption-free fast no-count shortcut. Direct `Bitrix24.iter_list_keyset()` calls and
 CLI keyset contracts that omit `execution` now assert the default `StableIntegerKeysetContract` and

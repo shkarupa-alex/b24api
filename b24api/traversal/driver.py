@@ -550,7 +550,7 @@ class PaginationDriver:
         if identities:
             self._last_identity = identities[-1]
         self._fingerprints.update((fingerprint,) if track_fingerprint else ())
-        self._record_committed_page(items, response, identities)
+        self._record_committed_page(items, response)
         return identities
 
     def _settle_duplicates(self, duplicates: int) -> None:
@@ -573,7 +573,6 @@ class PaginationDriver:
         self,
         items: tuple[FrozenJson, ...],
         response: Response,
-        identities: Sequence[IdentityValue] = (),
     ) -> None:
         self._append_page_record(
             PageRecord(
@@ -590,7 +589,7 @@ class PaginationDriver:
             ),
         )
         if self.completion_recorder is not None:
-            self.completion_recorder.validated(identities, len(items))
+            self.completion_recorder.validated(len(items))
 
     def schedule_page(
         self,

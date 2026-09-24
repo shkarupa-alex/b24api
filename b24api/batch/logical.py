@@ -217,7 +217,7 @@ class LogicalBatchKernelStream[C]:
         binding = self._completion.binding(outcome.index)
         if isinstance(outcome, CommandSuccess):
             binding.settled(CommandSettlement.SUCCESS)
-            binding.validated((outcome.index,), 1)
+            binding.validated(1)
         elif isinstance(outcome, CommandOutcomeUnknown):
             binding.settled(CommandSettlement.UNKNOWN)
         elif isinstance(outcome, CommandNotExecuted):

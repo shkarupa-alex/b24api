@@ -8,6 +8,8 @@ import math
 import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from b24api._error_types import FailurePhase
@@ -53,6 +55,22 @@ type Sleeper = Callable[[float], Awaitable[None]]
 
 _HTTP_STATUS_MINIMUM = 100
 _HTTP_STATUS_MAXIMUM = 599
+
+
+class _BodyMode(Enum):
+    """Select how a conclusive success body is interpreted."""
+
+    BINARY = "binary"
+    JSON = "json"
+    JSON_STRICT_MEMBERS = "json_strict_members"
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedBody:
+    """Carry the result of the one strict parse of a JSON success body."""
+
+    payload: object
+    failure: ValueError | None
 
 
 class _DecodedJsonObject(dict[str, object]):
@@ -135,19 +153,15 @@ class Executor:
         if not isinstance(strict_json_members, bool):
             raise TypeError("strict_json_members must be a boolean")
         context = context or self.context(policy)
-        wire = await self._execute_wire(
+        wire, parsed = await self._execute_wire(
             request,
             context=context,
             work_class=work_class,
-            binary=False,
+            mode=_BodyMode.JSON_STRICT_MEMBERS if strict_json_members else _BodyMode.JSON,
             methods=_admission_methods or frozenset({request.method}),
         )
         try:
-            response = _decode_success(
-                wire,
-                request_summary=request.summary,
-                strict_json_members=strict_json_members,
-            )
+            response = _decode_success(wire, parsed, request_summary=request.summary)
             _raise_embedded_result_error(
                 request,
                 response.result,
@@ -174,11 +188,11 @@ class Executor:
         if not isinstance(request, Request):
             raise TypeError("request must be canonical Request")
         context = context or self.context(policy)
-        wire = await self._execute_wire(
+        wire, _parsed = await self._execute_wire(
             request,
             context=context,
             work_class=work_class,
-            binary=True,
+            mode=_BodyMode.BINARY,
             methods=frozenset({request.method}),
         )
         content_type = wire.content_type
@@ -192,9 +206,9 @@ class Executor:
         *,
         context: ExecutionContext,
         work_class: WorkClass,
-        binary: bool,
+        mode: _BodyMode,
         methods: frozenset[str],
-    ) -> WireResponse:
+    ) -> tuple[WireResponse, _ParsedBody | None]:
         """Attach request-local dispatch evidence to every escaping failure."""
         dispatch_started = False
 
@@ -207,7 +221,7 @@ class Executor:
                 request,
                 context=context,
                 work_class=work_class,
-                binary=binary,
+                mode=mode,
                 methods=methods,
                 on_dispatch=mark_dispatch_started,
             )
@@ -216,16 +230,16 @@ class Executor:
                 _mark_dispatch_started(error)
             raise
 
-    async def _execute_wire_attempts(  # noqa: C901, PLR0912, PLR0913, PLR0915
+    async def _execute_wire_attempts(  # noqa: C901, PLR0913, PLR0915
         self,
         request: Request,
         *,
         context: ExecutionContext,
         work_class: WorkClass,
-        binary: bool,
+        mode: _BodyMode,
         methods: frozenset[str],
         on_dispatch: Callable[[], None],
-    ) -> WireResponse:
+    ) -> tuple[WireResponse, _ParsedBody | None]:
         """Run the shared attempt loop and return one conclusive raw response."""
         self._preflight_request(request)
         wire_request = WireRequest(request) if self._wire_transport is not None else None
@@ -284,40 +298,12 @@ class Executor:
                 attempts += 1
                 continue
 
-            response_error: B24ApiError | None = None
-            if not binary or not _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM:
-                content_type = (wire.content_type or "").split(";", 1)[0].strip().casefold()
-                body: bytes | None = wire.body
-                if binary and content_type != "application/json" and not content_type.endswith("+json"):
-                    body = None
-                if wire.status_code < _HTTP_SUCCESS_MINIMUM or (
-                    _HTTP_REDIRECTION_MINIMUM <= wire.status_code < _HTTP_CLIENT_ERROR_MINIMUM
-                ):
-                    response_error = HTTPGatewayError(
-                        f"HTTP gateway error {wire.status_code}",
-                        request_summary=request.summary,
-                        evidence=_wire_evidence(wire),
-                    )
-                else:
-                    response_error = self.codec.error_from_http(
-                        status_code=wire.status_code,
-                        body=body,
-                        request_summary=request.summary,
-                        headers=wire.header_map,
-                        retry_codes=context.policy.retry.transient_api_codes,
-                        diagnostics=diagnostic_context(request),
-                    )
-                if response_error is None and not _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM:
-                    response_error = HTTPGatewayError(
-                        f"HTTP gateway error {wire.status_code}",
-                        request_summary=request.summary,
-                        evidence=_wire_evidence(wire),
-                    )
+            response_error, parsed = self._classify_response(request, wire, context=context, mode=mode)
             if response_error is None:
                 _raise_for_pending_cancellation()
                 if context.remaining_time(retry_started=retry_started) <= 0:
                     raise BudgetExceededError("transport completed after execution time budget")
-                return wire
+                return wire, parsed
             code = response_error.normalized_code if isinstance(response_error, ApiResponseError) else None
             method_cooldown = (
                 await context.coordinator.observe_api_throttle(request.method, code)
@@ -344,6 +330,53 @@ class Executor:
             )
             last_error = response_error
             attempts += 1
+
+    def _classify_response(
+        self,
+        request: Request,
+        wire: WireResponse,
+        *,
+        context: ExecutionContext,
+        mode: _BodyMode,
+    ) -> tuple[B24ApiError | None, _ParsedBody | None]:
+        """Classify one conclusive response, parsing a JSON success body exactly once."""
+        success = _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM
+        if success and mode is _BodyMode.BINARY:
+            return None, None
+        parsed = None
+        if success:
+            parsed = _parse_success_body(wire.body, strict_members=mode is _BodyMode.JSON_STRICT_MEMBERS)
+            # A cleanly parsed body without a top-level error is exactly what the codec passes through;
+            # structured errors and parse failures keep the codec's raw-body classification and preview.
+            if parsed.failure is None and not (isinstance(parsed.payload, Mapping) and "error" in parsed.payload):
+                return None, parsed
+        content_type = (wire.content_type or "").split(";", 1)[0].strip().casefold()
+        body: bytes | None = wire.body
+        if mode is _BodyMode.BINARY and content_type != "application/json" and not content_type.endswith("+json"):
+            body = None
+        if wire.status_code < _HTTP_SUCCESS_MINIMUM or (
+            _HTTP_REDIRECTION_MINIMUM <= wire.status_code < _HTTP_CLIENT_ERROR_MINIMUM
+        ):
+            return HTTPGatewayError(
+                f"HTTP gateway error {wire.status_code}",
+                request_summary=request.summary,
+                evidence=_wire_evidence(wire),
+            ), parsed
+        response_error = self.codec.error_from_http(
+            status_code=wire.status_code,
+            body=body,
+            request_summary=request.summary,
+            headers=wire.header_map,
+            retry_codes=context.policy.retry.transient_api_codes,
+            diagnostics=diagnostic_context(request),
+        )
+        if response_error is None and not success:
+            response_error = HTTPGatewayError(
+                f"HTTP gateway error {wire.status_code}",
+                request_summary=request.summary,
+                evidence=_wire_evidence(wire),
+            )
+        return response_error, parsed
 
     async def _prepare_retry(  # noqa: PLR0913
         self,
@@ -539,27 +572,32 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912, PLR0913
         )
 
 
-def _decode_success(
-    wire: WireResponse,
-    request_summary: RequestSummary,
-    *,
-    strict_json_members: bool = False,
-) -> Response:
-    evidence = _wire_evidence(wire)
+def _parse_success_body(body: bytes, *, strict_members: bool) -> _ParsedBody:
+    """Run the one strict JSON parse of a success body, keeping a failure for the envelope decoder."""
     try:
         payload = json.loads(
-            wire.body,
+            body.decode("utf-8"),
             parse_constant=_reject_json_constant,
-            object_pairs_hook=_DecodedJsonObject if strict_json_members else None,
+            object_pairs_hook=_DecodedJsonObject if strict_members else None,
         )
-        if strict_json_members:
+        if strict_members:
             _reject_duplicate_batch_correlation_keys(payload)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
+    except ValueError as error:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        return _ParsedBody(None, error)
+    return _ParsedBody(payload, None)
+
+
+def _decode_success(wire: WireResponse, parsed: _ParsedBody | None, *, request_summary: RequestSummary) -> Response:
+    if parsed is None:
+        raise RuntimeError("JSON success response lacks its parsed body")
+    evidence = _wire_evidence(wire)
+    if parsed.failure is not None:
         raise EnvelopeContractError(
             "Malformed successful HTTP response",
             request_summary=request_summary,
             evidence=evidence,
-        ) from error
+        ) from parsed.failure
+    payload = parsed.payload
     if not isinstance(payload, Mapping) or "result" not in payload:
         raise EnvelopeContractError(
             "Successful response is missing the result envelope",

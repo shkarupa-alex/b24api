@@ -5,11 +5,7 @@
   "noqa_package": 182,
   "long_functions": {
     "b24api/completion/gate.py::CompletionGate.emit": {
-      "lines": 167,
-      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
-    },
-    "b24api/execution/executor.py::Executor._execute_wire_attempts": {
-      "lines": 128,
+      "lines": 162,
       "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
     },
     "b24api/references/scheduler.py::ReferenceScheduler._run_reference": {

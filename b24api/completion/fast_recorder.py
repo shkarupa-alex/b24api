@@ -1,8 +1,6 @@
 """Correlate fast keyset wave commands with the sole completion gate."""
 
 from __future__ import annotations
-import hashlib
-import json
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -32,7 +30,7 @@ class _CommandPage:
     page_id: int
     settled: bool = False
     recorded: bool = False
-    identity_digest: str | None = None
+    validated: bool = False
     remaining: int | None = None
 
 
@@ -79,12 +77,12 @@ class FastCompletionRecorder:
             self._negative = True
             del self._active[command_id]
 
-    def validated(self, command_id: str, identities: tuple[int, ...]) -> None:
-        """Hold a bounded value-free digest until ordered admission is decided."""
+    def validated(self, command_id: str) -> None:
+        """Mark a settled page validated until ordered admission is decided."""
         page = self._active[command_id]
-        if not page.settled or page.identity_digest is not None:
+        if not page.settled or page.validated:
             raise RuntimeError("fast page validation lacks a unique successful settlement")
-        page.identity_digest = hashlib.sha256(json.dumps(identities, separators=(",", ":")).encode()).hexdigest()
+        page.validated = True
 
     def recorded(self, command_id: str, outcome: PageOutcome) -> None:
         """Retire a semantically accepted or rejected scheduler page."""
@@ -94,7 +92,7 @@ class FastCompletionRecorder:
         if not page.settled:
             raise RuntimeError("fast observation preceded physical settlement")
         if outcome is PageOutcome.COMMITTED:
-            if page.identity_digest is None:
+            if not page.validated:
                 raise RuntimeError("fast accepted page was not validated")
             page.recorded = True
         else:
@@ -110,16 +108,7 @@ class FastCompletionRecorder:
         if page is None or not page.recorded or page.remaining is not None or count < 0:
             raise RuntimeError("fast page admission lacks a committed physical page")
         page.remaining = count
-        digest = page.identity_digest
-        if digest is None:
-            raise RuntimeError("fast admitted page lacks an identity digest")
-        self._emit(
-            PageValidated,
-            binding_id=0,
-            page_id=page.page_id,
-            identity_digest=digest,
-            row_count=count,
-        )
+        self._emit(PageValidated, binding_id=0, page_id=page.page_id, row_count=count)
         if count == 0:
             self._acknowledge(command_id)
 

@@ -7,6 +7,11 @@
   `KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS`, `ReplayDisposition.REPLAYED_DIRECT` and
   `DIRECT_REPLAY_FAILED`, `CompletionAssurance.ORACLE_VERIFIED`, `SnapshotState.VERIFIED` and
   `CHANGED`, and `NotExecutedReason.SCHEDULER_STOPPED` (B11). See the migration guide.
+- **Breaking (3.0.0):** `PageValidated` no longer carries `identity_digest`, and the recorders no
+  longer hash identities per page; the gate checks event order and `row_count` as before (B12).
+- A JSON success body is parsed once, strictly, instead of once by the error codec and again by the
+  envelope decoder. Structured errors and malformed bodies keep their previous classification; a
+  16 MiB call decodes about 15% faster (B8).
 - The PyPI release workflow accepts only canonical stable tags `MAJOR.MINOR.PATCH` (for example
   `2.2.1`, with no `fix-` or `v` prefix) and rejects any other tag before the build backend runs. It
   then requires exactly one sdist and one wheel whose filenames and metadata carry that version, and

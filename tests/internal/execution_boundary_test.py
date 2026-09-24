@@ -26,6 +26,7 @@ from b24api.contracts.policy import AmbiguityReason, ExecutionPolicy, RetryPolic
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
+    ApiResponseError,
     BudgetExceededError,
     CapabilityError,
     ResponseTooLargeError,
@@ -435,7 +436,14 @@ class _DecoderSpy:
             self.calls += 1
             return original_error(codec, **kwargs)  # type: ignore[arg-type]
 
+        original_parse = executor_module._parse_success_body  # noqa: SLF001 - decoder spy
+
+        def parse(*args: object, **kwargs: object) -> object:
+            self.calls += 1
+            return original_parse(*args, **kwargs)  # type: ignore[arg-type]
+
         monkeypatch.setattr(executor_module, "_decode_success", decode)
+        monkeypatch.setattr(executor_module, "_parse_success_body", parse)
         monkeypatch.setattr(ProtocolCodec, "error_from_http", error_from_http)
 
 
@@ -533,3 +541,66 @@ async def test_wire_transport_response_is_bound_by_the_same_ceiling() -> None:
         await _client(transport).call(_request(ReplaySafety.SAFE), policy=_policy(max_response_bytes=CEILING))
 
     assert transport.entered == 1
+
+
+# --- B8 --------------------------------------------------------------------------------------
+
+
+class _ParseCounter:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.strict = 0
+        self.codec = 0
+        original_strict = executor_module._parse_success_body  # noqa: SLF001 - parse spy
+        original_codec = ProtocolCodec._parse_body  # noqa: SLF001 - parse spy
+
+        def strict(*args: object, **kwargs: object) -> object:
+            self.strict += 1
+            return original_strict(*args, **kwargs)  # type: ignore[arg-type]
+
+        def codec(body: object) -> object:
+            self.codec += 1
+            return original_codec(body)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(executor_module, "_parse_success_body", strict)
+        monkeypatch.setattr(ProtocolCodec, "_parse_body", staticmethod(codec))
+
+
+def _json_body(payload: object) -> Callable[[Request], WireResponse]:
+    def behavior(_request: Request) -> WireResponse:
+        return WireResponse(HTTP_OK, (("content-type", "application/json"),), json.dumps(payload).encode())
+
+    return behavior
+
+
+@pytest.mark.asyncio
+async def test_json_success_body_is_parsed_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    counter = _ParseCounter(monkeypatch)
+    transport = _Script([_json_body({"result": {"ID": "1"}, "total": 1})])
+
+    assert await _client(transport).call(_request(ReplaySafety.SAFE)) == {"ID": "1"}
+    assert (counter.strict, counter.codec) == (1, 0)
+
+
+@pytest.mark.asyncio
+async def test_batch_success_body_is_parsed_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    counter = _ParseCounter(monkeypatch)
+    transport = _Script([_envelope])
+
+    outcomes = await _drain(_client(transport).batch_outcomes([Command(_request(ReplaySafety.SAFE), 0)]))
+
+    assert [type(outcome) for outcome in outcomes] == [CommandSuccess]
+    assert (counter.strict, counter.codec) == (1, 0)
+
+
+@pytest.mark.asyncio
+async def test_structured_error_in_success_status_keeps_the_codec_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    counter = _ParseCounter(monkeypatch)
+    transport = _Script([_json_body({"error": "ACCESS_DENIED", "error_description": "denied"})])
+
+    with pytest.raises(ApiResponseError) as captured:
+        await _client(transport).call(_request(ReplaySafety.SAFE))
+
+    assert captured.value.normalized_code == "access_denied"
+    assert (counter.strict, counter.codec) == (1, 1)

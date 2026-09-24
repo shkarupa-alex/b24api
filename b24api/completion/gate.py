@@ -193,12 +193,7 @@ class CompletionGate:
             page = self._page(event)
             if page is None:
                 return
-            if (
-                page.stage is not _Stage.SETTLED
-                or type(event.row_count) is not int
-                or event.row_count < 0
-                or not event.identity_digest
-            ):
+            if page.stage is not _Stage.SETTLED or type(event.row_count) is not int or event.row_count < 0:
                 self._violate("completion_invalid_validation")
                 return
             page.stage = _Stage.VALIDATED

@@ -157,7 +157,7 @@ async def execute_wave(  # noqa: PLR0912 - one atomic correlated validation tran
                     violation=receipt.violation,
                 )
             else:
-                scheduler.completion_recorder.validated(plan.command_id, receipt.identities)
+                scheduler.completion_recorder.validated(plan.command_id)
                 receipts.append(receipt)
         if failed:
             successful = {receipt.command_id: receipt for receipt in receipts}
@@ -356,7 +356,7 @@ async def execute_finish_page(
             if receipt.error is not None:
                 raise receipt.error
             raise PaginationError(receipt.detail)
-        scheduler.completion_recorder.validated(plan.command_id, receipt.identities)
+        scheduler.completion_recorder.validated(plan.command_id)
         terminal = keyset_step.keyset_page_terminal(finish_plan, len(receipt.rows))
         await scheduler.adjust_buffer(-scheduler.effective_page_cap + len(receipt.rows))
         scheduler.admission.record_raw(len(receipt.rows))

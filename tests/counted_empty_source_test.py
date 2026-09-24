@@ -413,7 +413,7 @@ def _finished_gate(closure: BindingClosure, *, witness: bool) -> OperationReport
     recorder = CountedCompletionRecorder()
     recorder.activate(recorder.reserve())
     recorder.settled(CommandSettlement.SUCCESS)
-    recorder.validated((), 0)
+    recorder.validated(0)
     recorder.terminal(
         closure, StreamClosure.NATURAL, qualified_total=0 if closure is BindingClosure.QUALIFIED_TOTAL else None
     )

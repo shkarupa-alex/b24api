@@ -22,4 +22,4 @@ probes are replaced with placeholders such as `/rest/<user>/<token>/` before a r
 |---|---|
 | [`b24api-issues-architecture/`](b24api-issues-architecture/specification.md) | Architecture program for issues #1–#8: routes, traversal, transport and error contracts, examples |
 | [`b24api-open-issues-release-ci/`](b24api-open-issues-release-ci/specification.md) | Release workflow gate for issues #10 and #11 |
-| [`review-astra-fable/`](review-astra-fable/b11-dead-code.md) | Astra-fable review follow-up: dead-code outcomes (B11) |
+| [`review-astra-fable/`](review-astra-fable/b11-dead-code.md) | Astra-fable review follow-up: dead-code outcomes (B11), [16 MiB parse and digest benchmark](review-astra-fable/b8-b12-benchmark.md) (B8, B12) |

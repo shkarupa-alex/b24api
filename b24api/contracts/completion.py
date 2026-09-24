@@ -106,7 +106,6 @@ class PageValidated(CompletionEvent):
 
     binding_id: int
     page_id: int
-    identity_digest: str
     row_count: int
 
 
