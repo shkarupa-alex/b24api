@@ -52,8 +52,7 @@ from b24api.references.dispatch import (
     _ReferenceWindowError,
 )
 from b24api.references.dispatch_plan import kernel_dispatch
-from b24api.references.outcome import ReferenceFailure as KernelFailure
-from b24api.references.outcome import ReferenceItem as KernelItem
+from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem
 from b24api.references.stream import iter_references as _iter_references
 from b24api.traversal.driver import PaginationDriver
 from b24api.traversal.offset_rules import sequential_offset_plan
@@ -74,7 +73,7 @@ if TYPE_CHECKING:
     from b24api.contracts.stream import OperationStream
     from b24api.execution.snapshot import KernelReport
 
-type KernelReferenceEvent = KernelItem | KernelFailure | _KernelReferenceComplete
+type KernelReferenceEvent = KernelReferenceItem | KernelReferenceFailure | _KernelReferenceComplete
 type Deregister = Callable[[object], None]
 
 
@@ -200,7 +199,7 @@ class _ReferenceEventMapper:
 
     def __call__(self, event: KernelReferenceEvent) -> ReferenceOutcome[object]:
         """Convert one kernel event without interpreting correlation."""
-        if isinstance(event, KernelItem):
+        if isinstance(event, KernelReferenceItem):
             context = cast("_BindingContext", event.correlation)
             item_index = self._item_indexes.get(context.index, 0)
             self._item_indexes[context.index] = item_index + 1

@@ -276,7 +276,7 @@ class ItemCursorPlan(PlanContract):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class BatchDispatch:
+class KernelBatchDispatch:
     """Explicit bounded batch dispatch."""
 
     batch_size: int = PORTAL_BATCH_CAP
@@ -300,7 +300,7 @@ class BatchDispatch:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class DirectDispatch:
+class KernelDirectDispatch:
     """Explicit bounded direct dispatch."""
 
     concurrency: int = 10
@@ -315,7 +315,7 @@ class DirectDispatch:
 
 
 type ListPlan = SingleResponsePlan | OffsetSequentialPlan | CountedOffsetPlan | KeysetPlan | ItemCursorPlan
-type DispatchPlan = BatchDispatch | DirectDispatch
+type DispatchPlan = KernelBatchDispatch | KernelDirectDispatch
 
 
 def _validate_page_size(limit_path: ParameterPath | None, requested_page_size: int | None) -> None:
@@ -343,13 +343,13 @@ def _is_plain_int(value: object) -> bool:
 
 
 __all__ = [
-    "BatchDispatch",
     "CountedOffsetMode",
     "CountedOffsetPlan",
     "CursorTerminalRule",
-    "DirectDispatch",
     "DispatchPlan",
     "ItemCursorPlan",
+    "KernelBatchDispatch",
+    "KernelDirectDispatch",
     "KeysetPlan",
     "KeysetTerminalRule",
     "ListPlan",

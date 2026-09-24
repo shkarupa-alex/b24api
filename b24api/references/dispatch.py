@@ -18,8 +18,8 @@ from b24api.execution import (
     WorkClass,
 )
 from b24api.references.outcome import (
-    ReferenceFailure,
-    ReferenceItem,
+    KernelReferenceFailure,
+    KernelReferenceItem,
     ReferenceRequest,
 )
 
@@ -30,8 +30,8 @@ if TYPE_CHECKING:
     from b24api.contracts.request import Request
     from b24api.contracts.response import Response
     from b24api.traversal.plans import (
-        BatchDispatch,
-        DirectDispatch,
+        KernelBatchDispatch,
+        KernelDirectDispatch,
     )
     from b24api.traversal.values import IdentityValue
 
@@ -114,11 +114,13 @@ class _KernelFanOutSuccess:
     response: Response
 
 
-type ReferenceStreamItem = ReferenceItem | ReferenceFailure | _KernelReferenceComplete | _KernelFanOutSuccess
+type ReferenceStreamItem = (
+    KernelReferenceItem | KernelReferenceFailure | _KernelReferenceComplete | _KernelFanOutSuccess
+)
 
 
 class _ReferenceWindowError(Exception):
-    def __init__(self, failure: ReferenceFailure) -> None:
+    def __init__(self, failure: KernelReferenceFailure) -> None:
         self.failure = failure
         self.replay_disposition = failure.replay_disposition
         super().__init__("reference traversal window failed")
@@ -321,7 +323,7 @@ class _DirectPageDispatcher:
         self,
         executor: Executor,
         context: ExecutionContext,
-        plan: DirectDispatch,
+        plan: KernelDirectDispatch,
     ) -> None:
         self.executor = executor
         self.context = context
@@ -362,7 +364,7 @@ class _BatchPageDispatcher:
         self,
         executor: Executor,
         context: ExecutionContext,
-        plan: BatchDispatch,
+        plan: KernelBatchDispatch,
         *,
         producer_state: _ProducerState | None = None,
         buffer: _RowBuffer | None = None,

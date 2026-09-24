@@ -10,9 +10,9 @@ from b24api.contracts.completion import BindingClosure
 from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
 from b24api.traversal.plans import (
     CountedOffsetPlan,
-    DirectDispatch,
     DispatchPlan,
     ItemCursorPlan,
+    KernelDirectDispatch,
     KeysetPlan,
     ListPlan,
     OffsetSequentialPlan,
@@ -131,7 +131,7 @@ def _page_cap(
     page_cap_hint: int | None,
 ) -> int:
     if whole_result:
-        if isinstance(dispatch, DirectDispatch):
+        if isinstance(dispatch, KernelDirectDispatch):
             concurrent_results = min(
                 dispatch.concurrency,
                 policy.max_direct_concurrency,

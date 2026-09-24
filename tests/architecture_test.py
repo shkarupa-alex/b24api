@@ -467,3 +467,13 @@ def test_pagination_driver_composes_strategies_instead_of_inheriting_them() -> N
         if isinstance(node, ast.ClassDef) and node.name.endswith("Mixin")
     ]
     assert not mixins
+
+
+def test_no_public_class_name_is_defined_twice() -> None:
+    # One name per concept (D30): kernel copies of public values carry a Kernel prefix.
+    owners: dict[str, list[str]] = {}
+    for path in _sources():
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+                owners.setdefault(node.name, []).append(path.relative_to(PACKAGE).as_posix())
+    assert {name: paths for name, paths in owners.items() if len(paths) > 1} == {}

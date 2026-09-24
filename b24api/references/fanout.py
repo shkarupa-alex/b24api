@@ -21,8 +21,7 @@ from b24api.references.dispatch import (
     _ReferenceWindowError,
 )
 from b24api.references.dispatch_plan import kernel_dispatch
-from b24api.references.outcome import ReferenceFailure as KernelFailure
-from b24api.references.outcome import ReferenceRequest
+from b24api.references.outcome import KernelReferenceFailure, ReferenceRequest
 from b24api.references.stream import (
     iter_references as _iter_references,
 )
@@ -37,7 +36,7 @@ if TYPE_CHECKING:
     from b24api.execution.snapshot import KernelReport
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
-type KernelFanOutEvent = _KernelFanOutSuccess | KernelFailure
+type KernelFanOutEvent = _KernelFanOutSuccess | KernelReferenceFailure
 type Deregister = Callable[[object], None]
 
 

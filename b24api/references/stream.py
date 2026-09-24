@@ -31,13 +31,13 @@ from b24api.references.dispatch import (
     ReferenceSource,
     ReferenceStreamItem,
 )
-from b24api.references.outcome import ReferenceItem, ReferenceRequest
+from b24api.references.outcome import KernelReferenceItem, ReferenceRequest
 from b24api.references.scheduler import ReferenceScheduler
 from b24api.traversal import PaginationDriver
 from b24api.traversal.plans import (
-    BatchDispatch,
-    DirectDispatch,
     DispatchPlan,
+    KernelBatchDispatch,
+    KernelDirectDispatch,
     ListPlan,
     ReferenceOutputOrder,
 )
@@ -114,7 +114,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     async def _run(self) -> AsyncGenerator[ReferenceStreamItem]:
         outcomes = self._outcomes = self._scheduler.outcomes(self._source)
         async for outcome in outcomes:
-            if isinstance(outcome, ReferenceItem):
+            if isinstance(outcome, KernelReferenceItem):
                 self._emitted += 1
                 if self._scheduler.record_delivery(outcome):
                     self._unique_emitted += 1
@@ -229,7 +229,7 @@ def iter_references(  # noqa: PLR0913
 ) -> ReferenceStream:
     """Construct a lazy bounded reference traversal stream without I/O."""
     PaginationDriver.validate_plan(plan)
-    if not isinstance(dispatch, BatchDispatch | DirectDispatch):
+    if not isinstance(dispatch, KernelBatchDispatch | KernelDirectDispatch):
         raise TypeError("dispatch must be a canonical DispatchPlan")
     if not isinstance(output_order, ReferenceOutputOrder):
         raise TypeError("output_order must be ReferenceOutputOrder")

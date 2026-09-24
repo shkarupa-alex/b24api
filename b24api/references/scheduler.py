@@ -40,8 +40,8 @@ from b24api.references.dispatch import (
     _Work,
 )
 from b24api.references.outcome import (
-    ReferenceFailure,
-    ReferenceItem,
+    KernelReferenceFailure,
+    KernelReferenceItem,
     ReferenceRequest,
 )
 from b24api.references.support import (
@@ -57,9 +57,9 @@ from b24api.references.support import (
 )
 from b24api.traversal import PaginationDriver
 from b24api.traversal.plans import (
-    BatchDispatch,
-    DirectDispatch,
     DispatchPlan,
+    KernelBatchDispatch,
+    KernelDirectDispatch,
     ListPlan,
     ReferenceOutputOrder,
 )
@@ -131,7 +131,7 @@ class ReferenceScheduler:
             producer_state=self.producer_state,
         )
         self.dispatcher: _PageDispatcher
-        if isinstance(dispatch, DirectDispatch):
+        if isinstance(dispatch, KernelDirectDispatch):
             self.dispatcher = _DirectPageDispatcher(executor, self.context, dispatch)
         else:
             self.dispatcher = _BatchPageDispatcher(
@@ -146,7 +146,7 @@ class ReferenceScheduler:
         self.violations: list[Violation] = []
         self.page_trace: list[PageRecord] = []
         self.page_trace_truncated = False
-        self._delivery_uniqueness: dict[int, tuple[ReferenceItem, bool]] = {}
+        self._delivery_uniqueness: dict[int, tuple[KernelReferenceItem, bool]] = {}
         self._source_controller: AsyncIteratorController[ReferenceRequest] | None = None
         self.active_references_high_water = 0
         self._next_page_sequence = 0
@@ -374,7 +374,7 @@ class ReferenceScheduler:
                 if reservation is not None:
                     await self.buffer.abort(reservation)
                 reservation = None
-                dispatch = PageDispatch.BATCH if isinstance(self.dispatch, BatchDispatch) else PageDispatch.DIRECT
+                dispatch = PageDispatch.BATCH if isinstance(self.dispatch, KernelBatchDispatch) else PageDispatch.DIRECT
                 batch_index = error.failure.command_index if isinstance(error, _BatchPageError) else None
                 report_error = (
                     error.failure.error
@@ -636,7 +636,7 @@ class ReferenceScheduler:
                     event.unique_mask,
                     strict=True,
                 ):
-                    outcome = ReferenceItem._from_frozen(  # noqa: SLF001 - trusted frozen traversal row
+                    outcome = KernelReferenceItem._from_frozen(  # noqa: SLF001 - trusted frozen traversal row
                         event.work.reference.reference_key,
                         item,
                         event.work.reference.correlation,
@@ -663,7 +663,7 @@ class ReferenceScheduler:
             event.work.index,
             BindingClosure.UNKNOWN if self.completion.binding(event.work.index).unknown else BindingClosure.FAILURE,
         )
-        failure = ReferenceFailure(
+        failure = KernelReferenceFailure(
             event.work.reference.reference_key,
             request,
             event.error,
@@ -688,7 +688,7 @@ class ReferenceScheduler:
         self.violations[:] = retain_violations((*self.violations, violation))
         yield failure
 
-    def record_delivery(self, item: ReferenceItem) -> bool:
+    def record_delivery(self, item: KernelReferenceItem) -> bool:
         """Record one delivered reference item."""
         stored = self._delivery_uniqueness.pop(id(item), None)
         return stored is not None and stored[0] is item and stored[1]

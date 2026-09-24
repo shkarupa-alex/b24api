@@ -1,4 +1,4 @@
-"""Immutable public values shared by execution and evidence layers."""
+"""Immutable reference-kernel values; the public outcomes live in b24api.contracts.reference."""
 
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -47,7 +47,7 @@ class ReferenceRequest:
 
 
 @dataclass(frozen=True, slots=True, init=False)
-class ReferenceItem:
+class KernelReferenceItem:
     """Successful reference item; raw item and correlation are hidden from repr."""
 
     reference_key: str = field(repr=False)
@@ -63,7 +63,7 @@ class ReferenceItem:
         object.__setattr__(self, "correlation", correlation)
 
     @classmethod
-    def _from_frozen(cls, reference_key: str, item: FrozenJson, correlation: object = None) -> ReferenceItem:
+    def _from_frozen(cls, reference_key: str, item: FrozenJson, correlation: object = None) -> KernelReferenceItem:
         """Build one trusted internal item without thawing and freezing it again."""
         if not reference_key or len(reference_key) > STABLE_KEY_MAXIMUM:
             raise ValueError("reference_key must be 1..100 characters")
@@ -80,7 +80,7 @@ class ReferenceItem:
 
 
 @dataclass(frozen=True, slots=True, init=False)
-class ReferenceFailure:
+class KernelReferenceFailure:
     """Failed reference state with raw correlation excluded from repr."""
 
     reference_key: str = field(repr=False)
@@ -137,6 +137,3 @@ class ReferenceFailure:
     def cursor(self) -> JsonValue:
         """Return the cursor."""
         return _thaw_json(self._cursor)
-
-
-type ReferenceOutcome = ReferenceItem | ReferenceFailure

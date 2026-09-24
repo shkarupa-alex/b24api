@@ -12,6 +12,9 @@
 - A JSON success body is parsed once, strictly, instead of once by the error codec and again by the
   envelope decoder. Structured errors and malformed bodies keep their previous classification; a
   16 MiB call decodes about 15% faster (B8).
+- Internal kernel copies of public values carry a `Kernel` prefix (`KernelReferenceItem`,
+  `KernelReferenceFailure`, `KernelBatchDispatch`, `KernelDirectDispatch`), so every public class name
+  has one definition; an architecture test keeps it that way (D30).
 - The PyPI release workflow accepts only canonical stable tags `MAJOR.MINOR.PATCH` (for example
   `2.2.1`, with no `fix-` or `v` prefix) and rejects any other tag before the build backend runs. It
   then requires exactly one sdist and one wheel whose filenames and metadata carry that version, and
