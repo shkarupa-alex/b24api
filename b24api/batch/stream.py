@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterator
-from dataclasses import replace
 from typing import Protocol, Self, cast, runtime_checkable
 
 from b24api.batch.engine import (
@@ -36,6 +35,12 @@ from b24api.execution import (
     await_cancellation_resistant,
     await_cleanup_resistant,
     rearm_cancellation,
+)
+from b24api.execution.failure import (
+    CLEANUP_FAILED_REASON,
+    EARLY_CLOSE_REASON,
+    report_reason,
+    with_cleanup_failure,
 )
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
@@ -137,7 +142,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             self._prefetched = _MISSING
         await self._observe_source_cleanup()
         if self.report.state is KernelState.NOT_STARTED and self._runner is not None:
-            await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
+            await self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON)
 
     async def _run(self) -> AsyncGenerator[BatchStreamItem]:  # noqa: C901, PLR0912, PLR0915
         await self._context.start()
@@ -215,7 +220,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         except GeneratorExit as error:
             primary_error = error
             cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.CANCELLED, "stream closed before exhaustion"),
+                self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON),
             )
             if cancellation is not None:
                 primary_error = cancellation
@@ -226,7 +231,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         except BaseException as error:
             primary_error = error
             cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.FAILED, type(error).__name__),
+                self._finalize(KernelState.FAILED, report_reason(error)),
             )
             if cancellation is not None:
                 _attach_report(cancellation, self.report)
@@ -283,33 +288,13 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             raise
 
     def _record_cleanup_failure(self, error: BaseException, primary_error: BaseException) -> None:
-        violation = Violation(
-            severity=ViolationSeverity.BLOCKING,
-            code="cleanup_failure",
-            message=f"batch cleanup also failed ({type(error).__name__})",
-        )
-        self.report = replace(self.report, violations=(*self.report.violations, violation))
+        self.report = with_cleanup_failure(self.report, error, terminal=False)
         _attach_report(primary_error, self.report)
 
     async def _record_terminal_cleanup_failure(self, error: BaseException) -> None:
         if self.report.state is KernelState.NOT_STARTED:
-            await self._finalize(KernelState.FAILED, "stream cleanup failed")
-        violations = self.report.violations
-        if not any(violation.code == "cleanup_failure" for violation in violations):
-            violations = (
-                *violations,
-                Violation(
-                    severity=ViolationSeverity.BLOCKING,
-                    code="cleanup_failure",
-                    message=f"batch cleanup failed ({type(error).__name__})",
-                ),
-            )
-        self.report = replace(
-            self.report,
-            state=KernelState.FAILED,
-            terminal_reason="stream cleanup failed",
-            violations=violations,
-        )
+            await self._finalize(KernelState.FAILED, CLEANUP_FAILED_REASON)
+        self.report = with_cleanup_failure(self.report, error, terminal=True)
         _attach_report(error, self.report)
 
     async def _finalize(self, state: KernelState, reason: str) -> None:

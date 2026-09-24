@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass, replace
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from b24api.contracts.policy import KernelState, ReplayDisposition
 from b24api.contracts.report import TerminalState, Violation, ViolationSeverity
@@ -26,6 +26,9 @@ from b24api.errors import (
     ResultShapeError,
     TransportError,
 )
+
+if TYPE_CHECKING:
+    from b24api.execution.snapshot import KernelReport
 
 R = TypeVar("R")
 
@@ -80,6 +83,44 @@ def classify_failure(error: BaseException) -> FailureClass:  # noqa: C901, PLR09
     return FailureClass("internal_failure")
 
 
+EARLY_CLOSE_REASON = "stream closed before exhaustion"
+
+
+def report_reason(error: BaseException) -> str:
+    """Return the public terminal reason for a failure: its report cause's declared name or type name.
+
+    Private carrier exceptions declare ``report_cause`` (the public failure they carry) and may declare
+    ``report_name``, so a report never names a private class.
+    """
+    cause = getattr(error, "report_cause", error)
+    if not isinstance(cause, BaseException):
+        cause = error
+    return str(getattr(cause, "report_name", type(cause).__name__))
+
+
+def cleanup_failure_violation(error: BaseException, *, secondary: bool) -> Violation:
+    """Record a cleanup failure; ``secondary`` marks one that follows an earlier primary failure."""
+    outcome = "also failed" if secondary else "failed"
+    return Violation(ViolationSeverity.BLOCKING, "cleanup_failure", f"batch cleanup {outcome} ({type(error).__name__})")
+
+
+CLEANUP_FAILED_REASON = "stream cleanup failed"
+
+
+def with_cleanup_failure(report: KernelReport, error: BaseException, *, terminal: bool) -> KernelReport:
+    """Return the kernel report with one cleanup-failure violation.
+
+    A terminal cleanup failure (no earlier primary failure) also turns the report FAILED with
+    ``CLEANUP_FAILED_REASON``; a secondary one keeps the primary outcome and adds its violation.
+    """
+    violations = report.violations
+    if not (terminal and any(item.code == "cleanup_failure" for item in violations)):
+        violations = (*violations, cleanup_failure_violation(error, secondary=not terminal))
+    if not terminal:
+        return replace(report, violations=violations)
+    return replace(report, state=KernelState.FAILED, terminal_reason=CLEANUP_FAILED_REASON, violations=violations)
+
+
 def attach_report(error: BaseException, report: object) -> None:
     """Attach immutable report evidence without replacing the primary error."""
     with contextlib.suppress(AttributeError, TypeError):
@@ -107,7 +148,7 @@ def finalize_failure[R](
     if isinstance(error, IncompleteTraversalError):
         report_error = error.error or report_error
         replay_disposition = error.replay_disposition
-    error_name = str(getattr(report_error, "report_name", type(report_error).__name__))
+    error_name = report_reason(report_error)
     reason = terminal_reason if terminal_reason and terminal_reason != error_name else f"{operation} failed"
     violations = tuple(getattr(report, "violations", ()))
     if not any(item.code == failure.code for item in violations):
@@ -147,4 +188,13 @@ def finalize_failure[R](
     return frozen, error
 
 
-__all__ = ["FailureClass", "classify_failure", "finalize_failure"]
+__all__ = [
+    "CLEANUP_FAILED_REASON",
+    "EARLY_CLOSE_REASON",
+    "FailureClass",
+    "classify_failure",
+    "cleanup_failure_violation",
+    "finalize_failure",
+    "report_reason",
+    "with_cleanup_failure",
+]

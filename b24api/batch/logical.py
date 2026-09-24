@@ -5,7 +5,7 @@
 from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator
-from typing import Protocol, Self, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, Self, cast, runtime_checkable
 
 from b24api.batch.engine import BatchExecutor, BatchSource, _BatchInput, _BatchItem, _BatchNotExecutedError
 from b24api.batch.outcome import BatchFailure as KernelFailure
@@ -37,7 +37,16 @@ from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
 )
+from b24api.execution.failure import (
+    CLEANUP_FAILED_REASON,
+    EARLY_CLOSE_REASON,
+    report_reason,
+    with_cleanup_failure,
+)
 from b24api.execution.snapshot import KernelReport
+
+if TYPE_CHECKING:
+    from b24api.execution.context import _CleanupOutcome
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
 
@@ -105,8 +114,23 @@ def _adapt_source[C](
 
 
 class _BatchWindowError(Exception):
-    def __init__(self, outcomes: tuple[CommandOutcome[object], ...]) -> None:
+    """Carry the failed fail-fast window; reports name the public failure it carries (``report_cause``)."""
+
+    report_name = "BatchFailed"
+
+    def __init__(
+        self,
+        outcomes: tuple[CommandOutcome[object], ...],
+        *,
+        source_error: BaseException | None = None,
+    ) -> None:
         self.outcomes = outcomes
+        errors = (getattr(outcome, "error", None) for outcome in outcomes)
+        carried = next((error for error in errors if isinstance(error, BaseException)), None)
+        if source_error is not None:
+            carried = InputSourceError("Logical batch input source failed")
+            carried.__cause__ = source_error
+        self.report_cause: BaseException = carried if carried is not None else self
         super().__init__("logical batch physical window failed")
 
 
@@ -194,6 +218,7 @@ class LogicalBatchKernelStream[C]:
         self._context = executor.context(policy)
         self._completion = ReferenceCompletionRecorder()
         self._completion_cleanup_done = False
+        self._cleanup_failed = False
         self._runner: AsyncIterator[CommandOutcome[object]] | None = None
         self._controller: AsyncIteratorController[_BatchItem] | None = None
         self._closed = False
@@ -216,7 +241,7 @@ class LogicalBatchKernelStream[C]:
     def _finish_completion_cleanup(self) -> None:
         if self._completion_cleanup_done or self.report.state is KernelState.NOT_STARTED:
             return
-        self._completion.cleanup(CleanupState.SUCCESS)
+        self._completion.cleanup(CleanupState.FAILURE if self._cleanup_failed else CleanupState.SUCCESS)
         self._completion_cleanup_done = True
 
     def _settle_outcome(self, outcome: CommandOutcome[object]) -> None:
@@ -260,12 +285,15 @@ class LogicalBatchKernelStream[C]:
         if self._closed:
             return
         self._closed = True
-        if self._runner is not None and hasattr(self._runner, "aclose"):
-            await cast("_AsyncClosable", self._runner).aclose()
-        await self._close_controller()
-        if self.report.state is KernelState.NOT_STARTED:
-            await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
-        self._finish_completion_cleanup()
+        try:
+            if self._runner is not None and hasattr(self._runner, "aclose"):
+                await cast("_AsyncClosable", self._runner).aclose()
+            await self._close_controller()
+            if self.report.state is KernelState.NOT_STARTED:
+                await self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON)
+        finally:
+            # Cleanup evidence is recorded even when closing fails, so the report is always published.
+            self._finish_completion_cleanup()
 
     async def _run(self) -> AsyncGenerator[CommandOutcome[object]]:  # noqa: C901
         await self._context.start()
@@ -316,7 +344,9 @@ class LogicalBatchKernelStream[C]:
                         for command in chunk.commands
                     )
                     if self._fail_fast:
-                        raise _BatchWindowError(cast("tuple[CommandOutcome[object], ...]", pending))
+                        raise _BatchWindowError(
+                            cast("tuple[CommandOutcome[object], ...]", pending), source_error=chunk.source_error
+                        )
                     for pending_outcome in pending:
                         self._emitted += 1
                         yield pending_outcome
@@ -362,35 +392,62 @@ class LogicalBatchKernelStream[C]:
             if repeated is not None:
                 pending_cancellation = repeated
             raise
+        except GeneratorExit as error:
+            primary_error = error
+            cancellation = await await_cancellation_resistant(self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON))
+            if cancellation is not None:
+                raise cancellation from error
+            raise
         except BaseException as error:
             primary_error = error
             pending_cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.FAILED, type(error).__name__),
+                self._finalize(KernelState.FAILED, report_reason(error)),
             )
             raise
         finally:
             await self._context.set_buffered_rows(0)
             cleanup = await await_cleanup_resistant(self._close_controller())
-            if cleanup.error is not None:
-                if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                    await self._finalize(KernelState.FAILED, "batch source cleanup failed")
-                    rearm_cancellation(cleanup.cancellation)
-                    raise cleanup.error
-                primary_error.add_note(f"batch source cleanup also failed ({type(cleanup.error).__name__})")
-            if cleanup.cancellation is not None:
-                if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                    raise cleanup.cancellation
-                pending_cancellation = cleanup.cancellation
+            pending_cancellation = await self._settle_cleanup(cleanup, primary_error) or pending_cancellation
             self._closed = True
             if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
                 rearm_cancellation(pending_cancellation)
 
     async def _close_controller(self) -> None:
-        controller = self._controller
+        # One close attempt: a failed close is recorded once and never retried by a later aclose().
+        controller, self._controller = self._controller, None
         if controller is None:
             return
         await controller.aclose(remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed))
-        self._controller = None
+
+    async def _settle_cleanup(
+        self,
+        cleanup: _CleanupOutcome,
+        primary_error: BaseException | None,
+    ) -> asyncio.CancelledError | None:
+        """Record the source cleanup result; return a cancellation deferred behind a primary failure.
+
+        Without a primary failure (exhaustion, early close, cancellation) a cleanup failure becomes the
+        raised error and turns the report FAILED; behind a primary failure it only adds a violation.
+        """
+        if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
+            if cleanup.error is not None:
+                self._cleanup_failed = True
+                if self.report.state is KernelState.NOT_STARTED:
+                    await self._finalize(KernelState.FAILED, CLEANUP_FAILED_REASON)
+                self.report = with_cleanup_failure(self.report, cleanup.error, terminal=True)
+                primary_cancellation = primary_error if isinstance(primary_error, asyncio.CancelledError) else None
+                rearm_cancellation(cleanup.cancellation or primary_cancellation)
+                raise cleanup.error
+            if cleanup.cancellation is not None:
+                raise cleanup.cancellation
+            return None
+        for failure in (cleanup.error, cleanup.cancellation):
+            if failure is not None:
+                self._cleanup_failed = True
+                self.report = with_cleanup_failure(self.report, failure, terminal=False)
+        if cleanup.error is not None:
+            primary_error.add_note(f"batch source cleanup also failed ({type(cleanup.error).__name__})")
+        return cleanup.cancellation
 
     async def _finalize(self, state: KernelState, reason: str) -> None:
         if self.report.state is not KernelState.NOT_STARTED:

@@ -12,7 +12,7 @@ from b24api.contracts.json import _freeze_json
 from b24api.contracts.reference import Binding
 from b24api.contracts.traversal import CursorTraversal, TraversalSpec, traversal_control_paths
 from b24api.contracts.violation import retain_violations
-from b24api.errors import CapabilityError, PaginationError
+from b24api.errors import CapabilityError, InputSourceError, PaginationError
 from b24api.references.outcome import ReferenceRequest
 from b24api.traversal.cursor_domain import validate_cursor_value
 from b24api.traversal.identity import _request_with_controls
@@ -47,7 +47,11 @@ class _BindingContext:
 
 
 class _BindingSourceError(Exception):
-    pass
+    """Carry a failed binding source; reports name the public failure it maps to (``report_cause``)."""
+
+    def __init__(self) -> None:
+        super().__init__("reference input source failed")
+        self.report_cause = InputSourceError("Reference input source failed")
 
 
 class _BindingLocalValidationError(ValueError):

@@ -75,7 +75,11 @@ class _CommandContext:
 
 
 class _CommandSourceError(Exception):
-    pass
+    """Carry a failed fan-out input source; reports name the public failure it maps to (``report_cause``)."""
+
+    def __init__(self) -> None:
+        super().__init__("fan-out input source failed")
+        self.report_cause = InputSourceError("Fan-out input source failed")
 
 
 def _reference(command: Command[object], index: int) -> ReferenceRequest:
@@ -197,8 +201,7 @@ def _fanout_error(
     if isinstance(error, _ReferenceWindowError):
         return BatchFailed(_fanout_error_items(error, mapper), report=report)
     if isinstance(error, _CommandSourceError):
-        source_error = InputSourceError("Fan-out input source failed")
-        return source_error if tolerant else BatchFailed((), report=report)
+        return error.report_cause if tolerant else BatchFailed((), report=report)
     return error
 
 

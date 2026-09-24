@@ -11,6 +11,7 @@ from b24api.contracts.policy import KernelState
 from b24api.contracts.report import OperationReport, TerminalState, TraversalAssurance, Violation
 from b24api.contracts.stream import PartialResult
 from b24api.errors import IncompleteTraversalError
+from b24api.execution.context import await_cleanup_resistant, rearm_cancellation
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.failure import finalize_failure
 
@@ -122,13 +123,16 @@ class MappedOperationStream[S, T]:
             self._finalize()
             raise
         except asyncio.CancelledError as error:
-            await self._close_source()
-            self._finalize(forced_state=TerminalState.CANCELLED)
+            await self._close_then_finalize(TerminalState.CANCELLED)
             _attach_report(error, cast("OperationReport", self._report))
             self._terminal_error = error
             raise
         except BaseException as error:
-            await self._close_source()
+            cleanup = await await_cleanup_resistant(self._close_source())
+            if cleanup.error is not None:
+                # The primary failure stays the raised one; the source already recorded its cleanup violation.
+                error.add_note(f"stream cleanup also failed ({type(cleanup.error).__name__})")
+            rearm_cancellation(cleanup.cancellation)
             if self._error_items is not None:
                 for item in self._error_items(error):
                     if self._count_admitted is None or self._count_admitted(item):
@@ -169,8 +173,7 @@ class MappedOperationStream[S, T]:
             pull.cancel()
             with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
                 await pull
-        await self._close_source()
-        self._finalize(forced_state=TerminalState.EARLY_CLOSED)
+        await self._close_then_finalize(TerminalState.EARLY_CLOSED)
 
     async def first(self) -> PartialResult[tuple[T, ...]]:
         """Consume zero or one item without an extra proof pull."""
@@ -199,6 +202,16 @@ class MappedOperationStream[S, T]:
 
     async def _close_source(self) -> None:
         await self._source.aclose()
+
+    async def _close_then_finalize(self, forced_state: TerminalState) -> None:
+        """Close the source and publish the report even when closing fails; the close failure carries it."""
+        try:
+            await self._close_source()
+        except BaseException as error:
+            self._finalize(forced_state=forced_state)
+            _attach_report(error, cast("OperationReport", self._report))
+            raise
+        self._finalize(forced_state=forced_state)
 
     def _record_variant(self, item: T) -> None:
         variant = self._classify(item) if self._classify is not None else "success"

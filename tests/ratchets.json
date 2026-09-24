@@ -6,7 +6,7 @@
   "untyped_self_traversal": 9,
   "long_functions": {
     "b24api/batch/logical.py::LogicalBatchKernelStream._run": {
-      "lines": 117,
+      "lines": 116,
       "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
     },
     "b24api/batch/stream.py::_BatchOutcomeStream._run": {

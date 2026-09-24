@@ -42,7 +42,6 @@ from b24api.errors import (
     B24ApiError,
     CapabilityError,
     IncompleteTraversalError,
-    InputSourceError,
     PageAdaptationError,
     PaginationError,
     ReferenceFailed,
@@ -281,7 +280,7 @@ def _reference_error(error: BaseException, report: OperationReport, mapper: _Ref
     if isinstance(error, _ReferenceWindowError):
         return ReferenceFailed(_reference_error_items(error, mapper), report=report)
     if isinstance(error, _BindingSourceError):
-        return InputSourceError("Reference input source failed")
+        return error.report_cause
     return error
 
 

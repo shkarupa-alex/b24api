@@ -243,9 +243,9 @@ def test_report_replacements_stay_on_reviewed_downgrade_sites() -> None:
         and node.args
         and "report" in ast.unparse(node.args[0]).casefold()
     }
-    # batch/stream.py and traversal/stream.py replace their KernelReport; references/support.py and
-    # execution/failure.py only downgrade a report to FAILED/INCOMPLETE with exhausted=False.
-    assert sites == {"batch/stream.py", "traversal/stream.py", "references/support.py", "execution/failure.py"}
+    # traversal/stream.py replaces its KernelReport; references/support.py and execution/failure.py only
+    # downgrade a report to FAILED/INCOMPLETE with exhausted=False or add a cleanup-failure violation.
+    assert sites == {"traversal/stream.py", "references/support.py", "execution/failure.py"}
 
 
 def test_failure_classification_importers_stay_inside_state_machine_layers() -> None:

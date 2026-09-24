@@ -23,6 +23,7 @@ from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
 )
+from b24api.execution.failure import EARLY_CLOSE_REASON, report_reason
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 from b24api.references.dispatch import (
@@ -70,6 +71,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         self._unique_emitted = 0
         self._assurance = assurance
         self._completion_cleanup_done = False
+        self._close_attempted = False
         self.report = KernelReport(assurance=assurance)
 
     def __aiter__(self) -> Self:
@@ -133,7 +135,17 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close owned asynchronous resources."""
+        """Close owned asynchronous resources; a repeated close after a completed one does nothing."""
+        if self._close_attempted:
+            return
+        self._close_attempted = True
+        try:
+            await self._close_owned()
+        finally:
+            # Cleanup evidence is recorded even when closing fails, so the report is always published.
+            self._finish_completion_cleanup()
+
+    async def _close_owned(self) -> None:
         if self._closed:
             await self._observe_source_cleanup()
             return
@@ -155,8 +167,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             self._prefetched = _MISSING
         await self._observe_source_cleanup()
         if self.report.state is KernelState.NOT_STARTED and self._runner is not None:
-            await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
-        self._finish_completion_cleanup()
+            await self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON)
 
     async def _observe_source_cleanup(self) -> None:
         try:
@@ -196,7 +207,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         except GeneratorExit as error:
             primary_error = error
             cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.CANCELLED, "stream closed before exhaustion"),
+                self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON),
             )
             if cancellation is not None:
                 primary_error = cancellation
@@ -206,14 +217,8 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             raise
         except BaseException as error:
             primary_error = error
-            terminal_error = getattr(error, "report_cause", error)
-            if not isinstance(terminal_error, BaseException):
-                terminal_error = error
-            terminal_name = getattr(terminal_error, "report_name", type(terminal_error).__name__)
-            if not isinstance(terminal_name, str):
-                terminal_name = type(terminal_error).__name__
             cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.FAILED, terminal_name),
+                self._finalize(KernelState.FAILED, report_reason(error)),
             )
             if cancellation is not None:
                 _attach_report(cancellation, self.report)
