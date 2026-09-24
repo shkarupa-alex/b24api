@@ -8,6 +8,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TypedDict, cast
 
+from b24api._diagnostics import DiagnosticContext
 from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, _thaw_json
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.positional import PositionalArguments
@@ -352,6 +353,17 @@ class Request:
     def __repr__(self) -> str:
         """Return a safe representation."""
         return f"Request(summary={self.summary!r}, replay_safety={self.replay_safety!r})"
+
+
+def diagnostic_context(request: Request) -> DiagnosticContext:
+    """Derive the private diagnostic context bound to this one canonical request.
+
+    The context is a pure function of the frozen request, resolved lazily on the error path, so it
+    adds no per-request cost and is never stored on the request, a shared context or a report.
+    Positional PHP arguments carry no named field positions and get an empty alias map.
+    """
+    parameters = request._parameters if request._positional is None else None  # noqa: SLF001 - owning module
+    return DiagnosticContext(parameters, headers=request.headers.items)
 
 
 type RequestLike = Request | RequestSpec

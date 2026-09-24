@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from b24api._error_types import ErrorOrigin
 from b24api.contracts.response import ResponseEvidence
+from b24api.contracts.v3_codes import NON_RETRYABLE_V3_ERROR_CODES
 from b24api.errors import (
     ApiResponseError,
     B24ApiError,
@@ -18,6 +19,7 @@ from b24api.errors import (
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 if TYPE_CHECKING:
+    from b24api._diagnostics import DiagnosticContext
     from b24api.contracts.request import RequestSummary
 
 _SAFE_HEADER_NAMES = frozenset(
@@ -34,12 +36,6 @@ HTTP_ERROR_MINIMUM = 400
 _MAX_VALIDATION_ITEMS = 32
 _MAX_VALIDATION_TEXT = 256
 _MAX_V3_SAFE_BYTES = 8 * 1024
-_NON_RETRYABLE_V3_CODES = frozenset(
-    {
-        "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION",
-        "BITRIX_REST_V3_EXCEPTION_METHODNOTFOUNDEXCEPTION",
-    }
-)
 
 
 class ProtocolCodec:
@@ -49,7 +45,12 @@ class ProtocolCodec:
         """Initialize instance state."""
         self._redactor = redactor
 
-    def error_from_http(  # noqa: PLR0911 - distinct structured, gateway, and malformed response exits
+    @property
+    def redactor(self) -> Redactor:
+        """Return the redactor, with its registered exact secrets, that renders every decoded error."""
+        return self._redactor
+
+    def error_from_http(  # noqa: PLR0911, PLR0913 - distinct structured, gateway, and malformed response exits
         self,
         *,
         status_code: int,
@@ -57,13 +58,18 @@ class ProtocolCodec:
         request_summary: RequestSummary | None = None,
         headers: Mapping[str, str] | None = None,
         retry_codes: Collection[str] = (),
+        diagnostics: DiagnosticContext | None = None,
     ) -> B24ApiError | None:
-        """Return a structured error before considering generic HTTP status."""
+        """Return a structured error before considering generic HTTP status.
+
+        ``diagnostics`` is the private context of the one request this response answers; it renders
+        that request's field names as local aliases and is not retained by the returned error.
+        """
         parsed, malformed = self._parse_body(body)
 
         if isinstance(parsed, Mapping) and "error" in parsed:
             safe_headers = self._safe_headers(headers or {})
-            preview = self._body_preview(body)
+            preview = self._body_preview(body, diagnostics)
             original_code = parsed["error"]
             description: str | None
             validation: tuple[ValidationIssue, ...] = ()
@@ -71,7 +77,7 @@ class ProtocolCodec:
             code_is_exact = isinstance(original_code, Mapping)
             if isinstance(original_code, Mapping):
                 try:
-                    original_code, description, validation, truncated = self._v3_error(original_code)
+                    original_code, description, validation, truncated = self._v3_error(original_code, diagnostics)
                 except (TypeError, ValueError):
                     return self._protocol_error(
                         "Malformed V3 error object",
@@ -94,7 +100,7 @@ class ProtocolCodec:
             normalized = str(original_code).strip().casefold()
             normalized_retry_codes = {code.casefold() for code in retry_codes}
             retryable = normalized in normalized_retry_codes
-            if code_is_exact and original_code in _NON_RETRYABLE_V3_CODES:
+            if code_is_exact and original_code in NON_RETRYABLE_V3_ERROR_CODES:
                 retryable = False
             if code_is_exact:
                 return self._bounded_v3_error(
@@ -107,6 +113,7 @@ class ProtocolCodec:
                     headers=dict(safe_headers),
                     preview=preview,
                     retryable=retryable,
+                    diagnostics=diagnostics,
                 )
             return ApiResponseError(
                 code=original_code,
@@ -120,11 +127,12 @@ class ProtocolCodec:
                 code_is_exact=code_is_exact,
                 retryable=retryable,
                 redactor=self._redactor,
+                diagnostics=diagnostics,
             )
 
         if status_code >= HTTP_ERROR_MINIMUM:
             safe_headers = self._safe_headers(headers or {})
-            preview = self._body_preview(body)
+            preview = self._body_preview(body, diagnostics)
             evidence = ResponseEvidence(
                 http_status=status_code,
                 request_id=dict(safe_headers).get("x-request-id"),
@@ -141,7 +149,7 @@ class ProtocolCodec:
 
         if malformed:
             safe_headers = self._safe_headers(headers or {})
-            preview = self._body_preview(body)
+            preview = self._body_preview(body, diagnostics)
             return self._protocol_error(
                 "Malformed JSON response",
                 status_code=status_code,
@@ -163,6 +171,7 @@ class ProtocolCodec:
         headers: dict[str, str],
         preview: str | None,
         retryable: bool,
+        diagnostics: DiagnosticContext | None,
     ) -> ApiResponseError:
         """Bound the full redacted serialization, including contextual evidence."""
         while True:
@@ -178,6 +187,7 @@ class ProtocolCodec:
                 body_preview=preview,
                 retryable=retryable,
                 redactor=self._redactor,
+                diagnostics=diagnostics,
             )
             size = len(json.dumps(error.to_safe_dict(), ensure_ascii=False).encode("utf-8"))
             if size <= _MAX_V3_SAFE_BYTES:
@@ -197,7 +207,11 @@ class ProtocolCodec:
             else:
                 raise AssertionError("bounded V3 code and message exceeded the safe serialization limit")
 
-    def _v3_error(self, value: Mapping[str, Any]) -> tuple[str, str, tuple[ValidationIssue, ...], bool]:
+    def _v3_error(
+        self,
+        value: Mapping[str, Any],
+        diagnostics: DiagnosticContext | None,
+    ) -> tuple[str, str, tuple[ValidationIssue, ...], bool]:
         code = value.get("code")
         message = value.get("message")
         issues = value.get("validation", [])
@@ -221,8 +235,8 @@ class ProtocolCodec:
             truncated |= len(field) > _MAX_VALIDATION_TEXT or len(detail) > _MAX_VALIDATION_TEXT
             bounded.append(
                 ValidationIssue(
-                    self._redactor.redact_text(field[:_MAX_VALIDATION_TEXT]),
-                    self._redactor.redact_text(detail[:_MAX_VALIDATION_TEXT]),
+                    self._redactor.render_text(field[:_MAX_VALIDATION_TEXT], context=diagnostics),
+                    self._redactor.render_text(detail[:_MAX_VALIDATION_TEXT], context=diagnostics),
                 )
             )
         return code[:_MAX_VALIDATION_TEXT], message[:_MAX_VALIDATION_TEXT], tuple(bounded), truncated
@@ -250,12 +264,17 @@ class ProtocolCodec:
             ),
         )
 
-    def _body_preview(self, body: bytes | str | Mapping[str, Any] | None) -> str | None:
+    def _body_preview(
+        self,
+        body: bytes | str | Mapping[str, Any] | None,
+        diagnostics: DiagnosticContext | None,
+    ) -> str | None:
         if isinstance(body, Mapping):
             bounded_redactor = replace(self._redactor, max_depth=min(self._redactor.max_depth, 4))
-            encoded = json.dumps(bounded_redactor.redact(body), ensure_ascii=False, default=str)
+            encoded = json.dumps(bounded_redactor.redact(body, context=diagnostics), ensure_ascii=False, default=str)
+            # The context was applied once above; rendering aliases again would re-alias their own text.
             return self._redactor.safe_preview(encoded)
-        return self._redactor.safe_preview(body)
+        return self._redactor.safe_preview(body, context=diagnostics)
 
     @staticmethod
     def _protocol_error(

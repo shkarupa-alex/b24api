@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from b24api._error_types import FailurePhase
 from b24api.contracts.json import _json_type_name
 from b24api.contracts.policy import AmbiguityReason, ExecutionPolicy
-from b24api.contracts.request import ReplaySafety, Request, RequestSummary, ResultErrorShape
+from b24api.contracts.request import ReplaySafety, Request, RequestSummary, ResultErrorShape, diagnostic_context
 from b24api.contracts.response import (
     BinaryEvidence,
     BinaryResponse,
@@ -41,6 +41,7 @@ from b24api.execution.context import (
 )
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
+from b24api.redaction import DEFAULT_REDACTOR, Redactor
 from b24api.transport.base import WireRequest, WireTransport, preflight_transport
 from b24api.transport.protocol import ProtocolCodec
 
@@ -152,6 +153,7 @@ class Executor:
                 response.result,
                 http_status=wire.status_code,
                 retry_codes=context.policy.retry.transient_api_codes,
+                redactor=self.codec.redactor,
             )
         except BaseException as error:
             _mark_dispatch_started(error)
@@ -305,6 +307,7 @@ class Executor:
                         request_summary=request.summary,
                         headers=wire.header_map,
                         retry_codes=context.policy.retry.transient_api_codes,
+                        diagnostics=diagnostic_context(request),
                     )
                 if response_error is None and not _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM:
                     response_error = HTTPGatewayError(
@@ -460,15 +463,16 @@ def _result_protocol_error(
     return error
 
 
-def _raise_embedded_result_error(  # noqa: C901, PLR0912
+def _raise_embedded_result_error(  # noqa: C901, PLR0912, PLR0913
     request: Request,
     result: object,
     *,
     http_status: int,
     retry_codes: frozenset[str],
     batch: bool = False,
+    redactor: Redactor = DEFAULT_REDACTOR,
 ) -> None:
-    """Evaluate the request-local embedded-error contract."""
+    """Evaluate the request-local embedded-error contract, rendering through that request's context."""
     spec = request.result_error
     if spec is None:
         return
@@ -532,6 +536,8 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912
             request_summary=request.summary,
             http_status=http_status,
             retryable=str(code).strip().casefold() in retry_codes,
+            redactor=redactor,
+            diagnostics=diagnostic_context(request),
         )
 
 

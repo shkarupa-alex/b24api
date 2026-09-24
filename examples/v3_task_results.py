@@ -1,7 +1,8 @@
 """Scenario 19: REST 3.0 task result read and object-valued validation error.
 
 Offline fixture: one readable task with expected result ID, one invalid task
-with dotted `filter.taskId` validation. `RouteKind.API_V3` selects `/rest/api/`;
+with dotted `filter.taskId` validation, rendered as the request-local alias `filter.field#1`.
+`RouteKind.API_V3` selects `/rest/api/`;
 the denied parent keeps its checkpoint unchanged. Live semantic verification
 requires a disposable task fixture. Run: `uv run python -m examples.v3_task_results`.
 """
@@ -65,7 +66,8 @@ async def run() -> RecipeEvidence:
         except ApiResponseError as error:
             if error.normalized_code != ERROR_CODE or not error.validation:
                 raise AssertionError("scenario 19 lost the typed object-valued error") from error
-            if error.validation[0].field != "filter.taskId":
+            # Caller field names render as request-local aliases: `taskId` is the first filter field.
+            if error.validation[0].field != "filter.field#1":
                 raise AssertionError("scenario 19 lost the dotted validation field") from error
         else:
             raise AssertionError("scenario 19 invalid task was treated as success")
