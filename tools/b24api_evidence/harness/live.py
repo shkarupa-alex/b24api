@@ -6,12 +6,20 @@ import os
 import secrets
 import uuid
 import weakref
+import zlib
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Self, cast
 from urllib.parse import urljoin
 
 import httpx
+
+from b24api.transport.decoding import (
+    BOUNDED_ACCEPT_ENCODING,
+    _BoundedDecoder,
+    _DecodedBodyTooLargeError,
+    _DecodeRefusedError,
+)
 
 from .contracts import ContractError, PortalIdentity, parse_fingerprint_key, portal_identity, strict_json_loads
 
@@ -103,6 +111,20 @@ class LivePreflight:
     scopes: frozenset[str]
 
 
+def _decode_within_ceiling(response: httpx.Response) -> bytearray:
+    """Decode raw transfer bytes through the shared bounded decoder; ``iter_bytes`` inflates before counting."""
+    decoder = _BoundedDecoder.for_encoding(response.headers.get("content-encoding"), limit=MAX_RESPONSE_BYTES)
+    payload = bytearray()
+    if response.is_stream_consumed:
+        # An in-memory (mock) response arrives already read and decoded; only the ceiling remains.
+        payload.extend(_BoundedDecoder.for_encoding(None, limit=MAX_RESPONSE_BYTES).feed(response.content))
+        return payload
+    for chunk in response.iter_raw():
+        payload.extend(decoder.feed(chunk))
+    payload.extend(decoder.finish())
+    return payload
+
+
 def _bounded_response_payload(response: httpx.Response, *, method: str) -> bytes:
     """Consume a streamed response without crossing the reviewed memory ceiling."""
     content_length = response.headers.get("content-length")
@@ -120,16 +142,17 @@ def _bounded_response_payload(response: httpx.Response, *, method: str) -> bytes
     if declared is not None and declared > MAX_RESPONSE_BYTES:
         response = None  # type: ignore[assignment]
         raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
-    payload = bytearray()
-    received = 0
-    for chunk in response.iter_bytes():
-        received += len(chunk)
-        if received > MAX_RESPONSE_BYTES:
-            del chunk
-            payload.clear()
-            response = None  # type: ignore[assignment]
-            raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
-        payload.extend(chunk)
+    failure: str | None = None
+    try:
+        payload = _decode_within_ceiling(response)
+    except _DecodedBodyTooLargeError:
+        failure = "exceeds the reviewed byte ceiling"
+    except (_DecodeRefusedError, zlib.error):
+        # The same correctness failure an undecodable body produced before the decoder was bounded.
+        failure = "decoding failed"
+    if failure is not None:
+        response = None  # type: ignore[assignment]
+        raise LiveCorrectnessError(f"live response {failure} for {method}")
     return bytes(payload)
 
 
@@ -213,6 +236,7 @@ class LivePortal:
                 "POST",
                 urljoin(_webhook_for(self._webhook_handle), method),
                 json=parameters or {},
+                headers={"accept-encoding": BOUNDED_ACCEPT_ENCODING},
             ) as response:
                 status_code = response.status_code
                 try:

@@ -3,9 +3,11 @@
 from __future__ import annotations
 import base64
 import gc
+import gzip
 import json
 import tracemalloc
 import weakref
+import zlib
 from typing import TYPE_CHECKING
 
 import httpx
@@ -553,3 +555,88 @@ def test_point_read_never_treats_not_found_substrings_as_absence(
 
     with _portal(monkeypatch, handler) as portal, pytest.raises(LiveApiError):
         ADAPTERS["crm-deal-v1"].read(portal, "42")
+
+
+class _RawSyncStream(httpx.SyncByteStream):
+    """Serve raw transfer bytes in fixed chunks and count what was read."""
+
+    def __init__(self, raw: bytes, *, chunk_size: int = 65_536) -> None:
+        self.raw = raw
+        self.chunk_size = chunk_size
+        self.served = 0
+
+    def __iter__(self) -> Iterator[bytes]:
+        for index in range(0, len(self.raw), self.chunk_size):
+            chunk = self.raw[index : index + self.chunk_size]
+            self.served += len(chunk)
+            yield chunk
+
+
+def _bounded_peak(response: httpx.Response) -> tuple[Exception | bytes, int]:
+    tracemalloc.start()
+    try:
+        outcome: Exception | bytes = _bounded_response_payload(response, method="scope")
+    except LiveCorrectnessError as error:
+        outcome = error
+    finally:
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        response.close()
+    return outcome, peak
+
+
+def test_live_gzip_bomb_is_refused_inside_the_bounded_decoder() -> None:
+    bomb = gzip.compress(bytes(4 * MAX_RESPONSE_BYTES))
+    response = httpx.Response(200, headers={"content-encoding": "gzip"}, stream=_RawSyncStream(bomb))
+
+    outcome, peak = _bounded_peak(response)
+
+    assert isinstance(outcome, LiveCorrectnessError)
+    assert "byte ceiling" in str(outcome)
+    assert peak < 2 * MAX_RESPONSE_BYTES + (1 << 20)
+
+
+def test_live_stacked_gzip_cascade_is_refused_before_decompression() -> None:
+    stream = _RawSyncStream(gzip.compress(gzip.compress(bytes(4 * MAX_RESPONSE_BYTES))))
+    response = httpx.Response(200, headers={"content-encoding": "gzip, gzip"}, stream=stream)
+
+    outcome, peak = _bounded_peak(response)
+
+    assert isinstance(outcome, LiveCorrectnessError)
+    assert "decoding failed" in str(outcome)
+    assert stream.served == 0
+    assert peak < 2 * MAX_RESPONSE_BYTES + (1 << 20)
+
+
+@pytest.mark.parametrize("wbits", [zlib.MAX_WBITS, -zlib.MAX_WBITS], ids=["zlib", "raw"])
+def test_live_deflate_fed_one_byte_at_a_time_decodes_once(wbits: int) -> None:
+    payload = json.dumps({"result": ["x" * 1024]}).encode()
+    compressor = zlib.compressobj(wbits=wbits)
+    encoded = compressor.compress(payload) + compressor.flush()
+    stream = _RawSyncStream(encoded, chunk_size=1)
+    response = httpx.Response(200, headers={"content-encoding": "deflate"}, stream=stream)
+
+    assert _bounded_response_payload(response, method="scope") == payload
+
+
+@pytest.mark.parametrize("coding", ["br", "zstd", "unknown"])
+def test_live_unbounded_codings_are_refused_as_decoding_failures(coding: str) -> None:
+    stream = _RawSyncStream(b"opaque")
+    response = httpx.Response(200, headers={"content-encoding": coding}, stream=stream)
+
+    with pytest.raises(LiveCorrectnessError, match="decoding failed") as captured:
+        _bounded_response_payload(response, method="scope")
+    assert stream.served == 0
+    assert captured.value.__context__ is None
+
+
+def test_live_portal_advertises_only_bounded_codings(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("accept-encoding"))
+        return httpx.Response(200, json={"result": []})
+
+    with _portal(monkeypatch, handler) as portal:
+        portal.call("scope")
+    assert seen == ["gzip, deflate"]

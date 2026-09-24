@@ -363,6 +363,22 @@ def test_project_configuration_has_no_removed_v1_runtime_or_test_knobs() -> None
         assert removed not in configuration
 
 
+def test_response_bodies_are_read_only_as_raw_bytes_through_the_bounded_decoder() -> None:
+    # Protective source guard, kept with this justification under B21: HTTPX's decoded readers inflate a
+    # whole received chunk before any byte ceiling can see its size (A2: a 32 KiB gzip allocated 81 MB, a
+    # ``gzip, gzip`` cascade 1.1 GB). Bodies must come from ``aiter_raw``/``iter_raw`` through
+    # ``_BoundedDecoder``. A behavioural test cannot prove that no future call site reintroduces one.
+    decoded_readers = {"aiter_bytes", "iter_bytes", "aiter_text", "iter_text", "aiter_lines", "iter_lines", "aread"}
+    paths = (*sorted((PACKAGE / "transport").glob("*.py")), ROOT / "tools/b24api_evidence/harness/live.py")
+    for path in paths:
+        calls = {
+            node.func.attr
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert not calls & decoded_readers, f"{path.relative_to(ROOT)} reads decoded HTTPX bytes"
+
+
 def test_module_sizes_keep_facades_small_and_state_machines_bounded() -> None:
     for path in _sources():
         relative = path.relative_to(PACKAGE).as_posix()
