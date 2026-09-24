@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from b24api.contracts.response import BinaryResponse, Response
     from b24api.contracts.stream import OperationStream
     from b24api.contracts.traversal import CursorSpec, TraversalSpec
+    from b24api.execution.rate import RateCoordinator
     from b24api.references.binding import BindingSource
 
 _DEFAULT_REFERENCE_DISPATCH = BatchDispatch()
@@ -89,6 +90,7 @@ class Bitrix24(_TraversalFacade):
         self._transport = selected_transport
         self._owned_transport = owned_transport
         self._executor = Executor(selected_transport)
+        self._owned_coordinator: RateCoordinator | None = self._executor.coordinator
         self._default_policy = policy or ExecutionPolicy(
             max_retry_elapsed_per_request=float(resolved.http_timeout),
         )
@@ -113,6 +115,7 @@ class Bitrix24(_TraversalFacade):
         instance._transport = executor.transport
         instance._owned_transport = None
         instance._executor = executor
+        instance._owned_coordinator = None
         instance._default_policy = policy or ExecutionPolicy()
         instance._host = host
         instance._closed = False
@@ -146,13 +149,13 @@ class Bitrix24(_TraversalFacade):
             raise
 
     async def aclose(self) -> None:
-        """Close active streams and then the owned transport idempotently."""
+        """Close active streams, the owned rate coordinator and the owned transport idempotently."""
         if self._close_task is not None and self._close_task.done():
             return
         if self._close_task is None:
             self._closed = True
             self._close_task = asyncio.create_task(
-                close_owned_resources(tuple(self._streams), self._owned_transport),
+                close_owned_resources(tuple(self._streams), self._owned_transport, self._owned_coordinator),
             )
         cleanup = await await_cleanup_resistant(self._close_task)
         if cleanup.error is not None:
