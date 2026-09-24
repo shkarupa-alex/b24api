@@ -10,21 +10,12 @@ import pytest
 from b24api import (
     Binding,
     Bitrix24,
-    Command,
-    CommandFailure,
-    CommandNotExecuted,
-    CommandOutcomeUnknown,
-    CommandSuccess,
     CursorSpec,
-    DeliveryOrder,
     DirectDispatch,
     IdentitySpec,
     OffsetSpec,
     ParameterPath,
     ParameterUpdate,
-    ReferenceComplete,
-    ReferenceItem,
-    ReplayDisposition,
     ReplaySafety,
     Request,
     ResultSelector,
@@ -34,7 +25,18 @@ from b24api import (
     TerminalState,
     TraversalAssurance,
 )
-from b24api.contracts import IdentityCoercion
+from b24api.contracts import (
+    Command,
+    CommandFailure,
+    CommandNotExecuted,
+    CommandOutcomeUnknown,
+    CommandSuccess,
+    DeliveryOrder,
+    IdentityCoercion,
+    ReferenceComplete,
+    ReferenceItem,
+    ReplayDisposition,
+)
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,

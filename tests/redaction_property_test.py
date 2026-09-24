@@ -27,13 +27,14 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from b24api import Bitrix24, ReplaySafety, Request, RouteKind, Settings, WireResponse, cli
+from b24api import Bitrix24, ReplaySafety, Request, RouteKind, Settings, cli
 from b24api.contracts import Violation, ViolationSeverity
 from b24api.contracts.request import diagnostic_context
 from b24api.contracts.v3_codes import KNOWN_V3_ERROR_CODES, METHOD_NOT_FOUND_ERROR_CODE, VALIDATION_ERROR_CODE
 from b24api.errors import ApiResponseError
 from b24api.redaction import REDACTED, Redactor
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from b24api.transport import WireResponse
 from b24api.transport.protocol import ProtocolCodec
 
 _HIDDEN_LABEL = re.compile(r"\[REDACTED#[1-9][0-9]*\]")

@@ -15,8 +15,6 @@ import asyncio
 
 from b24api import (
     Bitrix24,
-    ConsistencyPolicy,
-    DuplicatePolicy,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
@@ -29,6 +27,7 @@ from b24api import (
     Settings,
     TraversalAssurance,
 )
+from b24api.contracts import ConsistencyPolicy, DuplicatePolicy
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 

@@ -18,7 +18,6 @@ from b24api import (
     BatchDispatch,
     Binding,
     Bitrix24,
-    Command,
     OffsetSpec,
     ReplaySafety,
     Request,
@@ -27,6 +26,7 @@ from b24api import (
     Settings,
     TerminalState,
 )
+from b24api.contracts import Command
 from b24api.contracts.report import OperationReport
 from b24api.errors import B24ApiError, BatchFailed, InputSourceError
 from b24api.transport import WireResponse

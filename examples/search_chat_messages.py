@@ -12,16 +12,12 @@ from b24api import (
     ApiResponseError,
     Binding,
     Bitrix24,
-    CursorDomain,
     CursorSpec,
     CursorTraversal,
     DirectDispatch,
     IdentityCoercion,
     ParameterPath,
     ParameterUpdate,
-    ReferenceComplete,
-    ReferenceFailure,
-    ReferenceItem,
     ReplaySafety,
     Request,
     ResultSelector,
@@ -29,6 +25,7 @@ from b24api import (
     Settings,
     TerminalState,
 )
+from b24api.contracts import CursorDomain, ReferenceComplete, ReferenceFailure, ReferenceItem
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 

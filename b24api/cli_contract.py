@@ -11,7 +11,6 @@ from b24api import (
     Bitrix24,
     CursorSpec,
     IdentitySpec,
-    KeysetPageCompletion,
     KeysetSpec,
     OffsetSpec,
     ParameterPath,
@@ -19,14 +18,20 @@ from b24api import (
     RangeKeysetExecution,
     ReplaySafety,
     Request,
-    ResultCollectionShape,
     ResultSelector,
     RouteKind,
     SequentialKeysetExecution,
     StableIntegerKeysetContract,
+)
+from b24api.contracts import (
+    IdentityCoercion,
+    JsonValue,
+    KeysetExecution,
+    KeysetPageCompletion,
+    OperationStream,
+    ResultCollectionShape,
     TotalHintMode,
 )
-from b24api.contracts import IdentityCoercion, JsonValue, KeysetExecution, OperationStream
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.keyset_execution import KeysetExecutionJson
 

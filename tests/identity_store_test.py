@@ -11,12 +11,9 @@ import pytest
 
 from b24api import (
     Bitrix24,
-    ConsistencyPolicy,
-    DuplicatePolicy,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
-    IdentityStore,
     OffsetSpec,
     ReplaySafety,
     Request,
@@ -24,11 +21,11 @@ from b24api import (
     TerminalState,
     TotalTermination,
     TraversalAssurance,
-    WireResponse,
-    identity_store_key,
 )
+from b24api.contracts import ConsistencyPolicy, DuplicatePolicy, IdentityStore, identity_store_key
 from b24api.errors import BudgetExceededError, IncompleteTraversalError
 from b24api.execution import Executor
+from b24api.transport import WireResponse
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence

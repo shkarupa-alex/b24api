@@ -20,12 +20,8 @@ from b24api import (
     OffsetContinuation,
     OffsetSpec,
     OperationReport,
-    PageStride,
     ParameterPath,
     ParameterUpdate,
-    ReferenceComplete,
-    ReferenceFailure,
-    ReferenceItem,
     ReplaySafety,
     Request,
     ResultSelector,
@@ -35,6 +31,7 @@ from b24api import (
     TerminalState,
     TotalTermination,
 )
+from b24api.contracts import PageStride, ReferenceComplete, ReferenceFailure, ReferenceItem
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 

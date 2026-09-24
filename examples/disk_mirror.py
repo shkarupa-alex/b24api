@@ -18,7 +18,6 @@ from b24api import (
     OffsetContinuation,
     OffsetSpec,
     OperationReport,
-    PageStride,
     ReplaySafety,
     Request,
     RouteKind,
@@ -27,6 +26,7 @@ from b24api import (
     TotalTermination,
     TraversalAssurance,
 )
+from b24api.contracts import PageStride
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 

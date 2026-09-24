@@ -106,6 +106,25 @@ class Bitrix24(_TraversalFacade):
         self._streams: weakref.WeakSet[CloseableResource] = weakref.WeakSet()
 
     @classmethod
+    def from_webhook(
+        cls,
+        url: str,
+        *,
+        http_timeout: float | None = None,
+        policy: ExecutionPolicy | None = None,
+    ) -> Bitrix24:
+        """Build a client that owns its HTTPX transport and rate coordinator for one webhook URL.
+
+        The URL is validated by ``Settings``; ``http_timeout=None`` keeps the ``Settings`` default.
+        """
+        if not isinstance(url, str):
+            raise TypeError("webhook url must be a string")
+        settings = (
+            Settings(webhook_url=url) if http_timeout is None else Settings(webhook_url=url, http_timeout=http_timeout)
+        )
+        return cls(settings, policy=policy)
+
+    @classmethod
     def _from_executor(
         cls,
         executor: Executor,

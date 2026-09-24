@@ -16,10 +16,8 @@ from b24api import (
     BatchDispatch,
     Binding,
     Bitrix24,
-    Command,
     CountedTraversal,
     CursorSpec,
-    DeliveryOrder,
     DirectDispatch,
     IdentityCoercion,
     IdentitySpec,
@@ -36,7 +34,7 @@ from b24api import (
     Settings,
     TotalTermination,
 )
-from b24api.contracts import CallerStop, PageBoundary
+from b24api.contracts import CallerStop, Command, DeliveryOrder, PageBoundary
 from b24api.errors import TransportError
 from b24api.transport import TransportCapabilities, WireResponse
 

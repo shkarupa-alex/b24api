@@ -8,7 +8,6 @@ import pytest
 from b24api import (
     Bitrix24,
     CapabilityError,
-    CursorDomain,
     CursorSpec,
     IdentityCoercion,
     IncompleteTraversalError,
@@ -17,6 +16,7 @@ from b24api import (
     ResultSelector,
     RouteKind,
 )
+from b24api.contracts import CursorDomain
 from b24api.execution import Executor, WireResponse
 
 

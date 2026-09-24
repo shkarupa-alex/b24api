@@ -16,10 +16,11 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
 
-from b24api import Bitrix24, Command, ReplaySafety, Request, RouteKind, Settings
+from b24api import Bitrix24, ReplaySafety, Request, RouteKind, Settings
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.logical import LogicalBatchKernelStream
 from b24api.batch.stream import batch_outcome_stream
+from b24api.contracts import Command
 from b24api.contracts.policy import ExecutionPolicy, IdentityCoercion
 from b24api.contracts.request import IdentitySpec
 from b24api.execution import Executor, WireResponse

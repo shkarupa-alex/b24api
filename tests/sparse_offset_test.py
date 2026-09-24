@@ -12,17 +12,15 @@ from b24api import (
     IdentityCoercion,
     IdentitySpec,
     OffsetSpec,
-    PageStride,
     ParameterPath,
-    RawTotalSource,
     Request,
     ResultSelector,
     RouteKind,
     SequentialTraversal,
-    SparseRawBound,
     TerminalState,
     TraversalAssurance,
 )
+from b24api.contracts import PageStride, RawTotalSource, SparseRawBound
 from b24api.contracts.traversal import OffsetContinuation
 from b24api.errors import BudgetExceededError, CapabilityError, IncompleteTraversalError, PaginationError
 from b24api.execution import Executor, WireResponse

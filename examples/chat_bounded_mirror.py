@@ -16,17 +16,11 @@ import asyncio
 from b24api import (
     Binding,
     Bitrix24,
-    CallerStop,
-    ContinuePage,
-    CursorDomain,
     CursorSpec,
     DirectDispatch,
     IdentityCoercion,
-    PageBoundary,
     ParameterPath,
     ParameterUpdate,
-    ReferenceComplete,
-    ReferenceItem,
     ReplaySafety,
     Request,
     ResultSelector,
@@ -35,6 +29,7 @@ from b24api import (
     TerminalState,
     TraversalAssurance,
 )
+from b24api.contracts import CallerStop, ContinuePage, CursorDomain, PageBoundary, ReferenceComplete, ReferenceItem
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 

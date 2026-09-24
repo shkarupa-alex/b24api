@@ -7,19 +7,11 @@ import pytest
 
 from b24api import (
     Bitrix24,
-    CallerStop,
-    ConsistencyPolicy,
-    ContinuePage,
-    CursorDomain,
     CursorSpec,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
-    KeysetExecutionKind,
-    KeysetSelectionReason,
-    KeysetSelectionSummary,
     KeysetSpec,
-    PageBoundary,
     ParameterPath,
     Request,
     ResultSelector,
@@ -28,6 +20,16 @@ from b24api import (
     Settings,
     TerminalState,
     TraversalAssurance,
+)
+from b24api.contracts import (
+    CallerStop,
+    ConsistencyPolicy,
+    ContinuePage,
+    CursorDomain,
+    KeysetExecutionKind,
+    KeysetSelectionReason,
+    KeysetSelectionSummary,
+    PageBoundary,
 )
 from b24api.contracts.completion import PageAcknowledged, PageDelivered, PageScheduled
 from b24api.contracts.policy import SnapshotRequirement

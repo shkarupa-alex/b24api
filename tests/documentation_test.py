@@ -12,6 +12,7 @@ from typing import Self, cast
 import pytest
 
 import b24api
+import b24api.contracts
 from b24api.execution import Executor, WireResponse
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -137,9 +138,9 @@ async def test_migration_python_examples_execute_without_io() -> None:
     for source in blocks:
         client = _MigrationClient()
         namespace: dict[str, object] = {
-            "AdaptedPage": b24api.AdaptedPage,
+            "AdaptedPage": b24api.contracts.AdaptedPage,
             "Binding": b24api.Binding,
-            "PageView": b24api.PageView,
+            "PageView": b24api.contracts.PageView,
             "ParameterPath": b24api.ParameterPath,
             "ParameterUpdate": b24api.ParameterUpdate,
             "ResultSelector": b24api.ResultSelector,

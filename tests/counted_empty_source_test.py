@@ -8,24 +8,20 @@ import pytest
 
 from b24api import (
     Bitrix24,
-    ConsistencyPolicy,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
     OffsetContinuation,
     OffsetSpec,
-    PageDispatch,
-    PageOutcome,
-    PageRejectionCode,
     ReplaySafety,
     Request,
     TerminalState,
     TotalTermination,
     TraversalAssurance,
-    WireResponse,
 )
 from b24api.completion.gate import CompletionReportFacts
 from b24api.completion.recorder import CountedCompletionRecorder
+from b24api.contracts import ConsistencyPolicy, PageDispatch, PageOutcome, PageRejectionCode
 from b24api.contracts.completion import (
     EMPTY_SOURCE_WITNESS,
     BindingClosure,
@@ -46,6 +42,7 @@ from b24api.contracts.response import Response
 from b24api.errors import CapabilityError, IncompleteTraversalError
 from b24api.execution import Executor
 from b24api.execution.snapshot import KernelReport
+from b24api.transport import WireResponse
 from b24api.traversal.driver import PaginationDriver
 from b24api.traversal.plans import CountedOffsetPlan
 

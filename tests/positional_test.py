@@ -6,28 +6,23 @@ import json
 import httpx
 import pytest
 
-from b24api import (
-    Bitrix24,
+from b24api import Bitrix24, OffsetSpec, ParameterPath, Request, RouteKind, Settings
+from b24api.batch.engine import BatchExecutor
+from b24api.batch.outcome import BatchFailure
+from b24api.batch.stream import batch_outcome_stream
+from b24api.contracts import (
     BodyEncoding,
     EmptyArray,
     EmptyObject,
     Null,
-    OffsetSpec,
     Omitted,
     PageIndex,
-    ParameterPath,
     PositionalArguments,
     PositionalLayout,
     Present,
-    Request,
-    RouteKind,
-    Settings,
     SlotContract,
     SlotShape,
 )
-from b24api.batch.engine import BatchExecutor
-from b24api.batch.outcome import BatchFailure
-from b24api.batch.stream import batch_outcome_stream
 from b24api.errors import CapabilityError
 from b24api.execution import Executor, HttpxTransport
 from b24api.testing import ScriptedTransport

@@ -14,7 +14,6 @@ from b24api import (
     KeysetCapabilityError,
     ReplaySafety,
     Request,
-    Response,
     RouteKind,
     TerminalState,
     TraversalAssurance,
@@ -30,6 +29,7 @@ from b24api.cli_contract import (
     parse_verify_keyset_contract,
     read_json_source,
 )
+from b24api.contracts import Response
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

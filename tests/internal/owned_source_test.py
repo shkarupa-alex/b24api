@@ -7,8 +7,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from b24api import Command, ReplaySafety, Request, RouteKind
+from b24api import ReplaySafety, Request, RouteKind
 from b24api._sources import EXHAUSTED, OwnedSource
+from b24api.contracts import Command
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.violation import MAX_RETAINED_VIOLATIONS
 

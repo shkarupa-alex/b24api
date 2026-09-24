@@ -16,25 +16,10 @@ import pytest
 from b24api import (
     AutoKeysetExecution,
     Bitrix24,
-    ClosureWitness,
-    CompletionGate,
-    ConsistencyPolicy,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
-    KeysetAssuranceSource,
-    KeysetExecutionKind,
-    KeysetPageCompletion,
-    KeysetPhase,
-    KeysetSelectionReason,
-    KeysetSelectionSummary,
     KeysetSpec,
-    PageAcknowledged,
-    PageDelivered,
-    PageOutcome,
-    PageRejectionCode,
-    PageScheduled,
-    PageValidated,
     ParameterPath,
     PartitionedKeysetExecution,
     RangeKeysetExecution,
@@ -43,10 +28,27 @@ from b24api import (
     SequentialKeysetExecution,
     StableIntegerKeysetContract,
     TerminalState,
+)
+from b24api.cli import _report_json
+from b24api.completion import CompletionGate
+from b24api.contracts import (
+    ClosureWitness,
+    ConsistencyPolicy,
+    KeysetAssuranceSource,
+    KeysetExecutionKind,
+    KeysetPageCompletion,
+    KeysetPhase,
+    KeysetSelectionReason,
+    KeysetSelectionSummary,
+    PageAcknowledged,
+    PageDelivered,
+    PageOutcome,
+    PageRejectionCode,
+    PageScheduled,
+    PageValidated,
     TotalHintMode,
     TraceClass,
 )
-from b24api.cli import _report_json
 from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.contracts.report import OperationReport, PageDispatch
 from b24api.contracts.request import RouteKind

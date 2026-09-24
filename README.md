@@ -104,7 +104,7 @@ matching a result to the object, file, chat or database row that produced its re
 <!-- tested: tests/client_v2_test.py::test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_off_wire -->
 ```python
 from b24api import RouteKind
-from b24api import Command, CommandSuccess
+from b24api.contracts import Command, CommandSuccess
 
 commands = (
     Command(
@@ -125,7 +125,7 @@ async with client.batch(commands, batch_size=25) as stream:
 
 <!-- tested: tests/client_v2_test.py::test_batch_outcomes_retains_typed_failure_without_halting_later_commands -->
 ```python
-from b24api import CommandFailure, CommandNotExecuted, CommandOutcomeUnknown
+from b24api.contracts import CommandFailure, CommandNotExecuted, CommandOutcomeUnknown
 
 async with client.batch_outcomes(commands) as stream:
     async for outcome in stream:
@@ -203,7 +203,7 @@ sequence and records that degradation in the operation report.
 <!-- tested: tests/client_findings_3_test.py::test_shape_rejection_is_retained_as_zero_admission_page_evidence -->
 ```python
 from b24api import RouteKind
-from b24api import ResultCollectionShape
+from b24api.contracts import ResultCollectionShape
 
 stream = client.iter_list(
     Request("example.dictionary.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
@@ -370,15 +370,8 @@ caller-defined parent.
 <!-- tested: tests/client_v2_test.py::test_bound_references_apply_nested_updates_off_wire_and_emit_exact_completion -->
 ```python
 from b24api import RouteKind
-from b24api import (
-    BatchDispatch,
-    Binding,
-    ParameterPath,
-    ParameterUpdate,
-    ReferenceComplete,
-    ReferenceItem,
-    SequentialTraversal,
-)
+from b24api import BatchDispatch, Binding, ParameterPath, ParameterUpdate, SequentialTraversal
+from b24api.contracts import ReferenceComplete, ReferenceItem
 
 bindings = (
     Binding(

@@ -11,19 +11,8 @@ from typing import Any, Self, cast
 import pytest
 
 import b24api
-from b24api import (
-    Command,
-    CommandSuccess,
-    IdentitySpec,
-    ReferenceComplete,
-    ReferenceItem,
-    ReplaySafety,
-    Request,
-    Response,
-    ResultSelector,
-    Settings,
-)
-from b24api.contracts import IdentityCoercion
+from b24api import IdentitySpec, ReplaySafety, Request, ResultSelector, Settings
+from b24api.contracts import Command, CommandSuccess, IdentityCoercion, ReferenceComplete, ReferenceItem, Response
 from b24api.contracts.request import RouteKind
 
 ROOT = Path(__file__).resolve().parents[1]

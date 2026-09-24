@@ -5,7 +5,8 @@ import json
 
 import pytest
 
-from b24api import Bitrix24, OffsetSpec, PageIndex, ParameterPath, Request, RouteKind
+from b24api import Bitrix24, OffsetSpec, ParameterPath, Request, RouteKind
+from b24api.contracts import PageIndex
 from b24api.errors import CapabilityError
 from b24api.execution import Executor, WireResponse
 

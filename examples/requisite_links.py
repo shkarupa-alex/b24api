@@ -12,15 +12,11 @@ import asyncio
 
 from b24api import (
     Bitrix24,
-    CompositeIdentitySpec,
     IdentityCoercion,
-    IdentityComponent,
     IncompleteTraversalError,
     OffsetContinuation,
     OffsetSpec,
     OperationReport,
-    PageOutcome,
-    PageStride,
     ReplaySafety,
     Request,
     ResultSelector,
@@ -30,6 +26,7 @@ from b24api import (
     TotalTermination,
     TraversalAssurance,
 )
+from b24api.contracts import CompositeIdentitySpec, IdentityComponent, PageOutcome, PageStride
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 

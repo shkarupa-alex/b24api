@@ -117,6 +117,8 @@ markers = [
     "benchmark: wall-clock measurements recorded with record_property; never part of a blocking gate",
 ]
 asyncio_default_fixture_loop_scope = "function"
+# A deprecated root import (C7) fails the suite; tests that check the warning catch it themselves.
+filterwarnings = ["error:b24api\\.\\w+ moved to :DeprecationWarning"]
 xfail_strict = true
 
 [tool.pytest_env]

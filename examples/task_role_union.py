@@ -14,7 +14,6 @@ from b24api import (
     Bitrix24,
     OffsetContinuation,
     OffsetSpec,
-    PageStride,
     ReplaySafety,
     Request,
     ResultSelector,
@@ -22,6 +21,7 @@ from b24api import (
     Settings,
     TotalTermination,
 )
+from b24api.contracts import PageStride
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 

@@ -392,8 +392,7 @@ async def execute_finish_page(
             host.transactions.pending.append(commit.rows)
             host.add_pending_owner(((plan.command_id, len(commit.rows)),))
         if terminal is not None:
-            if receipt.witness is None:
-                raise RuntimeError("terminal fast finish page lacked a closure witness")  # noqa: TRY301 - invariant
+            _require_closure_witness(receipt)
             host.record_completion_witness()
             host.transactions.terminal = True
             host.transactions.finishing = False
@@ -407,6 +406,11 @@ async def execute_finish_page(
         raise
     if host.transactions.buffer_balance > host.context.policy.max_buffered_rows:
         raise RuntimeError("fast host buffer accounting escaped policy")
+
+
+def _require_closure_witness(receipt: LaneReceipt) -> None:
+    if receipt.witness is None:
+        raise RuntimeError("terminal fast finish page lacked a closure witness")
 
 
 def _finish_lane(cursor: int, finish_plan: KeysetPlan) -> LaneState:

@@ -13,56 +13,54 @@ import pytest
 
 from b24api import (
     AmbiguityPolicy,
-    AmbiguityReason,
     AmbiguousExecutionError,
     BatchDispatch,
-    BinaryEvidence,
-    BinaryResponse,
     Binding,
     Bitrix24,
-    BodyEncoding,
-    Command,
-    CommandFailure,
-    CommandSuccess,
-    CompositeIdentitySpec,
     CountedTraversal,
     CursorSpec,
     CursorTraversal,
     DirectDispatch,
-    EnvelopeContractError,
     ExecutionPolicy,
     IdentityCoercion,
-    IdentityComponent,
     IdentitySpec,
     KeysetSpec,
     KeysetTraversal,
     OffsetContinuation,
     OffsetSpec,
+    ParameterPath,
+    ReplaySafety,
+    Request,
+    ResultSelector,
+    SequentialKeysetExecution,
+    SequentialTraversal,
+    TotalTermination,
+)
+from b24api.contracts import (
+    AmbiguityReason,
+    BinaryEvidence,
+    BinaryResponse,
+    BodyEncoding,
+    Command,
+    CommandFailure,
+    CommandSuccess,
+    CompositeIdentitySpec,
+    IdentityComponent,
     PageDispatch,
     PageIndex,
     PageOutcome,
     PageRejectionCode,
     PageStride,
-    ParameterPath,
     ReferenceFailure,
     ReferenceItem,
     ReplayDisposition,
-    ReplaySafety,
-    Request,
     RequestHeaders,
     RequestSummary,
     ResultCollectionShape,
     ResultErrorShape,
     ResultErrorSpec,
-    ResultSelector,
-    SequentialKeysetExecution,
-    SequentialTraversal,
     SplitOrderSpec,
-    TotalTermination,
-    TransportCapabilities,
     UnknownRequestCollector,
-    WireRequest,
-    WireResponse,
     traversal_control_paths,
 )
 from b24api.contracts.request import RouteKind
@@ -70,6 +68,7 @@ from b24api.encoding import encode_php_query
 from b24api.errors import (
     ApiResponseError,
     CapabilityError,
+    EnvelopeContractError,
     ErrorOrigin,
     HTTPGatewayError,
     IncompleteTraversalError,
@@ -81,7 +80,7 @@ from b24api.errors import (
 from b24api.execution import Executor
 from b24api.testing import ConformanceCase, run_transport_conformance
 from b24api.testing import transport as testing_transport
-from b24api.transport import HttpxTransport
+from b24api.transport import HttpxTransport, TransportCapabilities, WireRequest, WireResponse
 from b24api.traversal import iter_list
 from b24api.traversal.plans import CountedOffsetPlan
 

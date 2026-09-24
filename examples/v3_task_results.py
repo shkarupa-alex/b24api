@@ -11,8 +11,9 @@ from __future__ import annotations
 import asyncio
 import json
 
-from b24api import ApiResponseError, Bitrix24, ReplaySafety, Request, RouteKind, Settings, WireResponse
+from b24api import ApiResponseError, Bitrix24, ReplaySafety, Request, RouteKind, Settings
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from b24api.transport import WireResponse
 from examples._support.evidence import RecipeEvidence
 
 METHOD = "tasks.task.result.list"

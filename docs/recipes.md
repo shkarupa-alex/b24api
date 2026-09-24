@@ -55,7 +55,8 @@ Scenario 17 in [examples](../examples/README.md) shows the fail-closed outcome.
 Some endpoints use separate flat sort-field and direction controls:
 
 ```python
-from b24api import KeysetSpec, ParameterPath, SplitOrderSpec
+from b24api import KeysetSpec, ParameterPath
+from b24api.contracts import SplitOrderSpec
 
 keyset = KeysetSpec(
     order_path=None,
@@ -151,7 +152,8 @@ Use `coalesce_wait=0` when per-wave latency matters more than physical batch den
 Use strict mapping values when the selected collection is always an ID-keyed object:
 
 ```python
-from b24api import ResultCollectionShape, ResultSelector
+from b24api import ResultSelector
+from b24api.contracts import ResultCollectionShape
 
 stream = client.iter_list(
     request,
@@ -169,7 +171,8 @@ degradation is recorded as a warning violation.
 Sequential and counted traversal can prove uniqueness using a tuple without inventing tuple order:
 
 ```python
-from b24api import CompositeIdentitySpec, IdentityCoercion, IdentityComponent
+from b24api import IdentityCoercion
+from b24api.contracts import CompositeIdentitySpec, IdentityComponent
 
 identity = CompositeIdentitySpec(
     (
@@ -195,18 +198,14 @@ task scope in the application; scenario 13 in [examples](../examples/README.md) 
 
 <!-- tested: tests/examples/elapsed_task_items_test.py::test_elapsed_task_items_recipe_uses_five_json_slots -->
 ```python
-from b24api import (
+from b24api import OffsetSpec, ParameterPath, ReplaySafety, Request, RouteKind
+from b24api.contracts import (
     EmptyArray,
     EmptyObject,
-    OffsetSpec,
     PageIndex,
-    ParameterPath,
     PositionalArguments,
     PositionalLayout,
     Present,
-    ReplaySafety,
-    Request,
-    RouteKind,
     SlotContract,
     SlotShape,
 )
@@ -252,17 +251,19 @@ independent oracle for your portal and keep `iter_list()` as the default.
 import os
 
 from b24api import (
-    EmptyArray,
     KeysetSpec,
     ParameterPath,
-    PositionalArguments,
-    PositionalLayout,
-    Present,
     ReplaySafety,
     Request,
     ResultSelector,
     RouteKind,
     SequentialKeysetExecution,
+)
+from b24api.contracts import (
+    EmptyArray,
+    PositionalArguments,
+    PositionalLayout,
+    Present,
     SlotContract,
     SlotShape,
 )
@@ -318,7 +319,8 @@ original positional control error.
 
 ```python
 from b24api import RouteKind
-from b24api import BodyEncoding, Request, RequestHeaders
+from b24api import Request
+from b24api.contracts import BodyEncoding, RequestHeaders
 
 form_request = Request(
     "socialnetwork.workgroup.creategroup",

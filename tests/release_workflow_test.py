@@ -476,6 +476,16 @@ def test_blocking_jobs_run_the_specified_checks() -> None:
     assert "import-untyped" in _runs("wheel-typing")
 
 
+def test_wheel_typing_passes_every_canonical_import_and_flags_an_old_root_import() -> None:
+    runs = _runs("wheel-typing")
+
+    assert "cp tests/typing_smoke/moved_names.py" in runs
+    assert "mypy --strict --no-incremental app.py moved_names.py | tee mypy.txt" in runs
+    assert 'cp tests/typing_smoke/root_alias.txt "$consumer/root_alias.py"' in runs
+    assert "test \"$(grep -c ': error: ' negative.txt)\" = 1" in runs
+    assert 'Module "b24api" has no attribute "CommandSuccess"  [attr-defined]' in runs
+
+
 def test_wheel_typing_expects_the_real_request_location_revealed_by_the_smoke_consumer() -> None:
     smoke = (ROOT / "tests" / "typing_smoke" / "app.py").read_text(encoding="utf-8")
     revealed = f'Revealed type is "{Request.__module__}.{Request.__qualname__}"'

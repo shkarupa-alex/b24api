@@ -8,20 +8,9 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from b24api import (
-    BatchFailed,
-    Bitrix24,
-    Command,
-    CommandFailure,
-    CommandOutcomeUnknown,
-    CommandSuccess,
-    ReplayDisposition,
-    ReplaySafety,
-    Request,
-    Settings,
-    TerminalState,
-)
+from b24api import BatchFailed, Bitrix24, ReplaySafety, Request, Settings, TerminalState
 from b24api._error_types import FailurePhase
+from b24api.contracts import Command, CommandFailure, CommandOutcomeUnknown, CommandSuccess, ReplayDisposition
 from b24api.contracts.policy import AmbiguityReason, ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import (

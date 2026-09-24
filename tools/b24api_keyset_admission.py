@@ -42,7 +42,6 @@ from b24api import (  # noqa: E402 - direct execution binds imports to this chec
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
-    KeysetPageCompletion,
     KeysetSpec,
     OperationReport,
     ParameterPath,
@@ -54,8 +53,8 @@ from b24api import (  # noqa: E402 - direct execution binds imports to this chec
     RouteKind,
     Settings,
     StableIntegerKeysetContract,
-    TotalHintMode,
 )
+from b24api.contracts import KeysetPageCompletion, TotalHintMode  # noqa: E402
 from b24api.execution import Executor, WireResponse  # noqa: E402
 from tools.b24api_evidence.repository import clean_candidate_sha  # noqa: E402
 

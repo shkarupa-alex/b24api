@@ -86,13 +86,23 @@ jobs:
           uv pip install --python "$consumer/.venv" --constraint "$consumer/constraints.txt" \
             "$RUNNER_TEMP"/dist/*.whl mypy
           cp tests/typing_smoke/app.py "$consumer/app.py"
+          cp tests/typing_smoke/moved_names.py "$consumer/moved_names.py"
+          cp tests/typing_smoke/root_alias.txt "$consumer/root_alias.py"
           cd "$consumer"
-          .venv/bin/python -m mypy --strict --no-incremental app.py | tee mypy.txt
+          .venv/bin/python -m mypy --strict --no-incremental app.py moved_names.py | tee mypy.txt
           grep -F 'Revealed type is "b24api.contracts.request.Request"' mypy.txt
           if grep -F 'import-untyped' mypy.txt; then
             echo "::error title=wheel typing::the installed wheel is reported as untyped"
             exit 1
           fi
+          # A deprecated root alias must stay invisible to type checkers: exactly one attr-defined error.
+          if .venv/bin/python -m mypy --strict --no-incremental root_alias.py > negative.txt; then
+            echo "::error title=wheel typing::an old root import type-checks without an error"
+            exit 1
+          fi
+          cat negative.txt
+          test "$(grep -c ': error: ' negative.txt)" = 1
+          grep -F 'Module "b24api" has no attribute "CommandSuccess"  [attr-defined]' negative.txt
 
   slow:
     runs-on: ubuntu-latest

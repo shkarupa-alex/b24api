@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Breaking (3.0.0):** the `b24api` root exports 51 names instead of 165 (C7). The other 115 moved
+  to `b24api.contracts`, `b24api.errors`, `b24api.transport` or `b24api.completion`, which export
+  the same objects; nothing was removed or renamed. The old root paths keep working for all of 3.x
+  with a `DeprecationWarning` naming the new path, but type checkers report them as `attr-defined`.
+  `python -m b24api.migration PATH...` lists every old root import, and the migration guide has the
+  full table, generated from `b24api.migration.ROOT_MOVES`. `KeysetSelectionSummary` is exported
+  only by `b24api.contracts`.
+- `HttpxTransport` is exported from the root.
+- `Request.bare(...)` and `Request.v3(...)` build a request with the route fixed; they take the
+  constructor's other arguments unchanged, and `v3` keeps the V3 contract (a mapping, JSON only). The
+  route stays explicit and `Request(...)` is unchanged (C1, C13).
+- `Bitrix24.from_webhook(url, *, http_timeout=None, policy=None)` validates the URL through
+  `Settings` and owns the transport and coordinator it creates; `http_timeout=None` keeps the
+  `Settings` default.
 - **Breaking (3.0.0):** removed never-produced report vocabulary: the `canary_requests`,
   `canary_commands` and `canary_rows` fields of `KeysetExecutionReport`,
   `KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS`, `ReplayDisposition.REPLAYED_DIRECT` and

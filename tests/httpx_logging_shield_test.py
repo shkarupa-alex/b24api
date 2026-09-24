@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from b24api import BodyEncoding, Request, RouteKind
+from b24api import Request, RouteKind
+from b24api.contracts import BodyEncoding
 from b24api.errors import TransportError
 from b24api.transport import HttpxTransport
 from b24api.transport.logging_shield import HTTPX_LOG_SHIELD

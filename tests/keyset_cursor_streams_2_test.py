@@ -14,49 +14,50 @@ from urllib.parse import parse_qs
 import pytest
 
 from b24api import (
-    AdaptedPage,
     BatchDispatch,
     Binding,
     Bitrix24,
     CapabilityError,
     CursorSpec,
     CursorTraversal,
-    DeliveryOrder,
     ExecutionPolicy,
     IdentityCoercion,
-    IdentityPageAdapter,
     IdentitySpec,
     IncompleteTraversalError,
-    KeysetCapabilityCheckName,
-    KeysetCapabilityCheckOutcome,
-    KeysetCapabilityCheckResult,
     KeysetCapabilityError,
-    KeysetCapabilityReport,
-    KeysetCapabilityVerdict,
-    KeysetInconclusiveReason,
     KeysetSpec,
-    MembershipRecheck,
-    PageAdaptationError,
-    PageAdaptationViolation,
     PageAdapter,
-    PageRejectionCode,
     ParameterPath,
     ParameterUpdate,
-    ReferenceComplete,
     ReferenceFailed,
-    ReferenceFailure,
-    ReferenceItem,
-    ReferenceNotExecuted,
     Request,
     ResultSelector,
     SequentialTraversal,
 )
 from b24api.batch.outcome import BatchSuccess
+from b24api.contracts import (
+    AdaptedPage,
+    DeliveryOrder,
+    IdentityPageAdapter,
+    KeysetCapabilityCheckName,
+    KeysetCapabilityCheckOutcome,
+    KeysetCapabilityCheckResult,
+    KeysetCapabilityReport,
+    KeysetCapabilityVerdict,
+    KeysetInconclusiveReason,
+    MembershipRecheck,
+    PageRejectionCode,
+    ReferenceComplete,
+    ReferenceFailure,
+    ReferenceItem,
+    ReferenceNotExecuted,
+)
 from b24api.contracts.json import FrozenMapping
 from b24api.contracts.keyset_execution import KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.request import RouteKind
 from b24api.contracts.response import Response, ResultCollectionShape
+from b24api.errors import PageAdaptationError, PageAdaptationViolation
 from b24api.execution import Executor, WireResponse
 from b24api.references import dispatch as dispatch_module
 from b24api.references.dispatch import _BatchPageDispatcher, _ProducerState, _RowBuffer

@@ -35,8 +35,8 @@ import pickle
 
 import pytest
 
-from b24api import Bitrix24, Command, CommandFailure, ReplaySafety, Request, RouteKind, Settings, WireResponse, cli
-from b24api.contracts import Violation, ViolationSeverity
+from b24api import Bitrix24, ReplaySafety, Request, RouteKind, Settings, cli
+from b24api.contracts import Command, CommandFailure, Violation, ViolationSeverity
 from b24api.contracts.request import diagnostic_context
 from b24api.contracts.v3_codes import (
     KNOWN_V3_ERROR_CODES,
@@ -47,6 +47,7 @@ from b24api.contracts.v3_codes import (
 from b24api.errors import ApiResponseError
 from b24api.redaction import REDACTED, Redactor
 from b24api.testing import ScriptedExchange, ScriptedTransport
+from b24api.transport import WireResponse
 from b24api.transport.protocol import ProtocolCodec
 
 # Digit-free, so the bare-credential heuristic alone leaves it visible.

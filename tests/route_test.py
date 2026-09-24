@@ -3,7 +3,8 @@
 import httpx
 import pytest
 
-from b24api import BodyEncoding, Request, RouteKind
+from b24api import Request, RouteKind
+from b24api.contracts import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.execution import Executor, WireResponse
 from b24api.transport import HttpxTransport, TransportCapabilities, WireRequest

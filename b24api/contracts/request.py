@@ -17,6 +17,7 @@ from b24api.contracts.wire import BodyEncoding, RequestHeaders
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 _METHOD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+_NO_HEADERS = RequestHeaders()
 type PathPart = str | int
 _COMPONENT_LABEL_MAXIMUM = 80
 _COMPOSITE_COMPONENT_MINIMUM = 2
@@ -218,7 +219,7 @@ class Request:
         replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
         *,
         encoding: BodyEncoding = BodyEncoding.JSON,
-        headers: RequestHeaders = RequestHeaders(),  # noqa: B008 - immutable value singleton
+        headers: RequestHeaders = _NO_HEADERS,
         result_error: ResultErrorSpec | None = None,
         route: RouteKind,
     ) -> None:
@@ -253,6 +254,43 @@ class Request:
         object.__setattr__(self, "result_error", result_error)
         object.__setattr__(self, "_parameters", frozen)
         object.__setattr__(self, "_positional", positional)
+
+    @classmethod
+    def bare(  # noqa: PLR0913 - mirrors the canonical constructor's arguments except route
+        cls,
+        method: str,
+        parameters: Mapping[str, object] | PositionalArguments | None = None,
+        replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
+        *,
+        encoding: BodyEncoding = BodyEncoding.JSON,
+        headers: RequestHeaders = _NO_HEADERS,
+        result_error: ResultErrorSpec | None = None,
+    ) -> Request:
+        """Build a classic REST request: the constructor with ``route=RouteKind.BARE`` fixed."""
+        return cls(
+            method,
+            parameters,
+            replay_safety,
+            encoding=encoding,
+            headers=headers,
+            result_error=result_error,
+            route=RouteKind.BARE,
+        )
+
+    @classmethod
+    def v3(
+        cls,
+        method: str,
+        parameters: Mapping[str, object] | None = None,
+        replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
+        *,
+        headers: RequestHeaders = _NO_HEADERS,
+        result_error: ResultErrorSpec | None = None,
+    ) -> Request:
+        """Build a REST v3 request: JSON mapping parameters with ``route=RouteKind.API_V3`` fixed."""
+        return cls(
+            method, parameters, replay_safety, headers=headers, result_error=result_error, route=RouteKind.API_V3
+        )
 
     @property
     def positional(self) -> PositionalArguments | None:
