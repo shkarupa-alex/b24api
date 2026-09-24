@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING
 from b24api.errors import CapabilityError
 from b24api.traversal.cursor_domain import cursor_controls_replace, cursor_probe_updates
 from b24api.traversal.identity import _child_path, _initial_offset, _request_with_controls
-from b24api.traversal.plans import CountedOffsetPlan, ItemCursorPlan, KeysetPlan, OffsetSequentialPlan
+from b24api.traversal.plans import (
+    CountedOffsetPlan,
+    ItemCursorPlan,
+    KeysetPlan,
+    OffsetSequentialPlan,
+    OffsetTerminalRule,
+)
 
 if TYPE_CHECKING:
     from b24api.contracts.request import ParameterPath
@@ -20,6 +26,12 @@ def _aligned_initial_offset(driver: PaginationDriver, plan: OffsetSequentialPlan
     if stride is not None and initial_offset % stride.server_granularity:
         # The server would silently serve the floor window, repeating or skipping raw rows.
         raise CapabilityError("initial offset must align with the qualified server page granularity")
+    if initial_offset != plan.initial_control and OffsetTerminalRule.QUALIFIED_TOTAL in plan.terminal:
+        # The exact total counts the whole collection; a suffix never reaches it and would end incomplete.
+        raise CapabilityError(
+            "initial offset must equal the plan's initial control"
+            " when a caller-qualified exact total closes the collection"
+        )
     return initial_offset
 
 
