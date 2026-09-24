@@ -36,7 +36,11 @@ class _PageReservation:
 
 
 class ExecutionContext:
-    """Mutable operation-scoped budget ledger with immutable snapshots."""
+    """Mutable operation-scoped budget ledger with immutable snapshots.
+
+    Every state change is synchronous code between awaits, so the event loop serializes it and no
+    lock is needed; a mutator must never await in the middle of an update.
+    """
 
     def __init__(
         self,
@@ -56,7 +60,6 @@ class ExecutionContext:
         self._page_sequence = 0
         self._page_reservations: dict[_PageReservation, None] = {}
         self._retained_identity_keys = 0
-        self._lock = asyncio.Lock()
         self._page_changed = asyncio.Event()
 
     @property
@@ -68,49 +71,44 @@ class ExecutionContext:
 
     async def start(self) -> None:
         """Start the operation clock exactly once when execution first begins."""
-        async with self._lock:
-            if self._start is None:
-                self._start = self._clock()
+        if self._start is None:
+            self._start = self._clock()
 
     async def reserve_attempt(self, *, attempts_for_request: int, retry_started: float) -> None:
         """Reserve the attempt budget."""
-        async with self._lock:
-            self._counters = self._counters.reserve_attempt(
-                self.policy,
-                attempts_for_request=attempts_for_request,
-                retry_elapsed=max(0.0, self._clock() - retry_started),
-                total_elapsed=self.elapsed,
-            )
+        self._counters = self._counters.reserve_attempt(
+            self.policy,
+            attempts_for_request=attempts_for_request,
+            retry_elapsed=max(0.0, self._clock() - retry_started),
+            total_elapsed=self.elapsed,
+        )
 
     async def record_retry(self) -> None:
         """Record the retry."""
-        async with self._lock:
-            self._retries += 1
+        self._retries += 1
 
     async def record_cooldown(self, seconds: float) -> None:
         """Record the cooldown."""
-        async with self._lock:
-            self._cooldown_seconds += max(0.0, seconds)
+        self._cooldown_seconds += max(0.0, seconds)
 
     async def reserve_page(self, *, reference: str | None = None) -> _PageReservation:
         """Reserve page capacity before I/O without charging the response counter."""
         try:
             async with asyncio.timeout(self.policy.max_elapsed - self.elapsed):
                 while True:
-                    async with self._lock:
-                        if self._counters.logical_pages >= self.policy.max_pages:
-                            raise BudgetExceededError("logical page budget exhausted")
-                        committed = (
-                            dict(self._counters.pages_per_reference).get(reference, 0) if reference is not None else 0
-                        )
-                        if reference is not None and committed >= self.policy.max_pages_per_reference:
-                            raise BudgetExceededError("per-reference page budget exhausted")
-                        if self.can_reserve_page(reference=reference):
-                            reservation = _PageReservation(self._page_sequence, reference)
-                            self._page_sequence += 1
-                            self._page_reservations[reservation] = None
-                            return reservation
-                        self._page_changed.clear()
+                    if self._counters.logical_pages >= self.policy.max_pages:
+                        raise BudgetExceededError("logical page budget exhausted")
+                    committed = (
+                        dict(self._counters.pages_per_reference).get(reference, 0) if reference is not None else 0
+                    )
+                    if reference is not None and committed >= self.policy.max_pages_per_reference:
+                        raise BudgetExceededError("per-reference page budget exhausted")
+                    if self.can_reserve_page(reference=reference):
+                        reservation = _PageReservation(self._page_sequence, reference)
+                        self._page_sequence += 1
+                        self._page_reservations[reservation] = None
+                        return reservation
+                    self._page_changed.clear()
                     await self._page_changed.wait()
         except TimeoutError as error:
             raise BudgetExceededError("page reservation exceeded operation time budget") from error
@@ -131,16 +129,15 @@ class ExecutionContext:
         """Atomically reserve a fixed operation-local page wave or fail immediately."""
         if not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise ValueError("page reservation count must be a positive integer")
-        async with self._lock:
-            if self.policy.max_elapsed - self.elapsed <= 0:
-                raise BudgetExceededError("page reservation exceeded operation time budget")
-            used = self._counters.logical_pages + len(self._page_reservations)
-            if used + count > self.policy.max_pages:
-                raise BudgetExceededError("logical page budget cannot fit the requested wave")
-            reservations = tuple(_PageReservation(self._page_sequence + offset, None) for offset in range(count))
-            self._page_sequence += count
-            self._page_reservations.update(dict.fromkeys(reservations))
-            return reservations
+        if self.policy.max_elapsed - self.elapsed <= 0:
+            raise BudgetExceededError("page reservation exceeded operation time budget")
+        used = self._counters.logical_pages + len(self._page_reservations)
+        if used + count > self.policy.max_pages:
+            raise BudgetExceededError("logical page budget cannot fit the requested wave")
+        reservations = tuple(_PageReservation(self._page_sequence + offset, None) for offset in range(count))
+        self._page_sequence += count
+        self._page_reservations.update(dict.fromkeys(reservations))
+        return reservations
 
     def commit_page(self, reservation: _PageReservation) -> None:
         """Atomically charge one decoded response with no cancellation point."""
@@ -159,16 +156,14 @@ class ExecutionContext:
 
     async def set_buffered_rows(self, rows: int) -> None:
         """Record retained decoded rows and enforce the global buffer ceiling."""
-        async with self._lock:
-            self._counters = self._counters.with_buffered_rows(self.policy, rows)
+        self._counters = self._counters.with_buffered_rows(self.policy, rows)
 
     async def adjust_buffered_rows(self, delta: int) -> None:
         """Atomically account concurrent scheduler buffers by a signed delta."""
         if not isinstance(delta, int) or isinstance(delta, bool):
             raise TypeError("buffer delta must be an integer")
-        async with self._lock:
-            target = self._counters.buffered_rows + delta
-            self._counters = self._counters.with_buffered_rows(self.policy, target)
+        target = self._counters.buffered_rows + delta
+        self._counters = self._counters.with_buffered_rows(self.policy, target)
 
     def ensure_identity_capacity(self, additional: int) -> None:
         """Reject a page that would exceed the operation-wide identity budget."""
@@ -197,13 +192,12 @@ class ExecutionContext:
 
     async def snapshot(self) -> ExecutionSnapshot:
         """Return the current immutable snapshot."""
-        async with self._lock:
-            return ExecutionSnapshot(
-                counters=self._counters,
-                retries=self._retries,
-                cooldown_seconds=self._cooldown_seconds,
-                elapsed=self.elapsed,
-            )
+        return ExecutionSnapshot(
+            counters=self._counters,
+            retries=self._retries,
+            cooldown_seconds=self._cooldown_seconds,
+            elapsed=self.elapsed,
+        )
 
 
 class OwnedPull[T](Protocol):

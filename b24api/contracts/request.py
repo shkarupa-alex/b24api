@@ -355,3 +355,26 @@ def canonical_request(raw: RequestLike) -> Request:
         result_error=result_error,
         route=route,
     )
+
+
+# RequestSummary and RouteKind live in the request_summary leaf; they stay importable from here.
+__all__ = [
+    "CompositeIdentitySpec",
+    "IdentityComponent",
+    "IdentitySpec",
+    "ParameterPath",
+    "PathPart",
+    "ReplaySafety",
+    "Request",
+    "RequestLike",
+    "RequestSpec",
+    "RequestSummary",
+    "ResultErrorShape",
+    "ResultErrorSpec",
+    "ResultSelector",
+    "RouteKind",
+    "TraversalIdentity",
+    "canonical_request",
+    "diagnostic_context",
+    "summarize_request",
+]

@@ -33,7 +33,7 @@ from b24api.errors import (
     ProtocolError,
     TransportError,
 )
-from b24api.execution import ExecutionContext, Executor, WireResponse
+from b24api.execution import Executor, WireResponse
 from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem, ReferenceRequest
 from b24api.references.stream import iter_references
 from b24api.traversal.plans import (
@@ -48,6 +48,7 @@ from b24api.traversal.plans import (
     ReferenceOutputOrder,
     SingleResponsePlan,
 )
+from tests.ledger_hold import LedgerHold
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterator
@@ -1325,15 +1326,15 @@ async def test_reference_task_cancellation_closes_transport_and_buffer_state() -
         [_reference("a")],
         dispatch=KernelDirectDispatch(),
     )
+    hold = LedgerHold(stream._scheduler.context)  # noqa: SLF001 - repeated-cancel regression
     task = asyncio.create_task(anext(stream))
     await transport.started.wait()
 
-    await stream._scheduler.context._lock.acquire()  # noqa: SLF001 - repeated-cancel regression
+    hold.acquire()
     task.cancel()
-    for _ in range(5):
-        await asyncio.sleep(0)
+    await hold.blocked.wait()
     task.cancel()
-    stream._scheduler.context._lock.release()  # noqa: SLF001 - repeated-cancel regression
+    hold.release()
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
 
@@ -1345,7 +1346,6 @@ async def test_reference_task_cancellation_closes_transport_and_buffer_state() -
 
 @pytest.mark.asyncio
 async def test_reference_cancellation_during_failed_finalization_preserves_failure_report() -> None:
-    locked = asyncio.Event()
     loop = asyncio.get_running_loop()
     loop_contexts: list[dict[str, object]] = []
     previous_handler = loop.get_exception_handler()
@@ -1353,15 +1353,14 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
 
     class FailingSource:
         def __init__(self) -> None:
-            self.context: ExecutionContext | None = None
+            self.hold: LedgerHold | None = None
 
         def __aiter__(self) -> FailingSource:
             return self
 
         async def __anext__(self) -> ReferenceRequest:
-            assert self.context is not None
-            await self.context._lock.acquire()  # noqa: SLF001 - deterministic finalize-race regression
-            locked.set()
+            assert self.hold is not None
+            self.hold.acquire()
             raise RuntimeError("reference source failed")
 
     source = FailingSource()
@@ -1370,7 +1369,7 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
         source,
         dispatch=KernelDirectDispatch(),
     )
-    source.context = stream._scheduler.context  # noqa: SLF001 - deterministic finalize-race regression
+    hold = source.hold = LedgerHold(stream._scheduler.context)  # noqa: SLF001 - deterministic finalize-race regression
     primary: list[RuntimeError] = []
     cancelling_seen: list[int] = []
     post_failure_executed = False
@@ -1389,12 +1388,9 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
 
     task = asyncio.create_task(observe_replayed_cancellation())
     try:
-        await locked.wait()
-        for _ in range(50):
-            await asyncio.sleep(0)
+        await hold.blocked.wait()
         task.cancel()
-        assert source.context is not None
-        source.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
+        hold.release()
 
         with pytest.raises(asyncio.CancelledError):
             await task

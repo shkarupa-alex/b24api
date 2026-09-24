@@ -103,7 +103,11 @@ class _Permit:
 
 
 class RateCoordinator:
-    """Cooldown-aware fair permit scheduler shared by every execution class."""
+    """Cooldown-aware fair permit scheduler shared by every execution class.
+
+    Every state change is synchronous code between awaits, so the event loop serializes it and no
+    lock is needed; a mutator must never await in the middle of an update.
+    """
 
     _cycle = (
         WorkClass.INTERACTIVE_DIRECT,
@@ -128,7 +132,6 @@ class RateCoordinator:
             raise ValueError("operation_time_limit_delay must be finite and non-negative")
         self._max_concurrency = max_concurrency
         self._clock = clock
-        self._condition = asyncio.Condition()
         self._queues: dict[WorkClass, deque[_Waiter]] = {work_class: deque() for work_class in WorkClass}
         self._method_until: dict[str, float] = {}
         self._host: str | None = None
@@ -157,14 +160,13 @@ class RateCoordinator:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[None] = loop.create_future()
         waiter = _Waiter(future, methods)
-        async with self._condition:
-            if self._state is CoordinatorState.CLOSED:
-                raise CoordinatorClosedError("rate coordinator is closed")
-            self._refresh_cooldown_locked()
-            if budget is not None and self._clock() >= budget.deadline:
-                raise CoordinatorBudgetError("coordinator admission budget exhausted")
-            self._queues[work_class].append(waiter)
-            self._grant_locked()
+        if self._state is CoordinatorState.CLOSED:
+            raise CoordinatorClosedError("rate coordinator is closed")
+        self._refresh_cooldown()
+        if budget is not None and self._clock() >= budget.deadline:
+            raise CoordinatorBudgetError("coordinator admission budget exhausted")
+        self._queues[work_class].append(waiter)
+        self._grant()
         try:
             if budget is None:
                 await future
@@ -172,14 +174,13 @@ class RateCoordinator:
                 async with asyncio.timeout_at(loop.time() + max(0.0, budget.deadline - self._clock())):
                     await future
         except (asyncio.CancelledError, TimeoutError) as error:
-            async with self._condition:
-                was_granted = future.done() and not future.cancelled() and future.exception() is None
-                if was_granted:
-                    self._return_granted_locked()
-                else:
-                    with contextlib.suppress(ValueError):
-                        self._queues[work_class].remove(waiter)
-                self._grant_locked()
+            was_granted = future.done() and not future.cancelled() and future.exception() is None
+            if was_granted:
+                self._return_granted()
+            else:
+                with contextlib.suppress(ValueError):
+                    self._queues[work_class].remove(waiter)
+            self._grant()
             if isinstance(error, TimeoutError):
                 raise CoordinatorBudgetError("coordinator admission budget exhausted") from error
             raise
@@ -193,17 +194,16 @@ class RateCoordinator:
         if not math.isfinite(seconds) or seconds < 0:
             raise ValueError("method cooldown must be finite and non-negative")
         seconds = min(seconds, _RETRY_AFTER_CAP_SECONDS)
-        async with self._condition:
-            if self._state is CoordinatorState.CLOSED:
-                return 0.0
-            self._prune_methods_locked()
-            if method not in self._method_until and len(self._method_until) >= _METHOD_LIMIT_CAP:
-                raise RatePolicyCapacityError("method cooldown table is full")
-            deadline = self._clock() + seconds
-            self._method_until[method] = max(deadline, self._method_until.get(method, deadline))
-            self._schedule_wake_locked()
-            self._grant_locked()
-            return max(0.0, self._method_until[method] - self._clock())
+        if self._state is CoordinatorState.CLOSED:
+            return 0.0
+        self._prune_methods()
+        if method not in self._method_until and len(self._method_until) >= _METHOD_LIMIT_CAP:
+            raise RatePolicyCapacityError("method cooldown table is full")
+        deadline = self._clock() + seconds
+        self._method_until[method] = max(deadline, self._method_until.get(method, deadline))
+        self._schedule_wake()
+        self._grant()
+        return max(0.0, self._method_until[method] - self._clock())
 
     async def observe_api_throttle(self, method: str, code: str, *, delay: float | None = None) -> float:
         """Record a method-scoped throttle signal without dispatching a retry."""
@@ -226,28 +226,26 @@ class RateCoordinator:
         if not math.isfinite(delay) or delay < 0:
             raise ValueError("cooldown delay must be a finite non-negative number")
         delay = min(delay, _RETRY_AFTER_CAP_SECONDS)
-        async with self._condition:
-            if self._state is CoordinatorState.CLOSED:
-                return 0.0
-            candidate = self._clock() + delay
-            if self._cooldown_until is None or candidate > self._cooldown_until:
-                self._cooldown_until = candidate
-                self._cooldown_reason = reason
-            self._state = CoordinatorState.COOLDOWN
-            self._schedule_wake_locked()
-            return max(0.0, self._cooldown_until - self._clock())
+        if self._state is CoordinatorState.CLOSED:
+            return 0.0
+        candidate = self._clock() + delay
+        if self._cooldown_until is None or candidate > self._cooldown_until:
+            self._cooldown_until = candidate
+            self._cooldown_reason = reason
+        self._state = CoordinatorState.COOLDOWN
+        self._schedule_wake()
+        return max(0.0, self._cooldown_until - self._clock())
 
     async def close(self) -> None:
         """Reject queued and future admission, then cancel and await the cooldown wake task."""
-        async with self._condition:
-            wake_task, self._wake_task = self._wake_task, None
-            if self._state is not CoordinatorState.CLOSED:
-                self._state = CoordinatorState.CLOSED
-                for queue in self._queues.values():
-                    while queue:
-                        future = queue.popleft().future
-                        if not future.done():
-                            future.set_exception(CoordinatorClosedError("rate coordinator is closed"))
+        wake_task, self._wake_task = self._wake_task, None
+        if self._state is not CoordinatorState.CLOSED:
+            self._state = CoordinatorState.CLOSED
+            for queue in self._queues.values():
+                while queue:
+                    future = queue.popleft().future
+                    if not future.done():
+                        future.set_exception(CoordinatorClosedError("rate coordinator is closed"))
         if wake_task is not None:
             wake_task.cancel()
             await asyncio.gather(wake_task, return_exceptions=True)
@@ -258,32 +256,30 @@ class RateCoordinator:
 
     async def snapshot(self) -> CoordinatorSnapshot:
         """Return the current immutable snapshot."""
-        async with self._condition:
-            self._refresh_cooldown_locked()
-            return CoordinatorSnapshot(
-                state=self._state,
-                cooldown_until=self._cooldown_until,
-                cooldown_reason=self._cooldown_reason,
-                active_permits=self._active,
-                queued=tuple((work_class, len(self._queues[work_class])) for work_class in WorkClass),
-                method_cooldowns=len(self._method_until),
-            )
+        self._refresh_cooldown()
+        return CoordinatorSnapshot(
+            state=self._state,
+            cooldown_until=self._cooldown_until,
+            cooldown_reason=self._cooldown_reason,
+            active_permits=self._active,
+            queued=tuple((work_class, len(self._queues[work_class])) for work_class in WorkClass),
+            method_cooldowns=len(self._method_until),
+        )
 
     def _release_now(self) -> None:
         """Return one permit without an await, so cancellation cannot interrupt the accounting."""
-        # The condition lock is never held across an await, so a synchronous update cannot interleave.
         if self._active < 1:
             raise RuntimeError("permit accounting underflow")
         self._active -= 1
-        self._refresh_cooldown_locked()
-        self._grant_locked()
+        self._refresh_cooldown()
+        self._grant()
 
-    def _return_granted_locked(self) -> None:
+    def _return_granted(self) -> None:
         if self._active < 1:
             raise RuntimeError("granted permit accounting underflow")
         self._active -= 1
 
-    def _grant_locked(self) -> None:
+    def _grant(self) -> None:
         if self._state is not CoordinatorState.OPEN:
             return
         empty_visits = 0
@@ -292,7 +288,7 @@ class RateCoordinator:
             self._cycle_index = (self._cycle_index + 1) % len(self._cycle)
             queue = self._queues[work_class]
             eligible = next(
-                (waiter for waiter in queue if not waiter.future.done() and self._methods_ready_locked(waiter.methods)),
+                (waiter for waiter in queue if not waiter.future.done() and self._methods_ready(waiter.methods)),
                 None,
             )
             if eligible is None:
@@ -303,16 +299,16 @@ class RateCoordinator:
             self._active += 1
             eligible.future.set_result(None)
 
-    def _methods_ready_locked(self, methods: frozenset[str]) -> bool:
+    def _methods_ready(self, methods: frozenset[str]) -> bool:
         now = self._clock()
         return all(self._method_until.get(method, 0.0) <= now for method in methods)
 
-    def _prune_methods_locked(self) -> None:
+    def _prune_methods(self) -> None:
         now = self._clock()
         self._method_until = {method: until for method, until in self._method_until.items() if until > now}
 
-    def _refresh_cooldown_locked(self) -> None:
-        self._prune_methods_locked()
+    def _refresh_cooldown(self) -> None:
+        self._prune_methods()
         if (
             self._state is CoordinatorState.COOLDOWN
             and self._cooldown_until is not None
@@ -321,26 +317,25 @@ class RateCoordinator:
             self._state = CoordinatorState.OPEN
             self._cooldown_until = None
             self._cooldown_reason = None
-            self._grant_locked()
+            self._grant()
 
-    def _schedule_wake_locked(self) -> None:
+    def _schedule_wake(self) -> None:
         if self._wake_task is not None:
             self._wake_task.cancel()
         self._wake_task = asyncio.create_task(self._wake_after_cooldown(), name=_WAKE_TASK_NAME)
 
     async def _wake_after_cooldown(self) -> None:
         while True:
-            async with self._condition:
-                if self._state is CoordinatorState.CLOSED:
-                    return
-                deadlines = list(self._method_until.values())
-                if self._cooldown_until is not None:
-                    deadlines.append(self._cooldown_until)
-                if not deadlines:
-                    return
-                remaining = min(deadlines) - self._clock()
-                if remaining <= 0:
-                    self._refresh_cooldown_locked()
-                    self._grant_locked()
-                    continue
+            if self._state is CoordinatorState.CLOSED:
+                return
+            deadlines = list(self._method_until.values())
+            if self._cooldown_until is not None:
+                deadlines.append(self._cooldown_until)
+            if not deadlines:
+                return
+            remaining = min(deadlines) - self._clock()
+            if remaining <= 0:
+                self._refresh_cooldown()
+                self._grant()
+                continue
             await asyncio.sleep(remaining)

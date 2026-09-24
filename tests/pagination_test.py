@@ -33,7 +33,7 @@ from b24api.errors import (
     PaginationError,
     ProtocolError,
 )
-from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse, WorkClass
+from b24api.execution import Executor, RateCoordinator, WireResponse, WorkClass
 from b24api.traversal import iter_list
 from b24api.traversal.keyset_step import (
     keyset_page_request,
@@ -54,6 +54,7 @@ from b24api.traversal.plans import (
     OffsetTerminalRule,
     SingleResponsePlan,
 )
+from tests.ledger_hold import LedgerHold
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1168,14 +1169,12 @@ async def test_cancellation_after_decoded_response_cannot_rollback_logical_page(
         host = "fixture.invalid"
 
         def __init__(self) -> None:
-            self.context: ExecutionContext | None = None
-            self.locked = asyncio.Event()
+            self.hold: LedgerHold | None = None
 
         async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
             del request, attempt_timeout, max_response_bytes
-            assert self.context is not None
-            await self.context._lock.acquire()  # noqa: SLF001 - deterministic commit-race regression
-            self.locked.set()
+            assert self.hold is not None
+            self.hold.acquire()
             body = json.dumps({"result": [{"ID": 1}]}).encode()
             return WireResponse(200, (("content-type", "application/json"),), body)
 
@@ -1186,16 +1185,13 @@ async def test_cancellation_after_decoded_response_cannot_rollback_logical_page(
         plan=SingleResponsePlan(),
         identity=_identity(),
     )
-    transport.context = stream._context  # noqa: SLF001 - deterministic commit-race regression
+    hold = transport.hold = LedgerHold(stream._context)  # noqa: SLF001 - deterministic commit-race regression
     task = asyncio.create_task(anext(stream))
-    await transport.locked.wait()
-    for _ in range(10):
-        await asyncio.sleep(0)
+    await hold.blocked.wait()
     task.cancel()
     await asyncio.sleep(0)
     task.cancel()
-    assert transport.context is not None
-    transport.context._lock.release()  # noqa: SLF001 - deterministic commit-race regression
+    hold.release()
 
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
@@ -1207,23 +1203,21 @@ async def test_cancellation_after_decoded_response_cannot_rollback_logical_page(
 
 @pytest.mark.asyncio
 async def test_cancellation_during_failed_finalization_preserves_failure_report() -> None:
-    class MalformedAfterLockTransport:
+    class MalformedAfterHoldTransport:
         host = "fixture.invalid"
 
         def __init__(self) -> None:
-            self.context: ExecutionContext | None = None
-            self.locked = asyncio.Event()
+            self.hold: LedgerHold | None = None
 
         async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
             del request, attempt_timeout, max_response_bytes
-            assert self.context is not None
-            await self.context._lock.acquire()  # noqa: SLF001 - deterministic finalize-race regression
-            self.locked.set()
+            assert self.hold is not None
+            self.hold.acquire()
             return WireResponse(200, (("content-type", "application/json"),), b"{")
 
-    transport = MalformedAfterLockTransport()
+    transport = MalformedAfterHoldTransport()
     stream = iter_list(Executor(transport), Request("crm.item.list", route=RouteKind.BARE), plan=SingleResponsePlan())
-    transport.context = stream._context  # noqa: SLF001 - deterministic finalize-race regression
+    hold = transport.hold = LedgerHold(stream._context)  # noqa: SLF001 - deterministic finalize-race regression
     primary: list[ProtocolError] = []
     post_failure_executed = False
 
@@ -1237,12 +1231,9 @@ async def test_cancellation_during_failed_finalization_preserves_failure_report(
         post_failure_executed = True
 
     task = asyncio.create_task(observe_replayed_cancellation())
-    await transport.locked.wait()
-    for _ in range(10):
-        await asyncio.sleep(0)
+    await hold.blocked.wait()
     task.cancel()
-    assert transport.context is not None
-    transport.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
+    hold.release()
 
     with pytest.raises(asyncio.CancelledError):
         await task

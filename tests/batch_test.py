@@ -34,6 +34,7 @@ from b24api.errors import (
     TransportError,
 )
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse
+from tests.ledger_hold import LedgerHold
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterator
@@ -667,13 +668,14 @@ async def test_repeated_batch_cancellation_still_carries_final_report() -> None:
     stream = batch_outcome_stream(
         BatchExecutor(Executor(BlockingTransport())), [Request("profile", route=RouteKind.BARE)]
     )
+    hold = LedgerHold(stream._context)
     task = asyncio.create_task(anext(stream))
     await started.wait()
-    await stream._context._lock.acquire()
+    hold.acquire()
     task.cancel()
-    await asyncio.sleep(0)
+    await hold.blocked.wait()
     task.cancel()
-    stream._context._lock.release()
+    hold.release()
 
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
@@ -684,24 +686,21 @@ async def test_repeated_batch_cancellation_still_carries_final_report() -> None:
 
 @pytest.mark.asyncio
 async def test_batch_cancellation_during_failed_finalization_preserves_failure_report() -> None:
-    locked = asyncio.Event()
-
     class FailingSource:
         def __init__(self) -> None:
-            self.context: ExecutionContext | None = None
+            self.hold: LedgerHold | None = None
 
         def __aiter__(self) -> FailingSource:
             return self
 
         async def __anext__(self) -> Request:
-            assert self.context is not None
-            await self.context._lock.acquire()
-            locked.set()
+            assert self.hold is not None
+            self.hold.acquire()
             raise RuntimeError("batch source failed")
 
     source = FailingSource()
     stream = batch_outcome_stream(BatchExecutor(Executor(CallbackTransport(_echo_batch))), source)
-    source.context = stream._context
+    hold = source.hold = LedgerHold(stream._context)
     primary: list[RuntimeError] = []
     post_failure_executed = False
 
@@ -715,12 +714,9 @@ async def test_batch_cancellation_during_failed_finalization_preserves_failure_r
         post_failure_executed = True
 
     task = asyncio.create_task(observe_replayed_cancellation())
-    await locked.wait()
-    for _ in range(10):
-        await asyncio.sleep(0)
+    await hold.blocked.wait()
     task.cancel()
-    assert source.context is not None
-    source.context._lock.release()
+    hold.release()
 
     with pytest.raises(asyncio.CancelledError):
         await task
