@@ -5,6 +5,7 @@ from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, It
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 from b24api.contracts.command import Command
+from b24api.contracts.violation import retain_violations
 
 if TYPE_CHECKING:
     from b24api.contracts.report import Violation
@@ -35,7 +36,8 @@ class _SyncAuditSource[C](Iterator[Command[C]]):
         if isinstance(command, Command):
             violation = self._audit(command.request)
             if violation is not None:
-                self.violations.append(violation)
+                # Bounded like the report: a long source must not retain one violation per command.
+                self.violations = list(retain_violations((*self.violations, violation)))
         return command
 
     def close(self) -> None:
@@ -57,7 +59,8 @@ class _AsyncAuditSource[C](AsyncIterator[Command[C]]):
         if isinstance(command, Command):
             violation = self._audit(command.request)
             if violation is not None:
-                self.violations.append(violation)
+                # Bounded like the report: a long source must not retain one violation per command.
+                self.violations = list(retain_violations((*self.violations, violation)))
         return command
 
     async def aclose(self) -> None:
