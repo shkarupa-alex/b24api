@@ -355,8 +355,8 @@ class HttpxLogShield:
             return
         self._prune_closed()
         if self._clients:
-            # An open injected client keeps its registered secret, so both scrubbers stay with it; a later
-            # release, send admission or transport close prunes it and removes them.
+            # An open injected client keeps its registered secret, so both scrubbers stay with it. Once it
+            # closes, its secret is pruned at once; the next transport release or request exit removes them.
             return
         _LOGGER.removeFilter(self._filter)
         for logger in _HPACK_LOGGERS:

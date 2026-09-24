@@ -197,7 +197,9 @@ Two further observations; the first is decided, the second stays with the owner:
   commands become unknown after a transport failure, 408 or 5xx, and fail after 423, 425 or 429. Two
   retries stay, because nothing ran: a batch whose transport failed before dispatch
   (`NOT_DISPATCHED`, `CONNECTION_ESTABLISHED`), and a batch Bitrix refused as a whole with a
-  structured error such as `QUERY_LIMIT_EXCEEDED`. Tests:
+  structured error such as `QUERY_LIMIT_EXCEEDED`. Only a Bitrix envelope proves that Bitrix itself
+  refused the batch; an unstructured 423, 425 or 429 may come from a proxy in front of it, so those
+  commands fail instead of being replayed. Tests:
   `tests/internal/execution_boundary_test.py::test_physical_batch_replay_matrix`,
   `tests/internal/execution_boundary_test.py::test_physical_batch_after_an_unstructured_transient_status`
   and

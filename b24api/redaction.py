@@ -80,8 +80,7 @@ class SafeText(str):
 
     Only the error hierarchy and the protocol codec's bounded V3 message construct it, around text
     whose every caller- or portal-derived part went through ``render_text`` or ``render_code``. Any
-    string operation on it yields a plain
-    ``str``, so derived text is rendered as free text again.
+    string operation on it yields a plain ``str``, so derived text is rendered as free text again.
     """
 
     __slots__ = ()
