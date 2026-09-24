@@ -61,7 +61,7 @@ from b24api.execution import Executor, WireResponse
 from b24api.references import dispatch as dispatch_module
 from b24api.references.dispatch import _BatchPageDispatcher, _ProducerState, _RowBuffer
 from b24api.traversal.keyset_fast_plan import LaneBounds, LaneKind, LaneSpec, LaneState, LaneStatus
-from b24api.traversal.page_validation import LaneCommandPlan, ReceiptRejection, validate_lane_receipt
+from b24api.traversal.keyset_page_validation import LaneCommandPlan, ReceiptRejection, validate_lane_receipt
 from b24api.traversal.values import _page_fingerprint, _response_items
 
 if TYPE_CHECKING:

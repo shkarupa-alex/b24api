@@ -31,19 +31,19 @@ from b24api.traversal.keyset_fast_plan import (
     fit_wave,
 )
 from b24api.traversal.keyset_observation import stage_or_record_observation
-from b24api.traversal.keyset_range import descending_closure_witness
-from b24api.traversal.keyset_transaction_contract import boundary_totals, build_controlled_request, build_lane_plan
-from b24api.traversal.page_validation import (
+from b24api.traversal.keyset_page_validation import (
     LaneCommandPlan,
     ReceiptRejection,
     classify_rejection,
     validate_lane_receipt,
 )
+from b24api.traversal.keyset_range import descending_closure_witness
+from b24api.traversal.keyset_transaction_contract import boundary_totals, build_controlled_request, build_lane_plan
 
 if TYPE_CHECKING:
     from b24api.contracts.request import Request
+    from b24api.traversal.keyset_page_validation import LaneReceipt
     from b24api.traversal.keyset_scheduler import KeysetFastScheduler
-    from b24api.traversal.page_validation import LaneReceipt
     from b24api.traversal.plans import KeysetPlan
 
 

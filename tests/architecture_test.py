@@ -329,8 +329,8 @@ def test_response_selection_funnels_and_dead_batch_sentinel_stay_closed() -> Non
         ("traversal/driver.py", "select_page"),
         ("traversal/keyset_verifier.py", "_identities"),
         ("traversal/keyset_verifier.py", "_record_response"),
-        ("traversal/page_validation.py", "select_rows"),
-        ("traversal/page_validation.py", "validate_lane_receipt"),
+        ("traversal/keyset_page_validation.py", "select_rows"),
+        ("traversal/keyset_page_validation.py", "validate_lane_receipt"),
     }
     tree = ast.parse((PACKAGE / "references" / "dispatch.py").read_text(encoding="utf-8"))
     assert not any(

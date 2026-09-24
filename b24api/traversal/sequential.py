@@ -7,11 +7,9 @@ from b24api.completion.closure import QUALIFIED_TOTAL_REACHED, SINGLE_RESPONSE_C
 from b24api.contracts.report import PageDispatch, PageRejectionCode
 from b24api.contracts.traversal import OffsetContinuation
 from b24api.errors import BudgetExceededError, CapabilityError, PaginationError
+from b24api.traversal import offset_rules
 from b24api.traversal.counted_rules import CountedContradiction, CountedPageFacts, judge_counted_page
 from b24api.traversal.identity import (
-    _initial_offset,
-    _next_offset,
-    _offset_terminal,
     _Page,
     _PageRejectionError,
     _request_with_controls,
@@ -107,7 +105,7 @@ class OffsetStrategy:
     def first_request(self, ctx: StrategyContext) -> Request:
         """Start at the request's own offset; a sparse raw traversal must cover the range from zero."""
         plan = self._plan
-        offset = _initial_offset(ctx.request, plan.offset_path, default=plan.initial_control)
+        offset = offset_rules.initial_offset(ctx.request, plan.offset_path, default=plan.initial_control)
         if plan.sparse_raw_bound is not None and offset != 0:
             raise CapabilityError("sparse raw traversal requires the complete range from offset zero")
         ctx.cursor_state = offset
@@ -129,7 +127,7 @@ class OffsetStrategy:
         if self._pending_short_window and items:
             raise PaginationError(_SHORT_WINDOW_UNPROVEN)
         if sparse is None:
-            terminal = _offset_terminal(
+            terminal = offset_rules.offset_terminal(
                 plan,
                 response,
                 page_size=len(items),
@@ -151,7 +149,9 @@ class OffsetStrategy:
             sparse is None and terminal is None and _opens_short_window(plan, len(items))
         )
         next_offset = (
-            None if terminal is not None else _next_offset(plan, response, current=offset, observed=len(items))
+            None
+            if terminal is not None
+            else offset_rules.next_offset(plan, response, current=offset, observed=len(items))
         )
         if next_offset is not None and next_offset <= offset:
             raise PaginationError("offset did not advance")
@@ -209,7 +209,9 @@ class CountedStrategy:
             )
         if verdict.contradiction is CountedContradiction.CONTINUATION_AFTER_TOTAL:
             raise CapabilityError("counted traversal completed while continuation remained")
-        next_offset = None if terminal else _next_offset(plan, response, current=offset, observed=len(items))
+        next_offset = (
+            None if terminal else offset_rules.next_offset(plan, response, current=offset, observed=len(items))
+        )
         if next_offset is not None and next_offset <= offset:
             raise PaginationError("counted offset did not advance")
         self._next_offset = next_offset

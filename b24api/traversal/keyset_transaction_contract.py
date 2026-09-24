@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.keyset_execution import KeysetPhase
 from b24api.traversal import keyset_step
-from b24api.traversal.page_validation import LaneCommandPlan
+from b24api.traversal.keyset_page_validation import LaneCommandPlan
 
 if TYPE_CHECKING:
     from b24api.batch.outcome import BatchOutcome

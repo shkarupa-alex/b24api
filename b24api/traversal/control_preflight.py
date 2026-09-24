@@ -4,8 +4,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from b24api.errors import CapabilityError
+from b24api.traversal import offset_rules
 from b24api.traversal.cursor_domain import cursor_controls_replace, cursor_probe_updates
-from b24api.traversal.identity import _child_path, _initial_offset, _request_with_controls
+from b24api.traversal.identity import _child_path, _request_with_controls
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     ItemCursorPlan,
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
 
 def _aligned_initial_offset(driver: StrategyContext, plan: OffsetSequentialPlan) -> int:
     """Return the first wire offset, refusing one a rounding server would move to another window."""
-    initial_offset = _initial_offset(driver.request, plan.offset_path, default=plan.initial_control)
+    initial_offset = offset_rules.initial_offset(driver.request, plan.offset_path, default=plan.initial_control)
     stride = plan.page_stride or (plan.sparse_raw_bound.stride if plan.sparse_raw_bound is not None else None)
     if stride is not None and initial_offset % stride.server_granularity:
         # The server would silently serve the floor window, repeating or skipping raw rows.

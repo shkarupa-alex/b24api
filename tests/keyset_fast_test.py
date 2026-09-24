@@ -52,7 +52,7 @@ from b24api.contracts.report import OperationReport, PageDispatch
 from b24api.contracts.request import RouteKind
 from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError, ResultShapeError
 from b24api.execution import Executor, WireResponse
-from b24api.traversal import keyset_scheduler, page_validation
+from b24api.traversal import keyset_page_validation, keyset_scheduler
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
 from b24api.traversal.keyset_costs import estimates
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
@@ -1143,7 +1143,7 @@ async def test_internal_lane_validation_error_is_not_reclassified(
     def fail_selection(*_args: object, **_kwargs: object) -> list[JsonValue]:
         raise RuntimeError("internal validation defect")
 
-    monkeypatch.setattr(page_validation, "_response_items", fail_selection)
+    monkeypatch.setattr(keyset_page_validation, "_response_items", fail_selection)
 
     with pytest.raises(RuntimeError, match="internal validation defect"):
         await anext(stream)

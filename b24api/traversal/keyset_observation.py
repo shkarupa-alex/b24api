@@ -15,9 +15,9 @@ if TYPE_CHECKING:
 
     from b24api.contracts.keyset_execution import KeysetPhase
     from b24api.contracts.response import Response
+    from b24api.traversal.keyset_ordered_admission import OrderedAdmissionState
+    from b24api.traversal.keyset_page_validation import LaneCommandPlan
     from b24api.traversal.keyset_scheduler import KeysetFastScheduler
-    from b24api.traversal.ordered_admission import OrderedAdmissionState
-    from b24api.traversal.page_validation import LaneCommandPlan
 
 
 @dataclass(frozen=True, slots=True)

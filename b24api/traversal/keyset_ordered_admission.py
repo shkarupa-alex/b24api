@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Literal
 
 from b24api.errors import PaginationError
 from b24api.traversal.keyset_fast_plan import LaneState, LaneStatus, LazyRangePlan
-from b24api.traversal.page_validation import LaneReceipt
+from b24api.traversal.keyset_page_validation import LaneReceipt
 
 if TYPE_CHECKING:
     from collections.abc import Callable

@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from b24api.contracts.json import FrozenJson
     from b24api.contracts.request import Request
     from b24api.contracts.traversal import KeysetSpec
-    from b24api.traversal.page_validation import LaneCommandPlan, LaneReceipt
+    from b24api.traversal.keyset_page_validation import LaneCommandPlan, LaneReceipt
 
 
 @dataclass(frozen=True, slots=True)
