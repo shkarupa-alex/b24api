@@ -351,9 +351,11 @@ stream = client.iter_list_keyset(
 
 For CLI keyset contracts, use `"execution": {"kind": "sequential"}`. Omitting `execution` (or
 passing an empty execution object) selects auto. Use `iter_list_counted()` only when an endpoint
-supplies an exact filtered total. CLI reports now include a `keyset_execution` object for default
-keyset traversal; report consumers should treat that additive field as part of the selected-plan
-evidence.
+supplies an exact filtered total. CLI reports now include a `keyset_selection` object
+(`requested_kind`, `selected_kind`, `reason`) for every keyset traversal, and a detailed
+`keyset_execution` object only when the fast path ran; a `page_stop` traversal with the default auto
+execution reports `auto`, `sequential`, `page_stop`. Report consumers should treat both additive
+fields as selected-plan evidence.
 
 ## Practical migration order
 

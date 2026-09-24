@@ -24,6 +24,7 @@ from b24api.contracts.completion import (
 )
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import (
+    KeysetSelectionSummary,
     OperationReport,
     TerminalState,
     TraversalAssurance,
@@ -95,6 +96,7 @@ class CompletionReportFacts:
     early_closed: bool = False
     forced_state: TerminalState | None = None
     extra_violations: tuple[Violation, ...] = ()
+    keyset_selection: KeysetSelectionSummary | None = None
 
 
 class CompletionGate:
@@ -467,6 +469,11 @@ class CompletionGate:
             page_trace=source.page_trace,
             page_trace_truncated=source.page_trace_truncated,
             keyset_execution=source.keyset_execution,
+            keyset_selection=(
+                KeysetSelectionSummary.of(source.keyset_execution)
+                if source.keyset_execution is not None
+                else facts.keyset_selection
+            ),
         )
 
 

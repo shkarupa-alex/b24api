@@ -95,6 +95,7 @@ from b24api.contracts.reference import (
 )
 from b24api.contracts.report import (
     KeysetExecutionReport,
+    KeysetSelectionSummary,
     OperationReport,
     PageDispatch,
     PageOutcome,
@@ -206,6 +207,7 @@ __all__ = [
     "KeysetPageCompletion",
     "KeysetPhase",
     "KeysetSelectionReason",
+    "KeysetSelectionSummary",
     "KeysetSpec",
     "KeysetTraversal",
     "MembershipRecheck",

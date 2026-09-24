@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, Protocol, Self, cast
 
 from b24api.completion.gate import CompletionGate, CompletionReportFacts
 from b24api.contracts.policy import KernelState
-from b24api.contracts.report import OperationReport, TerminalState, TraversalAssurance, Violation
+from b24api.contracts.report import (
+    KeysetSelectionSummary,
+    OperationReport,
+    TerminalState,
+    TraversalAssurance,
+    Violation,
+)
 from b24api.contracts.stream import PartialResult
 from b24api.errors import IncompleteTraversalError
 from b24api.execution.context import await_cleanup_resistant, rearm_cancellation
@@ -59,6 +65,7 @@ class MappedOperationStream[S, T]:
         initial_violations: tuple[Violation, ...] = (),
         source_violations: Callable[[], tuple[Violation, ...]] | None = None,
         deregister: Callable[[MappedOperationStream[S, T]], None] | None = None,
+        keyset_selection: KeysetSelectionSummary | None = None,
     ) -> None:
         """Initialize without starting or prefetching the source."""
         self._source = source
@@ -73,6 +80,7 @@ class MappedOperationStream[S, T]:
         self._source_buffered_commands = source_buffered_commands
         self._source_active_references = source_active_references
         self._initial_violations = initial_violations
+        self._keyset_selection = keyset_selection
         self._source_violations = source_violations
         self._deregister = deregister
         self._report: OperationReport | None = None
@@ -256,6 +264,7 @@ class MappedOperationStream[S, T]:
                 early_closed=self._early_closed,
                 forced_state=forced_state,
                 extra_violations=extra_violations,
+                keyset_selection=self._keyset_selection,
             )
         )
         report = gate.finish()

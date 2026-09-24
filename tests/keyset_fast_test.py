@@ -26,6 +26,7 @@ from b24api import (
     KeysetPageCompletion,
     KeysetPhase,
     KeysetSelectionReason,
+    KeysetSelectionSummary,
     KeysetSpec,
     PageAcknowledged,
     PageDelivered,
@@ -924,6 +925,11 @@ async def test_explicit_partitioned_reports_degenerate_single_lane() -> None:
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.PARTITIONED
     assert stream.report.keyset_execution.preselection_reason is KeysetSelectionReason.DEGENERATE_SINGLE_LANE
     assert stream.report.keyset_execution.actual_lanes == 1
+    assert stream.report.keyset_selection == KeysetSelectionSummary(
+        KeysetExecutionKind.PARTITIONED,
+        KeysetExecutionKind.PARTITIONED,
+        KeysetSelectionReason.DEGENERATE_SINGLE_LANE,
+    )
 
 
 @pytest.mark.asyncio

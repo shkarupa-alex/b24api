@@ -253,8 +253,10 @@ Static incompatibility with the auto contract raises `CapabilityError` from the
 `iter_list_keyset(...)` call before iteration begins. A portal that accepts but contradicts the
 declared controls fails before emission with `IncompleteTraversalError`; auto never restarts that
 operation silently. `KeysetTraversal` inside reference traversal remains sequential-only. The
-terminal report now includes `keyset_execution` for omitted-execution keyset calls so consumers can
-see the requested and selected plan.
+terminal report carries a compact `keyset_selection` (`requested_kind`, `selected_kind`, `reason`)
+for every keyset traversal. A `page_stop` callback needs the ordered page stream, so auto reports
+`AUTO`, `SEQUENTIAL`, `PAGE_STOP`; an explicit `SequentialKeysetExecution()` reports
+`EXPLICIT_SEQUENTIAL`. The detailed `keyset_execution` report is present only when the fast path ran.
 
 Use `await client.verify_keyset_capability(...)` as a development/CI/staging guard on a stable
 representative fixture. It performs five strict-bound checks and returns only a `VERIFIED` report;

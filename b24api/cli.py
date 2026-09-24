@@ -87,6 +87,8 @@ def _report_json(report: OperationReport) -> dict[str, object]:
     }
     if report.keyset_execution is not None:
         result["keyset_execution"] = dataclasses.asdict(report.keyset_execution)
+    if report.keyset_selection is not None:
+        result["keyset_selection"] = dataclasses.asdict(report.keyset_selection)
     return result
 
 

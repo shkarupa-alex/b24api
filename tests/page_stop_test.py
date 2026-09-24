@@ -15,6 +15,9 @@ from b24api import (
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
+    KeysetExecutionKind,
+    KeysetSelectionReason,
+    KeysetSelectionSummary,
     KeysetSpec,
     PageBoundary,
     ParameterPath,
@@ -22,6 +25,7 @@ from b24api import (
     ResultSelector,
     RouteKind,
     SequentialKeysetExecution,
+    Settings,
     TerminalState,
     TraversalAssurance,
 )
@@ -248,3 +252,29 @@ async def test_default_auto_keyset_uses_sequential_path_for_page_stop() -> None:
     assert len(transport.requests) == 1
     assert stream.report is not None
     assert not stream.report.exhausted
+    # The compact summary says why AUTO ran sequentially; the fast-only report stays absent.
+    assert stream.report.keyset_selection == KeysetSelectionSummary(
+        KeysetExecutionKind.AUTO,
+        KeysetExecutionKind.SEQUENTIAL,
+        KeysetSelectionReason.PAGE_STOP,
+    )
+    assert stream.report.keyset_execution is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_sequential_keyset_reports_its_selection() -> None:
+    client = Bitrix24(Settings(webhook_url="https://fixture.invalid/rest/1/stop/"), transport=ListTransport())
+    stream = client.iter_list_keyset(
+        Request("keyset.list", route=RouteKind.BARE),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=2,
+        execution=SequentialKeysetExecution(),
+    )
+    assert [row["id"] async for row in stream] == [1, 2, 3, 4, 5]
+    assert stream.report is not None
+    assert stream.report.keyset_selection == KeysetSelectionSummary(
+        KeysetExecutionKind.SEQUENTIAL,
+        KeysetExecutionKind.SEQUENTIAL,
+        KeysetSelectionReason.EXPLICIT_SEQUENTIAL,
+    )

@@ -50,6 +50,8 @@ class KeysetSelectionReason(StrEnum):
     POST_PROBE_RANGE_PREFERRED = "post_probe_range_preferred"
     POST_PROBE_GAIN_LOST = "post_probe_gain_lost"
     DEGENERATE_SINGLE_LANE = "degenerate_single_lane"
+    EXPLICIT_SEQUENTIAL = "explicit_sequential"
+    PAGE_STOP = "page_stop"
 
 
 class KeysetAssuranceSource(StrEnum):
