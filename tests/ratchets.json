@@ -2,7 +2,7 @@
   "slf001_tests": 195,
   "slf001_package": 83,
   "slf001_traversal": 49,
-  "noqa_package": 195,
+  "noqa_package": 193,
   "untyped_self_traversal": 9,
   "long_functions": {
     "b24api/completion/gate.py::CompletionGate.emit": {
@@ -43,10 +43,6 @@
     },
     "b24api/traversal/keyset_transactions.py::execute_wave": {
       "lines": 133,
-      "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
-    },
-    "b24api/traversal/stream.py::ItemStream._run": {
-      "lines": 115,
       "justification": "measured at c4cafdd; shrinks when its state machine is refactored"
     }
   }

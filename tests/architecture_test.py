@@ -235,9 +235,9 @@ def test_report_replacements_stay_on_reviewed_downgrade_sites() -> None:
         and node.args
         and "report" in ast.unparse(node.args[0]).casefold()
     }
-    # traversal/stream.py replaces its KernelReport; references/support.py and execution/failure.py only
-    # downgrade a report to FAILED/INCOMPLETE with exhausted=False or add a cleanup-failure violation.
-    assert sites == {"traversal/stream.py", "references/support.py", "execution/failure.py"}
+    # execution/failure.py only downgrades a report to FAILED/INCOMPLETE with exhausted=False or adds a
+    # cleanup-failure violation, for the lifecycle runner and the public failure finalizer.
+    assert sites == {"execution/failure.py"}
 
 
 def test_failure_classification_importers_stay_inside_state_machine_layers() -> None:

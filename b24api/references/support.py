@@ -4,12 +4,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, AsyncIterable, Iterator
-from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from b24api.completion.closure import qualified_closure
 from b24api.contracts.completion import BindingClosure
-from b24api.contracts.policy import KernelState
 from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
 from b24api.references.dispatch import (
     _SYNC_EXHAUSTED,
@@ -31,7 +29,6 @@ from b24api.traversal.plans import (
 if TYPE_CHECKING:
     from b24api.completion.reference_recorder import ReferenceCompletionRecorder
     from b24api.contracts.policy import ExecutionPolicy
-    from b24api.execution.snapshot import KernelReport
     from b24api.references.outcome import ReferenceRequest
     from b24api.traversal.driver import PaginationDriver
 
@@ -71,26 +68,6 @@ def _record_cleanup_failure(violations: list[Violation], error: BaseException) -
             code="cleanup_failure",
             message=f"reference cleanup also failed ({type(error).__name__})",
         )
-    )
-
-
-def _cleanup_failed_report(report: KernelReport, error: BaseException) -> KernelReport:
-    """Return a terminal kernel snapshot with safe cleanup failure evidence."""
-    violations = report.violations
-    if not any(item.code == "cleanup_failure" for item in violations):
-        violations = (
-            *violations,
-            Violation(
-                severity=ViolationSeverity.BLOCKING,
-                code="cleanup_failure",
-                message=f"reference cleanup failed ({type(error).__name__})",
-            ),
-        )
-    return replace(
-        report,
-        state=KernelState.FAILED,
-        terminal_reason="stream cleanup failed",
-        violations=violations,
     )
 
 
