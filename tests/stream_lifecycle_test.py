@@ -10,7 +10,7 @@ private carrier exception (A14).
 from __future__ import annotations
 import asyncio
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -27,13 +27,13 @@ from b24api import (
     Settings,
     TerminalState,
 )
+from b24api.contracts.report import OperationReport
 from b24api.errors import B24ApiError, BatchFailed, InputSourceError
 from b24api.transport import WireResponse
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from b24api.contracts.report import OperationReport
     from b24api.contracts.stream import OperationStream
 
 HOST = "fixture.invalid"
@@ -117,7 +117,7 @@ def _client(portal: _Portal) -> Bitrix24:
     return Bitrix24(Settings(webhook_url=f"https://{HOST}/rest/1/life/"), transport=portal)
 
 
-def _stream(client: Bitrix24, family: str, source: _Source) -> OperationStream[object]:
+def _stream(client: Bitrix24, family: str, source: _Source) -> OperationStream[Any]:
     if family == "batch":
         return client.batch(source, batch_size=BATCH)
     if family == "batch_outcomes":
@@ -134,7 +134,7 @@ def _codes(report: OperationReport) -> list[str]:
 
 def _published(error: BaseException) -> OperationReport:
     report = error.__dict__.get("report")
-    assert report is not None, f"{type(error).__name__} carries no report"
+    assert isinstance(report, OperationReport), f"{type(error).__name__} carries no report"
     return report
 
 
