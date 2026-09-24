@@ -62,7 +62,6 @@ class FastTraceRecorder:
         self._sequence_commands: dict[int, str] = {}
         self._phase_commands: Counter[KeysetPhase] = Counter()
         self._phase_rows: Counter[KeysetPhase] = Counter()
-        self._phase_empty: Counter[KeysetPhase] = Counter()
 
     @staticmethod
     def classify(observation: PageObservation) -> TraceClass:
@@ -85,8 +84,6 @@ class FastTraceRecorder:
         observation = replace(observation, trace_class=trace_class)
         self._phase_commands[observation.phase] += 1
         self._phase_rows[observation.phase] += observation.rows_selected
-        if observation.rows_selected == 0:
-            self._phase_empty[observation.phase] += 1
         record = PageRecord(
             sequence=observation.ordinal,
             offset=None,
@@ -145,10 +142,6 @@ class FastTraceRecorder:
     def phase_rows(self, phase: KeysetPhase) -> int:
         """Return selected row count for one phase."""
         return self._phase_rows[phase]
-
-    def phase_empty(self, phase: KeysetPhase) -> int:
-        """Return empty response count for one phase."""
-        return self._phase_empty[phase]
 
     def snapshot(self) -> tuple[tuple[PageRecord, ...], Mapping[TraceClass, int]]:
         """Return retained records and exact per-class drop counts."""
@@ -274,8 +267,6 @@ class KeysetFastStream:
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
             snapshot=snapshot_state,
-            plan_id="iter_list_keyset_fast",
-            dispatch_id="batch",
             emitted_rows=self._scheduler.counters.emitted_rows,
             unique_rows=self._scheduler.counters.unique_rows,
             physical_requests=snapshot.counters.physical_requests,

@@ -188,8 +188,6 @@ class CountedItemStream:
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
             snapshot=snapshot_state,
-            plan_id="iter_list_counted",
-            dispatch_id="batch",
             emitted_rows=self._emitted,
             unique_rows=self._unique,
             duplicate_identities=self._driver.duplicate_identities,

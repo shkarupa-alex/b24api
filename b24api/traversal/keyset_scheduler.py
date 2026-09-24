@@ -344,7 +344,6 @@ class KeysetFastScheduler:
                     LaneKind.HEAD if ordinal == 0 else LaneKind.TAIL,
                     LaneBounds(None, None),
                     ordinal == 1,
-                    True,
                     None,
                 ),
                 None,
@@ -352,7 +351,6 @@ class KeysetFastScheduler:
                 None,
                 0,
                 self.effective_page_cap,
-                deque(),
             )
             boundary_plans.append(build_lane_plan(self, lane, phase=KeysetPhase.BOUNDARY, request=request))
         asc, desc = await self.execute_wave(tuple(boundary_plans))
@@ -437,7 +435,7 @@ class KeysetFastScheduler:
                 selected = KeysetExecutionKind.RANGE
             else:
                 anchors = await self._partition_planning(asc, desc, self.execution.target_lanes)
-                facts = AnchorFacts(tuple(anchors), self._anchor_probe_commands, self._empty_anchor_probes)
+                facts = AnchorFacts(tuple(anchors), self._empty_anchor_probes)
                 self._final = finalize(inputs, self._preselection, facts)
                 selected = self._final.kind
                 if selected is not KeysetExecutionKind.PARTITIONED:
@@ -576,7 +574,6 @@ class KeysetFastScheduler:
                 None,
                 0,
                 0,
-                deque(),
             )
             for spec in specs
         ]

@@ -163,8 +163,6 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             state=state,
             assurance=self._assurance,
             snapshot=snapshot_state,
-            plan_id=type(self._scheduler.plan).__name__,
-            dispatch_id=type(self._scheduler.dispatch).__name__,
             emitted_rows=self._emitted,
             unique_rows=self._unique_emitted,
             physical_requests=snapshot.counters.physical_requests,

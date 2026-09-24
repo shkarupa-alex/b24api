@@ -34,7 +34,6 @@ class PageObservation:
     rows_admitted: int
     reported_total: int | None
     reported_next: int | None
-    page_full: bool
     witness: ClosureWitness | None
     outcome: PageOutcome
     rejection_code: PageRejectionCode | None
@@ -49,7 +48,6 @@ def page_observation(  # noqa: PLR0913
     index: int | None,
     selected: int,
     admitted: int,
-    effective_page_cap: int,
     outcome: PageOutcome = PageOutcome.COMMITTED,
     rejection: PageRejectionCode | None = None,
     violation: Violation | None = None,
@@ -69,7 +67,6 @@ def page_observation(  # noqa: PLR0913
         admitted,
         response.total if response is not None and response.total is not None and response.total >= 0 else None,
         response.next if response is not None else None,
-        selected == effective_page_cap,
         witness,
         outcome,
         rejection,
@@ -100,7 +97,6 @@ def record_scheduler_observation(  # noqa: PLR0913
             index=index,
             selected=selected,
             admitted=admitted,
-            effective_page_cap=scheduler.effective_page_cap,
             outcome=outcome,
             rejection=rejection,
             violation=violation,

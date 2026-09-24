@@ -1,9 +1,8 @@
 """Stateless I/O transactions used by the fast keyset scheduler."""
 
-# ruff: noqa: C901, FBT003, PLR0915, TRY301
+# ruff: noqa: C901, PLR0915, TRY301
 
 from __future__ import annotations
-from collections import deque
 from typing import TYPE_CHECKING
 
 from b24api.batch.outcome import BatchSuccess
@@ -307,7 +306,7 @@ async def execute_finish_page(
         scheduler.transactions.finish_cursor if direction == "ASC" else None,
         scheduler.transactions.finish_cursor if direction == "DESC" else None,
     )
-    spec = LaneSpec(0, LaneKind.FINISH, bounds, direction == "DESC", True, None)
+    spec = LaneSpec(0, LaneKind.FINISH, bounds, direction == "DESC", None)
     finish_lane = LaneState(
         spec,
         scheduler.transactions.finish_cursor,
@@ -315,7 +314,6 @@ async def execute_finish_page(
         None,
         0,
         0,
-        deque(),
     )
     scheduler.transactions.finish_lane = finish_lane
     plan = build_lane_plan(scheduler, finish_lane, phase=KeysetPhase.FINISH, request=request)

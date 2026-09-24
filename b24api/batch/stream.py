@@ -196,8 +196,6 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
             snapshot=snapshot_state,
-            plan_id="batch_kernel",
-            dispatch_id="batch",
             emitted_rows=self._emitted,
             unique_rows=self._emitted,
             physical_requests=snapshot.counters.physical_requests,

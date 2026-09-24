@@ -15,7 +15,6 @@ SEQ_FLOOR_REQUESTS = 3
 FAST_GAIN_NUM = 3
 FAST_GAIN_DEN = 5
 FINISH_REQUESTS = 1
-CANARY_COMMANDS = 0
 MIN_WINDOW_WIDTH = 2
 
 
@@ -49,7 +48,6 @@ class AnchorFacts:
     """Normalized occupied-anchor probe observations."""
 
     anchors: tuple[int, ...]
-    probe_commands: int
     empty_probes: int
 
 
@@ -78,7 +76,6 @@ def preselect(inputs: SelectorInputs) -> Preselection:  # noqa: PLR0911
     """Apply the frozen ordered automatic preselection rules."""
     sequential, range_estimate, partition_estimate, geometry = estimates(
         inputs,
-        canary_commands=CANARY_COMMANDS,
         finish_requests=FINISH_REQUESTS,
     )
     span, numerator, denominator, interior_rows, all_rows = geometry
@@ -210,7 +207,6 @@ def normalize_total_hint(*, requested: bool, head: object, tail: object, maximum
 
 
 __all__ = [
-    "CANARY_COMMANDS",
     "FAST_GAIN_DEN",
     "FAST_GAIN_NUM",
     "FINISH_REQUESTS",

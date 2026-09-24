@@ -1,7 +1,6 @@
 """Pure common plan values and exclusive keyset interval algebra."""
 
 from __future__ import annotations
-from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -64,7 +63,6 @@ class LaneSpec:
     kind: LaneKind
     bounds: LaneBounds
     descending: bool
-    owns_output: bool
     retained_upper_anchor: Identity | None
 
 
@@ -78,7 +76,6 @@ class LaneState:
     witness: ClosureWitness | None
     rounds: int
     reserved_rows: int
-    retained: deque[FrozenJson]
 
 
 @dataclass(slots=True)
@@ -119,7 +116,6 @@ class LazyRangePlan:
                 None,
                 0,
                 0,
-                deque(),
             ),
         )
         rows[spec.ordinal], identities[spec.ordinal], commands[spec.ordinal] = [], [], []
@@ -214,7 +210,6 @@ def window_spec(  # noqa: PLR0913
         kind=LaneKind.WINDOW,
         bounds=LaneBounds(lower, upper),
         descending=descending,
-        owns_output=True,
         retained_upper_anchor=None,
     )
 
@@ -240,7 +235,6 @@ def plan_lanes_from_anchors(
                 kind=LaneKind.LANE,
                 bounds=LaneBounds(lower, anchor),
                 descending=False,
-                owns_output=True,
                 retained_upper_anchor=anchor,
             ),
         )
@@ -251,7 +245,6 @@ def plan_lanes_from_anchors(
             kind=LaneKind.LANE,
             bounds=LaneBounds(lower, upper_exclusive),
             descending=False,
-            owns_output=True,
             retained_upper_anchor=None,
         ),
     )

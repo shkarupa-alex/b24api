@@ -7,7 +7,6 @@ import asyncio
 import hashlib
 import json
 import random
-from collections import deque
 from dataclasses import FrozenInstanceError
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs
@@ -710,13 +709,12 @@ def test_fast_keyset_lane_applies_adapter_only_to_publishable_phases() -> None:
     response = Response([{"id": 1}])
     outcome = BatchSuccess(0, "body:0", request, response.result, response=response)
     lane = LaneState(
-        LaneSpec(0, LaneKind.LANE, LaneBounds(0, 2), False, True, None),
+        LaneSpec(0, LaneKind.LANE, LaneBounds(0, 2), False, None),
         0,
         LaneStatus.OPEN,
         None,
         0,
         1,
-        deque(),
     )
 
     class RaisingAdapter:

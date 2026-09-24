@@ -355,8 +355,6 @@ class LogicalBatchKernelStream[C]:
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
             snapshot=snapshot_state,
-            plan_id="batch" if self._fail_fast else "batch_outcomes",
-            dispatch_id="batch",
             emitted_rows=self._emitted,
             unique_rows=self._emitted,
             physical_requests=snapshot.counters.physical_requests,

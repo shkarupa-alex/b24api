@@ -21,8 +21,6 @@ class KernelReport:
     state: KernelState = KernelState.NOT_STARTED
     assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED
     snapshot: SnapshotState = SnapshotState.NOT_REQUESTED
-    plan_id: str | None = None
-    dispatch_id: str | None = None
     emitted_rows: int = 0
     unique_rows: int = 0
     duplicate_identities: int = 0

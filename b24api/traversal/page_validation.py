@@ -56,8 +56,6 @@ class LaneReceipt:
     command_id: str
     rows: tuple[FrozenJson, ...]
     identities: tuple[int, ...]
-    page_full: bool
-    last_identity: int | None
     witness: ClosureWitness | None
     warnings: tuple[Violation, ...]
 
@@ -196,8 +194,6 @@ def validate_lane_receipt(  # noqa: PLR0913
             plan.command_id,
             rows,
             identities,
-            len(rows) == effective_page_cap,
-            identities[-1] if identities else None,
             witness,
             (),
         )
@@ -256,7 +252,6 @@ def normalize_tail_receipt(
         tail,
         rows=tuple(row for row, _ in filtered),
         identities=tuple(identity for _, identity in filtered),
-        last_identity=filtered[-1][1] if filtered else None,
     ), overlap
 
 

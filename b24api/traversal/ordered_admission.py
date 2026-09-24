@@ -40,8 +40,6 @@ def drain_complete_lanes(  # noqa: PLR0913
                     command_id=f"body-admit-{lane.spec.ordinal}",
                     rows=tuple(rows),
                     identities=tuple(identities),
-                    page_full=False,
-                    last_identity=identities[-1] if identities else None,
                     witness=lane.witness,
                     warnings=(),
                 ),
@@ -70,7 +68,6 @@ class AdmissionCommit:
 
     rows: tuple[FrozenJson, ...]
     identities: tuple[int, ...]
-    unique_rows: int
 
 
 @dataclass(slots=True)
@@ -95,11 +92,6 @@ class OrderedAdmissionState:
         self._last: int | None = None
         self._counters = FastCounters()
 
-    @property
-    def last_identity(self) -> int | None:
-        """Return the last globally admitted identity."""
-        return self._last
-
     def has_seen(self, identity: int) -> bool:
         """Return whether monotonic admission has already crossed an identity."""
         if self._last is None:
@@ -120,7 +112,7 @@ class OrderedAdmissionState:
             last = value
         self._last = last
         self._counters.admitted_rows += len(receipt.rows)
-        return AdmissionCommit(receipt.rows, identities, len(receipt.rows))
+        return AdmissionCommit(receipt.rows, identities)
 
     def record_raw(self, count: int, *, discarded: bool = False) -> None:
         """Record validated reads that may not own output."""

@@ -229,8 +229,6 @@ class ItemStream(AsyncIterator[JsonValue]):
             state=state,
             assurance=self._assurance,
             snapshot=snapshot_state,
-            plan_id=type(self._driver.plan).__name__,
-            dispatch_id="sequential_direct",
             emitted_rows=self._emitted,
             unique_rows=self._unique_emitted,
             duplicate_identities=self._driver.duplicate_identities,

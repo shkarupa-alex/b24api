@@ -627,7 +627,7 @@ class ReferenceScheduler:
         if isinstance(event, _PageEvent):
             try:
                 if self.emit_response:
-                    yield _KernelFanOutSuccess(event.work.index, event.work.reference, event.response)
+                    yield _KernelFanOutSuccess(event.work.reference, event.response)
                     for weight in event.item_weights:
                         await self.buffer.release(event.reservation, weight)
                     self.completion.binding(event.work.index).delivered()
@@ -655,7 +655,6 @@ class ReferenceScheduler:
             _finish_done_completion(self.completion, event)
             if self.emit_complete:
                 yield _KernelReferenceComplete(
-                    event.work.index,
                     event.work.reference,
                     event.row_count,
                     event.stopped_reason,

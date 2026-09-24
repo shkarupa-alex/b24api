@@ -112,7 +112,6 @@ def _geometry(inputs: SelectorInputs) -> tuple[int, int, int, int, int]:
 def estimates(
     inputs: SelectorInputs,
     *,
-    canary_commands: int,
     finish_requests: int,
 ) -> tuple[CostEstimate, CostEstimate, CostEstimate, tuple[int, int, int, int, int]]:
     """Compute every frozen candidate formula from integer observations."""
@@ -144,7 +143,7 @@ def estimates(
     groups = ceil_div(windows, capacity) if windows else 0
     range_estimate = CostEstimate(
         KeysetExecutionKind.RANGE,
-        ceil_div(canary_commands, capacity) + groups * range_depth + finish_requests,
+        groups * range_depth + finish_requests,
         groups * range_depth <= inputs.max_range_waves,
         width,
         windows,
@@ -152,15 +151,11 @@ def estimates(
         range_depth,
         rows_per_window,
         groups,
-        ceil_div(canary_commands, capacity),
+        0,
     )
     lanes = min(inputs.target_lanes, max(1, ceil_div(interior_rows, cap)))
     partition_depth = max(1, ceil_div(interior_rows, lanes * cap))
-    planning_waves = (
-        1
-        if canary_commands + inputs.target_lanes <= capacity
-        else ceil_div(canary_commands, capacity) + ceil_div(inputs.target_lanes, capacity)
-    )
+    planning_waves = max(1, ceil_div(inputs.target_lanes, capacity))
     partition = CostEstimate(
         KeysetExecutionKind.PARTITIONED,
         planning_waves + ceil_div(lanes, capacity) * partition_depth + finish_requests,

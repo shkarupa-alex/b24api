@@ -380,7 +380,7 @@ def test_zero_canary_partition_planning_always_has_a_positive_exact_wave_count(
         completion=KeysetPageCompletion.EMPTY_CONFIRMATION,
         advisory_total=None,
     )
-    _sequential, range_estimate, partition, _geometry = estimates(inputs, canary_commands=0, finish_requests=1)
+    _sequential, range_estimate, partition, _geometry = estimates(inputs, finish_requests=1)
     assert range_estimate.planning_waves == 0
     expected = 1 if target_lanes <= capacity else (target_lanes + capacity - 1) // capacity
     assert partition.planning_waves == expected
@@ -757,7 +757,6 @@ def test_fast_trace_uses_exact_deterministic_class_quotas(
                         rows_admitted=0,
                         reported_total=None,
                         reported_next=None,
-                        page_full=False,
                         witness=None,
                         outcome=PageOutcome.REJECTED if anomaly else PageOutcome.COMMITTED,
                         rejection_code=PageRejectionCode.RANGE_CONTRADICTION if anomaly else None,
@@ -891,7 +890,7 @@ def test_post_probe_range_preferred_transition_is_pinned() -> None:
     )
     selection = preselect(inputs)
 
-    final = finalize(inputs, selection, AnchorFacts((), 20, 20))
+    final = finalize(inputs, selection, AnchorFacts((), 20))
 
     assert selection.plan is Preselected.PROBE_ANCHORS
     assert final.kind is KeysetExecutionKind.RANGE

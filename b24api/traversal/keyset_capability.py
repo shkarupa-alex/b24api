@@ -1,9 +1,8 @@
 """Pure capability-planning values for fast integer keysets."""
 
-# ruff: noqa: FBT003, PLR2004
+# ruff: noqa: PLR2004
 
 from __future__ import annotations
-from collections import deque
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -76,7 +75,6 @@ def build_capability_plans(  # noqa: PLR0913
                 kind=LaneKind.LANE,
                 bounds=bounds,
                 descending=command.descending,
-                owns_output=False,
                 retained_upper_anchor=None,
             ),
             bounds.upper_exclusive if command.descending else bounds.lower_exclusive,
@@ -84,7 +82,6 @@ def build_capability_plans(  # noqa: PLR0913
             None,
             0,
             command.reserve,
-            deque(),
         )
         plan = lane_plan(
             lane,
@@ -284,7 +281,6 @@ def compact_anchor_receipts(
             receipt,
             rows=receipt.rows[:1],
             identities=receipt.identities[:1],
-            last_identity=receipt.identities[0] if receipt.identities else None,
         )
         for receipt in receipts
     )
@@ -362,25 +358,23 @@ def lane_for_command(
     """Resolve the immutable validation view for one correlated command."""
     if plan.phase is KeysetPhase.BOUNDARY:
         return LaneState(
-            LaneSpec(plan.lane_ordinal, LaneKind.HEAD, LaneBounds(None, None), plan.lane_ordinal == 1, True, None),
+            LaneSpec(plan.lane_ordinal, LaneKind.HEAD, LaneBounds(None, None), plan.lane_ordinal == 1, None),
             None,
             LaneStatus.OPEN,
             None,
             0,
             plan.reserved_rows,
-            deque(),
         )
     if plan.phase in {KeysetPhase.CANARY, KeysetPhase.ANCHOR_PROBE}:
         bounds = planning_bounds[plan.command_id]
         descending = planning_descending.get(plan.command_id, False)
         return LaneState(
-            LaneSpec(plan.lane_ordinal, LaneKind.LANE, bounds, descending, False, None),
+            LaneSpec(plan.lane_ordinal, LaneKind.LANE, bounds, descending, None),
             bounds.upper_exclusive if descending else bounds.lower_exclusive,
             LaneStatus.OPEN,
             None,
             0,
             plan.reserved_rows,
-            deque(),
         )
     if plan.phase is KeysetPhase.FINISH:
         if finish_lane is None:

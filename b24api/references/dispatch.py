@@ -103,7 +103,6 @@ type _Event = _PageEvent | _DoneEvent | _FailureEvent
 
 @dataclass(frozen=True, slots=True)
 class _KernelReferenceComplete:
-    work_index: int
     reference: ReferenceRequest
     row_count: int
     stopped_reason: str | None = None
@@ -111,7 +110,6 @@ class _KernelReferenceComplete:
 
 @dataclass(frozen=True, slots=True)
 class _KernelFanOutSuccess:
-    work_index: int
     reference: ReferenceRequest
     response: Response
 
@@ -210,7 +208,6 @@ class _RowBuffer:
         self.maximum = maximum
         self.context = context
         self._available = maximum
-        self._accounted = 0
         self._head_index = 0
         self._head_reserve = head_reserve
         self._closed = False
@@ -260,7 +257,6 @@ class _RowBuffer:
             reservation.amount = actual
             reservation.accepted = True
             self._available += unused
-            self._accounted += actual
             if actual == 0:
                 self._reservations.remove(reservation)
             self._condition.notify_all()
@@ -278,7 +274,6 @@ class _RowBuffer:
                 return
             reservation.amount -= count
             self._available += count
-            self._accounted -= count
             if reservation.amount == 0:
                 self._reservations.remove(reservation)
             self._condition.notify_all()
@@ -295,8 +290,6 @@ class _RowBuffer:
                 return
             reservation.amount = 0
             self._available += amount
-            if reservation.accepted:
-                self._accounted -= amount
             self._reservations.remove(reservation)
             self._condition.notify_all()
             self._touch()
@@ -315,7 +308,6 @@ class _RowBuffer:
             if self._closed:
                 return
             self._closed = True
-            self._accounted = 0
             self._available = self.maximum
             for reservation in self._reservations:
                 reservation.amount = 0
