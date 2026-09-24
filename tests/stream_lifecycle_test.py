@@ -208,6 +208,8 @@ async def test_early_close_is_reported_as_closed_before_exhaustion(family: str) 
     assert stream.report is not None
     assert stream.report.state is TerminalState.EARLY_CLOSED
     assert stream.report.terminal_reason == "stream closed before exhaustion"
+    # The terminal event follows cleanup, so work cancelled by the close never lands after it (N1).
+    assert "completion_after_terminal" not in _codes(stream.report)
 
 
 @pytest.mark.asyncio
