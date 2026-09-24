@@ -19,6 +19,10 @@
 - `Bitrix24.from_webhook(url, *, http_timeout=None, policy=None)` validates the URL through
   `Settings` and owns the transport and coordinator it creates; `http_timeout=None` keeps the
   `Settings` default.
+- The README's list traversal animation is replayed from executed traces: a test runs all three
+  lanes against one scripted portal and checks the drawn HTTP counts, batch sizes and the final
+  keyset call (§3.13). Its caption now says that an unbounded keyset ends with an empty confirmation
+  call and that a `BoundedIdentityRange` stops at its upper ID without one.
 - The README opens with a quickstart on `crm.deal.list` and `user.get` that needs four concepts:
   the client, a request, `iter_list()` and the report. It runs in a doc-test on the real client (B26).
 - **Breaking (3.0.0):** removed never-produced report vocabulary: the `canary_requests`,

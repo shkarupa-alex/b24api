@@ -186,6 +186,13 @@ exact `limit_path`; the client never guesses method-specific parameter names.
 
 ![List traversal comparison](https://raw.githubusercontent.com/shkarupa-alex/b24api/master/list-traversal-comparison.svg)
 
+The animation replays real traces for 1,000 dense IDs at 50 rows per page. `iter_list` sends 20
+pages and one empty confirmation (21 HTTP). `iter_list_counted` sends the head and one batch of 19
+pages (2 HTTP). `iter_list_keyset` in auto mode reads both ends of the range in one batch, the 19
+ranges between them in a second, and confirms the end with one call for `ID > 1000` (3 HTTP). A
+`BoundedIdentityRange` with a qualified upper ID needs no confirmation: sequential execution stops
+when it receives that ID.
+
 ### Sequential offset
 
 This is the canonical default. It follows the `next` returned by the server and confirms the end
