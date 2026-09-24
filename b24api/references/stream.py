@@ -132,7 +132,8 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
 
     async def _finalize(self, cause: TerminalCause, failure: str | None, attempt: CleanupAttempt) -> KernelReport:
         if self._outcomes is None:
-            self.report = with_cleanup_attempt(self.report, cause, attempt, subject="reference")
+            # Never started: the report stays NOT_STARTED so the public adapter aborts the unstarted
+            # completion gate and records this stream's cleanup result itself; a close failure is raised.
             return self.report
         state, reason = kernel_terminal(cause, failure)
         if cause is TerminalCause.EXHAUSTED:

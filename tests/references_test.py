@@ -1827,5 +1827,7 @@ async def test_failing_source_close_before_the_first_pull_is_a_cleanup_failure()
         await stream.aclose()
 
     assert source.closes == 1
+    # The kernel never started, so its report stays NOT_STARTED: the public adapter aborts the unstarted
+    # completion gate and records the cleanup failure (tests/stream_lifecycle_test.py).
     assert stream.report is not None
-    assert "cleanup_failure" in [violation.code for violation in stream.report.violations]
+    assert stream.report.state is KernelState.NOT_STARTED

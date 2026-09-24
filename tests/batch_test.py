@@ -1024,3 +1024,41 @@ def test_physical_batch_size_and_non_request_input_fail_before_io() -> None:
     with pytest.raises(TypeError, match="must yield Request"):
         asyncio.run(consume())
     assert not transport.requests
+
+
+class _ClosableRequests:
+    """A request iterator that counts pulls and closes; its close can fail."""
+
+    def __init__(self, *, close_fails: bool = False) -> None:
+        self.pulls = 0
+        self.closes = 0
+        self.close_fails = close_fails
+
+    def __aiter__(self) -> _ClosableRequests:
+        return self
+
+    async def __anext__(self) -> Request:
+        self.pulls += 1
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closes += 1
+        if self.close_fails:
+            raise RuntimeError("request source close failed")
+
+
+@pytest.mark.asyncio
+async def test_internal_outcome_stream_closed_before_the_first_pull_closes_its_source_once() -> None:
+    source, failing = _ClosableRequests(), _ClosableRequests(close_fails=True)
+    transport = ResponderTransport(_echo_batch)
+
+    stream = batch_outcome_stream(BatchExecutor(Executor(transport)), source)
+    await stream.aclose()
+    await stream.aclose()
+    failing_stream = batch_outcome_stream(BatchExecutor(Executor(transport)), failing)
+    with pytest.raises(RuntimeError, match="request source close failed"):
+        await failing_stream.aclose()
+
+    assert (source.pulls, source.closes) == (0, 1)
+    assert (failing.pulls, failing.closes) == (0, 1)
+    assert transport.requests == []

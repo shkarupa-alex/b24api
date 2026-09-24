@@ -43,7 +43,8 @@
 - **Breaking (3.0.0):** closing a logical batch early reports `EARLY_CLOSED` with the reason
   `"stream closed before exhaustion"` (A12). A fail-fast batch reports `BatchCommandError` and the
   violation `batch_command_failure` instead of a private carrier class (A14). A failed source close
-  after an early close publishes exactly one report (A11).
+  after an early close publishes exactly one report, and a stream closed before its first read closes
+  the caller's source iterator once (A11).
 - **Breaking (3.0.0):** `OffsetContinuation.FIXED_STEP` without an exact qualified total fails right
   after a short page, without the unusable confirmation request (B10).
 - **Breaking (3.0.0):** `EnvelopeContractError` is also a `ProtocolError` with gateway origin (B20).

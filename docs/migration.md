@@ -39,6 +39,9 @@ details.
    - a failure during cleanup that follows another failure is kept as a secondary `cleanup_failure`
      violation (for example `reference cleanup also failed (RuntimeError)`), so a report can carry
      more than one.
+   - a stream closed before its first read, by `aclose()` or on leaving `async with`, still closes
+     the iterator it took from your command or reference source, once, without reading from it; a
+     failing close is raised and recorded as a `cleanup_failure` on an `EARLY_CLOSED` report.
 
 8. **Compressed responses.** Only identity, `gzip` and `deflate` bodies are decoded; `br`, `zstd`,
    stacked and unknown codings are refused as a transport failure. Library-owned requests send

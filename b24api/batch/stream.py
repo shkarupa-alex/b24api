@@ -67,6 +67,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         self._context = context or batch_executor.executor.context(policy)
         self._logical_page_per_command = logical_page_per_command
         self._source_controller: AsyncIteratorController[_BatchItem] | None = None
+        self._source_taken = False
         self._started = False
         self._batch_requests = 0
         self._batch_commands = 0
@@ -112,6 +113,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             cleanup_error="batch source cleanup exceeded operation time budget",
         )
         self._source_controller = source
+        self._source_taken = True
         next_index = 0
         while True:
             chunk = await _next_chunk(
@@ -166,6 +168,10 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
     async def _cleanup(self) -> None:
         source = self._source_controller
         if source is None:
+            if not self._source_taken:
+                # No controller took the source this stream opened (closed before the first pull, or the
+                # context failed to start), so the stream closes it itself. OwnedSource.aclose is idempotent.
+                (await self._source.aclose()).raise_failure()
             return
         await self._context.set_buffered_rows(0)
         await source.aclose(remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed))

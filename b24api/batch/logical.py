@@ -187,6 +187,7 @@ class LogicalBatchKernelStream[C]:
         self._context = executor.context(policy)
         self._completion = ReferenceCompletionRecorder()
         self._controller: AsyncIteratorController[_BatchItem] | None = None
+        self._source_taken = False
         self._runner = OperationRunner(
             self._run(),
             LifecycleHooks(finalize=self._finalize, failure_report=_failure_report, cleanup=self._cleanup),
@@ -253,6 +254,7 @@ class LogicalBatchKernelStream[C]:
             cleanup_error="batch source cleanup exceeded operation time budget",
         )
         self._controller = controller
+        self._source_taken = True
         next_index = 0
         while True:
             try:
@@ -333,6 +335,10 @@ class LogicalBatchKernelStream[C]:
         # One close attempt: a failed close is recorded once and never retried by a later aclose().
         controller, self._controller = self._controller, None
         if controller is None:
+            if not self._source_taken:
+                # No controller took the source this stream opened (closed before the first pull, or the
+                # context failed to start), so the stream closes it itself. OwnedSource.aclose is idempotent.
+                (await self._source.aclose()).raise_failure()
             return
         await controller.aclose(remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed))
 

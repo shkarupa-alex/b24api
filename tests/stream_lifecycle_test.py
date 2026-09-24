@@ -160,6 +160,65 @@ async def test_early_close_with_failing_source_close_publishes_one_report(family
     assert source.closes == 1
 
 
+class _SyncSource:
+    """A synchronous command iterator that counts pulls and closes."""
+
+    def __init__(self) -> None:
+        self.pulls = 0
+        self.closes = 0
+
+    def __iter__(self) -> _SyncSource:
+        return self
+
+    def __next__(self) -> Command[int]:
+        self.pulls += 1
+        raise StopIteration
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("exit_by", ["aclose", "context"])
+async def test_close_before_the_first_pull_closes_the_opened_source_once(family: str, exit_by: str) -> None:
+    # Every family opens the caller's source when it is built; closing before the first pull must still
+    # close that source, exactly once, without pulling from it or sending anything.
+    asynchronous, synchronous = _Source(), _SyncSource()
+    async with _client(_Portal()) as client:
+        for source in (asynchronous, synchronous):
+            stream = _stream(client, family, source)  # type: ignore[arg-type]
+            if exit_by == "context":
+                async with stream:
+                    pass
+            else:
+                await stream.aclose()
+            await stream.aclose()
+
+    assert (asynchronous.produced, asynchronous.closes) == (0, 1)
+    assert (synchronous.pulls, synchronous.closes) == (0, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_failing_source_close_before_the_first_pull_is_a_cleanup_failure(family: str) -> None:
+    source = _Source(close_fails=True)
+    async with _client(_Portal()) as client:
+        stream = _stream(client, family, source)
+        with pytest.raises(_CloseFailedError) as raised:
+            await stream.aclose()
+
+        report = stream.report
+        assert report is not None
+        assert _published(raised.value) is report
+        assert report.state is TerminalState.EARLY_CLOSED
+        assert report.terminal_reason == "stream cleanup failed"
+        assert "cleanup_failure" in _codes(report)
+        await stream.aclose()
+        assert stream.report is report
+    assert (source.produced, source.closes) == (0, 1)
+
+
 class _BodyFailedError(Exception):
     """The caller's own code failed inside ``async with stream``."""
 
