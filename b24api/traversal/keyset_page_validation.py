@@ -20,7 +20,7 @@ from b24api.errors import (
     PaginationError,
     ProtocolError,
 )
-from b24api.traversal.keyset_range import closure_witness
+from b24api.traversal.keyset_geometry import closure_witness
 from b24api.traversal.page_adaptation import adapt_page
 from b24api.traversal.values import _coerce_identity, _extract_path, _response_items, _validate_order
 

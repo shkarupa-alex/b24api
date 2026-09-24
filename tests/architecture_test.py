@@ -411,7 +411,7 @@ def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
 
     # Protective (B21): the auto selector is deterministic integer arithmetic, so its inputs never
     # include randomness, clocks, environment or floats.
-    for name in ("keyset_auto.py", "keyset_costs.py"):
+    for name in ("keyset_auto.py", "keyset_geometry.py"):
         selector = (PACKAGE / "traversal" / name).read_text(encoding="utf-8")
         for forbidden in ("random", "time.", "os.environ", "float("):
             assert forbidden not in selector

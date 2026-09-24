@@ -54,11 +54,10 @@ from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationE
 from b24api.execution import Executor, WireResponse
 from b24api.traversal import keyset_page_validation, keyset_scheduler
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
-from b24api.traversal.keyset_costs import estimates
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
 from b24api.traversal.keyset_fast_stream import FastTraceRecorder
+from b24api.traversal.keyset_geometry import anchor_guesses, estimates
 from b24api.traversal.keyset_observation import PageObservation
-from b24api.traversal.keyset_partition import anchor_guesses
 
 if TYPE_CHECKING:
     from b24api.contracts import JsonValue

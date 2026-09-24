@@ -2,7 +2,7 @@
   "slf001_tests": 194,
   "slf001_package": 78,
   "slf001_traversal": 46,
-  "noqa_package": 182,
+  "noqa_package": 181,
   "long_functions": {
     "b24api/completion/gate.py::CompletionGate.emit": {
       "lines": 162,

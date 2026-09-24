@@ -9,7 +9,7 @@ from b24api.contracts.keyset_execution import (
     KeysetExecutionKind,
     KeysetSelectionReason,
 )
-from b24api.traversal.keyset_costs import BoundaryFacts, CostEstimate, SelectorInputs, ceil_div, estimates
+from b24api.traversal.keyset_geometry import BoundaryFacts, CostEstimate, SelectorInputs, ceil_div, estimates
 
 SEQ_FLOOR_REQUESTS = 3
 FAST_GAIN_NUM = 3

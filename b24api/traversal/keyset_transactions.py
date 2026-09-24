@@ -30,6 +30,7 @@ from b24api.traversal.keyset_fast_plan import (
     LaneStatus,
     fit_wave,
 )
+from b24api.traversal.keyset_geometry import descending_closure_witness
 from b24api.traversal.keyset_observation import stage_or_record_observation
 from b24api.traversal.keyset_page_validation import (
     LaneCommandPlan,
@@ -37,7 +38,6 @@ from b24api.traversal.keyset_page_validation import (
     classify_rejection,
     validate_lane_receipt,
 )
-from b24api.traversal.keyset_range import descending_closure_witness
 from b24api.traversal.keyset_transaction_contract import boundary_totals, build_controlled_request, build_lane_plan
 
 if TYPE_CHECKING:

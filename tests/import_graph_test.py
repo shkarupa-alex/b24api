@@ -57,7 +57,7 @@ _TYPE_ONLY_CYCLE_BASELINE = {
     # Policy annotates RequestSummary in ambiguity decisions; request coerces identities by policy enums.
     ("contracts.policy", "contracts.request"),
     # Keyset planning and runtime modules see each other's types; removed by keyset consolidation (C5).
-    ("traversal.keyset_auto", "traversal.keyset_costs", "traversal.keyset_range", "traversal.keyset_fast_plan"),
+    ("traversal.keyset_auto", "traversal.keyset_geometry", "traversal.keyset_fast_plan"),
     ("traversal.keyset_fast_stream", "traversal.keyset_observation", "traversal.keyset_scheduler"),
     ("traversal.keyset_fast_stream", "traversal.keyset_scheduler"),
     ("traversal.keyset_observation", "traversal.keyset_scheduler"),

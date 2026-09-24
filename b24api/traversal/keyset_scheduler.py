@@ -38,9 +38,7 @@ from b24api.traversal.keyset_capability import (
     anchor_capable_batch_capacity,
     compact_anchor_receipts,
     normalize_anchor_receipts,
-    selected_lane_geometry,
 )
-from b24api.traversal.keyset_costs import selected_range_geometry
 from b24api.traversal.keyset_fast_plan import (
     FastKeysetPlan,
     LaneBounds,
@@ -52,6 +50,7 @@ from b24api.traversal.keyset_fast_plan import (
     PlanOutcome,
     fit_wave,
 )
+from b24api.traversal.keyset_geometry import BoundaryDensity, partition_lane_specs, selected_range_geometry
 from b24api.traversal.keyset_observation import (
     abort_staged_observations,
     close_scheduler,
@@ -89,6 +88,10 @@ if TYPE_CHECKING:
     from b24api.contracts.traversal import KeysetSpec
     from b24api.execution import ExecutionContext, Executor
     from b24api.traversal.keyset_fast_stream import FastTraceRecorder
+
+
+def _density_fields(density: BoundaryDensity | None) -> tuple[int | None, int | None, int | None]:
+    return (None, None, None) if density is None else (density.span, density.numerator, density.denominator)
 
 
 class KeysetFastScheduler:
@@ -154,6 +157,7 @@ class KeysetFastScheduler:
         self._pending_owners: deque[tuple[tuple[str, int], ...]] = deque()
         self._offered_owners: deque[tuple[str, int]] = deque()
         self._head_rows, self._tail_rows = 0, 0
+        self._density: BoundaryDensity | None = None
         self._interior_span: int | None = None
         self._density_num: int | None = None
         self._density_den: int | None = None
@@ -383,8 +387,8 @@ class KeysetFastScheduler:
         )
         self.transactions.boundary_totals.clear()
         self._total_hint = analysis.total_hint
-        self._interior_span = analysis.interior_span
-        self._density_num, self._density_den = analysis.density_numerator, analysis.density_denominator
+        self._density = analysis.density
+        self._interior_span, self._density_num, self._density_den = _density_fields(analysis.density)
         selected: KeysetExecutionKind
         if isinstance(self.execution, AutoKeysetExecution):
             inputs = SelectorInputs(
@@ -532,12 +536,13 @@ class KeysetFastScheduler:
         if self._selected is KeysetExecutionKind.RANGE:
             if not isinstance(self.execution, RangeKeysetExecution | AutoKeysetExecution):
                 raise TypeError("range selection requires range or auto execution")
+            if self._density is None:
+                raise RuntimeError("range selection lacks boundary density")
             width, count = selected_range_geometry(
                 execution=self.execution,
                 completion=self.completion,
                 page_cap=self.effective_page_cap,
-                ascending=asc.identities,
-                descending=desc.identities,
+                density=self._density,
             )
             self._window_width, self._window_count = width, count
             self._range_geometry = LazyRangePlan(
@@ -555,17 +560,12 @@ class KeysetFastScheduler:
                 self.transactions.lane_commands,
             )
             return
-        geometry = selected_lane_geometry(
-            selected=self._selected,
-            execution=self.execution,
-            keyset=self.keyset,
-            completion=self.completion,
-            page_cap=self.effective_page_cap,
-            ascending=asc.identities,
-            descending=desc.identities,
+        specs = partition_lane_specs(
+            lo=max(asc.identities),
+            upper_exclusive=min(desc.identities),
             anchors=tuple(sorted(self.transactions.anchor_rows)),
+            descending=self.keyset.direction == "descending",
         )
-        specs = geometry.specs
         self.transactions.lanes = [
             LaneState(
                 spec,
