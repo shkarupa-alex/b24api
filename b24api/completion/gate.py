@@ -118,6 +118,7 @@ class CompletionGate:
         self._unknown = 0
         self._caller_stops = 0
         self._bounded = 0
+        self._source_empty = 0
         self._stream: StreamClosure | None = None
         self._empty_source = False
         self._cleanup: CleanupState | None = None
@@ -289,6 +290,8 @@ class CompletionGate:
                 self._caller_stops += 1
             if event.closure is BindingClosure.BOUNDARY_SEEN:
                 self._bounded += 1
+            if event.closure is BindingClosure.SOURCE_EMPTY:
+                self._source_empty += 1
             self._terminal += 1
             del self._bindings[event.binding_id]
         elif isinstance(event, StreamTerminal):
@@ -383,6 +386,18 @@ class CompletionGate:
             )
         )
 
+    def _witness_mismatch(self, source: KernelReport) -> tuple[Violation, ...]:
+        """Refuse a report empty-source witness that no source-empty binding closure backs."""
+        if source.empty_source_witness is None or self._source_empty:
+            return ()
+        return (
+            Violation(
+                ViolationSeverity.BLOCKING,
+                "completion_empty_witness_mismatch",
+                "report empty-source witness lacks a source-empty binding closure",
+            ),
+        )
+
     def finish(self) -> OperationReport:
         """Build the sole strong frozen report after correlated cleanup evidence."""
         decision = self.decision()
@@ -401,7 +416,9 @@ class CompletionGate:
             state = TerminalState.CANCELLED
         else:
             state = TerminalState.FAILED
-        violations = retain_violations((*source.violations, *decision.violations, *facts.extra_violations))
+        violations = retain_violations(
+            (*source.violations, *decision.violations, *facts.extra_violations, *self._witness_mismatch(source))
+        )
         gate_negative = decision.state is TerminalState.COMPLETED_WITH_FAILURES
         if source.state is KernelState.COMPLETED and gate_negative != bool(negative_outcomes):
             violations = retain_violations(
@@ -474,6 +491,18 @@ def _observed_assurance(
         return TraversalAssurance.MECHANICS_ONLY if declared is not None or caller_stopped else None
     if caller_stopped:
         return TraversalAssurance.BOUNDED_PREFIX
+    if source.empty_source_witness is not None and declared is not None:
+        # No nonnegative total was observed, so a count-matched claim keeps only its identity strength.
+        declared = _without_count(declared)
     if source.duplicate_identities and declared in _IDENTITY_STRENGTH:
+        return TraversalAssurance.MECHANICS_ONLY
+    return declared
+
+
+def _without_count(declared: TraversalAssurance) -> TraversalAssurance:
+    """Drop the count half of a count-matched claim and keep its identity strength."""
+    if declared is TraversalAssurance.IDENTITY_AND_COUNT_MATCHED:
+        return TraversalAssurance.IDENTITY_EXACT
+    if declared is TraversalAssurance.COUNT_MATCHED:
         return TraversalAssurance.MECHANICS_ONLY
     return declared

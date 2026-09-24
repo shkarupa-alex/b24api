@@ -180,6 +180,10 @@ class CountedItemStream:
             self._context.policy.page_trace_limit,
         )
         page_trace_truncated = page_trace_truncated or self._driver.page_trace_truncated
+        # The binding closure, terminal reason and report witness all derive from this one value.
+        witness = self._driver.empty_source_witness if state is KernelState.COMPLETED else None
+        if witness is not None:
+            reason = witness.terminal_reason
         self.report = KernelReport(
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
@@ -201,9 +205,12 @@ class CountedItemStream:
             evidence=tuple(self._evidence),
             page_trace=page_trace,
             page_trace_truncated=page_trace_truncated,
+            empty_source_witness=witness,
         )
         closure = (
-            BindingClosure.QUALIFIED_TOTAL
+            witness.closure
+            if witness is not None
+            else BindingClosure.QUALIFIED_TOTAL
             if state is KernelState.COMPLETED
             else BindingClosure.UNKNOWN
             if self._completion.has_unknown

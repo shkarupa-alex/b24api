@@ -180,6 +180,139 @@ identity = CompositeIdentitySpec(
 
 Composite identities are intentionally unavailable for keyset and cursor traversal.
 
+## Legacy positional list methods
+
+Some legacy PHP methods bind arguments by position, not by name. `task.elapseditem.getlist` takes
+`taskId, order, filter, select, params`; send all five slots with `PositionalArguments` and an
+explicit `PositionalLayout`. A shorter request without the task slot can still return HTTP 200
+while selecting a different scope, so a successful response does not prove the arguments were bound
+as intended. The client has no endpoint catalog: it never reorders a named mapping by method name and
+does not turn a server error into a method-specific hint.
+
+The supported route is ordinary `iter_list()` paging through `NAV_PARAMS.iNumPage`. Check each row's
+task scope in the application; scenario 13 in [examples](../examples/README.md) does this offline.
+
+<!-- tested: tests/examples/elapsed_task_items_test.py::test_elapsed_task_items_recipe_uses_five_json_slots -->
+```python
+from b24api import (
+    EmptyArray,
+    EmptyObject,
+    OffsetSpec,
+    PageIndex,
+    ParameterPath,
+    PositionalArguments,
+    PositionalLayout,
+    Present,
+    ReplaySafety,
+    Request,
+    RouteKind,
+    SlotContract,
+    SlotShape,
+)
+
+page = ParameterPath((4, "NAV_PARAMS", "iNumPage"))
+layout = PositionalLayout(
+    "task.elapseditem.getlist.five.v1",
+    (
+        SlotContract("taskId", SlotShape.SCALAR, fixed=True),
+        SlotContract("order", SlotShape.OBJECT),
+        SlotContract("filter", SlotShape.OBJECT),
+        SlotContract("select", SlotShape.ARRAY),
+        SlotContract("params", SlotShape.OBJECT),
+    ),
+    control_paths=frozenset({page.path}),
+)
+arguments = PositionalArguments(
+    (Present(42), EmptyObject(), EmptyObject(), EmptyArray(), Present({"NAV_PARAMS": {"iNumPage": 1}})),
+    layout.layout_id,
+    layout=layout,
+)
+stream = client.iter_list(
+    Request("task.elapseditem.getlist", arguments, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+    identity=identity,
+    page_size=50,
+    offset=OffsetSpec(parameter_path=page, page_index=PageIndex(page, max_rows=50)),
+)
+```
+
+Bitrix physical batch cannot encode positional slots, so `iter_list_counted()` and the range,
+partitioned, and default auto keyset executions reject positional requests before I/O.
+
+An explicit sequential keyset profile is mechanically available when both object slots are present
+and the layout declares the order leaf `(1, "ID")` and the filter leaf `(2, ">ID")` as writable
+controls; those are the only leaves the traversal writes. The capability guard also writes `<ID` and
+the exact `ID` filter leaves for its bound checks, so this layout declares them as well. The profile
+is covered only by an offline regression of exact slot order and strict ID progression; it is not
+qualified against a portal. Before relying on it, verify the task scope and the ID filter against an
+independent oracle for your portal and keep `iter_list()` as the default.
+
+<!-- tested: tests/positional_keyset_test.py::test_documented_positional_keyset_guard_verifies_offline -->
+```python
+import os
+
+from b24api import (
+    EmptyArray,
+    KeysetSpec,
+    ParameterPath,
+    PositionalArguments,
+    PositionalLayout,
+    Present,
+    ReplaySafety,
+    Request,
+    ResultSelector,
+    RouteKind,
+    SequentialKeysetExecution,
+    SlotContract,
+    SlotShape,
+)
+
+layout = PositionalLayout(
+    "task.elapseditem.getlist.five.keyset.v1",
+    (
+        SlotContract("taskId", SlotShape.SCALAR, fixed=True),
+        SlotContract("order", SlotShape.OBJECT),
+        SlotContract("filter", SlotShape.OBJECT),
+        SlotContract("select", SlotShape.ARRAY),
+        SlotContract("params", SlotShape.OBJECT),
+    ),
+    control_paths=frozenset({(1, "ID"), (2, ">ID"), (2, "<ID"), (2, "ID")}),
+)
+arguments = PositionalArguments(
+    (Present(42), Present({}), Present({}), EmptyArray(), Present({"NAV_PARAMS": {"nPageSize": 50}})),
+    layout.layout_id,
+    layout=layout,
+)
+elapsed = Request("task.elapseditem.getlist", arguments, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+keyset = KeysetSpec(
+    order_path=ParameterPath((1,)),
+    filter_path=ParameterPath((2,)),
+    start_suppression_path=None,
+)
+
+if os.environ.get("ENV") != "PROD":
+    # Accepting an ID filter does not prove strict bounds or ordering.
+    await client.verify_keyset_capability(
+        elapsed,
+        selector=ResultSelector.root(),
+        identity=identity,
+        page_size=50,
+        keyset=keyset,
+    )
+
+stream = client.iter_list_keyset(
+    elapsed,
+    selector=ResultSelector.root(),
+    identity=identity,
+    page_size=50,
+    keyset=keyset,
+    execution=SequentialKeysetExecution(),
+)
+```
+
+A missing or empty-placeholder object slot, an undeclared control path, or near-match key casing fails
+before I/O with `CapabilityError`; its message names the value-free reason and its cause keeps the
+original positional control error.
+
 ## Form bodies, scoped headers, and binary responses
 
 ```python

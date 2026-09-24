@@ -1,5 +1,9 @@
 name: Publish to PyPI
 
+# Every pushed tag runs this workflow, but only a canonical stable release tag MAJOR.MINOR.PATCH
+# (for example 2.2.1, with no prefix or suffix) may build and publish. setuptools-git-versioning
+# derives the package version from that tag; the build job verifies the distributions against it.
+
 on:
   push:
     tags:
@@ -13,23 +17,32 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
+      - name: Validate release tag
+        # GITHUB_REF_NAME is read from the environment, never interpolated into the script.
+        run: python .github/scripts/verify_release.py tag
+
       - name: Build release distributions
         run: |
-          # NOTE: put your own distribution build steps here.
-          python -m pip install build
+          python -m pip install build twine
           python -m build
 
+      - name: Verify release distributions
+        run: |
+          python .github/scripts/verify_release.py dists dist
+          python -m twine check --strict dist/*
+
       - name: Upload distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-dists
           path: dist/
+          if-no-files-found: error
 
   pypi-publish:
     runs-on: ubuntu-latest
@@ -45,7 +58,7 @@ jobs:
 
     steps:
       - name: Retrieve release distributions
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: release-dists
           path: dist/

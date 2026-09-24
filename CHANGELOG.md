@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- The PyPI release workflow accepts only canonical stable tags `MAJOR.MINOR.PATCH` (for example
+  `2.2.1`, with no `fix-` or `v` prefix) and rejects any other tag before the build backend runs. It
+  then requires exactly one sdist and one wheel whose filenames and metadata carry that version, and
+  passes `twine check --strict`, before upload; publication still depends on the build job. The
+  checkout, setup-python, upload-artifact, and download-artifact actions move to their Node 24 `v7`
+  majors.
+- A positional request whose slots cannot accept a declared traversal control still raises
+  `CapabilityError` with the original positional error as its cause; the message now appends a
+  value-free reason (undeclared path, absent slot, missing parent, or near-match casing), and the
+  cause is a `ValueError` subclass carrying the closed
+  `b24api.contracts.positional.PositionalControlFault`.
+- Documented the five-slot positional `task.elapseditem.getlist` route and the optional,
+  offline-tested sequential positional keyset profile.
+- `iter_list_counted()` accepts a first page with no rows, no `next`, and a missing, `null`, or `-1`
+  `total` as an observed empty source. The report completes and is exhausted with `mechanics_only`
+  assurance (`identity_exact` with an identity) and never claims a count; `total: 0` keeps its
+  count-matched result, and an explicit `ConsistencyPolicy` confirmation of `QUALIFIED_TOTAL` keeps such a page strict.
 - Added `Bitrix24.iter_cursors()` with lazy one/many-parent scheduling, per-binding
   `Binding.start_cursor`, strict seed progression, shared physical batching and existing
   fail-fast/tolerant reference semantics. When cursor-control creation is disabled, the complete

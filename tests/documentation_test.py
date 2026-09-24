@@ -36,6 +36,7 @@ def test_docs_are_flat_compact_and_linked_from_readme() -> None:
         "docs/specifications/b24api-issues-architecture/synthesis.md",
         "docs/specifications/b24api-issues-architecture/transport-and-errors.md",
         "docs/specifications/b24api-issues-architecture/traversal-contracts.md",
+        "docs/specifications/b24api-open-issues-release-ci/specification.md",
     ]
     text = README.read_text(encoding="utf-8")
     assert "docs/architecture.md" in text

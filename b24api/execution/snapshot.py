@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from b24api.contracts.completion import EmptySourceWitness
 from b24api.contracts.json import _is_plain_int
 from b24api.contracts.policy import CompletionAssurance, KernelState, SnapshotState
 from b24api.contracts.report import KeysetExecutionReport, PageRecord, Violation, ViolationSeverity
@@ -39,8 +40,9 @@ class KernelReport:
     page_trace: tuple[PageRecord, ...] = ()
     page_trace_truncated: bool = False
     keyset_execution: KeysetExecutionReport | None = None
+    empty_source_witness: EmptySourceWitness | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901 - one flat validation of every report field
         """Validate and normalize instance state."""
         if not isinstance(self.state, KernelState):
             raise TypeError("state must be a KernelState")
@@ -74,6 +76,10 @@ class KernelReport:
             raise ValueError("completed report cannot contain blocking violations")
         if self.keyset_execution is not None and not isinstance(self.keyset_execution, KeysetExecutionReport):
             raise TypeError("keyset_execution must be a KeysetExecutionReport or None")
+        if self.empty_source_witness is not None and (
+            not isinstance(self.empty_source_witness, EmptySourceWitness) or not self.completed or self.emitted_rows
+        ):
+            raise ValueError("an empty-source witness requires a completed report without rows")
 
     @property
     def completed(self) -> bool:
