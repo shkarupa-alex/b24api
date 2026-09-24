@@ -50,7 +50,9 @@ details.
    ambiguous direct call. Unchanged from 2.3: a batch whose transport failed before dispatch is
    retried within the budget, and a batch of only `SAFE` commands answered with a transient HTTP
    status (`RetryPolicy.transient_http_statuses`) and no Bitrix envelope is replayed within the
-   budget, while `UNSAFE` or `UNKNOWN` commands of such a batch arrive as `CommandOutcomeUnknown`.
+   budget. `UNSAFE` or `UNKNOWN` commands of such a batch arrive as `CommandOutcomeUnknown` after a
+   408 or 5xx status (`AmbiguityPolicy.ambiguous_unstructured_statuses`), and as `CommandFailure`
+   after 423, 425 or 429, which mean the batch was not accepted.
 10. **Error text.** Error descriptions show field names from your request as `field#N`, known V3
     codes verbatim, and distinct hidden mapping keys as `[REDACTED#1]`, `[REDACTED#2]`, … Code that
     parses error strings must accept these forms.

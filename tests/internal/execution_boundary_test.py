@@ -18,6 +18,7 @@ from b24api.errors import (
     ApiResponseError,
     BudgetExceededError,
     CapabilityError,
+    HTTPGatewayError,
     ResponseTooLargeError,
     TransportError,
 )
@@ -237,22 +238,29 @@ async def test_physical_batch_replay_matrix(
 
 
 HTTP_BAD_GATEWAY = 502
+HTTP_TOO_MANY_REQUESTS = 429
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("count", [1, SEVERAL], ids=["one", "several"])
 @pytest.mark.parametrize("safety", _SAFETIES)
-async def test_physical_batch_after_an_unstructured_transient_status(safety: ReplaySafety, count: int) -> None:
+@pytest.mark.parametrize("status", [HTTP_BAD_GATEWAY, HTTP_TOO_MANY_REQUESTS])
+async def test_physical_batch_after_an_unstructured_transient_status(
+    status: int,
+    safety: ReplaySafety,
+    count: int,
+) -> None:
     # Decided with the owner's regressions in mind: the status path is unchanged from 2.3. A SAFE batch
     # answered with a transient status and no Bitrix envelope is replayed within the budget, as list
-    # traversals on real portals rely on; UNSAFE and UNKNOWN commands become unknown outcomes.
+    # traversals on real portals rely on. UNSAFE and UNKNOWN commands become unknown after a status that
+    # may follow execution (502) and fail after one that means the batch was not accepted (429).
     transport = _Script([])
 
-    def bad_gateway(request: Request) -> WireResponse:
+    def transient(request: Request) -> WireResponse:
         transport.sent.append(request)
-        return WireResponse(HTTP_BAD_GATEWAY, (("content-type", "text/html"),), b"<html>Bad Gateway</html>")
+        return WireResponse(status, (("content-type", "text/html"),), b"<html>transient</html>")
 
-    transport.behaviors = [bad_gateway, _counting(transport)]
+    transport.behaviors = [transient, _counting(transport)]
     stream = _client(transport).batch_outcomes(
         [Command(_request(safety), index) for index in range(count)],
         policy=_policy(),
@@ -265,12 +273,19 @@ async def test_physical_batch_after_an_unstructured_transient_status(safety: Rep
         assert len(transport.sent) == 2  # noqa: PLR2004 - one replay after the transient status
         assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
         assert stream.report.retries == 1
-    else:
+    elif status == HTTP_BAD_GATEWAY:
         assert len(transport.sent) == 1
         for outcome in outcomes:
             assert isinstance(outcome, CommandOutcomeUnknown)
             assert isinstance(outcome.error, AmbiguousExecutionError)
             assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    else:
+        assert len(transport.sent) == 1
+        for outcome in outcomes:
+            assert isinstance(outcome, CommandFailure)
+            assert isinstance(outcome.error, HTTPGatewayError)
+            assert outcome.error.http_status == HTTP_TOO_MANY_REQUESTS
+            assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
     assert stream.report.physical_requests == len(transport.sent)
 
 

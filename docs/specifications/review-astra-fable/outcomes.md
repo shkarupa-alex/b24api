@@ -191,11 +191,12 @@ Two further observations belong to the owner:
   in 2.3, because nothing can run twice or because list traversals on real portals rely on them:
   a batch whose transport failed before dispatch (`NOT_DISPATCHED`, `CONNECTION_ESTABLISHED`) is
   retried within the budget, and a batch of only `SAFE` commands answered with a transient HTTP
-  status and no Bitrix envelope is replayed within the budget; `UNSAFE` or `UNKNOWN` commands of such
-  a batch become unknown. Two tests pin both:
+  status and no Bitrix envelope is replayed within the budget. `UNSAFE` or `UNKNOWN` commands of such
+  a batch become unknown after a 408 or 5xx status and fail after 423, 425 or 429, which mean the
+  batch was not accepted. Two tests pin this:
   `tests/internal/execution_boundary_test.py::test_physical_batch_replay_matrix` and
   `tests/internal/execution_boundary_test.py::test_physical_batch_after_an_unstructured_transient_status`.
-  Migration item 9 states them. Forbidding the status replay as well is a stricter reading of §3.4 that the owner can
-  still choose.
+  Migration item 9 states it. Forbidding the status replay as well is a stricter reading of §3.4
+  that the owner can still choose.
 - **HTTPX logging on injected clients.** Two W2 gaps remain: the httpcore DEBUG record of a
   redirect token, and an unbounded `aread` on injected clients.

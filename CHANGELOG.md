@@ -17,11 +17,11 @@
 - **Breaking (3.0.0):** a physical batch that may have been accepted when its transport failed is
   never replayed, even when every command is `SAFE`; each admitted command becomes
   `CommandOutcomeUnknown` with its own `AmbiguousExecutionError` (A3). A `SAFE` batch answered with a
-  transient HTTP status and no Bitrix envelope is still replayed within the budget, as in 2.3. A transport failure marked `retryable=False` is raised once
-  instead of exhausting the attempt budget. An arbitrary exception from an injected transport
-  becomes `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause
-  (A13), and a response over `max_response_bytes` from an injected transport is refused before
-  decoding (B29).
+  transient HTTP status and no Bitrix envelope is still replayed within the budget, as in 2.3. A
+  transport failure marked `retryable=False` is raised once instead of exhausting the attempt budget.
+  An arbitrary exception from an injected transport becomes
+  `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause (A13), and
+  a response over `max_response_bytes` from an injected transport is refused before decoding (B29).
 - **Breaking (3.0.0):** error rendering is contextual. Known V3 error codes are shown verbatim, field
   names taken from the request render as `field#N` aliases, the request's own sensitive values are
   exact secrets, and distinct hidden mapping keys become `[REDACTED#1]`, `[REDACTED#2]`, … instead
