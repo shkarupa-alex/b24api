@@ -3,13 +3,14 @@
 # ruff: noqa: SLF001, PLR0912 - bounded orchestration state machine
 
 from __future__ import annotations
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator
-from typing import Protocol, Self, cast, runtime_checkable
+from collections.abc import AsyncGenerator, AsyncIterable, Iterable
+from typing import TYPE_CHECKING, Self, cast
 
-from b24api.batch.engine import BatchExecutor, BatchSource, _BatchInput, _BatchItem, _BatchNotExecutedError
+from b24api._sources import OwnedSource
+from b24api.batch.engine import BatchExecutor, _BatchInput, _BatchItem, _BatchNotExecutedError
 from b24api.batch.outcome import BatchFailure as KernelFailure
 from b24api.batch.outcome import BatchSuccess as KernelSuccess
-from b24api.batch.stream import _iterate_source, _next_chunk
+from b24api.batch.stream import _next_chunk
 from b24api.completion.reference_recorder import ReferenceCompletionRecorder
 from b24api.contracts.command import (
     Command,
@@ -52,69 +53,32 @@ from b24api.execution.lifecycle import (
 )
 from b24api.execution.snapshot import KernelReport
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from b24api.contracts.report import Violation
+    from b24api.contracts.request import Request
+
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
-
-
-@runtime_checkable
-class _SyncClosable(Protocol):
-    def close(self) -> None:
-        """Close a caller-owned synchronous iterator."""
-        ...
-
-
-@runtime_checkable
-class _AsyncClosable(Protocol):
-    async def aclose(self) -> None:
-        """Close a caller-owned asynchronous iterator."""
-        ...
 
 
 class _CommandLocalValidationError(TypeError):
     """A yielded source item is not a public Command value."""
 
 
-class _SyncCommandAdapter[C](Iterator[_BatchInput]):
-    def __init__(self, source: Iterable[Command[C]]) -> None:
-        self._iterator = iter(source)
-
-    def __iter__(self) -> Self:
-        return self
-
-    def __next__(self) -> _BatchInput:
-        command = next(self._iterator)
-        if not isinstance(command, Command):
-            raise _CommandLocalValidationError("batch source must yield Command values")
-        return _BatchInput(command.request, command.correlation)
-
-    def close(self) -> None:
-        if isinstance(self._iterator, _SyncClosable):
-            self._iterator.close()
+def _accept_command(command: object, _index: int) -> _BatchItem:
+    if not isinstance(command, Command):
+        raise _CommandLocalValidationError("batch source must yield Command values")
+    return _BatchInput(command.request, command.correlation)
 
 
-class _AsyncCommandAdapter[C](AsyncIterator[_BatchInput]):
-    def __init__(self, source: AsyncIterable[Command[C]]) -> None:
-        self._iterator = aiter(source)
-
-    def __aiter__(self) -> Self:
-        return self
-
-    async def __anext__(self) -> _BatchInput:
-        command = await anext(self._iterator)
-        if not isinstance(command, Command):
-            raise _CommandLocalValidationError("batch source must yield Command values")
-        return _BatchInput(command.request, command.correlation)
-
-    async def aclose(self) -> None:
-        if isinstance(self._iterator, _AsyncClosable):
-            await self._iterator.aclose()
-
-
-def _adapt_source[C](
-    source: CommandSource[C],
-) -> BatchSource:
-    if isinstance(source, AsyncIterable):
-        return _AsyncCommandAdapter(source)
-    return _SyncCommandAdapter(source)
+def command_source[C](
+    commands: CommandSource[C],
+    audit: Callable[[Request], Violation | None] | None = None,
+) -> OwnedSource[_BatchItem]:
+    """Own a logical command source; ``audit`` observes each admitted request."""
+    observe = None if audit is None else (lambda item: audit(cast("_BatchInput", item).request))
+    return OwnedSource.adapt(commands, accept=_accept_command, observe=observe)
 
 
 class _BatchWindowError(Exception):
@@ -209,7 +173,7 @@ class LogicalBatchKernelStream[C]:
     def __init__(
         self,
         executor: Executor,
-        source: CommandSource[C],
+        source: CommandSource[C] | OwnedSource[_BatchItem],
         *,
         batch_size: int,
         fail_fast: bool,
@@ -217,7 +181,7 @@ class LogicalBatchKernelStream[C]:
     ) -> None:
         """Initialize bounded admission without pulling the source."""
         self._batch_executor = BatchExecutor(executor)
-        self._source = _adapt_source(source)
+        self._source = source if isinstance(source, OwnedSource) else command_source(source)
         self._batch_size = batch_size
         self._fail_fast = fail_fast
         self._context = executor.context(policy)
@@ -243,6 +207,11 @@ class LogicalBatchKernelStream[C]:
     def completion_gate(self) -> object:
         """Expose the live logical-command completion gate."""
         return self._completion.gate
+
+    @property
+    def source_violations(self) -> tuple[Violation, ...]:
+        """Return the bounded violations observed while admitting source commands."""
+        return self._source.violations
 
     def _settle_outcome(self, outcome: CommandOutcome[object]) -> None:
         binding = self._completion.binding(outcome.index)
@@ -279,7 +248,7 @@ class LogicalBatchKernelStream[C]:
     async def _run(self) -> AsyncGenerator[CommandOutcome[object]]:  # noqa: C901
         await self._context.start()
         controller: AsyncIteratorController[_BatchItem] = AsyncIteratorController(
-            _iterate_source(self._source),
+            self._source,
             input_error="batch input exceeded operation time budget",
             cleanup_error="batch source cleanup exceeded operation time budget",
         )

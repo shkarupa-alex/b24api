@@ -37,7 +37,6 @@ if TYPE_CHECKING:
 type ReferenceSource = Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]
 type _WaitFirst = Callable[[tuple[asyncio.Future[object], ...], float], Awaitable[None]]
 _MISSING = object()
-_SYNC_EXHAUSTED = object()
 
 
 def _loop_time() -> float:

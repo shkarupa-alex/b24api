@@ -21,7 +21,6 @@ from b24api.execution import (
     rearm_cancellation,
 )
 from b24api.references.dispatch import (
-    ReferenceSource,
     ReferenceStreamItem,
     _AdmissionState,
     _BatchPageDispatcher,
@@ -49,7 +48,6 @@ from b24api.references.support import (
     _active_limit,
     _finish_done_completion,
     _finish_task,
-    _iterate_references,
     _new_page_records,
     _page_cap,
     _record_cleanup_failure,
@@ -69,6 +67,7 @@ from b24api.traversal.plans import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from b24api._sources import OwnedSource
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.response import Response
 
@@ -152,7 +151,7 @@ class ReferenceScheduler:
         self.active_references_high_water = 0
         self._next_page_sequence = 0
 
-    async def outcomes(self, source: ReferenceSource) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912
+    async def outcomes(self, source: OwnedSource[ReferenceRequest]) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912
         """Yield correlated operation outcomes."""
         PaginationDriver.validate_contract(
             self.plan,
@@ -161,7 +160,7 @@ class ReferenceScheduler:
         )
         await self.context.start()
         iterator = AsyncIteratorController(
-            _iterate_references(source),
+            source,
             input_error="reference input exceeded operation time budget",
             cleanup_error="reference source cleanup exceeded operation time budget",
         )
@@ -290,9 +289,6 @@ class ReferenceScheduler:
                 self.producer_state.next_key = None
                 self.producer_state.next_index = None
                 self.producer_state.touch()
-                if not isinstance(reference, ReferenceRequest):
-                    admission.slots.release()
-                    raise TypeError("reference source must yield ReferenceRequest values")
                 work = _Work(next_index, reference)
                 self.completion.admit(next_index)
                 next_index += 1

@@ -41,7 +41,6 @@ if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
 
 _MISSING = object()
-_SYNC_EXHAUSTED = object()
 
 
 class _BatchNotExecutedError(ProtocolError):

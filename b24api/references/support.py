@@ -3,18 +3,11 @@
 from __future__ import annotations
 import asyncio
 import contextlib
-from collections.abc import AsyncGenerator, AsyncIterable, Iterator
-from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING
 
 from b24api.completion.closure import qualified_closure
 from b24api.contracts.completion import BindingClosure
 from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
-from b24api.references.dispatch import (
-    _SYNC_EXHAUSTED,
-    ReferenceSource,
-    _DoneEvent,
-    _Event,
-)
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     DirectDispatch,
@@ -29,7 +22,7 @@ from b24api.traversal.plans import (
 if TYPE_CHECKING:
     from b24api.completion.reference_recorder import ReferenceCompletionRecorder
     from b24api.contracts.policy import ExecutionPolicy
-    from b24api.references.outcome import ReferenceRequest
+    from b24api.references.dispatch import _DoneEvent, _Event
     from b24api.traversal.driver import PaginationDriver
 
 
@@ -71,42 +64,6 @@ def _record_cleanup_failure(violations: list[Violation], error: BaseException) -
     )
 
 
-@runtime_checkable
-class _AsyncClosable(Protocol):
-    async def aclose(self) -> None: ...
-
-
-@runtime_checkable
-class _SyncClosable(Protocol):
-    def close(self) -> None: ...
-
-
-async def _iterate_references(source: ReferenceSource) -> AsyncGenerator[ReferenceRequest]:
-    if isinstance(source, AsyncIterable):
-        async_iterator = aiter(source)
-        try:
-            async for item in async_iterator:
-                yield item
-        finally:
-            if isinstance(async_iterator, _AsyncClosable):
-                await async_iterator.aclose()
-        return
-    if source.__class__ is list or source.__class__ is tuple:
-        for item in source:
-            yield item
-        return
-    sync_iterator = iter(source)
-    try:
-        while True:
-            sync_item = await _next_sync_owned(sync_iterator)
-            if sync_item is _SYNC_EXHAUSTED:
-                return
-            yield cast("ReferenceRequest", sync_item)
-    finally:
-        if isinstance(sync_iterator, _SyncClosable):
-            await _close_sync_owned(sync_iterator)
-
-
 async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Event) -> None:
     if producer.done():
         await producer
@@ -123,33 +80,6 @@ async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Eve
         if not waiter.done():
             waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
-
-
-def _next_sync(iterator: Iterator[ReferenceRequest]) -> ReferenceRequest | object:
-    try:
-        return next(iterator)
-    except StopIteration:
-        return _SYNC_EXHAUSTED
-
-
-async def _next_sync_owned(iterator: Iterator[ReferenceRequest]) -> ReferenceRequest | object:
-    pull = asyncio.create_task(asyncio.to_thread(_next_sync, iterator))
-    try:
-        return await asyncio.shield(pull)
-    except asyncio.CancelledError:
-        with contextlib.suppress(BaseException):
-            await pull
-        raise
-
-
-async def _close_sync_owned(iterator: _SyncClosable) -> None:
-    close = asyncio.create_task(asyncio.to_thread(iterator.close))
-    try:
-        await asyncio.shield(close)
-    except asyncio.CancelledError:
-        with contextlib.suppress(BaseException):
-            await close
-        raise
 
 
 async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[None]) -> _Event:

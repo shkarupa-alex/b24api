@@ -162,6 +162,29 @@ async def test_early_close_with_failing_source_close_publishes_one_report(family
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
+async def test_source_close_failure_after_exhaustion_is_a_cleanup_failure_not_a_source_failure(family: str) -> None:
+    # The owned source is closed by its owner's cleanup, not inside the final pull (§3.2), so every
+    # command is still delivered and the close failure never masquerades as a failed input source.
+    source = _Source(close_fails=True)
+    delivered = 0
+    async with _client(_Portal()) as client:
+        stream = _stream(client, family, source)
+        with pytest.raises(_CloseFailedError) as raised:
+            async for _ in stream:
+                delivered += 1
+
+    report = _published(raised.value)
+    assert delivered == COMMANDS
+    assert report.state is TerminalState.FAILED
+    assert "cleanup_failure" in _codes(report)
+    assert "source_failure" not in _codes(report)
+    if family in LOGICAL:
+        assert report.terminal_reason == "stream cleanup failed"
+    assert source.closes == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
 async def test_cancelled_pull_with_failing_source_close_raises_the_cleanup_failure(family: str) -> None:
     portal = _Portal(block=True)
     source = _Source(close_fails=True)

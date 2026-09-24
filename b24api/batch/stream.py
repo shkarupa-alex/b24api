@@ -1,13 +1,11 @@
 """Bounded fail-fast and total-outcome Bitrix batch execution."""
 
 from __future__ import annotations
-import asyncio
-import contextlib
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterator
-from typing import TYPE_CHECKING, Protocol, Self, cast, runtime_checkable
+from collections.abc import AsyncGenerator, AsyncIterator
+from typing import TYPE_CHECKING, Self, cast
 
+from b24api._sources import OwnedSource
 from b24api.batch.engine import (
-    _SYNC_EXHAUSTED,
     BatchExecutor,
     BatchSource,
     BatchStreamItem,
@@ -47,23 +45,13 @@ if TYPE_CHECKING:
     from types import TracebackType
 
 
-@runtime_checkable
-class _AsyncClosable(Protocol):
-    async def aclose(self) -> None: ...
-
-
-@runtime_checkable
-class _SyncClosable(Protocol):
-    def close(self) -> None: ...
-
-
 class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
     """Internal lazy outcome stream used by exact counted traversal."""
 
     def __init__(  # noqa: PLR0913
         self,
         batch_executor: BatchExecutor,
-        source: BatchSource,
+        source: BatchSource | OwnedSource[_BatchItem],
         *,
         batch_size: int,
         policy: ExecutionPolicy,
@@ -72,7 +60,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
     ) -> None:
         """Initialize instance state."""
         self._executor = batch_executor
-        self._source = source
+        self._source = own_batch_source(source)
         self._batch_size = batch_size
         if context is not None and context.policy != policy:
             raise ValueError("shared batch context must use the exact stream policy")
@@ -119,7 +107,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         self._started = True
         await self._context.start()
         source = AsyncIteratorController(
-            _iterate_source(self._source),
+            self._source,
             input_error="batch input exceeded operation time budget",
             cleanup_error="batch source cleanup exceeded operation time budget",
         )
@@ -244,57 +232,17 @@ def batch_outcome_stream(
     return _BatchOutcomeStream(engine, requests, batch_size=size, policy=policy or ExecutionPolicy())
 
 
-async def _iterate_source(source: BatchSource) -> AsyncGenerator[_BatchItem]:
-    if isinstance(source, AsyncIterable):
-        iterator = aiter(source)
-        try:
-            async for item in iterator:
-                yield item
-        finally:
-            if isinstance(iterator, _AsyncClosable):
-                await iterator.aclose()
-        return
-    if source.__class__ is list or source.__class__ is tuple:
-        for item in source:
-            yield item
-        return
-    sync_iterator = iter(source)
-    try:
-        while True:
-            sync_item = await _next_sync_owned(sync_iterator)
-            if sync_item is _SYNC_EXHAUSTED:
-                return
-            yield cast("_BatchItem", sync_item)
-    finally:
-        if isinstance(sync_iterator, _SyncClosable):
-            await _close_sync_owned(sync_iterator)
+def _accept_physical(item: object, _index: int) -> _BatchItem:
+    if not isinstance(item, Request | _BatchInput):
+        raise TypeError("physical batch source must yield Request values")
+    return item
 
 
-def _next_sync(iterator: Iterator[_BatchItem]) -> _BatchItem | object:
-    try:
-        return next(iterator)
-    except StopIteration:
-        return _SYNC_EXHAUSTED
-
-
-async def _next_sync_owned(iterator: Iterator[_BatchItem]) -> _BatchItem | object:
-    pull = asyncio.create_task(asyncio.to_thread(_next_sync, iterator))
-    try:
-        return await asyncio.shield(pull)
-    except asyncio.CancelledError:
-        with contextlib.suppress(BaseException):
-            await pull
-        raise
-
-
-async def _close_sync_owned(iterator: _SyncClosable) -> None:
-    close = asyncio.create_task(asyncio.to_thread(iterator.close))
-    try:
-        await asyncio.shield(close)
-    except asyncio.CancelledError:
-        with contextlib.suppress(BaseException):
-            await close
-        raise
+def own_batch_source(source: BatchSource | OwnedSource[_BatchItem]) -> OwnedSource[_BatchItem]:
+    """Adopt a raw physical source; a family that already owns its source passes it through."""
+    if isinstance(source, OwnedSource):
+        return cast("OwnedSource[_BatchItem]", source)
+    return OwnedSource.adapt(source, accept=_accept_physical, inline_sequences=True)
 
 
 async def _next_chunk(
@@ -315,13 +263,6 @@ async def _next_chunk(
                 raise
             return _Chunk(tuple(commands), error)
         index = start_index + offset
-        if isinstance(item, Request):
-            request, correlation = item, None
-        elif isinstance(item, _BatchInput):
-            request, correlation = item.request, item.correlation
-        else:
-            if not commands:
-                raise TypeError("physical batch source must yield Request values")
-            return _Chunk(tuple(commands), TypeError("physical batch source must yield Request values"))
+        request, correlation = (item, None) if isinstance(item, Request) else (item.request, item.correlation)
         commands.append(_Command(index, f"c{index:012d}", request, correlation))
     return _Chunk(tuple(commands))

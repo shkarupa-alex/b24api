@@ -38,7 +38,7 @@ _ROOT_FILE_LAYERS = {
     "redaction.py": "redaction",
     "_diagnostics.py": "redaction",
     "errors.py": "errors",
-    "_audit.py": "execution",
+    "_sources.py": "execution",
     "_client_traversal.py": "client",
     "client.py": "client",
     "cli.py": "cli",

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 from collections.abc import AsyncGenerator, AsyncIterator
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Self, cast
 
+from b24api._sources import OwnedSource
 from b24api.contracts.completion import CleanupState, StreamClosure
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import (
@@ -30,7 +31,7 @@ from b24api.references.dispatch import (
     ReferenceSource,
     ReferenceStreamItem,
 )
-from b24api.references.outcome import ReferenceItem
+from b24api.references.outcome import ReferenceItem, ReferenceRequest
 from b24api.references.scheduler import ReferenceScheduler
 from b24api.traversal import PaginationDriver
 from b24api.traversal.plans import (
@@ -58,13 +59,13 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     def __init__(
         self,
         scheduler: ReferenceScheduler,
-        source: ReferenceSource,
+        source: ReferenceSource | OwnedSource[ReferenceRequest],
         *,
         assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
     ) -> None:
         """Initialize instance state."""
         self._scheduler = scheduler
-        self._source = source
+        self._source = own_reference_source(source)
         self._outcomes: AsyncGenerator[ReferenceStreamItem] | None = None
         self._emitted = 0
         self._unique_emitted = 0
@@ -139,8 +140,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             if consistency.snapshot_requirement is SnapshotRequirement.TRAVERSAL_ONLY
             else SnapshotState.UNVERIFIED
         )
-        source_violations = tuple(getattr(self._source, "violations", ()))
-        violations = retain_violations((*self._scheduler.violations, *source_violations))
+        violations = retain_violations((*self._scheduler.violations, *self._source.violations))
         if state is KernelState.COMPLETED and snapshot_state is SnapshotState.UNVERIFIED:
             state = KernelState.INCOMPLETE
             reason = "required snapshot was not verified"
@@ -197,9 +197,22 @@ def _failure_report(_cause: TerminalCause, reason: str, _attempt: CleanupAttempt
     return failed_kernel_report(reason)
 
 
+def _accept_reference(item: object, _index: int) -> ReferenceRequest:
+    if not isinstance(item, ReferenceRequest):
+        raise TypeError("reference source must yield ReferenceRequest values")
+    return item
+
+
+def own_reference_source(source: ReferenceSource | OwnedSource[ReferenceRequest]) -> OwnedSource[ReferenceRequest]:
+    """Adopt a raw reference source; a family that already owns its source passes it through."""
+    if isinstance(source, OwnedSource):
+        return cast("OwnedSource[ReferenceRequest]", source)
+    return OwnedSource.adapt(source, accept=_accept_reference, inline_sequences=True)
+
+
 def fan_out(  # noqa: PLR0913
     executor: Executor,
-    requests: ReferenceSource,
+    requests: ReferenceSource | OwnedSource[ReferenceRequest],
     *,
     dispatch: DispatchPlan,
     output_order: ReferenceOutputOrder = ReferenceOutputOrder.READY,
@@ -221,7 +234,7 @@ def fan_out(  # noqa: PLR0913
 
 def iter_references(  # noqa: PLR0913
     executor: Executor,
-    requests: ReferenceSource,
+    requests: ReferenceSource | OwnedSource[ReferenceRequest],
     *,
     plan: ListPlan,
     dispatch: DispatchPlan,

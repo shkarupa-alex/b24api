@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from b24api.contracts.policy import BudgetCounters, ExecutionPolicy
 from b24api.errors import (
@@ -12,7 +12,7 @@ from b24api.errors import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable
+    from collections.abc import Awaitable, Callable
 
     from b24api.execution.rate import RateCoordinator
 
@@ -206,12 +206,24 @@ class ExecutionContext:
             )
 
 
+class OwnedPull[T](Protocol):
+    """An owned source: pulls raise ``StopAsyncIteration`` at the end and close never raises."""
+
+    async def __anext__(self) -> T:
+        """Pull one item."""
+        ...
+
+    async def aclose(self) -> CleanupResult:
+        """Close once and return the outcome."""
+        ...
+
+
 class AsyncIteratorController[T]:
     """Own one async source pull and retain cleanup past a public deadline."""
 
     def __init__(
         self,
-        source: AsyncGenerator[T],
+        source: OwnedPull[T],
         *,
         input_error: str,
         cleanup_error: str,
@@ -255,7 +267,7 @@ class AsyncIteratorController[T]:
         if self._cleanup_task is None:
             active = self._active_pull
             if active is None:
-                self._retain_cleanup(asyncio.create_task(self._source.aclose()))
+                self._retain_cleanup(asyncio.create_task(self._close_source()))
             else:
                 active.cancel()
                 self._retain_close_after(active)
@@ -291,13 +303,16 @@ class AsyncIteratorController[T]:
         if self._active_pull is pull:
             self._active_pull = None
         try:
-            await self._source.aclose()
+            await self._close_source()
         except BaseException as close_error:
             if pull_error is not None:
                 raise close_error from pull_error
             raise
         if pull_error is not None:
             raise pull_error
+
+    async def _close_source(self) -> None:
+        (await self._source.aclose()).raise_failure()
 
 
 def _observe_background_cleanup(task: asyncio.Task[None]) -> None:
@@ -325,12 +340,21 @@ async def await_cancellation_resistant(awaitable: Awaitable[None]) -> asyncio.Ca
 
 
 @dataclass(frozen=True, slots=True)
-class _CleanupOutcome:
+class CleanupResult:
+    """What owned cleanup reported: a concurrent caller cancellation and its own failure."""
+
     cancellation: asyncio.CancelledError | None
     error: BaseException | None
 
+    def raise_failure(self) -> None:
+        """Raise the deferred cancellation first, then the cleanup failure."""
+        if self.cancellation is not None:
+            raise self.cancellation
+        if self.error is not None:
+            raise self.error
 
-async def await_cleanup_resistant(awaitable: Awaitable[None]) -> _CleanupOutcome:
+
+async def await_cleanup_resistant(awaitable: Awaitable[None]) -> CleanupResult:
     """Finish owned cleanup without losing a concurrent caller cancellation."""
     task: asyncio.Future[None] = asyncio.ensure_future(awaitable)
     cancellation: asyncio.CancelledError | None = None
@@ -343,11 +367,11 @@ async def await_cleanup_resistant(awaitable: Awaitable[None]) -> _CleanupOutcome
         await task
     except asyncio.CancelledError as error:
         if cancellation is not None:
-            return _CleanupOutcome(cancellation, None)
-        return _CleanupOutcome(None, error)
+            return CleanupResult(cancellation, None)
+        return CleanupResult(None, error)
     except BaseException as error:  # noqa: BLE001 - cleanup failure is returned with cancellation
-        return _CleanupOutcome(cancellation, error)
-    return _CleanupOutcome(cancellation, None)
+        return CleanupResult(cancellation, error)
+    return CleanupResult(cancellation, None)
 
 
 def rearm_cancellation(cancellation: asyncio.CancelledError | None) -> None:

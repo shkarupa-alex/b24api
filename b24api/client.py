@@ -8,9 +8,9 @@ import warnings
 import weakref
 from typing import TYPE_CHECKING, Self, cast
 
-from b24api._audit import audit_command_source
 from b24api._client_traversal import _TraversalFacade
 from b24api.batch.facade import batch_outcome_stream, batch_stream
+from b24api.batch.logical import command_source as logical_command_source
 from b24api.contracts.dispatch import BatchDispatch, DirectDispatch, DispatchSpec
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import ExecutionPolicy, UnknownRequestAudit
@@ -28,6 +28,7 @@ from b24api.execution.cleanup import CloseableResource, close_owned_resources
 from b24api.redaction import Redactor, webhook_secrets
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
+from b24api.references.fanout import command_source as fanout_command_source
 from b24api.references.fanout import fanout_stream
 from b24api.settings import Settings, api_settings
 from b24api.transport.protocol import ProtocolCodec
@@ -225,7 +226,7 @@ class Bitrix24(_TraversalFacade):
         return self._register_stream(
             batch_stream(
                 self._executor,
-                audit_command_source(commands, self._audit_unknown),
+                logical_command_source(commands, self._audit_unknown),
                 batch_size=batch_size,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
@@ -244,7 +245,7 @@ class Bitrix24(_TraversalFacade):
         return self._register_stream(
             batch_outcome_stream(
                 self._executor,
-                audit_command_source(commands, self._audit_unknown),
+                logical_command_source(commands, self._audit_unknown),
                 batch_size=batch_size,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
@@ -260,9 +261,9 @@ class Bitrix24(_TraversalFacade):
     ) -> OperationStream[CommandSuccess[C]]:
         """Dispatch independent commands fail-fast with explicit delivery order."""
         self._require_open()
-        stream = fanout_stream(
+        stream: OperationStream[CommandOutcome[C]] = fanout_stream(
             self._executor,
-            audit_command_source(commands, self._audit_unknown),
+            fanout_command_source(commands, self._audit_unknown),
             dispatch=dispatch,
             policy=policy or self._default_policy,
             tolerant=False,
@@ -282,7 +283,7 @@ class Bitrix24(_TraversalFacade):
         return self._register_stream(
             fanout_stream(
                 self._executor,
-                audit_command_source(commands, self._audit_unknown),
+                fanout_command_source(commands, self._audit_unknown),
                 dispatch=dispatch,
                 policy=policy or self._default_policy,
                 tolerant=True,

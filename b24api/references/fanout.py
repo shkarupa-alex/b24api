@@ -1,10 +1,11 @@
 """Bounded independent command fan-out over direct or physical-batch dispatch."""
 
 from __future__ import annotations
-from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Iterator
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, Self, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast
 
+from b24api._sources import OwnedSource
 from b24api.completion.operation_stream import MappedOperationStream
 from b24api.contracts.command import (
     Command,
@@ -31,16 +32,13 @@ if TYPE_CHECKING:
     from b24api.contracts.dispatch import DispatchSpec
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.report import OperationReport, Violation
+    from b24api.contracts.request import Request
     from b24api.contracts.stream import OperationStream
     from b24api.execution.snapshot import KernelReport
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
 type KernelFanOutEvent = _KernelFanOutSuccess | KernelFailure
 type Deregister = Callable[[object], None]
-
-
-def _source_violations(source: object) -> tuple[Violation, ...]:
-    return tuple(cast("list[Violation]", getattr(source, "violations", ())))
 
 
 class FanOutKernelStream(AsyncIterator[KernelFanOutEvent], Protocol):
@@ -51,20 +49,6 @@ class FanOutKernelStream(AsyncIterator[KernelFanOutEvent], Protocol):
 
     async def aclose(self) -> None:
         """Close scheduler-owned resources."""
-        ...
-
-
-@runtime_checkable
-class _SyncClosable(Protocol):
-    def close(self) -> None:
-        """Close a synchronous iterator."""
-        ...
-
-
-@runtime_checkable
-class _AsyncClosable(Protocol):
-    async def aclose(self) -> None:
-        """Close an asynchronous iterator."""
         ...
 
 
@@ -82,7 +66,7 @@ class _CommandSourceError(Exception):
         self.report_cause = InputSourceError("Fan-out input source failed")
 
 
-def _reference(command: Command[object], index: int) -> ReferenceRequest:
+def _reference(command: object, index: int) -> ReferenceRequest:
     if not isinstance(command, Command):
         raise TypeError("fan-out source must yield Command values")
     return ReferenceRequest(
@@ -92,58 +76,18 @@ def _reference(command: Command[object], index: int) -> ReferenceRequest:
     )
 
 
-class _SyncCommandAdapter[C](Iterator[ReferenceRequest]):
-    def __init__(self, source: Iterable[Command[C]]) -> None:
-        self._iterator = iter(source)
-        self._index = 0
-
-    def __iter__(self) -> Self:
-        return self
-
-    def __next__(self) -> ReferenceRequest:
-        try:
-            command = next(self._iterator)
-            reference = _reference(cast("Command[object]", command), self._index)
-        except StopIteration:
-            raise
-        except Exception as error:
-            raise _CommandSourceError from error
-        self._index += 1
-        return reference
-
-    def close(self) -> None:
-        if isinstance(self._iterator, _SyncClosable):
-            self._iterator.close()
-
-
-class _AsyncCommandAdapter[C](AsyncIterator[ReferenceRequest]):
-    def __init__(self, source: AsyncIterable[Command[C]]) -> None:
-        self._iterator = aiter(source)
-        self._index = 0
-
-    def __aiter__(self) -> Self:
-        return self
-
-    async def __anext__(self) -> ReferenceRequest:
-        try:
-            command = await anext(self._iterator)
-            reference = _reference(cast("Command[object]", command), self._index)
-        except StopAsyncIteration:
-            raise
-        except Exception as error:
-            raise _CommandSourceError from error
-        self._index += 1
-        return reference
-
-    async def aclose(self) -> None:
-        if isinstance(self._iterator, _AsyncClosable):
-            await self._iterator.aclose()
-
-
-def _command_source[C](source: CommandSource[C]) -> Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]:
-    if isinstance(source, AsyncIterable):
-        return _AsyncCommandAdapter(source)
-    return _SyncCommandAdapter(source)
+def command_source[C](
+    source: CommandSource[C],
+    audit: Callable[[Request], Violation | None] | None = None,
+) -> OwnedSource[ReferenceRequest]:
+    """Own a fan-out command source; ``audit`` observes each admitted request."""
+    observe = None if audit is None else (lambda reference: audit(reference.request))
+    return OwnedSource.adapt(
+        source,
+        accept=_reference,
+        observe=observe,
+        failure=lambda _error: _CommandSourceError(),
+    )
 
 
 class _FanOutMapper:
@@ -207,7 +151,7 @@ def _fanout_error(
 
 def kernel_fanout_stream[C](
     executor: object,
-    commands: CommandSource[C],
+    commands: CommandSource[C] | OwnedSource[ReferenceRequest],
     *,
     dispatch: DispatchSpec,
     policy: ExecutionPolicy,
@@ -221,7 +165,7 @@ def kernel_fanout_stream[C](
     dispatch_plan = kernel_dispatch(dispatch, policy)
     stream = _iter_references(
         executor,
-        _command_source(commands),
+        commands if isinstance(commands, OwnedSource) else command_source(commands),
         plan=SingleResponsePlan(
             reject_continuation=False,
             reject_positive_total_over_result=False,
@@ -239,7 +183,7 @@ def kernel_fanout_stream[C](
 
 def fanout_stream[C](  # noqa: PLR0913
     executor: object,
-    commands: CommandSource[C],
+    commands: CommandSource[C] | OwnedSource[ReferenceRequest],
     *,
     dispatch: DispatchSpec,
     policy: ExecutionPolicy,
@@ -264,7 +208,6 @@ def fanout_stream[C](  # noqa: PLR0913
         error_mapper=lambda error, report: _fanout_error(error, report, mapper, tolerant=tolerant),
         error_items=lambda error: _fanout_error_items(error, mapper),
         source_active_references=lambda: source.active_references_high_water,
-        source_violations=lambda: _source_violations(commands),
         deregister=deregister,
     )
     return cast("OperationStream[CommandOutcome[C]]", stream)
