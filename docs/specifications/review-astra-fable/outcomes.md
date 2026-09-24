@@ -35,6 +35,11 @@ Test paths are `file::test`. The last section lists what remains for the owner.
 
 A15 became B0.
 
+Red on `c4cafdd`: every cited A test is absent at the base and arrives with the fix in the listed
+commit. The exception is A17's test, which existed at the base and was changed in `a4fb7c0` to
+inspect real library frames. The golden deltas in `tests/golden/DELTAS.md` show the base values that
+each A12, A14 and B10 test rejects.
+
 ## B: improvements
 
 | ID | Outcome | Commit | Evidence |
@@ -50,7 +55,7 @@ A15 became B0.
 | B10 | Done | `79f4e6c` | `tests/client_findings_3_test.py::test_fixed_step_rejects_any_closure_after_a_short_unqualified_window`; golden deltas B10 |
 | B11 | Done; breaking, in the migration guide | `357dc07`, `1640fb8` | [vulture outcomes](b11-dead-code.md) |
 | B12 | Done; breaking, in the migration guide | `db3c529` | `tests/completion_gate_test.py::test_page_validated_carries_no_identity_digest` |
-| B13 | Done | `aa2690c` | `tests/real_signature.py` binds the README and migration stubs to the real `Bitrix24` signatures |
+| B13 | Done | `aa2690c`, `3b0c9c9` | `tests/real_signature.py` binds the README and migration stubs to the real `Bitrix24` signatures. The `wheel-typing` job runs `tests/readme_test.py`, `tests/documentation_test.py` and `tests/root_surface_test.py` against the installed wheel (§6.1 item 4): `tests/release_workflow_test.py::test_wheel_typing_runs_the_migration_doc_tests_against_the_installed_wheel`. The same steps run locally: 147 passed, with `b24api` imported from site-packages. |
 | B14 | Done | `467ef2f` | `tests/documentation_test.py::test_every_local_documentation_link_resolves` |
 | B15 | Done | `aa2690c` | `tests/conftest.py` and `tests/scripting.py`; `tests/ratchet_test.py::test_homemade_test_transports_only_go_down` (49 → 35); `pytest-httpx` removed |
 | B16 | Done | `93f5494`, `c3d33c2` | `tests/structural_property_test.py`, `tests/redaction_property_test.py` |
@@ -94,9 +99,13 @@ B5 and B28 were never assigned (see §2).
   would either break the positive controls for foreign `httpx` records or miss a redirect's secret.
 - **Pin decision.** On 2026-09-24 the latest releases on PyPI were httpx 0.28.1, httpcore 1.0.9,
   h2 4.4.1 and hpack 4.2.0. The locked versions are the same, except h2 (4.3.0) and hpack (4.1.0).
-- **Local run of the `httpx-latest` job.** `uv run --with 'httpx[http2]==0.28.1' --with
-  'httpcore==1.0.9' --with 'h2==4.4.1' --with 'hpack==4.2.0' pytest
-  tests/httpx_logging_shield_test.py` passed (88 tests).
+- **Local run of the `httpx-latest` job.** The job runs the §3.8 shield
+  (`tests/httpx_logging_shield_test.py`), the hpack matrix (`tests/internal/httpx_log_shield_matrix_test.py`,
+  A20) and the LivePortal shield (`tools/b24api_evidence/harness/live_test.py`, A1).
+  `tests/release_workflow_test.py::test_httpx_latest_is_non_blocking_evidence_on_the_latest_httpx`
+  pins that. Run locally with `uv run --with 'httpx[http2]==0.28.1' --with 'httpcore==1.0.9' --with
+  'h2==4.4.1' --with 'hpack==4.2.0' pytest` over those three files: 159 passed, including the
+  hpack matrix on hpack 4.2.0, newer than the locked 4.1.0 (§9.7).
 - **Result.** Only 0.28.x exists, so by the rule in §2.3 the bound stays `httpx[http2]>=0.28.1,<0.29`.
   The CI job itself runs on the first push.
 
@@ -154,15 +163,26 @@ heuristic stays for free text, and diagnostic identifiers take the narrow struct
 
 These steps are outward-facing or need the owner's decision, so they were not performed.
 
-1. **Push.** Push the branch and open the phase PRs. The `ci` aggregate check, `httpx-latest`
-   (C2) and the wheel smoke on the installed wheel (§6.1 item 4) then run on the exact SHA.
-2. **Branch protection (B1, §6.1 item 5).** Protect `master` and `develop` with the required
-   `ci` check and `strict: true`, then record the `gh api` output.
-3. **L1.** Capture one real throttled response and record the form of `X-Bitrix-RateLimit-Reset` and
+1. **Phase order (§4, §6.1 item 1).** The program asked for a bootstrap PR in Ф0 and one PR per
+   phase into a protected `develop`. All work instead sits on one unpushed branch. Two choices: split
+   it into the phase PRs, or merge it as one PR and accept that the Ф0-time evidence below cannot be
+   produced retroactively.
+2. **Push and CI.** Push, then record the evidence CI produces on the exact SHA:
+   - the `ci` aggregate check;
+   - `httpx-latest` (C2);
+   - the wheel doc-tests (§6.1 item 4);
+   - the default-run time of the `tests` job (B2);
+   - `gh pr checks --required` on the first PR (B1);
+   - the manual full blocking run for the bootstrap PR (§6.1 item 1, §3.10).
+3. **Branch protection (B1, §6.1 item 5).** Protect `master` and `develop` with the required `ci`
+   check and `strict: true`. The spec wants the `gh api` output twice, in Ф0 and in Ф5; the Ф0
+   snapshot no longer exists (item 1).
+4. **L1.** Capture one real throttled response and record the form of `X-Bitrix-RateLimit-Reset` and
    `Retry-After`. That means a burst above the portal's limit, which is more load than was sent here.
-4. **Release.** Release `3.0.0` from the verified `master` SHA, with the tag on that SHA.
-5. **Issue comments.** Post the table "ID → PR → test or evidence → outcome" on #14 and #15, then
-   close both issues after the §6.1 gate.
+5. **Release (§6.1 item 4).** Release `3.0.0` from the verified `master` SHA, with the tag on that SHA
+   and the called `ci` green in the publish workflow.
+6. **Issue comments (§6.1 item 6).** Post the table "ID → PR → test or evidence → outcome" on #14
+   and #15, then close both issues after the §6.1 gate.
 
 Two further observations belong to the owner:
 
