@@ -2,35 +2,27 @@
 
 from __future__ import annotations
 import ast
+import inspect
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 import b24api.client
+import b24api.completion
+import b24api.contracts
+import b24api.errors
+import b24api.testing
+import b24api.transport
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "b24api"
 
-_STATE_MACHINES = {
-    "completion/operation_stream.py",
-    "completion/gate.py",
-    "batch/engine.py",
-    "batch/logical.py",
-    "batch/stream.py",
-    "execution/context.py",
-    "execution/executor.py",
-    "references/dispatch.py",
-    "references/scheduler.py",
-    "references/stream.py",
-    "traversal/driver.py",
-    "traversal/keyset_scheduler.py",
-    "traversal/keyset_transactions.py",
-    "traversal/keyset_verifier.py",
-    "traversal/stream.py",
-}
 _FORBIDDEN_ROOT_MODULES = {
     "api.py",
     "helper.py",
@@ -302,17 +294,18 @@ def test_no_endpoint_catalog_mutable_registry_or_evidence_literal_exists() -> No
 def test_removed_modules_symbols_and_storage_backends_are_absent() -> None:
     assert not (_FORBIDDEN_ROOT_MODULES & {path.name for path in PACKAGE.iterdir() if path.is_file()})
     assert not (_REMOVED_CLIENT_METHODS & set(vars(b24api.client.Bitrix24)))
+    # Removed v1 public names and parameters stay absent from every public namespace and signature.
+    namespaces = (b24api, b24api.contracts, b24api.errors, b24api.transport, b24api.completion, b24api.testing)
+    assert not {"IdentityTracker", "RequestWithPayload"} & {name for module in namespaces for name in dir(module)}
+    parameters = {
+        name
+        for method in vars(b24api.client.Bitrix24).values()
+        if callable(method)
+        for name in inspect.signature(method).parameters
+    }
+    assert not {"max_tracked_identities", "with_payload", "fallback_failed"} & parameters
+    # Protective ban (B21): the client keeps no durable storage, so no storage backend may appear.
     runtime = "\n".join(path.read_text(encoding="utf-8") for path in _sources())
-    for removed in (
-        "IdentityTracker",
-        "max_tracked_identities",
-        "_ImplicitCompatibilityString",
-        "_legacy_",
-        "with_payload",
-        "fallback_failed",
-        "RequestWithPayload",
-    ):
-        assert removed not in runtime
     assert "sqlite" not in runtime.casefold()
     forbidden_imports = ("sqlalchemy", "django.db", "peewee", "sqlmodel", "tortoise")
     assert not any(
@@ -321,6 +314,7 @@ def test_removed_modules_symbols_and_storage_backends_are_absent() -> None:
         for name in _imports(path)
         for forbidden in forbidden_imports
     )
+    # Protective ban (B21): endpoint-specific adapters live in recipes, never in the package.
     assert "im.dialog.messages.get" not in runtime
     assert "ImMessagePageAdapter" not in runtime
 
@@ -338,9 +332,7 @@ def test_response_selection_funnels_and_dead_batch_sentinel_stay_closed() -> Non
         ("traversal/page_validation.py", "select_rows"),
         ("traversal/page_validation.py", "validate_lane_receipt"),
     }
-    dispatch = (PACKAGE / "references" / "dispatch.py").read_text(encoding="utf-8")
-    assert "self._queue: asyncio.Queue[_PendingBatch]" in dispatch
-    tree = ast.parse(dispatch)
+    tree = ast.parse((PACKAGE / "references" / "dispatch.py").read_text(encoding="utf-8"))
     assert not any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -353,6 +345,7 @@ def test_response_selection_funnels_and_dead_batch_sentinel_stay_closed() -> Non
 
 
 def test_project_configuration_has_no_removed_v1_runtime_or_test_knobs() -> None:
+    # Protective ban (B21): removed v1 settings must not come back through project configuration.
     configuration = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     for removed in (
@@ -379,56 +372,51 @@ def test_response_bodies_are_read_only_as_raw_bytes_through_the_bounded_decoder(
         assert not calls & decoded_readers, f"{path.relative_to(ROOT)} reads decoded HTTPX bytes"
 
 
-def test_module_sizes_keep_facades_small_and_state_machines_bounded() -> None:
+def test_module_sizes_are_recorded(record_property: Callable[[str, object], None]) -> None:
+    # Module size is a signal, not a gate (B21): the import DAG, the private-access and the
+    # function-length ratchets block instead. The sizes land in the JUnit report for review.
     for path in _sources():
         relative = path.relative_to(PACKAGE).as_posix()
-        line_count = len(path.read_text(encoding="utf-8").splitlines())
-        ceiling = (
-            750
-            if relative == "traversal/driver.py"
-            else 710
-            if relative in _STATE_MACHINES
-            else 550
-            if relative == "errors.py"
-            else 450
-            if relative == "cli_contract.py"
-            else 410
-        )
-        assert line_count <= ceiling, f"{relative} has {line_count} lines; ceiling is {ceiling}"
+        record_property(f"lines:{relative}", len(path.read_text(encoding="utf-8").splitlines()))
 
 
 def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
     fast_sources = tuple(sorted((PACKAGE / "traversal").glob("keyset_*.py")))
+    # Protective (B21): the scheduler is the only owner of the fast buffered-row counter.
     delta_callers = {path.name for path in fast_sources if "adjust_buffered_rows(" in path.read_text(encoding="utf-8")}
     assert delta_callers == {"keyset_scheduler.py"}
     assert all("set_buffered_rows(" not in path.read_text(encoding="utf-8") for path in fast_sources)
-    scheduler = (PACKAGE / "traversal" / "keyset_scheduler.py").read_text(encoding="utf-8")
-    assert "class KeysetFastScheduler:" in scheduler
+    # Protective (B21, §3.6): the transaction host is a protocol, never a shared scheduler-state bag.
     assert not (PACKAGE / "traversal" / "keyset_scheduler_support.py").exists()
     assert not (PACKAGE / "traversal" / "keyset_scheduler_state.py").exists()
     assert all("SchedulerState" not in path.read_text(encoding="utf-8") for path in fast_sources)
-    sequential = (PACKAGE / "traversal" / "keyset.py").read_text(encoding="utf-8")
-    assert "from b24api.traversal.keyset_step import" in sequential
-    assert "from b24api.traversal import keyset_step" in scheduler
-    assert "keyset_page_request(" in sequential
-    assert "keyset_step.keyset_page_request(" in scheduler
+    # Sequential and fast keyset build every page request through the one shared step.
+    for name in ("keyset.py", "keyset_scheduler.py"):
+        path = PACKAGE / "traversal" / name
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        assert any(
+            isinstance(node, ast.ImportFrom)
+            and (
+                node.module == "b24api.traversal.keyset_step"
+                or (node.module == "b24api.traversal" and any(alias.name == "keyset_step" for alias in node.names))
+            )
+            for node in ast.walk(tree)
+        ), f"{name} does not import the shared keyset step"
+        called = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+        }
+        assert "keyset_page_request" in called, f"{name} builds keyset pages without the shared step"
 
+    # Protective (B21): the auto selector is deterministic integer arithmetic, so its inputs never
+    # include randomness, clocks, environment or floats.
     for name in ("keyset_auto.py", "keyset_costs.py"):
         selector = (PACKAGE / "traversal" / name).read_text(encoding="utf-8")
         for forbidden in ("random", "time.", "os.environ", "float("):
             assert forbidden not in selector
         tree = ast.parse(selector)
         assert not any(isinstance(node, ast.Constant) and isinstance(node.value, float) for node in ast.walk(tree))
-
-    ceilings = {
-        PACKAGE / "contracts" / "keyset_execution.py": 250,
-        PACKAGE / "traversal" / "keyset_auto.py": 250,
-        PACKAGE / "traversal" / "keyset_fast_plan.py": 300,
-        PACKAGE / "traversal" / "keyset_fast_stream.py": 400,
-        PACKAGE / "traversal" / "keyset_scheduler.py": 700,
-    }
-    for path, ceiling in ceilings.items():
-        assert len(path.read_text(encoding="utf-8").splitlines()) <= ceiling
 
     transactions = ast.parse((PACKAGE / "traversal" / "keyset_transactions.py").read_text(encoding="utf-8"))
     assert not any(isinstance(node, ast.ClassDef) for node in transactions.body)
