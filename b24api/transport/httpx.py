@@ -28,7 +28,7 @@ from b24api.transport.base import (
     WireResponse,
 )
 from b24api.transport.decoding import BOUNDED_ACCEPT_ENCODING, BodyReadOutcome, read_bounded_body
-from b24api.transport.logging_shield import HTTPX_LOG_SHIELD, OwnedRequestReplacedError
+from b24api.transport.logging_shield import HTTPX_LOG_SHIELD, OwnedRequestReplacedError, webhook_credentials
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -129,6 +129,9 @@ class HttpxTransport:
         if not webhook_url.endswith("/"):
             webhook_url += "/"
         normalized_host = _normalized_webhook_host(webhook_url)
+        # Both log filters are installed before a client exists or an injected one is registered.
+        HTTPX_LOG_SHIELD.register_transport()
+        shield_finalizer = weakref.finalize(self, HTTPX_LOG_SHIELD.release_transport)
         resolved_client = client
         client_initialization_failed = False
         if resolved_client is None:
@@ -140,6 +143,7 @@ class HttpxTransport:
         webhook_url = ""
         if client_initialization_failed:
             normalized_webhook = ""
+            shield_finalizer()
             raise RuntimeError("HTTP client initialization failed")
         self._webhook_handle = _store_webhook(normalized_webhook)
         self._webhook_finalizer = weakref.finalize(self, _drop_webhook, self._webhook_handle)
@@ -147,8 +151,11 @@ class HttpxTransport:
         self._owns_client = client is None
         self._closed = False
         self._host = normalized_host
-        HTTPX_LOG_SHIELD.register_transport()
-        self._shield_finalizer = weakref.finalize(self, HTTPX_LOG_SHIELD.release_transport)
+        self._shield_finalizer = shield_finalizer
+        # Keyed by the client, not this transport: an injected client's connections outlive the transport.
+        # A client that cannot be weakly registered gets its HTTP/2 sends refused by ``admit_send``.
+        HTTPX_LOG_SHIELD.bind_client(self._client, credentials=webhook_credentials(normalized_webhook))
+        normalized_webhook = ""
 
     @property
     def host(self) -> str:
@@ -179,6 +186,7 @@ class HttpxTransport:
         """Protect the emitting HTTPX logger for one owned request."""
         if self._closed:
             raise RuntimeError("transport is closed")
+        HTTPX_LOG_SHIELD.admit_send(self._client)
         method_url = _method_url(_webhook_for(self._webhook_handle), request)
         try:
             with HTTPX_LOG_SHIELD.request(method_url) as ownership:
