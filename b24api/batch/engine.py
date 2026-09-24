@@ -17,7 +17,7 @@ from b24api.contracts.policy import (
     ExecutionPolicy,
     ReplayDisposition,
 )
-from b24api.contracts.request import ReplaySafety, Request, RouteKind
+from b24api.contracts.request import ReplaySafety, Request, RouteKind, diagnostic_context
 from b24api.contracts.response import Response
 from b24api.encoding import encode_php_query
 from b24api.errors import B24ApiError, BatchCommandError, CapabilityError, ProtocolError
@@ -251,6 +251,7 @@ class BatchExecutor:
                 http_status=response.evidence.http_status or 200,
                 retry_codes=context.policy.retry.transient_api_codes,
                 batch=True,
+                redactor=self.executor.codec.redactor,
             )
         except BatchCommandError as error:
             command_evidence = BatchCommandEvidence(
@@ -332,11 +333,14 @@ class BatchExecutor:
             )
         normalized = str(code).strip().casefold()
         description = raw.get("error_description")
+        # Each command renders through its own request's context: the physical batch keeps one map per key.
         return BatchCommandError(
             code=code,
             description=None if description is None else str(description),
             request_summary=command.request.summary,
             retryable=normalized in retry_codes,
+            redactor=self.executor.codec.redactor,
+            diagnostics=diagnostic_context(command.request),
         )
 
 

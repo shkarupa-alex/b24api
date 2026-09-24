@@ -25,10 +25,12 @@ from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import KeysetSpec
 from b24api.execution import Executor, HttpxTransport, Transport, await_cleanup_resistant, rearm_cancellation
 from b24api.execution.cleanup import CloseableResource, close_owned_resources
+from b24api.redaction import Redactor, webhook_secrets
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
 from b24api.references.fanout import fanout_stream
 from b24api.settings import Settings, api_settings
+from b24api.transport.protocol import ProtocolCodec
 from b24api.traversal.facade_support import _collection_selector
 from b24api.traversal.keyset_verifier import verify_keyset_capability as _verify_keyset_capability
 
@@ -88,7 +90,9 @@ class Bitrix24(_TraversalFacade):
         self._settings: Settings | None = resolved
         self._transport = selected_transport
         self._owned_transport = owned_transport
-        self._executor = Executor(selected_transport)
+        # The configured webhook credential is an exact secret for every error this client renders.
+        codec = ProtocolCodec(redactor=Redactor(known_secrets=webhook_secrets(str(resolved.webhook_url))))
+        self._executor = Executor(selected_transport, codec=codec)
         self._default_policy = policy or ExecutionPolicy(
             max_retry_elapsed_per_request=float(resolved.http_timeout),
         )
