@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
 
 HOST = "fixture.invalid"
-WEBHOOK = f"https://{HOST}/rest/1/golden/"
+WEBHOOK = f"https://{HOST}/rest/1/gold/"
 ROWS = tuple({"ID": identity, "NAME": f"row-{identity}"} for identity in range(1, 131))
 PAGE = 50
 FAILING_ITEM = 7

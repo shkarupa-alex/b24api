@@ -54,7 +54,7 @@ class _Portal:
 
 
 def _client(portal: _Portal) -> Bitrix24:
-    return Bitrix24(Settings(webhook_url=f"https://{HOST}/rest/1/preflight/"), transport=portal)
+    return Bitrix24(Settings(webhook_url=f"https://{HOST}/rest/1/pre/"), transport=portal)
 
 
 @pytest.mark.asyncio
