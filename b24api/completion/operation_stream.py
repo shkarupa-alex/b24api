@@ -127,7 +127,7 @@ class MappedOperationStream[S, T]:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close owned work on context exit; a close failure never replaces the body's own exception."""
+        """Close owned work on context exit; a close failure or cancellation never replaces the body's own exception."""
         await self._runner.__aexit__(exc_type, exc, traceback)
 
     async def __anext__(self) -> T:
