@@ -356,3 +356,30 @@ def test_alias_words_as_field_names_are_aliased_exactly_once() -> None:
     assert error.description == "field#1 and field#2"
     assert error.evidence.body_preview is not None
     assert '"echo":{"[REDACTED#1]":2,"field#1":1}' in error.evidence.body_preview
+
+
+def test_long_v3_field_is_aliased_before_its_text_is_bounded() -> None:
+    # A request field longer than the 256-character V3 bound, made of runs too short for the heuristic:
+    # only the full-name alias hides it, so aliasing must see the whole echoed text before any cut.
+    name = "abc.def." * 35
+    request = Request("tasks.task.list", {"filter": {name: 1}}, route=RouteKind.API_V3)
+    echoed = f"filter.{name}"
+    error = ProtocolCodec().error_from_http(
+        status_code=400,
+        body={
+            "error": {
+                "code": VALIDATION_ERROR_CODE,
+                "message": f"{echoed} is not a known field",
+                "validation": [{"field": echoed, "message": f"{name} is invalid"}],
+            },
+        },
+        diagnostics=diagnostic_context(request),
+    )
+
+    assert isinstance(error, ApiResponseError)
+    assert error.truncated
+    assert error.validation[0].field == "filter.field#1"
+    assert error.validation[0].message == "field#1 is invalid"
+    assert error.description is not None
+    assert error.description.startswith("filter.field#1 ")
+    assert "abc.def." not in _channels(error)

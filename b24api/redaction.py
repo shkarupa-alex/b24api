@@ -78,8 +78,9 @@ PathPart = str | int
 class SafeText(str):
     """Text already composed from rendered parts; rendering it again returns it unchanged.
 
-    Only the error hierarchy constructs it, around a message whose every caller- or portal-derived
-    part went through ``render_text`` or ``render_code``. Any string operation on it yields a plain
+    Only the error hierarchy and the protocol codec's bounded V3 message construct it, around text
+    whose every caller- or portal-derived part went through ``render_text`` or ``render_code``. Any
+    string operation on it yields a plain
     ``str``, so derived text is rendered as free text again.
     """
 

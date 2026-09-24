@@ -49,15 +49,16 @@ details.
    stacked and unknown codings are refused as a transport failure. Library-owned requests send
    `Accept-Encoding: gzip, deflate`. If you inject an HTTPX client that asks for `br` or `zstd`,
    remove that header.
-9. **Possibly accepted batches are not replayed after a transport failure.** When the transport
-   fails after a physical batch may have reached Bitrix, the batch is not retried, even when every
-   command is `SAFE`; its commands arrive as `CommandOutcomeUnknown`. Reconcile them as you would an
-   ambiguous direct call. Unchanged from 2.3: a batch whose transport failed before dispatch is
-   retried within the budget, and a batch of only `SAFE` commands answered with a transient HTTP
-   status (`RetryPolicy.transient_http_statuses`) and no Bitrix envelope is replayed within the
-   budget. `UNSAFE` or `UNKNOWN` commands of such a batch arrive as `CommandOutcomeUnknown` after a
-   408 or 5xx status (`AmbiguityPolicy.ambiguous_unstructured_statuses`), and as `CommandFailure`
-   after 423, 425 or 429, which mean the batch was not accepted.
+9. **Possibly accepted batches are not replayed.** When the transport fails after a physical batch
+   may have reached Bitrix, or Bitrix answers it with an HTTP error status and no Bitrix envelope,
+   the batch is not retried, even when every command is `SAFE`. After a transport failure or a 408
+   or 5xx status (`AmbiguityPolicy.ambiguous_unstructured_statuses`) its commands arrive as
+   `CommandOutcomeUnknown`; reconcile them as you would an ambiguous direct call. After 423, 425 or
+   429, which mean the batch was not accepted, they arrive as `CommandFailure`. In 2.3 a batch of
+   only `SAFE` commands was replayed after such a status. Unchanged: a batch whose transport failed
+   before dispatch, and a batch that Bitrix refused as a whole with a structured error such as
+   `QUERY_LIMIT_EXCEEDED`, is retried within the budget; a direct `SAFE` request is still retried
+   after a transient status.
 10. **Error text.** Error descriptions show field names from your request as `field#N`, known V3
     codes verbatim, and distinct hidden mapping keys as `[REDACTED#1]`, `[REDACTED#2]`, … Code that
     parses error strings must accept these forms.
@@ -82,7 +83,9 @@ details.
     with your exception as `__cause__`. A direct `SAFE` request raises that `TransportError` after one
     send; a direct `UNKNOWN` or `UNSAFE` request raises `AmbiguousExecutionError`; every admitted
     command of a physical batch arrives as `CommandOutcomeUnknown`. Catch these instead of your own
-    exception class, and read `__cause__` for the original.
+    exception class, and read `__cause__` for the original. A closed `HttpxTransport` raises
+    `TransportError(phase=NOT_DISPATCHED, retryable=False)` instead of `RuntimeError`: nothing was
+    sent, so no command is reported as possibly executed.
 17. **Oversized responses.** A response larger than `ExecutionPolicy.max_response_bytes` is refused
     before decoding. An injected transport is now held to the same ceiling as the bundled one: a
     direct `SAFE` request raises `ResponseTooLargeError`, and a direct `UNKNOWN` or `UNSAFE` request

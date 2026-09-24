@@ -6,8 +6,8 @@ major with a ``DeprecationWarning``; the migration guide's table is generated fr
 
 Run ``python -m b24api.migration PATH...`` to list deprecated root imports in files or directories.
 It prints ``file:line b24api.Name -> package.Name`` for each one, rewrites nothing, and exits with 1
-when it finds any. The module imports nothing else from ``b24api``, so the check runs even where the
-rest of the package cannot be imported.
+when it finds any. The module itself imports nothing else from ``b24api``; running it with ``-m`` still
+imports the package root first, so the package must be importable.
 """
 
 from __future__ import annotations

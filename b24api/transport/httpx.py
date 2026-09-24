@@ -51,7 +51,10 @@ def _webhook_vault() -> tuple[Callable[[str], str], Callable[[str], str], Callab
         try:
             ciphertext, key = entries[handle]
         except KeyError as error:
-            raise RuntimeError("transport credential is unavailable") from error
+            # Refused before any I/O: nothing reached the portal, so the request is not possibly accepted.
+            raise TransportError(
+                "transport credential is unavailable", phase=FailurePhase.NOT_DISPATCHED, retryable=False
+            ) from error
         return bytes(left ^ right for left, right in zip(ciphertext, key, strict=True)).decode()
 
     def drop(handle: str) -> None:
@@ -112,6 +115,11 @@ def _method_url(webhook_url: str, request: WireRequest) -> str:
         path = f"/rest/api/{parts[1]}/{parts[2]}/"
     suffix = ".json" if request.route is RouteKind.JSON else ""
     return str(parsed.copy_with(path=f"{path}{request.method}{suffix}"))
+
+
+def _closed_refusal() -> TransportError:
+    """A closed transport refuses before any I/O; the request never left the process."""
+    return TransportError("transport is closed", phase=FailurePhase.NOT_DISPATCHED, retryable=False)
 
 
 class HttpxTransport:
@@ -185,7 +193,7 @@ class HttpxTransport:
     ) -> WireResponse:
         """Protect the emitting HTTPX logger for one owned request."""
         if self._closed:
-            raise RuntimeError("transport is closed")
+            raise _closed_refusal()
         HTTPX_LOG_SHIELD.admit_send(self._client)
         method_url = _method_url(_webhook_for(self._webhook_handle), request)
         try:
@@ -223,7 +231,7 @@ class HttpxTransport:
     ) -> WireResponse:
         """Send one explicitly represented transport request attempt."""
         if self._closed:
-            raise RuntimeError("transport is closed")
+            raise _closed_refusal()
         if isinstance(max_response_bytes, bool) or max_response_bytes < 1:
             raise ValueError("max_response_bytes must be a positive integer")
         tracker = _PhaseTracker()

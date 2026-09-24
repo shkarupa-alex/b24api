@@ -88,7 +88,9 @@ may already have reached Bitrix:
 | `UNSAFE` | Repeating the request is known to risk a duplicate effect, for example creating an entity without an idempotency key. | No automatic replay; the caller receives an ambiguous-execution error and reconciles state. |
 | `UNKNOWN` | The caller has not established whether replay is safe. This is the default. | Same conservative behavior as `UNSAFE`, while diagnostics preserve that safety was unknown rather than known unsafe. |
 
-A failure proved to occur before dispatch may still be retried. Method names never imply safety;
+A failure proved to occur before dispatch may still be retried. A physical batch is never replayed
+as a whole once it may have reached Bitrix, whatever its commands' safety: each command then
+arrives as unknown or failed. Method names never imply safety;
 mark a request `SAFE` only when the operation's semantics justify it.
 
 Use `ExecutionPolicy` to narrow attempts or resource budgets for one operation:

@@ -535,3 +535,28 @@ async def test_failing_finalizer_behind_a_body_failure_keeps_the_body_failure(fa
     assert harness.fallback_calls == 1
     assert getattr(error, "report", None) is harness.runner.report
     assert "report_finalize_failure" in harness.codes()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+@pytest.mark.parametrize("body", ["exhaust", "fail"])
+async def test_failing_finalizer_keeps_a_simultaneous_cleanup_failure(
+    family: Family, body: BodyMode, client: Bitrix24
+) -> None:
+    harness = _harness(family, client, body=body, cleanup="fail", finalize_fails=True)
+
+    error = await _outcome(asyncio.create_task(_drain(harness.stream)))
+
+    if body == "exhaust":
+        assert isinstance(error, _FinalizeFailedError)
+    else:
+        assert _is_body_failure(error)
+    assert (harness.finalize_calls, harness.fallback_calls) == (1, 1)
+    report = harness.runner.report
+    assert report is not None
+    assert report.state.value == "failed"
+    assert getattr(error, "report", None) is report
+    assert {"report_finalize_failure", "cleanup_failure"} <= set(harness.codes())
+    await harness.stream.aclose()
+    assert harness.runner.report is report
+    assert harness.finalize_calls == 1

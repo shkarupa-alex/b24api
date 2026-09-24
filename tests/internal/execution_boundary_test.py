@@ -252,10 +252,9 @@ async def test_physical_batch_after_an_unstructured_transient_status(
     safety: ReplaySafety,
     count: int,
 ) -> None:
-    # Decided with the owner's regressions in mind: the status path is unchanged from 2.3. A SAFE batch
-    # answered with a transient status and no Bitrix envelope is replayed within the budget, as list
-    # traversals on real portals rely on. UNSAFE and UNKNOWN commands become unknown after a status that
-    # may follow execution (502) and fail after one that means the batch was not accepted (429).
+    # §3.4: a physical batch is never replayed as a whole, whatever the safety flag. Every admitted command
+    # becomes unknown after a status that may follow execution (502) and fails after one that means the
+    # batch was not accepted (429); the scripted success after the status stays unused.
     transport = _Script([])
 
     def transient(request: Request) -> WireResponse:
@@ -271,24 +270,55 @@ async def test_physical_batch_after_an_unstructured_transient_status(
     outcomes = await _drain(stream)
 
     assert stream.report is not None
-    if safety is ReplaySafety.SAFE:
-        assert len(transport.sent) == 2  # noqa: PLR2004 - one replay after the transient status
-        assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
-        assert stream.report.retries == 1
-    elif status == HTTP_BAD_GATEWAY:
-        assert len(transport.sent) == 1
-        for outcome in outcomes:
+    assert len(transport.sent) == 1
+    assert len(outcomes) == count
+    assert stream.report.retries == 0
+    for outcome in outcomes:
+        if status == HTTP_BAD_GATEWAY:
             assert isinstance(outcome, CommandOutcomeUnknown)
+            assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
             assert isinstance(outcome.error, AmbiguousExecutionError)
             assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
-    else:
-        assert len(transport.sent) == 1
-        for outcome in outcomes:
+            assert isinstance(outcome.error.__cause__, HTTPGatewayError)
+        else:
             assert isinstance(outcome, CommandFailure)
+            assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
             assert isinstance(outcome.error, HTTPGatewayError)
             assert outcome.error.http_status == HTTP_TOO_MANY_REQUESTS
-            assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+    if status == HTTP_BAD_GATEWAY:
+        assert stream.report.unknown == count
     assert stream.report.physical_requests == len(transport.sent)
+
+
+@pytest.mark.asyncio
+async def test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_direct_call_keep_their_retry() -> None:
+    # Positive controls for the rule above: a Bitrix envelope refusing the whole batch proves it did not run,
+    # so the batch is sent again; a SAFE direct request still retries after an unstructured 502.
+    batch_transport = _Script([])
+
+    def refused(request: Request) -> WireResponse:
+        batch_transport.sent.append(request)
+        body = {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "Too many requests"}
+        return WireResponse(503, (("content-type", "application/json"),), json.dumps(body).encode())
+
+    batch_transport.behaviors = [refused, _counting(batch_transport)]
+    outcomes = await _drain(
+        _client(batch_transport).batch_outcomes(
+            [Command(_request(ReplaySafety.SAFE), index) for index in range(SEVERAL)], policy=_policy()
+        )
+    )
+    assert len(batch_transport.sent) == 2  # noqa: PLR2004 - one retry after the structured refusal
+    assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+
+    direct_transport = _Script([])
+
+    def transient(request: Request) -> WireResponse:
+        direct_transport.sent.append(request)
+        return WireResponse(HTTP_BAD_GATEWAY, (("content-type", "text/html"),), b"<html>transient</html>")
+
+    direct_transport.behaviors = [transient, _counting(direct_transport)]
+    await _client(direct_transport).call(_request(ReplaySafety.SAFE), policy=_policy())
+    assert len(direct_transport.sent) == 2  # noqa: PLR2004 - one retry after the transient status
 
 
 # --- A13 -------------------------------------------------------------------------------------
@@ -708,3 +738,33 @@ async def test_strict_only_defect_in_a_success_error_body_is_an_envelope_contrac
 
     assert (counter.strict, counter.codec) == (1, 0)
     assert transport.entered == 1
+
+
+@pytest.mark.asyncio
+async def test_closed_default_transport_refuses_before_dispatch_without_implying_acceptance() -> None:
+    # A closed HttpxTransport refuses before any byte leaves the process: NOT_DISPATCHED, never ambiguous,
+    # never retried. Only a foreign transport's arbitrary exception keeps the conservative classification.
+    sends: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sends.append(request)
+        return httpx.Response(HTTP_OK, headers={"content-type": "application/json"}, content=b'{"result": 1}')
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    transport = HttpxTransport(f"https://{HOST}/rest/1/token/", client=http_client)
+    client = _client(transport)
+    await transport.aclose()
+    try:
+        for safety in (ReplaySafety.UNSAFE, ReplaySafety.SAFE):
+            with pytest.raises(TransportError, match="transport is closed") as refused:
+                await client.call(_request(safety), policy=_policy())
+            assert refused.value.phase is FailurePhase.NOT_DISPATCHED
+            assert refused.value.retryable is False
+        outcomes = await _drain(
+            client.batch_outcomes([Command(_request(ReplaySafety.UNSAFE), index) for index in range(2)])
+        )
+        assert outcomes
+        assert not any(isinstance(outcome, CommandOutcomeUnknown) for outcome in outcomes)
+        assert sends == []
+    finally:
+        await http_client.aclose()

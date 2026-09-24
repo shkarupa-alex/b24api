@@ -483,3 +483,31 @@ async def test_secret_registry_is_deduplicated_by_value_and_tied_to_client_lifet
     await clients[1].aclose()
     assert HTTPX_LOG_SHIELD.suppresses_hpack() is False
     assert set(HTTPX_LOG_SHIELD.registered_secrets()) == initial
+
+
+@pytest.mark.asyncio
+async def test_registered_secret_stays_scrubbed_while_the_injected_client_outlives_its_transport() -> None:
+    _assert_shield_idle()
+    logger = logging.getLogger("httpx")
+    owned_url = f"https://portal.invalid/rest/1/{_OWNED}/profile"
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(_OK, request=request)))
+    await HttpxTransport(f"https://portal.invalid/rest/1/{_OWNED}/", client=client).aclose()
+    try:
+        with _capture() as handler:
+            # The transport is gone but its injected client, and so the registered secret, is still live.
+            await client.get(owned_url)
+            error = _raise_with(f"caller failure for {owned_url}")
+            logger.error("caller %s", owned_url, exc_info=(type(error), error, error.__traceback__))
+            logger.info("caller without the secret %s", "https://other.invalid/")
+    finally:
+        await client.aclose()
+    _assert_secret_free(handler, _OWNED)
+    assert handler.records[-1].args == ("https://other.invalid/",)
+
+    # Closing the client drops its secret at once; the next shield lifecycle event removes both filters.
+    assert _OWNED not in HTTPX_LOG_SHIELD.registered_secrets()
+    await HttpxTransport("https://portal.invalid/rest/1/synthetic-probe-secret-000000/").aclose()
+    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    for name in HPACK_LOGGER_NAMES:
+        assert HTTPX_LOG_SHIELD._hpack_filter not in logging.getLogger(name).filters  # noqa: SLF001
+    _assert_shield_idle()

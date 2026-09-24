@@ -16,7 +16,7 @@ from b24api.errors import (
     ProtocolError,
     ValidationIssue,
 )
-from b24api.redaction import DEFAULT_REDACTOR, Redactor
+from b24api.redaction import DEFAULT_REDACTOR, Redactor, SafeText
 
 if TYPE_CHECKING:
     from b24api._diagnostics import DiagnosticContext
@@ -225,11 +225,16 @@ class ProtocolCodec:
         if not isinstance(issues, list):
             raise TypeError("V3 validation must be a list")
         bounded: list[ValidationIssue] = []
-        truncated = (
-            len(issues) > _MAX_VALIDATION_ITEMS
-            or len(message) > _MAX_VALIDATION_TEXT
-            or len(code) > _MAX_VALIDATION_TEXT
-        )
+        truncated = len(issues) > _MAX_VALIDATION_ITEMS or len(code) > _MAX_VALIDATION_TEXT
+
+        def render(text: str) -> str:
+            # Aliasing and secret redaction see the whole text; only the safe result is bounded, so a cut
+            # can never split a request field name out of reach of its alias.
+            nonlocal truncated
+            rendered = self._redactor.render_text(text, context=diagnostics)
+            truncated |= len(text) > _MAX_VALIDATION_TEXT or len(rendered) > _MAX_VALIDATION_TEXT
+            return rendered[:_MAX_VALIDATION_TEXT]
+
         for issue in issues[:_MAX_VALIDATION_ITEMS]:
             if not isinstance(issue, Mapping):
                 raise TypeError("V3 validation item must be an object")
@@ -237,14 +242,8 @@ class ProtocolCodec:
             detail = issue.get("message")
             if not isinstance(field, str) or not isinstance(detail, str):
                 raise TypeError("V3 validation field and message must be strings")
-            truncated |= len(field) > _MAX_VALIDATION_TEXT or len(detail) > _MAX_VALIDATION_TEXT
-            bounded.append(
-                ValidationIssue(
-                    self._redactor.render_text(field[:_MAX_VALIDATION_TEXT], context=diagnostics),
-                    self._redactor.render_text(detail[:_MAX_VALIDATION_TEXT], context=diagnostics),
-                )
-            )
-        return code[:_MAX_VALIDATION_TEXT], message[:_MAX_VALIDATION_TEXT], tuple(bounded), truncated
+            bounded.append(ValidationIssue(render(field), render(detail)))
+        return code[:_MAX_VALIDATION_TEXT], SafeText(render(message)), tuple(bounded), truncated
 
     @staticmethod
     def _parse_body(body: bytes | str | Mapping[str, Any] | None) -> tuple[object, bool]:

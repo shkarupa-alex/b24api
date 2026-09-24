@@ -250,8 +250,7 @@ class Executor:
         attempts = 0
         last_error: B24ApiError | None = None
         while True:
-            remaining = context.remaining_time(retry_started=retry_started)
-            if remaining <= 0:
+            if (remaining := context.remaining_time(retry_started=retry_started)) <= 0:
                 raise BudgetExceededError("execution time budget exhausted")
             scheduled_class = work_class if attempts == 0 else WorkClass.RETRY
             try:
@@ -328,6 +327,7 @@ class Executor:
                 attempts=attempts,
                 wire=wire,
                 method_cooldown=method_cooldown,
+                physical_batch=work_class is WorkClass.BATCH,
             )
             last_error = response_error
             attempts += 1
@@ -425,7 +425,7 @@ class Executor:
             and error.http_status is not None
             and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
             and error.http_status in context.policy.ambiguity.ambiguous_unstructured_statuses
-            and safety is not ReplaySafety.SAFE
+            and (safety is not ReplaySafety.SAFE or physical_batch)
         ):
             raise AmbiguousExecutionError(
                 "Request may have executed before the unstructured HTTP failure",
@@ -435,8 +435,12 @@ class Executor:
                 evidence=error.evidence,
             ) from error
 
-        if physical_batch and isinstance(error, TransportError) and error.possible_acceptance:
-            # A physical batch that may have been accepted is never replayed as a whole, even when SAFE.
+        if physical_batch and (
+            (isinstance(error, TransportError) and error.possible_acceptance) or isinstance(error, HTTPGatewayError)
+        ):
+            # A physical batch that reached the portal is never replayed as a whole, even when SAFE (§3.4): after
+            # a transport failure that may follow acceptance, or after any unstructured HTTP status. Only a
+            # structured Bitrix refusal of the whole batch (ApiResponseError) keeps its retry.
             raise error
         retryable = _is_retryable(error, safety=safety, policy=context.policy)
         if not retryable:

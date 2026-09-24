@@ -16,12 +16,14 @@
   `Accept-Encoding: gzip, deflate`; a header set by the caller or an injected client is kept (A2).
 - **Breaking (3.0.0):** a physical batch that may have been accepted when its transport failed is
   never replayed, even when every command is `SAFE`; each admitted command becomes
-  `CommandOutcomeUnknown` with its own `AmbiguousExecutionError` (A3). A `SAFE` batch answered with a
-  transient HTTP status and no Bitrix envelope is still replayed within the budget, as in 2.3. A
-  transport failure marked `retryable=False` is raised once instead of exhausting the attempt budget.
+  `CommandOutcomeUnknown` with its own `AmbiguousExecutionError` (A3). A physical batch answered with
+  an HTTP error status and no Bitrix envelope is not replayed either, even when `SAFE`: its commands
+  become unknown after 408 or 5xx and fail after 423, 425 or 429 (in 2.3 a `SAFE` batch was replayed).
+  A transport failure marked `retryable=False` is raised once instead of exhausting the attempt budget.
   An arbitrary exception from an injected transport becomes
-  `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause (A13). A
-  response over `max_response_bytes` from an injected transport is refused before decoding, and on
+  `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause, and a
+  closed `HttpxTransport` refuses with `TransportError(phase=NOT_DISPATCHED, retryable=False)`
+  instead of `RuntimeError` (A13). A response over `max_response_bytes` from an injected transport is refused before decoding, and on
   any transport, the bundled one included, every command of a physical batch whose response is
   refused becomes `CommandOutcomeUnknown` instead of a `CommandFailure` (B29).
 - **Breaking (3.0.0):** error rendering is contextual. Known V3 error codes are shown verbatim, field
@@ -54,7 +56,8 @@
   `EnvelopeContractError` instead of an `ApiResponseError` (B8).
 - The HTTPX log shield drops every `hpack.hpack` and `hpack.table` record while a library HTTPX
   client is open. An HTTP/2 send is refused before I/O with `CapabilityError` when that filter was
-  removed or an injected client cannot be registered (A20).
+  removed or an injected client cannot be registered (A20). The `httpx` logger filter that hides a
+  registered webhook secret stays installed while an injected client outlives its transport.
 - Every keyset traversal reports `OperationReport.keyset_selection`;
   `KeysetSelectionReason` gains `EXPLICIT_SEQUENTIAL` and `PAGE_STOP`, which exhaustive matches must
   handle (B9).

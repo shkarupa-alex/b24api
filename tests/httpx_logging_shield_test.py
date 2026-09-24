@@ -59,6 +59,17 @@ def test_hpack_stack_is_bounded_to_the_verified_line(name: str) -> None:
     assert metadata.version(name) in specifier
 
 
+async def _assert_shield_released(logger: logging.Logger) -> None:
+    """After the last transport and its injected client close, nothing stays registered or installed.
+
+    A client closed after its transport leaves the filter inert, holding no secret, until the next shield
+    lifecycle event removes it; a throwaway transport provides that event.
+    """
+    assert not {_OWNED_MARKER, _FOREIGN_MARKER} & set(HTTPX_LOG_SHIELD.registered_secrets())
+    await HttpxTransport("https://portal.invalid/rest/1/synthetic-probe-secret-000000/").aclose()
+    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+
+
 class _CollectingHandler(logging.StreamHandler[io.StringIO]):
     """Retain the original LogRecord as well as the formatted handler output."""
 
@@ -126,7 +137,7 @@ async def test_httpx_info_record_is_emitted_and_rewritten_before_handler_formatt
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 @pytest.mark.asyncio
@@ -180,7 +191,7 @@ async def test_closing_transport_keeps_filter_until_inflight_httpx_record_is_emi
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - in-flight cleanup control
+    await _assert_shield_released(logger)
 
 
 @pytest.mark.asyncio
@@ -267,7 +278,7 @@ async def test_redirect_replaces_webhook_token_without_logging_either_secret(rou
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 _THIRD_MARKER = "synthetic-third-secret-777777"
@@ -333,7 +344,7 @@ async def test_unrelated_httpx_request_inside_owned_hook_is_unchanged(same_clien
         await foreign.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 _UNAUTHORIZED = 401
@@ -402,7 +413,7 @@ async def test_in_place_injected_auth_keeps_owned_webhook_out_of_info(route: Rou
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 def _substitute(url: httpx.URL, target: str) -> str:
@@ -502,7 +513,7 @@ async def test_injected_auth_substitute_is_refused_before_dispatch(
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 @pytest.mark.asyncio
@@ -551,7 +562,7 @@ async def test_foreign_root_redirect_to_the_owned_webhook_never_logs_its_secret(
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 @pytest.mark.asyncio
@@ -592,7 +603,7 @@ async def test_concurrent_owned_sends_with_distinct_tokens_share_one_client() ->
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 class _MutatingAuth(httpx.Auth):
@@ -655,7 +666,7 @@ async def test_mutating_the_owned_request_in_place_keeps_every_credential_privat
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 class _SilentAuth(httpx.Auth):
@@ -685,7 +696,7 @@ async def test_injected_auth_yielding_nothing_is_refused_before_dispatch() -> No
     finally:
         await transport.aclose()
         await client.aclose()
-    assert HTTPX_LOG_SHIELD._filter not in logging.getLogger("httpx").filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logging.getLogger("httpx"))
 
 
 @pytest.mark.asyncio
@@ -732,7 +743,7 @@ async def test_nested_foreign_redirect_with_a_distinct_token_stays_unchanged() -
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 @pytest.mark.asyncio
@@ -781,7 +792,7 @@ async def test_owned_response_hook_scrubs_url_bearing_extra() -> None:
         await foreign.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 def _extra_matrix(url: httpx.URL, hop: httpx.URL) -> dict[str, object]:
@@ -852,7 +863,7 @@ async def test_owned_and_foreign_extra_value_matrix() -> None:
         await foreign.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 def test_invalid_owned_url_does_not_leave_the_filter_in_flight() -> None:

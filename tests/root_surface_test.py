@@ -292,3 +292,11 @@ def test_negative_typing_smoke_is_one_old_root_import() -> None:
     assert [line for line in smoke.splitlines() if line and not line.startswith("#")] == [
         "from b24api import CommandSuccess"
     ]
+
+
+def test_migration_scanner_docstring_states_that_the_package_root_is_imported() -> None:
+    import b24api.migration  # noqa: PLC0415 - the module under test
+
+    doc = " ".join((b24api.migration.__doc__ or "").split())
+    assert "the check runs even where the rest of the package cannot be imported" not in doc
+    assert "still imports the package root first" in doc

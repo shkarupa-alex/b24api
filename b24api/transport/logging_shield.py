@@ -292,8 +292,10 @@ class HttpxLogShield:
             raise CapabilityError(_MISSING_HPACK_FILTER)
 
     def registered_secrets(self) -> tuple[str, ...]:
-        """Return each registered webhook secret once."""
+        """Return each registered webhook secret of a still-open client once."""
         with self._lock:
+            # Pruning touches only the registries, never a logger's filter list, so it is safe while logging.
+            self._prune_closed()
             return tuple(self._secrets)
 
     def suppresses_hpack(self) -> bool:
@@ -351,11 +353,14 @@ class HttpxLogShield:
     def _remove_if_idle(self) -> None:
         if self._transports or self._in_flight:
             return
-        _LOGGER.removeFilter(self._filter)
         self._prune_closed()
-        if not self._clients:
-            for logger in _HPACK_LOGGERS:
-                logger.removeFilter(self._hpack_filter)
+        if self._clients:
+            # An open injected client keeps its registered secret, so both scrubbers stay with it; a later
+            # release, send admission or transport close prunes it and removes them.
+            return
+        _LOGGER.removeFilter(self._filter)
+        for logger in _HPACK_LOGGERS:
+            logger.removeFilter(self._hpack_filter)
 
 
 HTTPX_LOG_SHIELD = HttpxLogShield()

@@ -98,15 +98,37 @@ def cleanup_failed(cause: TerminalCause, attempt: CleanupAttempt) -> bool:
     return attempt.error is not None or (cause is TerminalCause.FAILED and attempt.cancellation is not None)
 
 
-def failed_kernel_report(reason: str) -> KernelReport:
+def with_fallback_cleanup(
+    report: KernelReport,
+    cause: TerminalCause,
+    attempt: CleanupAttempt,
+    *,
+    subject: str = "batch",
+) -> KernelReport:
+    """Keep a cleanup result on a fallback report; the finalization failure stays its terminal reason."""
+    cancellation = attempt.cancellation if cause is TerminalCause.FAILED else None
+    for failure in (attempt.error, cancellation):
+        if failure is not None:
+            report = with_cleanup_failure(report, failure, terminal=False, subject=subject)
+    return report
+
+
+def failed_kernel_report(
+    cause: TerminalCause,
+    reason: str,
+    attempt: CleanupAttempt,
+    *,
+    subject: str = "batch",
+) -> KernelReport:
     """Return the minimal FAILED kernel report published when a family's finalizer raised."""
-    return KernelReport(
+    report = KernelReport(
         state=KernelState.FAILED,
         terminal_reason=reason,
         violations=(
             Violation(ViolationSeverity.BLOCKING, "report_finalize_failure", "stream report finalization failed"),
         ),
     )
+    return with_fallback_cleanup(report, cause, attempt, subject=subject)
 
 
 class _Phase(Enum):

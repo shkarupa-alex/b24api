@@ -15,23 +15,23 @@ Test paths are `file::test`. The last section lists what remains for the owner.
 |---|---|---|---|
 | A1 | Done | `4cd3998` | `tools/b24api_evidence/harness/live_test.py::test_live_portal_httpx_info_record_carries_no_webhook_token`, `::test_live_portal_sync_attribution_leaves_foreign_records_on_the_same_logger_unchanged` |
 | A2 | Done; L2 confirmed | `15b5155` | `tests/internal/bounded_decoding_test.py::test_single_gzip_bomb_is_refused_inside_the_decompressor`, `::test_stacked_gzip_cascade_is_refused_before_decompression`; [L2](live-probes.md#l2-a2-content-encoding-and-the-explicit-accept-encoding) |
-| A3 | Done | `228d0f8` | `tests/internal/execution_boundary_test.py::test_direct_replay_matrix`, `::test_physical_batch_replay_matrix`, `::test_permanent_transport_refusal_is_raised_once_instead_of_exhausting_the_budget` |
+| A3 | Done | `228d0f8` | `tests/internal/execution_boundary_test.py::test_direct_replay_matrix`, `::test_physical_batch_replay_matrix`, `::test_permanent_transport_refusal_is_raised_once_instead_of_exhausting_the_budget`, `::test_physical_batch_after_an_unstructured_transient_status`, `::test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_direct_call_keep_their_retry` |
 | A4 | Done | `06dfa00` | `pydantic>=2.12.0` in `pyproject.toml`; the `min-deps` job (`tests/release_workflow_test.py::test_blocking_jobs_run_the_specified_checks`) |
 | A5 | Done | `43fd34d` | `tests/internal/rate_coordinator_test.py::test_client_closes_its_own_coordinator_and_awaits_the_wake_task` |
 | A6 | Done | `06dfa00`, `de451d5` | `tests/release_workflow_test.py::test_wheel_check_refuses_an_untyped_wheel_or_files_beside_the_package`, `::test_wheel_typing_passes_every_canonical_import_and_flags_an_old_root_import` |
-| A7 | Done | `93f5494`, `3bccfe4` | `tests/diagnostic_rendering_test.py::test_known_v3_code_is_diagnosable_in_str_repr_and_safe_dict`; the §3.9 matrix in `tests/redaction_property_test.py` |
+| A7 | Done | `93f5494`, `3bccfe4` | `tests/diagnostic_rendering_test.py::test_known_v3_code_is_diagnosable_in_str_repr_and_safe_dict`; the §3.9 matrix in `tests/redaction_property_test.py`; `tests/diagnostic_rendering_test.py::test_long_v3_field_is_aliased_before_its_text_is_bounded` |
 | A8 | Done; L3 confirmed | `306cde0` | `tests/counted_rules_test.py::test_table_r_batched_counted_path`, `::test_table_r_sequential_counted_path`; [L3](live-probes.md#l3-a8-the-counted-validator-on-real-responses) |
 | A9 | Done; L5 confirmed | `6cb745f` | `tests/offset_preflight_test.py::test_exact_qualified_total_refuses_a_nonzero_start_before_io`, `::test_disabled_total_termination_keeps_the_suffix_traversal`; [L5](live-probes.md#l5-a9-no-start--0-with-total-only-closure-in-examples-and-documentation) |
 | A10 | Done | `d54dda7` | `tests/keyset_verifier_boundary_test.py::test_failed_boundary_read_is_an_unsupported_report` |
-| A11 | Done | `37c3de2` | `tests/stream_lifecycle_test.py::test_early_close_with_failing_source_close_publishes_one_report`, `::test_close_before_the_first_pull_closes_the_opened_source_once`, `::test_failing_source_close_before_the_first_pull_is_a_cleanup_failure`; `tests/batch_test.py::test_internal_outcome_stream_closed_before_the_first_pull_closes_its_source_once` |
+| A11 | Done | `37c3de2` | `tests/stream_lifecycle_test.py::test_early_close_with_failing_source_close_publishes_one_report`, `::test_close_before_the_first_pull_closes_the_opened_source_once`, `::test_failing_source_close_before_the_first_pull_is_a_cleanup_failure`; `tests/batch_test.py::test_internal_outcome_stream_closed_before_the_first_pull_closes_its_source_once`; `tests/internal/runner_transitions_test.py::test_failing_finalizer_keeps_a_simultaneous_cleanup_failure` |
 | A12 | Done; breaking, in the migration guide | `37c3de2` | `tests/stream_lifecycle_test.py::test_early_close_is_reported_as_closed_before_exhaustion`; golden delta A12 |
-| A13 | Done; breaking, in the migration guide | `228d0f8` | `tests/internal/execution_boundary_test.py::test_unknown_transport_exception_is_a_non_retryable_dispatch_started_failure`, `::test_unknown_transport_exception_is_ambiguous_for_unproven_direct_requests`, `::test_batch_outcomes_are_total_after_an_unknown_transport_exception` |
+| A13 | Done; breaking, in the migration guide | `228d0f8` | `tests/internal/execution_boundary_test.py::test_unknown_transport_exception_is_a_non_retryable_dispatch_started_failure`, `::test_unknown_transport_exception_is_ambiguous_for_unproven_direct_requests`, `::test_batch_outcomes_are_total_after_an_unknown_transport_exception`; `tests/internal/execution_boundary_test.py::test_closed_default_transport_refuses_before_dispatch_without_implying_acceptance` |
 | A14 | Done | `37c3de2` | `tests/stream_lifecycle_test.py::test_fail_fast_batch_reports_the_command_failure_not_its_carrier`; golden delta A14 |
 | A16 | Done | `d702e06` | `tests/internal/owned_source_test.py::test_sync_source_retains_bounded_violations`, `::test_async_source_retains_bounded_violations` |
 | A17 | Done | `a4fb7c0` | `tests/execution_test.py::test_transport_cancellation_drops_httpx_traceback_and_request_locals` filters frames under the installed `b24api` package path |
 | A18 | Done | `4cdd743` | `tests/keyset_cursor_streams_2_test.py::test_slow_consumer_coalescing_is_bounded_per_wave_on_a_virtual_clock` |
 | A19 | Done in code; **L1 open** | `29ff819` | `tests/throttle_headers_test.py::test_rate_limit_reset_accepts_delta_epoch_and_http_date`, `::test_epoch_rate_limit_reset_does_not_freeze_the_host_for_the_cap`; the live header form was not observed ([L1](live-probes.md#l1-a19-x-bitrix-ratelimit-reset-and-retry-after)) |
-| A20 | Done | `6c585e5` | `tests/internal/httpx_log_shield_matrix_test.py::test_owned_http2_encode_and_decode_records_are_suppressed_until_close` and the rest of the hpack matrix |
+| A20 | Done | `6c585e5` | `tests/internal/httpx_log_shield_matrix_test.py::test_owned_http2_encode_and_decode_records_are_suppressed_until_close` and the rest of the hpack matrix; `tests/internal/httpx_log_shield_matrix_test.py::test_registered_secret_stays_scrubbed_while_the_injected_client_outlives_its_transport` |
 
 A15 became B0.
 
@@ -189,19 +189,19 @@ These steps are outward-facing or need the owner's decision, so they were not pe
 6. **Issue comments (§6.1 item 6).** Post the table "ID → PR → test or evidence → outcome" on #14
    and #15, then close both issues after the §6.1 gate.
 
-Two further observations belong to the owner:
+Two further observations; the first is decided, the second stays with the owner:
 
-- **Physical batch replay.** A physical batch is never replayed after a transport failure that may
-  have followed acceptance, even when every command is `SAFE` (§3.4, D05). Two replays are kept as
-  in 2.3, because nothing can run twice or because list traversals on real portals rely on them:
-  a batch whose transport failed before dispatch (`NOT_DISPATCHED`, `CONNECTION_ESTABLISHED`) is
-  retried within the budget, and a batch of only `SAFE` commands answered with a transient HTTP
-  status and no Bitrix envelope is replayed within the budget. `UNSAFE` or `UNKNOWN` commands of such
-  a batch become unknown after a 408 or 5xx status and fail after 423, 425 or 429, which mean the
-  batch was not accepted. Two tests pin this:
-  `tests/internal/execution_boundary_test.py::test_physical_batch_replay_matrix` and
-  `tests/internal/execution_boundary_test.py::test_physical_batch_after_an_unstructured_transient_status`.
-  Migration item 9 states it. Forbidding the status replay as well is a stricter reading of §3.4
-  that the owner can still choose.
+- **Physical batch replay.** Decided by §3.4 as written: a physical batch is never replayed as a whole
+  once it may have reached the portal, even when every command is `SAFE` — neither after a transport
+  failure that may follow acceptance nor after an HTTP error status without a Bitrix envelope. Its
+  commands become unknown after a transport failure, 408 or 5xx, and fail after 423, 425 or 429. Two
+  retries stay, because nothing ran: a batch whose transport failed before dispatch
+  (`NOT_DISPATCHED`, `CONNECTION_ESTABLISHED`), and a batch Bitrix refused as a whole with a
+  structured error such as `QUERY_LIMIT_EXCEEDED`. Tests:
+  `tests/internal/execution_boundary_test.py::test_physical_batch_replay_matrix`,
+  `tests/internal/execution_boundary_test.py::test_physical_batch_after_an_unstructured_transient_status`
+  and
+  `tests/internal/execution_boundary_test.py::test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_direct_call_keep_their_retry`.
+  Migration item 9 states it.
 - **HTTPX logging on injected clients.** Two W2 gaps remain: the httpcore DEBUG record of a
   redirect token, and an unbounded `aread` on injected clients.

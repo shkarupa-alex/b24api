@@ -259,8 +259,8 @@ class ItemStream(AsyncIterator[JsonValue]):
         return self.report
 
 
-def _failure_report(_cause: TerminalCause, reason: str, _attempt: CleanupAttempt) -> KernelReport:
-    return failed_kernel_report(reason)
+def _failure_report(cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
+    return failed_kernel_report(cause, reason, attempt, subject="pagination")
 
 
 def iter_list(  # noqa: PLR0913

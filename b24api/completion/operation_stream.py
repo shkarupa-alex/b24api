@@ -23,6 +23,7 @@ from b24api.execution.lifecycle import (
     OperationRunner,
     TerminalCause,
     with_cleanup_attempt,
+    with_fallback_cleanup,
 )
 from b24api.execution.snapshot import KernelReport
 
@@ -183,7 +184,9 @@ class MappedOperationStream[S, T]:
         self._cleanup = (cause, attempt)
         if self._report is not None:
             return self._report
-        failed = KernelReport(state=KernelState.FAILED, terminal_reason=reason)
+        failed = with_fallback_cleanup(
+            KernelReport(state=KernelState.FAILED, terminal_reason=reason), cause, attempt, subject="stream"
+        )
         facts = self._facts(failed, forced_state=TerminalState.FAILED)
         facts = replace(
             facts,
