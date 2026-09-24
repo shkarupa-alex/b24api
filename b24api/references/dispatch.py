@@ -3,7 +3,7 @@
 from __future__ import annotations
 import asyncio
 import contextlib
-from collections.abc import AsyncIterable, Iterable
+from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
@@ -35,8 +35,17 @@ if TYPE_CHECKING:
     )
 
 type ReferenceSource = Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]
+type _WaitFirst = Callable[[tuple[asyncio.Future[object], ...], float], Awaitable[None]]
 _MISSING = object()
 _SYNC_EXHAUSTED = object()
+
+
+def _loop_time() -> float:
+    return asyncio.get_running_loop().time()
+
+
+async def _wait_first(futures: tuple[asyncio.Future[object], ...], seconds: float) -> None:
+    await asyncio.wait(futures, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,9 +377,14 @@ class _BatchPageDispatcher:
         buffer: _RowBuffer | None = None,
         page_cap: int = 1,
         pending_continuations_can_progress: bool = True,
+        time: Callable[[], float] | None = None,
+        wait: _WaitFirst | None = None,
     ) -> None:
         self.context = context
         self.plan = plan
+        # Internal clock and wait seams (not public API): tests drive coalescing on a virtual clock.
+        self._time = time or _loop_time
+        self._wait = wait or _wait_first
         self._executor = BatchExecutor(executor)
         self._queue: asyncio.Queue[_PendingBatch] = asyncio.Queue(
             maxsize=context.policy.max_active_references,
@@ -474,8 +488,7 @@ class _BatchPageDispatcher:
                     continue
                 chunk = [first]
                 self._drain_nowait(chunk)
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + self.plan.coalesce_wait
+                deadline = self._time() + self.plan.coalesce_wait
                 coalescing_delay = 0.0
                 while len(chunk) < self.plan.batch_size:
                     self._drain_nowait(chunk)
@@ -486,7 +499,7 @@ class _BatchPageDispatcher:
                     if self._potential({item.reference_id for item in chunk}) == 0:
                         break
                     remaining = min(
-                        deadline - loop.time(),
+                        deadline - self._time(),
                         self.context.policy.max_elapsed - self.context.elapsed,
                     )
                     if remaining <= 0:
@@ -498,13 +511,12 @@ class _BatchPageDispatcher:
                     if get_task is None:
                         get_task = asyncio.create_task(self._queue.get())
                     wake = state.changed(seen)
-                    wait_started = loop.time()
-                    await asyncio.wait(
-                        [cast("asyncio.Future[object]", get_task), cast("asyncio.Future[object]", wake)],
-                        timeout=remaining,
-                        return_when=asyncio.FIRST_COMPLETED,
+                    wait_started = self._time()
+                    await self._wait(
+                        (cast("asyncio.Future[object]", get_task), cast("asyncio.Future[object]", wake)),
+                        remaining,
                     )
-                    coalescing_delay += loop.time() - wait_started
+                    coalescing_delay += self._time() - wait_started
                     if get_task.done():
                         pending = get_task.result()
                         get_task = None
