@@ -19,6 +19,10 @@
 - `Bitrix24.from_webhook(url, *, http_timeout=None, policy=None)` validates the URL through
   `Settings` and owns the transport and coordinator it creates; `http_timeout=None` keeps the
   `Settings` default.
+- Examples: scenario 14 (`requisite_links`) now uses the camelCase `select`, `filter` and `order` keys
+  of `crm.requisitelink.list` and reads its `requisiteLinks` collection. The live method silently
+  ignores the uppercase keys the recipe used, so the recipe's selector never matched a real response
+  (found by live probe L3).
 - The README's list traversal animation is replayed from executed traces: a test runs all three
   lanes against one scripted portal and checks the drawn HTTP counts, batch sizes and the final
   keyset call (§3.13). Its caption now says that an unbounded keyset ends with an empty confirmation

@@ -1,6 +1,8 @@
 """Scenario 14: exact counted tail beyond 400 composite CRM identities.
 
-Frozen filtered source has 582 independent `(ENTITY_TYPE_ID, ENTITY_ID)` keys.
+Frozen filtered source has 582 independent `(entityTypeId, entityId)` keys.
+`crm.requisitelink.list` takes camelCase `select`, `filter` and `order` keys
+and returns `{"requisiteLinks": [...]}`; uppercase keys are silently ignored.
 Direct windows and a physical batch tail must cover the same 0..550 offsets.
 A truncated 400-row batch tail is rejected as incomplete. The historical
 582/400 portal observation is not claimed reproduced here.
@@ -42,9 +44,9 @@ def _request(offset: int | None) -> Request:
     return Request(
         METHOD,
         {
-            "select": ["ENTITY_TYPE_ID", "ENTITY_ID"],
-            "filter": {"ENTITY_TYPE_ID": 2},
-            "order": {"ENTITY_ID": "ASC"},
+            "select": ["entityTypeId", "entityId"],
+            "filter": {"entityTypeId": 2},
+            "order": {"entityId": "ASC"},
             **({"start": offset} if offset is not None else {}),
         },
         replay_safety=ReplaySafety.SAFE,
@@ -54,14 +56,14 @@ def _request(offset: int | None) -> Request:
 
 def _rows(offset: int) -> list[dict[str, int]]:
     return [
-        {"ENTITY_TYPE_ID": entity_type, "ENTITY_ID": entity_id}
+        {"entityTypeId": entity_type, "entityId": entity_id}
         for entity_type, entity_id in EXPECTED_KEYS[offset : offset + PAGE_SIZE]
     ]
 
 
 def _result(offset: int, *, truncated: bool = False) -> dict[str, object]:
     rows = [] if truncated and offset == TRUNCATED_OFFSET else _rows(offset)
-    return {"REQUISITE_LINKS": rows}
+    return {"requisiteLinks": rows}
 
 
 def _envelope(offset: int) -> dict[str, object]:
@@ -94,8 +96,8 @@ def _batch_fixture(*, truncated: bool = False) -> ScriptedTransport:
 def _identity() -> CompositeIdentitySpec:
     return CompositeIdentitySpec(
         (
-            IdentityComponent(("ENTITY_TYPE_ID",), IdentityCoercion.EXACT_INTEGER, "entityTypeId"),
-            IdentityComponent(("ENTITY_ID",), IdentityCoercion.EXACT_INTEGER, "entityId"),
+            IdentityComponent(("entityTypeId",), IdentityCoercion.EXACT_INTEGER, "entityTypeId"),
+            IdentityComponent(("entityId",), IdentityCoercion.EXACT_INTEGER, "entityId"),
         )
     )
 
@@ -112,7 +114,7 @@ def _offset() -> OffsetSpec:
 def _key(row: object) -> tuple[int, int]:
     if not isinstance(row, dict):
         raise TypeError("requisite link row must be an object")
-    left, right = row.get("ENTITY_TYPE_ID"), row.get("ENTITY_ID")
+    left, right = row.get("entityTypeId"), row.get("entityId")
     if isinstance(left, bool) or isinstance(right, bool) or not isinstance(left, int) or not isinstance(right, int):
         raise TypeError("requisite link identity components must be integers")
     return left, right
@@ -128,7 +130,7 @@ async def _run_complete(
         stream = (
             client.iter_list_counted(
                 _request(None),
-                selector=ResultSelector(("REQUISITE_LINKS",)),
+                selector=ResultSelector(("requisiteLinks",)),
                 identity=_identity(),
                 page_size=PAGE_SIZE,
                 offset=_offset(),
@@ -136,7 +138,7 @@ async def _run_complete(
             if counted
             else client.iter_list(
                 _request(None),
-                selector=ResultSelector(("REQUISITE_LINKS",)),
+                selector=ResultSelector(("requisiteLinks",)),
                 identity=_identity(),
                 page_size=PAGE_SIZE,
                 offset=_offset(),
@@ -162,7 +164,7 @@ async def _reject_truncated_tail() -> OperationReport:
     async with Bitrix24(settings, transport=transport) as client:
         stream = client.iter_list_counted(
             _request(None),
-            selector=ResultSelector(("REQUISITE_LINKS",)),
+            selector=ResultSelector(("requisiteLinks",)),
             identity=_identity(),
             page_size=PAGE_SIZE,
             offset=_offset(),
