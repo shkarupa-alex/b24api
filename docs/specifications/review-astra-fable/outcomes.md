@@ -66,7 +66,7 @@ each A12, A14 and B10 test rejects.
 | B21 | Done | `467ef2f`, `eb44210` | `tests/architecture_test.py::test_module_sizes_are_recorded` records sizes without gating on them; each source-substring check keeps a written justification |
 | B22 | Done | `31a6ac7` | the new module layout; golden traces match |
 | B23 | Done | `97dd73b`, `e5d1429` | `tests/import_graph_test.py::test_no_import_cycle_even_through_type_checking_imports` |
-| B24 | Done | `68e67e4`, `aa2690c`, `10118a8` | `tests/ratchet_test.py::test_private_member_access_only_goes_down` (SLF001 in `tests/` outside `tests/internal`: 131; `noqa: SLF001` comments 122 → 106) |
+| B24 | Done | `68e67e4`, `aa2690c`, `10118a8` | `tests/ratchet_test.py::test_private_member_access_only_goes_down` (ratchet `slf001_tests`, counted by `ruff check --select SLF001 --ignore-noqa` over `tests/` outside `tests/internal`: 234 when introduced in `68e67e4` → 119; `noqa: SLF001` comments in `tests/`, counted by `git grep -o 'noqa: SLF001' <sha> -- tests \| wc -l`: 120 at `c4cafdd` → 98, 62 of them outside `tests/internal`) |
 | B25 | Done | `68e67e4`, `d7c4a48`, `2f35f25` | `tests/ratchet_test.py::test_long_functions_only_shrink`; the two remaining long functions carry recorded justifications in `tests/ratchets.json` |
 | B26 | Done | `c601960` | `tests/readme_test.py::test_quickstart_runs_exactly_against_a_scripted_portal` |
 | B27 | Done | `de451d5` | `tests/release_workflow_test.py::test_coverage_floor_has_one_source_in_pyproject` |

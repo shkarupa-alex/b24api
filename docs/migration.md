@@ -43,7 +43,13 @@ details.
      more than one.
    - a stream closed before its first read, by `aclose()` or on leaving `async with`, still closes
      the iterator it took from your command or reference source, once, without reading from it; a
-     failing close is raised and recorded as a `cleanup_failure` on an `EARLY_CLOSED` report.
+     failing close is raised and recorded as a `cleanup_failure` on an `EARLY_CLOSED` report;
+   - a stream raises its terminal failure once: a later read, before or after `aclose()`, ends the
+     iteration with `StopAsyncIteration` and sends nothing (previously the same exception was raised
+     again). Keep the exception from the read that raised it if you need it later; it carries the
+     published report;
+   - a cancellation during the cleanup on leaving `async with` no longer replaces the exception raised
+     in its body: that exception propagates and the cancellation is raised at the next `await`.
 
 8. **Compressed responses.** Only identity, `gzip` and `deflate` bodies are decoded; `br`, `zstd`,
    stacked and unknown codings are refused as a transport failure. Library-owned requests send
@@ -136,7 +142,9 @@ already been answered: a substitute would make it undecidable which records carr
 Direct use of a caller-owned client after the transport closes is outside that shield. An
 application enabling the separate `httpcore` DEBUG logger needs its own logging policy and test;
 this guarantee covers the emitting `httpx` INFO logger.
-The supported HTTPX range is `>=0.28.1,<0.29`; raising that upper bound requires rerunning the
+The supported HTTPX range is `>=0.28.1,<0.29`, with `h2>=4.3.0,<4.5` and `hpack>=4.1.0,<4.3` as
+direct requirements, because the shield filters the `hpack` logger names verified on those lines. An
+environment pinned below them must upgrade; raising any of these upper bounds requires rerunning the
 positive logger controls against the newly admitted version.
 
 Direct access to `RateCoordinator.acquire()` now requires a non-empty `methods` frozenset. A

@@ -163,7 +163,6 @@ class OperationRunner[T, R]:
         self._pull: asyncio.Future[T] | None = None
         self._published = asyncio.Event()
         self._report: R | None = None
-        self._terminal_error: BaseException | None = None
         self._primary: BaseException | None = None
         self._finalize_error: BaseException | None = None
 
@@ -196,10 +195,15 @@ class OperationRunner[T, R]:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close on exit; a close failure never replaces the body's primary exception."""
+        """Close on exit; a close failure or cancellation never replaces the body's primary exception."""
         del exc_type, traceback
         try:
             await self.aclose()
+        except asyncio.CancelledError as cancellation:
+            if exc is None or isinstance(exc, asyncio.CancelledError):
+                raise
+            # §3.1 X + C: the body's exception stays primary and the cancellation lands on the next await.
+            rearm_cancellation(cancellation)
         except Exception as close_error:
             if exc is None:
                 raise
@@ -207,8 +211,6 @@ class OperationRunner[T, R]:
 
     async def __anext__(self) -> T:
         """Read one item; the read that ends the body publishes the report and raises by §3.1."""
-        if self._phase is _Phase.CLOSED and self._terminal_error is not None:
-            raise self._terminal_error
         if self._phase in {_Phase.CLOSING, _Phase.CLOSED}:
             raise StopAsyncIteration
         if self._phase is _Phase.PULLING:
@@ -335,7 +337,6 @@ class OperationRunner[T, R]:
         if cause is TerminalCause.FAILED and primary is not None:
             self._raise_failed(primary, report, attempt, finalize_failed=finalize_failed)
         if finalize_failed and self._finalize_error is not None and primary is None:
-            self._terminal_error = self._finalize_error
             raise self._finalize_error
         self._raise_terminal(cause, primary, report, attempt)
 
@@ -355,7 +356,6 @@ class OperationRunner[T, R]:
         propagated = self._hooks.propagate(primary, report) if self._hooks.propagate is not None else primary
         self._hooks.attach(primary, report)
         self._hooks.attach(propagated, report)
-        self._terminal_error = propagated
         rearm_cancellation(attempt.cancellation)
         if propagated is primary:
             raise primary
@@ -383,8 +383,6 @@ class OperationRunner[T, R]:
                 raise StopAsyncIteration
             return
         self._hooks.attach(raised, report)
-        if cause is not TerminalCause.EARLY_CLOSED:
-            self._terminal_error = raised
         if attempt.error is None and attempt.cancellation is not None and primary is not None:
             raise raised from primary
         raise raised

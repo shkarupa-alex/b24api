@@ -655,9 +655,9 @@ async def test_tolerant_batch_distinguishes_user_source_failure_from_local_item_
     assert outcome.reason is NotExecutedReason.SOURCE_FAILED
     with pytest.raises(InputSourceError) as captured:
         await anext(stream)
-    with pytest.raises(InputSourceError) as repeated:
+    # The failure is raised once; a later read ends the iteration (§3.1).
+    with pytest.raises(StopAsyncIteration):
         await anext(stream)
-    assert repeated.value is captured.value
     assert isinstance(captured.value.__cause__, ValueError)
     assert transport.requests == []
 
@@ -1477,14 +1477,15 @@ async def test_counted_page_cap_rejects_a_wider_observed_head_before_tail_or_row
 
 
 @pytest.mark.asyncio
-async def test_empty_page_with_continuation_never_completes_and_negative_pull_is_sticky() -> None:
+async def test_empty_page_with_continuation_never_completes_and_a_later_read_ends_the_iteration() -> None:
     def handler(request: Request) -> object:
         start = int(request.copy_parameters().get("start", 0))
         if start == 0:
             return {"result": [{"ID": 1}], "next": 1}
         return {"result": [], "next": 2}
 
-    stream = _client(ResponderTransport(handler)).iter_list(
+    transport = ResponderTransport(handler)
+    stream = _client(transport).iter_list(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
@@ -1492,11 +1493,13 @@ async def test_empty_page_with_continuation_never_completes_and_negative_pull_is
     assert await anext(stream) == {"ID": 1}
     with pytest.raises(IncompleteTraversalError) as first:
         await anext(stream)
-    with pytest.raises(IncompleteTraversalError) as repeated:
+    sent = len(transport.requests)
+    # The failure is raised once; a later read starts no work and ends the iteration (§3.1).
+    with pytest.raises(StopAsyncIteration):
         await anext(stream)
 
-    assert repeated.value is first.value
-    assert repeated.value.report is stream.report
+    assert len(transport.requests) == sent
+    assert first.value.report is stream.report
     assert stream.report is not None
     assert stream.report.state is TerminalState.INCOMPLETE
     assert stream.report.terminal_reason == "PaginationError"

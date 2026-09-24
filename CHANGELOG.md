@@ -46,7 +46,10 @@
   `"stream closed before exhaustion"` (A12). A fail-fast batch reports `BatchCommandError` and the
   violation `batch_command_failure` instead of a private carrier class (A14). A failed source close
   after an early close publishes exactly one report, and a stream closed before its first read closes
-  the caller's source iterator once (A11).
+  the caller's source iterator once (A11). A stream raises its terminal failure once; a later read ends
+  the iteration with `StopAsyncIteration` and sends nothing, instead of raising the same exception
+  again. A cancellation during the cleanup on leaving `async with` no longer replaces the exception
+  raised in its body: that exception propagates and the cancellation lands on the next `await` (A11).
 - **Breaking (3.0.0):** `OffsetContinuation.FIXED_STEP` without an exact qualified total fails right
   after a short page, without the unusable confirmation request (B10).
 - **Breaking (3.0.0):** `EnvelopeContractError` is also a `ProtocolError` with gateway origin (B20).
@@ -58,6 +61,10 @@
   client is open. An HTTP/2 send is refused before I/O with `CapabilityError` when that filter was
   removed or an injected client cannot be registered (A20). The `httpx` logger filter that hides a
   registered webhook secret stays installed while an injected client outlives its transport.
+- **Dependencies:** `h2>=4.3.0,<4.5` and `hpack>=4.1.0,<4.3` are now direct requirements beside
+  `httpx[http2]>=0.28.1,<0.29`: the log shield filters the `hpack` logger names verified on those
+  lines, so an environment pinned below them must upgrade, and a newer line is admitted only after the
+  logger controls are rerun (C2).
 - Every keyset traversal reports `OperationReport.keyset_selection`;
   `KeysetSelectionReason` gains `EXPLICIT_SEQUENTIAL` and `PAGE_STOP`, which exhaustive matches must
   handle (B9).

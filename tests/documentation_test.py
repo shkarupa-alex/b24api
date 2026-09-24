@@ -3,12 +3,14 @@
 from __future__ import annotations
 import ast
 import re
+import tomllib
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Self, cast
 
 import pytest
+from packaging.requirements import Requirement
 
 import b24api
 import b24api.contracts
@@ -143,6 +145,17 @@ def test_every_breaking_release_note_has_a_migration_item() -> None:
     assert breaking == set(_BREAKING_MIGRATION_ITEMS)
     for identifier, items in _BREAKING_MIGRATION_ITEMS.items():
         assert set(items) <= titles, f"{identifier}: {sorted(set(items) - titles)}"
+
+
+@pytest.mark.parametrize("name", ["h2", "hpack"])
+def test_release_notes_and_migration_guide_state_the_hpack_stack_bounds(name: str) -> None:
+    # 3.0.0 made both direct requirements (C2); a consumer pinned outside them learns it before resolving.
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    line = next(dependency for dependency in project["project"]["dependencies"] if Requirement(dependency).name == name)
+    notes = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").split("## Unreleased (3.0.0)")[1].split("\n## ")[0]
+
+    assert f"`{line}`" in notes
+    assert f"`{line}`" in MIGRATION.read_text(encoding="utf-8")
 
 
 # Report fields and enum members 3.0.0 removed (B11, B12); only the migration guide, which describes their

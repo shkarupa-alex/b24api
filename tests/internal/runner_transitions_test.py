@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NoReturn
 
 import pytest
 
@@ -49,6 +49,14 @@ class _CleanupFailedError(Exception):
     """Cleanup failed (the table's ``E``)."""
 
 
+class _CallerError(Exception):
+    """The caller's own failure inside ``async with``."""
+
+
+def _raise_caller_error() -> NoReturn:
+    raise _CallerError
+
+
 class _FinalizeFailedError(Exception):
     """The family's finalizer raised."""
 
@@ -57,9 +65,11 @@ class _Portal:
     """Answer batch commands with their ids and list reads with two rows."""
 
     host = HOST
+    sent: ClassVar[list[str]] = []  # every portal's sends; a test compares its own before/after lengths
 
     async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         del attempt_timeout, max_response_bytes
+        _Portal.sent.append(request.method)
         if request.method == "batch":
             commands = request.copy_parameters()["cmd"]
             assert isinstance(commands, dict)
@@ -515,7 +525,7 @@ async def test_failing_finalizer_publishes_one_fallback_report_and_raises(family
     assert harness.fallback_calls == 1
     assert getattr(error, "report", None) is harness.runner.report
     assert "report_finalize_failure" in harness.codes()
-    with pytest.raises(_FinalizeFailedError):
+    with pytest.raises(StopAsyncIteration):
         await anext(harness.stream)
     await harness.stream.aclose()
     assert harness.finalize_calls == 1
@@ -535,6 +545,78 @@ async def test_failing_finalizer_behind_a_body_failure_keeps_the_body_failure(fa
     assert harness.fallback_calls == 1
     assert getattr(error, "report", None) is harness.runner.report
     assert "report_finalize_failure" in harness.codes()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["body", "cleanup", "finalize"])
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_terminal_failure_is_raised_once_and_later_reads_end_the_iteration(
+    family: Family, failure: str, client: Bitrix24
+) -> None:
+    # §3.1: the read that ends the body raises its failure with the report; any later read, before or after
+    # aclose(), starts no work and ends the iteration.
+    harness = _harness(
+        family,
+        client,
+        body="fail" if failure == "body" else "exhaust",
+        cleanup="fail" if failure == "cleanup" else "ok",
+        finalize_fails=failure == "finalize",
+    )
+
+    error = await _outcome(asyncio.create_task(_drain(harness.stream)))
+
+    report = harness.runner.report
+    assert report is not None
+    assert getattr(error, "report", None) is report
+    if failure == "body":
+        assert _is_body_failure(error)
+    else:
+        assert isinstance(error, _CleanupFailedError if failure == "cleanup" else _FinalizeFailedError)
+    sent = len(_Portal.sent)
+    calls = (harness.finalize_calls, harness.fallback_calls)
+    with pytest.raises(StopAsyncIteration):
+        await anext(harness.stream)
+    await harness.stream.aclose()
+    with pytest.raises(StopAsyncIteration):
+        await anext(harness.stream)
+    assert len(_Portal.sent) == sent
+    assert (harness.finalize_calls, harness.fallback_calls) == calls
+    assert harness.runner.report is report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["fails", "returns"])
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_cancellation_during_context_exit_cleanup_keeps_the_callers_exception(
+    family: Family, caller: str, client: Bitrix24
+) -> None:
+    # §3.1 X + C: the caller's exception leaves ``async with`` and the cancellation lands on its next await;
+    # without a caller exception the cancellation is raised at once. Either way the report is published once.
+    harness = _harness(family, client, body="exhaust", cleanup="cancel")
+    # Internal kernels have no context protocol; the public adapter delegates it to the same runner.
+    stream = harness.stream if hasattr(harness.stream, "__aenter__") else harness.runner
+    caught: list[BaseException] = []
+    resumed: list[bool] = []
+
+    async def use() -> None:
+        try:
+            async with stream:
+                await anext(stream)
+                if caller == "fails":
+                    _raise_caller_error()
+        except _CallerError as error:
+            caught.append(error)
+        resumed.append(True)
+        await asyncio.sleep(0)
+        resumed.append(True)
+
+    task = asyncio.create_task(use())
+    await _cancel_during_cleanup(harness, task)
+
+    assert isinstance(await _outcome(task), asyncio.CancelledError)
+    assert len(caught) == (1 if caller == "fails" else 0)
+    assert resumed == ([True] if caller == "fails" else [])
+    harness.assert_published_once()
 
 
 @pytest.mark.asyncio
