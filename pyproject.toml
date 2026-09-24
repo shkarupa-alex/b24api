@@ -44,8 +44,6 @@ dev = [
 ]
 
 [tool.ruff]
-fix = true
-unsafe-fixes = true
 line-length = 120
 target-version = "py312"
 
@@ -70,6 +68,7 @@ known-third-party = []
     "S101",
     "S311",
 ]
+"tests/golden/*.py" = ["S101"]
 
 
 [tool.mypy]
