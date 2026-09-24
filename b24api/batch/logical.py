@@ -1,11 +1,10 @@
 """Canonical arbitrary-length logical batch over bounded physical Bitrix batches."""
 
-# ruff: noqa: SLF001, PLR0912, PLR0915, TRY301 - bounded orchestration state machine
+# ruff: noqa: SLF001, PLR0912 - bounded orchestration state machine
 
 from __future__ import annotations
-import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Iterator
-from typing import TYPE_CHECKING, Protocol, Self, cast, runtime_checkable
+from typing import Protocol, Self, cast, runtime_checkable
 
 from b24api.batch.engine import BatchExecutor, BatchSource, _BatchInput, _BatchItem, _BatchNotExecutedError
 from b24api.batch.outcome import BatchFailure as KernelFailure
@@ -40,20 +39,18 @@ from b24api.errors import (
 from b24api.execution import (
     AsyncIteratorController,
     Executor,
-    await_cancellation_resistant,
-    await_cleanup_resistant,
-    rearm_cancellation,
 )
-from b24api.execution.failure import (
-    CLEANUP_FAILED_REASON,
-    EARLY_CLOSE_REASON,
-    report_reason,
-    with_cleanup_failure,
+from b24api.execution.lifecycle import (
+    CleanupAttempt,
+    LifecycleHooks,
+    OperationRunner,
+    TerminalCause,
+    cleanup_failed,
+    failed_kernel_report,
+    kernel_terminal,
+    with_cleanup_attempt,
 )
 from b24api.execution.snapshot import KernelReport
-
-if TYPE_CHECKING:
-    from b24api.execution.context import _CleanupOutcome
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
 
@@ -225,11 +222,12 @@ class LogicalBatchKernelStream[C]:
         self._fail_fast = fail_fast
         self._context = executor.context(policy)
         self._completion = ReferenceCompletionRecorder()
-        self._completion_cleanup_done = False
-        self._cleanup_failed = False
-        self._runner: AsyncIterator[CommandOutcome[object]] | None = None
         self._controller: AsyncIteratorController[_BatchItem] | None = None
-        self._closed = False
+        self._runner = OperationRunner(
+            self._run(),
+            LifecycleHooks(finalize=self._finalize, failure_report=_failure_report, cleanup=self._cleanup),
+            isolated_pulls=False,
+        )
         self._emitted = 0
         self._batch_requests = 0
         self._batch_commands = 0
@@ -245,12 +243,6 @@ class LogicalBatchKernelStream[C]:
     def completion_gate(self) -> object:
         """Expose the live logical-command completion gate."""
         return self._completion.gate
-
-    def _finish_completion_cleanup(self) -> None:
-        if self._completion_cleanup_done or self.report.state is KernelState.NOT_STARTED:
-            return
-        self._completion.cleanup(CleanupState.FAILURE if self._cleanup_failed else CleanupState.SUCCESS)
-        self._completion_cleanup_done = True
 
     def _settle_outcome(self, outcome: CommandOutcome[object]) -> None:
         binding = self._completion.binding(outcome.index)
@@ -278,30 +270,11 @@ class LogicalBatchKernelStream[C]:
 
     async def __anext__(self) -> CommandOutcome[object]:
         """Return one correlated command outcome."""
-        if self._closed:
-            raise StopAsyncIteration
-        if self._runner is None:
-            self._runner = self._run()
-        try:
-            return await anext(self._runner)
-        except BaseException:
-            self._finish_completion_cleanup()
-            raise
+        return await anext(self._runner)
 
     async def aclose(self) -> None:
-        """Close input and pending work idempotently."""
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            if self._runner is not None and hasattr(self._runner, "aclose"):
-                await cast("_AsyncClosable", self._runner).aclose()
-            await self._close_controller()
-            if self.report.state is KernelState.NOT_STARTED:
-                await self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON)
-        finally:
-            # Cleanup evidence is recorded even when closing fails, so the report is always published.
-            self._finish_completion_cleanup()
+        """Close input and pending work idempotently; the report is published after cleanup."""
+        await self._runner.aclose()
 
     async def _run(self) -> AsyncGenerator[CommandOutcome[object]]:  # noqa: C901
         await self._context.start()
@@ -312,113 +285,80 @@ class LogicalBatchKernelStream[C]:
         )
         self._controller = controller
         next_index = 0
-        primary_error: BaseException | None = None
-        pending_cancellation: asyncio.CancelledError | None = None
-        try:
-            while True:
-                try:
-                    chunk = await _next_chunk(
-                        controller,
-                        min(
-                            self._batch_size,
-                            self._context.policy.max_buffered_commands,
-                            self._context.policy.max_buffered_rows,
-                        ),
-                        start_index=next_index,
-                        context=self._context,
-                    )
-                except B24ApiError:
-                    raise
-                except Exception as error:
-                    raise InputSourceError("Logical batch input source failed") from error
-                if not chunk.commands:
-                    break
-                next_index += len(chunk.commands)
-                self.admitted += len(chunk.commands)
-                for command in chunk.commands:
-                    self._completion.admit(command.index)
-                self.buffered_commands_high_water = max(
-                    self.buffered_commands_high_water,
-                    len(chunk.commands),
-                )
-                if chunk.source_error is not None:
-                    reason = (
-                        NotExecutedReason.LOCAL_VALIDATION_FAILED
-                        if isinstance(chunk.source_error, _CommandLocalValidationError)
-                        else NotExecutedReason.SOURCE_FAILED
-                    )
-                    pending = tuple(
-                        CommandNotExecuted(command.index, command.correlation, command.request.summary, reason)
-                        for command in chunk.commands
-                    )
-                    if self._fail_fast:
-                        raise _BatchWindowError(
-                            cast("tuple[CommandOutcome[object], ...]", pending), source_error=chunk.source_error
-                        )
-                    for pending_outcome in pending:
-                        self._emitted += 1
-                        yield pending_outcome
-                        self._completion.terminal(pending_outcome.index, BindingClosure.FAILURE)
-                    raise InputSourceError("Logical batch input source failed") from chunk.source_error
-                for command in chunk.commands:
-                    self._completion.binding(command.index).scheduled()
-                if self._batch_executor._will_dispatch_commands(chunk.commands, halt=self._fail_fast):
-                    self._batch_requests += 1
-                self._batch_commands += len(chunk.commands)
-                kernel = await self._batch_executor._execute_chunk(
-                    chunk.commands,
+        while True:
+            try:
+                chunk = await _next_chunk(
+                    controller,
+                    min(
+                        self._batch_size,
+                        self._context.policy.max_buffered_commands,
+                        self._context.policy.max_buffered_rows,
+                    ),
+                    start_index=next_index,
                     context=self._context,
-                    halt=self._fail_fast,
                 )
-                buffered_rows = sum(
-                    outcome.decoded_rows if isinstance(outcome, KernelSuccess) else 1 for outcome in kernel
+            except B24ApiError:
+                raise
+            except Exception as error:
+                raise InputSourceError("Logical batch input source failed") from error
+            if not chunk.commands:
+                break
+            next_index += len(chunk.commands)
+            self.admitted += len(chunk.commands)
+            for command in chunk.commands:
+                self._completion.admit(command.index)
+            self.buffered_commands_high_water = max(
+                self.buffered_commands_high_water,
+                len(chunk.commands),
+            )
+            if chunk.source_error is not None:
+                reason = (
+                    NotExecutedReason.LOCAL_VALIDATION_FAILED
+                    if isinstance(chunk.source_error, _CommandLocalValidationError)
+                    else NotExecutedReason.SOURCE_FAILED
                 )
-                outcomes = _public_outcomes(kernel, halt=self._fail_fast)
-                await self._context.set_buffered_rows(buffered_rows)
-                if self._fail_fast and any(not isinstance(outcome, CommandSuccess) for outcome in outcomes):
-                    failed_at = next(
-                        index for index, outcome in enumerate(outcomes) if not isinstance(outcome, CommandSuccess)
+                pending = tuple(
+                    CommandNotExecuted(command.index, command.correlation, command.request.summary, reason)
+                    for command in chunk.commands
+                )
+                if self._fail_fast:
+                    raise _BatchWindowError(
+                        cast("tuple[CommandOutcome[object], ...]", pending), source_error=chunk.source_error
                     )
-                    for successful_outcome in outcomes[:failed_at]:
-                        self._settle_outcome(successful_outcome)
-                        self._emitted += 1
-                        yield successful_outcome
-                        self._finish_outcome(successful_outcome)
-                    raise _BatchWindowError(outcomes[failed_at:])
-                for batch_outcome in outcomes:
-                    self._settle_outcome(batch_outcome)
+                for pending_outcome in pending:
                     self._emitted += 1
-                    yield batch_outcome
-                    self._finish_outcome(batch_outcome)
-                await self._context.set_buffered_rows(0)
-            await self._finalize(KernelState.COMPLETED, "input exhausted")
-        except asyncio.CancelledError as error:
-            primary_error = error
-            repeated = await await_cancellation_resistant(
-                self._finalize(KernelState.CANCELLED, "iteration cancelled"),
+                    yield pending_outcome
+                    self._completion.terminal(pending_outcome.index, BindingClosure.FAILURE)
+                raise InputSourceError("Logical batch input source failed") from chunk.source_error
+            for command in chunk.commands:
+                self._completion.binding(command.index).scheduled()
+            if self._batch_executor._will_dispatch_commands(chunk.commands, halt=self._fail_fast):
+                self._batch_requests += 1
+            self._batch_commands += len(chunk.commands)
+            kernel = await self._batch_executor._execute_chunk(
+                chunk.commands,
+                context=self._context,
+                halt=self._fail_fast,
             )
-            if repeated is not None:
-                pending_cancellation = repeated
-            raise
-        except GeneratorExit as error:
-            primary_error = error
-            cancellation = await await_cancellation_resistant(self._finalize(KernelState.CANCELLED, EARLY_CLOSE_REASON))
-            if cancellation is not None:
-                raise cancellation from error
-            raise
-        except BaseException as error:
-            primary_error = error
-            pending_cancellation = await await_cancellation_resistant(
-                self._finalize(KernelState.FAILED, report_reason(error)),
-            )
-            raise
-        finally:
+            buffered_rows = sum(outcome.decoded_rows if isinstance(outcome, KernelSuccess) else 1 for outcome in kernel)
+            outcomes = _public_outcomes(kernel, halt=self._fail_fast)
+            await self._context.set_buffered_rows(buffered_rows)
+            if self._fail_fast and any(not isinstance(outcome, CommandSuccess) for outcome in outcomes):
+                failed_at = next(
+                    index for index, outcome in enumerate(outcomes) if not isinstance(outcome, CommandSuccess)
+                )
+                for successful_outcome in outcomes[:failed_at]:
+                    self._settle_outcome(successful_outcome)
+                    self._emitted += 1
+                    yield successful_outcome
+                    self._finish_outcome(successful_outcome)
+                raise _BatchWindowError(outcomes[failed_at:])
+            for batch_outcome in outcomes:
+                self._settle_outcome(batch_outcome)
+                self._emitted += 1
+                yield batch_outcome
+                self._finish_outcome(batch_outcome)
             await self._context.set_buffered_rows(0)
-            cleanup = await await_cleanup_resistant(self._close_controller())
-            pending_cancellation = await self._settle_cleanup(cleanup, primary_error) or pending_cancellation
-            self._closed = True
-            if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                rearm_cancellation(pending_cancellation)
 
     async def _close_controller(self) -> None:
         # One close attempt: a failed close is recorded once and never retried by a later aclose().
@@ -427,39 +367,12 @@ class LogicalBatchKernelStream[C]:
             return
         await controller.aclose(remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed))
 
-    async def _settle_cleanup(
-        self,
-        cleanup: _CleanupOutcome,
-        primary_error: BaseException | None,
-    ) -> asyncio.CancelledError | None:
-        """Record the source cleanup result; return a cancellation deferred behind a primary failure.
+    async def _cleanup(self) -> None:
+        await self._context.set_buffered_rows(0)
+        await self._close_controller()
 
-        Without a primary failure (exhaustion, early close, cancellation) a cleanup failure becomes the
-        raised error and turns the report FAILED; behind a primary failure it only adds a violation.
-        """
-        if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-            if cleanup.error is not None:
-                self._cleanup_failed = True
-                if self.report.state is KernelState.NOT_STARTED:
-                    await self._finalize(KernelState.FAILED, CLEANUP_FAILED_REASON)
-                self.report = with_cleanup_failure(self.report, cleanup.error, terminal=True)
-                primary_cancellation = primary_error if isinstance(primary_error, asyncio.CancelledError) else None
-                rearm_cancellation(cleanup.cancellation or primary_cancellation)
-                raise cleanup.error
-            if cleanup.cancellation is not None:
-                raise cleanup.cancellation
-            return None
-        for failure in (cleanup.error, cleanup.cancellation):
-            if failure is not None:
-                self._cleanup_failed = True
-                self.report = with_cleanup_failure(self.report, failure, terminal=False)
-        if cleanup.error is not None:
-            primary_error.add_note(f"batch source cleanup also failed ({type(cleanup.error).__name__})")
-        return cleanup.cancellation
-
-    async def _finalize(self, state: KernelState, reason: str) -> None:
-        if self.report.state is not KernelState.NOT_STARTED:
-            return
+    async def _finalize(self, cause: TerminalCause, failure: str | None, attempt: CleanupAttempt) -> KernelReport:
+        state, reason = kernel_terminal(cause, failure)
         snapshot = await self._context.snapshot()
         snapshot_state = (
             SnapshotState.NOT_REQUESTED
@@ -493,6 +406,13 @@ class LogicalBatchKernelStream[C]:
             if state is KernelState.CANCELLED
             else StreamClosure.EARLY_CLOSE,
         )
+        self.report = with_cleanup_attempt(self.report, cause, attempt)
+        self._completion.cleanup(CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS)
+        return self.report
+
+
+def _failure_report(_cause: TerminalCause, reason: str, _attempt: CleanupAttempt) -> KernelReport:
+    return failed_kernel_report(reason)
 
 
 __all__ = ["CommandSource", "LogicalBatchKernelStream", "_BatchWindowError"]
