@@ -2,7 +2,7 @@
   "slf001_tests": 195,
   "slf001_package": 83,
   "slf001_traversal": 49,
-  "noqa_package": 198,
+  "noqa_package": 197,
   "untyped_self_traversal": 9,
   "long_functions": {
     "b24api/batch/stream.py::_BatchOutcomeStream._run": {
