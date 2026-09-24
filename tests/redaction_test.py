@@ -1,5 +1,6 @@
 """Tests for the one canonical bounded redaction path."""
 
+from collections.abc import Iterator, Mapping
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -65,6 +66,35 @@ def test_redactor_bounds_depth_items_strings_and_cycles() -> None:
     assert redactor.redact([1, 2, 3]) == [1, 2, TRUNCATED]
     assert redactor.redact({"a": {"b": {"c": 1}}}) == {"a": {"b": TRUNCATED}}
     assert len(redactor.redact_text("x" * 100)) == MAX_TEST_STRING
+
+
+class _CountingMapping(Mapping[str, int]):
+    """A large mapping that counts how many of its pairs a renderer actually reads."""
+
+    def __init__(self, size: int) -> None:
+        self.size, self.reads = size, 0
+
+    def __getitem__(self, key: str) -> int:
+        self.reads += 1
+        return int(key[1:])
+
+    def __iter__(self) -> Iterator[str]:
+        for index in range(self.size):
+            self.reads += 1
+            yield f"k{index}"
+
+    def __len__(self) -> int:
+        return self.size
+
+
+def test_mapping_rendering_reads_only_the_rendered_items() -> None:
+    mapping = _CountingMapping(100_000)
+
+    rendered = Redactor(max_items=3).redact(mapping)
+
+    assert rendered == {"k0": 0, "k1": 1, "k2": 2, TRUNCATED: TRUNCATED}
+    # One key read and one value read per rendered pair, plus the one pull islice needs to stop.
+    assert mapping.reads <= 2 * 3 + 1
 
 
 def test_safe_preview_redacts_before_truncating() -> None:

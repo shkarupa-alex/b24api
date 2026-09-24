@@ -259,6 +259,38 @@ def test_configured_webhook_token_is_an_exact_secret() -> None:
     assert WEBHOOK_CREDENTIAL not in _channels(asyncio.run(run()))
 
 
+def test_short_configured_webhook_token_is_still_an_exact_secret() -> None:
+    short = "abcde"
+    request = Request("profile", route=RouteKind.BARE)
+    body = {"error": "NOT_FOUND", "error_description": f"token {short} is not valid for abcdef"}
+    transport = ScriptedTransport((ScriptedExchange(request, _wire(404, body)),))
+
+    settings = Settings(webhook_url=f"https://fixture.invalid/rest/1/{short}/")
+
+    async def run() -> ApiResponseError:
+        async with Bitrix24(settings, transport=transport) as client:
+            with pytest.raises(ApiResponseError) as caught:
+                await client.call(request)
+        return caught.value
+
+    error = asyncio.run(run())
+    # A short secret is hidden wherever it stands as a whole token; a longer word that contains it stays readable.
+    assert error.description == f"token {REDACTED} is not valid for abcdef"
+    assert f" {short} " not in _channels(error)
+
+
+def test_short_request_auth_value_is_hidden_as_a_whole_token() -> None:
+    request = Request("crm.item.list", {"auth": "k9x", "select": ["TITLE"]}, route=RouteKind.BARE)
+    error = ProtocolCodec().error_from_http(
+        status_code=401,
+        body={"error": "expired_token", "error_description": "token k9x expired; k9xy is another value"},
+        diagnostics=diagnostic_context(request),
+    )
+
+    assert isinstance(error, ApiResponseError)
+    assert error.description == f"token {REDACTED} expired; k9xy is another value"
+
+
 def test_request_auth_values_are_exact_secrets_that_are_never_aliased() -> None:
     request = Request("crm.item.list", {"auth": AUTH_VALUE, "select": [AUTH_VALUE, "TITLE"]}, route=RouteKind.BARE)
     error = ProtocolCodec().error_from_http(

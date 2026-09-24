@@ -92,7 +92,7 @@ class BatchExecutor:
     ) -> None:
         """Initialize instance state."""
         if isinstance(portal_command_cap, bool) or not 1 <= portal_command_cap <= PORTAL_BATCH_CAP:
-            raise ValueError("portal command cap must be between 1 and 50")
+            raise ValueError(f"portal command cap must be between 1 and {PORTAL_BATCH_CAP}")
         self.executor = executor
         self.portal_command_cap = portal_command_cap
 

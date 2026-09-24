@@ -287,7 +287,7 @@ class KernelBatchDispatch:
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
         if not _is_plain_int(self.batch_size) or not 1 <= self.batch_size <= PORTAL_BATCH_CAP:
-            raise ValueError("batch_size must be between 1 and 50")
+            raise ValueError(f"batch_size must be between 1 and {PORTAL_BATCH_CAP}")
         if not _is_plain_int(self.concurrency) or self.concurrency < 1:
             raise ValueError("batch concurrency must be positive")
         if not isinstance(self.output_order, ReferenceOutputOrder):

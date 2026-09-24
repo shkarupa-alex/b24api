@@ -158,6 +158,8 @@ class MalformedBatchEnvelopeTransport(KeysetTransport):
         )
         if request.method != "batch":
             return response
+        if self.fault == "no_envelope":
+            return WireResponse(response.status_code, response.headers, b'{"foo":1}')
         payload = json.loads(response.body)
         result = payload["result"]["result"]
         if self.fault == "extra":
@@ -1042,6 +1044,25 @@ async def test_fast_wave_invalid_correlation_rejects_every_observation_as_batch_
 
     assert stream.report is not None
     assert len(stream.report.page_trace) == 2
+    assert {(record.outcome, record.rejection_code) for record in stream.report.page_trace} == {
+        (PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE),
+    }
+
+
+@pytest.mark.asyncio
+async def test_fast_wave_success_status_without_an_envelope_rejects_every_observation_as_batch_envelope() -> None:
+    # EnvelopeContractError is a ProtocolError since 3.0, so a 2xx physical batch without the Bitrix
+    # envelope is a batch-envelope rejection (2.3 recorded COMMAND_FAILURE); the migration guide says so.
+    stream = _stream(
+        MalformedBatchEnvelopeTransport(tuple(range(1, 21)), fault="no_envelope"),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    with pytest.raises(IncompleteTraversalError):
+        _ = [item async for item in stream]
+
+    assert stream.report is not None
+    assert stream.report.page_trace
     assert {(record.outcome, record.rejection_code) for record in stream.report.page_trace} == {
         (PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE),
     }

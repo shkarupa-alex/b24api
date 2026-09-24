@@ -15,7 +15,7 @@ Test paths are `file::test`. The last section lists what remains for the owner.
 |---|---|---|---|
 | A1 | Done | `4cd3998` | `tools/b24api_evidence/harness/live_test.py::test_live_portal_httpx_info_record_carries_no_webhook_token`, `::test_live_portal_sync_attribution_leaves_foreign_records_on_the_same_logger_unchanged` |
 | A2 | Done; L2 confirmed | `15b5155` | `tests/internal/bounded_decoding_test.py::test_single_gzip_bomb_is_refused_inside_the_decompressor`, `::test_stacked_gzip_cascade_is_refused_before_decompression`; [L2](live-probes.md#l2-a2-content-encoding-and-the-explicit-accept-encoding) |
-| A3 | Done | `228d0f8` | `tests/internal/execution_boundary_test.py::test_direct_replay_matrix`, `::test_physical_batch_replay_matrix` |
+| A3 | Done | `228d0f8` | `tests/internal/execution_boundary_test.py::test_direct_replay_matrix`, `::test_physical_batch_replay_matrix`, `::test_permanent_transport_refusal_is_raised_once_instead_of_exhausting_the_budget` |
 | A4 | Done | `06dfa00` | `pydantic>=2.12.0` in `pyproject.toml`; the `min-deps` job (`tests/release_workflow_test.py::test_blocking_jobs_run_the_specified_checks`) |
 | A5 | Done | `43fd34d` | `tests/internal/rate_coordinator_test.py::test_client_closes_its_own_coordinator_and_awaits_the_wake_task` |
 | A6 | Done | `06dfa00`, `de451d5` | `tests/release_workflow_test.py::test_wheel_check_refuses_an_untyped_wheel_or_files_beside_the_package`, `::test_wheel_typing_passes_every_canonical_import_and_flags_an_old_root_import` |
@@ -25,7 +25,7 @@ Test paths are `file::test`. The last section lists what remains for the owner.
 | A10 | Done | `d54dda7` | `tests/keyset_verifier_boundary_test.py::test_failed_boundary_read_is_an_unsupported_report` |
 | A11 | Done | `37c3de2` | `tests/stream_lifecycle_test.py::test_early_close_with_failing_source_close_publishes_one_report` |
 | A12 | Done; breaking, in the migration guide | `37c3de2` | `tests/stream_lifecycle_test.py::test_early_close_is_reported_as_closed_before_exhaustion`; golden delta A12 |
-| A13 | Done | `228d0f8` | `tests/internal/execution_boundary_test.py::test_permanent_transport_refusal_is_raised_once_instead_of_exhausting_the_budget` |
+| A13 | Done; breaking, in the migration guide | `228d0f8` | `tests/internal/execution_boundary_test.py::test_unknown_transport_exception_is_a_non_retryable_dispatch_started_failure`, `::test_unknown_transport_exception_is_ambiguous_for_unproven_direct_requests`, `::test_batch_outcomes_are_total_after_an_unknown_transport_exception` |
 | A14 | Done | `37c3de2` | `tests/stream_lifecycle_test.py::test_fail_fast_batch_reports_the_command_failure_not_its_carrier`; golden delta A14 |
 | A16 | Done | `d702e06` | `tests/internal/owned_source_test.py::test_sync_source_retains_bounded_violations`, `::test_async_source_retains_bounded_violations` |
 | A17 | Done | `a4fb7c0` | `tests/execution_test.py::test_transport_cancellation_drops_httpx_traceback_and_request_locals` filters frames under the installed `b24api` package path |
@@ -49,9 +49,9 @@ each A12, A14 and B10 test rejects.
 | B2, B3 | Done | `d0de275` | the `slow` marker, `tests/client_v2_test.py::test_logical_batch_pulls_its_generator_with_bounded_lookahead` (N=2,000) |
 | B4 | Done | `7db6793` | `pyproject.toml` has no `fix`/`unsafe-fixes`; the `lint` job runs `ruff check --no-fix` |
 | B6 | Done | `2991260`, `97dd73b` | `tests/import_graph_test.py::test_package_import_graph_respects_layers` |
-| B7 | Done | `ff7bf49` | the single `PORTAL_BATCH_CAP` in `b24api/contracts/dispatch.py` |
+| B7 | Done | `ff7bf49` | the single `PORTAL_BATCH_CAP` in `b24api/contracts/dispatch.py`, read by every batch capacity computation: `tests/architecture_test.py::test_batch_and_traversal_read_the_portal_batch_cap_from_its_one_owner` |
 | B8 | Done | `db3c529` | `tests/internal/execution_boundary_test.py::test_json_success_body_is_parsed_exactly_once`; [16 MiB benchmark](b8-b12-benchmark.md) |
-| B9 | Done | `8cade30` | `tests/page_stop_test.py::test_explicit_sequential_keyset_reports_its_selection` |
+| B9 | Done | `8cade30` | `tests/page_stop_test.py::test_default_auto_keyset_uses_sequential_path_for_page_stop` (auto with `page_stop` reports AUTO → SEQUENTIAL with `PAGE_STOP`); `::test_explicit_sequential_keyset_reports_its_selection` |
 | B10 | Done | `79f4e6c` | `tests/client_findings_3_test.py::test_fixed_step_rejects_any_closure_after_a_short_unqualified_window`; golden deltas B10 |
 | B11 | Done; breaking, in the migration guide | `357dc07`, `1640fb8` | [vulture outcomes](b11-dead-code.md) |
 | B12 | Done; breaking, in the migration guide | `db3c529` | `tests/completion_gate_test.py::test_page_validated_carries_no_identity_digest` |
@@ -62,7 +62,7 @@ each A12, A14 and B10 test rejects.
 | B17 | Done | `de451d5` | mypy ratchet over `tests/` at 380, below 385: `tests/release_workflow_test.py::test_committed_mypy_baseline_never_exceeds_the_specified_starting_count` |
 | B18 | Done | `2a27505` | `tests/settings_test.py::test_policy_from_settings_is_the_library_default_with_the_settings_timeout` |
 | B19 | Done | `06dfa00`, `23bec8d` | `twine check --strict` on the built wheel and sdist; CHANGELOG split by release; `tests/documentation_test.py::test_readme_links_are_absolute_so_they_work_on_pypi` |
-| B20 | Done; breaking, in the migration guide | `2a27505` | `tests/client_findings_3_test.py::test_envelope_contract_error_is_a_gateway_origin_protocol_error_and_is_not_retried` |
+| B20 | Done; breaking, in the migration guide | `2a27505` | `tests/client_findings_3_test.py::test_envelope_contract_error_is_a_gateway_origin_protocol_error_and_is_not_retried`; the fast-keyset `page_trace` code: `tests/keyset_fast_test.py::test_fast_wave_success_status_without_an_envelope_rejects_every_observation_as_batch_envelope` |
 | B21 | Done | `467ef2f`, `eb44210` | `tests/architecture_test.py::test_module_sizes_are_recorded` records sizes without gating on them; each source-substring check keeps a written justification |
 | B22 | Done | `31a6ac7` | the new module layout; golden traces match |
 | B23 | Done | `97dd73b`, `e5d1429` | `tests/import_graph_test.py::test_no_import_cycle_even_through_type_checking_imports` |
@@ -70,7 +70,7 @@ each A12, A14 and B10 test rejects.
 | B25 | Done | `68e67e4`, `d7c4a48`, `2f35f25` | `tests/ratchet_test.py::test_long_functions_only_shrink`; the two remaining long functions carry recorded justifications in `tests/ratchets.json` |
 | B26 | Done | `c601960` | `tests/readme_test.py::test_quickstart_runs_exactly_against_a_scripted_portal` |
 | B27 | Done | `de451d5` | `tests/release_workflow_test.py::test_coverage_floor_has_one_source_in_pyproject` |
-| B29 | Done | `228d0f8` | `tests/internal/execution_boundary_test.py::test_oversized_injected_response_is_rejected_before_decoding_for_safe_direct`, `::test_oversized_injected_batch_response_makes_every_command_unknown` |
+| B29 | Done; breaking, in the migration guide | `228d0f8` | `tests/internal/execution_boundary_test.py::test_oversized_injected_response_is_rejected_before_decoding_for_safe_direct`, `::test_oversized_injected_batch_response_makes_every_command_unknown` |
 
 B5 and B28 were never assigned (see §2).
 
@@ -186,7 +186,16 @@ These steps are outward-facing or need the owner's decision, so they were not pe
 
 Two further observations belong to the owner:
 
-- **Physical batch replay.** A `SAFE` physical batch is never replayed after possible acceptance.
-  This is the conservative choice, and it is left to the owner.
+- **Physical batch replay.** A physical batch is never replayed after a transport failure that may
+  have followed acceptance, even when every command is `SAFE` (§3.4, D05). Two replays are kept as
+  in 2.3, because nothing can run twice or because list traversals on real portals rely on them:
+  a batch whose transport failed before dispatch (`NOT_DISPATCHED`, `CONNECTION_ESTABLISHED`) is
+  retried within the budget, and a batch of only `SAFE` commands answered with a transient HTTP
+  status and no Bitrix envelope is replayed within the budget; `UNSAFE` or `UNKNOWN` commands of such
+  a batch become unknown. Two tests pin both:
+  `tests/internal/execution_boundary_test.py::test_physical_batch_replay_matrix` and
+  `tests/internal/execution_boundary_test.py::test_physical_batch_after_an_unstructured_transient_status`.
+  Migration item 9 states them. Forbidding the status replay as well is a stricter reading of §3.4 that the owner can
+  still choose.
 - **HTTPX logging on injected clients.** Two W2 gaps remain: the httpcore DEBUG record of a
   redirect token, and an unbounded `aread` on injected clients.

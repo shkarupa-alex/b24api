@@ -48,7 +48,7 @@ class BatchDispatch:
     def __post_init__(self) -> None:
         """Validate the discriminated batch controls."""
         if not 1 <= _positive_plain_integer(self.batch_size, "batch_size") <= PORTAL_BATCH_CAP:
-            raise ValueError("batch_size must be between 1 and 50")
+            raise ValueError(f"batch_size must be between 1 and {PORTAL_BATCH_CAP}")
         _positive_plain_integer(self.concurrency, "concurrency")
         if not isinstance(self.output_order, DeliveryOrder):
             raise TypeError("output_order must be a DeliveryOrder")

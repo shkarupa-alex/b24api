@@ -153,6 +153,21 @@ def test_completion_layer_does_not_import_traversal_families() -> None:
         ), f"{path.relative_to(PACKAGE)} imports a traversal family at runtime"
 
 
+def test_batch_and_traversal_read_the_portal_batch_cap_from_its_one_owner() -> None:
+    # PORTAL_BATCH_CAP in contracts/dispatch.py owns the portal's 50-command limit (B7); a literal copy in
+    # a capacity computation would drift from it silently.
+    from b24api.contracts.dispatch import PORTAL_BATCH_CAP  # noqa: PLC0415
+
+    copies = [
+        f"{path.relative_to(PACKAGE)}:{node.lineno}"
+        for family in ("batch", "traversal")
+        for path in sorted((PACKAGE / family).rglob("*.py"))
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Constant) and type(node.value) is int and node.value == PORTAL_BATCH_CAP
+    ]
+    assert copies == []
+
+
 def test_runtime_imports_ignore_only_type_checking_blocks(tmp_path: Path) -> None:
     module = tmp_path / "module.py"
     module.write_text(

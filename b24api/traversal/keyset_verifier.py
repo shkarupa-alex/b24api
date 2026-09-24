@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.keyset_capability import (
     KeysetCapabilityCheckName,
     KeysetCapabilityCheckOutcome,
@@ -82,7 +83,8 @@ class _Verifier:
         self.identity, self.page_size, self.keyset = identity, page_size, keyset
         self.context = executor.context(policy)
         self.engine = BatchExecutor(executor)
-        self.capacity = min(50, policy.max_buffered_commands, max(1, policy.max_buffered_rows // page_size))
+        rows_per_wave = max(1, policy.max_buffered_rows // page_size)
+        self.capacity = min(PORTAL_BATCH_CAP, policy.max_buffered_commands, rows_per_wave)
         self.batch_waves = 0
         self.logical_commands = 0
         self.page_trace: tuple[PageRecord, ...] = ()

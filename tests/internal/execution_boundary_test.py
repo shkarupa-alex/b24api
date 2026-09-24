@@ -236,6 +236,44 @@ async def test_physical_batch_replay_matrix(
     assert stream.report.batch_requests == 1
 
 
+HTTP_BAD_GATEWAY = 502
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [1, SEVERAL], ids=["one", "several"])
+@pytest.mark.parametrize("safety", _SAFETIES)
+async def test_physical_batch_after_an_unstructured_transient_status(safety: ReplaySafety, count: int) -> None:
+    # Decided with the owner's regressions in mind: the status path is unchanged from 2.3. A SAFE batch
+    # answered with a transient status and no Bitrix envelope is replayed within the budget, as list
+    # traversals on real portals rely on; UNSAFE and UNKNOWN commands become unknown outcomes.
+    transport = _Script([])
+
+    def bad_gateway(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        return WireResponse(HTTP_BAD_GATEWAY, (("content-type", "text/html"),), b"<html>Bad Gateway</html>")
+
+    transport.behaviors = [bad_gateway, _counting(transport)]
+    stream = _client(transport).batch_outcomes(
+        [Command(_request(safety), index) for index in range(count)],
+        policy=_policy(),
+    )
+
+    outcomes = await _drain(stream)
+
+    assert stream.report is not None
+    if safety is ReplaySafety.SAFE:
+        assert len(transport.sent) == 2  # noqa: PLR2004 - one replay after the transient status
+        assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+        assert stream.report.retries == 1
+    else:
+        assert len(transport.sent) == 1
+        for outcome in outcomes:
+            assert isinstance(outcome, CommandOutcomeUnknown)
+            assert isinstance(outcome.error, AmbiguousExecutionError)
+            assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    assert stream.report.physical_requests == len(transport.sent)
+
+
 # --- A13 -------------------------------------------------------------------------------------
 
 

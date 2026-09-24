@@ -27,6 +27,8 @@ from b24api.execution.lifecycle import (
 from b24api.execution.snapshot import KernelReport
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from b24api.contracts.stream import PartialResult
 
 type Mapper[S, T] = Callable[[S], T | Awaitable[T]]
@@ -118,9 +120,14 @@ class MappedOperationStream[S, T]:
             raise RuntimeError("stream is already terminated")
         return self
 
-    async def __aexit__(self, *_exc: object) -> None:
-        """Close owned work on context exit."""
-        await self.aclose()
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close owned work on context exit; a close failure never replaces the body's own exception."""
+        await self._runner.__aexit__(exc_type, exc, traceback)
 
     async def __anext__(self) -> T:
         """Pull exactly one source item and map it; after termination no work starts."""

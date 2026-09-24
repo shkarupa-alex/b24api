@@ -14,9 +14,10 @@
   one `gzip`/`deflate` coding is accepted; stacked, unknown, `br` and `zstd` codings are refused
   before decompression as a body-read transport failure. Library-owned requests send
   `Accept-Encoding: gzip, deflate`; a header set by the caller or an injected client is kept (A2).
-- **Breaking (3.0.0):** a physical batch that may have been accepted is never replayed, even when
-  every command is `SAFE`; each admitted command becomes `CommandOutcomeUnknown` with its own
-  `AmbiguousExecutionError` (A3). A transport failure marked `retryable=False` is raised once
+- **Breaking (3.0.0):** a physical batch that may have been accepted when its transport failed is
+  never replayed, even when every command is `SAFE`; each admitted command becomes
+  `CommandOutcomeUnknown` with its own `AmbiguousExecutionError` (A3). A `SAFE` batch answered with a
+  transient HTTP status and no Bitrix envelope is still replayed within the budget, as in 2.3. A transport failure marked `retryable=False` is raised once
   instead of exhausting the attempt budget. An arbitrary exception from an injected transport
   becomes `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause
   (A13), and a response over `max_response_bytes` from an injected transport is refused before
@@ -24,8 +25,9 @@
 - **Breaking (3.0.0):** error rendering is contextual. Known V3 error codes are shown verbatim, field
   names taken from the request render as `field#N` aliases, the request's own sensitive values are
   exact secrets, and distinct hidden mapping keys become `[REDACTED#1]`, `[REDACTED#2]`, … instead
-  of merging into one key. `str()`, `repr()`, `to_safe_dict()`, reports and the CLI show the same
-  text (A7).
+  of merging into one key. A registered secret of any length is hidden; one shorter than six
+  characters is replaced where it stands as a whole token. `str()`, `repr()`, `to_safe_dict()`,
+  reports and the CLI show the same text (A7).
 - **Breaking (3.0.0):** an offset traversal that starts mid-collection while a caller-qualified exact
   total (`TotalTermination.EXACT_QUALIFIED`) closes it raises `CapabilityError` before any request,
   instead of ending incomplete; with `TotalTermination.DISABLED` the suffix traversal still works
@@ -43,6 +45,8 @@
 - **Breaking (3.0.0):** `OffsetContinuation.FIXED_STEP` without an exact qualified total fails right
   after a short page, without the unusable confirmation request (B10).
 - **Breaking (3.0.0):** `EnvelopeContractError` is also a `ProtocolError` with gateway origin (B20).
+  A fast keyset wave whose physical batch gets such a response records `BATCH_ENVELOPE` in
+  `page_trace` instead of `COMMAND_FAILURE`.
 - The HTTPX log shield drops every `hpack.hpack` and `hpack.table` record while a library HTTPX
   client is open. An HTTP/2 send is refused before I/O with `CapabilityError` when that filter was
   removed or an injected client cannot be registered (A20).

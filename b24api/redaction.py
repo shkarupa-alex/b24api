@@ -15,6 +15,7 @@ import json
 import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import Any, Protocol
 
 
@@ -47,8 +48,10 @@ _COOKIE_RE = re.compile(r"(?P<prefix>\b(?:Cookie|Set-Cookie)\s*:\s*)[^\r\n]+", r
 _BARE_CREDENTIAL_RE = re.compile(r"\b[A-Za-z0-9_-]{16,}\b")
 _WEBHOOK_CREDENTIAL_RE = re.compile(r"/rest/(?:api/)?[^/\s]+/(?P<token>[^/\s?#]+)/", re.IGNORECASE)
 _HIDDEN_KEY = "[REDACTED#{}]"
-# Shorter values cannot be told apart from ordinary words, so they are never registered as exact secrets.
+# A shorter exact secret can be a fragment of an ordinary word, so it is replaced only where it stands as a
+# whole token; a longer one is replaced wherever it occurs. Either way a registered secret is never shown.
 MINIMUM_SECRET_LENGTH = 6
+_WORD_RUN = "A-Za-z0-9_-"
 
 DEFAULT_SENSITIVE_KEYS = frozenset(
     {
@@ -84,12 +87,12 @@ class SafeText(str):
 
 
 def secret_values(values: Collection[str]) -> frozenset[str]:
-    """Normalize exact secret registrations, dropping values too short to be told apart from words."""
+    """Normalize exact secret registrations; every non-empty value stays registered, whatever its length."""
     if isinstance(values, str):
         raise TypeError("known secrets must be a collection of strings, not one string")
     if not all(isinstance(value, str) for value in values):
         raise TypeError("known secrets must be strings")
-    return frozenset(value for value in values if len(value) >= MINIMUM_SECRET_LENGTH)
+    return frozenset(value for value in values if value)
 
 
 def webhook_secrets(webhook_url: str) -> frozenset[str]:
@@ -107,10 +110,15 @@ def is_secret(value: str, secrets: frozenset[str], *, ignore_case: bool = False)
 
 
 def replace_secrets(text: str, secrets: frozenset[str]) -> str:
-    """Replace every occurrence of every exact secret, longest first so an overlap leaves no suffix."""
+    """Replace every exact secret, longest first so an overlap leaves no suffix; short ones as whole tokens."""
     for secret in sorted(secrets, key=len, reverse=True):
-        if secret in text:
+        if secret not in text:
+            continue
+        if len(secret) >= MINIMUM_SECRET_LENGTH:
             text = text.replace(secret, REDACTED)
+        else:
+            pattern = rf"(?<![{_WORD_RUN}]){re.escape(secret)}(?![{_WORD_RUN}])"
+            text = re.sub(pattern, REDACTED, text)
     return text
 
 
@@ -253,7 +261,7 @@ class Redactor:
         try:
             entries = [
                 (str(raw_key), *self._render_key(str(raw_key), state.context), item)
-                for raw_key, item in list(value.items())[: self.max_items]
+                for raw_key, item in islice(value.items(), self.max_items)
             ]
             taken = {label for _, label, _, _ in entries if label is not None}
             redacted: dict[str, Any] = {}

@@ -14,6 +14,7 @@ from b24api.contracts.command import (
     CommandOutcomeUnknown,
     CommandSuccess,
 )
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.errors import BatchFailed, InputSourceError
 
 if TYPE_CHECKING:
@@ -62,10 +63,10 @@ def _fail_fast_error(error: BaseException, report: OperationReport) -> BaseExcep
 
 def resolve_batch_size(batch_size: int | None, policy: ExecutionPolicy) -> int:
     """Resolve a physical chunk size without changing the logical source limit."""
-    ceiling = min(50, policy.max_buffered_commands)
+    ceiling = min(PORTAL_BATCH_CAP, policy.max_buffered_commands)
     size = ceiling if batch_size is None else batch_size
     if not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= ceiling:
-        raise ValueError("batch_size must be within 1..50 and the command buffer ceiling")
+        raise ValueError(f"batch_size must be within 1..{PORTAL_BATCH_CAP} and the command buffer ceiling")
     return size
 
 

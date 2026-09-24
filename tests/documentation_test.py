@@ -107,6 +107,67 @@ def test_migration_covers_changed_completion_stop_keyset_and_replay_contracts() 
     assert "partial_rows" in reference
 
 
+# Each review ID a "Breaking (3.0.0)" release note names -> the migration items that tell the caller what to
+# change. The guide carries no internal IDs, so the items are matched by their bold titles.
+_BREAKING_MIGRATION_ITEMS = {
+    "C7": ("Root imports.",),
+    "A2": ("Compressed responses.",),
+    "A3": ("Possibly accepted batches are not replayed after a transport failure.", "Permanent transport refusals."),
+    "A13": ("Exceptions from an injected transport.",),
+    "B29": ("Oversized responses from an injected transport.",),
+    "A7": ("Error text.",),
+    "A9": ("Mid-collection start with an exact total.",),
+    "A10": ("Keyset verification.",),
+    "A11": ("Stream lifecycle.",),
+    "A12": ("A logical batch closed early says so.",),
+    "A14": ("Reports name the public failure.",),
+    "B10": ("Fixed step refuses at once.",),
+    "B11": ("Removed report vocabulary.",),
+    "B12": ("Removed report vocabulary.",),
+    "B20": ("`EnvelopeContractError` is a `ProtocolError`.",),
+}
+
+
+def test_every_breaking_release_note_has_a_migration_item() -> None:
+    notes = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").split("## Unreleased (3.0.0)")[1].split("\n## ")[0]
+    breaking = {
+        identifier
+        for bullet in re.split(r"\n- ", f"\n{notes}")
+        if bullet.startswith("**Breaking (3.0.0):**")
+        for identifier in re.findall(r"\(([A-D]\d+)\)", bullet)
+    }
+    upgrade = MIGRATION.read_text(encoding="utf-8").split("## Upgrading from 2.3 to 3.0")[1].split("\n## ")[0]
+    titles = set(re.findall(r"^\s*\d+\. \*\*(.+?)\*\*", upgrade, re.MULTILINE))
+
+    assert breaking == set(_BREAKING_MIGRATION_ITEMS)
+    for identifier, items in _BREAKING_MIGRATION_ITEMS.items():
+        assert set(items) <= titles, f"{identifier}: {sorted(set(items) - titles)}"
+
+
+def test_every_test_the_review_outcome_registry_cites_exists() -> None:
+    # The registry is the evidence map of the astra-fable review; a citation of a missing or renamed test
+    # would claim evidence that nothing runs. ``::name`` continues the file named earlier on the same line.
+    registry = DOCS / "specifications" / "review-astra-fable" / "outcomes.md"
+    citation = re.compile(r"`(?P<path>(?:tests|tools)/[\w/]+\.py)?::(?P<name>test_\w+)`")
+    missing: list[str] = []
+    cited = 0
+    for line in registry.read_text(encoding="utf-8").splitlines():
+        path: str | None = None
+        for match in citation.finditer(line):
+            path = match.group("path") or path
+            assert path is not None, f"continuation without a file: {line}"
+            functions = {
+                node.name
+                for node in ast.walk(ast.parse((ROOT / path).read_text(encoding="utf-8")))
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            }
+            cited += 1
+            if match.group("name") not in functions:
+                missing.append(f"{path}::{match.group('name')}")
+    assert cited > 0
+    assert missing == []
+
+
 def test_architecture_document_names_the_complete_public_capability_family() -> None:
     text = (DOCS / "architecture.md").read_text(encoding="utf-8")
 

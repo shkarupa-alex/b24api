@@ -160,6 +160,51 @@ async def test_early_close_with_failing_source_close_publishes_one_report(family
     assert source.closes == 1
 
 
+class _BodyFailedError(Exception):
+    """The caller's own code failed inside ``async with stream``."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_body_failure_survives_a_failing_source_close_on_context_exit(family: str) -> None:
+    source = _Source(close_fails=True)
+    async with _client(_Portal()) as client:
+        stream = _stream(client, family, source)
+
+        async def body() -> None:
+            async with stream:
+                await anext(stream)
+                raise _BodyFailedError
+
+        with pytest.raises(_BodyFailedError) as raised:
+            await body()
+
+        # The body's own exception reaches the caller; the cleanup failure is a note and a report entry.
+        assert any("_CloseFailedError" in note for note in raised.value.__notes__)
+        report = stream.report
+        assert report is not None
+        assert report.terminal_reason == "stream cleanup failed"
+        assert "cleanup_failure" in _codes(report)
+    assert source.closes == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_context_exit_without_a_body_failure_still_raises_the_cleanup_failure(family: str) -> None:
+    source = _Source(close_fails=True)
+    async with _client(_Portal()) as client:
+        stream = _stream(client, family, source)
+
+        async def body() -> None:
+            async with stream:
+                await anext(stream)
+
+        with pytest.raises(_CloseFailedError):
+            await body()
+        assert stream.report is not None
+    assert source.closes == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
 async def test_source_close_failure_after_exhaustion_is_a_cleanup_failure_not_a_source_failure(family: str) -> None:

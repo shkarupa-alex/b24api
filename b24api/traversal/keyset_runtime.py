@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from b24api.completion.fast_recorder import FastCompletionRecorder
 from b24api.contracts.completion import BindingClosure
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     ClosureWitness,
@@ -67,7 +68,7 @@ class KeysetRuntime:
         self.page_adapter = page_adapter
         self.completion_recorder = FastCompletionRecorder()
         self.completion = execution.contract.page_completion
-        requested_batch = getattr(execution, "batch_size", None) or 50
+        requested_batch = getattr(execution, "batch_size", None) or PORTAL_BATCH_CAP
         self.batch_capacity = min(
             requested_batch,
             engine.portal_command_cap,

@@ -15,7 +15,9 @@ details.
    matches; see [Removed intentionally](#removed-intentionally).
 3. **`EnvelopeContractError` is a `ProtocolError`.** `except ProtocolError` now also catches a 2xx
    response without the result envelope; see
-   [Important semantic corrections](#important-semantic-corrections).
+   [Important semantic corrections](#important-semantic-corrections). When such a response answers
+   the physical batch of a fast keyset wave, `page_trace` records `PageRejectionCode.BATCH_ENVELOPE`
+   for its pages (previously `COMMAND_FAILURE`).
 4. **A logical batch closed early says so.** Closing `batch()` or `batch_outcomes()` before the input
    is exhausted gives an `EARLY_CLOSED` report whose `terminal_reason` is
    `"stream closed before exhaustion"` (previously `"GeneratorExit"`).
@@ -42,9 +44,13 @@ details.
    stacked and unknown codings are refused as a transport failure. Library-owned requests send
    `Accept-Encoding: gzip, deflate`. If you inject an HTTPX client that asks for `br` or `zstd`,
    remove that header.
-9. **Possibly accepted batches are not replayed.** A physical batch that may have reached Bitrix is
-   never retried, even when every command is `SAFE`; its commands arrive as
-   `CommandOutcomeUnknown`. Reconcile them as you would an ambiguous direct call.
+9. **Possibly accepted batches are not replayed after a transport failure.** When the transport
+   fails after a physical batch may have reached Bitrix, the batch is not retried, even when every
+   command is `SAFE`; its commands arrive as `CommandOutcomeUnknown`. Reconcile them as you would an
+   ambiguous direct call. Unchanged from 2.3: a batch whose transport failed before dispatch is
+   retried within the budget, and a batch of only `SAFE` commands answered with a transient HTTP
+   status (`RetryPolicy.transient_http_statuses`) and no Bitrix envelope is replayed within the
+   budget, while `UNSAFE` or `UNKNOWN` commands of such a batch arrive as `CommandOutcomeUnknown`.
 10. **Error text.** Error descriptions show field names from your request as `field#N`, known V3
     codes verbatim, and distinct hidden mapping keys as `[REDACTED#1]`, `[REDACTED#2]`, … Code that
     parses error strings must accept these forms.
@@ -61,6 +67,19 @@ details.
 14. **HTTP/2 and hpack logging.** While a library HTTPX client is open, `hpack.hpack` and
     `hpack.table` records are dropped. Removing that filter makes the next HTTP/2 send raise
     `CapabilityError` before I/O.
+15. **Permanent transport refusals.** A `TransportError` with `retryable=False` is raised after one
+    send instead of being retried until `BudgetExceededError`. Code that caught
+    `BudgetExceededError` for such a failure must catch `TransportError`.
+16. **Exceptions from an injected transport.** An arbitrary exception raised inside a custom
+    `Transport.send` or `send_wire` becomes `TransportError(phase=DISPATCH_STARTED, retryable=False)`
+    with your exception as `__cause__`. A direct `SAFE` request raises that `TransportError` after one
+    send; a direct `UNKNOWN` or `UNSAFE` request raises `AmbiguousExecutionError`; every admitted
+    command of a physical batch arrives as `CommandOutcomeUnknown`. Catch these instead of your own
+    exception class, and read `__cause__` for the original.
+17. **Oversized responses from an injected transport.** A response larger than
+    `ExecutionPolicy.max_response_bytes` is refused before decoding: a direct `SAFE` request raises
+    `ResponseTooLargeError`, a direct `UNKNOWN` or `UNSAFE` request raises `AmbiguousExecutionError`,
+    and every command of a physical batch arrives as `CommandOutcomeUnknown`.
 
 Additions that need no change: `Request.bare()` and `Request.v3()`, `Bitrix24.from_webhook()`,
 `HttpxTransport` in the root, `ExecutionPolicy.from_settings()` and
