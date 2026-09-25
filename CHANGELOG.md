@@ -26,12 +26,16 @@
   such a proven refusal. The refusals are the new `AmbiguityPolicy.refusal_http_statuses` and
   `AmbiguityPolicy.refusal_api_codes`; a code or status added only to `RetryPolicy` retries `SAFE`
   work alone. Every send of a command, across replay rounds and the retries inside them, counts
-  against `max_attempts_per_request` and the retry time budget, and a replay that was sent before
-  the budget ran out reports its commands as possibly executed. A fail-fast batch is not split. A transport failure marked `retryable=False` is raised once instead of exhausting the attempt budget.
-  An arbitrary exception from an injected transport becomes
+  against `max_attempts_per_request` and the retry time budget. A round in which a send may have
+  run, including one that was sent before the budget ran out, reports its commands as possibly
+  executed, unless its last answer was a listed refusal. A fail-fast batch is not split. A
+  transport failure marked `retryable=False` is raised once instead of exhausting the attempt
+  budget. An arbitrary exception from an injected transport becomes
   `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause, and a
   closed `HttpxTransport`, or one whose injected `httpx.AsyncClient` was closed before the call,
-  refuses with `TransportError(phase=NOT_DISPATCHED, retryable=False)` instead of `RuntimeError` (A13). A response over `max_response_bytes` from an injected transport is refused before decoding, and on
+  refuses with `TransportError(phase=NOT_DISPATCHED, retryable=False)` instead of `RuntimeError`
+  (A13). A response over `max_response_bytes` from an injected transport is refused before
+  decoding, and on
   any transport, the bundled one included, every command of a physical batch whose response is
   refused becomes `CommandOutcomeUnknown` instead of a `CommandFailure` (B29).
 - **Breaking (3.0.0):** error rendering is contextual. Known V3 error codes are shown verbatim, field

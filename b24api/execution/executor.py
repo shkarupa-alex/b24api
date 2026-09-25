@@ -80,12 +80,37 @@ class _RequestAttempts:
 
     started: float | None = None
     used: int = 0
+    # Whether a send of the current batch round may have run: one before its last send, and the last one.
+    earlier_unproven: bool = False
+    last_unproven: bool = False
+    last_failure: B24ApiError | None = None
 
     def begin(self, clock: Clock) -> tuple[float, int]:
         """Start the retry clock on the first send and return it with the attempts already spent."""
         if self.started is None:
             self.started = clock()
         return self.started, self.used
+
+    def dispatched(self) -> None:
+        """Record a send, which may have run until its failure proves otherwise."""
+        self.earlier_unproven = self.earlier_unproven or self.last_unproven
+        self.last_unproven = True
+        self.used += 1
+
+    def settle(self, error: B24ApiError, policy: ExecutionPolicy) -> None:
+        """Record how the last send failed; a budget that stops a retry reports the failure that asked for it."""
+        if isinstance(error, BudgetExceededError):
+            if error.__cause__ is None:
+                error.__cause__ = self.last_failure
+            return
+        self.last_failure = error
+        if _proves_not_run(error, policy):
+            self.last_unproven = False
+
+    def new_round(self) -> None:
+        """Forget which sends of the previous batch round may have run and how they failed."""
+        self.earlier_unproven = self.last_unproven = False
+        self.last_failure = None
 
 
 class _DecodedJsonObject(dict[str, object]):
@@ -250,7 +275,7 @@ class Executor:
         last_error: B24ApiError | None = None
         while True:
             if (remaining := context.remaining_time(retry_started=retry_started)) <= 0:
-                raise BudgetExceededError("execution time budget exhausted")
+                raise BudgetExceededError("execution time budget exhausted") from last_error
             scheduled_class = work_class if attempts == 0 else WorkClass.RETRY
             try:
                 async with asyncio.timeout(remaining):
@@ -265,7 +290,7 @@ class Executor:
                     if remaining <= 0:
                         raise BudgetExceededError("execution time budget exhausted before dispatch")
                     await context.reserve_attempt(attempts_for_request=attempts, retry_started=retry_started)
-                    shared.used = attempts + 1
+                    shared.dispatched()
                     try:
                         async with asyncio.timeout(remaining):
                             wire = await send_transport(
@@ -291,6 +316,7 @@ class Executor:
                     context=context,
                     retry_started=retry_started,
                     attempts=attempts,
+                    shared=shared,
                 )
                 last_error = error
                 attempts += 1
@@ -316,13 +342,14 @@ class Executor:
                 await context.record_cooldown(merged)
             _raise_for_pending_cancellation()
             if context.remaining_time(retry_started=retry_started) <= 0:
-                raise BudgetExceededError("transport completed after execution time budget")
+                raise BudgetExceededError("transport completed after execution time budget") from response_error
             await self._prepare_retry(
                 request,
                 response_error,
                 context=context,
                 retry_started=retry_started,
                 attempts=attempts,
+                shared=shared,
                 wire=wire,
                 method_cooldown=method_cooldown,
             )
@@ -410,9 +437,11 @@ class Executor:
         context: ExecutionContext,
         retry_started: float,
         attempts: int,
+        shared: _RequestAttempts,
         wire: WireResponse | None = None,
         method_cooldown: float = 0.0,
     ) -> None:
+        shared.settle(error, context.policy)
         safety = request.replay_safety or ReplaySafety.UNKNOWN
         if isinstance(error, ResponseTooLargeError) and safety is not ReplaySafety.SAFE:
             raise AmbiguousExecutionError(
@@ -473,24 +502,31 @@ class Executor:
 
 def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: ExecutionPolicy) -> bool:
     """SAFE work is retried after any transient failure; other work only when the failure proves nothing ran."""
+    if isinstance(error, TransportError | ApiResponseError):
+        transient = error.retryable
+    else:
+        transient = (
+            isinstance(error, HTTPGatewayError)
+            and not isinstance(error, EnvelopeContractError)
+            and error.http_status is not None
+            and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
+            and error.http_status in policy.retry.transient_http_statuses
+        )
+    return transient and (safety is ReplaySafety.SAFE or _proves_not_run(error, policy))
+
+
+def _proves_not_run(error: B24ApiError, policy: ExecutionPolicy) -> bool:
+    """Return whether a failure proves the request did not run: it was never dispatched, or Bitrix refused it."""
     if isinstance(error, TransportError):
-        return error.retryable and (not error.possible_acceptance or safety is ReplaySafety.SAFE)
+        return not error.possible_acceptance
     if isinstance(error, ApiResponseError):
-        return error.retryable and (safety is ReplaySafety.SAFE or _refused_before_running(error, policy))
-    transient = (
+        return _refused_before_running(error, policy)
+    # Only a listed refusal status (423, 425, 429 by default) proves the request was not accepted.
+    return (
         isinstance(error, HTTPGatewayError)
         and not isinstance(error, EnvelopeContractError)
-        and error.http_status is not None
-        and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
-        and error.http_status in policy.retry.transient_http_statuses
-    )
-    # Only a listed refusal status (423, 425, 429 by default) proves the request was not accepted.
-    return transient and (
-        safety is ReplaySafety.SAFE
-        or (
-            error.http_status in policy.ambiguity.refusal_http_statuses
-            and error.http_status not in policy.ambiguity.ambiguous_unstructured_statuses
-        )
+        and error.http_status in policy.ambiguity.refusal_http_statuses
+        and error.http_status not in policy.ambiguity.ambiguous_unstructured_statuses
     )
 
 

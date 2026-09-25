@@ -65,7 +65,8 @@ details.
    commands arrive as `CommandOutcomeUnknown`; reconcile them as you would an ambiguous direct call.
    In 2.3 the whole batch was retried or not by its least safe command. Replays share the request's
    attempt and time budgets. A command keeps its last outcome when the budget stops a replay before
-   it is sent; a replay that was sent reports the command as possibly executed. A direct `UNSAFE`
+   it is sent; a replay that was sent reports the command as possibly executed, unless its last
+   answer was a listed refusal. A direct `UNSAFE`
    or `UNKNOWN` request is now also retried after such a proven refusal. The refusals come from
    `AmbiguityPolicy.refusal_http_statuses` and `AmbiguityPolicy.refusal_api_codes`. A code or status
    you add to `RetryPolicy` alone retries `SAFE` work only; add it to the refusal sets too if it

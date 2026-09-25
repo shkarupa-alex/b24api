@@ -24,10 +24,12 @@ from b24api.contracts.response import Response
 from b24api.encoding import encode_php_query
 from b24api.errors import (
     AmbiguousExecutionError,
+    ApiResponseError,
     B24ApiError,
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
+    HTTPGatewayError,
     ProtocolError,
     ResponseTooLargeError,
     TransportError,
@@ -181,6 +183,7 @@ class BatchExecutor:
         they did not run (owner decision, 2026-09-25). A fail-fast batch is never split.
         """
         request = _batch_request(commands, halt=options.halt)
+        attempts.new_round()
         try:
             response = await self.executor.execute(
                 request,
@@ -209,7 +212,7 @@ class BatchExecutor:
                 )
                 scoped_error.__cause__ = error
                 error = scoped_error
-            if not _possibly_executed(error, context):
+            if not _possibly_executed(error, attempts):
                 return _Round(tuple(_shared_failure(command, error) for command in commands))
             replay = () if options.halt or not _safe_replay_allowed(error, context) else commands
             return _Round(
@@ -600,17 +603,15 @@ def _shared_failure(command: _Command, error: B24ApiError) -> BatchFailure:
     )
 
 
-def _possibly_executed(error: B24ApiError, context: ExecutionContext) -> bool:
+def _possibly_executed(error: B24ApiError, attempts: _RequestAttempts) -> bool:
     """Return whether a failed physical batch may have executed its admitted commands."""
+    # A send of this round that no failure proved refused may have run, whatever ended the round.
+    if attempts.earlier_unproven:
+        return True
+    if isinstance(error, BudgetExceededError):
+        return attempts.last_unproven
     if isinstance(error, TransportError):
         return error.possible_acceptance
-    if isinstance(error, BudgetExceededError):
-        # The budget ran out after a send; only a listed refusal on that send proves nothing ran.
-        cause = error.__cause__
-        refused = isinstance(cause, B24ApiError) and _is_retryable(
-            cause, safety=ReplaySafety.UNSAFE, policy=context.policy
-        )
-        return bool(getattr(error, "_b24api_dispatch_started", False)) and not refused
     return isinstance(error, AmbiguousExecutionError | ResponseTooLargeError)
 
 
@@ -622,12 +623,18 @@ def _safe_replay_allowed(error: B24ApiError, context: ExecutionContext) -> bool:
 
 def _unknown_failure(command: _Command, error: B24ApiError) -> BatchFailure:
     """Give one admitted command its own possible-execution outcome, kept unless a SAFE replay replaces it."""
-    if isinstance(error, AmbiguousExecutionError):
-        reason = error.reason
-    elif isinstance(error, ResponseTooLargeError):
+    # A budget that ended the round after a send is explained by the last failure it carries, if any.
+    source = error
+    if isinstance(error, BudgetExceededError) and isinstance(error.__cause__, B24ApiError):
+        source = error.__cause__
+    if isinstance(source, AmbiguousExecutionError):
+        reason = source.reason
+    elif isinstance(source, ResponseTooLargeError):
         reason = AmbiguityReason.RESPONSE_LIMIT_AFTER_DISPATCH
-    elif isinstance(error, BudgetExceededError) or isinstance(error.__cause__, TimeoutError):
+    elif isinstance(source, BudgetExceededError) or isinstance(source.__cause__, TimeoutError):
         reason = AmbiguityReason.DEADLINE_AFTER_DISPATCH
+    elif isinstance(source, HTTPGatewayError | ApiResponseError):
+        reason = AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
     else:
         reason = AmbiguityReason.CONNECTION_LOST_AFTER_DISPATCH
     ambiguous = AmbiguousExecutionError(

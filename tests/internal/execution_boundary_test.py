@@ -601,7 +601,23 @@ async def test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budge
     assert len(transport.sent) == 2  # noqa: PLR2004 - the refused batch and the replay the budget ends
     assert isinstance(outcome, CommandOutcomeUnknown)
     assert isinstance(outcome.error, AmbiguousExecutionError)
-    assert outcome.error.reason is AmbiguityReason.DEADLINE_AFTER_DISPATCH
+    assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    budget = outcome.error.__cause__
+    assert isinstance(budget, BudgetExceededError)
+    assert isinstance(budget.__cause__, HTTPGatewayError)
+    assert budget.__cause__.http_status == HTTP_BAD_GATEWAY
+
+    # A replay refused with a listed status ran nothing, so the stop after it keeps the refusal.
+    refused = _Script([])
+    _refused_then(refused, _status(refused, HTTP_TOO_MANY_REQUESTS))
+    (still_refused,) = await _drain(
+        _client(refused).batch_outcomes(
+            [Command(_request(ReplaySafety.UNSAFE, "tasks.task.add"), 0)], policy=_policy(max_requests=2)
+        )
+    )
+    assert len(refused.sent) == 2  # noqa: PLR2004 - the refused batch and the refused replay
+    assert isinstance(still_refused, CommandFailure)
+    assert still_refused.replay_disposition is ReplayDisposition.ELIGIBLE
 
     # Control: a budget that stops the replay before it is sent leaves the refusal the command received.
     stopped = _Script([])
@@ -615,6 +631,31 @@ async def test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budge
     assert isinstance(kept, CommandFailure)
     assert isinstance(kept.error, BatchCommandError)
     assert kept.replay_disposition is ReplayDisposition.ELIGIBLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retryable", ["retryable", "permanent"])
+async def test_a_batch_retried_after_a_send_that_may_have_run_stays_unknown_whatever_ends_the_retries(
+    retryable: str,
+) -> None:
+    # The first send got a 502 and may have run; the retry never left the client. The round ends on that last
+    # failure (or on the attempt budget after it), yet the command may already have run.
+    transport = _Script([])
+
+    def not_dispatched(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        raise TransportError("refused locally", phase=FailurePhase.NOT_DISPATCHED, retryable=retryable == "retryable")
+
+    transport.behaviors = [_status(transport, HTTP_BAD_GATEWAY), not_dispatched]
+    stream = _client(transport).batch_outcomes(
+        [Command(_request(ReplaySafety.SAFE, "user.get"), 0)], policy=_policy(max_attempts_per_request=2)
+    )
+
+    (outcome,) = await _drain(stream)
+
+    assert len(transport.sent) == 2  # noqa: PLR2004 - the 502 and the retry that was not dispatched
+    assert isinstance(outcome, CommandOutcomeUnknown)
+    assert isinstance(outcome.error, AmbiguousExecutionError)
 
 
 @pytest.mark.asyncio
@@ -648,6 +689,9 @@ async def test_a_batch_answered_after_the_time_budget_reports_its_unsafe_command
     assert isinstance(outcome.error, AmbiguousExecutionError)
     assert isinstance(outcome.error.__cause__, BudgetExceededError)
     assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+    assert outcome.error.reason is (
+        AmbiguityReason.DEADLINE_AFTER_DISPATCH if replay == "success" else AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    )
 
 
 @pytest.mark.asyncio
@@ -674,7 +718,10 @@ async def test_replay_rounds_and_the_retries_inside_them_share_one_attempt_budge
     ]
     outcomes = await _drain(_client(mixed).batch_outcomes(commands, policy=_policy()))
     assert len(mixed.sent) == 3  # noqa: PLR2004 - the mixed batch and two sends of the reads alone
-    assert all(isinstance(outcome, CommandOutcomeUnknown) for outcome in outcomes)
+    for outcome in outcomes:
+        assert isinstance(outcome, CommandOutcomeUnknown)
+        assert isinstance(outcome.error, AmbiguousExecutionError)
+        assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
 
     # One attempt allows no replay round at all.
     single = _Script([])

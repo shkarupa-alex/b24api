@@ -203,9 +203,11 @@ Two further observations; the first is decided, the second stays with the owner:
   refused with a transient code, and the others it refused with a listed refusal; the `UNSAFE` and
   `UNKNOWN` commands of a batch that may have run become unknown. Every send of a command, across
   rounds and the executor's retries inside them, shares one `max_attempts_per_request` count and one
-  retry clock from its first send. A command keeps its last outcome when the budget stops a replay
-  before it is sent; a replay that was sent and then ran out of budget, or any batch answered after the
-  time budget, makes its commands unknown unless its last answer was a listed refusal. A fail-fast
+  retry clock from the start of its first attempt. A command keeps its last outcome when the budget
+  stops a replay before it is sent. A round in which any send may have run makes its commands
+  unknown whatever failure ends it, including a budget that runs out after a send or a batch answered
+  after the time budget; only a listed refusal as the round's last answer keeps the refused outcome.
+  The unknown outcome takes its reason from the last failure the budget error carries. A fail-fast
   batch is not split. The same rule now also retries a direct `UNSAFE` request after a proven refusal.
   Tests:
   `tests/internal/execution_boundary_test.py::test_physical_batch_replay_matrix`,
@@ -219,6 +221,7 @@ Two further observations; the first is decided, the second stays with the owner:
   `tests/internal/execution_boundary_test.py::test_a_configured_retry_code_or_status_does_not_prove_an_unsafe_request_never_ran`,
   `tests/internal/execution_boundary_test.py::test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budget_stops_the_next_attempt`,
   `tests/internal/execution_boundary_test.py::test_a_batch_answered_after_the_time_budget_reports_its_unsafe_command_unknown`,
+  `tests/internal/execution_boundary_test.py::test_a_batch_retried_after_a_send_that_may_have_run_stays_unknown_whatever_ends_the_retries`,
   `tests/internal/execution_boundary_test.py::test_replay_rounds_and_the_retries_inside_them_share_one_attempt_budget`,
   `tests/internal/execution_boundary_test.py::test_replay_rounds_share_the_retry_time_budget_measured_from_the_first_send`, and
   `tests/execution_test.py::test_unsafe_operation_time_limit_waits_for_the_method_and_replays`.
