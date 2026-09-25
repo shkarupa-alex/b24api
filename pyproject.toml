@@ -46,7 +46,6 @@ dependencies = [
 Homepage = "https://github.com/shkarupa-alex/b24api"
 Repository = "https://github.com/shkarupa-alex/b24api"
 Issues = "https://github.com/shkarupa-alex/b24api/issues"
-Changelog = "https://github.com/shkarupa-alex/b24api/blob/master/CHANGELOG.md"
 
 [project.scripts]
 b24api = "b24api.cli:main"

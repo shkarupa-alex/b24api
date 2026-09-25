@@ -35,8 +35,16 @@ if TYPE_CHECKING:
 type Mapper[S, T] = Callable[[S], T | Awaitable[T]]
 
 
-class _ClosableIterator[T](AsyncIterator[T], Protocol):
+class _ClosableIterator[T](Protocol):
     report: KernelReport
+
+    def __aiter__(self) -> Self:
+        """Return this iterator."""
+        ...
+
+    async def __anext__(self) -> T:
+        """Return the next item."""
+        ...
 
     async def aclose(self) -> None:
         """Close the underlying subsystem stream."""
