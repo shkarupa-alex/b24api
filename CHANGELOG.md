@@ -23,7 +23,11 @@
   `UNKNOWN` command of a batch that may have run (a transport failure after dispatch, 408 or 5xx)
   becomes `CommandOutcomeUnknown` with its own `AmbiguousExecutionError`; in 2.3 the whole batch
   followed the least safe command. A direct `UNSAFE` or `UNKNOWN` request is now also retried after
-  such a proven refusal. A fail-fast batch is not split. A transport failure marked `retryable=False` is raised once instead of exhausting the attempt budget.
+  such a proven refusal. The refusals are the new `AmbiguityPolicy.refusal_http_statuses` and
+  `AmbiguityPolicy.refusal_api_codes`; a code or status added only to `RetryPolicy` retries `SAFE`
+  work alone. Every send of a command, across replay rounds and the retries inside them, counts
+  against `max_attempts_per_request` and the retry time budget, and a replay that was sent before
+  the budget ran out reports its commands as possibly executed. A fail-fast batch is not split. A transport failure marked `retryable=False` is raised once instead of exhausting the attempt budget.
   An arbitrary exception from an injected transport becomes
   `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause, and a
   closed `HttpxTransport`, or one whose injected `httpx.AsyncClient` was closed before the call,

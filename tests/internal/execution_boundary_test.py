@@ -11,8 +11,10 @@ import pytest
 
 from b24api import BatchFailed, Bitrix24, ReplaySafety, Request, Settings, TerminalState
 from b24api._error_types import FailurePhase
+from b24api.batch.engine import BatchExecutor
+from b24api.batch.outcome import BatchFailure
 from b24api.contracts import Command, CommandFailure, CommandOutcomeUnknown, CommandSuccess, ReplayDisposition
-from b24api.contracts.policy import AmbiguityReason, ExecutionPolicy, RetryPolicy
+from b24api.contracts.policy import AmbiguityPolicy, AmbiguityReason, ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
@@ -483,6 +485,232 @@ async def test_a_fail_fast_batch_is_never_split_for_a_replay() -> None:
     with pytest.raises(BatchFailed):
         [outcome async for outcome in stream]
     assert len(transport.sent) == 1
+
+
+_AFTER_WRITE = {"error": "AFTER_WRITE", "error_description": "failed after the write"}
+HTTP_BAD_REQUEST = 400
+HTTP_CONFLICT = 409
+
+
+def _command_errors_then(
+    transport: _Script, error: Mapping[str, object], *later: Callable[[Request], WireResponse]
+) -> None:
+    """Answer the first batch with ``error`` for every command, then follow ``later``."""
+
+    def refused(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        return _batch_answer({}, dict.fromkeys(_batch_keys(request), error))
+
+    transport.behaviors = [refused, *later]
+
+
+def _batch_keys(request: Request) -> list[str]:
+    commands = request.copy_parameters()["cmd"]
+    assert isinstance(commands, dict)
+    return list(commands)
+
+
+def _direct_answers(transport: _Script, first: WireResponse) -> None:
+    def answered(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        return first
+
+    transport.behaviors = [answered, _counting(transport)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("safety", _SAFETIES)
+async def test_a_configured_retry_code_or_status_does_not_prove_an_unsafe_request_never_ran(
+    safety: ReplaySafety,
+) -> None:
+    # A code or status added to the retry policy says a failure is worth retrying, which is enough for SAFE work;
+    # only the ambiguity policy's refusals prove that UNSAFE or UNKNOWN work did not run (owner decision).
+    retry = RetryPolicy(
+        transient_http_statuses=frozenset({HTTP_CONFLICT}),
+        transient_api_codes=frozenset({"after_write"}),
+        initial_delay=0,
+        maximum_delay=0,
+        jitter=0,
+    )
+    structured = WireResponse(
+        HTTP_BAD_REQUEST, (("content-type", "application/json"),), json.dumps(_AFTER_WRITE).encode()
+    )
+    unstructured = WireResponse(HTTP_CONFLICT, (("content-type", "text/html"),), b"<html>conflict</html>")
+    expected = 2 if safety is ReplaySafety.SAFE else 1
+    for first, error_type in ((structured, ApiResponseError), (unstructured, HTTPGatewayError)):
+        direct = _Script([])
+        _direct_answers(direct, first)
+        call = _client(direct).call(_request(safety, "tasks.task.add"), policy=_policy(retry=retry))
+        if safety is ReplaySafety.SAFE:
+            await call
+        else:
+            with pytest.raises(error_type):
+                await call
+        assert len(direct.sent) == expected
+
+    batch = _Script([])
+    _command_errors_then(batch, _AFTER_WRITE, _counting(batch))
+    command = Command(_request(safety, "tasks.task.add"), 0)
+    (outcome,) = await _drain(_client(batch).batch_outcomes([command], policy=_policy(retry=retry)))
+    assert len(batch.sent) == expected
+    if safety is ReplaySafety.SAFE:
+        assert isinstance(outcome, CommandSuccess)
+    else:
+        assert isinstance(outcome, CommandFailure)
+        assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+
+    # Declaring the code a refusal is what lets the creation run again, directly and inside a batch.
+    refusal = AmbiguityPolicy(refusal_api_codes=frozenset({"after_write"}))
+    declared = _Script([])
+    _direct_answers(declared, structured)
+    await _client(declared).call(_request(safety, "tasks.task.add"), policy=_policy(retry=retry, ambiguity=refusal))
+    assert len(declared.sent) == 2  # noqa: PLR2004 - the refusal and its replay
+    declared_batch = _Script([])
+    _command_errors_then(declared_batch, _AFTER_WRITE, _counting(declared_batch))
+    (replayed,) = await _drain(
+        _client(declared_batch).batch_outcomes([command], policy=_policy(retry=retry, ambiguity=refusal))
+    )
+    assert len(declared_batch.sent) == 2  # noqa: PLR2004 - the refused batch and its replay
+    assert isinstance(replayed, CommandSuccess)
+
+
+def _refused_then(transport: _Script, *later: Callable[[Request], WireResponse]) -> None:
+    _command_errors_then(transport, _QUERY_LIMIT, *later)
+
+
+def _status(transport: _Script, status: int) -> Callable[[Request], WireResponse]:
+    def answered(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        return WireResponse(status, (("content-type", "text/html"),), b"<html>transient</html>")
+
+    return answered
+
+
+@pytest.mark.asyncio
+async def test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budget_stops_the_next_attempt() -> None:
+    # The replay reached Bitrix and got a 502, and the request budget stopped the retry after it: the command may
+    # have run, so its earlier "refused before running" outcome must not stand.
+    transport = _Script([])
+    _refused_then(transport, _status(transport, HTTP_BAD_GATEWAY))
+    stream = _client(transport).batch_outcomes(
+        [Command(_request(ReplaySafety.SAFE, "user.get"), 0)], policy=_policy(max_requests=2)
+    )
+
+    (outcome,) = await _drain(stream)
+
+    assert len(transport.sent) == 2  # noqa: PLR2004 - the refused batch and the replay the budget ends
+    assert isinstance(outcome, CommandOutcomeUnknown)
+    assert isinstance(outcome.error, AmbiguousExecutionError)
+    assert outcome.error.reason is AmbiguityReason.DEADLINE_AFTER_DISPATCH
+
+    # Control: a budget that stops the replay before it is sent leaves the refusal the command received.
+    stopped = _Script([])
+    _refused_then(stopped, _counting(stopped))
+    (kept,) = await _drain(
+        _client(stopped).batch_outcomes(
+            [Command(_request(ReplaySafety.UNSAFE, "tasks.task.add"), 0)], policy=_policy(max_requests=1)
+        )
+    )
+    assert len(stopped.sent) == 1
+    assert isinstance(kept, CommandFailure)
+    assert isinstance(kept.error, BatchCommandError)
+    assert kept.replay_disposition is ReplayDisposition.ELIGIBLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replay", ["success", "status"])
+@pytest.mark.parametrize("rounds", [1, 2], ids=["first-round", "replay-round"])
+async def test_a_batch_answered_after_the_time_budget_reports_its_unsafe_command_unknown(
+    replay: str, rounds: int
+) -> None:
+    # Bitrix answered, but the time budget ran out before the answer was classified: an UNSAFE creation in that
+    # batch may have run, whether it was the first batch or a replay after a quota refusal.
+    now = [0.0]
+    transport = _Script([])
+
+    def late(request: Request) -> WireResponse:
+        now[0] = 100.0
+        if replay == "success":
+            return _counting(transport)(request)
+        return _status(transport, HTTP_BAD_GATEWAY)(request)
+
+    if rounds == 1:
+        transport.behaviors = [late]
+    else:
+        _refused_then(transport, late)
+    executor = Executor(transport, clock=lambda: now[0])
+    request = _request(ReplaySafety.UNSAFE, "tasks.task.add")
+
+    (outcome,) = await BatchExecutor(executor).execute_requests((request,), context=executor.context(_policy()))
+
+    assert len(transport.sent) == rounds
+    assert isinstance(outcome, BatchFailure)
+    assert isinstance(outcome.error, AmbiguousExecutionError)
+    assert isinstance(outcome.error.__cause__, BudgetExceededError)
+    assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+
+
+@pytest.mark.asyncio
+async def test_replay_rounds_and_the_retries_inside_them_share_one_attempt_budget() -> None:
+    # max_attempts_per_request bounds every send of a command: the refused batch, the replay and its retries.
+    transport = _Script([])
+    _refused_then(transport, _status(transport, HTTP_TOO_MANY_REQUESTS), _status(transport, HTTP_TOO_MANY_REQUESTS))
+    transport.behaviors.append(_counting(transport))
+    stream = _client(transport).batch_outcomes([Command(_request(ReplaySafety.SAFE, "user.get"), 0)], policy=_policy())
+
+    (outcome,) = await _drain(stream)
+
+    assert len(transport.sent) == 3  # noqa: PLR2004 - max_attempts_per_request
+    assert not isinstance(outcome, CommandSuccess)
+    assert stream.report is not None
+    assert stream.report.physical_requests == 3  # noqa: PLR2004 - no fourth send reaches the prepared success
+
+    # The SAFE reads replayed from a mixed batch count the batch that carried them.
+    mixed = _Script([])
+    mixed.behaviors = [_status(mixed, HTTP_BAD_GATEWAY)]
+    commands = [
+        Command(_request(ReplaySafety.SAFE, "user.get"), 0),
+        Command(_request(ReplaySafety.UNSAFE, "tasks.task.add"), 1),
+    ]
+    outcomes = await _drain(_client(mixed).batch_outcomes(commands, policy=_policy()))
+    assert len(mixed.sent) == 3  # noqa: PLR2004 - the mixed batch and two sends of the reads alone
+    assert all(isinstance(outcome, CommandOutcomeUnknown) for outcome in outcomes)
+
+    # One attempt allows no replay round at all.
+    single = _Script([])
+    _refused_then(single, _counting(single))
+    (refused,) = await _drain(
+        _client(single).batch_outcomes(
+            [Command(_request(ReplaySafety.SAFE, "user.get"), 0)], policy=_policy(max_attempts_per_request=1)
+        )
+    )
+    assert len(single.sent) == 1
+    assert isinstance(refused, CommandFailure)
+
+
+@pytest.mark.asyncio
+async def test_replay_rounds_share_the_retry_time_budget_measured_from_the_first_send() -> None:
+    now = [0.0]
+    transport = _Script([])
+
+    def slow(behavior: Callable[[Request], WireResponse]) -> Callable[[Request], WireResponse]:
+        def answered(request: Request) -> WireResponse:
+            now[0] += 6.0
+            return behavior(request)
+
+        return answered
+
+    _refused_then(transport, slow(_status(transport, HTTP_TOO_MANY_REQUESTS)), _counting(transport))
+    transport.behaviors[0] = slow(transport.behaviors[0])
+    executor = Executor(transport, clock=lambda: now[0])
+    context = executor.context(_policy(max_elapsed=100.0, max_retry_elapsed_per_request=10.0))
+    request = _request(ReplaySafety.SAFE, "user.get")
+
+    (outcome,) = await BatchExecutor(executor).execute_requests((request,), context=context)
+
+    # Each send takes 6 s: the replay's own 429 retry would start at 12 s, past the 10 s window of the first send.
+    assert len(transport.sent) == 2  # noqa: PLR2004 - the refusal and one replay inside the window
+    assert isinstance(outcome, BatchFailure)
 
 
 # --- A13 -------------------------------------------------------------------------------------

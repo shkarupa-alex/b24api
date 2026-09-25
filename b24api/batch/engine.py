@@ -37,7 +37,12 @@ from b24api.execution import (
     Executor,
     WorkClass,
 )
-from b24api.execution.executor import _is_retryable, _raise_embedded_result_error
+from b24api.execution.executor import (
+    _is_retryable,
+    _raise_embedded_result_error,
+    _refused_before_running,
+    _RequestAttempts,
+)
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
@@ -142,10 +147,11 @@ class BatchExecutor:
             return tuple(rejected[command.index] for command in commands)
         options = _RoundOptions(halt, advisory_totals, strict_envelope, strict_json_members)
         settled: dict[int, BatchOutcome] = {}
-        pending, rounds, started = eligible, 0, context.monotonic()
+        # Every command of a replay round was sent in each round before it, so one count bounds them all.
+        pending, rounds, attempts = eligible, 0, _RequestAttempts()
         while pending:
-            sent = await self._dispatch_round(pending, context=context, options=options)
-            # A replay the budget stops before it is sent leaves each command the outcome it last received.
+            sent = await self._dispatch_round(pending, context=context, options=options, attempts=attempts)
+            # A replay the budget stops before it runs leaves each command the outcome it last received.
             settled.update(
                 (outcome.command_index, outcome)
                 for outcome in sent.outcomes
@@ -155,7 +161,7 @@ class BatchExecutor:
             # Only the commands that may run again are sent again, in a smaller physical batch; the rest keep
             # the outcome this round gave them, which also stands for a replay the budget does not allow.
             if not sent.replay or not await self.executor.pause_before_replay(
-                context, rounds=rounds, started=started, method_cooldown=sent.method_cooldown
+                context, attempts=attempts, method_cooldown=sent.method_cooldown
             ):
                 break
             pending = sent.replay
@@ -167,6 +173,7 @@ class BatchExecutor:
         *,
         context: ExecutionContext,
         options: _RoundOptions,
+        attempts: _RequestAttempts,
     ) -> _Round:
         """Send one physical batch; return each command's outcome and the commands that may be sent again.
 
@@ -181,6 +188,7 @@ class BatchExecutor:
                 work_class=WorkClass.BATCH,
                 strict_json_members=options.strict_json_members,
                 _admission_methods=frozenset(command.request.method for command in commands),
+                _attempts=attempts,
             )
             envelope = _decode_batch_envelope(
                 response.result,
@@ -201,7 +209,7 @@ class BatchExecutor:
                 )
                 scoped_error.__cause__ = error
                 error = scoped_error
-            if not _possibly_executed(error):
+            if not _possibly_executed(error, context):
                 return _Round(tuple(_shared_failure(command, error) for command in commands))
             replay = () if options.halt or not _safe_replay_allowed(error, context) else commands
             return _Round(
@@ -230,7 +238,7 @@ class BatchExecutor:
                     command.request.method, outcome.error.normalized_code
                 )
                 method_cooldown = max(method_cooldown, cooldown)
-        # A transient Bitrix refusal of one command (a request or time quota) answers before it runs.
+        # A SAFE command is sent again after its own transient error; any other only after a listed refusal.
         replay = (
             ()
             if options.halt
@@ -239,7 +247,7 @@ class BatchExecutor:
                 for command, outcome in zip(commands, outcomes, strict=True)
                 if isinstance(outcome, BatchFailure)
                 and isinstance(outcome.error, BatchCommandError)
-                and outcome.error.retryable
+                and outcome.replay_disposition is ReplayDisposition.ELIGIBLE
             )
         )
         return _Round(outcomes, replay, method_cooldown)
@@ -282,7 +290,12 @@ class BatchExecutor:
                 original_code=command_error.original_code,
                 normalized_code=command_error.normalized_code,
             )
-            return _command_failure(command, command_error, evidence=command_evidence)
+            return _command_failure(
+                command,
+                command_error,
+                evidence=command_evidence,
+                refused=_refused_before_running(command_error, context.policy),
+            )
         if command.stable_key not in envelope.results:
             missing_error = ProtocolError(
                 "Batch result map is missing a submitted command",
@@ -317,7 +330,9 @@ class BatchExecutor:
                 original_code=error.original_code,
                 normalized_code=error.normalized_code,
             )
-            return _command_failure(command, error, evidence=command_evidence)
+            return _command_failure(
+                command, error, evidence=command_evidence, refused=_refused_before_running(error, context.policy)
+            )
         except ProtocolError as error:
             return _command_failure(command, error, evidence=evidence)
         except (TypeError, ValueError) as error:
@@ -559,12 +574,11 @@ def _command_failure(
     error: B24ApiError,
     *,
     evidence: BatchCommandEvidence,
+    refused: bool = False,
 ) -> BatchFailure:
     safety = command.request.replay_safety or ReplaySafety.UNKNOWN
-    # A transient Bitrix refusal, or a transport failure before dispatch, proves the command did not run.
-    proven_not_run = isinstance(error, BatchCommandError) or (
-        isinstance(error, TransportError) and not error.possible_acceptance
-    )
+    # A listed Bitrix refusal of the command, or a transport failure before dispatch, proves it did not run.
+    proven_not_run = refused or (isinstance(error, TransportError) and not error.possible_acceptance)
     eligible = error.retryable and (safety is ReplaySafety.SAFE or proven_not_run)
     return BatchFailure(
         command.index,
@@ -586,10 +600,17 @@ def _shared_failure(command: _Command, error: B24ApiError) -> BatchFailure:
     )
 
 
-def _possibly_executed(error: B24ApiError) -> bool:
+def _possibly_executed(error: B24ApiError, context: ExecutionContext) -> bool:
     """Return whether a failed physical batch may have executed its admitted commands."""
     if isinstance(error, TransportError):
         return error.possible_acceptance
+    if isinstance(error, BudgetExceededError):
+        # The budget ran out after a send; only a listed refusal on that send proves nothing ran.
+        cause = error.__cause__
+        refused = isinstance(cause, B24ApiError) and _is_retryable(
+            cause, safety=ReplaySafety.UNSAFE, policy=context.policy
+        )
+        return bool(getattr(error, "_b24api_dispatch_started", False)) and not refused
     return isinstance(error, AmbiguousExecutionError | ResponseTooLargeError)
 
 
@@ -605,7 +626,7 @@ def _unknown_failure(command: _Command, error: B24ApiError) -> BatchFailure:
         reason = error.reason
     elif isinstance(error, ResponseTooLargeError):
         reason = AmbiguityReason.RESPONSE_LIMIT_AFTER_DISPATCH
-    elif isinstance(error.__cause__, TimeoutError):
+    elif isinstance(error, BudgetExceededError) or isinstance(error.__cause__, TimeoutError):
         reason = AmbiguityReason.DEADLINE_AFTER_DISPATCH
     else:
         reason = AmbiguityReason.CONNECTION_LOST_AFTER_DISPATCH

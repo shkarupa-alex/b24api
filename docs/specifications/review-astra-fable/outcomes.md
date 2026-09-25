@@ -15,7 +15,7 @@ Test paths are `file::test`. The last section lists what remains for the owner.
 |---|---|---|---|
 | A1 | Done | `4cd3998` | `tools/b24api_evidence/harness/live_test.py::test_live_portal_httpx_info_record_carries_no_webhook_token`, `::test_live_portal_sync_attribution_leaves_foreign_records_on_the_same_logger_unchanged` |
 | A2 | Done; L2 confirmed | `15b5155` | `tests/internal/bounded_decoding_test.py::test_single_gzip_bomb_is_refused_inside_the_decompressor`, `::test_stacked_gzip_cascade_is_refused_before_decompression`; [L2](live-probes.md#l2-a2-content-encoding-and-the-explicit-accept-encoding) |
-| A3 | Done | `228d0f8` | `tests/internal/execution_boundary_test.py::test_direct_replay_matrix`, `::test_physical_batch_replay_matrix`, `::test_permanent_transport_refusal_is_raised_once_instead_of_exhausting_the_budget`, `::test_physical_batch_after_an_unstructured_transient_status`, `::test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_direct_call_keep_their_retry`, `::test_a_mixed_batch_that_may_have_run_sends_only_its_safe_commands_again`, `::test_commands_refused_by_their_own_transient_error_are_sent_again_alone` |
+| A3 | Done | `228d0f8` | `tests/internal/execution_boundary_test.py::test_direct_replay_matrix`, `::test_physical_batch_replay_matrix`, `::test_permanent_transport_refusal_is_raised_once_instead_of_exhausting_the_budget`, `::test_physical_batch_after_an_unstructured_transient_status`, `::test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_direct_call_keep_their_retry`, `::test_a_mixed_batch_that_may_have_run_sends_only_its_safe_commands_again`, `::test_commands_refused_by_their_own_transient_error_are_sent_again_alone`, `::test_a_configured_retry_code_or_status_does_not_prove_an_unsafe_request_never_ran`, `::test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budget_stops_the_next_attempt`, `::test_replay_rounds_and_the_retries_inside_them_share_one_attempt_budget` |
 | A4 | Done | `06dfa00` | `pydantic>=2.12.0` in `pyproject.toml`; the `min-deps` job (`tests/release_workflow_test.py::test_blocking_jobs_run_the_specified_checks`) |
 | A5 | Done | `43fd34d` | `tests/internal/rate_coordinator_test.py::test_client_closes_its_own_coordinator_and_awaits_the_wake_task` |
 | A6 | Done | `06dfa00`, `de451d5` | `tests/release_workflow_test.py::test_wheel_check_refuses_an_untyped_wheel_or_files_beside_the_package`, `::test_wheel_typing_passes_every_canonical_import_and_flags_an_old_root_import` |
@@ -195,13 +195,19 @@ Two further observations; the first is decided, the second stays with the owner:
   §3.4: `SAFE` work is always replayed within the budget; `UNSAFE` and `UNKNOWN` work only when the
   failure proves it did not run, so a replay cannot duplicate an effect. A physical batch applies this
   per command. The executor retries the whole batch only when every command would be retried (all
-  `SAFE`, or a proven refusal: a transport failure before dispatch, an unstructured 423, 425 or 429, a
-  structured `QUERY_LIMIT_EXCEEDED` or `OPERATION_TIME_LIMIT`). Otherwise the batch engine sends again,
-  in a smaller physical batch, the `SAFE` commands of a batch that may have run and every command that
-  its own `result_error` refused with a transient code; the `UNSAFE` and `UNKNOWN` commands of a batch
-  that may have run become unknown. Rounds are bounded by `max_attempts_per_request` and the retry time
-  budget; a command keeps its last outcome when they run out. A fail-fast batch is not split. The same
-  rule now also retries a direct `UNSAFE` request after a proven refusal. Tests:
+  `SAFE`, or a proven refusal: a transport failure before dispatch, or a refusal listed in
+  `AmbiguityPolicy.refusal_http_statuses` (423, 425, 429) or `AmbiguityPolicy.refusal_api_codes`
+  (`QUERY_LIMIT_EXCEEDED`, `OPERATION_TIME_LIMIT`)). A code or status only in `RetryPolicy` proves
+  nothing and retries `SAFE` work alone. Otherwise the batch engine sends again, in a smaller physical
+  batch, the `SAFE` commands of a batch that may have run, the `SAFE` commands its own `result_error`
+  refused with a transient code, and the others it refused with a listed refusal; the `UNSAFE` and
+  `UNKNOWN` commands of a batch that may have run become unknown. Every send of a command, across
+  rounds and the executor's retries inside them, shares one `max_attempts_per_request` count and one
+  retry clock from its first send. A command keeps its last outcome when the budget stops a replay
+  before it is sent; a replay that was sent and then ran out of budget, or any batch answered after the
+  time budget, makes its commands unknown unless its last answer was a listed refusal. A fail-fast
+  batch is not split. The same rule now also retries a direct `UNSAFE` request after a proven refusal.
+  Tests:
   `tests/internal/execution_boundary_test.py::test_physical_batch_replay_matrix`,
   `tests/internal/execution_boundary_test.py::test_physical_batch_after_an_unstructured_transient_status`,
   `tests/internal/execution_boundary_test.py::test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_direct_call_keep_their_retry`,
@@ -209,7 +215,12 @@ Two further observations; the first is decided, the second stays with the owner:
   `tests/internal/execution_boundary_test.py::test_a_mixed_batch_that_was_not_accepted_is_sent_again_whole`,
   `tests/internal/execution_boundary_test.py::test_commands_refused_by_their_own_transient_error_are_sent_again_alone`,
   `tests/internal/execution_boundary_test.py::test_a_command_refused_on_every_round_keeps_its_error_once_the_attempt_budget_is_spent`,
-  `tests/internal/execution_boundary_test.py::test_a_fail_fast_batch_is_never_split_for_a_replay`, and
+  `tests/internal/execution_boundary_test.py::test_a_fail_fast_batch_is_never_split_for_a_replay`,
+  `tests/internal/execution_boundary_test.py::test_a_configured_retry_code_or_status_does_not_prove_an_unsafe_request_never_ran`,
+  `tests/internal/execution_boundary_test.py::test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budget_stops_the_next_attempt`,
+  `tests/internal/execution_boundary_test.py::test_a_batch_answered_after_the_time_budget_reports_its_unsafe_command_unknown`,
+  `tests/internal/execution_boundary_test.py::test_replay_rounds_and_the_retries_inside_them_share_one_attempt_budget`,
+  `tests/internal/execution_boundary_test.py::test_replay_rounds_share_the_retry_time_budget_measured_from_the_first_send`, and
   `tests/execution_test.py::test_unsafe_operation_time_limit_waits_for_the_method_and_replays`.
   Migration item 9 states it.
 - **HTTPX logging on injected clients.** Two W2 gaps remain: the httpcore DEBUG record of a

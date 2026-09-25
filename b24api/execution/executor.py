@@ -74,6 +74,20 @@ class _ParsedBody:
     failure: ValueError | None
 
 
+@dataclass(slots=True)
+class _RequestAttempts:
+    """Attempts and retry clock one request shares across its sends, including a batch's replay rounds."""
+
+    started: float | None = None
+    used: int = 0
+
+    def begin(self, clock: Clock) -> tuple[float, int]:
+        """Start the retry clock on the first send and return it with the attempts already spent."""
+        if self.started is None:
+            self.started = clock()
+        return self.started, self.used
+
+
 class _DecodedJsonObject(dict[str, object]):
     """Last-member-wins JSON object retaining duplicate-name evidence."""
 
@@ -145,6 +159,7 @@ class Executor:
         work_class: WorkClass = WorkClass.INTERACTIVE_DIRECT,
         strict_json_members: bool = False,
         _admission_methods: frozenset[str] | None = None,
+        _attempts: _RequestAttempts | None = None,
     ) -> Response:
         """Execute one canonical request."""
         if context is not None and policy is not None:
@@ -154,13 +169,21 @@ class Executor:
         if not isinstance(strict_json_members, bool):
             raise TypeError("strict_json_members must be a boolean")
         context = context or self.context(policy)
-        wire, parsed = await self._execute_wire(
-            request,
-            context=context,
-            work_class=work_class,
-            mode=_BodyMode.JSON_STRICT_MEMBERS if strict_json_members else _BodyMode.JSON,
-            methods=_admission_methods or frozenset({request.method}),
-        )
+        attempts = _attempts or _RequestAttempts()
+        spent = attempts.used
+        try:
+            wire, parsed = await self._execute_wire_attempts(
+                request,
+                context=context,
+                work_class=work_class,
+                mode=_BodyMode.JSON_STRICT_MEMBERS if strict_json_members else _BodyMode.JSON,
+                methods=_admission_methods or frozenset({request.method}),
+                shared=attempts,
+            )
+        except BaseException as error:
+            if attempts.used > spent:
+                _mark_dispatch_started(error)
+            raise
         try:
             response = _decode_success(wire, parsed, request_summary=request.summary)
             _raise_embedded_result_error(
@@ -189,47 +212,24 @@ class Executor:
         if not isinstance(request, Request):
             raise TypeError("request must be canonical Request")
         context = context or self.context(policy)
-        wire, _parsed = await self._execute_wire(
-            request,
-            context=context,
-            work_class=work_class,
-            mode=_BodyMode.BINARY,
-            methods=frozenset({request.method}),
-        )
+        attempts = _RequestAttempts()
+        try:
+            wire, _parsed = await self._execute_wire_attempts(
+                request,
+                context=context,
+                work_class=work_class,
+                mode=_BodyMode.BINARY,
+                methods=frozenset({request.method}),
+                shared=attempts,
+            )
+        except BaseException as error:
+            if attempts.used:
+                _mark_dispatch_started(error)
+            raise
         content_type = wire.content_type
         digest = hashlib.sha256(wire.body).hexdigest() if context.policy.binary_digest else None
         evidence = BinaryEvidence(wire.status_code, content_type, wire.byte_length, digest)
         return BinaryResponse(wire.body, content_type=content_type, evidence=evidence)
-
-    async def _execute_wire(
-        self,
-        request: Request,
-        *,
-        context: ExecutionContext,
-        work_class: WorkClass,
-        mode: _BodyMode,
-        methods: frozenset[str],
-    ) -> tuple[WireResponse, _ParsedBody | None]:
-        """Attach request-local dispatch evidence to every escaping failure."""
-        dispatch_started = False
-
-        def mark_dispatch_started() -> None:
-            nonlocal dispatch_started
-            dispatch_started = True
-
-        try:
-            return await self._execute_wire_attempts(
-                request,
-                context=context,
-                work_class=work_class,
-                mode=mode,
-                methods=methods,
-                on_dispatch=mark_dispatch_started,
-            )
-        except BaseException as error:
-            if dispatch_started:
-                _mark_dispatch_started(error)
-            raise
 
     async def _execute_wire_attempts(  # noqa: C901, PLR0913, PLR0915
         self,
@@ -239,15 +239,14 @@ class Executor:
         work_class: WorkClass,
         mode: _BodyMode,
         methods: frozenset[str],
-        on_dispatch: Callable[[], None],
+        shared: _RequestAttempts,
     ) -> tuple[WireResponse, _ParsedBody | None]:
-        """Run the shared attempt loop and return one conclusive raw response."""
+        """Run the attempt loop and return one conclusive raw response; ``shared`` counts every dispatch."""
         self.preflight_request(request)
         wire_request = WireRequest(request) if self._wire_transport is not None else None
         await _checkpoint_pending_cancellation()
         await context.start()
-        retry_started = self._clock()
-        attempts = 0
+        retry_started, attempts = shared.begin(self._clock)
         last_error: B24ApiError | None = None
         while True:
             if (remaining := context.remaining_time(retry_started=retry_started)) <= 0:
@@ -266,7 +265,7 @@ class Executor:
                     if remaining <= 0:
                         raise BudgetExceededError("execution time budget exhausted before dispatch")
                     await context.reserve_attempt(attempts_for_request=attempts, retry_started=retry_started)
-                    on_dispatch()
+                    shared.used = attempts + 1
                     try:
                         async with asyncio.timeout(remaining):
                             wire = await send_transport(
@@ -384,13 +383,18 @@ class Executor:
         return response_error, parsed
 
     async def pause_before_replay(
-        self, context: ExecutionContext, *, rounds: int, started: float, method_cooldown: float = 0.0
+        self, context: ExecutionContext, *, attempts: _RequestAttempts, method_cooldown: float = 0.0
     ) -> bool:
-        """Wait before sending part of a physical batch again; ``False`` when the budget forbids another round."""
-        if rounds >= context.policy.max_attempts_per_request:
+        """Wait before sending part of a physical batch again; ``False`` when the budget forbids another round.
+
+        The round spends the same attempt and retry-time budget as the sends before it.
+        """
+        if attempts.started is None or attempts.used >= context.policy.max_attempts_per_request:
             return False
-        delay = max(_retry_delay(context.policy, retry_number=rounds, random_source=self._random), method_cooldown)
-        if delay >= context.remaining_time(retry_started=started):
+        delay = max(
+            _retry_delay(context.policy, retry_number=attempts.used, random_source=self._random), method_cooldown
+        )
+        if delay >= context.remaining_time(retry_started=attempts.started):
             return False
         await context.record_retry()
         # The coordinator holds the next permit until a method cooldown ends, as for a direct retry.
@@ -472,8 +476,7 @@ def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: Execution
     if isinstance(error, TransportError):
         return error.retryable and (not error.possible_acceptance or safety is ReplaySafety.SAFE)
     if isinstance(error, ApiResponseError):
-        # A transient Bitrix refusal (a request or time quota) answers before the method runs.
-        return error.retryable
+        return error.retryable and (safety is ReplaySafety.SAFE or _refused_before_running(error, policy))
     transient = (
         isinstance(error, HTTPGatewayError)
         and not isinstance(error, EnvelopeContractError)
@@ -481,10 +484,19 @@ def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: Execution
         and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
         and error.http_status in policy.retry.transient_http_statuses
     )
-    # A transient status outside the ambiguous set (423, 425, 429 by default) means the request was not accepted.
+    # Only a listed refusal status (423, 425, 429 by default) proves the request was not accepted.
     return transient and (
-        safety is ReplaySafety.SAFE or error.http_status not in policy.ambiguity.ambiguous_unstructured_statuses
+        safety is ReplaySafety.SAFE
+        or (
+            error.http_status in policy.ambiguity.refusal_http_statuses
+            and error.http_status not in policy.ambiguity.ambiguous_unstructured_statuses
+        )
     )
+
+
+def _refused_before_running(error: ApiResponseError, policy: ExecutionPolicy) -> bool:
+    """Return whether Bitrix answered with a listed refusal (a request or time quota by default) before running."""
+    return str(error.original_code).strip().casefold() in policy.ambiguity.refusal_api_codes
 
 
 def _resolve_optional_path(value: object, path: tuple[str | int, ...]) -> tuple[bool, object]:

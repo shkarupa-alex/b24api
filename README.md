@@ -89,10 +89,13 @@ may already have reached Bitrix:
 | `UNKNOWN` | The caller has not established whether replay is safe. This is the default. | Same conservative behavior as `UNSAFE`, while diagnostics preserve that safety was unknown rather than known unsafe. |
 
 A failure that proves the request did not run is retried whatever its safety: a transport failure
-before dispatch, an unstructured 423, 425 or 429, or a `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT`
-refusal. A physical batch applies these rules to each command: after a failure, only the commands that
+before dispatch, or a refusal listed in `AmbiguityPolicy`, which by default is an unstructured 423, 425
+or 429 (`refusal_http_statuses`) or a `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT` refusal
+(`refusal_api_codes`). A code or status added only to `RetryPolicy` is retried for `SAFE` work alone.
+A physical batch applies these rules to each command: after a failure, only the commands that
 may run again are sent again, in a smaller batch, and an `UNSAFE` command of a batch that may have run
-arrives as unknown. Method names never imply safety;
+arrives as unknown. Replay rounds spend the same attempt and retry-time budget as the sends before
+them. Method names never imply safety;
 mark a request `SAFE` only when the operation's semantics justify it.
 
 Use `ExecutionPolicy` to narrow attempts or resource budgets for one operation:

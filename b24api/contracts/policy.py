@@ -120,16 +120,29 @@ class AmbiguityReason(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class AmbiguityPolicy:
-    """Unstructured statuses that do not prove non-execution."""
+    """Which failures prove that a request did not run, and which prove nothing.
+
+    Only a refusal listed here lets UNSAFE or UNKNOWN work run again, and a status that is also ambiguous stays
+    ambiguous; the retry policy's transient sets decide whether a failure is worth retrying at all, which is enough
+    for SAFE work.
+    """
 
     ambiguous_unstructured_statuses: frozenset[int] = frozenset({408, *range(500, 600)})
+    refusal_http_statuses: frozenset[int] = frozenset({423, 425, 429})
+    refusal_api_codes: frozenset[str] = frozenset({"query_limit_exceeded", "operation_time_limit"})
 
     def __post_init__(self) -> None:
-        """Validate and freeze the status set."""
+        """Validate and freeze the status and code sets."""
         object.__setattr__(self, "ambiguous_unstructured_statuses", frozenset(self.ambiguous_unstructured_statuses))
+        object.__setattr__(self, "refusal_http_statuses", frozenset(self.refusal_http_statuses))
+        object.__setattr__(
+            self,
+            "refusal_api_codes",
+            frozenset(str(code).strip().casefold() for code in self.refusal_api_codes),
+        )
         if any(
             not _is_plain_int(status) or status < HTTP_STATUS_MINIMUM or status > HTTP_STATUS_MAXIMUM
-            for status in self.ambiguous_unstructured_statuses
+            for status in (*self.ambiguous_unstructured_statuses, *self.refusal_http_statuses)
         ):
             raise ValueError("ambiguity HTTP statuses must be between 100 and 599")
 
