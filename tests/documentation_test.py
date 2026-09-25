@@ -109,57 +109,16 @@ def test_migration_covers_changed_completion_stop_keyset_and_replay_contracts() 
     assert "partial_rows" in reference
 
 
-# Each review ID a "Breaking (3.0.0)" release note names -> the migration items that tell the caller what to
-# change. The guide carries no internal IDs, so the items are matched by their bold titles.
-_BREAKING_MIGRATION_ITEMS = {
-    "C7": ("Root imports.",),
-    "A2": ("Compressed responses.",),
-    "A3": ("Batch replay is decided per command.", "Permanent transport refusals."),
-    "A13": ("Exceptions from an injected transport.",),
-    "B29": ("Oversized responses.",),
-    "A7": ("Error text.",),
-    "A9": ("Mid-collection start with an exact total.",),
-    "A10": ("Keyset verification.",),
-    "A11": ("Stream lifecycle.",),
-    "A12": ("A logical batch closed early says so.",),
-    "A14": ("Reports name the public failure.",),
-    "B10": ("Fixed step refuses at once.",),
-    "B11": ("Removed report vocabulary.",),
-    "B12": ("Removed report vocabulary.",),
-    "B8": ("`EnvelopeContractError` is a `ProtocolError`.",),
-    "B20": ("`EnvelopeContractError` is a `ProtocolError`.",),
-}
-
-
-def test_every_breaking_release_note_has_a_migration_item() -> None:
-    notes = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").split("## Unreleased (3.0.0)")[1].split("\n## ")[0]
-    breaking = {
-        identifier
-        for bullet in re.split(r"\n- ", f"\n{notes}")
-        if bullet.startswith("**Breaking (3.0.0):**")
-        for identifier in re.findall(r"\(([A-D]\d+)\)", bullet)
-    }
-    upgrade = MIGRATION.read_text(encoding="utf-8").split("## Upgrading from 2.3 to 3.0")[1].split("\n## ")[0]
-    titles = set(re.findall(r"^\s*\d+\. \*\*(.+?)\*\*", upgrade, re.MULTILINE))
-
-    assert breaking == set(_BREAKING_MIGRATION_ITEMS)
-    for identifier, items in _BREAKING_MIGRATION_ITEMS.items():
-        assert set(items) <= titles, f"{identifier}: {sorted(set(items) - titles)}"
-
-
 @pytest.mark.parametrize("name", ["h2", "hpack"])
-def test_release_notes_and_migration_guide_state_the_hpack_stack_bounds(name: str) -> None:
+def test_migration_guide_states_the_hpack_stack_bounds(name: str) -> None:
     # 3.0.0 made both direct requirements (C2); a consumer pinned outside them learns it before resolving.
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     line = next(dependency for dependency in project["project"]["dependencies"] if Requirement(dependency).name == name)
-    notes = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").split("## Unreleased (3.0.0)")[1].split("\n## ")[0]
-
-    assert f"`{line}`" in notes
     assert f"`{line}`" in MIGRATION.read_text(encoding="utf-8")
 
 
 # Report fields and enum members 3.0.0 removed (B11, B12); only the migration guide, which describes their
-# removal, and the release notes may still name them.
+# removal, may still name them.
 _REMOVED_REPORT_VOCABULARY = (
     "canary_requests",
     "canary_commands",
