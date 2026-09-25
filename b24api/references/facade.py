@@ -2,8 +2,8 @@
 
 # ruff: noqa: PLR0913 - bounded orchestration adapter
 from __future__ import annotations
-from collections.abc import AsyncIterator, Callable
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Literal, Protocol, Self, cast
 
 from b24api.completion.operation_stream import MappedOperationStream
 from b24api.contracts.dispatch import DirectDispatch, DispatchSpec
@@ -77,11 +77,19 @@ type KernelReferenceEvent = KernelReferenceItem | KernelReferenceFailure | _Kern
 type Deregister = Callable[[object], None]
 
 
-class ReferenceKernelStream(AsyncIterator[KernelReferenceEvent], Protocol):
+class ReferenceKernelStream(Protocol):
     """Narrow structural view of the reference scheduler output."""
 
     report: KernelReport
     active_references_high_water: int
+
+    def __aiter__(self) -> Self:
+        """Return this iterator."""
+        ...
+
+    async def __anext__(self) -> KernelReferenceEvent:
+        """Return the next event."""
+        ...
 
     async def aclose(self) -> None:
         """Close scheduler-owned resources."""

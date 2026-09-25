@@ -192,7 +192,9 @@ async def test_iter_cursors_normalizes_independent_seeds_and_keeps_correlation_o
     assert [event.row_count for event in completions] == [2, 2]
     assert items[0].correlation is correlations[0]
     assert items[-1].correlation is correlations[1]
-    initial = {str(command["parent"]): int(command["after"]) for command in transport.commands[:2]}
+    initial: dict[str, int] = {}
+    for command in transport.commands:
+        initial.setdefault(str(command["parent"]), int(command["after"]))
     assert initial == {"a": 2, "b": 10}
     wire = "".join(request.summary.method for request in transport.requests) + repr(transport.requests)
     assert "alpha" not in wire

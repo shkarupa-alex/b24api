@@ -1,9 +1,9 @@
 """Bounded independent command fan-out over direct or physical-batch dispatch."""
 
 from __future__ import annotations
-from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterable, Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, Self, cast
 
 from b24api._sources import OwnedSource
 from b24api.completion.operation_stream import MappedOperationStream
@@ -40,11 +40,19 @@ type KernelFanOutEvent = _KernelFanOutSuccess | KernelReferenceFailure
 type Deregister = Callable[[object], None]
 
 
-class FanOutKernelStream(AsyncIterator[KernelFanOutEvent], Protocol):
+class FanOutKernelStream(Protocol):
     """Narrow structural view of the independent scheduler output."""
 
     report: KernelReport
     active_references_high_water: int
+
+    def __aiter__(self) -> Self:
+        """Return this iterator."""
+        ...
+
+    async def __anext__(self) -> KernelFanOutEvent:
+        """Return the next event."""
+        ...
 
     async def aclose(self) -> None:
         """Close scheduler-owned resources."""

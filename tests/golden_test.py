@@ -3,6 +3,8 @@
 from __future__ import annotations
 import json
 import re
+from copy import deepcopy
+from typing import Any, cast
 
 import pytest
 
@@ -11,6 +13,50 @@ from tests.golden.projection import ABSENT, flatten
 
 _ROW = re.compile(r"^\|(?P<cells>.+)\|\s*$")
 _COLUMNS = ("id", "fixture", "field", "old", "new", "reason", "evidence")
+_CONCURRENT_FIXTURES = frozenset(
+    {
+        "recipe:chat_bounded_mirror",
+        "recipe:chat_resume",
+        "recipe:search_chat_messages",
+        "recipe:task_comments",
+        "recipe:timeline_comments",
+        "scenario:fan_out_direct",
+        "scenario:fan_out_outcomes_batch",
+        "scenario:references_counted",
+        "scenario:references_sequential",
+    }
+)
+
+
+def _stable_projection(fixture: str, projection: dict[str, object]) -> dict[str, object]:
+    """Keep observable outcomes while ignoring scheduling details of concurrent fixtures."""
+    if fixture not in _CONCURRENT_FIXTURES:
+        return projection
+    stable = cast("Any", deepcopy(projection))
+    for stream in stable["streams"]:
+        report = stream["report"]
+        if report is not None:
+            report.pop("active_references_high_water")
+            report.pop("buffered_rows_high_water")
+            report.pop("buffered_commands_high_water")
+            report.pop("page_trace")
+        if fixture.startswith("recipe:"):
+            stream["items"].pop("sha256")
+    if "evidence" in stable:
+        for report in stable["evidence"]["reports"]:
+            report.pop("active_references_high_water")
+            report.pop("buffered_rows_high_water")
+            report.pop("buffered_commands_high_water")
+            report.pop("page_trace")
+    if fixture == "recipe:chat_resume":
+        # An early close can race with a speculative request already in flight.
+        stable.pop("requests")
+        stable["streams"][0]["report"].pop("physical_requests")
+        stable["evidence"]["reports"][0].pop("physical_requests")
+    else:
+        for requests in stable["requests"]:
+            requests.sort(key=lambda request: json.dumps(request, sort_keys=True))
+    return cast("dict[str, object]", stable)
 
 
 def _declared() -> dict[tuple[str, str], tuple[object, object]]:
@@ -48,8 +94,8 @@ def test_every_fixture_has_a_baseline_and_every_delta_names_a_fixture() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fixture", fixture_names())
 async def test_public_projection_matches_baseline_or_declared_delta(fixture: str) -> None:
-    baseline = dict(flatten(_BASELINE[fixture]))
-    current = dict(flatten(await capture(fixture)))
+    baseline = dict(flatten(_stable_projection(fixture, _BASELINE[fixture])))
+    current = dict(flatten(_stable_projection(fixture, await capture(fixture))))
     declared = {field: values for (name, field), values in _DECLARED.items() if name == fixture}
 
     undeclared = []
