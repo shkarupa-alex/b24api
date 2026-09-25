@@ -578,12 +578,13 @@ Projects moving from an earlier API surface can use [docs/migration.md](https://
 
 ```console
 uv sync --frozen
-.venv/bin/pytest -q -p no:cacheprovider
-.venv/bin/ruff check . --no-fix --no-cache
-.venv/bin/ruff format --check . --no-cache
-.venv/bin/mypy --strict b24api tools/b24api_evidence
+make qc
 git diff --check
 ```
+
+`make qc` runs the lint, type and default test checks that CI blocks on. It leaves out the internal
+benches (the pytest marker `slow`: the evidence harness contracts and the 50k/100k-scale runs, which
+take several minutes). `make bench` runs them, and so does the blocking CI job `slow`.
 
 The wheel regression installs into an isolated environment, executes the `b24api` entry point and
 checks that tests, live/evidence tooling and credentials are excluded.

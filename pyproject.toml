@@ -116,7 +116,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers", "-m", "not slow and not benchmark"]
 markers = [
-    "slow: long harness and 100k-scale runs; excluded by default, run by the blocking CI slow job",
+    "slow: internal benches that are always slow (harness contracts, 50k/100k-scale runs); excluded by default, run by make bench and the blocking CI slow job",
     "benchmark: wall-clock measurements recorded with record_property; never part of a blocking gate",
 ]
 asyncio_default_fixture_loop_scope = "function"

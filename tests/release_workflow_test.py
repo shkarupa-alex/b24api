@@ -461,6 +461,35 @@ def test_httpx_latest_is_non_blocking_evidence_on_the_latest_httpx() -> None:
     assert not any(job.get("continue-on-error") for name, job in jobs.items() if name != "httpx-latest")
 
 
+def _make_targets() -> dict[str, tuple[list[str], list[str]]]:
+    targets: dict[str, tuple[list[str], list[str]]] = {}
+    recipe: list[str] = []
+    for line in (ROOT / "Makefile").read_text(encoding="utf-8").splitlines():
+        if line.startswith("\t"):
+            recipe.append(line.strip())
+        elif ":" in line and not line.startswith(("#", ".")):
+            name, prerequisites = line.split(":", 1)
+            recipe = []
+            targets[name.strip()] = (prerequisites.split(), recipe)
+    return targets
+
+
+def test_local_qc_leaves_out_the_internal_benches_that_the_slow_job_runs() -> None:
+    targets = _make_targets()
+
+    assert targets["qc"] == (["lint", "types", "test"], [])
+    assert targets["lint"][1] == ["uv run --locked ruff check --no-fix", "uv run --locked ruff format --check"]
+    assert targets["types"][1] == [
+        "uv run --locked mypy b24api",
+        "uv run --locked python .github/scripts/mypy_ratchet.py",
+    ]
+    # The default addopts leave out the benches, so `test` must not override the marker selection.
+    assert targets["test"][1] == ["uv run --locked pytest"]
+    assert '"-m", "not slow and not benchmark"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert targets["bench"][1] == ["uv run --locked pytest -m slow"]
+    assert "make bench" in _runs("slow")
+
+
 def test_blocking_jobs_run_the_specified_checks() -> None:
     jobs = _ci_jobs()
 
@@ -473,7 +502,7 @@ def test_blocking_jobs_run_the_specified_checks() -> None:
     assert "--resolution lowest-direct" in _runs("min-deps")
     assert "-m pytest" in _runs("min-deps")
     assert "not slow" not in _runs("min-deps")
-    assert "pytest -m slow" in _runs("slow")
+    assert "make bench" in _runs("slow")
     assert "uv build --wheel" in _runs("wheel-typing")
     assert "python .github/scripts/verify_release.py wheel" in _runs("wheel-typing")
     assert "cp tests/typing_smoke/app.py" in _runs("wheel-typing")

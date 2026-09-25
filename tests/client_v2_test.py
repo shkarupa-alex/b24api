@@ -229,6 +229,7 @@ async def test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_of
     assert stream.report.buffered_commands_high_water == LOGICAL_BATCH_SIZE
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_public_counted_traversal_above_100k_uses_declared_identity_budget() -> None:
     def page(start: int) -> list[dict[str, int]]:
@@ -318,6 +319,7 @@ async def test_counted_identity_budget_stops_before_admitting_an_overflow_page()
     assert stream.report.emitted == PAGE_SIZE
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_public_keyset_above_100k_uses_monotonic_progression_without_identity_set() -> None:
     page_size = 2_500

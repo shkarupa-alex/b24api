@@ -1774,6 +1774,7 @@ async def test_rejected_finish_page_records_selected_and_discarded_rows() -> Non
     assert stream.report.keyset_execution.probe_rows_discarded == 2
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_default_partitioned_streams_selection_larger_than_row_buffer() -> None:
     identities = tuple(range(1, 50_001))

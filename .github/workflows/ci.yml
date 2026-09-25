@@ -125,8 +125,8 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
-      - name: Run the slow suite
-        run: uv run --locked pytest -m slow
+      - name: Run the internal benches, which local QC leaves out
+        run: make bench
 
   httpx-latest:
     # Non-blocking evidence for the httpx pin decision (C2): the logging-shield matrix on the
