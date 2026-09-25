@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, cast
 from b24api.contracts.json import FrozenJson, FrozenMapping, _json_type_name
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.request import ResultSelector
-from b24api.contracts.response import ResultCollectionShape
+from b24api.contracts.response import ResultCollectionShape, result_snapshot
 from b24api.errors import CapabilityError, PaginationError, ResultShapeError
 
 if TYPE_CHECKING:
@@ -55,7 +55,7 @@ def _mapping_values(response: Response, selector: ResultSelector) -> tuple[Froze
 
 def _selected_value(response: Response, selector: ResultSelector) -> FrozenJson:
     """Resolve a declared selector or fail without exposing response values."""
-    selected = response._frozen_result()  # noqa: SLF001 - validate the immutable transport snapshot
+    selected = result_snapshot(response)
     for part in selector.path:
         if isinstance(part, str):
             if not isinstance(selected, Mapping) or part not in selected:
@@ -71,7 +71,7 @@ def _selected_value(response: Response, selector: ResultSelector) -> FrozenJson:
 def _response_items(response: Response, selector: ResultSelector, *, single: bool = False) -> tuple[FrozenJson, ...]:
     if isinstance(selector, _MappingValuesResultSelector):
         return _mapping_values(response, selector)
-    frozen_result = response._frozen_result()  # noqa: SLF001 - avoid whole-result thaw
+    frozen_result = result_snapshot(response)
     if single and selector.path == () and not isinstance(frozen_result, tuple):
         return (frozen_result,)
     selected = _selected_value(response, selector)
@@ -87,7 +87,7 @@ def _response_items(response: Response, selector: ResultSelector, *, single: boo
 def _mapping_shape_degraded(response: Response, selector: ResultSelector) -> bool:
     if not isinstance(selector, _TolerantMappingValuesResultSelector):
         return False
-    selected = response._frozen_result()  # noqa: SLF001 - avoid a second whole-result thaw
+    selected = result_snapshot(response)
     for part in selector.path:
         if isinstance(part, str):
             if not isinstance(selected, Mapping) or part not in selected:

@@ -7,11 +7,11 @@ import pytest
 from b24api.contracts.policy import IdentityCoercion, IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.contracts.request import ParameterPath
 from b24api.traversal.plans import (
-    BatchDispatch,
     CountedOffsetMode,
     CountedOffsetPlan,
-    DirectDispatch,
     ItemCursorPlan,
+    KernelBatchDispatch,
+    KernelDirectDispatch,
     KeysetPlan,
     OffsetSequentialPlan,
     OffsetTerminalRule,
@@ -129,9 +129,9 @@ def test_item_cursor_validates_identity_and_cursor_shape() -> None:
 
 
 def test_dispatch_limits_validate_before_execution() -> None:
-    assert BatchDispatch(batch_size=PAGE_SIZE).batch_size == PAGE_SIZE
-    assert DirectDispatch(concurrency=1).concurrency == 1
+    assert KernelBatchDispatch(batch_size=PAGE_SIZE).batch_size == PAGE_SIZE
+    assert KernelDirectDispatch(concurrency=1).concurrency == 1
     with pytest.raises(ValueError, match="batch_size"):
-        BatchDispatch(batch_size=51)
+        KernelBatchDispatch(batch_size=51)
     with pytest.raises(ValueError, match="concurrency"):
-        DirectDispatch(concurrency=0)
+        KernelDirectDispatch(concurrency=0)

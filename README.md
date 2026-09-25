@@ -1,4 +1,4 @@
-# b24api 2.x
+# b24api 3.x
 
 `b24api` is a thin asynchronous Bitrix24 REST client for Python 3.12+. It knows how to send
 requests, split logical batches, traverse lists, retry safely, preserve caller correlation and
@@ -15,16 +15,42 @@ export BITRIX24_API_WEBHOOK_URL='https://portal.example/rest/.../'
 Keep the webhook out of source, logs and command arguments. Reuse one client for a related unit of
 work so its HTTP/2 connection pool and rate state are reused.
 
-<!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
-```python
-from b24api import Bitrix24, Request, RouteKind
+## Quickstart
 
-async with Bitrix24() as client:
-    profile = await client.call(Request("profile", route=RouteKind.BARE))
+<!-- tested: tests/readme_test.py::test_quickstart_runs_exactly_against_a_scripted_portal -->
+```python
+import os
+
+from b24api import Bitrix24, Request
+
+async with Bitrix24.from_webhook(os.environ["BITRIX24_API_WEBHOOK_URL"]) as client:
+    deals = client.iter_list(Request.bare("crm.deal.list", {"select": ["ID", "TITLE"]}))
+    async for deal in deals:
+        print(deal["ID"], deal["TITLE"])
+    print(deals.report.state)
 ```
 
-The client owns its default transport. An injected transport remains caller-owned. `aclose()` is
-idempotent and closes active streams before the owned transport.
+Four things are at work:
+
+- **The client.** `Bitrix24.from_webhook()` checks the URL and owns the connection pool it opens;
+  `async with` closes it. `Bitrix24()` reads the same URL from the environment.
+- **The request.** `Request.bare()` names a REST method and its parameters and sends them to the
+  classic `/rest/` endpoint. The route is always explicit: `Request.v3()` targets the V3 API.
+- **`iter_list()`.** It walks the list page by page and reads one more, empty, page to confirm
+  the end.
+- **The report.** `deals.report` says how the traversal ended. `completed` means every page was
+  read; a traversal that stops early or fails records why.
+
+A single call returns the decoded `result`:
+
+<!-- tested: tests/readme_test.py::test_quickstart_runs_exactly_against_a_scripted_portal -->
+```python
+users = await client.call(Request.bare("user.get", {"ID": 1}))
+```
+
+The client owns the transport it creates. An injected transport remains caller-owned. `aclose()` is
+idempotent and closes active streams before the owned transport. To prove that no row is missing or
+repeated, give the traversal an identity (see [Choosing a list operation](#choosing-a-list-operation)).
 
 ## Direct calls
 
@@ -59,10 +85,17 @@ may already have reached Bitrix:
 | Value | Meaning | After possible dispatch |
 |---|---|---|
 | `SAFE` | Repeating the request cannot create a second business effect. Typical reads and explicitly idempotent operations belong here. | Automatic retry is allowed within policy budgets. |
-| `UNSAFE` | Repeating the request is known to risk a duplicate effect, for example creating an entity without an idempotency key. | No automatic replay; the caller receives an ambiguous-execution error and reconciles state. |
+| `UNSAFE` | Repeating the request is known to risk a duplicate effect, for example creating an entity without an idempotency key. | No automatic replay; the caller receives an ambiguous-execution error and reconciles state. It is retried only when the failure proves it did not run. |
 | `UNKNOWN` | The caller has not established whether replay is safe. This is the default. | Same conservative behavior as `UNSAFE`, while diagnostics preserve that safety was unknown rather than known unsafe. |
 
-A failure proved to occur before dispatch may still be retried. Method names never imply safety;
+A failure that proves the request did not run is retried whatever its safety: a transport failure
+before dispatch, or a refusal listed in `AmbiguityPolicy`, which by default is an unstructured 423, 425
+or 429 (`refusal_http_statuses`) or a `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT` refusal
+(`refusal_api_codes`). A code or status added only to `RetryPolicy` is retried for `SAFE` work alone.
+A physical batch applies these rules to each command: after a failure, only the commands that
+may run again are sent again, in a smaller batch, and an `UNSAFE` command of a batch that may have run
+arrives as unknown. Replay rounds spend the same attempt and retry-time budget as the sends before
+them. Method names never imply safety;
 mark a request `SAFE` only when the operation's semantics justify it.
 
 Use `ExecutionPolicy` to narrow attempts or resource budgets for one operation:
@@ -72,6 +105,22 @@ Use `ExecutionPolicy` to narrow attempts or resource budgets for one operation:
 from b24api import ExecutionPolicy
 
 one_attempt = ExecutionPolicy(max_attempts_per_request=1)
+result = await client.call(request, policy=one_attempt)
+```
+
+A `policy=` argument replaces the client's default policy wholesale; fields are never merged. The
+client default is `ExecutionPolicy.from_settings(settings)`: the library defaults with
+`max_retry_elapsed_per_request` taken from `Settings.http_timeout` (30 s by default, while a bare
+`ExecutionPolicy()` allows 120 s). To change one field and keep the configured timeout, derive the
+per-call policy from that default:
+
+<!-- tested: tests/settings_test.py::test_a_per_call_policy_replaces_the_client_default_without_merging -->
+```python
+import dataclasses
+
+from b24api import ExecutionPolicy
+
+one_attempt = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_attempts_per_request=1)
 result = await client.call(request, policy=one_attempt)
 ```
 
@@ -88,7 +137,7 @@ matching a result to the object, file, chat or database row that produced its re
 <!-- tested: tests/client_v2_test.py::test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_off_wire -->
 ```python
 from b24api import RouteKind
-from b24api import Command, CommandSuccess
+from b24api.contracts import Command, CommandSuccess
 
 commands = (
     Command(
@@ -109,7 +158,7 @@ async with client.batch(commands, batch_size=25) as stream:
 
 <!-- tested: tests/client_v2_test.py::test_batch_outcomes_retains_typed_failure_without_halting_later_commands -->
 ```python
-from b24api import CommandFailure, CommandNotExecuted, CommandOutcomeUnknown
+from b24api.contracts import CommandFailure, CommandNotExecuted, CommandOutcomeUnknown
 
 async with client.batch_outcomes(commands) as stream:
     async for outcome in stream:
@@ -142,7 +191,16 @@ exact `limit_path`; the client never guesses method-specific parameter names.
 
 ### List traversal comparison
 
-![List traversal comparison](list-traversal-comparison.svg)
+![List traversal comparison](https://raw.githubusercontent.com/shkarupa-alex/b24api/master/list-traversal-comparison.svg)
+
+The animation replays traces executed against a scripted portal with 1,000 dense IDs at 50 rows
+per page. `iter_list` sends 20 pages and one empty confirmation (21 HTTP). `iter_list_counted` sends
+the head and one batch of 19 pages (2 HTTP). `iter_list_keyset` in auto mode selects range
+execution: it reads both ends of the range in one batch, the 19 ranges between them in a second, and
+confirms the end with one call for `ID > 1000` (3 HTTP). A `BoundedIdentityRange` with a qualified
+upper ID needs no confirmation: sequential execution stops when it receives that ID. On a real portal
+auto chooses from the observed geometry, so the plan and its request count can differ; the report's
+`keyset_selection` says which plan ran.
 
 ### Sequential offset
 
@@ -187,7 +245,7 @@ sequence and records that degradation in the operation report.
 <!-- tested: tests/client_findings_3_test.py::test_shape_rejection_is_retained_as_zero_admission_page_evidence -->
 ```python
 from b24api import RouteKind
-from b24api import ResultCollectionShape
+from b24api.contracts import ResultCollectionShape
 
 stream = client.iter_list(
     Request("example.dictionary.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
@@ -253,8 +311,10 @@ Static incompatibility with the auto contract raises `CapabilityError` from the
 `iter_list_keyset(...)` call before iteration begins. A portal that accepts but contradicts the
 declared controls fails before emission with `IncompleteTraversalError`; auto never restarts that
 operation silently. `KeysetTraversal` inside reference traversal remains sequential-only. The
-terminal report now includes `keyset_execution` for omitted-execution keyset calls so consumers can
-see the requested and selected plan.
+terminal report carries a compact `keyset_selection` (`requested_kind`, `selected_kind`, `reason`)
+for every keyset traversal. A `page_stop` callback needs the ordered page stream, so auto reports
+`AUTO`, `SEQUENTIAL`, `PAGE_STOP`; an explicit `SequentialKeysetExecution()` reports
+`EXPLICIT_SEQUENTIAL`. The detailed `keyset_execution` report is present only when the fast path ran.
 
 Use `await client.verify_keyset_capability(...)` as a development/CI/staging guard on a stable
 representative fixture. It performs five strict-bound checks and returns only a `VERIFIED` report;
@@ -335,10 +395,10 @@ boundary, use an application-owned direct-call workflow or supply a unique tie-b
 For multiple parent-bound cursor chains, `iter_cursors()` keeps cursor progress and correlation
 isolated per binding while ready pages share the physical batch queue.
 
-![Cursor batching across independent chats](cursor-batching.svg)
+![Cursor batching across independent chats](https://raw.githubusercontent.com/shkarupa-alex/b24api/master/cursor-batching.svg)
 
-See [architecture](docs/architecture.md), [migration](docs/migration.md),
-[performance](docs/performance.md), and [endpoint recipes](docs/recipes.md) for the complete
+See [architecture](https://github.com/shkarupa-alex/b24api/blob/master/docs/architecture.md), [migration](https://github.com/shkarupa-alex/b24api/blob/master/docs/migration.md),
+[performance](https://github.com/shkarupa-alex/b24api/blob/master/docs/performance.md), and [endpoint recipes](https://github.com/shkarupa-alex/b24api/blob/master/docs/recipes.md) for the complete
 contracts and selection guidance.
 
 ### One list method across many parent entities
@@ -347,20 +407,13 @@ contracts and selection guidance.
 client remains unaware of entity types: a binding can represent a deal, lead, chat or any other
 caller-defined parent.
 
-![Reference batching across leads and deals](references-batching.svg)
+![Reference batching across leads and deals](https://raw.githubusercontent.com/shkarupa-alex/b24api/master/references-batching.svg)
 
 <!-- tested: tests/client_v2_test.py::test_bound_references_apply_nested_updates_off_wire_and_emit_exact_completion -->
 ```python
 from b24api import RouteKind
-from b24api import (
-    BatchDispatch,
-    Binding,
-    ParameterPath,
-    ParameterUpdate,
-    ReferenceComplete,
-    ReferenceItem,
-    SequentialTraversal,
-)
+from b24api import BatchDispatch, Binding, ParameterPath, ParameterUpdate, SequentialTraversal
+from b24api.contracts import ReferenceComplete, ReferenceItem
 
 bindings = (
     Binding(
@@ -516,21 +569,22 @@ uv run --with memray memray stats /tmp/b24api.bin
 ```
 
 These deterministic fixtures characterize local resources and network shape; they are not live
-portal latency admission. See [docs/performance.md](docs/performance.md) for current measurements
-and [docs/architecture.md](docs/architecture.md) for guarantees and ownership boundaries.
+portal latency admission. See [docs/performance.md](https://github.com/shkarupa-alex/b24api/blob/master/docs/performance.md) for current measurements
+and [docs/architecture.md](https://github.com/shkarupa-alex/b24api/blob/master/docs/architecture.md) for guarantees and ownership boundaries.
 
-Projects moving from an earlier API surface can use [docs/migration.md](docs/migration.md).
+Projects moving from an earlier API surface can use [docs/migration.md](https://github.com/shkarupa-alex/b24api/blob/master/docs/migration.md).
 
 ## Verification
 
 ```console
 uv sync --frozen
-.venv/bin/pytest -q -p no:cacheprovider
-.venv/bin/ruff check . --no-fix --no-cache
-.venv/bin/ruff format --check . --no-cache
-.venv/bin/mypy --strict b24api tools/b24api_evidence
+make qc
 git diff --check
 ```
+
+`make qc` runs the lint, type and default test checks that CI blocks on. It leaves out the internal
+benches (the pytest marker `slow`: the evidence harness contracts and the 50k/100k-scale runs, which
+take several minutes). `make bench` runs them, and so does the blocking CI job `slow`.
 
 The wheel regression installs into an isolated environment, executes the `b24api` entry point and
 checks that tests, live/evidence tooling and credentials are excluded.

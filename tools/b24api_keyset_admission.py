@@ -42,7 +42,6 @@ from b24api import (  # noqa: E402 - direct execution binds imports to this chec
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
-    KeysetPageCompletion,
     KeysetSpec,
     OperationReport,
     ParameterPath,
@@ -54,8 +53,8 @@ from b24api import (  # noqa: E402 - direct execution binds imports to this chec
     RouteKind,
     Settings,
     StableIntegerKeysetContract,
-    TotalHintMode,
 )
+from b24api.contracts import KeysetPageCompletion, TotalHintMode  # noqa: E402
 from b24api.execution import Executor, WireResponse  # noqa: E402
 from tools.b24api_evidence.repository import clean_candidate_sha  # noqa: E402
 
@@ -401,7 +400,6 @@ def _record(
         "selected_requests_estimate": execution.selected_requests_estimate if execution is not None else None,
         "planning_requests": execution.planning_requests if execution is not None else 0,
         "boundary_requests": execution.boundary_requests if execution is not None else 0,
-        "canary_requests": execution.canary_requests if execution is not None else 0,
         "anchor_probe_requests": execution.anchor_probe_requests if execution is not None else 0,
         "total_hint_requested": execution.total_hint_requested if execution is not None else False,
         "total_hint_observed": execution.total_hint_observed if execution is not None else None,

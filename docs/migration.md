@@ -1,4 +1,121 @@
-# Migrating to the issues architecture
+# Migration guide
+
+## Upgrading from 2.3 to 3.0
+
+3.0.0 changes only what the list below names. Work through it in order; each item links to the
+details.
+
+1. **Root imports.** The `b24api` root exports 51 names; 115 others moved to `b24api.contracts`,
+   `b24api.errors`, `b24api.transport` or `b24api.completion`. Old imports fail with `ImportError`
+   or `AttributeError`, and type checkers flag them. `from b24api import *` follows `__all__` and
+   no longer brings the moved names; replace it with explicit imports. Run
+   `python -m b24api.migration src/ tests/` to list both; see [Root imports in 3.0](#root-imports-in-30).
+2. **Removed report vocabulary.** Values no code path produced are gone from `KeysetExecutionReport`,
+   `KeysetAssuranceSource`, `ReplayDisposition`, `CompletionAssurance`, `SnapshotState` and
+   `NotExecutedReason`, and `PageValidated` has no `identity_digest`. Drop those arms from exhaustive
+   matches; see [Removed intentionally](#removed-intentionally).
+3. **`EnvelopeContractError` is a `ProtocolError`.** `except ProtocolError` now also catches a 2xx
+   response without the result envelope; see
+   [Important semantic corrections](#important-semantic-corrections). When such a response answers
+   the physical batch of a fast keyset wave, `page_trace` records `PageRejectionCode.BATCH_ENVELOPE`
+   for its pages (previously `COMMAND_FAILURE`). A 2xx body with a top-level `error` that is not
+   strict JSON (invalid UTF-8, `NaN` or `Infinity`, a duplicate batch correlation key) is now an
+   `EnvelopeContractError` too, where 2.3 reported the embedded error as `ApiResponseError`.
+4. **A logical batch closed early says so.** Closing `batch()` or `batch_outcomes()` before the input
+   is exhausted gives an `EARLY_CLOSED` report whose `terminal_reason` is
+   `"stream closed before exhaustion"` (previously `"GeneratorExit"`).
+5. **Reports name the public failure.** A fail-fast batch reports `terminal_reason="BatchCommandError"`
+   with the violation `batch_command_failure`, instead of a private carrier class and
+   `internal_failure`. Code that matched the old strings must match the new ones.
+6. **Fixed step refuses at once.** `OffsetContinuation.FIXED_STEP` without an exact qualified total
+   raises right after a short page instead of first requesting an unusable confirmation page, so such
+   a traversal sends one request fewer.
+7. **Stream lifecycle.** Every stream family now terminates through one lifecycle owner:
+   - reading a stream after `aclose()` ends the iteration with `StopAsyncIteration` and sends
+     nothing (previously `RuntimeError("stream was closed before exhaustion")`);
+   - `aclose()` during an in-flight read reports `EARLY_CLOSED` (previously `CANCELLED`): the close
+     owns termination, even though it cancels the read;
+   - a report is final once published, after cleanup; a later `aclose()` never raises a cleanup error
+     or changes it;
+   - when cleanup fails after the source was exhausted, the report records a `cleanup_failure`
+     violation and `CleanupState.FAILURE`, and the cleanup error is raised;
+   - a failure during cleanup that follows another failure is kept as a secondary `cleanup_failure`
+     violation (for example `reference cleanup also failed (RuntimeError)`), so a report can carry
+     more than one.
+   - a stream closed before its first read, by `aclose()` or on leaving `async with`, still closes
+     the iterator it took from your command or reference source, once, without reading from it; a
+     failing close is raised and recorded as a `cleanup_failure` on an `EARLY_CLOSED` report;
+   - a stream raises its terminal failure once: a later read, before or after `aclose()`, ends the
+     iteration with `StopAsyncIteration` and sends nothing (previously the same exception was raised
+     again). Keep the exception from the read that raised it if you need it later; it carries the
+     published report;
+   - a cancellation during the cleanup on leaving `async with` no longer replaces the exception raised
+     in its body: that exception propagates and the cancellation is raised at the next `await`.
+
+8. **Compressed responses.** Only identity, `gzip` and `deflate` bodies are decoded; `br`, `zstd`,
+   stacked and unknown codings are refused as a transport failure. Library-owned requests send
+   `Accept-Encoding: gzip, deflate`. If you inject an HTTPX client that asks for `br` or `zstd`,
+   remove that header.
+9. **Batch replay is decided per command.** A failed physical batch is not retried or abandoned as
+   a whole. Each `SAFE` command is sent again, in a smaller physical batch, after any transient
+   failure. An `UNSAFE` or `UNKNOWN` command is sent again only when the failure proves it did not
+   run: a transport failure before dispatch, an unstructured 423, 425 or 429, or a
+   `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT` refusal of the batch or of that command in
+   `result_error`. When the batch may have run (a transport failure after dispatch, or a 408 or 5xx
+   status from `AmbiguityPolicy.ambiguous_unstructured_statuses`), its `UNSAFE` and `UNKNOWN`
+   commands arrive as `CommandOutcomeUnknown`; reconcile them as you would an ambiguous direct call.
+   In 2.3 the whole batch was retried or not by its least safe command. Replays share the request's
+   attempt and time budgets. A command keeps its last outcome when the budget stops a replay before
+   it is sent; a replay that was sent reports the command as possibly executed, unless its last
+   answer was a listed refusal. A direct `UNSAFE`
+   or `UNKNOWN` request is now also retried after such a proven refusal. The refusals come from
+   `AmbiguityPolicy.refusal_http_statuses` and `AmbiguityPolicy.refusal_api_codes`. A code or status
+   you add to `RetryPolicy` alone retries `SAFE` work only; add it to the refusal sets too if it
+   proves that Bitrix did not run the method. A fail-fast `batch()` is not split.
+10. **Error text.** Error descriptions show field names from your request as `field#N`, known V3
+    codes verbatim, and distinct hidden mapping keys as `[REDACTED#1]`, `[REDACTED#2]`, … Code that
+    parses error strings must accept these forms.
+11. **Mid-collection start with an exact total.** An offset traversal whose initial `start` differs
+    from the plan's first offset raises `CapabilityError` before any request when
+    `TotalTermination.EXACT_QUALIFIED` closes it. Start from the beginning, or use
+    `TotalTermination.DISABLED` to walk a suffix.
+12. **Keyset verification.** When a boundary read is answered wrongly, `verify_keyset_capability()`
+    raises `KeysetCapabilityError` with an `UNSUPPORTED` report (`error.report`) instead of a raw
+    `PaginationError` (order, page cap) or `CapabilityError` (identity shape). Code that caught
+    `PaginationError` there must catch `KeysetCapabilityError` or `CapabilityError`.
+13. **Keyset selection reasons.** `KeysetSelectionReason` gains `EXPLICIT_SEQUENTIAL` and
+    `PAGE_STOP`; handle them in exhaustive matches.
+14. **HTTP/2 and hpack logging.** While a library HTTPX client is open, `hpack.hpack` and
+    `hpack.table` records are dropped. Removing that filter makes the next HTTP/2 send raise
+    `CapabilityError` before I/O.
+15. **Permanent transport refusals.** A `TransportError` with `retryable=False` is raised after one
+    send instead of being retried until `BudgetExceededError`. Code that caught
+    `BudgetExceededError` for such a failure must catch `TransportError`.
+16. **Exceptions from an injected transport.** An arbitrary exception raised inside a custom
+    `Transport.send` or `send_wire` becomes `TransportError(phase=DISPATCH_STARTED, retryable=False)`
+    with your exception as `__cause__`. A direct `SAFE` request raises that `TransportError` after one
+    send; a direct `UNKNOWN` or `UNSAFE` request raises `AmbiguousExecutionError`; every admitted
+    command of a physical batch arrives as `CommandOutcomeUnknown`. Catch these instead of your own
+    exception class, and read `__cause__` for the original. A closed `HttpxTransport` raises
+    `TransportError(phase=NOT_DISPATCHED, retryable=False)` instead of `RuntimeError`: nothing was
+    sent, so no command is reported as possibly executed.
+17. **Oversized responses.** A response larger than `ExecutionPolicy.max_response_bytes` is refused
+    before decoding. An injected transport is now held to the same ceiling as the bundled one: a
+    direct `SAFE` request raises `ResponseTooLargeError`, and a direct `UNKNOWN` or `UNSAFE` request
+    raises `AmbiguousExecutionError`. For a physical batch the change applies to every transport,
+    the bundled `HttpxTransport` included: each command arrives as `CommandOutcomeUnknown` with the
+    `ResponseTooLargeError` as the cause, where 2.3 gave a `CommandFailure`, and a keyset page trace
+    records the page as an ambiguous execution rather than a command failure. Code that retried
+    such commands with a smaller `select` must now treat them as possibly executed.
+
+Additions that need no change: `Request.bare()` and `Request.v3()`, `Bitrix24.from_webhook()`,
+`HttpxTransport` in the root, `ExecutionPolicy.from_settings()` and
+`OperationReport.keyset_selection`.
+
+The sections below describe the full current contract, including the 2.3 changes (a required
+`route=`, positional arguments, page stops) for code upgrading from earlier releases.
+
+## Migrating to the issues architecture (2.3)
 
 The route is now a required part of every `Request` and closed request mapping. Existing callers
 must choose `RouteKind.BARE`, `RouteKind.JSON` or `RouteKind.API_V3`; `with_parameters()` preserves
@@ -32,7 +149,9 @@ already been answered: a substitute would make it undecidable which records carr
 Direct use of a caller-owned client after the transport closes is outside that shield. An
 application enabling the separate `httpcore` DEBUG logger needs its own logging policy and test;
 this guarantee covers the emitting `httpx` INFO logger.
-The supported HTTPX range is `>=0.28.1,<0.29`; raising that upper bound requires rerunning the
+The supported HTTPX range is `>=0.28.1,<0.29`, with `h2>=4.3.0,<4.5` and `hpack>=4.1.0,<4.3` as
+direct requirements, because the shield filters the `hpack` logger names verified on those lines. An
+environment pinned below them must upgrade; raising any of these upper bounds requires rerunning the
 positive logger controls against the newly admitted version.
 
 Direct access to `RateCoordinator.acquire()` now requires a non-empty `methods` frozenset. A
@@ -131,12 +250,160 @@ traversal keeps its separate raw-range closure contract.
 
 The earlier 2.x keyset migration notes below remain as historical guidance for that API.
 
+## Root imports in 3.0
+
+The `b24api` root now exports only the names a typical application needs: the client and its
+settings, requests and routes, policies, traversal and dispatch specifications, the report and the
+main errors, and the transports, including `HttpxTransport`. The other 115 names moved to one of the
+public packages `b24api.contracts`, `b24api.errors`, `b24api.transport` and `b24api.completion`,
+which export the same objects. No object was removed or renamed; only the root path is gone.
+
+The old root paths do not resolve in 3.0 and there is no deprecation period:
+`from b24api import CommandSuccess` raises `ImportError: cannot import name 'CommandSuccess' from
+'b24api'`, and `b24api.CommandSuccess` raises `AttributeError: module 'b24api' has no attribute
+'CommandSuccess'; it moved to b24api.contracts.CommandSuccess in 3.0`. Mypy and pyright report each
+old root import as `attr-defined`, which points at every line to change. A wildcard import follows
+`__all__`, which lists only the 51 root names, so a moved name used after `from b24api import *`
+raises `NameError`. The scanner reports every such import; replace it with
+explicit imports of the names the module uses. Leaf modules such as
+`b24api.contracts.request` or `b24api.transport.base` are not public paths; import from the packages
+above.
+
+To list every old root import in your code, run the scanner. It rewrites nothing and exits with 1
+when it finds any:
+
+```console
+$ python -m b24api.migration src/ tests/
+src/app.py:3 b24api.CommandSuccess -> b24api.contracts.CommandSuccess
+```
+
+<!-- ROOT_MOVES table: generated by b24api.migration.migration_table(); do not edit by hand -->
+| Old import | New import |
+|---|---|
+| `from b24api import CompletionGate` | `from b24api.completion import CompletionGate` |
+| `from b24api import AdaptedPage` | `from b24api.contracts import AdaptedPage` |
+| `from b24api import AmbiguityReason` | `from b24api.contracts import AmbiguityReason` |
+| `from b24api import BinaryEvidence` | `from b24api.contracts import BinaryEvidence` |
+| `from b24api import BinaryResponse` | `from b24api.contracts import BinaryResponse` |
+| `from b24api import BindingAdmitted` | `from b24api.contracts import BindingAdmitted` |
+| `from b24api import BindingClosure` | `from b24api.contracts import BindingClosure` |
+| `from b24api import BindingTerminal` | `from b24api.contracts import BindingTerminal` |
+| `from b24api import BodyEncoding` | `from b24api.contracts import BodyEncoding` |
+| `from b24api import CallerStop` | `from b24api.contracts import CallerStop` |
+| `from b24api import CleanupOutcome` | `from b24api.contracts import CleanupOutcome` |
+| `from b24api import CleanupState` | `from b24api.contracts import CleanupState` |
+| `from b24api import ClosureWitness` | `from b24api.contracts import ClosureWitness` |
+| `from b24api import Command` | `from b24api.contracts import Command` |
+| `from b24api import CommandFailure` | `from b24api.contracts import CommandFailure` |
+| `from b24api import CommandNotExecuted` | `from b24api.contracts import CommandNotExecuted` |
+| `from b24api import CommandOutcome` | `from b24api.contracts import CommandOutcome` |
+| `from b24api import CommandOutcomeUnknown` | `from b24api.contracts import CommandOutcomeUnknown` |
+| `from b24api import CommandSettlement` | `from b24api.contracts import CommandSettlement` |
+| `from b24api import CommandSuccess` | `from b24api.contracts import CommandSuccess` |
+| `from b24api import CompletionEvent` | `from b24api.contracts import CompletionEvent` |
+| `from b24api import CompositeIdentitySpec` | `from b24api.contracts import CompositeIdentitySpec` |
+| `from b24api import ConsistencyPolicy` | `from b24api.contracts import ConsistencyPolicy` |
+| `from b24api import ContinuePage` | `from b24api.contracts import ContinuePage` |
+| `from b24api import CursorDomain` | `from b24api.contracts import CursorDomain` |
+| `from b24api import DeliveryOrder` | `from b24api.contracts import DeliveryOrder` |
+| `from b24api import DuplicatePolicy` | `from b24api.contracts import DuplicatePolicy` |
+| `from b24api import EmptyArray` | `from b24api.contracts import EmptyArray` |
+| `from b24api import EmptyObject` | `from b24api.contracts import EmptyObject` |
+| `from b24api import FrozenJson` | `from b24api.contracts import FrozenJson` |
+| `from b24api import FrozenMapping` | `from b24api.contracts import FrozenMapping` |
+| `from b24api import identity_store_key` | `from b24api.contracts import identity_store_key` |
+| `from b24api import IdentityComponent` | `from b24api.contracts import IdentityComponent` |
+| `from b24api import IdentityPageAdapter` | `from b24api.contracts import IdentityPageAdapter` |
+| `from b24api import IdentityStore` | `from b24api.contracts import IdentityStore` |
+| `from b24api import KeysetAssuranceSource` | `from b24api.contracts import KeysetAssuranceSource` |
+| `from b24api import KeysetCapabilityCheckName` | `from b24api.contracts import KeysetCapabilityCheckName` |
+| `from b24api import KeysetCapabilityCheckOutcome` | `from b24api.contracts import KeysetCapabilityCheckOutcome` |
+| `from b24api import KeysetCapabilityCheckResult` | `from b24api.contracts import KeysetCapabilityCheckResult` |
+| `from b24api import KeysetCapabilityReport` | `from b24api.contracts import KeysetCapabilityReport` |
+| `from b24api import KeysetCapabilityVerdict` | `from b24api.contracts import KeysetCapabilityVerdict` |
+| `from b24api import KeysetExecution` | `from b24api.contracts import KeysetExecution` |
+| `from b24api import KeysetExecutionKind` | `from b24api.contracts import KeysetExecutionKind` |
+| `from b24api import KeysetExecutionReport` | `from b24api.contracts import KeysetExecutionReport` |
+| `from b24api import KeysetInconclusiveReason` | `from b24api.contracts import KeysetInconclusiveReason` |
+| `from b24api import KeysetPageCompletion` | `from b24api.contracts import KeysetPageCompletion` |
+| `from b24api import KeysetPhase` | `from b24api.contracts import KeysetPhase` |
+| `from b24api import KeysetSelectionReason` | `from b24api.contracts import KeysetSelectionReason` |
+| `from b24api import MembershipRecheck` | `from b24api.contracts import MembershipRecheck` |
+| `from b24api import NotExecutedReason` | `from b24api.contracts import NotExecutedReason` |
+| `from b24api import Null` | `from b24api.contracts import Null` |
+| `from b24api import Omitted` | `from b24api.contracts import Omitted` |
+| `from b24api import OperationStream` | `from b24api.contracts import OperationStream` |
+| `from b24api import PageAcknowledged` | `from b24api.contracts import PageAcknowledged` |
+| `from b24api import PageBoundary` | `from b24api.contracts import PageBoundary` |
+| `from b24api import PageCommandOutcome` | `from b24api.contracts import PageCommandOutcome` |
+| `from b24api import PageDelivered` | `from b24api.contracts import PageDelivered` |
+| `from b24api import PageDispatch` | `from b24api.contracts import PageDispatch` |
+| `from b24api import PageIndex` | `from b24api.contracts import PageIndex` |
+| `from b24api import PageOutcome` | `from b24api.contracts import PageOutcome` |
+| `from b24api import PageRecord` | `from b24api.contracts import PageRecord` |
+| `from b24api import PageRejected` | `from b24api.contracts import PageRejected` |
+| `from b24api import PageRejectionCode` | `from b24api.contracts import PageRejectionCode` |
+| `from b24api import PageScheduled` | `from b24api.contracts import PageScheduled` |
+| `from b24api import PageStride` | `from b24api.contracts import PageStride` |
+| `from b24api import PageValidated` | `from b24api.contracts import PageValidated` |
+| `from b24api import PageView` | `from b24api.contracts import PageView` |
+| `from b24api import PartialResult` | `from b24api.contracts import PartialResult` |
+| `from b24api import partition_command_outcomes` | `from b24api.contracts import partition_command_outcomes` |
+| `from b24api import partition_reference_outcomes` | `from b24api.contracts import partition_reference_outcomes` |
+| `from b24api import PositionalArguments` | `from b24api.contracts import PositionalArguments` |
+| `from b24api import PositionalLayout` | `from b24api.contracts import PositionalLayout` |
+| `from b24api import Present` | `from b24api.contracts import Present` |
+| `from b24api import RawTotalSource` | `from b24api.contracts import RawTotalSource` |
+| `from b24api import ReferenceComplete` | `from b24api.contracts import ReferenceComplete` |
+| `from b24api import ReferenceEvent` | `from b24api.contracts import ReferenceEvent` |
+| `from b24api import ReferenceFailure` | `from b24api.contracts import ReferenceFailure` |
+| `from b24api import ReferenceItem` | `from b24api.contracts import ReferenceItem` |
+| `from b24api import ReferenceNotExecuted` | `from b24api.contracts import ReferenceNotExecuted` |
+| `from b24api import ReferenceOutcome` | `from b24api.contracts import ReferenceOutcome` |
+| `from b24api import ReferenceOutcomeUnknown` | `from b24api.contracts import ReferenceOutcomeUnknown` |
+| `from b24api import ReplayDisposition` | `from b24api.contracts import ReplayDisposition` |
+| `from b24api import RequestHeaders` | `from b24api.contracts import RequestHeaders` |
+| `from b24api import RequestSummary` | `from b24api.contracts import RequestSummary` |
+| `from b24api import Response` | `from b24api.contracts import Response` |
+| `from b24api import ResultCollectionShape` | `from b24api.contracts import ResultCollectionShape` |
+| `from b24api import ResultErrorShape` | `from b24api.contracts import ResultErrorShape` |
+| `from b24api import ResultErrorSpec` | `from b24api.contracts import ResultErrorSpec` |
+| `from b24api import SlotContract` | `from b24api.contracts import SlotContract` |
+| `from b24api import SlotShape` | `from b24api.contracts import SlotShape` |
+| `from b24api import SparseRawBound` | `from b24api.contracts import SparseRawBound` |
+| `from b24api import SplitOrderSpec` | `from b24api.contracts import SplitOrderSpec` |
+| `from b24api import StreamClosure` | `from b24api.contracts import StreamClosure` |
+| `from b24api import StreamTerminal` | `from b24api.contracts import StreamTerminal` |
+| `from b24api import TotalHintMode` | `from b24api.contracts import TotalHintMode` |
+| `from b24api import TraceClass` | `from b24api.contracts import TraceClass` |
+| `from b24api import traversal_control_paths` | `from b24api.contracts import traversal_control_paths` |
+| `from b24api import TraversalIdentity` | `from b24api.contracts import TraversalIdentity` |
+| `from b24api import UnknownRequestAudit` | `from b24api.contracts import UnknownRequestAudit` |
+| `from b24api import UnknownRequestCollector` | `from b24api.contracts import UnknownRequestCollector` |
+| `from b24api import Violation` | `from b24api.contracts import Violation` |
+| `from b24api import ViolationSeverity` | `from b24api.contracts import ViolationSeverity` |
+| `from b24api import BatchCommandError` | `from b24api.errors import BatchCommandError` |
+| `from b24api import EnvelopeContractError` | `from b24api.errors import EnvelopeContractError` |
+| `from b24api import HTTPGatewayError` | `from b24api.errors import HTTPGatewayError` |
+| `from b24api import IdentityContractError` | `from b24api.errors import IdentityContractError` |
+| `from b24api import InputSourceError` | `from b24api.errors import InputSourceError` |
+| `from b24api import PageAdaptationError` | `from b24api.errors import PageAdaptationError` |
+| `from b24api import PageAdaptationViolation` | `from b24api.errors import PageAdaptationViolation` |
+| `from b24api import ResponseTooLargeError` | `from b24api.errors import ResponseTooLargeError` |
+| `from b24api import ResultShapeError` | `from b24api.errors import ResultShapeError` |
+| `from b24api import ValidationIssue` | `from b24api.errors import ValidationIssue` |
+| `from b24api import TransportCapabilities` | `from b24api.transport import TransportCapabilities` |
+| `from b24api import WireRequest` | `from b24api.transport import WireRequest` |
+| `from b24api import WireResponse` | `from b24api.transport import WireResponse` |
+<!-- end of ROOT_MOVES table -->
+
 ## Keyset verification, cursor fan-out, and page adaptation
 
 Normal `iter_list_keyset()` no longer sends the five diagnostic canary commands. Range and
-partitioned reports use `KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS`; the legacy
-`CANARY_VERIFIED_BOUNDS`, `KeysetPhase.CANARY`, and canary report counters remain readable for
-compatibility, but normal traversal never produces that assurance and its canary counters are zero.
+partitioned reports use `KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS`. 3.0.0 removes the legacy
+`KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS` and the always-zero `canary_requests`,
+`canary_commands` and `canary_rows` fields of `KeysetExecutionReport`; `KeysetPhase.CANARY` remains
+because `verify_keyset_capability()` still records its canary wave under that phase.
 This reduces every bounded runtime estimate by the former canary waves, but a broken endpoint can
 now emit a partial prefix before later bound validation raises typed `IncompleteTraversalError`.
 
@@ -249,8 +516,13 @@ latency-oriented workloads. The dispatcher shutdown remains cancellation-based; 
   text was truthy to PHP.
 - `None` values are omitted from form and physical-batch bracket encoding, matching PHP query conventions;
   JSON encoding continues to send them as `null`.
-- A 2xx response missing the canonical result envelope raises `EnvelopeContractError`, still a
-  subclass of `HTTPGatewayError`. Malformed non-empty JSON remains `ProtocolError`.
+- A 2xx response missing the canonical result envelope raises `EnvelopeContractError`. It is a
+  subclass of both `HTTPGatewayError` and `ProtocolError`, so `except ProtocolError` now catches it
+  too; its origin stays `http_gateway`, it is never retried, and reports still classify it as
+  `envelope_contract`. Malformed non-empty JSON remains a plain `ProtocolError`.
+- `ExecutionPolicy.from_settings(settings)` returns the client's default policy (the library
+  defaults with `max_retry_elapsed_per_request = settings.http_timeout`). A `policy=` argument still
+  replaces that default wholesale; derive it with `dataclasses.replace` to keep the timeout.
 - Counted identity is optional. Without it, matching a qualified total yields count-only assurance;
   with it, the report records identity-and-count assurance.
 - `iter_list_counted()` no longer fails when the first page has no rows, no `next`, and no usable
@@ -306,6 +578,15 @@ preserving names or return-shaping flags.
 - permissive cursor de-duplication that could hide missing rows;
 - automatic unsafe direct fallback;
 - public low-level execution plans and compatibility data models.
+- report values no code path produced (3.0.0): `ReplayDisposition.REPLAYED_DIRECT` and
+  `DIRECT_REPLAY_FAILED` (a physical batch is never replayed as direct calls),
+  `CompletionAssurance.ORACLE_VERIFIED`, `SnapshotState.VERIFIED` and `SnapshotState.CHANGED`
+  (no snapshot oracle exists; a required snapshot reports `UNVERIFIED`), and
+  `NotExecutedReason.SCHEDULER_STOPPED`. Drop those arms from exhaustive matches; the enum inputs
+  `SnapshotRequirement` and `ConfirmationPolicy` keep every member.
+- `PageValidated.identity_digest` (3.0.0). The gate only ever checked that the digest was non-empty,
+  so every recorder paid a SHA-256 per page for no guarantee. The gate still checks event order and
+  `row_count`; a custom recorder or test that builds `PageValidated` drops the argument.
 
 There is no assumption-free fast no-count shortcut. Direct `Bitrix24.iter_list_keyset()` calls and
 CLI keyset contracts that omit `execution` now assert the default `StableIntegerKeysetContract` and
@@ -351,9 +632,11 @@ stream = client.iter_list_keyset(
 
 For CLI keyset contracts, use `"execution": {"kind": "sequential"}`. Omitting `execution` (or
 passing an empty execution object) selects auto. Use `iter_list_counted()` only when an endpoint
-supplies an exact filtered total. CLI reports now include a `keyset_execution` object for default
-keyset traversal; report consumers should treat that additive field as part of the selected-plan
-evidence.
+supplies an exact filtered total. CLI reports now include a `keyset_selection` object
+(`requested_kind`, `selected_kind`, `reason`) for every keyset traversal, and a detailed
+`keyset_execution` object only when the fast path ran; a `page_stop` traversal with the default auto
+execution reports `auto`, `sequential`, `page_stop`. Report consumers should treat both additive
+fields as selected-plan evidence.
 
 ## Practical migration order
 

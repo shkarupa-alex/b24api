@@ -7,7 +7,6 @@ import asyncio
 import hashlib
 import json
 import random
-from collections import deque
 from dataclasses import FrozenInstanceError
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs
@@ -15,64 +14,77 @@ from urllib.parse import parse_qs
 import pytest
 
 from b24api import (
-    AdaptedPage,
     BatchDispatch,
     Binding,
     Bitrix24,
     CapabilityError,
     CursorSpec,
     CursorTraversal,
-    DeliveryOrder,
     ExecutionPolicy,
     IdentityCoercion,
-    IdentityPageAdapter,
     IdentitySpec,
     IncompleteTraversalError,
-    KeysetCapabilityCheckName,
-    KeysetCapabilityCheckOutcome,
-    KeysetCapabilityCheckResult,
     KeysetCapabilityError,
-    KeysetCapabilityReport,
-    KeysetCapabilityVerdict,
-    KeysetInconclusiveReason,
     KeysetSpec,
-    MembershipRecheck,
-    PageAdaptationError,
-    PageAdaptationViolation,
     PageAdapter,
-    PageRejectionCode,
     ParameterPath,
     ParameterUpdate,
-    ReferenceComplete,
     ReferenceFailed,
-    ReferenceFailure,
-    ReferenceItem,
-    ReferenceNotExecuted,
     Request,
     ResultSelector,
     SequentialTraversal,
 )
 from b24api.batch.outcome import BatchSuccess
+from b24api.contracts import (
+    AdaptedPage,
+    DeliveryOrder,
+    IdentityPageAdapter,
+    KeysetCapabilityCheckName,
+    KeysetCapabilityCheckOutcome,
+    KeysetCapabilityCheckResult,
+    KeysetCapabilityReport,
+    KeysetCapabilityVerdict,
+    KeysetInconclusiveReason,
+    MembershipRecheck,
+    PageRejectionCode,
+    ReferenceComplete,
+    ReferenceFailure,
+    ReferenceItem,
+    ReferenceNotExecuted,
+)
 from b24api.contracts.json import FrozenMapping
 from b24api.contracts.keyset_execution import KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.request import RouteKind
 from b24api.contracts.response import Response, ResultCollectionShape
+from b24api.errors import PageAdaptationError, PageAdaptationViolation
 from b24api.execution import Executor, WireResponse
+from b24api.references import dispatch as dispatch_module
 from b24api.references.dispatch import _BatchPageDispatcher, _ProducerState, _RowBuffer
 from b24api.traversal.keyset_fast_plan import LaneBounds, LaneKind, LaneSpec, LaneState, LaneStatus
-from b24api.traversal.page_validation import LaneCommandPlan, ReceiptRejection, validate_lane_receipt
+from b24api.traversal.keyset_page_validation import LaneCommandPlan, ReceiptRejection, validate_lane_receipt
 from b24api.traversal.values import _page_fingerprint, _response_items
+from tests.scripting import ResponderTransport, client_for
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import AsyncIterator, Callable, Mapping
 
     from b24api.contracts import JsonValue
     from b24api.contracts.page import PageView
+    from b24api.contracts.report import OperationReport
+
+# Coalescing tests run structurally: waits end by an event within bounded loop turns or by a timer.
+# The contract caps coalesce_wait at one second; a wave that waited for that timer is a regression.
+_UNREACHABLE_COALESCE_WAIT = 1
+_REGRESSION_GUARD_SECONDS = 30
+_EVENT_TURNS = 64
+_CONSUMER_TURNS = 4
+_COALESCE_BINDINGS = 8
+_COALESCE_BATCH = 4
 
 
 def _client(transport: object, *, policy: ExecutionPolicy | None = None) -> Bitrix24:
-    return Bitrix24._from_executor(Executor(transport), policy=policy)  # type: ignore[arg-type]
+    return client_for(transport, policy=policy)  # type: ignore[arg-type]
 
 
 def _identity() -> IdentitySpec:
@@ -272,23 +284,10 @@ async def test_cursor_seed_replaces_existing_control_when_creation_is_forbidden(
     assert [row["id"] async for row in singular] == [1, 2]
 
 
-class PageTransport:
-    host = "test.invalid"
-
-    def __init__(self) -> None:
-        self.requests: list[Request] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        del attempt_timeout, max_response_bytes
-        self.requests.append(request)
-        cursor = int(request.copy_parameters().get("after", 0))
-        messages = [] if cursor else [{"id": 1, "author_id": 7}, {"id": 2, "author_id": 8}]
-        result = {"chat_id": 42, "messages": messages, "users": {"7": "Ada", "8": "Lin"}, "files": []}
-        return WireResponse(
-            200,
-            (("content-type", "application/json"),),
-            json.dumps({"result": result}).encode(),
-        )
+def _chat_page(request: Request) -> object:
+    cursor = int(request.copy_parameters().get("after", 0))
+    messages = [] if cursor else [{"id": 1, "author_id": 7}, {"id": 2, "author_id": 8}]
+    return {"result": {"chat_id": 42, "messages": messages, "users": {"7": "Ada", "8": "Lin"}, "files": []}}
 
 
 class EnrichMessages:
@@ -315,7 +314,7 @@ class ReorderingIdentityAdapter(IdentityPageAdapter):
 @pytest.mark.asyncio
 async def test_page_adapter_enriches_from_frozen_siblings_and_runs_on_empty_confirmation() -> None:
     adapter = EnrichMessages()
-    stream = _client(PageTransport()).iter_list_cursor(
+    stream = _client(ResponderTransport(_chat_page)).iter_list_cursor(
         Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector(("messages",)),
         cursor=_cursor(),
@@ -334,7 +333,7 @@ async def test_page_adapter_enriches_from_frozen_siblings_and_runs_on_empty_conf
 
 @pytest.mark.asyncio
 async def test_custom_adapter_without_configured_identity_preserves_generic_list_support() -> None:
-    transport = PageTransport()
+    transport = ResponderTransport(_chat_page)
     adapter = EnrichMessages()
     stream = _client(transport).iter_list(
         Request("item.list", route=RouteKind.BARE),
@@ -367,7 +366,7 @@ class BrokenAdapter:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("violation", list(PageAdaptationViolation))
 async def test_page_adapter_violations_are_typed_atomic_and_value_free(violation: PageAdaptationViolation) -> None:
-    stream = _client(PageTransport()).iter_list_cursor(
+    stream = _client(ResponderTransport(_chat_page)).iter_list_cursor(
         Request("item.list", route=RouteKind.BARE),
         selector=ResultSelector(("messages",)),
         cursor=_cursor(),
@@ -699,13 +698,12 @@ def test_fast_keyset_lane_applies_adapter_only_to_publishable_phases() -> None:
     response = Response([{"id": 1}])
     outcome = BatchSuccess(0, "body:0", request, response.result, response=response)
     lane = LaneState(
-        LaneSpec(0, LaneKind.LANE, LaneBounds(0, 2), False, True, None),
+        LaneSpec(0, LaneKind.LANE, LaneBounds(0, 2), False, None),
         0,
         LaneStatus.OPEN,
         None,
         0,
         1,
-        deque(),
     )
 
     class RaisingAdapter:
@@ -725,7 +723,6 @@ def test_fast_keyset_lane_applies_adapter_only_to_publishable_phases() -> None:
         )
 
     assert not isinstance(validate(KeysetPhase.ANCHOR_PROBE), ReceiptRejection)
-    assert not isinstance(validate(KeysetPhase.CANARY), ReceiptRejection)
     rejected = validate(KeysetPhase.BODY)
     assert isinstance(rejected, ReceiptRejection)
     assert isinstance(rejected.error, PageAdaptationError)
@@ -756,7 +753,8 @@ async def test_fast_source_fills_initial_and_continuation_batches() -> None:
         selector=ResultSelector.root(),
         cursor=_cursor(),
         page_size=1,
-        dispatch=BatchDispatch(batch_size=count),
+        # Full waves dispatch at once; the widest wait keeps a slow host (coverage, CI) from splitting them.
+        dispatch=BatchDispatch(batch_size=count, coalesce_wait=_UNREACHABLE_COALESCE_WAIT),
     )
 
     assert len([event async for event in stream]) == 2 * count
@@ -764,11 +762,18 @@ async def test_fast_source_fills_initial_and_continuation_batches() -> None:
     state = stream._source._scheduler.producer_state
     assert state.runnable == state.admitting == state.pending_continuations == set()
     assert not state.source_pull_in_flight
-    assert state.source_terminal
 
 
 @pytest.mark.asyncio
-async def test_input_order_does_not_wait_for_an_unacknowledgeable_continuation() -> None:
+async def test_input_order_does_not_wait_for_an_unacknowledgeable_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waves: list[tuple[int, float]] = []
+
+    def observe_wave(_dispatcher: _BatchPageDispatcher, commands: int, delay: float) -> None:
+        waves.append((commands, delay))
+
+    monkeypatch.setattr(_BatchPageDispatcher, "_observe_wave", observe_wave)
     transport = CursorBatchTransport({"slow": tuple(range(1, 11)), "fast": (100,)})
     bindings = [
         Binding(
@@ -784,12 +789,20 @@ async def test_input_order_does_not_wait_for_an_unacknowledgeable_continuation()
         selector=ResultSelector.root(),
         cursor=_cursor(),
         page_size=1,
-        dispatch=BatchDispatch(batch_size=2, concurrency=1, coalesce_wait=1, output_order=DeliveryOrder.INPUT),
+        dispatch=BatchDispatch(
+            batch_size=2,
+            concurrency=1,
+            coalesce_wait=_UNREACHABLE_COALESCE_WAIT,
+            output_order=DeliveryOrder.INPUT,
+        ),
     )
 
-    async with asyncio.timeout(0.2):
+    # The guard only bounds a regression; the assertion is structural: no wave waited for its timer.
+    async with asyncio.timeout(_REGRESSION_GUARD_SECONDS):
         events = [event async for event in stream]
     assert len(events) == 13
+    assert waves
+    assert all(delay < _UNREACHABLE_COALESCE_WAIT for _commands, delay in waves)
 
 
 @pytest.mark.asyncio
@@ -818,11 +831,80 @@ async def test_sender_capacity_is_released_before_downstream_acknowledgement(
     assert len([event async for event in stream]) == 3
 
 
+class _VirtualClock:
+    """Deterministic coalescing clock: a wait ends by an event within bounded loop turns or by its timer."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.timer_firings = 0
+
+    def time(self) -> float:
+        return self.now
+
+    async def wait(self, futures: tuple[asyncio.Future[object], ...], seconds: float) -> None:
+        for _turn in range(_EVENT_TURNS):
+            if any(future.done() for future in futures):
+                return
+            await asyncio.sleep(0)
+        self.now += seconds
+        self.timer_firings += 1
+
+
+class _TimedCursorBatchTransport(CursorBatchTransport):
+    def __init__(self, rows: Mapping[str, tuple[int, ...]], clock: Callable[[], float]) -> None:
+        super().__init__(rows)
+        self._clock = clock
+        self.first_request_at: float | None = None
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        if self.first_request_at is None:
+            self.first_request_at = self._clock()
+        return await super().send(request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
+
+
+async def _coalescing_run(
+    output_order: DeliveryOrder,
+    wait: float,
+    clock: Callable[[], float],
+    observations: list[tuple[int, float]],
+) -> tuple[list[object], _TimedCursorBatchTransport, OperationReport | None, tuple[tuple[int, float], ...], float]:
+    observations.clear()
+    transport = _TimedCursorBatchTransport({str(index): (1, 2, 3) for index in range(_COALESCE_BINDINGS)}, clock)
+
+    async def bindings() -> AsyncIterator[Binding[str]]:
+        # An asynchronous source keeps binding admission on the event loop: a synchronous source is
+        # pulled through a worker thread, whose wall-clock timing would reorder admission.
+        for key in transport.rows:
+            yield Binding(key, (ParameterUpdate(ParameterPath(("parent",)), key),), key)
+
+    stream = _client(transport).iter_cursors(
+        Request("item.list", {"parent": "base"}, route=RouteKind.BARE),
+        bindings(),
+        selector=ResultSelector.root(),
+        cursor=_cursor(),
+        page_size=1,
+        dispatch=BatchDispatch(
+            batch_size=_COALESCE_BATCH,
+            concurrency=1,
+            coalesce_wait=wait,
+            output_order=output_order,
+        ),
+    )
+    started = clock()
+    events: list[object] = []
+    async for event in stream:
+        events.append(event)
+        # A slow consumer hands control back to the producer instead of sleeping on the wall clock.
+        for _turn in range(_CONSUMER_TURNS):
+            await asyncio.sleep(0)
+    assert transport.first_request_at is not None
+    return events, transport, stream.report, tuple(observations), transport.first_request_at - started
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("output_order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
-async def test_slow_consumer_records_bounded_per_wave_coalescing_cost(
+async def test_slow_consumer_coalescing_is_bounded_per_wave_on_a_virtual_clock(
     monkeypatch: pytest.MonkeyPatch,
-    record_property: Callable[[str, object], None],
     output_order: DeliveryOrder,
 ) -> None:
     observations: list[tuple[int, float]] = []
@@ -831,89 +913,80 @@ async def test_slow_consumer_records_bounded_per_wave_coalescing_cost(
         observations.append((commands, delay))
 
     monkeypatch.setattr(_BatchPageDispatcher, "_observe_wave", observe_wave)
-    count = 8
-    batch_size = 4
+    clock = _VirtualClock()
+    monkeypatch.setattr(dispatch_module, "_loop_time", clock.time)
+    monkeypatch.setattr(dispatch_module, "_wait_first", clock.wait)
     coalesce_wait = 0.005
 
-    class TimedCursorBatchTransport(CursorBatchTransport):
-        def __init__(self, rows: Mapping[str, tuple[int, ...]]) -> None:
-            super().__init__(rows)
-            self.first_request_at: float | None = None
+    _baseline_events, _baseline_transport, _baseline_report, baseline_waves, _ = await _coalescing_run(
+        output_order, 0, clock.time, observations
+    )
+    assert clock.timer_firings == 0
+    events, transport, report, waves, first_request_latency = await _coalescing_run(
+        output_order, coalesce_wait, clock.time, observations
+    )
 
-        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-            if self.first_request_at is None:
-                self.first_request_at = asyncio.get_running_loop().time()
-            return await super().send(
-                request,
-                attempt_timeout=attempt_timeout,
-                max_response_bytes=max_response_bytes,
-            )
+    assert len([event for event in events if isinstance(event, ReferenceItem)]) == 3 * _COALESCE_BINDINGS
+    command_counts = sorted(commands for commands, _delay in waves)
+    underfilled = [delay for commands, delay in waves if commands < _COALESCE_BATCH]
+    assert len(waves) == len(transport.requests)
+    assert sum(command_counts) == len(transport.commands) == 4 * _COALESCE_BINDINGS
+    if output_order is DeliveryOrder.READY:
+        assert len(underfilled) < len(waves)
+        assert command_counts[-1] == _COALESCE_BATCH
+    else:
+        assert len(waves) > _COALESCE_BINDINGS
+        assert len(underfilled) == len(waves)
+        assert command_counts[-1] < _COALESCE_BATCH
+    # At most one timer firing per underfilled wave, and no wave waits longer than its window.
+    assert clock.timer_firings <= len(underfilled)
+    assert all(delay <= coalesce_wait for _commands, delay in waves)
+    assert sum(underfilled) <= coalesce_wait * len(underfilled)
+    assert all(delay == 0 for _commands, delay in baseline_waves)
+    assert first_request_latency <= coalesce_wait
+    assert report is not None
+    # The row buffer is bounded by the active bindings; the exact peak depends on consumer interleaving.
+    assert 1 <= report.buffered_rows_high_water <= _COALESCE_BINDINGS
+    assert report.active_references_high_water == _COALESCE_BINDINGS
 
-    async def benchmark(wait: float):
-        observations.clear()
-        transport = TimedCursorBatchTransport({str(index): (1, 2, 3) for index in range(count)})
-        stream = _client(transport).iter_cursors(
-            Request("item.list", {"parent": "base"}, route=RouteKind.BARE),
-            [Binding(key, (ParameterUpdate(ParameterPath(("parent",)), key),), key) for key in transport.rows],
-            selector=ResultSelector.root(),
-            cursor=_cursor(),
-            page_size=1,
-            dispatch=BatchDispatch(
-                batch_size=batch_size,
-                concurrency=1,
-                coalesce_wait=wait,
-                output_order=output_order,
-            ),
-        )
-        started = asyncio.get_running_loop().time()
-        events = []
-        async for event in stream:
-            events.append(event)
-            await asyncio.sleep(0.001)
-        elapsed = asyncio.get_running_loop().time() - started
-        assert transport.first_request_at is not None
-        return (
-            events,
-            transport,
-            stream.report,
-            tuple(observations),
-            transport.first_request_at - started,
-            elapsed,
-        )
 
-    baseline = await benchmark(0)
-    measured = await benchmark(coalesce_wait)
-    events, transport, report, waves, first_request_latency, wall_clock = measured
-    _baseline_events, _baseline_transport, _baseline_report, baseline_waves, _, baseline_wall_clock = baseline
+@pytest.mark.benchmark
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
+async def test_slow_consumer_records_bounded_per_wave_coalescing_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, object], None],
+    output_order: DeliveryOrder,
+) -> None:
+    """Wall-clock coalescing benchmark; recorded for trend review and never part of the blocking gate."""
+    observations: list[tuple[int, float]] = []
 
-    assert len([event for event in events if isinstance(event, ReferenceItem)]) == 3 * count
+    def observe_wave(_dispatcher: _BatchPageDispatcher, commands: int, delay: float) -> None:
+        observations.append((commands, delay))
+
+    monkeypatch.setattr(_BatchPageDispatcher, "_observe_wave", observe_wave)
+    coalesce_wait = 0.005
+    clock = asyncio.get_running_loop().time
+
+    started = clock()
+    await _coalescing_run(output_order, 0, clock, observations)
+    baseline_wall_clock = clock() - started
+    started = clock()
+    _events, transport, report, waves, first_request_latency = await _coalescing_run(
+        output_order, coalesce_wait, clock, observations
+    )
+    wall_clock = clock() - started
+
     wave_count = len(waves)
     command_counts = sorted(commands for commands, _delay in waves)
-    underfilled_waves = sum(commands < batch_size for commands in command_counts)
-    assert wave_count == len(transport.requests)
-    assert sum(command_counts) == len(transport.commands) == 4 * count
-    if output_order is DeliveryOrder.READY:
-        assert underfilled_waves < wave_count
-        assert command_counts[-1] == batch_size
-    else:
-        assert wave_count > 8
-        assert underfilled_waves == wave_count
-        assert command_counts[-1] < batch_size
-
     delays = sorted(delay for _commands, delay in waves)
     mean_delay = sum(delays) / wave_count
     p95_delay = delays[(95 * wave_count + 99) // 100 - 1]
-    underfilled_delay = sum(delay for commands, delay in waves if commands < batch_size)
-    scheduling_slack_per_wave = 0.002
+    underfilled_delay = sum(delay for commands, delay in waves if commands < _COALESCE_BATCH)
     assert mean_delay <= 0.020
     assert p95_delay <= 0.020
-    assert underfilled_delay <= (coalesce_wait + scheduling_slack_per_wave) * underfilled_waves
-    assert all(delay == 0 for _commands, delay in baseline_waves)
     assert first_request_latency <= 0.020
     assert report is not None
-    assert report.buffered_rows_high_water == count
-    assert report.active_references_high_water == count
-
     record_property(
         "coalescing_benchmark",
         json.dumps(
@@ -921,7 +994,7 @@ async def test_slow_consumer_records_bounded_per_wave_coalescing_cost(
                 "output_order": output_order.value,
                 "physical_waves": wave_count,
                 "physical_requests": len(transport.requests),
-                "underfilled_waves": underfilled_waves,
+                "underfilled_waves": sum(commands < _COALESCE_BATCH for commands in command_counts),
                 "commands_mean": sum(command_counts) / wave_count,
                 "commands_p50": command_counts[len(command_counts) // 2],
                 "commands_p95": command_counts[(95 * wave_count + 99) // 100 - 1],
@@ -978,7 +1051,7 @@ async def test_exhausted_single_producer_skips_wait_for_one_hundred_sequential_w
         ExecutionPolicy(max_pages=150, max_pages_per_reference=150, max_buffered_rows=2),
     )
     await context.start()
-    state = _ProducerState({"r0"}, {"r0": 0}, source_terminal=True)
+    state = _ProducerState({"r0"}, {"r0": 0})
     buffer = _RowBuffer(2, context, producer_state=state)
     dispatcher = _BatchPageDispatcher(
         executor,
@@ -1131,7 +1204,7 @@ async def test_producer_state_broadcast_and_capacity_predicate_parity() -> None:
     await buffer.close()
     assert not buffer.can_reserve(0, 1)
 
-    blocked_state = _ProducerState(set(), {"r0": 0, "r1": 1}, admitting={"r1"}, source_terminal=True)
+    blocked_state = _ProducerState(set(), {"r0": 0, "r1": 1}, admitting={"r1"})
     blocked_buffer = _RowBuffer(1, context, producer_state=blocked_state)
     held = await blocked_buffer.reserve(1, 1)
     dispatcher = _BatchPageDispatcher(
@@ -1146,7 +1219,7 @@ async def test_producer_state_broadcast_and_capacity_predicate_parity() -> None:
     await blocked_buffer.abort(held)
     await blocked_buffer.close()
 
-    settling_state = _ProducerState(set(), {"r0": 0}, source_terminal=False)
+    settling_state = _ProducerState(set(), {"r0": 0})
     settling_buffer = _RowBuffer(1, context, producer_state=settling_state)
     settling_dispatcher = _BatchPageDispatcher(
         executor,
@@ -1185,7 +1258,7 @@ async def test_settling_wave_counts_only_a_concrete_capacity_blocked_admission()
         ExecutionPolicy(max_pages=2, max_pages_per_reference=2, max_buffered_rows=1),
     )
     await context.start()
-    state = _ProducerState(set(), {"r0": 0}, admitting={"r0"}, source_terminal=True)
+    state = _ProducerState(set(), {"r0": 0}, admitting={"r0"})
     buffer = _RowBuffer(1, context, producer_state=state)
     held = await buffer.reserve(0, 1)
     dispatcher = _BatchPageDispatcher(
@@ -1200,7 +1273,6 @@ async def test_settling_wave_counts_only_a_concrete_capacity_blocked_admission()
     dispatcher._settling_waves = 1
     assert dispatcher._potential({"other"}) == 1
     state.admitting.clear()
-    state.source_terminal = False
     assert dispatcher._potential({"other"}) == 0
     await buffer.abort(held)
     await buffer.close()

@@ -10,7 +10,6 @@ import pytest
 from b24api import (
     AutoKeysetExecution,
     Binding,
-    Bitrix24,
     BoundedIdentityRange,
     CapabilityError,
     DirectDispatch,
@@ -29,7 +28,8 @@ from b24api import (
     TraversalAssurance,
 )
 from b24api.errors import PaginationError
-from b24api.execution import Executor, WireResponse
+from b24api.execution import WireResponse
+from tests.scripting import client_for
 
 
 class BoundaryTransport:
@@ -60,7 +60,7 @@ class BoundaryTransport:
 
 def _setup(ids: tuple[int, ...], *, upper: int = 3, ignore_fence: bool = False):
     transport = BoundaryTransport(ids, ignore_fence=ignore_fence)
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    client = client_for(transport)
     request = Request("item.list", {"filter": {"STATUS": "open"}}, route=RouteKind.BARE)
     boundary = BoundedIdentityRange.capture(
         request,

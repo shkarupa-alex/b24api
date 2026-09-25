@@ -95,6 +95,7 @@ from b24api.contracts.reference import (
 )
 from b24api.contracts.report import (
     KeysetExecutionReport,
+    KeysetSelectionSummary,
     OperationReport,
     PageDispatch,
     PageOutcome,
@@ -114,13 +115,12 @@ from b24api.contracts.request import (
     Request,
     RequestLike,
     RequestSpec,
-    RequestSummary,
     ResultErrorShape,
     ResultErrorSpec,
     ResultSelector,
-    RouteKind,
     TraversalIdentity,
 )
+from b24api.contracts.request_summary import RequestSummary, RouteKind
 from b24api.contracts.response import BinaryEvidence, BinaryResponse, Response, ResultCollectionShape
 from b24api.contracts.stream import OperationStream, PartialResult
 from b24api.contracts.traversal import (
@@ -206,6 +206,7 @@ __all__ = [
     "KeysetPageCompletion",
     "KeysetPhase",
     "KeysetSelectionReason",
+    "KeysetSelectionSummary",
     "KeysetSpec",
     "KeysetTraversal",
     "MembershipRecheck",

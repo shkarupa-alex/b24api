@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from b24api.contracts.command import NotExecutedReason
-    from b24api.errors import B24ApiError
+    from b24api.contracts.error_base import B24ApiError
 
 _SUMMARY_MAXIMUM = 256
 

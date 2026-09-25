@@ -1,23 +1,27 @@
-"""Value-only staging record for fast keyset trace observations."""
-
-# ruff: noqa: SLF001
+"""Value-only fast keyset page observations, their staging and the bounded page trace."""
 
 from __future__ import annotations
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NoReturn
 
-from b24api.contracts.keyset_execution import ClosureWitness, TraceClass
-from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode, Violation, ViolationSeverity
+from b24api.contracts.keyset_execution import ClosureWitness, KeysetPhase, TraceClass
+from b24api.contracts.report import (
+    PageDispatch,
+    PageOutcome,
+    PageRecord,
+    PageRejectionCode,
+    Violation,
+    ViolationSeverity,
+)
 from b24api.errors import PaginationError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
-    from b24api.contracts.keyset_execution import KeysetPhase
     from b24api.contracts.response import Response
-    from b24api.traversal.keyset_scheduler import KeysetFastScheduler
-    from b24api.traversal.ordered_admission import OrderedAdmissionState
-    from b24api.traversal.page_validation import LaneCommandPlan
+    from b24api.traversal.keyset_ordered_admission import OrderedAdmissionState
+    from b24api.traversal.keyset_page_validation import LaneCommandPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +38,6 @@ class PageObservation:
     rows_admitted: int
     reported_total: int | None
     reported_next: int | None
-    page_full: bool
     witness: ClosureWitness | None
     outcome: PageOutcome
     rejection_code: PageRejectionCode | None
@@ -49,7 +52,6 @@ def page_observation(  # noqa: PLR0913
     index: int | None,
     selected: int,
     admitted: int,
-    effective_page_cap: int,
     outcome: PageOutcome = PageOutcome.COMMITTED,
     rejection: PageRejectionCode | None = None,
     violation: Violation | None = None,
@@ -69,47 +71,12 @@ def page_observation(  # noqa: PLR0913
         admitted,
         response.total if response is not None and response.total is not None and response.total >= 0 else None,
         response.next if response is not None else None,
-        selected == effective_page_cap,
         witness,
         outcome,
         rejection,
         violation,
         TraceClass.BODY,
     )
-
-
-def record_scheduler_observation(  # noqa: PLR0913
-    scheduler: KeysetFastScheduler,
-    plan: LaneCommandPlan,
-    *,
-    index: int | None,
-    selected: int,
-    admitted: int,
-    outcome: PageOutcome,
-    rejection: PageRejectionCode | None,
-    violation: Violation | None,
-    response: Response | None,
-    witness: ClosureWitness | None,
-    dispatch: PageDispatch,
-) -> None:
-    """Record one scheduler observation and advance its sole ordinal."""
-    scheduler.trace.record(
-        page_observation(
-            scheduler._observation_ordinal,
-            plan,
-            index=index,
-            selected=selected,
-            admitted=admitted,
-            effective_page_cap=scheduler.effective_page_cap,
-            outcome=outcome,
-            rejection=rejection,
-            violation=violation,
-            response=response,
-            witness=witness,
-            dispatch=dispatch,
-        ),
-    )
-    scheduler._observation_ordinal += 1
 
 
 def flush_staged_observations(
@@ -167,9 +134,7 @@ def abort_staged_observations(
     if not staged:
         return
     boundary = sum(item[2] for item in staged if item[0].phase.value == "boundary")
-    canary = sum(item[2] for item in staged if item[0].phase.value == "canary")
     admission.record_discarded(boundary)
-    admission.record_raw(canary, discarded=True)
     violation = (
         violations[-1]
         if violations
@@ -215,38 +180,113 @@ def finalize_boundary_observations(
     flush_staged_observations(staged, record)
 
 
-async def close_scheduler(scheduler: KeysetFastScheduler) -> None:
-    """Release all state retained by the scheduler owner exactly once."""
-    if scheduler._closed:
-        return
-    scheduler.admission.discard_unadmitted_raw()
-    scheduler._frozen_report = scheduler.report_fragment()
-    if scheduler.transactions.buffer_balance:
-        await scheduler.adjust_buffer(-scheduler.transactions.buffer_balance)
-    if scheduler.transactions.buffer_balance != 0:
-        raise RuntimeError("fast scheduler buffer balance survived cleanup")
-    for retained in (
-        scheduler.transactions.pending,
-        scheduler._pending_owners,
-        scheduler._offered_owners,
-        scheduler.transactions.lane_rows,
-        scheduler.transactions.lane_identities,
-        scheduler.transactions.lane_commands,
-        scheduler.transactions.lanes,
-    ):
-        retained.clear()
-    scheduler._tail = None
-    scheduler.transactions.anchor_rows.clear()
-    scheduler.transactions.anchor_commands.clear()
-    scheduler.transactions.planning_bounds.clear()
-    scheduler.transactions.planning_descending.clear()
-    scheduler.transactions.boundary_totals.clear()
-    scheduler.transactions.staged_observations.clear()
-    scheduler._plan_outcome = None
-    scheduler._range_geometry = None
-    scheduler.admission.assert_clean()
-    scheduler.admission.close()
-    scheduler._closed = True
+class FastTraceRecorder:
+    """Retain first/last records under fixed per-class quotas."""
+
+    def __init__(self, capacity: int) -> None:
+        """Derive fixed quotas and initialize bounded buffers."""
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 0:
+            raise ValueError("trace capacity must be a non-negative integer")
+        planning = capacity // 8
+        terminal = capacity // 8
+        body = capacity // 4
+        self._quotas = {
+            TraceClass.PLANNING: planning,
+            TraceClass.TERMINAL: terminal,
+            TraceClass.BODY: body,
+            TraceClass.ANOMALY: capacity - planning - terminal - body,
+        }
+        self._heads: dict[TraceClass, list[PageRecord]] = {kind: [] for kind in TraceClass}
+        self._tails: dict[TraceClass, deque[PageRecord]] = {
+            kind: deque(maxlen=self._quotas[kind] // 2) for kind in TraceClass
+        }
+        self._dropped: dict[TraceClass, int] = dict.fromkeys(TraceClass, 0)
+        self._command_sequences: dict[str, int] = {}
+        self._sequence_commands: dict[int, str] = {}
+
+    @staticmethod
+    def classify(observation: PageObservation) -> TraceClass:
+        """Apply the normative anomaly-first class priority."""
+        if (
+            observation.violation is not None
+            or observation.outcome is not PageOutcome.COMMITTED
+            or observation.rejection_code is not None
+        ):
+            return TraceClass.ANOMALY
+        if observation.phase in {KeysetPhase.BOUNDARY, KeysetPhase.ANCHOR_PROBE}:
+            return TraceClass.PLANNING
+        if observation.phase is KeysetPhase.FINISH:
+            return TraceClass.TERMINAL
+        return TraceClass.BODY
+
+    def record(self, observation: PageObservation) -> None:
+        """Convert and retain one finalized observation exactly once."""
+        trace_class = self.classify(observation)
+        observation = replace(observation, trace_class=trace_class)
+        record = PageRecord(
+            sequence=observation.ordinal,
+            offset=None,
+            dispatch=observation.dispatch,
+            batch_index=observation.batch_index,
+            rows_selected=observation.rows_selected,
+            rows_admitted=observation.rows_admitted,
+            reported_total=observation.reported_total,
+            reported_next=observation.reported_next,
+            outcome=observation.outcome,
+            rejection_code=observation.rejection_code,
+            phase=observation.phase,
+            lane_ordinal=observation.lane_ordinal,
+        )
+        quota = self._quotas[trace_class]
+        head_cap = (quota + 1) // 2
+        head = self._heads[trace_class]
+        tail = self._tails[trace_class]
+        if len(head) < head_cap:
+            head.append(record)
+            self._retain_command(observation.command_id, record.sequence)
+        elif tail.maxlen:
+            if len(tail) == tail.maxlen:
+                self._dropped[trace_class] += 1
+                self._forget_sequence(tail[0].sequence)
+            tail.append(record)
+            self._retain_command(observation.command_id, record.sequence)
+        else:
+            self._dropped[trace_class] += 1
+
+    def _retain_command(self, command_id: str, sequence: int) -> None:
+        self._command_sequences[command_id] = sequence
+        self._sequence_commands[sequence] = command_id
+
+    def _forget_sequence(self, sequence: int) -> None:
+        command_id = self._sequence_commands.pop(sequence, None)
+        if command_id is not None:
+            self._command_sequences.pop(command_id, None)
+
+    def admit(self, command_id: str, rows: int) -> None:
+        """Finalize admission on one retained successful observation."""
+        sequence = self._command_sequences.pop(command_id, None)
+        if sequence is None:
+            return
+        self._sequence_commands.pop(sequence, None)
+        for records in (*self._heads.values(), *self._tails.values()):
+            for index, record in enumerate(records):
+                if record.sequence == sequence:
+                    records[index] = replace(record, rows_admitted=rows)
+                    return
+
+    def snapshot(self) -> tuple[tuple[PageRecord, ...], Mapping[TraceClass, int]]:
+        """Return retained records and exact per-class drop counts."""
+        records = tuple(
+            sorted(
+                (record for kind in TraceClass for record in (*self._heads[kind], *self._tails[kind])),
+                key=lambda record: record.sequence,
+            ),
+        )
+        return records, dict(self._dropped)
+
+    def class_counts(self) -> tuple[tuple[TraceClass, int], ...]:
+        """Return retained counts in enum order."""
+        return tuple((kind, len(self._heads[kind]) + len(self._tails[kind])) for kind in TraceClass)
 
 
-__all__: list[str] = []
+__all__ = ["FastTraceRecorder", "PageObservation"]

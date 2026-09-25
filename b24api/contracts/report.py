@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 import math
-import warnings
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -128,10 +127,7 @@ class KeysetExecutionReport:
     assurance_source: KeysetAssuranceSource
     planning_requests: int
     boundary_requests: int
-    canary_requests: int
     anchor_probe_requests: int
-    canary_commands: int
-    canary_rows: int
     anchor_probe_commands: int
     anchor_count: int
     empty_anchor_probes: int
@@ -163,12 +159,6 @@ class KeysetExecutionReport:
 
     def __post_init__(self) -> None:
         """Validate closed aggregate report fields."""
-        if self.assurance_source is KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS:
-            warnings.warn(
-                "CANARY_VERIFIED_BOUNDS is retained only for legacy report compatibility",
-                DeprecationWarning,
-                stacklevel=2,
-            )
         enum_values = (
             (self.requested_kind, KeysetExecutionKind),
             (self.selected_kind, KeysetExecutionKind),
@@ -185,10 +175,7 @@ class KeysetExecutionReport:
         integers = (
             self.planning_requests,
             self.boundary_requests,
-            self.canary_requests,
             self.anchor_probe_requests,
-            self.canary_commands,
-            self.canary_rows,
             self.anchor_probe_commands,
             self.anchor_count,
             self.empty_anchor_probes,
@@ -244,6 +231,43 @@ class KeysetExecutionReport:
             raise ValueError(f"{field} must contain declared enums and non-negative integer counts")
 
 
+@dataclass(frozen=True, slots=True)
+class KeysetSelectionSummary:
+    """Which keyset strategy the caller asked for, which one ran, and why."""
+
+    requested_kind: KeysetExecutionKind
+    selected_kind: KeysetExecutionKind
+    reason: KeysetSelectionReason
+
+    def __post_init__(self) -> None:
+        """Validate the closed selection enums."""
+        if not isinstance(self.requested_kind, KeysetExecutionKind) or not isinstance(
+            self.selected_kind,
+            KeysetExecutionKind,
+        ):
+            raise TypeError("keyset selection kinds must be KeysetExecutionKind values")
+        if not isinstance(self.reason, KeysetSelectionReason):
+            raise TypeError("keyset selection reason must be a KeysetSelectionReason")
+
+    @classmethod
+    def of(cls, report: KeysetExecutionReport) -> KeysetSelectionSummary:
+        """Summarize a fast execution by its final, or else its preselection, decision."""
+        reason = report.final_selection_reason or report.preselection_reason
+        return cls(report.requested_kind, report.selected_kind, reason)
+
+
+def _validate_keyset_evidence(execution: object, selection: object) -> None:
+    keyset = ((execution, KeysetExecutionReport), (selection, KeysetSelectionSummary))
+    if any(value is not None and not isinstance(value, kind) for value, kind in keyset):
+        raise TypeError("keyset_execution and keyset_selection must be their report types or None")
+    if (
+        isinstance(execution, KeysetExecutionReport)
+        and isinstance(selection, KeysetSelectionSummary)
+        and (execution.requested_kind, execution.selected_kind) != (selection.requested_kind, selection.selected_kind)
+    ):
+        raise ValueError("keyset_selection must name the same requested and selected kinds as keyset_execution")
+
+
 def _validated_exhausted(state: TerminalState, *, value: bool | None) -> bool:
     if value is None:
         return state is TerminalState.COMPLETED
@@ -281,6 +305,7 @@ class OperationReport:
     page_trace: tuple[PageRecord, ...] = ()
     page_trace_truncated: bool = False
     keyset_execution: KeysetExecutionReport | None = None
+    keyset_selection: KeysetSelectionSummary | None = None
 
     def __post_init__(self) -> None:
         """Validate bounded terminal evidence."""
@@ -318,8 +343,7 @@ class OperationReport:
             raise TypeError("page_trace must contain PageRecord values")
         if not isinstance(self.page_trace_truncated, bool):
             raise TypeError("page_trace_truncated must be a bool")
-        if self.keyset_execution is not None and not isinstance(self.keyset_execution, KeysetExecutionReport):
-            raise TypeError("keyset_execution must be a KeysetExecutionReport or None")
+        _validate_keyset_evidence(self.keyset_execution, self.keyset_selection)
         if self.successful and any(item.severity is ViolationSeverity.BLOCKING for item in self.violations):
             raise ValueError("successful report cannot contain blocking violations")
 

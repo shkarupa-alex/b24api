@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 from collections.abc import Callable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, TypedDict, Unpack, cast
 
-from b24api._stream import MappedOperationStream, _ClosableIterator
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.facade import resolve_batch_size
+from b24api.completion.operation_stream import MappedOperationStream, _ClosableIterator
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     KeysetExecution,
+    KeysetExecutionKind,
+    KeysetSelectionReason,
     PartitionedKeysetExecution,
     RangeKeysetExecution,
     SequentialKeysetExecution,
@@ -21,23 +23,18 @@ from b24api.contracts.policy import (
     OrderSemantics,
     TotalSemantics,
 )
-from b24api.contracts.report import TraversalAssurance, Violation
-from b24api.contracts.request import (
-    IdentitySpec,
-    RequestLike,
-    ResultSelector,
-    RouteKind,
-    TraversalIdentity,
-    canonical_request,
-)
+from b24api.contracts.report import KeysetSelectionSummary, TraversalAssurance, Violation
+from b24api.contracts.request import IdentitySpec, RequestLike, ResultSelector, TraversalIdentity, canonical_request
+from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.traversal import OffsetContinuation, TotalTermination
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.counted import CountedItemStream
 from b24api.traversal.facade_support import _checked_identity_store, _collection_selector, _direction
 from b24api.traversal.keyset_eligibility import validate_fast_keyset
-from b24api.traversal.keyset_fast_stream import FastTraceRecorder, KeysetFastStream
-from b24api.traversal.keyset_scheduler import KeysetFastScheduler
+from b24api.traversal.keyset_fast_stream import KeysetFastStream
+from b24api.traversal.keyset_observation import FastTraceRecorder
+from b24api.traversal.keyset_runtime import KeysetRuntime
 from b24api.traversal.keyset_step import sequential_keyset_plan
 from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import (
@@ -63,13 +60,20 @@ if TYPE_CHECKING:
 type Deregister = Callable[[object], None]
 
 
+class _ReportSeed(TypedDict, total=False):
+    """Facts known before the first pull that the final report carries."""
+
+    initial_violations: tuple[Violation, ...]
+    keyset_selection: KeysetSelectionSummary | None
+
+
 def _mapped_stream(
     source: _ClosableIterator[JsonValue],
     *,
     operation: str,
     assurance: TraversalAssurance,
     deregister: Deregister,
-    audit_violations: tuple[Violation, ...] = (),
+    **seed: Unpack[_ReportSeed],
 ) -> OperationStream[JsonValue]:
     stream: MappedOperationStream[JsonValue, JsonValue] = MappedOperationStream(
         source,
@@ -77,7 +81,7 @@ def _mapped_stream(
         operation=operation,
         assurance=assurance,
         deregister=deregister,
-        initial_violations=audit_violations,
+        **seed,
     )
     return cast("OperationStream[JsonValue]", stream)
 
@@ -154,7 +158,10 @@ def keyset_stream(  # noqa: PLR0913
         SequentialKeysetExecution | RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
     ):
         raise TypeError("execution must be a supported KeysetExecution")
+    requested, reason = KeysetExecutionKind.SEQUENTIAL, KeysetSelectionReason.EXPLICIT_SEQUENTIAL
     if page_stop is not None and isinstance(execution, AutoKeysetExecution):
+        # A page stop needs the ordered page stream, so AUTO settles on sequential before planning.
+        requested, reason = KeysetExecutionKind.AUTO, KeysetSelectionReason.PAGE_STOP
         execution = SequentialKeysetExecution()
     if page_stop is not None and not isinstance(execution, SequentialKeysetExecution):
         raise CapabilityError("page stop requires sequential keyset execution")
@@ -171,7 +178,7 @@ def keyset_stream(  # noqa: PLR0913
         )
         context = executor.context(policy)
         trace = FastTraceRecorder(policy.page_trace_limit)
-        scheduler = KeysetFastScheduler(
+        runtime = KeysetRuntime(
             executor=executor,
             request=canonical,
             identity=identity,
@@ -187,11 +194,11 @@ def keyset_stream(  # noqa: PLR0913
             page_adapter=page_adapter,
         )
         return _mapped_stream(
-            KeysetFastStream(scheduler),
+            KeysetFastStream(runtime),
             operation="iter_list_keyset",
             assurance=TraversalAssurance.IDENTITY_EXACT,
             deregister=deregister,
-            audit_violations=audit_violations,
+            initial_violations=audit_violations,
         )
     plan = sequential_keyset_plan(keyset, page_size)
     return _plan_stream(
@@ -209,6 +216,7 @@ def keyset_stream(  # noqa: PLR0913
         assurance=(TraversalAssurance.BOUNDED_RANGE_OBSERVED if keyset.boundary else TraversalAssurance.IDENTITY_EXACT),
         deregister=deregister,
         audit_violations=audit_violations,
+        keyset_selection=KeysetSelectionSummary(requested, KeysetExecutionKind.SEQUENTIAL, reason),
     )
 
 
@@ -251,7 +259,7 @@ def counted_stream(  # noqa: PLR0913
         or canonical.positional is not None
     ):
         raise CapabilityError("counted traversal supports JSON requests without scoped headers")
-    executor._preflight_request(canonical)  # noqa: SLF001 - operation-wide preflight before stream construction
+    executor.preflight_request(canonical)
     plan = CountedOffsetPlan(
         offset_path=offset.parameter_path,
         limit_path=offset.limit_path,
@@ -288,7 +296,7 @@ def counted_stream(  # noqa: PLR0913
             TraversalAssurance.IDENTITY_AND_COUNT_MATCHED if identity is not None else TraversalAssurance.COUNT_MATCHED
         ),
         deregister=deregister,
-        audit_violations=audit_violations,
+        initial_violations=audit_violations,
     )
 
 
@@ -365,6 +373,7 @@ def _plan_stream(  # noqa: PLR0913
     deregister: Deregister,
     audit_violations: tuple[Violation, ...] = (),
     identity_store: IdentityStore | None = None,
+    keyset_selection: KeysetSelectionSummary | None = None,
 ) -> OperationStream[JsonValue]:
     source = _iter_list(
         executor,
@@ -383,7 +392,8 @@ def _plan_stream(  # noqa: PLR0913
         operation=operation,
         assurance=assurance,
         deregister=deregister,
-        audit_violations=audit_violations,
+        initial_violations=audit_violations,
+        keyset_selection=keyset_selection,
     )
 
 

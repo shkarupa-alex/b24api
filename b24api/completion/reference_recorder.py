@@ -1,9 +1,7 @@
 """Bounded completion evidence for concurrently scheduled reference bindings."""
 
 from __future__ import annotations
-import hashlib
-import json
-from typing import TYPE_CHECKING, TypedDict
+from typing import TypedDict
 from uuid import uuid4
 
 from b24api.completion.gate import CompletionGate
@@ -24,11 +22,6 @@ from b24api.contracts.completion import (
     StreamClosure,
     StreamTerminal,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from b24api.traversal.values import IdentityValue
 
 
 class _PageFields(TypedDict):
@@ -149,10 +142,9 @@ class ReferenceBindingRecorder:
             self.unknown = outcome is CommandSettlement.UNKNOWN
             self._current = None
 
-    def validated(self, identities: Sequence[IdentityValue], row_count: int) -> None:
+    def validated(self, row_count: int) -> None:
         """Record committed validation without retaining identity values."""
-        digest = hashlib.sha256(json.dumps(identities, separators=(",", ":")).encode()).hexdigest()
-        self._emit(PageValidated(**self._fields(), identity_digest=digest, row_count=row_count))
+        self._emit(PageValidated(**self._fields(), row_count=row_count))
         self._validated_rows = row_count
 
     def complete_omitted_empty(self) -> None:

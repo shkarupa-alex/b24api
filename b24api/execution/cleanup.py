@@ -18,25 +18,28 @@ class CloseableResource(Protocol):
 async def close_owned_resources(
     streams: Iterable[CloseableResource],
     transport: CloseableResource | None,
+    coordinator: CloseableResource | None = None,
 ) -> None:
-    """Attempt every owned close and preserve the first cleanup failure."""
+    """Attempt every owned close and preserve the first cleanup failure.
+
+    Order: streams, then the owned rate coordinator (its cooldown wake task is awaited), then the
+    owned transport.
+    """
+    ordered: list[tuple[CloseableResource, str]] = [(stream, "additional stream") for stream in streams]
+    ordered.extend(
+        (resource, label)
+        for resource, label in ((coordinator, "coordinator"), (transport, "transport"))
+        if resource is not None
+    )
     primary: BaseException | None = None
-    for stream in streams:
+    for resource, label in ordered:
         try:
-            await stream.aclose()
+            await resource.aclose()
         except BaseException as error:  # noqa: BLE001 - every owned resource must still be closed
             if primary is None:
                 primary = error
             else:
-                primary.add_note(f"additional stream cleanup failure: {type(error).__name__}")
-    if transport is not None:
-        try:
-            await transport.aclose()
-        except BaseException as error:  # noqa: BLE001 - retain failure after ordered cleanup
-            if primary is None:
-                primary = error
-            else:
-                primary.add_note(f"transport cleanup failure: {type(error).__name__}")
+                primary.add_note(f"{label} cleanup failure: {type(error).__name__}")
     if primary is not None:
         raise primary
 

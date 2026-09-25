@@ -3,15 +3,8 @@
 from __future__ import annotations
 
 import b24api.errors as error_types
-from b24api import (
-    AmbiguityReason,
-    IdentityCoercion,
-    OperationReport,
-    ReplayDisposition,
-    ResultCollectionShape,
-    ResultSelector,
-    TerminalState,
-)
+from b24api import IdentityCoercion, OperationReport, ResultSelector, TerminalState
+from b24api.contracts import AmbiguityReason, ReplayDisposition, ResultCollectionShape
 from b24api.execution.failure import classify_failure, finalize_failure
 
 

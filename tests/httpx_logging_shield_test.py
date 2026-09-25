@@ -5,13 +5,17 @@ import asyncio
 import io
 import logging
 import tomllib
+from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
-from b24api import BodyEncoding, Request, RouteKind
+from b24api import Request, RouteKind
+from b24api.contracts import BodyEncoding
 from b24api.errors import TransportError
 from b24api.transport import HttpxTransport
 from b24api.transport.logging_shield import HTTPX_LOG_SHIELD
@@ -21,6 +25,7 @@ if TYPE_CHECKING:
 
 _OWNED_MARKER = "synthetic-owned-secret-123456"
 _FOREIGN_MARKER = "synthetic-foreign-secret-123456"
+_PROBE_MARKER = "synthetic-probe-secret-000000"
 _SUCCESS_STATUS = 200
 _RESPONSE_STATUS = 403
 _OWNED_RECORDS = 2
@@ -32,6 +37,38 @@ def test_httpx_dependency_range_matches_the_positive_controlled_minor() -> None:
     project = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
 
     assert "httpx[http2]>=0.28.1,<0.29" in project["project"]["dependencies"]
+
+
+# The newest h2 and hpack the hpack logger matrix ran on (outcomes.md, C2). The shield filters a fixed set of
+# hpack logger names, so a consumer must not resolve a newer, unverified line.
+_VERIFIED_HPACK_STACK = {"h2": Version("4.4.1"), "hpack": Version("4.2.0")}
+
+
+@pytest.mark.parametrize("name", sorted(_VERIFIED_HPACK_STACK))
+def test_hpack_stack_is_bounded_to_the_verified_line(name: str) -> None:
+    project = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    requirements = [Requirement(line) for line in project["project"]["dependencies"]]
+    specifier = next(requirement.specifier for requirement in requirements if requirement.name == name)
+    upper = [spec for spec in specifier if spec.operator == "<"]
+
+    verified = _VERIFIED_HPACK_STACK[name]
+    next_minor = Version(f"{verified.major}.{verified.minor + 1}")
+
+    assert upper, f"{name} has no upper bound"
+    assert verified in specifier
+    assert all(Version(spec.version) <= next_minor for spec in upper)
+    assert metadata.version(name) in specifier
+
+
+async def _assert_shield_released(logger: logging.Logger) -> None:
+    """After the last transport and its injected client close, nothing stays registered or installed.
+
+    A client closed after its transport leaves the filter inert, holding no secret, until the next shield
+    lifecycle event removes it; a throwaway transport provides that event.
+    """
+    assert not {_OWNED_MARKER, _FOREIGN_MARKER} & set(HTTPX_LOG_SHIELD.registered_secrets())
+    await HttpxTransport(f"https://portal.invalid/rest/1/{_PROBE_MARKER}/").aclose()
+    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
 
 
 class _CollectingHandler(logging.StreamHandler[io.StringIO]):
@@ -101,7 +138,7 @@ async def test_httpx_info_record_is_emitted_and_rewritten_before_handler_formatt
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 @pytest.mark.asyncio
@@ -155,7 +192,7 @@ async def test_closing_transport_keeps_filter_until_inflight_httpx_record_is_emi
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - in-flight cleanup control
+    await _assert_shield_released(logger)
 
 
 @pytest.mark.asyncio
@@ -242,7 +279,7 @@ async def test_redirect_replaces_webhook_token_without_logging_either_secret(rou
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 _THIRD_MARKER = "synthetic-third-secret-777777"
@@ -308,7 +345,7 @@ async def test_unrelated_httpx_request_inside_owned_hook_is_unchanged(same_clien
         await foreign.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 _UNAUTHORIZED = 401
@@ -377,7 +414,7 @@ async def test_in_place_injected_auth_keeps_owned_webhook_out_of_info(route: Rou
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 def _substitute(url: httpx.URL, target: str) -> str:
@@ -477,7 +514,7 @@ async def test_injected_auth_substitute_is_refused_before_dispatch(
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 @pytest.mark.asyncio
@@ -526,7 +563,7 @@ async def test_foreign_root_redirect_to_the_owned_webhook_never_logs_its_secret(
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 @pytest.mark.asyncio
@@ -567,7 +604,7 @@ async def test_concurrent_owned_sends_with_distinct_tokens_share_one_client() ->
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 class _MutatingAuth(httpx.Auth):
@@ -630,7 +667,7 @@ async def test_mutating_the_owned_request_in_place_keeps_every_credential_privat
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 class _SilentAuth(httpx.Auth):
@@ -660,7 +697,7 @@ async def test_injected_auth_yielding_nothing_is_refused_before_dispatch() -> No
     finally:
         await transport.aclose()
         await client.aclose()
-    assert HTTPX_LOG_SHIELD._filter not in logging.getLogger("httpx").filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logging.getLogger("httpx"))
 
 
 @pytest.mark.asyncio
@@ -707,7 +744,7 @@ async def test_nested_foreign_redirect_with_a_distinct_token_stays_unchanged() -
         await client.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 @pytest.mark.asyncio
@@ -756,7 +793,7 @@ async def test_owned_response_hook_scrubs_url_bearing_extra() -> None:
         await foreign.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 def _extra_matrix(url: httpx.URL, hop: httpx.URL) -> dict[str, object]:
@@ -827,7 +864,7 @@ async def test_owned_and_foreign_extra_value_matrix() -> None:
         await foreign.aclose()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
-    assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
+    await _assert_shield_released(logger)
 
 
 def test_invalid_owned_url_does_not_leave_the_filter_in_flight() -> None:

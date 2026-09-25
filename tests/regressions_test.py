@@ -10,21 +10,12 @@ import pytest
 from b24api import (
     Binding,
     Bitrix24,
-    Command,
-    CommandFailure,
-    CommandNotExecuted,
-    CommandOutcomeUnknown,
-    CommandSuccess,
     CursorSpec,
-    DeliveryOrder,
     DirectDispatch,
     IdentitySpec,
     OffsetSpec,
     ParameterPath,
     ParameterUpdate,
-    ReferenceComplete,
-    ReferenceItem,
-    ReplayDisposition,
     ReplaySafety,
     Request,
     ResultSelector,
@@ -34,7 +25,18 @@ from b24api import (
     TerminalState,
     TraversalAssurance,
 )
-from b24api.contracts import IdentityCoercion
+from b24api.contracts import (
+    Command,
+    CommandFailure,
+    CommandNotExecuted,
+    CommandOutcomeUnknown,
+    CommandSuccess,
+    DeliveryOrder,
+    IdentityCoercion,
+    ReferenceComplete,
+    ReferenceItem,
+    ReplayDisposition,
+)
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
@@ -44,10 +46,10 @@ from b24api.errors import (
     InputSourceError,
     TransportError,
 )
-from b24api.execution import WireResponse
+from tests.scripting import ResponderTransport
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator
 
     from b24api.contracts import JsonValue
 
@@ -57,33 +59,8 @@ _EXPECTED_OWNER = 10
 _EXPECTED_ROWS = 2
 
 
-class FixtureTransport:
-    """Credential-free method-agnostic response fixture."""
-
-    host = "bitrix24.com"
-
-    def __init__(self, handler: Callable[[Request], object]) -> None:
-        """Store the deterministic response handler."""
-        self.handler = handler
-        self.requests: list[Request] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Return or raise the handler's deterministic outcome."""
-        assert attempt_timeout > 0
-        self.requests.append(request)
-        outcome = self.handler(request)
-        if isinstance(outcome, BaseException):
-            raise outcome
-        body = json.dumps(outcome, separators=(",", ":")).encode()
-        assert len(body) <= max_response_bytes
-        return WireResponse(_HTTP_OK, (("content-type", "application/json"),), body)
-
-    async def aclose(self) -> None:
-        """Caller-owned fixture has no resources."""
-
-
-def _client(transport: FixtureTransport) -> Bitrix24:
-    return Bitrix24(Settings(webhook_url="https://bitrix24.com/rest/0/test/"), transport=transport)
+def _client(transport: ResponderTransport) -> Bitrix24:
+    return Bitrix24(Settings(webhook_url=f"https://{transport.host}/rest/0/test/"), transport=transport)
 
 
 def _identity(
@@ -116,7 +93,7 @@ async def test_tolerant_batch_preserves_all_correlated_states() -> None:
             },
         }
 
-    mixed = _client(FixtureTransport(mixed_handler)).batch_outcomes(
+    mixed = _client(ResponderTransport(mixed_handler)).batch_outcomes(
         [
             Command(
                 Request("sample.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
@@ -135,7 +112,7 @@ async def test_tolerant_batch_preserves_all_correlated_states() -> None:
         raise RuntimeError("source failed")
 
     not_executed = _client(
-        FixtureTransport(lambda _request: pytest.fail("partial source must not dispatch")),
+        ResponderTransport(lambda _request: pytest.fail("partial source must not dispatch")),
     ).batch_outcomes(
         broken_source(),
         batch_size=2,
@@ -145,7 +122,7 @@ async def test_tolerant_batch_preserves_all_correlated_states() -> None:
         await anext(not_executed)
 
     ambiguous = TransportError("response lost", phase=FailurePhase.DISPATCH_STARTED)
-    unknown_transport = FixtureTransport(lambda _request: ambiguous)
+    unknown_transport = ResponderTransport(lambda _request: ambiguous)
     unknown_stream = _client(unknown_transport).batch_outcomes(
         [
             Command(
@@ -169,7 +146,7 @@ async def test_tolerant_batch_preserves_all_correlated_states() -> None:
 
 @pytest.mark.asyncio
 async def test_unknown_write_is_not_replayed_after_dispatch() -> None:
-    transport = FixtureTransport(
+    transport = ResponderTransport(
         lambda _request: TransportError("response lost", phase=FailurePhase.DISPATCH_STARTED),
     )
 
@@ -181,7 +158,7 @@ async def test_unknown_write_is_not_replayed_after_dispatch() -> None:
 
 @pytest.mark.asyncio
 async def test_limit_conflict_rejects_before_network() -> None:
-    transport = FixtureTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     stream = _client(transport).iter_list(
         Request("sample.list", {"LIMIT": 99}, ReplaySafety.SAFE, route=RouteKind.BARE),
         page_size=_PAGE,
@@ -221,7 +198,7 @@ async def test_async_binding_correlation_and_selector() -> None:
         assert not isinstance(owner, bool)
         return {"result": {"items": [] if parameters["start"] else [{"ID": owner}]}}
 
-    transport = FixtureTransport(handler)
+    transport = ResponderTransport(handler)
     stream = _client(transport).iter_references(
         Request("sample.list", {"filter": {"OWNER": 0}}, ReplaySafety.SAFE, route=RouteKind.BARE),
         bindings(),
@@ -268,7 +245,7 @@ async def test_counted_stride_uses_observed_head_width() -> None:
             },
         }
 
-    stream = _client(FixtureTransport(handler)).iter_list_counted(
+    stream = _client(ResponderTransport(handler)).iter_list_counted(
         Request("sample.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
         page_size=_PAGE,
@@ -294,7 +271,7 @@ async def test_distinct_item_filter_order_paths_are_exact() -> None:
         rows = [{"id": value} for value in (1, 2) if value > boundary]
         return {"result": rows[:1]}
 
-    stream = _client(FixtureTransport(handler)).iter_list_keyset(
+    stream = _client(ResponderTransport(handler)).iter_list_keyset(
         Request("sample.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(item_path=("id",), filter_key="ID", order_key="id"),
@@ -309,7 +286,7 @@ async def test_distinct_item_filter_order_paths_are_exact() -> None:
 
 @pytest.mark.asyncio
 async def test_repeated_cursor_boundary_is_not_reported_complete() -> None:
-    transport = FixtureTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 1}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 1}]})
     stream = _client(transport).iter_list_cursor(
         Request("sample.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
@@ -332,7 +309,7 @@ async def test_repeated_cursor_boundary_is_not_reported_complete() -> None:
 @pytest.mark.asyncio
 async def test_ignored_filter_requires_application_reconciliation() -> None:
     pages = [[{"ID": 1, "owner": 10}, {"ID": 2, "owner": 20}], []]
-    stream = _client(FixtureTransport(lambda _request: {"result": pages.pop(0)})).iter_list(
+    stream = _client(ResponderTransport(lambda _request: {"result": pages.pop(0)})).iter_list(
         Request("sample.list", {"filter": {"owner": 10}}, ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
@@ -348,7 +325,7 @@ async def test_ignored_filter_requires_application_reconciliation() -> None:
 @pytest.mark.asyncio
 async def test_overmatched_multifield_is_not_claimed_verified() -> None:
     pages = [[{"ID": 1, "email": "a@example.invalid"}, {"ID": 2, "phone": "100"}], []]
-    stream = _client(FixtureTransport(lambda _request: {"result": pages.pop(0)})).iter_list(
+    stream = _client(ResponderTransport(lambda _request: {"result": pages.pop(0)})).iter_list(
         Request(
             "sample.list",
             {"filter": {"has_email": True, "has_phone": True}},

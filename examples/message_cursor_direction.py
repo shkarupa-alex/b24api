@@ -13,7 +13,6 @@ import asyncio
 
 from b24api import (
     Bitrix24,
-    CursorDomain,
     CursorSpec,
     IdentityCoercion,
     ParameterPath,
@@ -23,6 +22,7 @@ from b24api import (
     RouteKind,
     Settings,
 )
+from b24api.contracts import CursorDomain
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 

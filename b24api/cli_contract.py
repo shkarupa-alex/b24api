@@ -11,7 +11,6 @@ from b24api import (
     Bitrix24,
     CursorSpec,
     IdentitySpec,
-    KeysetPageCompletion,
     KeysetSpec,
     OffsetSpec,
     ParameterPath,
@@ -19,23 +18,29 @@ from b24api import (
     RangeKeysetExecution,
     ReplaySafety,
     Request,
-    ResultCollectionShape,
     ResultSelector,
     RouteKind,
     SequentialKeysetExecution,
     StableIntegerKeysetContract,
+)
+from b24api.contracts import (
+    IdentityCoercion,
+    JsonValue,
+    KeysetExecution,
+    KeysetPageCompletion,
+    OperationStream,
+    ResultCollectionShape,
     TotalHintMode,
 )
-from b24api.contracts import IdentityCoercion, JsonValue, KeysetExecution, OperationStream
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.keyset_execution import KeysetExecutionJson
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from b24api.contracts.request import RouteKind
+    from b24api.contracts.request_summary import RouteKind
 
 _CONTRACT_VERSION = 1
-_PORTAL_BATCH_CAP = 50
 _DEFAULT_AUTO_KEYSET_EXECUTION = AutoKeysetExecution(StableIntegerKeysetContract())
 
 
@@ -176,7 +181,7 @@ def _common(contract: Mapping[str, object], *, selector_required: bool) -> tuple
     if contract.get("version") != _CONTRACT_VERSION:
         raise CliUsageError("contract.version must equal 1")
     selector = _selector(contract.get("selector"), required=selector_required)
-    page_size = contract.get("page_size", _PORTAL_BATCH_CAP)
+    page_size = contract.get("page_size", PORTAL_BATCH_CAP)
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         raise CliUsageError("contract.page_size must be a positive integer")
     return selector, page_size
@@ -329,7 +334,7 @@ class VerifyKeysetContractRoute:
     identity: IdentitySpec
     keyset: KeysetSpec
     collection_shape: ResultCollectionShape = ResultCollectionShape.SEQUENCE
-    page_size: int = _PORTAL_BATCH_CAP
+    page_size: int = PORTAL_BATCH_CAP
 
 
 def parse_verify_keyset_contract(contract: dict[str, object]) -> VerifyKeysetContractRoute:

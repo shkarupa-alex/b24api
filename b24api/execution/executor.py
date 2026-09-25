@@ -8,17 +8,19 @@ import math
 import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from b24api._error_types import FailurePhase
+from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.json import _json_type_name
 from b24api.contracts.policy import AmbiguityReason, ExecutionPolicy
-from b24api.contracts.request import ReplaySafety, Request, RequestSummary, ResultErrorShape
+from b24api.contracts.request import ReplaySafety, Request, ResultErrorShape, diagnostic_context
 from b24api.contracts.response import (
     BinaryEvidence,
     BinaryResponse,
     Response,
-    ResponseEvidence,
     ResponseTime,
 )
 from b24api.errors import (
@@ -27,13 +29,13 @@ from b24api.errors import (
     B24ApiError,
     BatchCommandError,
     BudgetExceededError,
-    CapabilityError,
     EnvelopeContractError,
     HTTPGatewayError,
     ProtocolError,
     ResponseTooLargeError,
     TransportError,
 )
+from b24api.execution.boundary import send_transport
 from b24api.execution.context import (
     ExecutionContext,
     _checkpoint_pending_cancellation,
@@ -41,10 +43,12 @@ from b24api.execution.context import (
 )
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
-from b24api.transport.base import TransportCapabilities, WireRequest, WireTransport, preflight_transport
+from b24api.redaction import DEFAULT_REDACTOR, Redactor
+from b24api.transport.base import WireRequest, WireTransport, preflight_transport
 from b24api.transport.protocol import ProtocolCodec
 
 if TYPE_CHECKING:
+    from b24api.contracts.request_summary import RequestSummary
     from b24api.transport.base import Transport, WireResponse
 
 type Clock = Callable[[], float]
@@ -52,6 +56,65 @@ type Sleeper = Callable[[float], Awaitable[None]]
 
 _HTTP_STATUS_MINIMUM = 100
 _HTTP_STATUS_MAXIMUM = 599
+
+
+class _BodyMode(Enum):
+    """Select how a conclusive success body is interpreted."""
+
+    BINARY = "binary"
+    JSON = "json"
+    JSON_STRICT_MEMBERS = "json_strict_members"
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedBody:
+    """Carry the result of the one strict parse of a JSON success body."""
+
+    payload: object
+    failure: ValueError | None
+
+
+@dataclass(slots=True)
+class _RequestAttempts:
+    """Attempts and retry clock one request shares across its sends, including a batch's replay rounds."""
+
+    started: float | None = None
+    used: int = 0
+    # Whether a send of the current batch round may have run: one before its last send, and the last one.
+    earlier_unproven: bool = False
+    last_unproven: bool = False
+    last_failure: B24ApiError | None = None
+    # The latest failure of the round that does not prove its send did not run: what an unknown outcome is about.
+    unproven_failure: B24ApiError | None = None
+
+    def begin(self, clock: Clock) -> tuple[float, int]:
+        """Start the retry clock on the first send and return it with the attempts already spent."""
+        if self.started is None:
+            self.started = clock()
+        return self.started, self.used
+
+    def dispatched(self) -> None:
+        """Record a send, which may have run until its failure proves otherwise."""
+        self.earlier_unproven = self.earlier_unproven or self.last_unproven
+        self.last_unproven = True
+        self.used += 1
+
+    def settle(self, error: B24ApiError, policy: ExecutionPolicy) -> None:
+        """Record how the last send failed; a budget that stops a retry reports the failure that asked for it."""
+        if isinstance(error, BudgetExceededError):
+            if error.__cause__ is None:
+                error.__cause__ = self.last_failure
+            return
+        self.last_failure = error
+        if _proves_not_run(error, policy):
+            self.last_unproven = False
+        else:
+            self.unproven_failure = error
+
+    def new_round(self) -> None:
+        """Forget which sends of the previous batch round may have run and how they failed."""
+        self.earlier_unproven = self.last_unproven = False
+        self.last_failure = self.unproven_failure = None
 
 
 class _DecodedJsonObject(dict[str, object]):
@@ -108,7 +171,7 @@ class Executor:
         self._sleep = sleep
         self._random = random_source
 
-    def _preflight_request(self, request: Request) -> None:
+    def preflight_request(self, request: Request) -> None:
         """Validate transport representation without reserving budget or dispatching."""
         preflight_transport(self._wire_transport, request)
 
@@ -125,6 +188,7 @@ class Executor:
         work_class: WorkClass = WorkClass.INTERACTIVE_DIRECT,
         strict_json_members: bool = False,
         _admission_methods: frozenset[str] | None = None,
+        _attempts: _RequestAttempts | None = None,
     ) -> Response:
         """Execute one canonical request."""
         if context is not None and policy is not None:
@@ -134,24 +198,29 @@ class Executor:
         if not isinstance(strict_json_members, bool):
             raise TypeError("strict_json_members must be a boolean")
         context = context or self.context(policy)
-        wire = await self._execute_wire(
-            request,
-            context=context,
-            work_class=work_class,
-            binary=False,
-            methods=_admission_methods or frozenset({request.method}),
-        )
+        attempts = _attempts or _RequestAttempts()
+        spent = attempts.used
         try:
-            response = _decode_success(
-                wire,
-                request_summary=request.summary,
-                strict_json_members=strict_json_members,
+            wire, parsed = await self._execute_wire_attempts(
+                request,
+                context=context,
+                work_class=work_class,
+                mode=_BodyMode.JSON_STRICT_MEMBERS if strict_json_members else _BodyMode.JSON,
+                methods=_admission_methods or frozenset({request.method}),
+                shared=attempts,
             )
+        except BaseException as error:
+            if attempts.used > spent:
+                _mark_dispatch_started(error)
+            raise
+        try:
+            response = _decode_success(wire, parsed, request_summary=request.summary)
             _raise_embedded_result_error(
                 request,
                 response.result,
                 http_status=wire.status_code,
                 retry_codes=context.policy.retry.transient_api_codes,
+                redactor=self.codec.redactor,
             )
         except BaseException as error:
             _mark_dispatch_started(error)
@@ -172,77 +241,50 @@ class Executor:
         if not isinstance(request, Request):
             raise TypeError("request must be canonical Request")
         context = context or self.context(policy)
-        wire = await self._execute_wire(
-            request,
-            context=context,
-            work_class=work_class,
-            binary=True,
-            methods=frozenset({request.method}),
-        )
+        attempts = _RequestAttempts()
+        try:
+            wire, _parsed = await self._execute_wire_attempts(
+                request,
+                context=context,
+                work_class=work_class,
+                mode=_BodyMode.BINARY,
+                methods=frozenset({request.method}),
+                shared=attempts,
+            )
+        except BaseException as error:
+            if attempts.used:
+                _mark_dispatch_started(error)
+            raise
         content_type = wire.content_type
         digest = hashlib.sha256(wire.body).hexdigest() if context.policy.binary_digest else None
         evidence = BinaryEvidence(wire.status_code, content_type, wire.byte_length, digest)
         return BinaryResponse(wire.body, content_type=content_type, evidence=evidence)
 
-    async def _execute_wire(
+    async def _execute_wire_attempts(  # noqa: C901, PLR0913, PLR0915
         self,
         request: Request,
         *,
         context: ExecutionContext,
         work_class: WorkClass,
-        binary: bool,
+        mode: _BodyMode,
         methods: frozenset[str],
-    ) -> WireResponse:
-        """Attach request-local dispatch evidence to every escaping failure."""
-        dispatch_started = False
-
-        def mark_dispatch_started() -> None:
-            nonlocal dispatch_started
-            dispatch_started = True
-
-        try:
-            return await self._execute_wire_attempts(
-                request,
-                context=context,
-                work_class=work_class,
-                binary=binary,
-                methods=methods,
-                on_dispatch=mark_dispatch_started,
-            )
-        except BaseException as error:
-            if dispatch_started:
-                _mark_dispatch_started(error)
-            raise
-
-    async def _execute_wire_attempts(  # noqa: C901, PLR0912, PLR0913, PLR0915
-        self,
-        request: Request,
-        *,
-        context: ExecutionContext,
-        work_class: WorkClass,
-        binary: bool,
-        methods: frozenset[str],
-        on_dispatch: Callable[[], None],
-    ) -> WireResponse:
-        """Run the shared attempt loop and return one conclusive raw response."""
-        self._preflight_request(request)
+        shared: _RequestAttempts,
+    ) -> tuple[WireResponse, _ParsedBody | None]:
+        """Run the attempt loop and return one conclusive raw response; ``shared`` counts every dispatch."""
+        self.preflight_request(request)
         wire_request = WireRequest(request) if self._wire_transport is not None else None
         await _checkpoint_pending_cancellation()
         await context.start()
-        retry_started = self._clock()
-        attempts = 0
+        retry_started, attempts = shared.begin(self._clock)
         last_error: B24ApiError | None = None
         while True:
-            remaining = context.remaining_time(retry_started=retry_started)
-            if remaining <= 0:
-                raise BudgetExceededError("execution time budget exhausted")
+            if (remaining := context.remaining_time(retry_started=retry_started)) <= 0:
+                raise BudgetExceededError("execution time budget exhausted") from last_error
             scheduled_class = work_class if attempts == 0 else WorkClass.RETRY
             try:
                 async with asyncio.timeout(remaining):
                     permit = await context.coordinator.acquire(
-                        scheduled_class,
-                        methods=methods,
-                        budget=DeadlineBudget(self._clock() + remaining),
+                        scheduled_class, methods=methods, budget=DeadlineBudget(self._clock() + remaining)
                     )
             except TimeoutError as error:
                 raise BudgetExceededError("permit wait exhausted execution time budget") from (last_error or error)
@@ -252,10 +294,10 @@ class Executor:
                     if remaining <= 0:
                         raise BudgetExceededError("execution time budget exhausted before dispatch")
                     await context.reserve_attempt(attempts_for_request=attempts, retry_started=retry_started)
-                    on_dispatch()
+                    shared.dispatched()
                     try:
                         async with asyncio.timeout(remaining):
-                            wire = await _send_transport(
+                            wire = await send_transport(
                                 self.transport,
                                 self._wire_transport,
                                 request,
@@ -278,44 +320,18 @@ class Executor:
                     context=context,
                     retry_started=retry_started,
                     attempts=attempts,
+                    shared=shared,
                 )
                 last_error = error
                 attempts += 1
                 continue
 
-            response_error: B24ApiError | None = None
-            if not binary or not _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM:
-                content_type = (wire.content_type or "").split(";", 1)[0].strip().casefold()
-                body: bytes | None = wire.body
-                if binary and content_type != "application/json" and not content_type.endswith("+json"):
-                    body = None
-                if wire.status_code < _HTTP_SUCCESS_MINIMUM or (
-                    _HTTP_REDIRECTION_MINIMUM <= wire.status_code < _HTTP_CLIENT_ERROR_MINIMUM
-                ):
-                    response_error = HTTPGatewayError(
-                        f"HTTP gateway error {wire.status_code}",
-                        request_summary=request.summary,
-                        evidence=_wire_evidence(wire),
-                    )
-                else:
-                    response_error = self.codec.error_from_http(
-                        status_code=wire.status_code,
-                        body=body,
-                        request_summary=request.summary,
-                        headers=wire.header_map,
-                        retry_codes=context.policy.retry.transient_api_codes,
-                    )
-                if response_error is None and not _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM:
-                    response_error = HTTPGatewayError(
-                        f"HTTP gateway error {wire.status_code}",
-                        request_summary=request.summary,
-                        evidence=_wire_evidence(wire),
-                    )
+            response_error, parsed = self._classify_response(request, wire, context=context, mode=mode)
             if response_error is None:
                 _raise_for_pending_cancellation()
                 if context.remaining_time(retry_started=retry_started) <= 0:
                     raise BudgetExceededError("transport completed after execution time budget")
-                return wire
+                return wire, parsed
             code = response_error.normalized_code if isinstance(response_error, ApiResponseError) else None
             method_cooldown = (
                 await context.coordinator.observe_api_throttle(request.method, code)
@@ -325,24 +341,98 @@ class Executor:
             throttle_delay = _retry_after_seconds(wire)
             if throttle_delay is not None:
                 merged = await context.coordinator.observe_throttle(
-                    throttle_delay,
-                    reason=_throttle_reason(response_error),
+                    throttle_delay, reason=_throttle_reason(response_error)
                 )
                 await context.record_cooldown(merged)
             _raise_for_pending_cancellation()
+            shared.settle(response_error, context.policy)
             if context.remaining_time(retry_started=retry_started) <= 0:
-                raise BudgetExceededError("transport completed after execution time budget")
+                raise BudgetExceededError("transport completed after execution time budget") from response_error
             await self._prepare_retry(
                 request,
                 response_error,
                 context=context,
                 retry_started=retry_started,
                 attempts=attempts,
+                shared=shared,
                 wire=wire,
                 method_cooldown=method_cooldown,
             )
             last_error = response_error
             attempts += 1
+
+    def _classify_response(
+        self,
+        request: Request,
+        wire: WireResponse,
+        *,
+        context: ExecutionContext,
+        mode: _BodyMode,
+    ) -> tuple[B24ApiError | None, _ParsedBody | None]:
+        """Classify one conclusive response, parsing a JSON success body exactly once."""
+        success = _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM
+        if success and mode is _BodyMode.BINARY:
+            return None, None
+        parsed = None
+        body: bytes | Mapping[str, object] | None = wire.body
+        if success:
+            parsed = _parse_success_body(wire.body, strict_members=mode is _BodyMode.JSON_STRICT_MEMBERS)
+            if parsed.failure is not None and not isinstance(parsed.failure, json.JSONDecodeError):
+                # Invalid UTF-8, a non-finite number or a duplicate correlation key is a defect only the
+                # strict parse sees; a lenient second parse must not turn it into a structured API error.
+                return None, parsed
+            if parsed.failure is None:
+                payload = parsed.payload
+                if not (isinstance(payload, Mapping) and "error" in payload):
+                    return None, parsed
+                # The codec classifies the structured error from the one strict parse, not a second one.
+                body = payload
+        content_type = (wire.content_type or "").split(";", 1)[0].strip().casefold()
+        if mode is _BodyMode.BINARY and content_type != "application/json" and not content_type.endswith("+json"):
+            body = None
+        if wire.status_code < _HTTP_SUCCESS_MINIMUM or (
+            _HTTP_REDIRECTION_MINIMUM <= wire.status_code < _HTTP_CLIENT_ERROR_MINIMUM
+        ):
+            return HTTPGatewayError(
+                f"HTTP gateway error {wire.status_code}",
+                request_summary=request.summary,
+                evidence=_wire_evidence(wire),
+            ), parsed
+        response_error = self.codec.error_from_http(
+            status_code=wire.status_code,
+            body=body,
+            request_summary=request.summary,
+            headers=wire.header_map,
+            retry_codes=context.policy.retry.transient_api_codes,
+            diagnostics=diagnostic_context(request),
+        )
+        if response_error is None and not success:
+            response_error = HTTPGatewayError(
+                f"HTTP gateway error {wire.status_code}",
+                request_summary=request.summary,
+                evidence=_wire_evidence(wire),
+            )
+        return response_error, parsed
+
+    async def pause_before_replay(
+        self, context: ExecutionContext, *, attempts: _RequestAttempts, method_cooldown: float = 0.0
+    ) -> bool:
+        """Wait before sending part of a physical batch again; ``False`` when the budget forbids another round.
+
+        The round spends the same attempt and retry-time budget as the sends before it.
+        """
+        if attempts.started is None or attempts.used >= context.policy.max_attempts_per_request:
+            return False
+        delay = max(
+            _retry_delay(context.policy, retry_number=attempts.used, random_source=self._random), method_cooldown
+        )
+        if delay >= context.remaining_time(retry_started=attempts.started):
+            return False
+        await context.record_retry()
+        # The coordinator holds the next permit until a method cooldown ends, as for a direct retry.
+        if not method_cooldown and delay > 0:
+            await self._sleep(delay)
+        return True
 
     async def _prepare_retry(  # noqa: PLR0913
         self,
@@ -352,9 +442,11 @@ class Executor:
         context: ExecutionContext,
         retry_started: float,
         attempts: int,
+        shared: _RequestAttempts,
         wire: WireResponse | None = None,
         method_cooldown: float = 0.0,
     ) -> None:
+        shared.settle(error, context.policy)
         safety = request.replay_safety or ReplaySafety.UNKNOWN
         if isinstance(error, ResponseTooLargeError) and safety is not ReplaySafety.SAFE:
             raise AmbiguousExecutionError(
@@ -392,7 +484,8 @@ class Executor:
                 request_summary=request.summary,
                 evidence=error.evidence,
             ) from error
-
+        # A physical batch follows the same rule with its combined safety (owner decision, 2026-09-25): SAFE is
+        # replayed within the budget; UNSAFE/UNKNOWN only when the failure proves nothing ran.
         retryable = _is_retryable(error, safety=safety, policy=context.policy)
         if not retryable:
             raise error
@@ -413,46 +506,38 @@ class Executor:
 
 
 def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: ExecutionPolicy) -> bool:
+    """SAFE work is retried after any transient failure; other work only when the failure proves nothing ran."""
+    if isinstance(error, TransportError | ApiResponseError):
+        transient = error.retryable
+    else:
+        transient = (
+            isinstance(error, HTTPGatewayError)
+            and not isinstance(error, EnvelopeContractError)
+            and error.http_status is not None
+            and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
+            and error.http_status in policy.retry.transient_http_statuses
+        )
+    return transient and (safety is ReplaySafety.SAFE or _proves_not_run(error, policy))
+
+
+def _proves_not_run(error: B24ApiError, policy: ExecutionPolicy) -> bool:
+    """Return whether a failure proves the request did not run: it was never dispatched, or Bitrix refused it."""
     if isinstance(error, TransportError):
-        return not error.possible_acceptance or safety is ReplaySafety.SAFE
-    if safety is not ReplaySafety.SAFE:
-        return False
-    if isinstance(error, ApiResponseError) and error.retryable:
-        return True
+        return not error.possible_acceptance
+    if isinstance(error, ApiResponseError):
+        return _refused_before_running(error, policy)
+    # Only a listed refusal status (423, 425, 429 by default) proves the request was not accepted.
     return (
         isinstance(error, HTTPGatewayError)
         and not isinstance(error, EnvelopeContractError)
-        and error.http_status is not None
-        and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
-        and error.http_status in policy.retry.transient_http_statuses
+        and error.http_status in policy.ambiguity.refusal_http_statuses
+        and error.http_status not in policy.ambiguity.ambiguous_unstructured_statuses
     )
 
 
-async def _send_transport(  # noqa: PLR0913 - keeps legacy and wire boundaries explicit
-    transport: Transport,
-    wire_transport: WireTransport | None,
-    request: Request,
-    *,
-    wire_request: WireRequest | None,
-    attempt_timeout: float,
-    max_response_bytes: int,
-) -> WireResponse:
-    if wire_transport is not None:
-        capabilities = wire_transport.capabilities
-        if not isinstance(capabilities, TransportCapabilities):
-            raise CapabilityError("transport exposes malformed capabilities")
-        if wire_request is None or wire_request.route is not request.route or wire_request.method != request.method:
-            raise CapabilityError("wire request differs from canonical request", request_summary=request.summary)
-        return await wire_transport.send_wire(
-            wire_request,
-            attempt_timeout=attempt_timeout,
-            max_response_bytes=max_response_bytes,
-        )
-    return await transport.send(
-        request,
-        attempt_timeout=attempt_timeout,
-        max_response_bytes=max_response_bytes,
-    )
+def _refused_before_running(error: ApiResponseError, policy: ExecutionPolicy) -> bool:
+    """Return whether Bitrix answered with a listed refusal (a request or time quota by default) before running."""
+    return str(error.original_code).strip().casefold() in policy.ambiguity.refusal_api_codes
 
 
 def _resolve_optional_path(value: object, path: tuple[str | int, ...]) -> tuple[bool, object]:
@@ -483,15 +568,16 @@ def _result_protocol_error(
     return error
 
 
-def _raise_embedded_result_error(  # noqa: C901, PLR0912
+def _raise_embedded_result_error(  # noqa: C901, PLR0912, PLR0913
     request: Request,
     result: object,
     *,
     http_status: int,
     retry_codes: frozenset[str],
     batch: bool = False,
+    redactor: Redactor = DEFAULT_REDACTOR,
 ) -> None:
-    """Evaluate the request-local embedded-error contract."""
+    """Evaluate the request-local embedded-error contract, rendering through that request's context."""
     spec = request.result_error
     if spec is None:
         return
@@ -555,30 +641,37 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912
             request_summary=request.summary,
             http_status=http_status,
             retryable=str(code).strip().casefold() in retry_codes,
+            redactor=redactor,
+            diagnostics=diagnostic_context(request),
         )
 
 
-def _decode_success(
-    wire: WireResponse,
-    request_summary: RequestSummary,
-    *,
-    strict_json_members: bool = False,
-) -> Response:
-    evidence = _wire_evidence(wire)
+def _parse_success_body(body: bytes, *, strict_members: bool) -> _ParsedBody:
+    """Run the one strict JSON parse of a success body, keeping a failure for the envelope decoder."""
     try:
         payload = json.loads(
-            wire.body,
+            body.decode("utf-8"),
             parse_constant=_reject_json_constant,
-            object_pairs_hook=_DecodedJsonObject if strict_json_members else None,
+            object_pairs_hook=_DecodedJsonObject if strict_members else None,
         )
-        if strict_json_members:
+        if strict_members:
             _reject_duplicate_batch_correlation_keys(payload)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
+    except ValueError as error:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        return _ParsedBody(None, error)
+    return _ParsedBody(payload, None)
+
+
+def _decode_success(wire: WireResponse, parsed: _ParsedBody | None, *, request_summary: RequestSummary) -> Response:
+    if parsed is None:
+        raise RuntimeError("JSON success response lacks its parsed body")
+    evidence = _wire_evidence(wire)
+    if parsed.failure is not None:
         raise EnvelopeContractError(
             "Malformed successful HTTP response",
             request_summary=request_summary,
             evidence=evidence,
-        ) from error
+        ) from parsed.failure
+    payload = parsed.payload
     if not isinstance(payload, Mapping) or "result" not in payload:
         raise EnvelopeContractError(
             "Successful response is missing the result envelope",

@@ -5,14 +5,14 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
-from b24api.contracts.request import ReplaySafety, Request, RouteKind
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
+from b24api.contracts.request import ReplaySafety, Request
+from b24api.contracts.request_summary import RouteKind
 from b24api.encoding import encode_php_query
 from b24api.transport.base import TransportCapabilities, WireRequest, WireResponse
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-_PORTAL_BATCH_CAP = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,7 +38,7 @@ class ScriptedExchange:
         continuations: tuple[int | None, ...] | None = None,
     ) -> ScriptedExchange:
         """Freeze an exact physical batch request and correlated result envelope."""
-        if not commands or len(commands) > _PORTAL_BATCH_CAP or len(results) != len(commands):
+        if not commands or len(commands) > PORTAL_BATCH_CAP or len(results) != len(commands):
             raise ValueError("batch fixture requires 1..50 commands and matching results")
         if continuations is None:
             continuations = (None,) * len(commands)

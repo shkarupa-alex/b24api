@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.keyset_capability import (
     KeysetCapabilityCheckName,
     KeysetCapabilityCheckOutcome,
@@ -82,7 +83,8 @@ class _Verifier:
         self.identity, self.page_size, self.keyset = identity, page_size, keyset
         self.context = executor.context(policy)
         self.engine = BatchExecutor(executor)
-        self.capacity = min(50, policy.max_buffered_commands, max(1, policy.max_buffered_rows // page_size))
+        rows_per_wave = max(1, policy.max_buffered_rows // page_size)
+        self.capacity = min(PORTAL_BATCH_CAP, policy.max_buffered_commands, rows_per_wave)
         self.batch_waves = 0
         self.logical_commands = 0
         self.page_trace: tuple[PageRecord, ...] = ()
@@ -96,8 +98,17 @@ class _Verifier:
             self._request("DESC", None, None),
         )
         boundary_responses = await self._waves(boundaries, KeysetPhase.BOUNDARY)
-        asc = self._identities(boundary_responses[0], direction="asc")
-        desc = self._identities(boundary_responses[1], direction="desc")
+        asc = self._boundary_identities(boundary_responses[0], descending=False)
+        desc = self._boundary_identities(boundary_responses[1], descending=True)
+        if isinstance(asc, KeysetCapabilityCheckResult) or isinstance(desc, KeysetCapabilityCheckResult):
+            # A boundary read the portal answered wrongly already proves the contract unusable.
+            refused = {read.name: read for read in (asc, desc) if isinstance(read, KeysetCapabilityCheckResult)}
+            return await self._report(
+                KeysetCapabilityVerdict.UNSUPPORTED,
+                tuple(refused.get(check.name, check) for check in self._not_executed()),
+                reason=None,
+                cross_digit=False,
+            )
         reason = self._early_reason(asc, desc)
         if reason is not None:
             return await self._report(
@@ -252,13 +263,7 @@ class _Verifier:
         self.page_trace = retained
         self.page_trace_truncated = self.page_trace_truncated or truncated
 
-    def _identities(
-        self,
-        response: Response,
-        *,
-        direction: str | None = None,
-        enforce_cap: bool = True,
-    ) -> tuple[int, ...]:
+    def _identities(self, response: Response, *, enforce_cap: bool = True) -> tuple[int, ...]:
         rows = _response_items(response, self.selector)
         if enforce_cap and self.keyset.limit_path is not None and len(rows) > self.page_size:
             raise PaginationError("keyset verifier response exceeded its declared page cap")
@@ -267,9 +272,26 @@ class _Verifier:
         )
         if any(not isinstance(value, int) for value in values):
             raise CapabilityError("keyset verifier requires integer-coercible identity values")
-        identities = cast("tuple[int, ...]", values)
-        if direction is not None:
-            _validate_order(identities, direction)
+        return cast("tuple[int, ...]", values)
+
+    def _boundary_identities(
+        self,
+        response: Response,
+        *,
+        descending: bool,
+    ) -> tuple[int, ...] | KeysetCapabilityCheckResult:
+        """Return one boundary page's identities, or the failed two-row check of that direction."""
+        name = KeysetCapabilityCheckName.TWO_ROW_DESC if descending else KeysetCapabilityCheckName.TWO_ROW_ASC
+        try:
+            identities = self._identities(response, enforce_cap=False)
+        except (CapabilityError, PaginationError):
+            return KeysetCapabilityCheckResult(name, KeysetCapabilityCheckOutcome.SHAPE_INVALID)
+        if self.keyset.limit_path is not None and len(identities) > self.page_size:
+            return KeysetCapabilityCheckResult(name, KeysetCapabilityCheckOutcome.CAP_EXCEEDED, len(identities))
+        try:
+            _validate_order(identities, "desc" if descending else "asc")
+        except PaginationError:
+            return KeysetCapabilityCheckResult(name, KeysetCapabilityCheckOutcome.ORDER_INVALID, len(identities))
         return identities
 
     def _early_reason(self, asc: tuple[int, ...], desc: tuple[int, ...]) -> KeysetInconclusiveReason | None:

@@ -7,10 +7,12 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from b24api.contracts.error_base import BudgetExceededError
 from b24api.contracts.json import _is_plain_int
 
 if TYPE_CHECKING:
-    from b24api.contracts.request import RequestSummary
+    from b24api.contracts.request_summary import RequestSummary
+    from b24api.settings import Settings
 
 HTTP_STATUS_MINIMUM = 100
 HTTP_STATUS_MAXIMUM = 599
@@ -22,8 +24,6 @@ class ReplayDisposition(StrEnum):
 
     NOT_ELIGIBLE = "not_eligible"
     ELIGIBLE = "eligible"
-    REPLAYED_DIRECT = "replayed_direct"
-    DIRECT_REPLAY_FAILED = "direct_replay_failed"
 
 
 class IdentityCoercion(StrEnum):
@@ -99,7 +99,6 @@ class KernelState(StrEnum):
 class CompletionAssurance(StrEnum):
     """Strength of evidence supporting completion."""
 
-    ORACLE_VERIFIED = "oracle_verified"
     CALLER_ASSERTED = "caller_asserted"
 
 
@@ -107,9 +106,7 @@ class SnapshotState(StrEnum):
     """Observed snapshot condition."""
 
     NOT_REQUESTED = "not_requested"
-    VERIFIED = "verified"
     UNVERIFIED = "unverified"
-    CHANGED = "changed"
 
 
 class AmbiguityReason(StrEnum):
@@ -123,16 +120,29 @@ class AmbiguityReason(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class AmbiguityPolicy:
-    """Unstructured statuses that do not prove non-execution."""
+    """Which failures prove that a request did not run, and which prove nothing.
+
+    Only a refusal listed here lets UNSAFE or UNKNOWN work run again, and a status that is also ambiguous stays
+    ambiguous; the retry policy's transient sets decide whether a failure is worth retrying at all, which is enough
+    for SAFE work.
+    """
 
     ambiguous_unstructured_statuses: frozenset[int] = frozenset({408, *range(500, 600)})
+    refusal_http_statuses: frozenset[int] = frozenset({423, 425, 429})
+    refusal_api_codes: frozenset[str] = frozenset({"query_limit_exceeded", "operation_time_limit"})
 
     def __post_init__(self) -> None:
-        """Validate and freeze the status set."""
+        """Validate and freeze the status and code sets."""
         object.__setattr__(self, "ambiguous_unstructured_statuses", frozenset(self.ambiguous_unstructured_statuses))
+        object.__setattr__(self, "refusal_http_statuses", frozenset(self.refusal_http_statuses))
+        object.__setattr__(
+            self,
+            "refusal_api_codes",
+            frozenset(str(code).strip().casefold() for code in self.refusal_api_codes),
+        )
         if any(
             not _is_plain_int(status) or status < HTTP_STATUS_MINIMUM or status > HTTP_STATUS_MAXIMUM
-            for status in self.ambiguous_unstructured_statuses
+            for status in (*self.ambiguous_unstructured_statuses, *self.refusal_http_statuses)
         ):
             raise ValueError("ambiguity HTTP statuses must be between 100 and 599")
 
@@ -264,6 +274,16 @@ class ExecutionPolicy:
     page_trace_limit: int = 64
     debug_evidence: bool = False
 
+    @classmethod
+    def from_settings(cls, settings: Settings) -> ExecutionPolicy:
+        """Return the policy a client built from ``settings`` uses when a call passes none.
+
+        It is ``ExecutionPolicy()`` with ``max_retry_elapsed_per_request`` set to
+        ``settings.http_timeout``. A ``policy=`` argument, on the client or on one call, replaces the
+        default wholesale; derive it from this value with ``dataclasses.replace`` to keep the timeout.
+        """
+        return cls(max_retry_elapsed_per_request=float(settings.http_timeout))
+
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
         if (
@@ -381,6 +401,4 @@ class BudgetCounters:
 
 
 def _raise_budget(message: str) -> None:
-    from b24api.errors import BudgetExceededError  # noqa: PLC0415
-
     raise BudgetExceededError(message)

@@ -13,19 +13,12 @@ import pytest
 
 from b24api import (
     Bitrix24,
-    EmptyArray,
-    EmptyObject,
     IdentityCoercion,
     IdentitySpec,
-    KeysetCapabilityVerdict,
     KeysetSpec,
     OffsetSpec,
-    PageIndex,
     ParameterPath,
     PartitionedKeysetExecution,
-    PositionalArguments,
-    PositionalLayout,
-    Present,
     RangeKeysetExecution,
     ReplaySafety,
     Request,
@@ -33,12 +26,21 @@ from b24api import (
     RouteKind,
     SequentialKeysetExecution,
     Settings,
-    SlotContract,
-    SlotShape,
     StableIntegerKeysetContract,
     TerminalState,
     TotalTermination,
     TraversalAssurance,
+)
+from b24api.contracts import (
+    EmptyArray,
+    EmptyObject,
+    KeysetCapabilityVerdict,
+    PageIndex,
+    PositionalArguments,
+    PositionalLayout,
+    Present,
+    SlotContract,
+    SlotShape,
 )
 from b24api.contracts.positional import PositionalControlError, PositionalControlFault
 from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError

@@ -10,9 +10,8 @@ from pathlib import Path
 
 import pytest
 
-import b24api as public_client
-import b24api.testing as public_testing
 from b24api import Request, RouteKind
+from b24api.migration import PUBLIC_NAMESPACES
 from b24api.testing import ScriptedExchange, ScriptedTransport
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,13 +37,12 @@ def _assert_public_client_imports(source: str) -> None:  # noqa: C901, PLR0912
             )
 
     public_exports = {
-        "b24api": frozenset(public_client.__all__),
-        "b24api.testing": frozenset(public_testing.__all__),
+        namespace: frozenset(importlib.import_module(namespace).__all__) for namespace in PUBLIC_NAMESPACES
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.startswith("b24api") and alias.name != "b24api":
+                if alias.name.startswith("b24api") and alias.name not in public_exports:
                     raise AssertionError(f"private client import: {alias.name}")
         elif isinstance(node, ast.ImportFrom) and node.module is not None and node.module.startswith("b24api"):
             if node.module not in public_exports:
@@ -88,6 +86,10 @@ def test_recipe_uses_only_public_client_exports() -> None:
         'import importlib\nimportlib.import_module("b24api.traversal")',
         'from importlib import import_module\nimport_module("b24api.batch")',
         '__import__("b24api.references")',
+        "from b24api import CommandSuccess",
+        "import b24api\nb24api.FrozenJson",
+        "from b24api.contracts.request import Request",
+        "import b24api.transport.base",
     ],
 )
 def test_private_client_import_forms_are_rejected(source: str) -> None:

@@ -8,9 +8,9 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, cast
 
+from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.json import FrozenJson, FrozenMapping, JsonValue, _freeze_json, _is_plain_int, _thaw_json
 from b24api.contracts.request import PathPart, ResultSelector
-from b24api.redaction import DEFAULT_REDACTOR
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -98,38 +98,6 @@ class BinaryResponse:
             f"BinaryResponse(status_code={self.evidence.status_code!r}, content_type={self.content_type!r}, "
             f"byte_length={self.byte_length!r})"
         )
-
-
-@dataclass(frozen=True, slots=True)
-class ResponseEvidence:
-    """Bounded redacted HTTP evidence safe for default serialization."""
-
-    http_status: int | None = None
-    request_id: str | None = None
-    headers: tuple[tuple[str, str], ...] = ()
-    body_preview: str | None = None
-
-    def __post_init__(self) -> None:
-        """Validate and normalize instance state."""
-        redacted_headers = DEFAULT_REDACTOR.redact(dict(self.headers))
-        object.__setattr__(
-            self,
-            "headers",
-            tuple(sorted((str(key), str(value)) for key, value in redacted_headers.items()))[:50],
-        )
-        if self.request_id is not None:
-            object.__setattr__(self, "request_id", DEFAULT_REDACTOR.redact_text(self.request_id))
-        if self.body_preview is not None:
-            object.__setattr__(self, "body_preview", DEFAULT_REDACTOR.redact_text(self.body_preview))
-
-    def to_dict(self) -> dict[str, object]:
-        """Return the to dict representation."""
-        return {
-            "http_status": self.http_status,
-            "request_id": self.request_id,
-            "headers": dict(self.headers),
-            "body_preview": self.body_preview,
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,3 +256,8 @@ def _case_insensitive_key(mapping: Mapping[str, object], requested: str) -> str 
     if len(matches) > 1:
         raise ValueError(f"ambiguous case-insensitive control key: {requested}")
     return matches[0] if matches else None
+
+
+def result_snapshot(response: Response) -> FrozenJson:
+    """Return a response's immutable result snapshot to operation-internal readers without a thaw."""
+    return response._frozen_result()  # noqa: SLF001 - the owning module exposes the snapshot to its package

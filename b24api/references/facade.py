@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
-from b24api._stream import MappedOperationStream
+from b24api.completion.operation_stream import MappedOperationStream
 from b24api.contracts.dispatch import DirectDispatch, DispatchSpec
 from b24api.contracts.keyset_execution import SequentialKeysetExecution
 from b24api.contracts.policy import (
@@ -42,7 +42,6 @@ from b24api.errors import (
     B24ApiError,
     CapabilityError,
     IncompleteTraversalError,
-    InputSourceError,
     PageAdaptationError,
     PaginationError,
     ReferenceFailed,
@@ -53,8 +52,7 @@ from b24api.references.dispatch import (
     _ReferenceWindowError,
 )
 from b24api.references.dispatch_plan import kernel_dispatch
-from b24api.references.outcome import ReferenceFailure as KernelFailure
-from b24api.references.outcome import ReferenceItem as KernelItem
+from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem
 from b24api.references.stream import iter_references as _iter_references
 from b24api.traversal.driver import PaginationDriver
 from b24api.traversal.offset_rules import sequential_offset_plan
@@ -75,7 +73,7 @@ if TYPE_CHECKING:
     from b24api.contracts.stream import OperationStream
     from b24api.execution.snapshot import KernelReport
 
-type KernelReferenceEvent = KernelItem | KernelFailure | _KernelReferenceComplete
+type KernelReferenceEvent = KernelReferenceItem | KernelReferenceFailure | _KernelReferenceComplete
 type Deregister = Callable[[object], None]
 
 
@@ -201,7 +199,7 @@ class _ReferenceEventMapper:
 
     def __call__(self, event: KernelReferenceEvent) -> ReferenceOutcome[object]:
         """Convert one kernel event without interpreting correlation."""
-        if isinstance(event, KernelItem):
+        if isinstance(event, KernelReferenceItem):
             context = cast("_BindingContext", event.correlation)
             item_index = self._item_indexes.get(context.index, 0)
             self._item_indexes[context.index] = item_index + 1
@@ -281,7 +279,7 @@ def _reference_error(error: BaseException, report: OperationReport, mapper: _Ref
     if isinstance(error, _ReferenceWindowError):
         return ReferenceFailed(_reference_error_items(error, mapper), report=report)
     if isinstance(error, _BindingSourceError):
-        return InputSourceError("Reference input source failed")
+        return error.report_cause
     return error
 
 
@@ -317,7 +315,7 @@ def kernel_reference_stream[C](
         page_adapter=traversal.page_adapter,
     )
     preflight._validate_capabilities()  # noqa: SLF001 - reject base controls before consuming caller input
-    executor._preflight_request(base)  # noqa: SLF001 - reject transport representation before caller input
+    executor.preflight_request(base)
     dispatch_plan = kernel_dispatch(dispatch, policy)
     stream = _iter_references(
         executor,

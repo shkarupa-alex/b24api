@@ -12,14 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from b24api import (
-    AutoKeysetExecution,
-    PartitionedKeysetExecution,
-    RangeKeysetExecution,
-    ReplaySafety,
-    Request,
-    TotalHintMode,
-)
+from b24api import AutoKeysetExecution, PartitionedKeysetExecution, RangeKeysetExecution, ReplaySafety, Request
+from b24api.contracts import TotalHintMode
 from b24api.contracts.request import RouteKind
 from tools import b24api_keyset_admission as harness
 from tools.b24api_evidence.keyset_admission import LIVE_ATTEMPT_WINDOWS, _current_candidate_sha

@@ -72,6 +72,9 @@ from .contracts import (
 from .live import ADAPTERS, LiveCorrectnessError, LivePreflight, LiveUnavailableError
 from .model import DeterministicPortal, exact_model_cases, run_exact_matrix_sync
 
+# The harness contract suite takes most of the default run (~6 minutes); CI runs it in the slow job.
+pytestmark = pytest.mark.slow
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 

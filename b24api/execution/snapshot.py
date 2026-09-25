@@ -11,7 +11,7 @@ from b24api.contracts.report import KeysetExecutionReport, PageRecord, Violation
 from b24api.redaction import DEFAULT_REDACTOR
 
 if TYPE_CHECKING:
-    from b24api.contracts.response import ResponseEvidence
+    from b24api.contracts.evidence import ResponseEvidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,8 +21,6 @@ class KernelReport:
     state: KernelState = KernelState.NOT_STARTED
     assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED
     snapshot: SnapshotState = SnapshotState.NOT_REQUESTED
-    plan_id: str | None = None
-    dispatch_id: str | None = None
     emitted_rows: int = 0
     unique_rows: int = 0
     duplicate_identities: int = 0

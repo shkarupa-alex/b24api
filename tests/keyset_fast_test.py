@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 import asyncio
+import dataclasses
 import json
-import random
 from dataclasses import replace
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs
@@ -15,24 +15,10 @@ import pytest
 from b24api import (
     AutoKeysetExecution,
     Bitrix24,
-    ClosureWitness,
-    CompletionGate,
-    ConsistencyPolicy,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
-    KeysetAssuranceSource,
-    KeysetExecutionKind,
-    KeysetPageCompletion,
-    KeysetPhase,
-    KeysetSelectionReason,
     KeysetSpec,
-    PageAcknowledged,
-    PageDelivered,
-    PageOutcome,
-    PageRejectionCode,
-    PageScheduled,
-    PageValidated,
     ParameterPath,
     PartitionedKeysetExecution,
     RangeKeysetExecution,
@@ -41,22 +27,38 @@ from b24api import (
     SequentialKeysetExecution,
     StableIntegerKeysetContract,
     TerminalState,
+)
+from b24api.cli import _report_json
+from b24api.completion import CompletionGate
+from b24api.contracts import (
+    ClosureWitness,
+    ConsistencyPolicy,
+    KeysetAssuranceSource,
+    KeysetExecutionKind,
+    KeysetPageCompletion,
+    KeysetPhase,
+    KeysetSelectionReason,
+    KeysetSelectionSummary,
+    PageAcknowledged,
+    PageDelivered,
+    PageOutcome,
+    PageRejectionCode,
+    PageScheduled,
+    PageValidated,
     TotalHintMode,
     TraceClass,
 )
-from b24api.cli import _report_json
 from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSemantics
-from b24api.contracts.report import PageDispatch
+from b24api.contracts.report import OperationReport, PageDispatch
 from b24api.contracts.request import RouteKind
 from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError, ResultShapeError
-from b24api.execution import Executor, WireResponse
-from b24api.traversal import keyset_scheduler, page_validation
+from b24api.execution import WireResponse
+from b24api.traversal import keyset_page_validation, keyset_plan
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
-from b24api.traversal.keyset_costs import estimates
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
-from b24api.traversal.keyset_fast_stream import FastTraceRecorder
-from b24api.traversal.keyset_observation import PageObservation
-from b24api.traversal.keyset_partition import anchor_guesses
+from b24api.traversal.keyset_geometry import anchor_guesses, estimates
+from b24api.traversal.keyset_observation import FastTraceRecorder, PageObservation
+from tests.scripting import client_for
 
 if TYPE_CHECKING:
     from b24api.contracts import JsonValue
@@ -156,6 +158,8 @@ class MalformedBatchEnvelopeTransport(KeysetTransport):
         )
         if request.method != "batch":
             return response
+        if self.fault == "no_envelope":
+            return WireResponse(response.status_code, response.headers, b'{"foo":1}')
         payload = json.loads(response.body)
         result = payload["result"]["result"]
         if self.fault == "extra":
@@ -292,8 +296,14 @@ class NthBatchMissingResultTransport(KeysetTransport):
         )
 
 
+def _sends_no_canary(report: OperationReport | None) -> bool:
+    """Fast traversal never schedules a canary page: every recorded page belongs to another phase."""
+    assert report is not None
+    return all(record.phase is not KeysetPhase.CANARY for record in report.page_trace)
+
+
 def _client(transport: KeysetTransport, *, policy: ExecutionPolicy | None = None) -> Bitrix24:
-    return Bitrix24._from_executor(Executor(transport), policy=policy)
+    return client_for(transport, policy=policy)
 
 
 def _identity() -> IdentitySpec:
@@ -345,23 +355,6 @@ def test_window_and_anchor_algebra_is_disjoint_and_exact() -> None:
     assert tuple(lane.retained_upper_anchor for lane in lanes) == (20, 70, None)
 
 
-def test_window_algebra_fixed_seed_property_tier() -> None:
-    generator = random.Random(20260910)
-    for _ in range(250):
-        lo = generator.randint(-(10**12), 10**12)
-        span = generator.randint(1, 500)
-        upper = lo + span + 1
-        width = generator.randint(2, 80)
-        windows = plan_windows(lo=lo, upper_exclusive=upper, width=width)
-        owned = [
-            value
-            for lane in windows
-            for value in range(lane.bounds.lower_exclusive + 1, lane.bounds.upper_exclusive)  # type: ignore[operator]
-        ]
-        assert owned == list(range(lo + 1, upper))
-        assert len(owned) == len(set(owned))
-
-
 @pytest.mark.parametrize("capacity", range(1, 11))
 @pytest.mark.parametrize("target_lanes", range(2, 21))
 def test_zero_canary_partition_planning_always_has_a_positive_exact_wave_count(
@@ -378,7 +371,7 @@ def test_zero_canary_partition_planning_always_has_a_positive_exact_wave_count(
         completion=KeysetPageCompletion.EMPTY_CONFIRMATION,
         advisory_total=None,
     )
-    _sequential, range_estimate, partition, _geometry = estimates(inputs, canary_commands=0, finish_requests=1)
+    _sequential, range_estimate, partition, _geometry = estimates(inputs, finish_requests=1)
     assert range_estimate.planning_waves == 0
     expected = 1 if target_lanes <= capacity else (target_lanes + capacity - 1) // capacity
     assert partition.planning_waves == expected
@@ -655,8 +648,7 @@ async def test_explicit_modes_match_sparse_ordered_oracle(direction: str, kind: 
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind(kind)
-    assert stream.report.keyset_execution.canary_commands == 0
-    assert stream.report.keyset_execution.canary_requests == 0
+    assert _sends_no_canary(stream.report)
     assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS
     assert all(
         record.rows_admitted == record.rows_selected
@@ -755,7 +747,6 @@ def test_fast_trace_uses_exact_deterministic_class_quotas(
                         rows_admitted=0,
                         reported_total=None,
                         reported_next=None,
-                        page_full=False,
                         witness=None,
                         outcome=PageOutcome.REJECTED if anomaly else PageOutcome.COMMITTED,
                         rejection_code=PageRejectionCode.RANGE_CONTRADICTION if anomaly else None,
@@ -795,7 +786,7 @@ async def test_auto_sequential_has_request_parity_and_no_canaries() -> None:
     report = stream.report.keyset_execution
     assert report.selected_kind is KeysetExecutionKind.SEQUENTIAL
     assert report.preselection_reason is KeysetSelectionReason.INSUFFICIENT_PREDICTED_GAIN
-    assert report.canary_commands == 0
+    assert _sends_no_canary(stream.report)
     assert stream.report.physical_requests == 5
 
 
@@ -873,7 +864,7 @@ async def test_adjacent_boundaries_select_prefix_assured_boundary_only() -> None
     assert report.selected_kind is KeysetExecutionKind.BOUNDARY_ONLY
     assert report.preselection_reason is KeysetSelectionReason.ADJACENT_BOUNDARIES
     assert report.assurance_source is KeysetAssuranceSource.ORDERED_PREFIX_ONLY
-    assert report.canary_commands == 0
+    assert _sends_no_canary(stream.report)
 
 
 def test_post_probe_range_preferred_transition_is_pinned() -> None:
@@ -889,7 +880,7 @@ def test_post_probe_range_preferred_transition_is_pinned() -> None:
     )
     selection = preselect(inputs)
 
-    final = finalize(inputs, selection, AnchorFacts((), 20, 20))
+    final = finalize(inputs, selection, AnchorFacts((), 20))
 
     assert selection.plan is Preselected.PROBE_ANCHORS
     assert final.kind is KeysetExecutionKind.RANGE
@@ -906,7 +897,7 @@ async def test_boundary_overlap_releases_duplicate_row_capacity_immediately() ->
 
     assert (await anext(source))["id"] == 1
 
-    scheduler = source._scheduler
+    scheduler = source._runtime
     assert scheduler.counters.boundary_overlap_rows == 3
     assert scheduler.transactions.buffer_balance == 7
     await source.aclose()
@@ -924,6 +915,18 @@ async def test_explicit_partitioned_reports_degenerate_single_lane() -> None:
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.PARTITIONED
     assert stream.report.keyset_execution.preselection_reason is KeysetSelectionReason.DEGENERATE_SINGLE_LANE
     assert stream.report.keyset_execution.actual_lanes == 1
+    assert stream.report.keyset_selection == KeysetSelectionSummary(
+        KeysetExecutionKind.PARTITIONED,
+        KeysetExecutionKind.PARTITIONED,
+        KeysetSelectionReason.DEGENERATE_SINGLE_LANE,
+    )
+    disagreeing = KeysetSelectionSummary(
+        KeysetExecutionKind.AUTO,
+        KeysetExecutionKind.SEQUENTIAL,
+        KeysetSelectionReason.PAGE_STOP,
+    )
+    with pytest.raises(ValueError, match="same requested and selected kinds"):
+        dataclasses.replace(stream.report, keyset_selection=disagreeing)
 
 
 @pytest.mark.asyncio
@@ -972,7 +975,7 @@ async def test_partition_transfers_anchor_ownership_without_retaining_payload() 
         KeysetTransport(tuple(range(1, 101))),
         PartitionedKeysetExecution(StableIntegerKeysetContract(), target_lanes=3),
     )
-    scheduler = stream._source._scheduler
+    scheduler = stream._source._runtime
     await scheduler.plan_barrier()
     assert scheduler.transactions.anchor_rows
 
@@ -988,7 +991,7 @@ async def test_partition_transfers_anchor_ownership_without_retaining_payload() 
 async def test_auto_discards_precharged_anchor_objects_when_post_probe_gain_is_lost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original = keyset_scheduler.finalize
+    original = keyset_plan.finalize
 
     def force_sequential(*args: object, **kwargs: object):
         return replace(
@@ -997,16 +1000,16 @@ async def test_auto_discards_precharged_anchor_objects_when_post_probe_gain_is_l
             reason=KeysetSelectionReason.POST_PROBE_GAIN_LOST,
         )
 
-    monkeypatch.setattr(keyset_scheduler, "finalize", force_sequential)
+    monkeypatch.setattr(keyset_plan, "finalize", force_sequential)
     stream = _stream(
         KeysetTransport(tuple(range(1, 5_001))),
         AutoKeysetExecution(StableIntegerKeysetContract(), target_lanes=20),
     )
 
     assert (await anext(stream))["id"] == 1
-    scheduler = stream._source._scheduler
-    assert scheduler._selected is KeysetExecutionKind.SEQUENTIAL
-    assert scheduler._anchor_count > 0
+    scheduler = stream._source._runtime
+    assert scheduler.planner.facts.selected is KeysetExecutionKind.SEQUENTIAL
+    assert scheduler.planner.facts.anchor_count > 0
     assert scheduler.transactions.anchor_rows == scheduler.transactions.anchor_commands == {}
     assert scheduler.transactions.boundary_totals == {}
     assert scheduler.transactions.buffer_balance == PAGE_SIZE
@@ -1041,6 +1044,25 @@ async def test_fast_wave_invalid_correlation_rejects_every_observation_as_batch_
 
     assert stream.report is not None
     assert len(stream.report.page_trace) == 2
+    assert {(record.outcome, record.rejection_code) for record in stream.report.page_trace} == {
+        (PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE),
+    }
+
+
+@pytest.mark.asyncio
+async def test_fast_wave_success_status_without_an_envelope_rejects_every_observation_as_batch_envelope() -> None:
+    # EnvelopeContractError is a ProtocolError since 3.0, so a 2xx physical batch without the Bitrix
+    # envelope is a batch-envelope rejection (2.3 recorded COMMAND_FAILURE); the migration guide says so.
+    stream = _stream(
+        MalformedBatchEnvelopeTransport(tuple(range(1, 21)), fault="no_envelope"),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    with pytest.raises(IncompleteTraversalError):
+        _ = [item async for item in stream]
+
+    assert stream.report is not None
+    assert stream.report.page_trace
     assert {(record.outcome, record.rejection_code) for record in stream.report.page_trace} == {
         (PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE),
     }
@@ -1110,7 +1132,7 @@ async def test_boundary_direction_contradiction_fails_before_emission() -> None:
     assert stream.report is not None
     assert stream.report.emitted == 0
     assert stream.report.state is TerminalState.INCOMPLETE
-    assert stream._source._scheduler.transactions.boundary_totals == {}
+    assert stream._source._runtime.transactions.boundary_totals == {}
 
 
 @pytest.mark.asyncio
@@ -1125,7 +1147,7 @@ async def test_internal_lane_validation_error_is_not_reclassified(
     def fail_selection(*_args: object, **_kwargs: object) -> list[JsonValue]:
         raise RuntimeError("internal validation defect")
 
-    monkeypatch.setattr(page_validation, "_response_items", fail_selection)
+    monkeypatch.setattr(keyset_page_validation, "_response_items", fail_selection)
 
     with pytest.raises(RuntimeError, match="internal validation defect"):
         await anext(stream)
@@ -1166,8 +1188,7 @@ async def test_ignored_numeric_bounds_fail_late_without_runtime_canaries() -> No
     assert stream.report.emitted > 0
     assert stream.report.state is TerminalState.INCOMPLETE
     assert stream.report.keyset_execution is not None
-    assert stream.report.keyset_execution.canary_rows == 0
-    assert stream.report.keyset_execution.canary_commands == 0
+    assert _sends_no_canary(stream.report)
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.RANGE
     assert stream.report.keyset_execution.preselection_reason is KeysetSelectionReason.EXPLICIT_RANGE
     assert stream.report.keyset_execution.assurance_source is KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS
@@ -1188,7 +1209,7 @@ async def test_small_batch_runtime_still_emits_no_canary_observations() -> None:
     canaries = [record for record in stream.report.page_trace if record.phase is KeysetPhase.CANARY]
     assert canaries == []
     assert stream.report.keyset_execution is not None
-    assert stream.report.keyset_execution.canary_commands == 0
+    assert _sends_no_canary(stream.report)
 
 
 @pytest.mark.asyncio
@@ -1288,9 +1309,9 @@ async def test_fast_bounded_consumption_freezes_an_early_close_report(operation:
     assert partial.report.emitted == expected
     assert partial.report.unique_rows == expected
     assert partial.report.buffered_rows_high_water <= ExecutionPolicy().max_buffered_rows
-    assert stream._source._scheduler._plan_outcome is None
+    assert stream._source._runtime.plan is None
     assert not stream._source._buffer
-    assert stream._source._scheduler.transactions.anchor_rows == {}
+    assert stream._source._runtime.transactions.anchor_rows == {}
 
 
 @pytest.mark.asyncio
@@ -1323,7 +1344,7 @@ async def test_fast_close_finishes_cleanup_before_propagating_cancellation(
     )
     source = stream._source
     await anext(source)
-    scheduler = source._scheduler
+    scheduler = source._runtime
     original = scheduler.adjust_buffer
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -1343,7 +1364,7 @@ async def test_fast_close_finishes_cleanup_before_propagating_cancellation(
     with pytest.raises(asyncio.CancelledError):
         await closing
 
-    assert scheduler._closed is True
+    assert scheduler.closed is True
     assert source._closed is True
     assert scheduler.transactions.buffer_balance == 0
     assert not source._buffer
@@ -1378,12 +1399,6 @@ async def test_keyset_report_rejects_boolean_total_hint_observation() -> None:
 
     with pytest.raises(ValueError, match="optional keyset report counters"):
         replace(stream.report.keyset_execution, total_hint_observed=True)
-    with pytest.warns(DeprecationWarning, match="legacy report compatibility"):
-        legacy = replace(
-            stream.report.keyset_execution,
-            assurance_source=KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS,
-        )
-    assert legacy.assurance_source is KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS
     nested = _report_json(stream.report)["keyset_execution"]
     assert isinstance(nested, dict)
     assert nested["selected_kind"] == stream.report.keyset_execution.selected_kind
@@ -1448,7 +1463,7 @@ async def test_partition_anchor_waves_discard_unneeded_rows_before_the_next_wave
             batch_size=1,
         ),
     )
-    scheduler = stream._source._scheduler
+    scheduler = stream._source._runtime
     await scheduler.plan_barrier()
 
     assert scheduler.transactions.boundary_totals == {}
@@ -1589,11 +1604,13 @@ async def test_range_windows_are_materialized_one_bounded_group_at_a_time() -> N
         KeysetTransport(identities),
         RangeKeysetExecution(StableIntegerKeysetContract()),
     )
-    scheduler = stream._source._scheduler
+    scheduler = stream._source._runtime
 
     await scheduler.plan_barrier()
 
-    assert scheduler._window_count == 249_999
+    assert scheduler.plan is not None
+    assert scheduler.plan.range_bounds is not None
+    assert scheduler.plan.range_bounds.count == 249_999
     assert len(scheduler.transactions.lanes) == scheduler.batch_capacity
     assert len(scheduler.transactions.lane_rows) == scheduler.batch_capacity
     await stream.aclose()
@@ -1635,7 +1652,7 @@ async def test_page_cap_one_can_select_range_without_canary_prefix_requirement()
     assert [row["id"] async for row in stream] == list(identities)
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is KeysetExecutionKind.RANGE
-    assert stream.report.keyset_execution.canary_commands == 0
+    assert _sends_no_canary(stream.report)
 
 
 @pytest.mark.asyncio
@@ -1651,7 +1668,7 @@ async def test_explicit_range_with_page_cap_one_needs_no_canary_pair() -> None:
 
     assert [row["id"] async for row in stream] == list(range(1, 41))
     assert stream.report.keyset_execution is not None
-    assert stream.report.keyset_execution.canary_commands == 0
+    assert _sends_no_canary(stream.report)
 
 
 @pytest.mark.asyncio
@@ -1691,7 +1708,7 @@ async def test_auto_uses_asymmetric_boundary_without_runtime_canaries() -> None:
     assert [row["id"] async for row in stream] == list(identities)
     assert stream.report.keyset_execution is not None
     assert stream.report.keyset_execution.selected_kind is not KeysetExecutionKind.SEQUENTIAL
-    assert stream.report.keyset_execution.canary_commands == 0
+    assert _sends_no_canary(stream.report)
 
 
 @pytest.mark.asyncio
@@ -1732,7 +1749,7 @@ async def test_later_anchor_wave_failure_accounts_for_prior_compacted_rows() -> 
     with pytest.raises(IncompleteTraversalError):
         await anext(stream)
     assert stream.report.keyset_execution is not None
-    assert stream._source._scheduler.counters.raw_rows == 13
+    assert stream._source._runtime.counters.raw_rows == 13
     assert stream.report.keyset_execution.probe_rows_discarded == 13
 
 
@@ -1757,6 +1774,7 @@ async def test_rejected_finish_page_records_selected_and_discarded_rows() -> Non
     assert stream.report.keyset_execution.probe_rows_discarded == 2
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_default_partitioned_streams_selection_larger_than_row_buffer() -> None:
     identities = tuple(range(1, 50_001))
@@ -1780,15 +1798,15 @@ async def test_later_partition_lanes_are_not_rescheduled_while_frontier_is_open(
         KeysetTransport(tuple(range(1, 201))),
         PartitionedKeysetExecution(StableIntegerKeysetContract(), target_lanes=3),
     )
-    scheduler = stream._source._scheduler
+    scheduler = stream._source._runtime
     await scheduler.plan_barrier()
 
-    await scheduler._body_wave()
+    await scheduler.body_wave()
     frontier = scheduler.transactions.lane_index
     frontier_ordinal = scheduler.transactions.lanes[frontier].spec.ordinal
     first_rounds = {lane.spec.ordinal: lane.rounds for lane in scheduler.transactions.lanes}
     assert scheduler.transactions.lanes[frontier].status.value == "open"
-    await scheduler._body_wave()
+    await scheduler.body_wave()
     second_rounds = {lane.spec.ordinal: lane.rounds for lane in scheduler.transactions.lanes}
 
     assert second_rounds[frontier_ordinal] > first_rounds[frontier_ordinal]

@@ -8,69 +8,20 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TypedDict, cast
 
+from b24api._diagnostics import DiagnosticContext
 from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, _thaw_json
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.positional import PositionalArguments
+from b24api.contracts.request_summary import RequestSummary, RouteKind
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 _METHOD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+_NO_HEADERS = RequestHeaders()
 type PathPart = str | int
 _COMPONENT_LABEL_MAXIMUM = 80
 _COMPOSITE_COMPONENT_MINIMUM = 2
 _COMPOSITE_COMPONENT_MAXIMUM = 8
-
-
-class RouteKind(StrEnum):
-    """REST endpoint family selected by the caller."""
-
-    BARE = "bare"
-    JSON = "json"
-    API_V3 = "api_v3"
-
-
-@dataclass(frozen=True, slots=True)
-class RequestSummary:
-    """Bounded request identity that intentionally excludes parameter values."""
-
-    method: str
-    parameter_keys: tuple[str, ...] = ()
-    encoding: BodyEncoding = BodyEncoding.JSON
-    header_names: tuple[str, ...] = ()
-    route: RouteKind = RouteKind.BARE
-
-    def __post_init__(self) -> None:
-        """Validate and normalize instance state."""
-        object.__setattr__(self, "method", DEFAULT_REDACTOR.redact_text(self.method))
-        object.__setattr__(
-            self,
-            "parameter_keys",
-            tuple(DEFAULT_REDACTOR.redact_text(str(key)) for key in self.parameter_keys[: DEFAULT_REDACTOR.max_items]),
-        )
-        if not isinstance(self.encoding, BodyEncoding):
-            raise TypeError("encoding must be a BodyEncoding")
-        if not isinstance(self.route, RouteKind):
-            raise TypeError("route must be a RouteKind")
-        object.__setattr__(
-            self,
-            "header_names",
-            tuple(
-                sorted(
-                    DEFAULT_REDACTOR.redact_text(str(name).casefold())
-                    for name in self.header_names[: DEFAULT_REDACTOR.max_items]
-                ),
-            ),
-        )
-
-    def to_dict(self) -> dict[str, object]:
-        """Return the to dict representation."""
-        return {
-            "method": self.method,
-            "parameter_keys": list(self.parameter_keys),
-            "encoding": self.encoding.value,
-            "header_names": list(self.header_names),
-            "route": self.route.value,
-        }
 
 
 def summarize_request(  # noqa: PLR0913
@@ -268,7 +219,7 @@ class Request:
         replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
         *,
         encoding: BodyEncoding = BodyEncoding.JSON,
-        headers: RequestHeaders = RequestHeaders(),  # noqa: B008 - immutable value singleton
+        headers: RequestHeaders = _NO_HEADERS,
         result_error: ResultErrorSpec | None = None,
         route: RouteKind,
     ) -> None:
@@ -303,6 +254,43 @@ class Request:
         object.__setattr__(self, "result_error", result_error)
         object.__setattr__(self, "_parameters", frozen)
         object.__setattr__(self, "_positional", positional)
+
+    @classmethod
+    def bare(  # noqa: PLR0913 - mirrors the canonical constructor's arguments except route
+        cls,
+        method: str,
+        parameters: Mapping[str, object] | PositionalArguments | None = None,
+        replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
+        *,
+        encoding: BodyEncoding = BodyEncoding.JSON,
+        headers: RequestHeaders = _NO_HEADERS,
+        result_error: ResultErrorSpec | None = None,
+    ) -> Request:
+        """Build a classic REST request: the constructor with ``route=RouteKind.BARE`` fixed."""
+        return cls(
+            method,
+            parameters,
+            replay_safety,
+            encoding=encoding,
+            headers=headers,
+            result_error=result_error,
+            route=RouteKind.BARE,
+        )
+
+    @classmethod
+    def v3(
+        cls,
+        method: str,
+        parameters: Mapping[str, object] | None = None,
+        replay_safety: ReplaySafety = ReplaySafety.UNKNOWN,
+        *,
+        headers: RequestHeaders = _NO_HEADERS,
+        result_error: ResultErrorSpec | None = None,
+    ) -> Request:
+        """Build a REST v3 request: JSON mapping parameters with ``route=RouteKind.API_V3`` fixed."""
+        return cls(
+            method, parameters, replay_safety, headers=headers, result_error=result_error, route=RouteKind.API_V3
+        )
 
     @property
     def positional(self) -> PositionalArguments | None:
@@ -354,6 +342,17 @@ class Request:
         return f"Request(summary={self.summary!r}, replay_safety={self.replay_safety!r})"
 
 
+def diagnostic_context(request: Request) -> DiagnosticContext:
+    """Derive the private diagnostic context bound to this one canonical request.
+
+    The context is a pure function of the frozen request, resolved lazily on the error path, so it
+    adds no per-request cost and is never stored on the request, a shared context or a report.
+    Positional PHP arguments carry no named field positions and get an empty alias map.
+    """
+    parameters = request.copy_parameters() if request.positional is None else None
+    return DiagnosticContext(parameters, headers=request.headers.items)
+
+
 type RequestLike = Request | RequestSpec
 
 
@@ -394,3 +393,26 @@ def canonical_request(raw: RequestLike) -> Request:
         result_error=result_error,
         route=route,
     )
+
+
+# RequestSummary and RouteKind live in the request_summary leaf; they stay importable from here.
+__all__ = [
+    "CompositeIdentitySpec",
+    "IdentityComponent",
+    "IdentitySpec",
+    "ParameterPath",
+    "PathPart",
+    "ReplaySafety",
+    "Request",
+    "RequestLike",
+    "RequestSpec",
+    "RequestSummary",
+    "ResultErrorShape",
+    "ResultErrorSpec",
+    "ResultSelector",
+    "RouteKind",
+    "TraversalIdentity",
+    "canonical_request",
+    "diagnostic_context",
+    "summarize_request",
+]

@@ -1,66 +1,59 @@
 """Whole-page durable acknowledgement and bounded-prefix stop via public API."""
 
 from __future__ import annotations
-import json
+from typing import TYPE_CHECKING
 
 import pytest
 
 from b24api import (
     Bitrix24,
-    CallerStop,
-    ConsistencyPolicy,
-    ContinuePage,
-    CursorDomain,
     CursorSpec,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
     KeysetSpec,
-    PageBoundary,
     ParameterPath,
     Request,
     ResultSelector,
     RouteKind,
     SequentialKeysetExecution,
+    Settings,
     TerminalState,
     TraversalAssurance,
 )
+from b24api.contracts import (
+    CallerStop,
+    ConsistencyPolicy,
+    ContinuePage,
+    CursorDomain,
+    KeysetExecutionKind,
+    KeysetSelectionReason,
+    KeysetSelectionSummary,
+    PageBoundary,
+)
 from b24api.contracts.completion import PageAcknowledged, PageDelivered, PageScheduled
 from b24api.contracts.policy import SnapshotRequirement
-from b24api.execution import Executor, WireResponse
+from tests.scripting import ResponderTransport, client_for
+
+if TYPE_CHECKING:
+    from tests.scripting import ClientFactory
 
 
-class ListTransport:
+def _five_rows(request: Request) -> object:
     """Three distinct wire families over an independent five-row oracle."""
-
-    host = "fixture.invalid"
-
-    def __init__(self) -> None:
-        """Track physical requests per run."""
-        self.requests: list[Request] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Return the requested page without altering caller stop decisions."""
-        assert attempt_timeout > 0
-        assert max_response_bytes > 0
-        self.requests.append(request)
-        parameters = request.copy_parameters()
-        if request.method == "offset.list":
-            start = parameters.get("start", 0)
-            assert isinstance(start, int)
-            rows = [{"id": value} for value in (1, 2, 3, 4, 5)[start : start + 2]]
-            payload = {"result": rows, "next": start + 2 if rows else None}
-        elif request.method == "keyset.list":
-            controls = parameters.get("filter", {})
-            assert isinstance(controls, dict)
-            rows = [{"id": value} for value in (1, 2, 3, 4, 5) if value > controls.get(">ID", 0)][:2]
-            payload = {"result": rows}
-        else:
-            control = parameters.get("LAST_ID", 6)
-            assert isinstance(control, int)
-            rows = [{"id": value} for value in (5, 4, 3, 2, 1) if value < control][:2]
-            payload = {"result": rows}
-        return WireResponse(200, (), json.dumps(payload).encode())
+    parameters = request.copy_parameters()
+    if request.method == "offset.list":
+        start = parameters.get("start", 0)
+        assert isinstance(start, int)
+        rows = [{"id": value} for value in (1, 2, 3, 4, 5)[start : start + 2]]
+        return {"result": rows, "next": start + 2 if rows else None}
+    if request.method == "keyset.list":
+        controls = parameters.get("filter", {})
+        assert isinstance(controls, dict)
+        return {"result": [{"id": value} for value in (1, 2, 3, 4, 5) if value > controls.get(">ID", 0)][:2]}
+    control = parameters.get("LAST_ID", 6)
+    assert isinstance(control, int)
+    return {"result": [{"id": value} for value in (5, 4, 3, 2, 1) if value < control][:2]}
 
 
 class StopAfterCommit:
@@ -86,9 +79,11 @@ def _identity() -> IdentitySpec:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", ["offset", "keyset", "cursor"])
-async def test_page_stop_prevents_next_request_and_reports_bounded_prefix(family: str) -> None:
-    transport = ListTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_page_stop_prevents_next_request_and_reports_bounded_prefix(
+    family: str, scripted_client: ClientFactory
+) -> None:
+    transport = ResponderTransport(_five_rows)
+    client = scripted_client(transport)
     policy = StopAfterCommit()
     if family == "offset":
         stream = client.iter_list(Request("offset.list", route=RouteKind.BARE), page_size=2, page_stop=policy)
@@ -134,9 +129,9 @@ async def test_page_stop_prevents_next_request_and_reports_bounded_prefix(family
 
 
 @pytest.mark.asyncio
-async def test_incomplete_caller_stop_downgrades_assurance() -> None:
-    transport = ListTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_incomplete_caller_stop_downgrades_assurance(scripted_client: ClientFactory) -> None:
+    transport = ResponderTransport(_five_rows)
+    client = scripted_client(transport)
     frozen = ExecutionPolicy(consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST))
     stream = client.iter_list(
         Request("offset.list", route=RouteKind.BARE),
@@ -153,8 +148,8 @@ async def test_incomplete_caller_stop_downgrades_assurance() -> None:
 
 
 def test_counted_batch_tail_rejects_page_stop_at_construction() -> None:
-    transport = ListTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    transport = ResponderTransport(_five_rows)
+    client = client_for(transport)
     with pytest.raises(ValueError, match="counted physical batch tail"):
         client.iter_list_counted(Request("offset.list", route=RouteKind.BARE), page_stop=StopAfterCommit())
     assert transport.requests == []
@@ -170,9 +165,9 @@ class ContinueAfterCommit:
 
 
 @pytest.mark.asyncio
-async def test_continue_policy_preserves_natural_exhaustion() -> None:
-    transport = ListTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_continue_policy_preserves_natural_exhaustion(scripted_client: ClientFactory) -> None:
+    transport = ResponderTransport(_five_rows)
+    client = scripted_client(transport)
     stream = client.iter_list(
         Request("offset.list", route=RouteKind.BARE),
         page_size=2,
@@ -184,7 +179,7 @@ async def test_continue_policy_preserves_natural_exhaustion() -> None:
 
 
 @pytest.mark.asyncio
-async def test_page_stop_callback_runs_between_delivery_and_acknowledgement() -> None:
+async def test_page_stop_callback_runs_between_delivery_and_acknowledgement(scripted_client: ClientFactory) -> None:
     order: list[str] = []
 
     class OrderedStop:
@@ -192,7 +187,7 @@ async def test_page_stop_callback_runs_between_delivery_and_acknowledgement() ->
             order.append("callback")
             return CallerStop("committed")
 
-    client = Bitrix24._from_executor(Executor(ListTransport()))  # noqa: SLF001 - deterministic facade seam
+    client = scripted_client(ResponderTransport(_five_rows))
     stream = client.iter_list(Request("offset.list", route=RouteKind.BARE), page_size=2, page_stop=OrderedStop())
     gate = stream._source.completion_gate  # noqa: SLF001 - observe the actual kernel gate
     original_emit = gate.emit
@@ -210,12 +205,14 @@ async def test_page_stop_callback_runs_between_delivery_and_acknowledgement() ->
 
 
 @pytest.mark.asyncio
-async def test_page_stop_callback_failure_does_not_acknowledge_or_schedule_next_page() -> None:
+async def test_page_stop_callback_failure_does_not_acknowledge_or_schedule_next_page(
+    scripted_client: ClientFactory,
+) -> None:
     class FailingStop:
         def on_page(self, _boundary: PageBoundary) -> ContinuePage:
             raise RuntimeError("commit failed")
 
-    client = Bitrix24._from_executor(Executor(ListTransport()))  # noqa: SLF001 - deterministic facade seam
+    client = scripted_client(ResponderTransport(_five_rows))
     stream = client.iter_list(Request("offset.list", route=RouteKind.BARE), page_size=2, page_stop=FailingStop())
     gate = stream._source.completion_gate  # noqa: SLF001 - observe the actual kernel gate
     events: list[type[object]] = []
@@ -234,9 +231,9 @@ async def test_page_stop_callback_failure_does_not_acknowledge_or_schedule_next_
 
 
 @pytest.mark.asyncio
-async def test_default_auto_keyset_uses_sequential_path_for_page_stop() -> None:
-    transport = ListTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_default_auto_keyset_uses_sequential_path_for_page_stop(scripted_client: ClientFactory) -> None:
+    transport = ResponderTransport(_five_rows)
+    client = scripted_client(transport)
     stream = client.iter_list_keyset(
         Request("keyset.list", route=RouteKind.BARE),
         selector=ResultSelector.root(),
@@ -248,3 +245,31 @@ async def test_default_auto_keyset_uses_sequential_path_for_page_stop() -> None:
     assert len(transport.requests) == 1
     assert stream.report is not None
     assert not stream.report.exhausted
+    # The compact summary says why AUTO ran sequentially; the fast-only report stays absent.
+    assert stream.report.keyset_selection == KeysetSelectionSummary(
+        KeysetExecutionKind.AUTO,
+        KeysetExecutionKind.SEQUENTIAL,
+        KeysetSelectionReason.PAGE_STOP,
+    )
+    assert stream.report.keyset_execution is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_sequential_keyset_reports_its_selection() -> None:
+    client = Bitrix24(
+        Settings(webhook_url="https://fixture.invalid/rest/1/stop/"), transport=ResponderTransport(_five_rows)
+    )
+    stream = client.iter_list_keyset(
+        Request("keyset.list", route=RouteKind.BARE),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=2,
+        execution=SequentialKeysetExecution(),
+    )
+    assert [row["id"] async for row in stream] == [1, 2, 3, 4, 5]
+    assert stream.report is not None
+    assert stream.report.keyset_selection == KeysetSelectionSummary(
+        KeysetExecutionKind.SEQUENTIAL,
+        KeysetExecutionKind.SEQUENTIAL,
+        KeysetSelectionReason.EXPLICIT_SEQUENTIAL,
+    )

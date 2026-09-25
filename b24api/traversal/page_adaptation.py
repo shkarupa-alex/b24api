@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from b24api.contracts.page import AdaptedPage, PageAdapter, PageView, _PageOutputTypeError
 from b24api.contracts.policy import IdentityCoercion
+from b24api.contracts.response import result_snapshot
 from b24api.errors import PageAdaptationError, PageAdaptationViolation, PaginationError
 from b24api.traversal.values import IdentityValue, _coerce_identity, _extract_path
 
@@ -12,7 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from b24api.contracts.json import FrozenJson
-    from b24api.contracts.request import RequestSummary
+    from b24api.contracts.request_summary import RequestSummary
     from b24api.contracts.response import Response
 
 type _IdentityTokenSpec = tuple[tuple[str | int, ...], IdentityCoercion]
@@ -58,7 +59,7 @@ def adapt_page(  # noqa: PLR0913 - explicit public-contract evidence at the shar
 
     source_tokens = _tokens(source, identities)
     try:
-        adapted = adapter.adapt(PageView(response._frozen_result(), source))  # noqa: SLF001
+        adapted = adapter.adapt(PageView(result_snapshot(response), source))
     except _PageOutputTypeError as error:
         raise failure(PageAdaptationViolation.NON_JSON_VALUE, error.row_offset) from error
     except Exception as error:

@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal, TypedDict
 
-PORTAL_BATCH_CAP = 50
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
+
 MIN_WINDOW_WIDTH = 2
 MIN_TARGET_LANES = 2
 
@@ -49,13 +50,14 @@ class KeysetSelectionReason(StrEnum):
     POST_PROBE_RANGE_PREFERRED = "post_probe_range_preferred"
     POST_PROBE_GAIN_LOST = "post_probe_gain_lost"
     DEGENERATE_SINGLE_LANE = "degenerate_single_lane"
+    EXPLICIT_SEQUENTIAL = "explicit_sequential"
+    PAGE_STOP = "page_stop"
 
 
 class KeysetAssuranceSource(StrEnum):
     """Evidence source for the selected fast plan."""
 
     ORDERED_PREFIX_ONLY = "ordered_prefix_only"
-    CANARY_VERIFIED_BOUNDS = "canary_verified_bounds"
     CALLER_ASSERTED_BOUNDS = "caller_asserted_bounds"
 
 

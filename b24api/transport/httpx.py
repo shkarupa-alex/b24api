@@ -6,13 +6,12 @@ import json
 import secrets
 import uuid
 import weakref
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import httpx
 
 from b24api._error_types import FailurePhase
-from b24api.contracts.request import RouteKind
+from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.wire import BodyEncoding, _validate_headers
 from b24api.encoding import encode_php_query
 from b24api.errors import (
@@ -28,7 +27,8 @@ from b24api.transport.base import (
     WireRequest,
     WireResponse,
 )
-from b24api.transport.logging_shield import HTTPX_LOG_SHIELD, OwnedRequestReplacedError
+from b24api.transport.decoding import BOUNDED_ACCEPT_ENCODING, BodyReadOutcome, read_bounded_body
+from b24api.transport.logging_shield import HTTPX_LOG_SHIELD, OwnedRequestReplacedError, webhook_credentials
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -51,7 +51,10 @@ def _webhook_vault() -> tuple[Callable[[str], str], Callable[[str], str], Callab
         try:
             ciphertext, key = entries[handle]
         except KeyError as error:
-            raise RuntimeError("transport credential is unavailable") from error
+            # Refused before any I/O: nothing reached the portal, so the request is not possibly accepted.
+            raise TransportError(
+                "transport credential is unavailable", phase=FailurePhase.NOT_DISPATCHED, retryable=False
+            ) from error
         return bytes(left ^ right for left, right in zip(ciphertext, key, strict=True)).decode()
 
     def drop(handle: str) -> None:
@@ -79,33 +82,6 @@ class _PhaseTracker:
             self.phase = FailurePhase.HEADERS_RECEIVED
         elif event_name.endswith("receive_response_body.started"):
             self.phase = FailurePhase.BODY_PARTIALLY_RECEIVED
-
-
-@dataclass(frozen=True, slots=True)
-class _BodyReadOutcome:
-    body: bytes | None = None
-    cancellation_args: tuple[object, ...] | None = None
-    transport_failure: str | None = None
-    too_large: bool = False
-
-
-async def _read_bounded_body(response: httpx.Response, maximum: int) -> _BodyReadOutcome:
-    """Consume decoded bytes without propagating credential-bearing HTTPX exceptions."""
-    body = bytearray()
-    try:
-        async for chunk in response.aiter_bytes():
-            if len(body) + len(chunk) > maximum:
-                return _BodyReadOutcome(too_large=True)
-            body.extend(chunk)
-    except asyncio.CancelledError as error:
-        return _BodyReadOutcome(cancellation_args=error.args)
-    except (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.DecodingError):
-        return _BodyReadOutcome(transport_failure="Transport failed while reading the response body")
-    except httpx.TransportError:
-        return _BodyReadOutcome(transport_failure="Unclassified transport failure while reading the response body")
-    except httpx.RequestError:
-        return _BodyReadOutcome(transport_failure="HTTP client failed while reading the response body")
-    return _BodyReadOutcome(body=bytes(body))
 
 
 def _normalized_webhook_host(webhook_url: str) -> str:
@@ -141,6 +117,12 @@ def _method_url(webhook_url: str, request: WireRequest) -> str:
     return str(parsed.copy_with(path=f"{path}{request.method}{suffix}"))
 
 
+def _closed_refusal(*, transport_closed: bool) -> TransportError:
+    """A closed transport or injected client refuses before any I/O; the request never left the process."""
+    message = "transport is closed" if transport_closed else "HTTP client is closed"
+    return TransportError(message, phase=FailurePhase.NOT_DISPATCHED, retryable=False)
+
+
 class HttpxTransport:
     """HTTPX transport with conservative failure-phase classification."""
 
@@ -156,6 +138,9 @@ class HttpxTransport:
         if not webhook_url.endswith("/"):
             webhook_url += "/"
         normalized_host = _normalized_webhook_host(webhook_url)
+        # Both log filters are installed before a client exists or an injected one is registered.
+        HTTPX_LOG_SHIELD.register_transport()
+        shield_finalizer = weakref.finalize(self, HTTPX_LOG_SHIELD.release_transport)
         resolved_client = client
         client_initialization_failed = False
         if resolved_client is None:
@@ -167,6 +152,7 @@ class HttpxTransport:
         webhook_url = ""
         if client_initialization_failed:
             normalized_webhook = ""
+            shield_finalizer()
             raise RuntimeError("HTTP client initialization failed")
         self._webhook_handle = _store_webhook(normalized_webhook)
         self._webhook_finalizer = weakref.finalize(self, _drop_webhook, self._webhook_handle)
@@ -174,8 +160,11 @@ class HttpxTransport:
         self._owns_client = client is None
         self._closed = False
         self._host = normalized_host
-        HTTPX_LOG_SHIELD.register_transport()
-        self._shield_finalizer = weakref.finalize(self, HTTPX_LOG_SHIELD.release_transport)
+        self._shield_finalizer = shield_finalizer
+        # Keyed by the client, not this transport: an injected client's connections outlive the transport.
+        # A client that cannot be weakly registered gets its HTTP/2 sends refused by ``admit_send``.
+        HTTPX_LOG_SHIELD.bind_client(self._client, credentials=webhook_credentials(normalized_webhook))
+        normalized_webhook = ""
 
     @property
     def host(self) -> str:
@@ -204,8 +193,9 @@ class HttpxTransport:
         max_response_bytes: int,
     ) -> WireResponse:
         """Protect the emitting HTTPX logger for one owned request."""
-        if self._closed:
-            raise RuntimeError("transport is closed")
+        if self._closed or self._client.is_closed:
+            raise _closed_refusal(transport_closed=self._closed)
+        HTTPX_LOG_SHIELD.admit_send(self._client)
         method_url = _method_url(_webhook_for(self._webhook_handle), request)
         try:
             with HTTPX_LOG_SHIELD.request(method_url) as ownership:
@@ -219,6 +209,18 @@ class HttpxTransport:
         finally:
             method_url = ""
 
+    def _with_bounded_accept_encoding(self, headers: dict[str, str]) -> dict[str, str]:
+        """Advertise only what the bounded decoder can inflate.
+
+        A caller's header, or one an injected client was configured with, is kept; a coding it admits
+        is then refused on arrival.
+        """
+        if "accept-encoding" not in headers and (
+            self._owns_client or self._client.headers.get("accept-encoding") == _httpx_default_accept_encoding()
+        ):
+            headers["accept-encoding"] = BOUNDED_ACCEPT_ENCODING
+        return headers
+
     async def _send_wire_impl(  # noqa: C901, PLR0912, PLR0915
         self,
         request: WireRequest,
@@ -229,8 +231,8 @@ class HttpxTransport:
         max_response_bytes: int,
     ) -> WireResponse:
         """Send one explicitly represented transport request attempt."""
-        if self._closed:
-            raise RuntimeError("transport is closed")
+        if self._closed or self._client.is_closed:
+            raise _closed_refusal(transport_closed=self._closed)
         if isinstance(max_response_bytes, bool) or max_response_bytes < 1:
             raise ValueError("max_response_bytes must be a positive integer")
         tracker = _PhaseTracker()
@@ -238,7 +240,7 @@ class HttpxTransport:
         cancellation_args: tuple[object, ...] | None = None
         http_request: httpx.Request | None = None
         try:
-            request_headers = dict(_validate_headers(request.headers.items))
+            request_headers = self._with_bounded_accept_encoding(dict(_validate_headers(request.headers.items)))
             if request.encoding is BodyEncoding.JSON:
                 request_headers["content-type"] = "application/json"
                 if request.positional is not None:
@@ -329,7 +331,7 @@ class HttpxTransport:
                 retryable=message != _REPLACED_OWNED_REQUEST,
             )
         pending_error: B24ApiError | None = None
-        body_outcome = _BodyReadOutcome()
+        body_outcome = BodyReadOutcome()
         try:
             status_code = response.status_code
             if not _HTTP_STATUS_MINIMUM <= status_code <= _HTTP_STATUS_MAXIMUM:
@@ -338,7 +340,7 @@ class HttpxTransport:
             else:
                 response_headers = tuple(response.headers.multi_items())
                 tracker.phase = FailurePhase.BODY_PARTIALLY_RECEIVED
-                body_outcome = await _read_bounded_body(response, max_response_bytes)
+                body_outcome = await read_bounded_body(response, max_response_bytes)
         finally:
             await response.aclose()
             del response
@@ -374,6 +376,12 @@ class HttpxTransport:
                 self._webhook_finalizer()
             finally:
                 self._shield_finalizer()
+
+
+def _httpx_default_accept_encoding() -> str:
+    """Return the value HTTPX puts on a client given none; it grows ``br``/``zstd`` once those codecs are installed."""
+    # Read from the pinned HTTPX, like the shield's ``_send_handling_auth`` attribution.
+    return httpx._client.ACCEPT_ENCODING  # noqa: SLF001 - tell HTTPX's default from a configured value
 
 
 def _at_least_dispatch_started(phase: FailurePhase) -> FailurePhase:
