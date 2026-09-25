@@ -22,7 +22,7 @@ from b24api.contracts.response import Response, inject_controls
 from b24api.contracts.violation import MAX_RETAINED_VIOLATIONS, retain_violations
 from b24api.errors import BudgetExceededError
 from b24api.execution.snapshot import KernelReport
-from b24api.references.outcome import ReferenceFailure, ReferenceItem, ReferenceRequest
+from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem, ReferenceRequest
 
 EXAMPLE_CREDENTIAL = "n1x2y3z4q5w6e7r8"
 TEST_LIMIT = 2
@@ -260,14 +260,14 @@ def test_reference_values_hide_correlation_and_detach_mutable_items() -> None:
     request = Request("profile", {"auth": EXAMPLE_CREDENTIAL}, route=RouteKind.BARE)
     reference = ReferenceRequest(request, EXAMPLE_CREDENTIAL)
     source = {"rows": [1]}
-    item = ReferenceItem(EXAMPLE_CREDENTIAL, source, correlation={"secret": EXAMPLE_CREDENTIAL})
+    item = KernelReferenceItem(EXAMPLE_CREDENTIAL, source, correlation={"secret": EXAMPLE_CREDENTIAL})
     source["rows"].append(2)
     exposed = item.item
     assert isinstance(exposed, dict)
     rows = exposed["rows"]
     assert isinstance(rows, list)
     rows.append(3)
-    failure = ReferenceFailure(
+    failure = KernelReferenceFailure(
         EXAMPLE_CREDENTIAL,
         request,
         RuntimeError(EXAMPLE_CREDENTIAL),

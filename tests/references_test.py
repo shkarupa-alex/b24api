@@ -33,14 +33,14 @@ from b24api.errors import (
     ProtocolError,
     TransportError,
 )
-from b24api.execution import ExecutionContext, Executor, WireResponse
-from b24api.references.outcome import ReferenceFailure, ReferenceItem, ReferenceRequest
-from b24api.references.stream import fan_out, iter_references
+from b24api.execution import Executor, WireResponse
+from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem, ReferenceRequest
+from b24api.references.stream import iter_references
 from b24api.traversal.plans import (
-    BatchDispatch,
     CountedOffsetPlan,
-    DirectDispatch,
     DispatchPlan,
+    KernelBatchDispatch,
+    KernelDirectDispatch,
     ListPlan,
     OffsetContinuation,
     OffsetSequentialPlan,
@@ -48,9 +48,13 @@ from b24api.traversal.plans import (
     ReferenceOutputOrder,
     SingleResponsePlan,
 )
+from tests.ledger_hold import LedgerHold
+from tests.scripting import Blocker, ResponderTransport, attached_report, replies
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Iterator
+    from collections.abc import AsyncGenerator, Iterator
+
+    from b24api.references.stream import ReferenceStream
 
 PAGE_SIZE = 1
 TWO_REFERENCES = 2
@@ -61,46 +65,9 @@ REFERENCE_FAILURE_COUNT = 140
 RETAINED_VIOLATION_LIMIT = 128
 
 
-class AsyncFunctionTransport:
-    """Provide a deterministic test helper."""
-
-    host = "fixture.invalid"
-
-    def __init__(self, handler: Callable[[Request], object]) -> None:
-        """Initialize instance state."""
-        self.handler = handler
-        self.requests: list[Request] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Send one transport request attempt."""
-        del attempt_timeout, max_response_bytes
-        self.requests.append(request)
-        outcome = self.handler(request)
-        if asyncio.iscoroutine(outcome):
-            outcome = await outcome
-        body = json.dumps(outcome, separators=(",", ":")).encode()
-        return WireResponse(200, (("content-type", "application/json"),), body)
-
-
-class BlockingTransport:
-    """Provide a deterministic test helper."""
-
-    host = "fixture.invalid"
-
-    def __init__(self) -> None:
-        """Initialize instance state."""
-        self.started = asyncio.Event()
-        self.cancelled = asyncio.Event()
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Send one transport request attempt."""
-        del request, attempt_timeout, max_response_bytes
-        self.started.set()
-        try:
-            return await asyncio.Future[WireResponse]()
-        except asyncio.CancelledError:
-            self.cancelled.set()
-            raise
+def fan_out(executor: Executor, requests: object, **options: object) -> ReferenceStream:
+    """Schedule requests as whole-result single-response references through the reference kernel."""
+    return iter_references(executor, requests, plan=SingleResponsePlan(), _whole_result=True, **options)  # type: ignore[arg-type]
 
 
 def _reference(key: str) -> ReferenceRequest:
@@ -156,13 +123,13 @@ async def test_ready_order_interleaves_references_by_actual_completion() -> None
             second_started.set()
         return {"result": [{"ID": 1, "ref": reference}]}
 
-    transport = AsyncFunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = iter_references(
         Executor(transport),
         [_reference("first"), _reference("second")],
         plan=_one_page_plan(),
         _page_cap_hint=PAGE_SIZE,
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),
         identity=_identity(),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
     )
@@ -185,11 +152,11 @@ async def test_reference_bindings_share_one_operation_identity_budget() -> None:
         return {"result": [{"ID": base + 1}, {"ID": base + 2}]}
 
     stream = iter_references(
-        Executor(AsyncFunctionTransport(handler)),
+        Executor(ResponderTransport(handler)),
         [_reference("a"), _reference("b")],
         plan=_one_page_plan(),
         _page_cap_hint=TWO_REFERENCES,
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),
         identity=_identity(),
         tolerant=True,
         policy=ExecutionPolicy(
@@ -200,8 +167,8 @@ async def test_reference_bindings_share_one_operation_identity_budget() -> None:
     )
 
     outcomes = [outcome async for outcome in stream]
-    items = [outcome for outcome in outcomes if isinstance(outcome, ReferenceItem)]
-    failures = [outcome for outcome in outcomes if isinstance(outcome, ReferenceFailure)]
+    items = [outcome for outcome in outcomes if isinstance(outcome, KernelReferenceItem)]
+    failures = [outcome for outcome in outcomes if isinstance(outcome, KernelReferenceFailure)]
     assert len(items) == TWO_REFERENCES
     assert len({item.reference_key for item in items}) == 1
     assert len(failures) == 1
@@ -210,7 +177,7 @@ async def test_reference_bindings_share_one_operation_identity_budget() -> None:
 
 @pytest.mark.asyncio
 async def test_reference_failure_violations_are_bounded_without_losing_outcomes() -> None:
-    transport = AsyncFunctionTransport(
+    transport = ResponderTransport(
         lambda _request: {"error": "ACCESS_DENIED", "error_description": "denied"},
     )
     stream = iter_references(
@@ -218,7 +185,7 @@ async def test_reference_failure_violations_are_bounded_without_losing_outcomes(
         (_reference(str(index)) for index in range(REFERENCE_FAILURE_COUNT)),
         plan=_one_page_plan(),
         _page_cap_hint=PAGE_SIZE,
-        dispatch=DirectDispatch(concurrency=1),
+        dispatch=KernelDirectDispatch(concurrency=1),
         identity=_identity(),
         tolerant=True,
         policy=ExecutionPolicy(
@@ -232,7 +199,7 @@ async def test_reference_failure_violations_are_bounded_without_losing_outcomes(
     outcomes = [outcome async for outcome in stream]
 
     assert len(outcomes) == REFERENCE_FAILURE_COUNT
-    assert all(isinstance(outcome, ReferenceFailure) for outcome in outcomes)
+    assert all(isinstance(outcome, KernelReferenceFailure) for outcome in outcomes)
     assert len(stream.report.violations) <= RETAINED_VIOLATION_LIMIT
     assert stream.report.violations[-1].code == "violations_truncated"
 
@@ -250,13 +217,13 @@ async def test_input_order_allows_later_progress_without_cross_reference_reorder
             second_started.set()
         return {"result": [{"ID": 1, "ref": reference}]}
 
-    transport = AsyncFunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = iter_references(
         Executor(transport),
         [_reference("first"), _reference("second")],
         plan=_one_page_plan(),
         _page_cap_hint=PAGE_SIZE,
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES, output_order=ReferenceOutputOrder.INPUT),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES, output_order=ReferenceOutputOrder.INPUT),
         identity=_identity(),
         output_order=ReferenceOutputOrder.INPUT,
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
@@ -283,7 +250,7 @@ async def test_per_reference_pagination_is_sequential_while_references_are_concu
             return {"result": [{"ID": 1, "ref": reference}]}
         return {"result": []}
 
-    transport = AsyncFunctionTransport(handler)
+    transport = ResponderTransport(handler)
     plan = OffsetSequentialPlan(
         limit_path=ParameterPath(("limit",)),
         requested_page_size=PAGE_SIZE,
@@ -294,7 +261,7 @@ async def test_per_reference_pagination_is_sequential_while_references_are_concu
         Executor(transport),
         [_reference("a"), _reference("b")],
         plan=plan,
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),
         identity=_identity(),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
     )
@@ -334,19 +301,19 @@ async def test_invalid_reference_contract_refuses_even_empty_input(
     plan: ListPlan,
     policy: ExecutionPolicy,
 ) -> None:
-    transport = AsyncFunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     stream = iter_references(
         Executor(transport),
         [],
         plan=plan,
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         policy=policy,
     )
 
     with pytest.raises(CapabilityError) as captured:
         await anext(stream)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert transport.requests == []
 
@@ -377,19 +344,19 @@ async def test_composite_reference_identity_refuses_before_source_pull_or_io(
         pulled.set()
         yield _reference("unreachable")
 
-    transport = AsyncFunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     stream = iter_references(
         Executor(transport),
         source(),
         plan=plan,
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         policy=policy,
     )
 
     with pytest.raises(CapabilityError, match="composite identity") as captured:
         await anext(stream)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert not pulled.is_set()
     assert transport.requests == []
@@ -404,12 +371,12 @@ async def test_invalid_reference_contract_refuses_before_blocking_source_pull() 
         await asyncio.Future[None]()
         yield _reference("unreachable")
 
-    transport = AsyncFunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     stream = iter_references(
         Executor(transport),
         source(),
         plan=OffsetSequentialPlan(identity_requirement=IdentityRequirement.REQUIRED),
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         policy=ExecutionPolicy(max_elapsed=0.03),
     )
 
@@ -430,10 +397,10 @@ def test_invalid_reference_plan_type_refuses_at_construction() -> None:
 
     with pytest.raises(TypeError, match="canonical ListPlan"):
         iter_references(
-            Executor(AsyncFunctionTransport(lambda _request: {"result": []})),
+            Executor(ResponderTransport(lambda _request: {"result": []})),
             source(),
             plan=cast("ListPlan", object()),
-            dispatch=DirectDispatch(),
+            dispatch=KernelDirectDispatch(),
         )
 
     assert not source_touched
@@ -462,12 +429,12 @@ async def test_batch_dispatch_coalesces_pages_and_preserves_total_metadata() -> 
             },
         }
 
-    transport = AsyncFunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = iter_references(
         Executor(transport),
         [_reference("a"), _reference("b")],
         plan=CountedOffsetPlan(limit_path=ParameterPath(("limit",)), requested_page_size=PAGE_SIZE),
-        dispatch=BatchDispatch(batch_size=TWO_REFERENCES),
+        dispatch=KernelBatchDispatch(batch_size=TWO_REFERENCES),
         identity=_identity(),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
     )
@@ -509,14 +476,14 @@ async def test_reference_batch_preserves_tolerant_duplicate_json_members() -> No
         Executor(DuplicateMemberTransport()),
         [_reference("a")],
         plan=_one_page_plan(),
-        dispatch=BatchDispatch(batch_size=1),
+        dispatch=KernelBatchDispatch(batch_size=1),
         identity=_identity(),
     )
 
     outcomes = [outcome async for outcome in stream]
 
     assert len(outcomes) == 1
-    assert isinstance(outcomes[0], ReferenceItem)
+    assert isinstance(outcomes[0], KernelReferenceItem)
 
 
 @pytest.mark.asyncio
@@ -531,17 +498,17 @@ async def test_batch_fan_out_coalesces_whole_results_as_one_item_per_reference()
             },
         }
 
-    transport = AsyncFunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = fan_out(
         Executor(transport),
         [_reference("a"), _reference("b")],
-        dispatch=BatchDispatch(batch_size=TWO_REFERENCES),
+        dispatch=KernelBatchDispatch(batch_size=TWO_REFERENCES),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
     )
 
     outcomes = [outcome async for outcome in stream]
     assert len(outcomes) == TWO_REFERENCES
-    items = [outcome for outcome in outcomes if isinstance(outcome, ReferenceItem)]
+    items = [outcome for outcome in outcomes if isinstance(outcome, KernelReferenceItem)]
     assert len(items) == TWO_REFERENCES
     assert all(isinstance(outcome.item, dict) for outcome in items)
     assert len(transport.requests) == 1
@@ -549,44 +516,33 @@ async def test_batch_fan_out_coalesces_whole_results_as_one_item_per_reference()
 
 @pytest.mark.asyncio
 async def test_fan_out_accepts_list_result_whose_total_matches_list_length() -> None:
-    transport = AsyncFunctionTransport(
+    transport = ResponderTransport(
         lambda _request: {"result": [{"ID": 1}, {"ID": 2}], "total": TWO_REFERENCES},
     )
     stream = fan_out(
         Executor(transport),
         [_reference("a")],
-        dispatch=DirectDispatch(concurrency=1),
+        dispatch=KernelDirectDispatch(concurrency=1),
     )
 
     outcomes = [outcome async for outcome in stream]
 
     assert len(outcomes) == 1
-    assert isinstance(outcomes[0], ReferenceItem)
+    assert isinstance(outcomes[0], KernelReferenceItem)
     assert outcomes[0].item == [{"ID": 1}, {"ID": 2}]
     assert stream.report.state is KernelState.COMPLETED
 
 
 @pytest.mark.asyncio
 async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
-    class TransientThenSuccessTransport:
-        host = "fixture.invalid"
-
-        def __init__(self) -> None:
-            self.requests: list[Request] = []
-
-        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-            del attempt_timeout, max_response_bytes
-            self.requests.append(request)
-            if len(self.requests) == 1:
-                return WireResponse(503, (), b"gateway")
-            return WireResponse(200, (), b'{"result":{"ID":1}}')
-
-    transport = TransientThenSuccessTransport()
+    transport = ResponderTransport(
+        replies(WireResponse(503, (), b"gateway"), WireResponse(200, (), b'{"result":{"ID":1}}'))
+    )
     request = Request("tasks.task.add", route=RouteKind.BARE)
     stream = fan_out(
         Executor(transport),
         [ReferenceRequest(request, "write")],
-        dispatch=DirectDispatch(concurrency=1),
+        dispatch=KernelDirectDispatch(concurrency=1),
         policy=ExecutionPolicy(
             max_attempts_per_request=TWO_REFERENCES,
             retry=RetryPolicy(initial_delay=0, maximum_delay=0, jitter=0),
@@ -596,7 +552,7 @@ async def test_fan_out_does_not_infer_safe_replay_for_unset_requests() -> None:
     with pytest.raises(AmbiguousExecutionError) as captured:
         await anext(stream)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert request.replay_safety is ReplaySafety.UNKNOWN
     assert len(transport.requests) == 1
     assert transport.requests[0].replay_safety is ReplaySafety.UNKNOWN
@@ -623,21 +579,21 @@ async def test_batch_fan_out_accepts_list_result_whose_total_matches_list_length
         }
 
     stream = fan_out(
-        Executor(AsyncFunctionTransport(handler)),
+        Executor(ResponderTransport(handler)),
         [_reference("a")],
-        dispatch=BatchDispatch(batch_size=1),
+        dispatch=KernelBatchDispatch(batch_size=1),
     )
 
     outcomes = [outcome async for outcome in stream]
 
     assert len(outcomes) == 1
-    assert isinstance(outcomes[0], ReferenceItem)
+    assert isinstance(outcomes[0], KernelReferenceItem)
     assert outcomes[0].item == [{"ID": 1}, {"ID": 2}]
     assert stream.report.state is KernelState.COMPLETED
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("dispatch", [DirectDispatch(concurrency=1), BatchDispatch(batch_size=1)])
+@pytest.mark.parametrize("dispatch", [KernelDirectDispatch(concurrency=1), KernelBatchDispatch(batch_size=1)])
 async def test_fan_out_list_result_obeys_decoded_row_buffer(dispatch: DispatchPlan) -> None:
     def handler(request: Request) -> object:
         rows = [{"ID": 1}, {"ID": 2}, {"ID": 3}]
@@ -653,7 +609,7 @@ async def test_fan_out_list_result_obeys_decoded_row_buffer(dispatch: DispatchPl
             },
         }
 
-    transport = AsyncFunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = fan_out(
         Executor(transport),
         [_reference("a")],
@@ -664,7 +620,7 @@ async def test_fan_out_list_result_obeys_decoded_row_buffer(dispatch: DispatchPl
     with pytest.raises(BudgetExceededError, match="decoded page") as captured:
         await anext(stream)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert stream.report.emitted_rows == 0
     assert stream.report.buffered_rows_high_water == 0
@@ -687,9 +643,9 @@ async def test_input_order_rejects_oversized_whole_result_behind_blocked_head() 
 
     order = ReferenceOutputOrder.INPUT
     stream = fan_out(
-        Executor(AsyncFunctionTransport(handler)),
+        Executor(ResponderTransport(handler)),
         [_reference("head"), _reference("later")],
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES, output_order=order),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES, output_order=order),
         output_order=order,
         policy=ExecutionPolicy(
             max_active_references=TWO_REFERENCES,
@@ -707,7 +663,7 @@ async def test_input_order_rejects_oversized_whole_result_behind_blocked_head() 
 
     release_head.set()
     head = await first
-    assert isinstance(head, ReferenceItem)
+    assert isinstance(head, KernelReferenceItem)
     assert head.reference_key == "head"
 
     with pytest.raises(BudgetExceededError, match="decoded page"):
@@ -722,13 +678,13 @@ async def test_tolerant_reference_failure_preserves_total_correlation() -> None:
             return {"error": "ACCESS_DENIED", "error_description": "denied"}
         return {"result": [{"ID": 1}]}
 
-    transport = AsyncFunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = iter_references(
         Executor(transport),
         [_reference("bad"), _reference("good")],
         plan=_one_page_plan(),
         _page_cap_hint=PAGE_SIZE,
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),
         identity=_identity(),
         tolerant=True,
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
@@ -736,7 +692,7 @@ async def test_tolerant_reference_failure_preserves_total_correlation() -> None:
 
     outcomes = [outcome async for outcome in stream]
     assert {outcome.reference_key for outcome in outcomes} == {"bad", "good"}
-    failure = next(outcome for outcome in outcomes if isinstance(outcome, ReferenceFailure))
+    failure = next(outcome for outcome in outcomes if isinstance(outcome, KernelReferenceFailure))
     assert isinstance(failure.error, ApiResponseError)
     assert stream.report.state is KernelState.COMPLETED
     assert [violation.code for violation in stream.report.violations] == ["reference_failure"]
@@ -760,18 +716,18 @@ async def test_tolerant_batch_command_failure_records_unknown_page_provenance() 
         }
 
     stream = iter_references(
-        Executor(AsyncFunctionTransport(handler)),
+        Executor(ResponderTransport(handler)),
         [_reference("bad")],
         plan=_one_page_plan(),
         _page_cap_hint=PAGE_SIZE,
-        dispatch=BatchDispatch(batch_size=1),
+        dispatch=KernelBatchDispatch(batch_size=1),
         identity=_identity(),
         tolerant=True,
     )
 
     outcomes = [outcome async for outcome in stream]
     assert len(outcomes) == 1
-    assert isinstance(outcomes[0], ReferenceFailure)
+    assert isinstance(outcomes[0], KernelReferenceFailure)
     assert len(stream.report.page_trace) == 1
     record = stream.report.page_trace[0]
     assert record.outcome is PageOutcome.UNKNOWN
@@ -784,11 +740,11 @@ async def test_tolerant_batch_command_failure_records_unknown_page_provenance() 
 @pytest.mark.asyncio
 async def test_page_trace_limit_bounds_live_reference_aggregation() -> None:
     stream = iter_references(
-        Executor(AsyncFunctionTransport(lambda _request: {"result": []})),
+        Executor(ResponderTransport(lambda _request: {"result": []})),
         [_reference("a"), _reference("b")],
         plan=_one_page_plan(),
         _page_cap_hint=PAGE_SIZE,
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),
         identity=_identity(),
         policy=ExecutionPolicy(page_trace_limit=1),
     )
@@ -802,13 +758,13 @@ async def test_page_trace_limit_bounds_live_reference_aggregation() -> None:
 
 @pytest.mark.asyncio
 async def test_tolerant_batch_chunk_protocol_failure_yields_every_reference() -> None:
-    transport = AsyncFunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     stream = iter_references(
         Executor(transport),
         [_reference("a"), _reference("b")],
         plan=_one_page_plan(),
         _page_cap_hint=PAGE_SIZE,
-        dispatch=BatchDispatch(batch_size=TWO_REFERENCES),
+        dispatch=KernelBatchDispatch(batch_size=TWO_REFERENCES),
         identity=_identity(),
         tolerant=True,
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
@@ -816,20 +772,20 @@ async def test_tolerant_batch_chunk_protocol_failure_yields_every_reference() ->
 
     outcomes = [outcome async for outcome in stream]
     assert len(outcomes) == TWO_REFERENCES
-    assert all(isinstance(outcome, ReferenceFailure) for outcome in outcomes)
+    assert all(isinstance(outcome, KernelReferenceFailure) for outcome in outcomes)
     assert {outcome.reference_key for outcome in outcomes} == {"a", "b"}
     assert stream.report.emitted_rows == 0
 
 
 @pytest.mark.asyncio
 async def test_rejected_reference_batch_does_not_count_a_physical_batch_request() -> None:
-    transport = AsyncFunctionTransport(lambda _request: pytest.fail("unsupported batch must not be sent"))
+    transport = ResponderTransport(lambda _request: pytest.fail("unsupported batch must not be sent"))
     stream = iter_references(
         Executor(transport),
         [ReferenceRequest(Request("crm.item.list", route=RouteKind.JSON), "bad")],
         plan=_one_page_plan(),
         _page_cap_hint=PAGE_SIZE,
-        dispatch=BatchDispatch(),
+        dispatch=KernelBatchDispatch(),
         identity=_identity(),
         tolerant=True,
     )
@@ -837,7 +793,7 @@ async def test_rejected_reference_batch_does_not_count_a_physical_batch_request(
     outcomes = [outcome async for outcome in stream]
 
     assert len(outcomes) == 1
-    assert isinstance(outcomes[0], ReferenceFailure)
+    assert isinstance(outcomes[0], KernelReferenceFailure)
     assert transport.requests == []
     assert stream.report.physical_requests == 0
     assert stream.report.batch_requests == 0
@@ -851,11 +807,11 @@ async def test_failed_input_head_cannot_deadlock_a_full_later_page() -> None:
         return {"result": [{"ID": 1}]}
 
     stream = iter_references(
-        Executor(AsyncFunctionTransport(handler)),
+        Executor(ResponderTransport(handler)),
         [_reference("first"), _reference("second")],
         plan=_one_page_plan(),
         _page_cap_hint=PAGE_SIZE,
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES, output_order=ReferenceOutputOrder.INPUT),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES, output_order=ReferenceOutputOrder.INPUT),
         identity=_identity(),
         output_order=ReferenceOutputOrder.INPUT,
         tolerant=True,
@@ -864,26 +820,26 @@ async def test_failed_input_head_cannot_deadlock_a_full_later_page() -> None:
 
     outcomes = await asyncio.wait_for(_collect(stream), timeout=1)
     assert [outcome.reference_key for outcome in outcomes] == ["first", "second"]
-    assert isinstance(outcomes[0], ReferenceFailure)
-    assert isinstance(outcomes[1], ReferenceItem)
+    assert isinstance(outcomes[0], KernelReferenceFailure)
+    assert isinstance(outcomes[1], KernelReferenceItem)
 
 
 @pytest.mark.asyncio
 async def test_fail_fast_reference_error_carries_same_terminal_report() -> None:
-    transport = AsyncFunctionTransport(
+    transport = ResponderTransport(
         lambda _request: {"error": "ACCESS_DENIED", "error_description": "denied"},
     )
     stream = fan_out(
         Executor(transport),
         [_reference("bad")],
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
     )
 
     with pytest.raises(ApiResponseError) as captured:
         await anext(stream)
 
     assert stream.report.state is KernelState.FAILED
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
 
 
 @pytest.mark.asyncio
@@ -900,7 +856,7 @@ async def test_async_input_admission_is_bounded_and_closed_on_early_exit() -> No
         finally:
             source_closed.set()
 
-    transport = AsyncFunctionTransport(
+    transport = ResponderTransport(
         lambda request: {"result": [{"ID": int(_string_parameter(request, "ref"))}]},
     )
     stream = iter_references(
@@ -908,12 +864,12 @@ async def test_async_input_admission_is_bounded_and_closed_on_early_exit() -> No
         source(),
         plan=_one_page_plan(),
         _page_cap_hint=PAGE_SIZE,
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),
         identity=_identity(),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
     )
 
-    assert isinstance(await anext(stream), ReferenceItem)
+    assert isinstance(await anext(stream), KernelReferenceItem)
     assert produced <= TWO_REFERENCES
     await stream.aclose()
     assert source_closed.is_set()
@@ -930,9 +886,9 @@ async def test_blocked_second_async_input_does_not_block_ready_first_output() ->
         await asyncio.Future[None]()
 
     stream = fan_out(
-        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         source(),
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES),
     )
 
@@ -949,17 +905,17 @@ async def test_async_reference_input_pull_obeys_operation_elapsed_budget() -> No
         await asyncio.Future[None]()
 
     stream = fan_out(
-        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         source(),
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.03),
     )
 
-    assert isinstance(await anext(stream), ReferenceItem)
+    assert isinstance(await anext(stream), KernelReferenceItem)
     with pytest.raises(BudgetExceededError, match="reference input") as captured:
         await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
 
 
@@ -984,16 +940,16 @@ async def test_cancellation_resistant_reference_pull_is_closed_after_late_comple
             closed.set()
 
     stream = fan_out(
-        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         source(),
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.03),
     )
 
-    assert isinstance(await anext(stream), ReferenceItem)
+    assert isinstance(await anext(stream), KernelReferenceItem)
     with pytest.raises(BudgetExceededError) as captured:
         await asyncio.wait_for(anext(stream), timeout=0.15)
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert not closed.is_set()
 
     release.set()
@@ -1001,7 +957,7 @@ async def test_cancellation_resistant_reference_pull_is_closed_after_late_comple
 
 
 @pytest.mark.asyncio
-async def test_late_reference_source_cleanup_error_is_observed_by_subsequent_close() -> None:
+async def test_late_reference_source_cleanup_error_does_not_reopen_the_published_report() -> None:
     release = asyncio.Event()
     closed = asyncio.Event()
 
@@ -1018,20 +974,23 @@ async def test_late_reference_source_cleanup_error_is_observed_by_subsequent_clo
             raise RuntimeError("late reference close boom")
 
     stream = fan_out(
-        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         source(),
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.03),
     )
-    assert isinstance(await anext(stream), ReferenceItem)
-    with pytest.raises(BudgetExceededError):
+    assert isinstance(await anext(stream), KernelReferenceItem)
+    with pytest.raises(BudgetExceededError) as failed:
         await anext(stream)
+    report = stream.report
+    assert attached_report(failed.value) is report
 
     release.set()
     await asyncio.wait_for(closed.wait(), timeout=0.2)
-    with pytest.raises(RuntimeError, match="late reference close boom") as captured:
-        await stream.aclose()
-    assert captured.value.__dict__["report"] is stream.report
+    # The report was published once, after the bounded cleanup; a repeated close changes nothing (§3.1).
+    await stream.aclose()
+    assert stream.report is report
+    assert report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -1057,13 +1016,13 @@ async def test_blocking_sync_reference_pull_does_not_block_event_loop_or_deadlin
             closed.set()
 
     stream = fan_out(
-        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         BlockingPull(),
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.03),
     )
 
-    assert isinstance(await anext(stream), ReferenceItem)
+    assert isinstance(await anext(stream), KernelReferenceItem)
     started = asyncio.get_running_loop().time()
     with pytest.raises(BudgetExceededError):
         await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
@@ -1083,16 +1042,16 @@ async def test_reference_source_failure_drains_all_admitted_outcomes(
         yield _reference("b")
         raise RuntimeError("reference source boom")
 
-    transport = AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})
+    transport = ResponderTransport(lambda _request: {"result": {"ok": True}})
     stream = fan_out(
         Executor(transport),
         source(),
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES, output_order=output_order),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES, output_order=output_order),
         output_order=output_order,
         tolerant=True,
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES),
     )
-    outcomes: list[ReferenceItem | ReferenceFailure] = []
+    outcomes: list[KernelReferenceItem | KernelReferenceFailure] = []
 
     async def consume() -> None:
         while True:
@@ -1101,7 +1060,7 @@ async def test_reference_source_failure_drains_all_admitted_outcomes(
     with pytest.raises(RuntimeError, match="reference source boom") as captured:
         await consume()
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert sorted(outcome.reference_key for outcome in outcomes) == ["a", "b"]
     assert len(transport.requests) == TWO_REFERENCES
     assert stream.report.state is KernelState.FAILED
@@ -1110,12 +1069,12 @@ async def test_reference_source_failure_drains_all_admitted_outcomes(
 
 @pytest.mark.asyncio
 async def test_reference_page_budget_blocks_second_direct_request_before_io() -> None:
-    transport = AsyncFunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
     stream = iter_references(
         Executor(transport),
         [_reference("a")],
         plan=_empty_confirmation_plan(),
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         identity=_identity(),
         policy=ExecutionPolicy(max_pages_per_reference=1),
     )
@@ -1139,12 +1098,12 @@ async def test_reference_page_budget_blocks_second_batch_request_before_io() -> 
             },
         }
 
-    transport = AsyncFunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = iter_references(
         Executor(transport),
         [_reference("a")],
         plan=_empty_confirmation_plan(),
-        dispatch=BatchDispatch(batch_size=1),
+        dispatch=KernelBatchDispatch(batch_size=1),
         identity=_identity(),
         policy=ExecutionPolicy(max_pages_per_reference=1),
     )
@@ -1176,9 +1135,9 @@ async def test_failed_reference_releases_page_slot_for_independent_work() -> Non
         return {"result": {"ok": True}}
 
     stream = fan_out(
-        Executor(AsyncFunctionTransport(handler)),
+        Executor(ResponderTransport(handler)),
         [_reference("bad"), _reference("good")],
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),
         tolerant=True,
         policy=ExecutionPolicy(
             max_pages=1,
@@ -1194,8 +1153,8 @@ async def test_failed_reference_releases_page_slot_for_independent_work() -> Non
     release_bad.set()
     outcomes = await collecting
     assert calls == ["bad", "good"]
-    assert isinstance(outcomes[0], ReferenceFailure)
-    assert isinstance(outcomes[1], ReferenceItem)
+    assert isinstance(outcomes[0], KernelReferenceFailure)
+    assert isinstance(outcomes[1], KernelReferenceItem)
     assert stream.report.logical_pages == 1
 
 
@@ -1205,9 +1164,9 @@ async def test_required_reference_snapshot_finishes_incomplete() -> None:
         consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST),
     )
     stream = fan_out(
-        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         [_reference("a")],
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         policy=policy,
     )
 
@@ -1219,13 +1178,13 @@ async def test_required_reference_snapshot_finishes_incomplete() -> None:
 
 @pytest.mark.asyncio
 async def test_duplicate_public_reference_keys_keep_independent_page_budgets() -> None:
-    transport = AsyncFunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
     stream = iter_references(
         Executor(transport),
         [_reference("same"), _reference("same")],
         plan=_one_page_plan(),
         _page_cap_hint=PAGE_SIZE,
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),
         identity=_identity(),
         policy=ExecutionPolicy(
             max_active_references=TWO_REFERENCES,
@@ -1259,10 +1218,10 @@ async def test_reference_report_sums_per_reference_unique_counts_and_violations(
         duplicate_policy=DuplicatePolicy.REPORT,
     )
     stream = iter_references(
-        Executor(AsyncFunctionTransport(handler)),
+        Executor(ResponderTransport(handler)),
         [_reference("a")],
         plan=plan,
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         identity=_identity(),
         policy=ExecutionPolicy(
             consistency=ConsistencyPolicy(duplicate_policy=DuplicatePolicy.REPORT),
@@ -1278,7 +1237,7 @@ async def test_reference_report_sums_per_reference_unique_counts_and_violations(
 
 @pytest.mark.asyncio
 async def test_early_close_keeps_delivered_unique_count_and_detected_page_warning() -> None:
-    transport = AsyncFunctionTransport(
+    transport = ResponderTransport(
         lambda _request: {
             "result": [
                 {"ID": 1, "revision": "a"},
@@ -1291,7 +1250,7 @@ async def test_early_close_keeps_delivered_unique_count_and_detected_page_warnin
         Executor(transport),
         [_reference("a")],
         plan=plan,
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         identity=_identity(),
         policy=ExecutionPolicy(
             max_buffered_rows=TWO_REFERENCES,
@@ -1299,7 +1258,7 @@ async def test_early_close_keeps_delivered_unique_count_and_detected_page_warnin
         ),
     )
 
-    assert isinstance(await anext(stream), ReferenceItem)
+    assert isinstance(await anext(stream), KernelReferenceItem)
     await stream.aclose()
 
     assert stream.report.emitted_rows == 1
@@ -1309,33 +1268,33 @@ async def test_early_close_keeps_delivered_unique_count_and_detected_page_warnin
 
 @pytest.mark.asyncio
 async def test_reference_task_cancellation_closes_transport_and_buffer_state() -> None:
-    transport = BlockingTransport()
+    blocker = Blocker()
+    transport = ResponderTransport(blocker)
     stream = fan_out(
         Executor(transport),
         [_reference("a")],
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
     )
+    hold = LedgerHold(stream._scheduler.context)  # noqa: SLF001 - repeated-cancel regression
     task = asyncio.create_task(anext(stream))
-    await transport.started.wait()
+    await blocker.started.wait()
 
-    await stream._scheduler.context._lock.acquire()  # noqa: SLF001 - repeated-cancel regression
+    hold.acquire()
     task.cancel()
-    for _ in range(5):
-        await asyncio.sleep(0)
+    await hold.blocked.wait()
     task.cancel()
-    stream._scheduler.context._lock.release()  # noqa: SLF001 - repeated-cancel regression
+    hold.release()
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
 
-    assert captured.value.__dict__["report"] is stream.report
-    assert transport.cancelled.is_set()
+    assert attached_report(captured.value) is stream.report
+    assert blocker.cancelled.is_set()
     assert stream.report.state is KernelState.CANCELLED
     assert (await stream._scheduler.context.snapshot()).counters.buffered_rows == 0  # noqa: SLF001
 
 
 @pytest.mark.asyncio
 async def test_reference_cancellation_during_failed_finalization_preserves_failure_report() -> None:
-    locked = asyncio.Event()
     loop = asyncio.get_running_loop()
     loop_contexts: list[dict[str, object]] = []
     previous_handler = loop.get_exception_handler()
@@ -1343,24 +1302,23 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
 
     class FailingSource:
         def __init__(self) -> None:
-            self.context: ExecutionContext | None = None
+            self.hold: LedgerHold | None = None
 
         def __aiter__(self) -> FailingSource:
             return self
 
         async def __anext__(self) -> ReferenceRequest:
-            assert self.context is not None
-            await self.context._lock.acquire()  # noqa: SLF001 - deterministic finalize-race regression
-            locked.set()
+            assert self.hold is not None
+            self.hold.acquire()
             raise RuntimeError("reference source failed")
 
     source = FailingSource()
     stream = fan_out(
-        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         source,
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
     )
-    source.context = stream._scheduler.context  # noqa: SLF001 - deterministic finalize-race regression
+    hold = source.hold = LedgerHold(stream._scheduler.context)  # noqa: SLF001 - deterministic finalize-race regression
     primary: list[RuntimeError] = []
     cancelling_seen: list[int] = []
     post_failure_executed = False
@@ -1379,12 +1337,9 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
 
     task = asyncio.create_task(observe_replayed_cancellation())
     try:
-        await locked.wait()
-        for _ in range(50):
-            await asyncio.sleep(0)
+        await hold.blocked.wait()
         task.cancel()
-        assert source.context is not None
-        source.context._lock.release()  # noqa: SLF001 - deterministic finalize-race regression
+        hold.release()
 
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -1393,7 +1348,7 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
         loop.set_exception_handler(previous_handler)
 
     assert "reference source failed" in str(primary[0])
-    assert primary[0].__dict__["report"] is stream.report
+    assert attached_report(primary[0]) is stream.report
     assert cancelling_seen == [1]
     assert post_failure_executed is False
     assert stream.report.state is KernelState.FAILED
@@ -1402,20 +1357,21 @@ async def test_reference_cancellation_during_failed_finalization_preserves_failu
 
 @pytest.mark.asyncio
 async def test_batch_reference_cancellation_interrupts_inflight_batch_request() -> None:
-    transport = BlockingTransport()
+    blocker = Blocker()
+    transport = ResponderTransport(blocker)
     stream = fan_out(
         Executor(transport),
         [_reference("a")],
-        dispatch=BatchDispatch(),
+        dispatch=KernelBatchDispatch(),
     )
     task = asyncio.create_task(anext(stream))
-    await transport.started.wait()
+    await blocker.started.wait()
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=1)
 
-    assert transport.cancelled.is_set()
+    assert blocker.cancelled.is_set()
     assert stream.report.state is KernelState.CANCELLED
 
 
@@ -1446,7 +1402,7 @@ async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_
     stream = fan_out(
         Executor(CancellationResistantTransport()),
         [_reference("a")],
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         policy=ExecutionPolicy(max_elapsed=0.03),
     )
     task = asyncio.create_task(anext(stream))
@@ -1468,7 +1424,7 @@ async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_
         await asyncio.gather(safety, return_exceptions=True)
     assert asyncio.get_running_loop().time() - started_at < CLEANUP_TEST_TIMEOUT
     frozen_report = stream.report
-    assert captured.value.__dict__["report"] is frozen_report
+    assert attached_report(captured.value) is frozen_report
     assert frozen_report.logical_pages == 0
 
     await asyncio.wait_for(returned.wait(), timeout=0.2)
@@ -1510,7 +1466,7 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
             ReferenceRequest(Request("bad", route=RouteKind.BARE), "bad"),
             ReferenceRequest(Request("slow", route=RouteKind.BARE), "slow"),
         ],
-        dispatch=DirectDispatch(concurrency=TWO_REFERENCES),
+        dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_elapsed=0.04),
     )
     try:
@@ -1519,7 +1475,7 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
     finally:
         release.set()
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert stream.report.terminal_reason == "ProtocolError"
     cleanup = [violation for violation in stream.report.violations if violation.code == "cleanup_failure"]
@@ -1559,7 +1515,7 @@ async def test_closed_batch_worker_exits_after_transport_temporarily_resists_can
     stream = fan_out(
         Executor(CancellationResistantTransport()),
         [_reference("a")],
-        dispatch=BatchDispatch(batch_size=1),
+        dispatch=KernelBatchDispatch(batch_size=1),
         policy=ExecutionPolicy(max_elapsed=0.05),
     )
     task = asyncio.create_task(anext(stream))
@@ -1568,10 +1524,10 @@ async def test_closed_batch_worker_exits_after_transport_temporarily_resists_can
 
     with pytest.raises(BudgetExceededError) as captured:
         await asyncio.wait_for(task, timeout=0.2)
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
 
     dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
-    worker = dispatcher._worker  # type: ignore[union-attr]  # noqa: SLF001
+    worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001
     assert worker is not None
     assert not worker.done()
     release.set()
@@ -1608,21 +1564,21 @@ async def test_source_close_failure_does_not_skip_owned_resource_cleanup() -> No
             },
         }
 
-    transport = AsyncFunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = fan_out(
         Executor(transport),
         RaisingCloseSource(),
-        dispatch=BatchDispatch(batch_size=1),
+        dispatch=KernelBatchDispatch(batch_size=1),
         policy=ExecutionPolicy(max_active_references=1),
     )
 
-    assert isinstance(await anext(stream), ReferenceItem)
+    assert isinstance(await anext(stream), KernelReferenceItem)
     with pytest.raises(RuntimeError, match="source cleanup failed") as captured:
         await stream.aclose()
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
-    worker = dispatcher._worker  # type: ignore[union-attr]  # noqa: SLF001
+    worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001
     assert worker is not None
     assert worker.done()
     assert stream._scheduler.buffer._closed  # noqa: SLF001
@@ -1651,14 +1607,14 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
             raise RuntimeError("reference close boom")
 
     stream = fan_out(
-        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         RaisingCloseSource(),
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         policy=ExecutionPolicy(max_active_references=1),
     )
-    assert isinstance(await anext(stream), ReferenceItem)
+    assert isinstance(await anext(stream), KernelReferenceItem)
     observed: list[tuple[str, object]] = []
-    independent_transport = AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})
+    independent_transport = ResponderTransport(lambda _request: {"result": {"ok": True}})
 
     async def consume() -> None:
         current = asyncio.current_task()
@@ -1682,7 +1638,12 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
     assert observed == [("reference close boom", 1), ("external-caller", 1)]
     assert independent_transport.requests == []
     assert stream.report.state is KernelState.FAILED
-    assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
+    # The source close failure and the caller cancellation that arrived during cleanup are both
+    # secondary to the raised failure, as in every stream family (§3.1).
+    assert [violation.message for violation in stream.report.violations] == [
+        "reference cleanup also failed (RuntimeError)",
+        "reference cleanup also failed (CancelledError)",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1714,19 +1675,19 @@ async def test_stalled_source_cleanup_is_bounded_after_owned_resources_close() -
         }
 
     stream = fan_out(
-        Executor(AsyncFunctionTransport(handler)),
+        Executor(ResponderTransport(handler)),
         StalledCloseSource(),
-        dispatch=BatchDispatch(batch_size=1),
+        dispatch=KernelBatchDispatch(batch_size=1),
         policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.05),
     )
 
-    assert isinstance(await anext(stream), ReferenceItem)
+    assert isinstance(await anext(stream), KernelReferenceItem)
     with pytest.raises(BudgetExceededError, match="source cleanup") as captured:
         await asyncio.wait_for(stream.aclose(), timeout=0.2)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
-    worker = dispatcher._worker  # type: ignore[union-attr]  # noqa: SLF001
+    worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001
     assert worker is not None
     assert worker.done()
     assert stream._scheduler.buffer._closed  # noqa: SLF001
@@ -1755,36 +1716,118 @@ async def test_blocking_sync_source_close_does_not_block_event_loop_or_cleanup_d
             close_finished.set()
 
     stream = fan_out(
-        Executor(AsyncFunctionTransport(lambda _request: {"result": {"ok": True}})),
+        Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         BlockingCloseIterator(),
-        dispatch=DirectDispatch(),
+        dispatch=KernelDirectDispatch(),
         policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.05),
     )
 
-    assert isinstance(await anext(stream), ReferenceItem)
+    assert isinstance(await anext(stream), KernelReferenceItem)
     started = asyncio.get_running_loop().time()
     with pytest.raises(BudgetExceededError, match="source cleanup") as captured:
         await asyncio.wait_for(stream.aclose(), timeout=0.2)
     elapsed = asyncio.get_running_loop().time() - started
 
     assert elapsed < CLEANUP_TEST_TIMEOUT
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream._scheduler.buffer._closed  # noqa: SLF001
     release_close.set()
     assert await asyncio.to_thread(close_finished.wait, 0.2)
 
 
 def test_batch_reference_stream_construction_is_lazy_outside_an_event_loop() -> None:
-    transport = AsyncFunctionTransport(lambda _request: {"result": {"result": [], "result_error": []}})
+    transport = ResponderTransport(lambda _request: {"result": {"result": [], "result_error": []}})
     stream = fan_out(
         Executor(transport),
         [_reference("a")],
-        dispatch=BatchDispatch(),
+        dispatch=KernelBatchDispatch(),
     )
 
     assert transport.requests == []
     assert stream.report.state is KernelState.NOT_STARTED
 
 
-async def _collect(stream: object) -> list[ReferenceItem | ReferenceFailure]:
+async def _collect(stream: object) -> list[KernelReferenceItem | KernelReferenceFailure]:
     return [outcome async for outcome in stream]  # type: ignore[attr-defined]
+
+
+class _ClosableReferences:
+    """An iterable whose iterator counts pulls and closes and yields nothing until pulled."""
+
+    def __init__(self) -> None:
+        self.pulls = 0
+        self.closes = 0
+
+    def __iter__(self) -> _ClosableReferences:
+        return self
+
+    def __next__(self) -> ReferenceRequest:
+        self.pulls += 1
+        raise StopIteration
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+class _AsyncClosableReferences:
+    """The asynchronous counterpart, whose ``aclose`` can fail."""
+
+    def __init__(self, *, close_fails: bool = False) -> None:
+        self.pulls = 0
+        self.closes = 0
+        self.close_fails = close_fails
+
+    def __aiter__(self) -> _AsyncClosableReferences:
+        return self
+
+    async def __anext__(self) -> ReferenceRequest:
+        self.pulls += 1
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closes += 1
+        if self.close_fails:
+            raise RuntimeError("reference source close failed")
+
+
+@pytest.mark.asyncio
+async def test_close_before_the_first_pull_closes_the_opened_sync_source_once() -> None:
+    transport = ResponderTransport(lambda _request: {"result": []})
+    source = _ClosableReferences()
+    stream = fan_out(Executor(transport), source, dispatch=KernelDirectDispatch())
+
+    await stream.aclose()
+    await stream.aclose()
+
+    assert (source.pulls, source.closes) == (0, 1)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_close_before_the_first_pull_closes_the_opened_async_source_once() -> None:
+    source = _AsyncClosableReferences()
+    stream = fan_out(
+        Executor(ResponderTransport(lambda _request: {"result": []})), source, dispatch=KernelDirectDispatch()
+    )
+
+    await stream.aclose()
+    await stream.aclose()
+
+    assert (source.pulls, source.closes) == (0, 1)
+
+
+@pytest.mark.asyncio
+async def test_failing_source_close_before_the_first_pull_is_a_cleanup_failure() -> None:
+    source = _AsyncClosableReferences(close_fails=True)
+    stream = fan_out(
+        Executor(ResponderTransport(lambda _request: {"result": []})), source, dispatch=KernelDirectDispatch()
+    )
+
+    with pytest.raises(RuntimeError, match="reference source close failed"):
+        await stream.aclose()
+
+    assert source.closes == 1
+    # The kernel never started, so its report stays NOT_STARTED: the public adapter aborts the unstarted
+    # completion gate and records the cleanup failure (tests/stream_lifecycle_test.py).
+    assert stream.report is not None
+    assert stream.report.state is KernelState.NOT_STARTED

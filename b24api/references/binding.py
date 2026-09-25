@@ -1,18 +1,16 @@
 """Lazy exact binding of caller context to method-agnostic requests."""
 
-# ruff: noqa: TRY301 - iterator adapters normalize source failures
-
 from __future__ import annotations
-from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Iterator
+from collections.abc import AsyncIterable, Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, Self, cast, runtime_checkable
+from typing import TYPE_CHECKING, cast
 
+from b24api._sources import OwnedSource
 from b24api.contracts.command import NotExecutedReason
 from b24api.contracts.json import _freeze_json
 from b24api.contracts.reference import Binding
 from b24api.contracts.traversal import CursorTraversal, TraversalSpec, traversal_control_paths
-from b24api.contracts.violation import retain_violations
-from b24api.errors import CapabilityError, PaginationError
+from b24api.errors import CapabilityError, InputSourceError, PaginationError
 from b24api.references.outcome import ReferenceRequest
 from b24api.traversal.cursor_domain import validate_cursor_value
 from b24api.traversal.identity import _request_with_controls
@@ -26,20 +24,6 @@ if TYPE_CHECKING:
 type BindingSource[C] = Iterable[Binding[C]] | AsyncIterable[Binding[C]]
 
 
-@runtime_checkable
-class _SyncClosable(Protocol):
-    def close(self) -> None:
-        """Close a synchronous iterator."""
-        ...
-
-
-@runtime_checkable
-class _AsyncClosable(Protocol):
-    async def aclose(self) -> None:
-        """Close an asynchronous iterator."""
-        ...
-
-
 @dataclass(frozen=True, slots=True)
 class _BindingContext:
     index: int
@@ -47,7 +31,11 @@ class _BindingContext:
 
 
 class _BindingSourceError(Exception):
-    pass
+    """Carry a failed binding source; reports name the public failure it maps to (``report_cause``)."""
+
+    def __init__(self) -> None:
+        super().__init__("reference input source failed")
+        self.report_cause = InputSourceError("Reference input source failed")
 
 
 class _BindingLocalValidationError(ValueError):
@@ -115,7 +103,7 @@ def _bind_request(base: Request, binding: Binding[object], index: int, traversal
         initial_cursor = None
         if binding.start_cursor is not None:
             if not isinstance(traversal, CursorTraversal):
-                raise ValueError("start_cursor is valid only for CursorTraversal")
+                raise ValueError("start_cursor is valid only for CursorTraversal")  # noqa: TRY301 - joins the local-validation mapping below
             initial_cursor = _coerce_identity(_freeze_json(binding.start_cursor), traversal.cursor.coercion)
             validate_cursor_value(initial_cursor, traversal.cursor.domain)
             request = _request_with_controls(
@@ -144,104 +132,29 @@ def _local_validation_failure(base: Request, binding: Binding[object], index: in
     )
 
 
-class _SyncBindingAdapter[C](Iterator[ReferenceRequest]):
-    def __init__(
-        self,
-        base: Request,
-        source: Iterable[Binding[C]],
-        traversal: TraversalSpec,
-        audit: Callable[[Request], Violation | None] | None,
-    ) -> None:
-        self._base = base
-        self._iterator = iter(source)
-        self._traversal = traversal
-        self._audit = audit
-        self._index = 0
-        self.violations: list[Violation] = []
-
-    def __iter__(self) -> Self:
-        return self
-
-    def __next__(self) -> ReferenceRequest:
-        try:
-            binding = next(self._iterator)
-            if not isinstance(binding, Binding):
-                raise TypeError("reference source must yield Binding values")
-            canonical = cast("Binding[object]", binding)
-            try:
-                request = _bind_request(self._base, canonical, self._index, self._traversal)
-            except _BindingLocalValidationError:
-                request = _local_validation_failure(self._base, canonical, self._index)
-        except StopIteration:
-            raise
-        except Exception as error:
-            raise _BindingSourceError from error
-        if self._audit is not None:
-            violation = self._audit(request.request)
-            if violation is not None:
-                self.violations = list(retain_violations((*self.violations, violation)))
-        self._index += 1
-        return request
-
-    def close(self) -> None:
-        if isinstance(self._iterator, _SyncClosable):
-            self._iterator.close()
-
-
-class _AsyncBindingAdapter[C](AsyncIterator[ReferenceRequest]):
-    def __init__(
-        self,
-        base: Request,
-        source: AsyncIterable[Binding[C]],
-        traversal: TraversalSpec,
-        audit: Callable[[Request], Violation | None] | None,
-    ) -> None:
-        self._base = base
-        self._iterator = aiter(source)
-        self._traversal = traversal
-        self._audit = audit
-        self._index = 0
-        self.violations: list[Violation] = []
-
-    def __aiter__(self) -> Self:
-        return self
-
-    async def __anext__(self) -> ReferenceRequest:
-        try:
-            binding = await anext(self._iterator)
-            if not isinstance(binding, Binding):
-                raise TypeError("reference source must yield Binding values")
-            canonical = cast("Binding[object]", binding)
-            try:
-                request = _bind_request(self._base, canonical, self._index, self._traversal)
-            except _BindingLocalValidationError:
-                request = _local_validation_failure(self._base, canonical, self._index)
-        except StopAsyncIteration:
-            raise
-        except Exception as error:
-            raise _BindingSourceError from error
-        if self._audit is not None:
-            violation = self._audit(request.request)
-            if violation is not None:
-                self.violations = list(retain_violations((*self.violations, violation)))
-        self._index += 1
-        return request
-
-    async def aclose(self) -> None:
-        if isinstance(self._iterator, _AsyncClosable):
-            await self._iterator.aclose()
-
-
 def binding_source[C](
     base: Request,
     source: BindingSource[C],
     traversal: TraversalSpec,
     audit: Callable[[Request], Violation | None] | None = None,
-) -> Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]:
+) -> OwnedSource[ReferenceRequest]:
     """Adapt a lazy binding source while preserving exact iterator ownership."""
-    if isinstance(source, AsyncIterable):
-        return _AsyncBindingAdapter(base, source, traversal, audit)
-    return _SyncBindingAdapter(base, source, traversal, audit)
+
+    def accept(binding: object, index: int) -> ReferenceRequest:
+        if not isinstance(binding, Binding):
+            raise TypeError("reference source must yield Binding values")
+        canonical = cast("Binding[object]", binding)
+        try:
+            return _bind_request(base, canonical, index, traversal)
+        except _BindingLocalValidationError:
+            return _local_validation_failure(base, canonical, index)
+
+    return OwnedSource.adapt(
+        source,
+        accept=accept,
+        observe=None if audit is None else (lambda reference: audit(reference.request)),
+        failure=lambda _error: _BindingSourceError(),
+    )
 
 
 __all__ = ["BindingSource", "binding_source"]

@@ -1,14 +1,12 @@
 """Exclusive positive cursor controls must not silently restart at the head."""
 
 from __future__ import annotations
-import json
+from typing import TYPE_CHECKING
 
 import pytest
 
 from b24api import (
-    Bitrix24,
     CapabilityError,
-    CursorDomain,
     CursorSpec,
     IdentityCoercion,
     IncompleteTraversalError,
@@ -17,29 +15,26 @@ from b24api import (
     ResultSelector,
     RouteKind,
 )
-from b24api.execution import Executor, WireResponse
+from b24api.contracts import CursorDomain
+from tests.scripting import ResponderTransport
+
+if TYPE_CHECKING:
+    from tests.scripting import ClientFactory
 
 
-class MessageTransport:
-    """LAST_ID strictly excludes IDs at or above a positive control."""
+def _messages(ids: tuple[int, ...] = (3, 2, 1)) -> ResponderTransport:
+    """LAST_ID strictly excludes IDs at or above a positive control; pages hold two rows."""
 
-    host = "fixture.invalid"
-
-    def __init__(self, ids: tuple[int, ...] = (3, 2, 1)) -> None:
-        """Retain all physical cursor controls."""
-        self.controls: list[int] = []
-        self.ids = ids
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Return descending rows below the supplied exclusive boundary."""
-        assert attempt_timeout > 0
-        assert max_response_bytes > 0
-        parameters = request.copy_parameters()
-        control = parameters.get("LAST_ID", 10)
+    def respond(request: Request) -> object:
+        control = request.copy_parameters().get("LAST_ID", 10)
         assert isinstance(control, int)
-        self.controls.append(control)
-        rows = [{"id": value} for value in self.ids if value < control]
-        return WireResponse(200, (), json.dumps({"result": rows[:2]}).encode())
+        return {"result": [{"id": value} for value in ids if value < control][:2]}
+
+    return ResponderTransport(respond)
+
+
+def _controls(transport: ResponderTransport) -> list[object]:
+    return [parameters.get("LAST_ID", 10) for parameters in transport.parameters]
 
 
 def _cursor() -> CursorSpec:
@@ -54,9 +49,11 @@ def _cursor() -> CursorSpec:
 
 
 @pytest.mark.asyncio
-async def test_exclusive_cursor_allows_nonexistent_positive_boundary_and_one_empty() -> None:
-    transport = MessageTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_exclusive_cursor_allows_nonexistent_positive_boundary_and_one_empty(
+    scripted_client: ClientFactory,
+) -> None:
+    transport = _messages()
+    client = scripted_client(transport)
     stream = client.iter_list_cursor(
         Request("messages.get", {"LAST_ID": 10}, route=RouteKind.BARE),
         selector=ResultSelector.root(),
@@ -64,15 +61,15 @@ async def test_exclusive_cursor_allows_nonexistent_positive_boundary_and_one_emp
         page_size=2,
     )
     assert [row["id"] async for row in stream] == [3, 2, 1]
-    assert transport.controls == [10, 2, 1]
+    assert _controls(transport) == [10, 2, 1]
     assert stream.report is not None
     assert stream.report.exhausted
 
 
 @pytest.mark.asyncio
-async def test_exclusive_boundary_one_exhausts_the_range_below_one() -> None:
-    transport = MessageTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_exclusive_boundary_one_exhausts_the_range_below_one(scripted_client: ClientFactory) -> None:
+    transport = _messages()
+    client = scripted_client(transport)
     stream = client.iter_list_cursor(
         Request("messages.get", {"LAST_ID": 1}, route=RouteKind.BARE),
         selector=ResultSelector.root(),
@@ -80,15 +77,15 @@ async def test_exclusive_boundary_one_exhausts_the_range_below_one() -> None:
         page_size=2,
     )
     assert [row async for row in stream] == []
-    assert transport.controls == [1]
+    assert _controls(transport) == [1]
     assert stream.report is not None
     assert stream.report.exhausted
 
 
 @pytest.mark.asyncio
-async def test_server_emitted_zero_cursor_is_incomplete() -> None:
-    transport = MessageTransport((0,))
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_server_emitted_zero_cursor_is_incomplete(scripted_client: ClientFactory) -> None:
+    transport = _messages((0,))
+    client = scripted_client(transport)
     stream = client.iter_list_cursor(
         Request("messages.get", {"LAST_ID": 1}, route=RouteKind.BARE),
         selector=ResultSelector.root(),
@@ -97,14 +94,16 @@ async def test_server_emitted_zero_cursor_is_incomplete() -> None:
     )
     with pytest.raises(IncompleteTraversalError):
         _ = [row async for row in stream]
-    assert transport.controls == [1]
+    assert _controls(transport) == [1]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ignored", [0, None, -1, "bad"])
-async def test_ignored_or_invalid_initial_cursor_rejects_before_io(ignored: object) -> None:
-    transport = MessageTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_ignored_or_invalid_initial_cursor_rejects_before_io(
+    ignored: object, scripted_client: ClientFactory
+) -> None:
+    transport = _messages()
+    client = scripted_client(transport)
     stream = client.iter_list_cursor(
         Request("messages.get", {"LAST_ID": ignored}, route=RouteKind.BARE),
         selector=ResultSelector.root(),
@@ -113,4 +112,4 @@ async def test_ignored_or_invalid_initial_cursor_rejects_before_io(ignored: obje
     )
     with pytest.raises(CapabilityError, match="exclusive range cursor"):
         _ = [row async for row in stream]
-    assert transport.controls == []
+    assert _controls(transport) == []

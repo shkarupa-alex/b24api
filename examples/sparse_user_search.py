@@ -18,17 +18,14 @@ from b24api import (
     Bitrix24,
     OffsetContinuation,
     OffsetSpec,
-    PageStride,
-    RawTotalSource,
     ReplaySafety,
     Request,
-    ResultCollectionShape,
     ResultSelector,
     RouteKind,
     Settings,
-    SparseRawBound,
     TraversalAssurance,
 )
+from b24api.contracts import PageStride, RawTotalSource, ResultCollectionShape, SparseRawBound
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 

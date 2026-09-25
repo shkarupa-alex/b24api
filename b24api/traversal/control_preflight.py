@@ -4,26 +4,39 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from b24api.errors import CapabilityError
+from b24api.traversal import offset_rules
 from b24api.traversal.cursor_domain import cursor_controls_replace, cursor_probe_updates
-from b24api.traversal.identity import _child_path, _initial_offset, _request_with_controls
-from b24api.traversal.plans import CountedOffsetPlan, ItemCursorPlan, KeysetPlan, OffsetSequentialPlan
+from b24api.traversal.identity import _child_path, _request_with_controls
+from b24api.traversal.plans import (
+    CountedOffsetPlan,
+    ItemCursorPlan,
+    KeysetPlan,
+    OffsetSequentialPlan,
+    OffsetTerminalRule,
+)
 
 if TYPE_CHECKING:
     from b24api.contracts.request import ParameterPath
-    from b24api.traversal.driver import PaginationDriver
+    from b24api.traversal.strategy_context import StrategyContext
 
 
-def _aligned_initial_offset(driver: PaginationDriver, plan: OffsetSequentialPlan) -> int:
+def _aligned_initial_offset(driver: StrategyContext, plan: OffsetSequentialPlan) -> int:
     """Return the first wire offset, refusing one a rounding server would move to another window."""
-    initial_offset = _initial_offset(driver.request, plan.offset_path, default=plan.initial_control)
+    initial_offset = offset_rules.initial_offset(driver.request, plan.offset_path, default=plan.initial_control)
     stride = plan.page_stride or (plan.sparse_raw_bound.stride if plan.sparse_raw_bound is not None else None)
     if stride is not None and initial_offset % stride.server_granularity:
         # The server would silently serve the floor window, repeating or skipping raw rows.
         raise CapabilityError("initial offset must align with the qualified server page granularity")
+    if initial_offset != plan.initial_control and OffsetTerminalRule.QUALIFIED_TOTAL in plan.terminal:
+        # The exact total counts the whole collection; a suffix never reaches it and would end incomplete.
+        raise CapabilityError(
+            "initial offset must equal the plan's initial control"
+            " when a caller-qualified exact total closes the collection"
+        )
     return initial_offset
 
 
-def preflight_controls(driver: PaginationDriver) -> None:
+def preflight_controls(driver: StrategyContext) -> None:
     """Validate first and successor wire controls against the caller request."""
     plan = driver.plan
     first: dict[ParameterPath, object] = {}
@@ -37,7 +50,7 @@ def preflight_controls(driver: PaginationDriver) -> None:
         first[plan.offset_path] = 0
         second[plan.offset_path] = 1
     elif isinstance(plan, KeysetPlan):
-        identity = driver._require_identity("keyset")  # noqa: SLF001 - plan-local preflight helper
+        identity = driver.require_identity("keyset")
         if plan.split_order is None:
             if plan.order_path is None:
                 raise RuntimeError("keyset plan lacks ordering controls")

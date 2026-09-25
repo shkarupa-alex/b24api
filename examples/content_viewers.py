@@ -10,17 +10,8 @@ Run: `uv run python -m examples.content_viewers`.
 from __future__ import annotations
 import asyncio
 
-from b24api import (
-    Bitrix24,
-    OffsetSpec,
-    PageIndex,
-    ParameterPath,
-    ReplaySafety,
-    Request,
-    ResultSelector,
-    RouteKind,
-    Settings,
-)
+from b24api import Bitrix24, OffsetSpec, ParameterPath, ReplaySafety, Request, ResultSelector, RouteKind, Settings
+from b24api.contracts import PageIndex
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 

@@ -11,7 +11,8 @@ from enum import StrEnum
 from functools import partial
 from types import MappingProxyType
 
-from b24api.contracts.request import Request, RouteKind
+from b24api.contracts.request import Request
+from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 from b24api.errors import ResponseTooLargeError
 from b24api.testing._isolation import (

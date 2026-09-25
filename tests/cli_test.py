@@ -13,13 +13,7 @@ from b24api import (
     AutoKeysetExecution,
     CursorSpec,
     IdentitySpec,
-    KeysetCapabilityCheckName,
-    KeysetCapabilityCheckOutcome,
-    KeysetCapabilityCheckResult,
     KeysetCapabilityError,
-    KeysetCapabilityReport,
-    KeysetCapabilityVerdict,
-    KeysetInconclusiveReason,
     KeysetSpec,
     OffsetSpec,
     OperationReport,
@@ -28,8 +22,6 @@ from b24api import (
     RangeKeysetExecution,
     ReplaySafety,
     Request,
-    Response,
-    ResultCollectionShape,
     ResultSelector,
     RouteKind,
     TerminalState,
@@ -43,7 +35,17 @@ from b24api.cli_contract import (
     parse_list_contract,
     parse_verify_keyset_contract,
 )
-from b24api.contracts import IdentityCoercion
+from b24api.contracts import (
+    IdentityCoercion,
+    KeysetCapabilityCheckName,
+    KeysetCapabilityCheckOutcome,
+    KeysetCapabilityCheckResult,
+    KeysetCapabilityReport,
+    KeysetCapabilityVerdict,
+    KeysetInconclusiveReason,
+    Response,
+    ResultCollectionShape,
+)
 from b24api.errors import CapabilityError, IncompleteTraversalError, ProtocolError
 
 if TYPE_CHECKING:

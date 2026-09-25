@@ -1,6 +1,7 @@
 """Positive controls for correlated terminal evidence and bounded state."""
 
 from __future__ import annotations
+import dataclasses
 
 import pytest
 
@@ -45,7 +46,6 @@ def _page(gate: CompletionGate, *, acknowledged: bool = True, row_count: int = 2
             sequence=3,
             binding_id=0,
             page_id=0,
-            identity_digest="abc",
             row_count=row_count,
         )
     )
@@ -447,3 +447,13 @@ def test_completed_caller_stop_reports_bounded_prefix() -> None:
         TraversalAssurance.BOUNDED_PREFIX,
         False,
     )
+
+
+def test_page_validated_carries_no_identity_digest() -> None:
+    fields = {field.name for field in dataclasses.fields(PageValidated)}
+
+    assert "identity_digest" not in fields
+    with pytest.raises(TypeError):
+        PageValidated(  # type: ignore[call-arg]
+            operation_id="run", sequence=0, binding_id=0, page_id=0, identity_digest="abc", row_count=1
+        )

@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from b24api import CapabilityError, KeysetCapabilityVerdict, Request
+from b24api import CapabilityError, Request
+from b24api.contracts import KeysetCapabilityVerdict
 from b24api.execution import WireResponse
 from b24api.transport import TransportCapabilities, WireRequest
 from examples import task_comments

@@ -15,7 +15,7 @@ from b24api.batch.outcome import (
     BatchOutcome,
     BatchSuccess,
 )
-from b24api.batch.stream import _BatchOutcomeStream
+from b24api.batch.stream import _BatchOutcomeStream, batch_outcome_stream
 from b24api.contracts.policy import (
     ConsistencyPolicy,
     ExecutionPolicy,
@@ -34,9 +34,11 @@ from b24api.errors import (
     TransportError,
 )
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse
+from tests.ledger_hold import LedgerHold
+from tests.scripting import ResponderTransport, attached_report
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Iterator
+    from collections.abc import AsyncGenerator, Iterator
 
 TEST_BATCH_SIZE = 7
 TEST_COMMAND_COUNT = 23
@@ -47,27 +49,6 @@ EXPECTED_TOTAL = 3
 PULL_TEST_TIMEOUT = 0.15
 PARTIAL_COMMAND_COUNT = 2
 NESTED_ROW_COUNT = 2
-
-
-class CallbackTransport:
-    """Provide a deterministic test helper."""
-
-    host = "fixture.invalid"
-
-    def __init__(self, callback: Callable[[Request], WireResponse | Exception]) -> None:
-        """Initialize instance state."""
-        self.callback = callback
-        self.requests: list[Request] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Send one transport request attempt."""
-        assert attempt_timeout > 0
-        assert max_response_bytes > 0
-        self.requests.append(request)
-        outcome = self.callback(request)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
 
 
 def _batch_keys(request: Request) -> list[str]:
@@ -116,8 +97,9 @@ async def test_async_unlimited_input_pulls_only_one_bounded_chunk_before_first_y
             pulled += 1
             yield Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
 
-    transport = CallbackTransport(_echo_batch)
-    stream = BatchExecutor(Executor(transport))._outcomes(
+    transport = ResponderTransport(_echo_batch)
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(transport)),
         requests(),
         batch_size=TEST_BATCH_SIZE,
     )
@@ -132,8 +114,9 @@ async def test_async_unlimited_input_pulls_only_one_bounded_chunk_before_first_y
 
 @pytest.mark.asyncio
 async def test_non_bare_inner_command_is_correlated_rejection_before_batch_dispatch() -> None:
-    transport = CallbackTransport(_echo_batch)
-    stream = BatchExecutor(Executor(transport))._outcomes(
+    transport = ResponderTransport(_echo_batch)
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(transport)),
         [
             Request("im.v2.Chat.Message.CommentInfo.list", route=RouteKind.JSON),
             Request("profile", route=RouteKind.BARE),
@@ -152,8 +135,9 @@ async def test_non_bare_inner_command_is_correlated_rejection_before_batch_dispa
 
 @pytest.mark.asyncio
 async def test_fully_rejected_window_does_not_count_a_physical_batch_request() -> None:
-    transport = CallbackTransport(_echo_batch)
-    stream = BatchExecutor(Executor(transport))._outcomes(
+    transport = ResponderTransport(_echo_batch)
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(transport)),
         [Request("im.v2.Chat.Message.CommentInfo.list", route=RouteKind.JSON)],
     )
 
@@ -172,7 +156,7 @@ async def test_batch_method_limit_observes_only_failing_command_without_replay()
         keys = _batch_keys(request)
         return _wire_batch(keys, errors={keys[0]: {"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}})
 
-    transport = CallbackTransport(callback)
+    transport = ResponderTransport(callback)
     coordinator = RateCoordinator(operation_time_limit_delay=0.1)
     executor = BatchExecutor(Executor(transport, coordinator=coordinator))
     context = executor.executor.context(_one_attempt_policy())
@@ -193,8 +177,9 @@ async def test_batch_method_limit_observes_only_failing_command_without_replay()
 
 @pytest.mark.asyncio
 async def test_batch_outcomes_obey_decoded_row_buffer_ceiling() -> None:
-    transport = CallbackTransport(_echo_batch)
-    stream = BatchExecutor(Executor(transport))._outcomes(
+    transport = ResponderTransport(_echo_batch)
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(transport)),
         [Request("profile", route=RouteKind.BARE) for _index in range(MIXED_COMMAND_COUNT)],
         batch_size=MIXED_COMMAND_COUNT,
         policy=ExecutionPolicy(max_buffered_rows=1),
@@ -230,19 +215,21 @@ async def test_batch_list_result_uses_nested_decoded_row_weight() -> None:
         ).encode()
         return WireResponse(200, (("content-type", "application/json"),), body)
 
-    rejected = BatchExecutor(Executor(CallbackTransport(list_result)))._outcomes(
+    rejected = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(list_result))),
         [Request("profile", route=RouteKind.BARE)],
         batch_size=1,
         policy=ExecutionPolicy(max_buffered_rows=1),
     )
     with pytest.raises(BudgetExceededError, match="buffer") as captured:
         await anext(rejected)
-    assert captured.value.__dict__["report"] is rejected.report
+    assert attached_report(captured.value) is rejected.report
     assert rejected.report.state is KernelState.FAILED
     assert rejected.report.emitted_rows == 0
     assert rejected.report.buffered_rows_high_water == 0
 
-    admitted = BatchExecutor(Executor(CallbackTransport(list_result)))._outcomes(
+    admitted = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(list_result))),
         [Request("profile", route=RouteKind.BARE)],
         batch_size=1,
         policy=ExecutionPolicy(max_buffered_rows=NESTED_ROW_COUNT),
@@ -257,14 +244,16 @@ async def test_batch_list_result_uses_nested_decoded_row_weight() -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_entry_starts_batch_execution_without_counting_prefetch_as_emitted() -> None:
-    transport = CallbackTransport(_echo_batch)
-    stream = BatchExecutor(Executor(transport))._outcomes([Request("profile", route=RouteKind.BARE)], batch_size=1)
+async def test_context_entry_reads_nothing_and_an_unstarted_close_reports_nothing() -> None:
+    transport = ResponderTransport(_echo_batch)
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(transport)), [Request("profile", route=RouteKind.BARE)], batch_size=1
+    )
 
     async with stream:
-        assert len(transport.requests) == 1
+        assert transport.requests == []
 
-    assert stream.report.state is KernelState.CANCELLED
+    assert stream.report.state is KernelState.NOT_STARTED
     assert stream.report.emitted_rows == 0
 
 
@@ -277,13 +266,13 @@ async def test_batch_source_cleanup_error_carries_same_report() -> None:
         finally:
             raise RuntimeError("batch source close boom")
 
-    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(source(), batch_size=1)
+    stream = batch_outcome_stream(BatchExecutor(Executor(ResponderTransport(_echo_batch))), source(), batch_size=1)
     assert isinstance(await anext(stream), BatchSuccess)
 
     with pytest.raises(RuntimeError, match="batch source close boom") as captured:
         await stream.aclose()
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
 
@@ -301,7 +290,7 @@ async def test_primary_batch_failure_survives_secondary_source_cleanup_failure()
         body = json.dumps({"result": {"result": {}}}).encode()
         return WireResponse(200, (("content-type", "application/json"),), body)
 
-    stream = BatchExecutor(Executor(CallbackTransport(malformed)))._outcomes(source(), batch_size=1)
+    stream = batch_outcome_stream(BatchExecutor(Executor(ResponderTransport(malformed))), source(), batch_size=1)
     outcome = await anext(stream)
     assert isinstance(outcome, BatchFailure)
     assert isinstance(outcome.error, ProtocolError)
@@ -326,7 +315,8 @@ async def test_blocking_sync_batch_source_close_obeys_cleanup_deadline() -> None
             release_close.wait()
             close_finished.set()
 
-    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         BlockingCloseIterator(),
         batch_size=1,
         policy=ExecutionPolicy(max_elapsed=0.05),
@@ -336,7 +326,7 @@ async def test_blocking_sync_batch_source_close_obeys_cleanup_deadline() -> None
     with pytest.raises(BudgetExceededError, match="batch source cleanup") as captured:
         await asyncio.wait_for(stream.aclose(), timeout=0.2)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     release_close.set()
     assert await asyncio.to_thread(close_finished.wait, 0.2)
 
@@ -347,7 +337,8 @@ async def test_async_batch_input_pull_obeys_operation_elapsed_budget() -> None:
         yield Request("profile", route=RouteKind.BARE)
         await asyncio.Future[None]()
 
-    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         source(),
         batch_size=1,
         policy=ExecutionPolicy(max_elapsed=0.03),
@@ -357,7 +348,7 @@ async def test_async_batch_input_pull_obeys_operation_elapsed_budget() -> None:
     with pytest.raises(BudgetExceededError, match="batch input") as captured:
         await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
 
 
@@ -377,7 +368,8 @@ async def test_cancellation_resistant_batch_pull_is_closed_after_late_completion
         finally:
             closed.set()
 
-    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         source(),
         batch_size=1,
         policy=ExecutionPolicy(max_elapsed=0.03),
@@ -386,7 +378,7 @@ async def test_cancellation_resistant_batch_pull_is_closed_after_late_completion
     assert isinstance(await anext(stream), BatchSuccess)
     with pytest.raises(BudgetExceededError) as captured:
         await asyncio.wait_for(anext(stream), timeout=0.15)
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert not closed.is_set()
 
     release.set()
@@ -394,7 +386,7 @@ async def test_cancellation_resistant_batch_pull_is_closed_after_late_completion
 
 
 @pytest.mark.asyncio
-async def test_late_batch_source_cleanup_error_is_observed_by_subsequent_close() -> None:
+async def test_late_batch_source_cleanup_error_does_not_reopen_the_published_report() -> None:
     release = asyncio.Event()
     closed = asyncio.Event()
 
@@ -410,20 +402,24 @@ async def test_late_batch_source_cleanup_error_is_observed_by_subsequent_close()
             closed.set()
             raise RuntimeError("late batch close boom")
 
-    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         source(),
         batch_size=1,
         policy=ExecutionPolicy(max_elapsed=0.03),
     )
     assert isinstance(await anext(stream), BatchSuccess)
-    with pytest.raises(BudgetExceededError):
+    with pytest.raises(BudgetExceededError) as failed:
         await anext(stream)
+    report = stream.report
+    assert attached_report(failed.value) is report
 
     release.set()
     await asyncio.wait_for(closed.wait(), timeout=0.2)
-    with pytest.raises(RuntimeError, match="late batch close boom") as captured:
-        await stream.aclose()
-    assert captured.value.__dict__["report"] is stream.report
+    # The report was published once, after the bounded cleanup; a repeated close changes nothing (§3.1).
+    await stream.aclose()
+    assert stream.report is report
+    assert report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -448,7 +444,8 @@ async def test_blocking_sync_batch_pull_does_not_block_event_loop_or_deadline() 
         def close(self) -> None:
             closed.set()
 
-    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         BlockingPull(),
         batch_size=1,
         policy=ExecutionPolicy(max_elapsed=0.03),
@@ -471,8 +468,8 @@ async def test_partial_kernel_chunk_is_not_dispatched_before_source_error() -> N
         yield Request("b", route=RouteKind.BARE)
         raise RuntimeError("batch source boom")
 
-    transport = CallbackTransport(_echo_batch)
-    stream = BatchExecutor(Executor(transport))._outcomes(source(), batch_size=3)
+    transport = ResponderTransport(_echo_batch)
+    stream = batch_outcome_stream(BatchExecutor(Executor(transport)), source(), batch_size=3)
     outcomes: list[BatchOutcome] = []
 
     async def consume() -> None:
@@ -484,7 +481,7 @@ async def test_partial_kernel_chunk_is_not_dispatched_before_source_error() -> N
     with pytest.raises(RuntimeError, match="batch source boom") as captured:
         await consume()
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert outcomes == []
     assert transport.requests == []
     assert stream.report.emitted_rows == 0
@@ -513,7 +510,8 @@ async def test_batch_iteration_cancellation_propagates_source_cleanup_error() ->
         async def aclose(self) -> None:
             raise RuntimeError("batch close boom")
 
-    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         RaisingCloseSource(),
         batch_size=1,
     )
@@ -546,7 +544,8 @@ async def test_batch_iteration_cancellation_propagates_source_cleanup_error() ->
 
 @pytest.mark.asyncio
 async def test_batch_snapshot_policy_controls_terminal_state() -> None:
-    default_stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(
+    default_stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         [Request("profile", route=RouteKind.BARE)],
     )
     assert len([item async for item in default_stream]) == 1
@@ -556,7 +555,8 @@ async def test_batch_snapshot_policy_controls_terminal_state() -> None:
     stable_policy = ExecutionPolicy(
         consistency=ConsistencyPolicy(snapshot_requirement=SnapshotRequirement.FROZEN_MANIFEST),
     )
-    stable_stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(
+    stable_stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         [Request("profile", route=RouteKind.BARE)],
         policy=stable_policy,
     )
@@ -570,15 +570,13 @@ async def test_batch_snapshot_policy_controls_terminal_state() -> None:
 async def test_batch_cancellation_carries_same_terminal_report() -> None:
     started = asyncio.Event()
 
-    class BlockingTransport:
-        host = "fixture.invalid"
+    async def block(_request: Request) -> WireResponse:
+        started.set()
+        return await asyncio.Future[WireResponse]()
 
-        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-            del request, attempt_timeout, max_response_bytes
-            started.set()
-            return await asyncio.Future[WireResponse]()
-
-    stream = BatchExecutor(Executor(BlockingTransport()))._outcomes([Request("profile", route=RouteKind.BARE)])
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(block))), [Request("profile", route=RouteKind.BARE)]
+    )
     task = asyncio.create_task(anext(stream))
     await started.wait()
     task.cancel()
@@ -586,7 +584,7 @@ async def test_batch_cancellation_carries_same_terminal_report() -> None:
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.CANCELLED
 
 
@@ -608,7 +606,7 @@ async def test_shared_batch_page_reservations_roll_back_when_admission_is_cancel
         return await original_reserve(context, reference=reference)
 
     monkeypatch.setattr(ExecutionContext, "reserve_page", gated_reserve)
-    executor = Executor(CallbackTransport(_echo_batch))
+    executor = Executor(ResponderTransport(_echo_batch))
     policy = ExecutionPolicy()
     context = executor.context(policy)
     stream = _BatchOutcomeStream(
@@ -626,7 +624,7 @@ async def test_shared_batch_page_reservations_roll_back_when_admission_is_cancel
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.CANCELLED
     assert context._page_reservations == {}
 
@@ -635,50 +633,46 @@ async def test_shared_batch_page_reservations_roll_back_when_admission_is_cancel
 async def test_repeated_batch_cancellation_still_carries_final_report() -> None:
     started = asyncio.Event()
 
-    class BlockingTransport:
-        host = "fixture.invalid"
+    async def block(_request: Request) -> WireResponse:
+        started.set()
+        return await asyncio.Future[WireResponse]()
 
-        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-            del request, attempt_timeout, max_response_bytes
-            started.set()
-            return await asyncio.Future[WireResponse]()
-
-    stream = BatchExecutor(Executor(BlockingTransport()))._outcomes([Request("profile", route=RouteKind.BARE)])
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(block))), [Request("profile", route=RouteKind.BARE)]
+    )
+    hold = LedgerHold(stream._context)
     task = asyncio.create_task(anext(stream))
     await started.wait()
-    await stream._context._lock.acquire()
+    hold.acquire()
     task.cancel()
-    await asyncio.sleep(0)
+    await hold.blocked.wait()
     task.cancel()
-    stream._context._lock.release()
+    hold.release()
 
     with pytest.raises(asyncio.CancelledError) as captured:
         await task
 
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.CANCELLED
 
 
 @pytest.mark.asyncio
 async def test_batch_cancellation_during_failed_finalization_preserves_failure_report() -> None:
-    locked = asyncio.Event()
-
     class FailingSource:
         def __init__(self) -> None:
-            self.context: ExecutionContext | None = None
+            self.hold: LedgerHold | None = None
 
         def __aiter__(self) -> FailingSource:
             return self
 
         async def __anext__(self) -> Request:
-            assert self.context is not None
-            await self.context._lock.acquire()
-            locked.set()
+            assert self.hold is not None
+            self.hold.acquire()
             raise RuntimeError("batch source failed")
 
     source = FailingSource()
-    stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(source)
-    source.context = stream._context
+    stream = batch_outcome_stream(BatchExecutor(Executor(ResponderTransport(_echo_batch))), source)
+    hold = source.hold = LedgerHold(stream._context)
     primary: list[RuntimeError] = []
     post_failure_executed = False
 
@@ -692,25 +686,23 @@ async def test_batch_cancellation_during_failed_finalization_preserves_failure_r
         post_failure_executed = True
 
     task = asyncio.create_task(observe_replayed_cancellation())
-    await locked.wait()
-    for _ in range(10):
-        await asyncio.sleep(0)
+    await hold.blocked.wait()
     task.cancel()
-    assert source.context is not None
-    source.context._lock.release()
+    hold.release()
 
     with pytest.raises(asyncio.CancelledError):
         await task
 
     assert "batch source failed" in str(primary[0])
-    assert primary[0].__dict__["report"] is stream.report
+    assert attached_report(primary[0]) is stream.report
     assert post_failure_executed is False
     assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
 async def test_php_empty_error_array_is_valid_but_missing_or_nonempty_array_is_malformed() -> None:
-    valid = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(
+    valid = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         [Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)],
     )
     assert isinstance(await anext(valid), BatchSuccess)
@@ -718,7 +710,8 @@ async def test_php_empty_error_array_is_valid_but_missing_or_nonempty_array_is_m
     def missing(request: Request) -> WireResponse:
         return _wire_batch(_batch_keys(request), omit_error_key=True)
 
-    missing_stream = BatchExecutor(Executor(CallbackTransport(missing)))._outcomes(
+    missing_stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(missing))),
         [Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)],
     )
     missing_outcome = await anext(missing_stream)
@@ -728,7 +721,8 @@ async def test_php_empty_error_array_is_valid_but_missing_or_nonempty_array_is_m
     def malformed(request: Request) -> WireResponse:
         return _wire_batch(_batch_keys(request), errors=[{"error": "bad"}])
 
-    malformed_stream = BatchExecutor(Executor(CallbackTransport(malformed)))._outcomes(
+    malformed_stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(malformed))),
         [Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)],
     )
     malformed_outcome = await anext(malformed_stream)
@@ -747,7 +741,7 @@ async def test_php_empty_result_array_preserves_all_command_errors() -> None:
         )
 
     requests = [Request("entity.get", {"id": index}, ReplaySafety.SAFE, route=RouteKind.BARE) for index in range(3)]
-    tolerant = BatchExecutor(Executor(CallbackTransport(all_failed)))._outcomes(requests)
+    tolerant = batch_outcome_stream(BatchExecutor(Executor(ResponderTransport(all_failed))), requests)
     outcomes = cast("list[BatchOutcome]", [outcome async for outcome in tolerant])
 
     assert all(isinstance(outcome, BatchFailure) for outcome in outcomes)
@@ -772,7 +766,8 @@ async def test_default_batch_preserves_unknown_total_sentinel() -> None:
         ).encode()
         return WireResponse(200, (("content-type", "application/json"),), body)
 
-    stream = BatchExecutor(Executor(CallbackTransport(unknown_total)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(unknown_total))),
         [Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)],
     )
     outcome = await anext(stream)
@@ -792,7 +787,8 @@ async def test_tolerant_per_command_error_and_missing_result_each_get_one_outcom
             omit_result_keys=frozenset({keys[1], keys[2]}),
         )
 
-    stream = BatchExecutor(Executor(CallbackTransport(partial)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(partial))),
         [Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE) for _index in range(3)],
     )
     outcomes = cast("list[BatchOutcome]", [outcome async for outcome in stream])
@@ -818,7 +814,8 @@ async def test_chunk_transport_failure_synthesizes_every_unresolved_outcome() ->
     commands = [
         Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE) for _index in range(TEST_BATCH_SIZE)
     ]
-    stream = BatchExecutor(Executor(CallbackTransport(fail)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(fail))),
         commands,
         policy=_one_attempt_policy(),
     )
@@ -837,7 +834,8 @@ async def test_overflowed_batch_result_becomes_totally_correlated_protocol_failu
         body = ('{"result":{"result":{"' + key + '":1e400},"result_error":[]}}').encode()
         return WireResponse(status_code=HTTP_OK, headers=(("content-type", "application/json"),), body=body)
 
-    stream = BatchExecutor(Executor(CallbackTransport(overflowed)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(overflowed))),
         [Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)],
     )
     outcomes = cast("list[BatchOutcome]", [outcome async for outcome in stream])
@@ -852,10 +850,11 @@ async def test_overflowed_batch_result_becomes_totally_correlated_protocol_failu
 
 @pytest.mark.asyncio
 async def test_mixed_chunk_ambiguous_dispatch_is_not_replayed_and_keeps_total_correlation() -> None:
-    transport = CallbackTransport(
+    transport = ResponderTransport(
         lambda _request: TransportError("reset", phase=FailurePhase.DISPATCH_STARTED),
     )
-    stream = BatchExecutor(Executor(transport))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(transport)),
         [
             Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             Request("crm.deal.add", replay_safety=ReplaySafety.UNSAFE, route=RouteKind.BARE),
@@ -880,8 +879,8 @@ async def test_batch_defensively_rejects_a_route_suffixed_inner_method_without_i
     def unexpected(_request: Request) -> WireResponse:
         raise AssertionError("route-suffixed inner command reached transport")
 
-    transport = CallbackTransport(unexpected)
-    stream = BatchExecutor(Executor(transport))._outcomes([request])
+    transport = ResponderTransport(unexpected)
+    stream = batch_outcome_stream(BatchExecutor(Executor(transport)), [request])
     outcomes = cast("list[BatchOutcome]", [outcome async for outcome in stream])
 
     assert len(transport.requests) == 0
@@ -919,7 +918,8 @@ async def test_batch_success_preserves_validated_per_command_pagination_metadata
         ).encode()
         return WireResponse(status_code=HTTP_OK, headers=(), body=body)
 
-    stream = BatchExecutor(Executor(CallbackTransport(with_metadata)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(with_metadata))),
         [Request("profile", route=RouteKind.BARE)],
     )
     outcome = await anext(stream)
@@ -944,7 +944,8 @@ async def test_malformed_batch_pagination_metadata_is_correlated_failure() -> No
         ).encode()
         return WireResponse(status_code=HTTP_OK, headers=(), body=body)
 
-    stream = BatchExecutor(Executor(CallbackTransport(malformed_metadata)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(malformed_metadata))),
         [Request("profile", route=RouteKind.BARE)],
     )
     outcome = await anext(stream)
@@ -965,7 +966,8 @@ async def test_public_batch_preserves_tolerant_unknown_or_duplicate_correlation_
             body = ('{"result":{"result":{"' + key + '":{},"' + key + '":{}},"result_error":[]}}').encode()
         return WireResponse(status_code=HTTP_OK, headers=(), body=body)
 
-    stream = BatchExecutor(Executor(CallbackTransport(malformed_correlation)))._outcomes(
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(malformed_correlation))),
         [Request("profile", route=RouteKind.BARE)],
     )
     outcome = await anext(stream)
@@ -994,23 +996,27 @@ async def test_early_close_closes_original_sync_and_async_sources() -> None:
         finally:
             async_closed = True
 
-    sync_stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(sync_source(), batch_size=1)
+    sync_stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))), sync_source(), batch_size=1
+    )
     await anext(sync_stream)
     await sync_stream.aclose()
     assert sync_closed is True
 
-    async_stream = BatchExecutor(Executor(CallbackTransport(_echo_batch)))._outcomes(async_source(), batch_size=1)
+    async_stream = batch_outcome_stream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))), async_source(), batch_size=1
+    )
     await anext(async_stream)
     await async_stream.aclose()
     assert async_closed is True
 
 
 def test_physical_batch_size_and_non_request_input_fail_before_io() -> None:
-    transport = CallbackTransport(_echo_batch)
+    transport = ResponderTransport(_echo_batch)
     batch = BatchExecutor(Executor(transport))
     with pytest.raises(ValueError, match="batch_size"):
-        batch._outcomes([], batch_size=0)
-    stream = batch._outcomes([{"method": "profile", "extra": True}])
+        batch_outcome_stream(batch, [], batch_size=0)
+    stream = batch_outcome_stream(batch, [{"method": "profile", "extra": True}])
 
     async def consume() -> None:
         await anext(stream)
@@ -1018,3 +1024,41 @@ def test_physical_batch_size_and_non_request_input_fail_before_io() -> None:
     with pytest.raises(TypeError, match="must yield Request"):
         asyncio.run(consume())
     assert not transport.requests
+
+
+class _ClosableRequests:
+    """A request iterator that counts pulls and closes; its close can fail."""
+
+    def __init__(self, *, close_fails: bool = False) -> None:
+        self.pulls = 0
+        self.closes = 0
+        self.close_fails = close_fails
+
+    def __aiter__(self) -> _ClosableRequests:
+        return self
+
+    async def __anext__(self) -> Request:
+        self.pulls += 1
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closes += 1
+        if self.close_fails:
+            raise RuntimeError("request source close failed")
+
+
+@pytest.mark.asyncio
+async def test_internal_outcome_stream_closed_before_the_first_pull_closes_its_source_once() -> None:
+    source, failing = _ClosableRequests(), _ClosableRequests(close_fails=True)
+    transport = ResponderTransport(_echo_batch)
+
+    stream = batch_outcome_stream(BatchExecutor(Executor(transport)), source)
+    await stream.aclose()
+    await stream.aclose()
+    failing_stream = batch_outcome_stream(BatchExecutor(Executor(transport)), failing)
+    with pytest.raises(RuntimeError, match="request source close failed"):
+        await failing_stream.aclose()
+
+    assert (source.pulls, source.closes) == (0, 1)
+    assert (failing.pulls, failing.closes) == (0, 1)
+    assert transport.requests == []

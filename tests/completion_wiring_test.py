@@ -1,11 +1,11 @@
 """Public traversal proves live gate events are emitted around physical dispatch."""
 
 from __future__ import annotations
-import json
+from typing import TYPE_CHECKING
 
 import pytest
 
-from b24api import Bitrix24, Request, RouteKind, TerminalState
+from b24api import Request, RouteKind, TerminalState
 from b24api.completion import CompletionGate
 from b24api.completion.recorder import CompletionRecorder, CountedCompletionRecorder
 from b24api.contracts.completion import (
@@ -23,49 +23,43 @@ from b24api.contracts.completion import (
     StreamTerminal,
 )
 from b24api.contracts.policy import KernelState
-from b24api.execution import Executor, WireResponse
+from tests.scripting import ResponderTransport
+
+if TYPE_CHECKING:
+    from tests.scripting import ClientFactory
 
 RESERVED_PAGE_COUNT = 3
 
 
-class GateProbeTransport:
-    """Assert scheduling evidence exists before each physical send."""
+def _gate_probe(events: list[type[object]]) -> ResponderTransport:
+    """Assert scheduling evidence exists before each physical send; one full page, then an empty one."""
 
-    host = "fixture.invalid"
-
-    def __init__(self) -> None:
-        """Capture the observer installed after stream construction."""
-        self.events: list[type[object]] = []
-        self.calls = 0
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Return one full page and one empty confirmation."""
+    def respond(request: Request) -> object:
         assert request.method == "item.list"
-        assert attempt_timeout > 0
-        assert max_response_bytes > 0
-        assert self.events[-1] is PageScheduled
-        self.calls += 1
-        rows = [{"id": 1}, {"id": 2}] if self.calls == 1 else []
-        payload = {"result": rows, "next": 2 if rows else None}
-        return WireResponse(200, (), json.dumps(payload).encode())
+        assert events[-1] is PageScheduled
+        rows = [{"id": 1}, {"id": 2}] if events.count(PageScheduled) == 1 else []
+        return {"result": rows, "next": 2 if rows else None}
+
+    return ResponderTransport(respond)
 
 
 @pytest.mark.asyncio
-async def test_public_offset_traversal_emits_ordered_page_and_cleanup_evidence() -> None:
-    transport = GateProbeTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+async def test_public_offset_traversal_emits_ordered_page_and_cleanup_evidence(scripted_client: ClientFactory) -> None:
+    events: list[type[object]] = []
+    transport = _gate_probe(events)
+    client = scripted_client(transport)
     stream = client.iter_list(Request("item.list", route=RouteKind.BARE), page_size=2)
     gate = stream._source.completion_gate  # noqa: SLF001 - observe the actual kernel gate
     assert isinstance(gate, CompletionGate)
     original_emit = gate.emit
 
     def observe(event: object) -> None:
-        transport.events.append(type(event))
+        events.append(type(event))
         original_emit(event)
 
     gate.emit = observe
     assert [row["id"] async for row in stream] == [1, 2]
-    assert transport.events == [
+    assert events == [
         PageScheduled,
         PageCommandOutcome,
         PageValidated,
@@ -86,9 +80,9 @@ async def test_public_offset_traversal_emits_ordered_page_and_cleanup_evidence()
     assert (
         decision.pages_scheduled
         == decision.pages_acknowledged
-        == transport.calls
+        == len(transport.requests)
         == len(
-            [event for event in transport.events if event is PageScheduled],
+            [event for event in events if event is PageScheduled],
         )
     )
     assert stream.report is not None

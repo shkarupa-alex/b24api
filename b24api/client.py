@@ -8,9 +8,9 @@ import warnings
 import weakref
 from typing import TYPE_CHECKING, Self, cast
 
-from b24api._audit import audit_command_source
 from b24api._client_traversal import _TraversalFacade
 from b24api.batch.facade import batch_outcome_stream, batch_stream
+from b24api.batch.logical import command_source as logical_command_source
 from b24api.contracts.dispatch import BatchDispatch, DirectDispatch, DispatchSpec
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import ExecutionPolicy, UnknownRequestAudit
@@ -25,10 +25,13 @@ from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import KeysetSpec
 from b24api.execution import Executor, HttpxTransport, Transport, await_cleanup_resistant, rearm_cancellation
 from b24api.execution.cleanup import CloseableResource, close_owned_resources
+from b24api.redaction import Redactor, webhook_secrets
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
+from b24api.references.fanout import command_source as fanout_command_source
 from b24api.references.fanout import fanout_stream
 from b24api.settings import Settings, api_settings
+from b24api.transport.protocol import ProtocolCodec
 from b24api.traversal.facade_support import _collection_selector
 from b24api.traversal.keyset_verifier import verify_keyset_capability as _verify_keyset_capability
 
@@ -45,6 +48,7 @@ if TYPE_CHECKING:
     from b24api.contracts.response import BinaryResponse, Response
     from b24api.contracts.stream import OperationStream
     from b24api.contracts.traversal import CursorSpec, TraversalSpec
+    from b24api.execution.rate import RateCoordinator
     from b24api.references.binding import BindingSource
 
 _DEFAULT_REFERENCE_DISPATCH = BatchDispatch()
@@ -59,6 +63,9 @@ def _normalized_host(host: str) -> str:
 
 class Bitrix24(_TraversalFacade):
     """Async method-agnostic client over one correctness kernel."""
+
+    # Only a client built by __init__ owns its executor's coordinator; _from_executor leaves it to the caller.
+    _owned_coordinator: RateCoordinator | None = None
 
     def __init__(
         self,
@@ -85,18 +92,37 @@ class Bitrix24(_TraversalFacade):
                 raise ValueError("injected transport host does not match Settings")
             selected_transport = transport
             owned_transport = None
-        self._settings: Settings | None = resolved
         self._transport = selected_transport
         self._owned_transport = owned_transport
-        self._executor = Executor(selected_transport)
-        self._default_policy = policy or ExecutionPolicy(
-            max_retry_elapsed_per_request=float(resolved.http_timeout),
-        )
+        # The configured webhook credential is an exact secret for every error this client renders.
+        codec = ProtocolCodec(redactor=Redactor(known_secrets=webhook_secrets(str(resolved.webhook_url))))
+        self._executor = Executor(selected_transport, codec=codec)
+        self._owned_coordinator = self._executor.coordinator
+        self._default_policy = policy or ExecutionPolicy.from_settings(resolved)
         self._host = host
         self._closed = False
         self._unknown_request_audit = unknown_request_audit
         self._close_task: asyncio.Task[None] | None = None
         self._streams: weakref.WeakSet[CloseableResource] = weakref.WeakSet()
+
+    @classmethod
+    def from_webhook(
+        cls,
+        url: str,
+        *,
+        http_timeout: float | None = None,
+        policy: ExecutionPolicy | None = None,
+    ) -> Bitrix24:
+        """Build a client that owns its HTTPX transport and rate coordinator for one webhook URL.
+
+        The URL is validated by ``Settings``; ``http_timeout=None`` keeps the ``Settings`` default.
+        """
+        if not isinstance(url, str):
+            raise TypeError("webhook url must be a string")
+        settings = (
+            Settings(webhook_url=url) if http_timeout is None else Settings(webhook_url=url, http_timeout=http_timeout)
+        )
+        return cls(settings, policy=policy)
 
     @classmethod
     def _from_executor(
@@ -109,7 +135,6 @@ class Bitrix24(_TraversalFacade):
     ) -> Bitrix24:
         """Construct over an injected deterministic executor for tests."""
         instance = cls.__new__(cls)
-        instance._settings = None
         instance._transport = executor.transport
         instance._owned_transport = None
         instance._executor = executor
@@ -146,13 +171,13 @@ class Bitrix24(_TraversalFacade):
             raise
 
     async def aclose(self) -> None:
-        """Close active streams and then the owned transport idempotently."""
+        """Close active streams, the owned rate coordinator and the owned transport idempotently."""
         if self._close_task is not None and self._close_task.done():
             return
         if self._close_task is None:
             self._closed = True
             self._close_task = asyncio.create_task(
-                close_owned_resources(tuple(self._streams), self._owned_transport),
+                close_owned_resources(tuple(self._streams), self._owned_transport, self._owned_coordinator),
             )
         cleanup = await await_cleanup_resistant(self._close_task)
         if cleanup.error is not None:
@@ -194,7 +219,7 @@ class Bitrix24(_TraversalFacade):
         self._require_open()
         canonical = canonical_request(request)
         self._audit_unknown(canonical)
-        self._executor._preflight_request(canonical)
+        self._executor.preflight_request(canonical)
         return await _verify_keyset_capability(
             self._executor,
             canonical,
@@ -218,7 +243,7 @@ class Bitrix24(_TraversalFacade):
         return self._register_stream(
             batch_stream(
                 self._executor,
-                audit_command_source(commands, self._audit_unknown),
+                logical_command_source(commands, self._audit_unknown),
                 batch_size=batch_size,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
@@ -237,7 +262,7 @@ class Bitrix24(_TraversalFacade):
         return self._register_stream(
             batch_outcome_stream(
                 self._executor,
-                audit_command_source(commands, self._audit_unknown),
+                logical_command_source(commands, self._audit_unknown),
                 batch_size=batch_size,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
@@ -253,9 +278,9 @@ class Bitrix24(_TraversalFacade):
     ) -> OperationStream[CommandSuccess[C]]:
         """Dispatch independent commands fail-fast with explicit delivery order."""
         self._require_open()
-        stream = fanout_stream(
+        stream: OperationStream[CommandOutcome[C]] = fanout_stream(
             self._executor,
-            audit_command_source(commands, self._audit_unknown),
+            fanout_command_source(commands, self._audit_unknown),
             dispatch=dispatch,
             policy=policy or self._default_policy,
             tolerant=False,
@@ -275,7 +300,7 @@ class Bitrix24(_TraversalFacade):
         return self._register_stream(
             fanout_stream(
                 self._executor,
-                audit_command_source(commands, self._audit_unknown),
+                fanout_command_source(commands, self._audit_unknown),
                 dispatch=dispatch,
                 policy=policy or self._default_policy,
                 tolerant=True,

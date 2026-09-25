@@ -2,35 +2,27 @@
 
 from __future__ import annotations
 import ast
+import inspect
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 import b24api.client
+import b24api.completion
+import b24api.contracts
+import b24api.errors
+import b24api.testing
+import b24api.transport
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "b24api"
 
-_STATE_MACHINES = {
-    "_stream.py",
-    "completion/gate.py",
-    "batch/engine.py",
-    "batch/logical.py",
-    "batch/stream.py",
-    "execution/context.py",
-    "execution/executor.py",
-    "references/dispatch.py",
-    "references/scheduler.py",
-    "references/stream.py",
-    "traversal/driver.py",
-    "traversal/keyset_scheduler.py",
-    "traversal/keyset_transactions.py",
-    "traversal/keyset_verifier.py",
-    "traversal/stream.py",
-}
 _FORBIDDEN_ROOT_MODULES = {
     "api.py",
     "helper.py",
@@ -109,7 +101,7 @@ class _ResponseItemsVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def test_runtime_layer_import_boundaries_are_acyclic_and_evidence_free() -> None:
+def test_runtime_layers_stay_evidence_free_and_io_free() -> None:
     for path in _sources():
         imports = _imports(path)
         assert not any(name == "tools" or name.startswith("tools.") or "b24api_evidence" in name for name in imports)
@@ -159,6 +151,21 @@ def test_completion_layer_does_not_import_traversal_families() -> None:
             for name in imports
             for family in ("b24api.traversal", "b24api.references", "b24api.batch")
         ), f"{path.relative_to(PACKAGE)} imports a traversal family at runtime"
+
+
+def test_batch_and_traversal_read_the_portal_batch_cap_from_its_one_owner() -> None:
+    # PORTAL_BATCH_CAP in contracts/dispatch.py owns the portal's 50-command limit (B7); a literal copy in
+    # a capacity computation would drift from it silently.
+    from b24api.contracts.dispatch import PORTAL_BATCH_CAP  # noqa: PLC0415
+
+    copies = [
+        f"{path.relative_to(PACKAGE)}:{node.lineno}"
+        for family in ("batch", "traversal")
+        for path in sorted((PACKAGE / family).rglob("*.py"))
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Constant) and type(node.value) is int and node.value == PORTAL_BATCH_CAP
+    ]
+    assert copies == []
 
 
 def test_runtime_imports_ignore_only_type_checking_blocks(tmp_path: Path) -> None:
@@ -243,9 +250,9 @@ def test_report_replacements_stay_on_reviewed_downgrade_sites() -> None:
         and node.args
         and "report" in ast.unparse(node.args[0]).casefold()
     }
-    # batch/stream.py and traversal/stream.py replace their KernelReport; references/support.py and
-    # execution/failure.py only downgrade a report to FAILED/INCOMPLETE with exhausted=False.
-    assert sites == {"batch/stream.py", "traversal/stream.py", "references/support.py", "execution/failure.py"}
+    # execution/failure.py only downgrades a report to FAILED/INCOMPLETE with exhausted=False or adds a
+    # cleanup-failure violation, for the lifecycle runner and the public failure finalizer.
+    assert sites == {"execution/failure.py"}
 
 
 def test_failure_classification_importers_stay_inside_state_machine_layers() -> None:
@@ -254,7 +261,7 @@ def test_failure_classification_importers_stay_inside_state_machine_layers() -> 
         if owner not in _imports(path):
             continue
         relative = path.relative_to(PACKAGE)
-        assert relative == Path("_stream.py") or relative.parts[0] in {
+        assert relative == Path("completion/operation_stream.py") or relative.parts[0] in {
             "batch",
             "execution",
             "references",
@@ -302,17 +309,18 @@ def test_no_endpoint_catalog_mutable_registry_or_evidence_literal_exists() -> No
 def test_removed_modules_symbols_and_storage_backends_are_absent() -> None:
     assert not (_FORBIDDEN_ROOT_MODULES & {path.name for path in PACKAGE.iterdir() if path.is_file()})
     assert not (_REMOVED_CLIENT_METHODS & set(vars(b24api.client.Bitrix24)))
+    # Removed v1 public names and parameters stay absent from every public namespace and signature.
+    namespaces = (b24api, b24api.contracts, b24api.errors, b24api.transport, b24api.completion, b24api.testing)
+    assert not {"IdentityTracker", "RequestWithPayload"} & {name for module in namespaces for name in dir(module)}
+    parameters = {
+        name
+        for method in vars(b24api.client.Bitrix24).values()
+        if callable(method)
+        for name in inspect.signature(method).parameters
+    }
+    assert not {"max_tracked_identities", "with_payload", "fallback_failed"} & parameters
+    # Protective ban (B21): the client keeps no durable storage, so no storage backend may appear.
     runtime = "\n".join(path.read_text(encoding="utf-8") for path in _sources())
-    for removed in (
-        "IdentityTracker",
-        "max_tracked_identities",
-        "_ImplicitCompatibilityString",
-        "_legacy_",
-        "with_payload",
-        "fallback_failed",
-        "RequestWithPayload",
-    ):
-        assert removed not in runtime
     assert "sqlite" not in runtime.casefold()
     forbidden_imports = ("sqlalchemy", "django.db", "peewee", "sqlmodel", "tortoise")
     assert not any(
@@ -321,6 +329,7 @@ def test_removed_modules_symbols_and_storage_backends_are_absent() -> None:
         for name in _imports(path)
         for forbidden in forbidden_imports
     )
+    # Protective ban (B21): endpoint-specific adapters live in recipes, never in the package.
     assert "im.dialog.messages.get" not in runtime
     assert "ImMessagePageAdapter" not in runtime
 
@@ -335,12 +344,10 @@ def test_response_selection_funnels_and_dead_batch_sentinel_stay_closed() -> Non
         ("traversal/driver.py", "select_page"),
         ("traversal/keyset_verifier.py", "_identities"),
         ("traversal/keyset_verifier.py", "_record_response"),
-        ("traversal/page_validation.py", "select_rows"),
-        ("traversal/page_validation.py", "validate_lane_receipt"),
+        ("traversal/keyset_page_validation.py", "select_rows"),
+        ("traversal/keyset_page_validation.py", "validate_lane_receipt"),
     }
-    dispatch = (PACKAGE / "references" / "dispatch.py").read_text(encoding="utf-8")
-    assert "self._queue: asyncio.Queue[_PendingBatch]" in dispatch
-    tree = ast.parse(dispatch)
+    tree = ast.parse((PACKAGE / "references" / "dispatch.py").read_text(encoding="utf-8"))
     assert not any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -353,6 +360,7 @@ def test_response_selection_funnels_and_dead_batch_sentinel_stay_closed() -> Non
 
 
 def test_project_configuration_has_no_removed_v1_runtime_or_test_knobs() -> None:
+    # Protective ban (B21): removed v1 settings must not come back through project configuration.
     configuration = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     for removed in (
@@ -363,56 +371,67 @@ def test_project_configuration_has_no_removed_v1_runtime_or_test_knobs() -> None
         assert removed not in configuration
 
 
-def test_module_sizes_keep_facades_small_and_state_machines_bounded() -> None:
+def test_response_bodies_are_read_only_as_raw_bytes_through_the_bounded_decoder() -> None:
+    # Protective source guard, kept with this justification under B21: HTTPX's decoded readers inflate a
+    # whole received chunk before any byte ceiling can see its size (A2: a 32 KiB gzip allocated 81 MB, a
+    # ``gzip, gzip`` cascade 1.1 GB). Bodies must come from ``aiter_raw``/``iter_raw`` through
+    # ``_BoundedDecoder``. A behavioural test cannot prove that no future call site reintroduces one.
+    decoded_readers = {"aiter_bytes", "iter_bytes", "aiter_text", "iter_text", "aiter_lines", "iter_lines", "aread"}
+    paths = (*sorted((PACKAGE / "transport").glob("*.py")), ROOT / "tools/b24api_evidence/harness/live.py")
+    for path in paths:
+        calls = {
+            node.func.attr
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert not calls & decoded_readers, f"{path.relative_to(ROOT)} reads decoded HTTPX bytes"
+
+
+def test_module_sizes_are_recorded(record_property: Callable[[str, object], None]) -> None:
+    # Module size is a signal, not a gate (B21): the import DAG, the private-access and the
+    # function-length ratchets block instead. The sizes land in the JUnit report for review.
     for path in _sources():
         relative = path.relative_to(PACKAGE).as_posix()
-        line_count = len(path.read_text(encoding="utf-8").splitlines())
-        ceiling = (
-            750
-            if relative == "traversal/driver.py"
-            else 710
-            if relative in _STATE_MACHINES
-            else 550
-            if relative == "errors.py"
-            else 450
-            if relative == "cli_contract.py"
-            else 410
-        )
-        assert line_count <= ceiling, f"{relative} has {line_count} lines; ceiling is {ceiling}"
+        record_property(f"lines:{relative}", len(path.read_text(encoding="utf-8").splitlines()))
 
 
 def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
     fast_sources = tuple(sorted((PACKAGE / "traversal").glob("keyset_*.py")))
+    # Protective (B21): the runtime is the only owner of the fast buffered-row counter.
     delta_callers = {path.name for path in fast_sources if "adjust_buffered_rows(" in path.read_text(encoding="utf-8")}
-    assert delta_callers == {"keyset_scheduler.py"}
+    assert delta_callers == {"keyset_runtime.py"}
     assert all("set_buffered_rows(" not in path.read_text(encoding="utf-8") for path in fast_sources)
-    scheduler = (PACKAGE / "traversal" / "keyset_scheduler.py").read_text(encoding="utf-8")
-    assert "class KeysetFastScheduler:" in scheduler
+    # Protective (B21, §3.6): the transaction host is a protocol, never a shared scheduler-state bag.
     assert not (PACKAGE / "traversal" / "keyset_scheduler_support.py").exists()
     assert not (PACKAGE / "traversal" / "keyset_scheduler_state.py").exists()
     assert all("SchedulerState" not in path.read_text(encoding="utf-8") for path in fast_sources)
-    sequential = (PACKAGE / "traversal" / "keyset.py").read_text(encoding="utf-8")
-    assert "from b24api.traversal.keyset_step import" in sequential
-    assert "from b24api.traversal import keyset_step" in scheduler
-    assert "keyset_page_request(" in sequential
-    assert "keyset_step.keyset_page_request(" in scheduler
+    # Sequential and fast keyset build every page request through the one shared step.
+    for name in ("keyset.py", "keyset_runtime.py"):
+        path = PACKAGE / "traversal" / name
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        assert any(
+            isinstance(node, ast.ImportFrom)
+            and (
+                node.module == "b24api.traversal.keyset_step"
+                or (node.module == "b24api.traversal" and any(alias.name == "keyset_step" for alias in node.names))
+            )
+            for node in ast.walk(tree)
+        ), f"{name} does not import the shared keyset step"
+        called = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+        }
+        assert "keyset_page_request" in called, f"{name} builds keyset pages without the shared step"
 
-    for name in ("keyset_auto.py", "keyset_costs.py"):
+    # Protective (B21): the auto selector is deterministic integer arithmetic, so its inputs never
+    # include randomness, clocks, environment or floats.
+    for name in ("keyset_auto.py", "keyset_geometry.py"):
         selector = (PACKAGE / "traversal" / name).read_text(encoding="utf-8")
         for forbidden in ("random", "time.", "os.environ", "float("):
             assert forbidden not in selector
         tree = ast.parse(selector)
         assert not any(isinstance(node, ast.Constant) and isinstance(node.value, float) for node in ast.walk(tree))
-
-    ceilings = {
-        PACKAGE / "contracts" / "keyset_execution.py": 250,
-        PACKAGE / "traversal" / "keyset_auto.py": 250,
-        PACKAGE / "traversal" / "keyset_fast_plan.py": 300,
-        PACKAGE / "traversal" / "keyset_fast_stream.py": 400,
-        PACKAGE / "traversal" / "keyset_scheduler.py": 700,
-    }
-    for path, ceiling in ceilings.items():
-        assert len(path.read_text(encoding="utf-8").splitlines()) <= ceiling
 
     transactions = ast.parse((PACKAGE / "traversal" / "keyset_transactions.py").read_text(encoding="utf-8"))
     assert not any(isinstance(node, ast.ClassDef) for node in transactions.body)
@@ -445,3 +464,31 @@ def test_closure_reason_constants_map_to_their_qualified_closure() -> None:
     assert closure.qualified_closure(closure.ADMITTED_UPPER_BOUNDARY_REACHED) is BindingClosure.BOUNDARY_SEEN
     assert closure.qualified_closure("source exhausted") is None
     assert closure.qualified_closure(None) is None
+
+
+def test_pagination_driver_composes_strategies_instead_of_inheriting_them() -> None:
+    # The driver owns the page transaction and composes one strategy per plan (§3.6 step 2).
+    from b24api.traversal.counted_batch import CountedBatchStrategy  # noqa: PLC0415
+    from b24api.traversal.driver import PaginationDriver  # noqa: PLC0415
+    from b24api.traversal.strategy_context import PagedStrategy  # noqa: PLC0415
+
+    assert PaginationDriver.__bases__ == (object,)
+    assert isinstance(CountedBatchStrategy(batch_size=1, page_size=1), PagedStrategy)
+    strategy_modules = ("sequential", "keyset", "cursor", "counted_batch")
+    mixins = [
+        node.name
+        for module in strategy_modules
+        for node in ast.parse((PACKAGE / "traversal" / f"{module}.py").read_text(encoding="utf-8")).body
+        if isinstance(node, ast.ClassDef) and node.name.endswith("Mixin")
+    ]
+    assert not mixins
+
+
+def test_no_public_class_name_is_defined_twice() -> None:
+    # One name per concept (D30): kernel copies of public values carry a Kernel prefix.
+    owners: dict[str, list[str]] = {}
+    for path in _sources():
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+                owners.setdefault(node.name, []).append(path.relative_to(PACKAGE).as_posix())
+    assert {name: paths for name, paths in owners.items() if len(paths) > 1} == {}

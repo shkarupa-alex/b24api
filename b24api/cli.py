@@ -14,7 +14,6 @@ from b24api import (
     KeysetCapabilityError,
     ReplaySafety,
     Request,
-    Response,
     RouteKind,
     TerminalState,
     TraversalAssurance,
@@ -30,6 +29,7 @@ from b24api.cli_contract import (
     parse_verify_keyset_contract,
     read_json_source,
 )
+from b24api.contracts import Response
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -87,6 +87,8 @@ def _report_json(report: OperationReport) -> dict[str, object]:
     }
     if report.keyset_execution is not None:
         result["keyset_execution"] = dataclasses.asdict(report.keyset_execution)
+    if report.keyset_selection is not None:
+        result["keyset_selection"] = dataclasses.asdict(report.keyset_selection)
     return result
 
 

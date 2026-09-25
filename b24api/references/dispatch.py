@@ -3,7 +3,7 @@
 from __future__ import annotations
 import asyncio
 import contextlib
-from collections.abc import AsyncIterable, Iterable
+from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
@@ -18,8 +18,8 @@ from b24api.execution import (
     WorkClass,
 )
 from b24api.references.outcome import (
-    ReferenceFailure,
-    ReferenceItem,
+    KernelReferenceFailure,
+    KernelReferenceItem,
     ReferenceRequest,
 )
 
@@ -30,13 +30,22 @@ if TYPE_CHECKING:
     from b24api.contracts.request import Request
     from b24api.contracts.response import Response
     from b24api.traversal.plans import (
-        BatchDispatch,
-        DirectDispatch,
+        KernelBatchDispatch,
+        KernelDirectDispatch,
     )
+    from b24api.traversal.values import IdentityValue
 
 type ReferenceSource = Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]
+type _WaitFirst = Callable[[tuple[asyncio.Future[object], ...], float], Awaitable[None]]
 _MISSING = object()
-_SYNC_EXHAUSTED = object()
+
+
+def _loop_time() -> float:
+    return asyncio.get_running_loop().time()
+
+
+async def _wait_first(futures: tuple[asyncio.Future[object], ...], seconds: float) -> None:
+    await asyncio.wait(futures, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +89,7 @@ class _DoneEvent:
 class _FailureEvent:
     work: _Work
     error: BaseException
-    cursor: JsonValue
+    cursor: JsonValue | IdentityValue
     page_state: int
     partial_rows: int
     violations: tuple[Violation, ...]
@@ -94,7 +103,6 @@ type _Event = _PageEvent | _DoneEvent | _FailureEvent
 
 @dataclass(frozen=True, slots=True)
 class _KernelReferenceComplete:
-    work_index: int
     reference: ReferenceRequest
     row_count: int
     stopped_reason: str | None = None
@@ -102,16 +110,17 @@ class _KernelReferenceComplete:
 
 @dataclass(frozen=True, slots=True)
 class _KernelFanOutSuccess:
-    work_index: int
     reference: ReferenceRequest
     response: Response
 
 
-type ReferenceStreamItem = ReferenceItem | ReferenceFailure | _KernelReferenceComplete | _KernelFanOutSuccess
+type ReferenceStreamItem = (
+    KernelReferenceItem | KernelReferenceFailure | _KernelReferenceComplete | _KernelFanOutSuccess
+)
 
 
 class _ReferenceWindowError(Exception):
-    def __init__(self, failure: ReferenceFailure) -> None:
+    def __init__(self, failure: KernelReferenceFailure) -> None:
         self.failure = failure
         self.replay_disposition = failure.replay_disposition
         super().__init__("reference traversal window failed")
@@ -140,7 +149,6 @@ class _ProducerState:
     next_key: str | None = None
     next_index: int | None = None
     source_pull_in_flight: bool = False
-    source_terminal: bool = False
     closing: bool = False
     revision: int = 0
     _waiters: list[asyncio.Future[None]] = field(default_factory=list)
@@ -201,7 +209,6 @@ class _RowBuffer:
         self.maximum = maximum
         self.context = context
         self._available = maximum
-        self._accounted = 0
         self._head_index = 0
         self._head_reserve = head_reserve
         self._closed = False
@@ -251,7 +258,6 @@ class _RowBuffer:
             reservation.amount = actual
             reservation.accepted = True
             self._available += unused
-            self._accounted += actual
             if actual == 0:
                 self._reservations.remove(reservation)
             self._condition.notify_all()
@@ -269,7 +275,6 @@ class _RowBuffer:
                 return
             reservation.amount -= count
             self._available += count
-            self._accounted -= count
             if reservation.amount == 0:
                 self._reservations.remove(reservation)
             self._condition.notify_all()
@@ -286,8 +291,6 @@ class _RowBuffer:
                 return
             reservation.amount = 0
             self._available += amount
-            if reservation.accepted:
-                self._accounted -= amount
             self._reservations.remove(reservation)
             self._condition.notify_all()
             self._touch()
@@ -306,7 +309,6 @@ class _RowBuffer:
             if self._closed:
                 return
             self._closed = True
-            self._accounted = 0
             self._available = self.maximum
             for reservation in self._reservations:
                 reservation.amount = 0
@@ -321,7 +323,7 @@ class _DirectPageDispatcher:
         self,
         executor: Executor,
         context: ExecutionContext,
-        plan: DirectDispatch,
+        plan: KernelDirectDispatch,
     ) -> None:
         self.executor = executor
         self.context = context
@@ -362,15 +364,20 @@ class _BatchPageDispatcher:
         self,
         executor: Executor,
         context: ExecutionContext,
-        plan: BatchDispatch,
+        plan: KernelBatchDispatch,
         *,
         producer_state: _ProducerState | None = None,
         buffer: _RowBuffer | None = None,
         page_cap: int = 1,
         pending_continuations_can_progress: bool = True,
+        time: Callable[[], float] | None = None,
+        wait: _WaitFirst | None = None,
     ) -> None:
         self.context = context
         self.plan = plan
+        # Internal clock and wait seams (not public API): tests drive coalescing on a virtual clock.
+        self._time = time or _loop_time
+        self._wait = wait or _wait_first
         self._executor = BatchExecutor(executor)
         self._queue: asyncio.Queue[_PendingBatch] = asyncio.Queue(
             maxsize=context.policy.max_active_references,
@@ -383,7 +390,6 @@ class _BatchPageDispatcher:
         self._page_cap = page_cap
         self._pending_continuations_can_progress = pending_continuations_can_progress
         self._assembler: asyncio.Task[None] | None = None
-        self._worker: asyncio.Task[None] | None = None
         self._workers: tuple[asyncio.Task[None], ...] = ()
         self._settlement_workers: set[asyncio.Task[None]] = set()
         self._closed = False
@@ -453,7 +459,6 @@ class _BatchPageDispatcher:
         concurrency = min(self.plan.concurrency, self.context.policy.max_active_references)
         self._assembler = asyncio.create_task(self._run())
         senders = tuple(asyncio.create_task(self._send_run()) for _index in range(concurrency))
-        self._worker = senders[0]
         self._workers = (self._assembler, *senders)
 
     async def _run(self) -> None:  # noqa: C901, PLR0912, PLR0915
@@ -474,8 +479,7 @@ class _BatchPageDispatcher:
                     continue
                 chunk = [first]
                 self._drain_nowait(chunk)
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + self.plan.coalesce_wait
+                deadline = self._time() + self.plan.coalesce_wait
                 coalescing_delay = 0.0
                 while len(chunk) < self.plan.batch_size:
                     self._drain_nowait(chunk)
@@ -486,7 +490,7 @@ class _BatchPageDispatcher:
                     if self._potential({item.reference_id for item in chunk}) == 0:
                         break
                     remaining = min(
-                        deadline - loop.time(),
+                        deadline - self._time(),
                         self.context.policy.max_elapsed - self.context.elapsed,
                     )
                     if remaining <= 0:
@@ -498,13 +502,12 @@ class _BatchPageDispatcher:
                     if get_task is None:
                         get_task = asyncio.create_task(self._queue.get())
                     wake = state.changed(seen)
-                    wait_started = loop.time()
-                    await asyncio.wait(
-                        [cast("asyncio.Future[object]", get_task), cast("asyncio.Future[object]", wake)],
-                        timeout=remaining,
-                        return_when=asyncio.FIRST_COMPLETED,
+                    wait_started = self._time()
+                    await self._wait(
+                        (cast("asyncio.Future[object]", get_task), cast("asyncio.Future[object]", wake)),
+                        remaining,
                     )
-                    coalescing_delay += loop.time() - wait_started
+                    coalescing_delay += self._time() - wait_started
                     if get_task.done():
                         pending = get_task.result()
                         get_task = None

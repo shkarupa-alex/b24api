@@ -14,20 +14,22 @@ import asyncio
 
 from b24api import (
     Bitrix24,
-    EmptyArray,
-    EmptyObject,
     IdentityCoercion,
     IdentitySpec,
     OffsetSpec,
-    PageIndex,
     ParameterPath,
-    PositionalArguments,
-    PositionalLayout,
-    Present,
     ReplaySafety,
     Request,
     RouteKind,
     Settings,
+)
+from b24api.contracts import (
+    EmptyArray,
+    EmptyObject,
+    PageIndex,
+    PositionalArguments,
+    PositionalLayout,
+    Present,
     SlotContract,
     SlotShape,
 )

@@ -39,6 +39,7 @@ from b24api.contracts import (
     Request,
     ResultCollectionShape,
     ResultSelector,
+    RetryPolicy,
     SequentialKeysetExecution,
     SequentialTraversal,
     TerminalState,
@@ -58,11 +59,14 @@ from b24api.errors import (
     ReferenceFailed,
     TransportError,
 )
-from b24api.execution import Executor, Transport, WireResponse
 from b24api.settings import Settings
+from tests.scripting import ResponderTransport, attached_report, client_for
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Iterator
+    from collections.abc import AsyncGenerator, Iterator
+
+    from b24api.execution import Transport, WireResponse
+    from tests.scripting import ClientFactory
 
 HTTP_OK = 200
 COUNTED_ROWS = 500
@@ -83,38 +87,12 @@ FANOUT_BATCH_REQUESTS = 6
 LARGE_COUNTED_ROWS = 100_001
 LARGE_LOGICAL_BATCH_COMMANDS = 100_000
 LARGE_LOGICAL_BATCH_REQUESTS = 2_000
+BOUNDED_LOOKAHEAD_COMMANDS = 2_000
 CUSTOM_INITIAL_OFFSET = 10
 CUSTOM_NEXT_OFFSET = 12
 
 
-class FunctionTransport:
-    """Return deterministic Bitrix-shaped envelopes."""
-
-    host = "test.invalid"
-
-    def __init__(self, handler: Callable[[Request], object], *, delay: float = 0) -> None:
-        """Store the response callback and observations."""
-        self.handler = handler
-        self.delay = delay
-        self.requests: list[Request] = []
-        self.closed = False
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Return one encoded response within the supplied ceilings."""
-        assert attempt_timeout > 0
-        if self.delay:
-            await asyncio.sleep(self.delay)
-        self.requests.append(request)
-        body = json.dumps(self.handler(request), separators=(",", ":")).encode()
-        assert len(body) <= max_response_bytes
-        return WireResponse(HTTP_OK, (("content-type", "application/json"),), body)
-
-    async def aclose(self) -> None:
-        """Record caller/owner lifecycle tests."""
-        self.closed = True
-
-
-class BlockingCloseTransport(FunctionTransport):
+class BlockingCloseTransport(ResponderTransport):
     """Transport whose owned close can be cancelled while it is in flight."""
 
     def __init__(self) -> None:
@@ -130,7 +108,7 @@ class BlockingCloseTransport(FunctionTransport):
         self.closed = True
 
 
-class FailingCloseTransport(FunctionTransport):
+class FailingCloseTransport(ResponderTransport):
     """Transport that records close and then reports an owned cleanup failure."""
 
     async def aclose(self) -> None:
@@ -139,17 +117,14 @@ class FailingCloseTransport(FunctionTransport):
         raise RuntimeError("owned transport cleanup failed")
 
 
-class AmbiguousTransport(FunctionTransport):
+def _ambiguous() -> ResponderTransport:
     """Fail after possible dispatch without exposing caller-owned values."""
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Record the request and raise an ambiguous transport failure."""
-        del attempt_timeout, max_response_bytes
-        self.requests.append(request)
-        raise TransportError("ambiguous synthetic dispatch", phase=FailurePhase.DISPATCH_STARTED)
+    return ResponderTransport(
+        lambda _request: TransportError("ambiguous synthetic dispatch", phase=FailurePhase.DISPATCH_STARTED)
+    )
 
 
-class BlockingRequestTransport(FunctionTransport):
+class BlockingRequestTransport(ResponderTransport):
     """Expose cancellation of one in-flight public stream pull."""
 
     def __init__(self) -> None:
@@ -171,7 +146,7 @@ class BlockingRequestTransport(FunctionTransport):
 
 
 def _client(transport: Transport) -> Bitrix24:
-    return Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic facade seam
+    return client_for(transport)
 
 
 def _identity() -> IdentitySpec:
@@ -185,7 +160,7 @@ def _identity() -> IdentitySpec:
 
 @pytest.mark.asyncio
 async def test_call_and_call_response_have_stable_detached_types() -> None:
-    transport = FunctionTransport(lambda _request: {"result": {"items": [1, 2]}})
+    transport = ResponderTransport(lambda _request: {"result": {"items": [1, 2]}})
     client = _client(transport)
 
     decoded = await client.call(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
@@ -198,7 +173,7 @@ async def test_call_and_call_response_have_stable_detached_types() -> None:
 
 @pytest.mark.asyncio
 async def test_closed_request_mapping_canonicalizes_immediately_and_rejects_unknown_fields() -> None:
-    transport = FunctionTransport(lambda request: {"result": request.copy_parameters()})
+    transport = ResponderTransport(lambda request: {"result": request.copy_parameters()})
     client = _client(transport)
 
     result = await client.call(
@@ -231,7 +206,7 @@ async def test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_of
             },
         }
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     client = _client(transport)
     stream = client.batch(
         (
@@ -254,6 +229,7 @@ async def test_logical_batch_is_unbounded_ordered_and_correlation_is_strictly_of
     assert stream.report.buffered_commands_high_water == LOGICAL_BATCH_SIZE
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_public_counted_traversal_above_100k_uses_declared_identity_budget() -> None:
     def page(start: int) -> list[dict[str, int]]:
@@ -285,7 +261,7 @@ async def test_public_counted_traversal_above_100k_uses_declared_identity_budget
             },
         }
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     client = _client(transport)
     stream = client.iter_list_counted(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
@@ -327,7 +303,7 @@ async def test_counted_identity_budget_stops_before_admitting_an_overflow_page()
             },
         }
 
-    stream = _client(FunctionTransport(handler)).iter_list_counted(
+    stream = _client(ResponderTransport(handler)).iter_list_counted(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
         policy=ExecutionPolicy(max_identity_keys=PAGE_SIZE + 1),
@@ -343,6 +319,7 @@ async def test_counted_identity_budget_stops_before_admitting_an_overflow_page()
     assert stream.report.emitted == PAGE_SIZE
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_public_keyset_above_100k_uses_monotonic_progression_without_identity_set() -> None:
     page_size = 2_500
@@ -360,7 +337,7 @@ async def test_public_keyset_above_100k_uses_monotonic_progression_without_ident
             "result": [{"ID": value} for value in range(start, min(start + page_size, LARGE_COUNTED_ROWS))],
         }
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     client = _client(transport)
     stream = client.iter_list_keyset(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
@@ -392,6 +369,38 @@ async def test_public_keyset_above_100k_uses_monotonic_progression_without_ident
 
 
 @pytest.mark.asyncio
+async def test_logical_batch_pulls_its_generator_with_bounded_lookahead() -> None:
+    """The input is never materialized: at every outcome the source is ahead by at most one window."""
+    pulled = 0
+
+    def commands() -> Iterator[Command[int]]:
+        nonlocal pulled
+        for index in range(BOUNDED_LOOKAHEAD_COMMANDS):
+            pulled += 1
+            yield Command(Request("test.get", {"index": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
+
+    def handler(request: Request) -> object:
+        batch = request.copy_parameters()["cmd"]
+        assert isinstance(batch, dict)
+        return {"result": {"result": {key: int(key[1:]) for key in batch}, "result_error": {}}}
+
+    stream = _client(ResponderTransport(handler)).batch(commands(), batch_size=PAGE_SIZE)
+    count = 0
+    lookahead = 0
+    async for outcome in stream:
+        assert outcome.correlation == count
+        count += 1
+        lookahead = max(lookahead, pulled - count)
+
+    assert count == BOUNDED_LOOKAHEAD_COMMANDS
+    # One physical window of batch_size commands is pulled before its outcomes are yielded.
+    assert lookahead <= PAGE_SIZE
+    assert stream.report is not None
+    assert stream.report.buffered_commands_high_water == PAGE_SIZE
+
+
+@pytest.mark.slow
+@pytest.mark.asyncio
 async def test_public_logical_batch_accepts_100k_generator_without_input_materialization() -> None:
     def handler(request: Request) -> object:
         commands = request.copy_parameters()["cmd"]
@@ -403,7 +412,7 @@ async def test_public_logical_batch_accepts_100k_generator_without_input_materia
             },
         }
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     client = _client(transport)
     stream = client.batch(
         (
@@ -441,7 +450,7 @@ async def test_batch_outcomes_retains_typed_failure_without_halting_later_comman
         results = {key: int(key[1:]) for key in commands if key not in errors}
         return {"result": {"result": results, "result_error": errors}}
 
-    stream = _client(FunctionTransport(handler)).batch_outcomes(
+    stream = _client(ResponderTransport(handler)).batch_outcomes(
         [
             Command(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), index)
             for index in range(SMALL_BATCH_COMMANDS)
@@ -483,18 +492,19 @@ async def test_logical_batch_preserves_kernel_replay_disposition() -> None:
 
     outcomes = [
         outcome
-        async for outcome in _client(FunctionTransport(handler)).batch_outcomes(
+        async for outcome in _client(ResponderTransport(handler)).batch_outcomes(
             (
                 Command(Request("safe.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), "safe"),
                 Command(Request("unsafe.add", replay_safety=ReplaySafety.UNSAFE, route=RouteKind.BARE), "unsafe"),
                 Command(Request("unknown.get", route=RouteKind.BARE), "unknown"),
             ),
+            policy=ExecutionPolicy(retry=RetryPolicy(initial_delay=0, maximum_delay=0, jitter=0)),
         )
     ]
     assert all(isinstance(outcome, CommandFailure) for outcome in outcomes)
     failures = cast("list[CommandFailure[str]]", outcomes)
-    assert failures[0].replay_disposition is ReplayDisposition.ELIGIBLE
-    assert all(outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE for outcome in failures[1:])
+    # A quota refusal proves no command ran, so each may be replayed whatever its safety (owner decision).
+    assert all(outcome.replay_disposition is ReplayDisposition.ELIGIBLE for outcome in failures)
 
 
 @pytest.mark.asyncio
@@ -510,7 +520,7 @@ async def test_fail_fast_batch_raises_bounded_window_after_preceding_successes()
             },
         }
 
-    stream = _client(FunctionTransport(handler)).batch(
+    stream = _client(ResponderTransport(handler)).batch(
         [
             Command(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), index)
             for index in range(SMALL_BATCH_COMMANDS)
@@ -548,7 +558,7 @@ async def test_batch_source_failure_does_not_dispatch_partial_window_and_closes_
         finally:
             closed = True
 
-    transport = FunctionTransport(lambda _request: pytest.fail("partial window must not be dispatched"))
+    transport = ResponderTransport(lambda _request: pytest.fail("partial window must not be dispatched"))
     stream = _client(transport).batch_outcomes(commands(), batch_size=7)
 
     first = await anext(stream)
@@ -577,7 +587,7 @@ async def test_bound_references_apply_nested_updates_off_wire_and_emit_exact_com
         assert isinstance(owner, int)
         return {"result": [] if parameters["start"] else [{"ID": owner * 10}]}
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = _client(transport).iter_references(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [
@@ -612,7 +622,7 @@ async def test_bound_references_apply_nested_updates_off_wire_and_emit_exact_com
 @pytest.mark.asyncio
 async def test_binding_collision_rejects_before_reference_io() -> None:
     correlation = object()
-    transport = FunctionTransport(lambda _request: pytest.fail("binding collision must reject before I/O"))
+    transport = ResponderTransport(lambda _request: pytest.fail("binding collision must reject before I/O"))
     stream = _client(transport).iter_references(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("bad", (ParameterUpdate(ParameterPath(("start",)), 100),), correlation)],
@@ -640,7 +650,7 @@ async def test_tolerant_batch_distinguishes_user_source_failure_from_local_item_
         yield Command(Request("test.get", route=RouteKind.BARE), correlation)
         raise ValueError("caller source failed")
 
-    transport = FunctionTransport(lambda _request: pytest.fail("partial source window must not dispatch"))
+    transport = ResponderTransport(lambda _request: pytest.fail("partial source window must not dispatch"))
     stream = _client(transport).batch_outcomes(failed_source(), batch_size=2)
 
     outcome = await anext(stream)
@@ -649,9 +659,9 @@ async def test_tolerant_batch_distinguishes_user_source_failure_from_local_item_
     assert outcome.reason is NotExecutedReason.SOURCE_FAILED
     with pytest.raises(InputSourceError) as captured:
         await anext(stream)
-    with pytest.raises(InputSourceError) as repeated:
+    # The failure is raised once; a later read ends the iteration (§3.1).
+    with pytest.raises(StopAsyncIteration):
         await anext(stream)
-    assert repeated.value is captured.value
     assert isinstance(captured.value.__cause__, ValueError)
     assert transport.requests == []
 
@@ -684,7 +694,7 @@ async def test_early_closed_batch_reports_every_command_admitted_into_the_physic
         Command(Request("test.get", {"index": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
         for index in range(SMALL_BATCH_COMMANDS)
     )
-    stream = _client(FunctionTransport(handler)).batch_outcomes(
+    stream = _client(ResponderTransport(handler)).batch_outcomes(
         commands,
         batch_size=SMALL_BATCH_COMMANDS,
     )
@@ -701,7 +711,7 @@ async def test_early_closed_batch_reports_every_command_admitted_into_the_physic
 @pytest.mark.asyncio
 async def test_tolerant_local_binding_failure_emits_not_executed_and_continues() -> None:
     correlations = (object(), object())
-    transport = FunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     stream = _client(transport).iter_reference_outcomes(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [
@@ -730,7 +740,7 @@ async def test_tolerant_local_binding_failure_emits_not_executed_and_continues()
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", [RouteKind.JSON, RouteKind.API_V3])
 async def test_fail_fast_batch_retains_correlations_for_unsupported_route_without_io(route: RouteKind) -> None:
-    transport = FunctionTransport(lambda _request: pytest.fail("unsupported physical batch must not be sent"))
+    transport = ResponderTransport(lambda _request: pytest.fail("unsupported physical batch must not be sent"))
     correlations = (object(), object())
     stream = _client(transport).batch(
         (
@@ -787,7 +797,7 @@ async def test_reference_source_rejects_uncorrelated_malformed_value_without_fab
             },
         }
 
-    stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
+    stream = _client(ResponderTransport(handler)).iter_reference_outcomes(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         bindings(),
         traversal=SequentialTraversal(),
@@ -810,7 +820,7 @@ async def test_reference_source_rejects_uncorrelated_malformed_value_without_fab
 @pytest.mark.asyncio
 async def test_tolerant_reference_preserves_ambiguous_dispatch_as_unknown() -> None:
     correlation = object()
-    transport = AmbiguousTransport(lambda _request: None)
+    transport = _ambiguous()
     stream = _client(transport).iter_reference_outcomes(
         Request("test.list", replay_safety=ReplaySafety.UNKNOWN, route=RouteKind.BARE),
         [Binding("ambiguous", (), correlation)],
@@ -846,11 +856,12 @@ async def test_tolerant_reference_preserves_kernel_replay_disposition() -> None:
             },
         }
 
-    stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
+    stream = _client(ResponderTransport(handler)).iter_reference_outcomes(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("safe", (), "safe")],
         traversal=SequentialTraversal(),
         dispatch=BatchDispatch(batch_size=1),
+        policy=ExecutionPolicy(retry=RetryPolicy(initial_delay=0, maximum_delay=0, jitter=0)),
     )
 
     outcomes = [outcome async for outcome in stream]
@@ -872,7 +883,7 @@ def test_counted_reference_rejects_direct_dispatch_before_binding_pull_or_io() -
         pulled = True
         yield Binding("unreachable", (), object())
 
-    transport = FunctionTransport(lambda _request: {"result": []})
+    transport = ResponderTransport(lambda _request: {"result": []})
     client = _client(transport)
 
     with pytest.raises(CapabilityError, match="requires BatchDispatch"):
@@ -898,7 +909,7 @@ async def test_tolerant_reference_failure_has_no_false_completion_and_later_bind
             return {"error": "denied", "error_description": "no access"}
         return {"result": []}
 
-    stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
+    stream = _client(ResponderTransport(handler)).iter_reference_outcomes(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [
             Binding(
@@ -925,7 +936,7 @@ async def test_tolerant_reference_failure_has_no_false_completion_and_later_bind
 @pytest.mark.asyncio
 async def test_reference_traversal_enforces_its_local_page_cap_without_a_wire_limit() -> None:
     rows = [{"ID": index} for index in range(PAGE_SIZE + 1)]
-    transport = FunctionTransport(lambda _request: {"result": rows})
+    transport = ResponderTransport(lambda _request: {"result": rows})
     correlation = object()
     stream = _client(transport).iter_reference_outcomes(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
@@ -948,7 +959,7 @@ async def test_reference_traversal_enforces_its_local_page_cap_without_a_wire_li
 
 @pytest.mark.asyncio
 async def test_reference_incomplete_maps_to_typed_failure_not_unknown() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
     correlation = object()
     stream = _client(transport).iter_reference_outcomes(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
@@ -988,7 +999,7 @@ async def test_counted_reference_post_io_capability_failure_is_typed_incomplete(
         }
 
     correlation = object()
-    stream = _client(FunctionTransport(handler)).iter_reference_outcomes(
+    stream = _client(ResponderTransport(handler)).iter_reference_outcomes(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("missing exact total", (), correlation)],
         traversal=CountedTraversal(identity=_identity()),
@@ -1012,7 +1023,7 @@ async def test_counted_reference_post_io_capability_failure_is_typed_incomplete(
 
 @pytest.mark.asyncio
 async def test_fail_fast_reference_raises_bounded_reference_failed() -> None:
-    transport = FunctionTransport(lambda _request: {"error": "denied", "error_description": "no access"})
+    transport = ResponderTransport(lambda _request: {"error": "denied", "error_description": "no access"})
     stream = _client(transport).iter_references(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         [Binding("one", (), {"private": True})],
@@ -1030,7 +1041,7 @@ async def test_fail_fast_reference_raises_bounded_reference_failed() -> None:
 
 @pytest.mark.asyncio
 async def test_direct_fanout_preserves_full_response_without_treating_it_as_traversal() -> None:
-    transport = FunctionTransport(
+    transport = ResponderTransport(
         lambda request: {
             "result": [request.copy_parameters()["value"]],
             "total": 100,
@@ -1065,10 +1076,11 @@ async def test_direct_fanout_preserves_full_response_without_treating_it_as_trav
 async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlation(
     concurrency: int,
 ) -> None:
-    def handler(request: Request) -> object:
+    async def handler(request: Request) -> object:
         assert request.method == "batch"
         commands = request.copy_parameters()["cmd"]
         assert isinstance(commands, dict)
+        await asyncio.sleep(0.005)
         return {
             "result": {
                 "result": {key: {"key": key} for key in commands},
@@ -1076,16 +1088,18 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
             },
         }
 
-    transport = FunctionTransport(handler, delay=0.005)
+    transport = ResponderTransport(handler)
     stream = _client(transport).fan_out(
         [
             Command(Request("test.get", {"value": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
             for index in range(FANOUT_COMMANDS)
         ],
+        # Full windows must not depend on host speed: the widest coalescing wait never splits a window.
         dispatch=BatchDispatch(
             batch_size=FANOUT_BATCH_SIZE,
             concurrency=concurrency,
             output_order=DeliveryOrder.READY,
+            coalesce_wait=1,
         ),
     )
 
@@ -1109,7 +1123,7 @@ async def test_tolerant_fanout_continues_after_one_direct_failure() -> None:
             return {"error": "denied", "error_description": "no access"}
         return {"result": value}
 
-    stream = _client(FunctionTransport(handler)).fan_out_outcomes(
+    stream = _client(ResponderTransport(handler)).fan_out_outcomes(
         [
             Command(Request("test.get", {"value": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
             for index in range(3)
@@ -1160,7 +1174,7 @@ async def test_fanout_source_failure_accounts_known_commands_without_fabricating
             },
         }
 
-    stream = _client(FunctionTransport(handler)).fan_out_outcomes(commands(), dispatch=dispatch)
+    stream = _client(ResponderTransport(handler)).fan_out_outcomes(commands(), dispatch=dispatch)
 
     outcome = await anext(stream)
     with pytest.raises(InputSourceError):
@@ -1176,7 +1190,7 @@ async def test_fanout_source_failure_accounts_known_commands_without_fabricating
 
 
 def test_injected_transport_host_must_match_settings_before_io() -> None:
-    transport = FunctionTransport(lambda _request: {"result": None})
+    transport = ResponderTransport(lambda _request: {"result": None})
     settings = Settings(webhook_url="https://other.invalid/rest/1/token/")
 
     with pytest.raises(ValueError, match="host does not match"):
@@ -1195,7 +1209,7 @@ async def test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup
         assert not isinstance(start, bool)
         return {"result": pages[start]}
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     stream = _client(transport).iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
 
     assert stream.report is None
@@ -1220,7 +1234,7 @@ async def test_iter_list_starts_from_the_callers_existing_offset() -> None:
         assert start == CUSTOM_NEXT_OFFSET
         return {"result": []}
 
-    transport = FunctionTransport(handler)
+    transport = ResponderTransport(handler)
     client = _client(transport)
     stream = client.iter_list(
         Request("test.list", {"start": CUSTOM_INITIAL_OFFSET}, ReplaySafety.SAFE, route=RouteKind.BARE),
@@ -1243,7 +1257,7 @@ async def test_iter_list_starts_from_the_callers_existing_offset() -> None:
 
 @pytest.mark.asyncio
 async def test_sequential_missing_offset_refuses_before_io_when_control_creation_is_disabled() -> None:
-    transport = FunctionTransport(lambda _request: pytest.fail("missing traversal control must reject before I/O"))
+    transport = ResponderTransport(lambda _request: pytest.fail("missing traversal control must reject before I/O"))
     stream = _client(transport).iter_list(
         Request("test.list", route=RouteKind.BARE),
         offset=OffsetSpec(allow_create_controls=False),
@@ -1263,7 +1277,7 @@ async def test_mapping_values_shape_preserves_mapping_insertion_order() -> None:
         {"result": {"items": {"b": {"ID": 2}, "a": {"ID": 1}}}},
         {"result": {"items": {}}},
     ]
-    stream = _client(FunctionTransport(lambda _request: responses.pop(0))).iter_list(
+    stream = _client(ResponderTransport(lambda _request: responses.pop(0))).iter_list(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector(("items",)),
         collection_shape=ResultCollectionShape.MAPPING_VALUES,
@@ -1284,7 +1298,7 @@ async def test_keyset_and_cursor_are_explicit_strict_alternatives() -> None:
         rows = [item for item in ({"ID": 1}, {"ID": 2}, {"ID": 3}) if item["ID"] > boundary][:2]
         return {"result": rows}
 
-    keyset_transport = FunctionTransport(keyset_handler)
+    keyset_transport = ResponderTransport(keyset_handler)
     keyset = _client(keyset_transport).iter_list_keyset(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
@@ -1301,7 +1315,7 @@ async def test_keyset_and_cursor_are_explicit_strict_alternatives() -> None:
         rows = [item for item in ({"ID": 1}, {"ID": 2}) if item["ID"] > boundary][:1]
         return {"result": rows}
 
-    cursor = _client(FunctionTransport(cursor_handler)).iter_list_cursor(
+    cursor = _client(ResponderTransport(cursor_handler)).iter_list_cursor(
         Request("im.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         cursor=CursorSpec(
@@ -1356,7 +1370,7 @@ async def test_counted_traversal_preserves_frozen_request_shape_and_exact_identi
             },
         }
 
-    portal = FunctionTransport(handler)
+    portal = ResponderTransport(handler)
     stream = _client(portal).iter_list_counted(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
@@ -1387,7 +1401,7 @@ async def test_counted_traversal_preserves_frozen_request_shape_and_exact_identi
 
 @pytest.mark.asyncio
 async def test_counted_missing_in_band_stride_fails_incomplete() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}], "total": 2})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}], "total": 2})
     stream = _client(transport).iter_list_counted(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
@@ -1421,7 +1435,7 @@ async def test_counted_batch_failure_retains_cause_and_kernel_replay_decision() 
             },
         }
 
-    stream = _client(FunctionTransport(handler)).iter_list_counted(
+    stream = _client(ResponderTransport(handler)).iter_list_counted(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
@@ -1445,7 +1459,7 @@ async def test_counted_batch_failure_retains_cause_and_kernel_replay_decision() 
 
 @pytest.mark.asyncio
 async def test_counted_page_cap_rejects_a_wider_observed_head_before_tail_or_rows() -> None:
-    transport = FunctionTransport(
+    transport = ResponderTransport(
         lambda _request: {
             "result": [{"ID": index} for index in range(PAGE_SIZE)],
             "total": PAGE_SIZE * 2,
@@ -1468,14 +1482,15 @@ async def test_counted_page_cap_rejects_a_wider_observed_head_before_tail_or_row
 
 
 @pytest.mark.asyncio
-async def test_empty_page_with_continuation_never_completes_and_negative_pull_is_sticky() -> None:
+async def test_empty_page_with_continuation_never_completes_and_a_later_read_ends_the_iteration() -> None:
     def handler(request: Request) -> object:
         start = int(request.copy_parameters().get("start", 0))
         if start == 0:
             return {"result": [{"ID": 1}], "next": 1}
         return {"result": [], "next": 2}
 
-    stream = _client(FunctionTransport(handler)).iter_list(
+    transport = ResponderTransport(handler)
+    stream = _client(transport).iter_list(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
@@ -1483,11 +1498,13 @@ async def test_empty_page_with_continuation_never_completes_and_negative_pull_is
     assert await anext(stream) == {"ID": 1}
     with pytest.raises(IncompleteTraversalError) as first:
         await anext(stream)
-    with pytest.raises(IncompleteTraversalError) as repeated:
+    sent = len(transport.requests)
+    # The failure is raised once; a later read starts no work and ends the iteration (§3.1).
+    with pytest.raises(StopAsyncIteration):
         await anext(stream)
 
-    assert repeated.value is first.value
-    assert repeated.value.report is stream.report
+    assert len(transport.requests) == sent
+    assert first.value.report is stream.report
     assert stream.report is not None
     assert stream.report.state is TerminalState.INCOMPLETE
     assert stream.report.terminal_reason == "PaginationError"
@@ -1495,7 +1512,7 @@ async def test_empty_page_with_continuation_never_completes_and_negative_pull_is
 
 @pytest.mark.asyncio
 async def test_partial_helper_closes_without_claiming_completion() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}, {"ID": 2}]})
     stream = _client(transport).iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
 
     partial = await stream.first()
@@ -1503,14 +1520,18 @@ async def test_partial_helper_closes_without_claiming_completion() -> None:
     assert partial.value == ({"ID": 1},)
     assert partial.report.state is TerminalState.EARLY_CLOSED
     assert stream.report is partial.report
-    with pytest.raises(RuntimeError, match="closed before exhaustion"):
+    sent = len(transport.requests)
+    # A read after close starts no work and ends the iteration (§3.1).
+    with pytest.raises(StopAsyncIteration):
         await anext(stream)
+    assert len(transport.requests) == sent
+    assert stream.report is partial.report
 
 
 @pytest.mark.asyncio
 async def test_client_closes_active_stream_before_owned_transport_but_not_injected_transport() -> None:
-    transport = FunctionTransport(lambda _request: {"result": [{"ID": 1}]})
-    settings = Settings(webhook_url="https://test.invalid/rest/1/token/")
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
+    settings = Settings(webhook_url=f"https://{transport.host}/rest/1/token/")
     client = Bitrix24(settings, transport=transport)
     stream = client.iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
 
@@ -1525,9 +1546,11 @@ async def test_client_closes_active_stream_before_owned_transport_but_not_inject
 
 
 @pytest.mark.asyncio
-async def test_client_close_finishes_owned_cleanup_before_replaying_cancellation() -> None:
+async def test_client_close_finishes_owned_cleanup_before_replaying_cancellation(
+    scripted_client: ClientFactory,
+) -> None:
     transport = BlockingCloseTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic owned-close seam
+    client = scripted_client(transport)
     client._owned_transport = transport  # type: ignore[assignment]  # noqa: SLF001
     close = asyncio.create_task(client.aclose())
     await transport.close_started.wait()
@@ -1542,9 +1565,9 @@ async def test_client_close_finishes_owned_cleanup_before_replaying_cancellation
 
 
 @pytest.mark.asyncio
-async def test_concurrent_client_closes_await_one_owned_cleanup() -> None:
+async def test_concurrent_client_closes_await_one_owned_cleanup(scripted_client: ClientFactory) -> None:
     transport = BlockingCloseTransport()
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic owned-close seam
+    client = scripted_client(transport)
     client._owned_transport = transport  # type: ignore[assignment]  # noqa: SLF001
     first = asyncio.create_task(client.aclose())
     await transport.close_started.wait()
@@ -1562,9 +1585,9 @@ async def test_concurrent_client_closes_await_one_owned_cleanup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_context_preserves_body_error_when_owned_cleanup_fails() -> None:
+async def test_client_context_preserves_body_error_when_owned_cleanup_fails(scripted_client: ClientFactory) -> None:
     transport = FailingCloseTransport(lambda _request: {"result": None})
-    client = Bitrix24._from_executor(Executor(transport))  # noqa: SLF001 - deterministic owned-close seam
+    client = scripted_client(transport)
     client._owned_transport = transport  # type: ignore[assignment]  # noqa: SLF001
 
     with pytest.raises(ValueError, match="primary body failure") as captured:
@@ -1587,10 +1610,11 @@ async def test_public_aclose_is_permitted_during_an_inflight_pull_and_cancels_ow
 
     with pytest.raises(asyncio.CancelledError) as captured:
         await pull
-    assert captured.value.__dict__["report"] is stream.report
+    assert attached_report(captured.value) is stream.report
     assert transport.cancelled.is_set()
     assert stream.report is not None
-    assert stream.report.state is TerminalState.CANCELLED
+    # aclose() owns termination, so the cause is an early close even though the read was cancelled.
+    assert stream.report.state is TerminalState.EARLY_CLOSED
 
 
 @pytest.mark.asyncio
@@ -1600,7 +1624,7 @@ async def test_concurrent_public_pulls_reject_without_stealing_the_owned_pull() 
     owned_pull = asyncio.create_task(anext(stream))
     await transport.started.wait()
 
-    with pytest.raises(RuntimeError, match="concurrent stream pulls"):
+    with pytest.raises(RuntimeError, match="concurrent stream pull"):
         await anext(stream)
 
     await stream.aclose()
@@ -1610,7 +1634,7 @@ async def test_concurrent_public_pulls_reject_without_stealing_the_owned_pull() 
 
 @pytest.mark.asyncio
 async def test_long_lived_client_registry_does_not_retain_terminated_streams() -> None:
-    client = _client(FunctionTransport(lambda _request: {"result": []}))
+    client = _client(ResponderTransport(lambda _request: {"result": []}))
 
     for _ in range(100):
         stream = client.iter_list(Request("test.list", route=RouteKind.BARE))

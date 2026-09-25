@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
 
+from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.policy import (
     DuplicatePolicy,
     IdentityCoercion,
@@ -22,7 +23,6 @@ from b24api.contracts.traversal import CursorDomain, OffsetContinuation, PageStr
 if TYPE_CHECKING:
     from b24api.contracts.bounded_range import BoundedIdentityRange
 
-PORTAL_BATCH_CAP = 50
 _START_PATH = ParameterPath(("start",))
 _FILTER_PATH = ParameterPath(("filter",))
 _ORDER_PATH = ParameterPath(("order",))
@@ -276,10 +276,10 @@ class ItemCursorPlan(PlanContract):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class BatchDispatch:
+class KernelBatchDispatch:
     """Explicit bounded batch dispatch."""
 
-    batch_size: int = 50
+    batch_size: int = PORTAL_BATCH_CAP
     concurrency: int = 1
     output_order: ReferenceOutputOrder = ReferenceOutputOrder.READY
     coalesce_wait: float = 0.020
@@ -287,7 +287,7 @@ class BatchDispatch:
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
         if not _is_plain_int(self.batch_size) or not 1 <= self.batch_size <= PORTAL_BATCH_CAP:
-            raise ValueError("batch_size must be between 1 and 50")
+            raise ValueError(f"batch_size must be between 1 and {PORTAL_BATCH_CAP}")
         if not _is_plain_int(self.concurrency) or self.concurrency < 1:
             raise ValueError("batch concurrency must be positive")
         if not isinstance(self.output_order, ReferenceOutputOrder):
@@ -300,7 +300,7 @@ class BatchDispatch:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class DirectDispatch:
+class KernelDirectDispatch:
     """Explicit bounded direct dispatch."""
 
     concurrency: int = 10
@@ -315,7 +315,7 @@ class DirectDispatch:
 
 
 type ListPlan = SingleResponsePlan | OffsetSequentialPlan | CountedOffsetPlan | KeysetPlan | ItemCursorPlan
-type DispatchPlan = BatchDispatch | DirectDispatch
+type DispatchPlan = KernelBatchDispatch | KernelDirectDispatch
 
 
 def _validate_page_size(limit_path: ParameterPath | None, requested_page_size: int | None) -> None:
@@ -343,13 +343,13 @@ def _is_plain_int(value: object) -> bool:
 
 
 __all__ = [
-    "BatchDispatch",
     "CountedOffsetMode",
     "CountedOffsetPlan",
     "CursorTerminalRule",
-    "DirectDispatch",
     "DispatchPlan",
     "ItemCursorPlan",
+    "KernelBatchDispatch",
+    "KernelDirectDispatch",
     "KeysetPlan",
     "KeysetTerminalRule",
     "ListPlan",

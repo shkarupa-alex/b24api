@@ -6,14 +6,15 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from b24api.contracts.policy import ReplayDisposition
-from b24api.contracts.request import Request, RequestSummary
+from b24api.contracts.request import Request
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from b24api.contracts.error_base import B24ApiError
     from b24api.contracts.json import JsonValue
+    from b24api.contracts.request_summary import RequestSummary
     from b24api.contracts.response import Response
-    from b24api.errors import B24ApiError
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,7 +36,6 @@ class NotExecutedReason(StrEnum):
     HALTED = "halted"
     SOURCE_FAILED = "source_failed"
     LOCAL_VALIDATION_FAILED = "local_validation_failed"
-    SCHEDULER_STOPPED = "scheduler_stopped"
 
 
 @dataclass(frozen=True, slots=True)

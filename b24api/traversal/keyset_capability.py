@@ -1,19 +1,13 @@
 """Pure capability-planning values for fast integer keysets."""
 
-# ruff: noqa: FBT003, PLR2004
+# ruff: noqa: PLR2004
 
 from __future__ import annotations
-from collections import deque
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from b24api.contracts.keyset_execution import (
-    AutoKeysetExecution,
-    KeysetExecutionKind,
-    KeysetPageCompletion,
     KeysetPhase,
-    PartitionedKeysetExecution,
-    RangeKeysetExecution,
 )
 from b24api.errors import PaginationError
 from b24api.traversal.keyset_auto import BoundaryFacts, TotalHintState, normalize_total_hint
@@ -23,20 +17,15 @@ from b24api.traversal.keyset_fast_plan import (
     LaneSpec,
     LaneState,
     LaneStatus,
-    plan_lanes_from_anchors,
-    plan_windows,
-    window_count,
 )
-from b24api.traversal.keyset_partition import anchor_guesses, normalize_anchors
-from b24api.traversal.keyset_range import range_window_width
+from b24api.traversal.keyset_geometry import BoundaryDensity, anchor_guesses, boundary_density, normalize_anchors
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from b24api.contracts.json import FrozenJson
     from b24api.contracts.request import Request
-    from b24api.contracts.traversal import KeysetSpec
-    from b24api.traversal.page_validation import LaneCommandPlan, LaneReceipt
+    from b24api.traversal.keyset_page_validation import LaneCommandPlan, LaneReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +65,6 @@ def build_capability_plans(  # noqa: PLR0913
                 kind=LaneKind.LANE,
                 bounds=bounds,
                 descending=command.descending,
-                owns_output=False,
                 retained_upper_anchor=None,
             ),
             bounds.upper_exclusive if command.descending else bounds.lower_exclusive,
@@ -84,7 +72,6 @@ def build_capability_plans(  # noqa: PLR0913
             None,
             0,
             command.reserve,
-            deque(),
         )
         plan = lane_plan(
             lane,
@@ -112,23 +99,12 @@ class AnchorResult:
 
 
 @dataclass(frozen=True, slots=True)
-class LaneGeometry:
-    """Return selected body lanes with range-only report geometry."""
-
-    specs: tuple[LaneSpec, ...]
-    window_width: int | None
-    window_count: int | None
-
-
-@dataclass(frozen=True, slots=True)
 class BoundaryAnalysis:
     """Collect pure boundary facts, density evidence, and advisory-total state."""
 
     facts: BoundaryFacts
     total_hint: TotalHintState
-    interior_span: int | None
-    density_numerator: int | None
-    density_denominator: int | None
+    density: BoundaryDensity | None
 
 
 def analyze_boundary(
@@ -165,25 +141,7 @@ def analyze_boundary(
         overlap,
         adjacent,
     )
-    if not ascending.identities or not descending.identities:
-        return BoundaryAnalysis(facts, total_hint, None, None, None)
-    interior_span = max(0, min(descending.identities) - max(ascending.identities) - 1)
-    density_denominator = max(
-        1,
-        max(ascending.identities)
-        - min(ascending.identities)
-        + 1
-        + max(descending.identities)
-        - min(descending.identities)
-        + 1,
-    )
-    return BoundaryAnalysis(
-        facts,
-        total_hint,
-        interior_span,
-        len(ascending.rows) + len(descending.rows),
-        density_denominator,
-    )
+    return BoundaryAnalysis(facts, total_hint, boundary_density(facts))
 
 
 def canary_commands(
@@ -284,7 +242,6 @@ def compact_anchor_receipts(
             receipt,
             rows=receipt.rows[:1],
             identities=receipt.identities[:1],
-            last_identity=receipt.identities[0] if receipt.identities else None,
         )
         for receipt in receipts
     )
@@ -295,60 +252,6 @@ def compact_anchor_receipts(
 def anchor_capable_batch_capacity(*, current: int, available_rows: int, page_cap: int, target_lanes: int) -> int:
     """Disable auto anchor probing unless one body page and all possible anchors fit."""
     return current if available_rows >= page_cap + target_lanes else 0
-
-
-def selected_lane_geometry(  # noqa: PLR0913
-    *,
-    selected: KeysetExecutionKind,
-    execution: RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
-    keyset: KeysetSpec,
-    completion: KeysetPageCompletion,
-    page_cap: int,
-    ascending: tuple[int, ...],
-    descending: tuple[int, ...],
-    anchors: tuple[int, ...],
-) -> LaneGeometry:
-    """Plan body lane values without touching scheduler lifecycle state."""
-    lo, hi = max(ascending), min(descending)
-    width = count = None
-    if selected is KeysetExecutionKind.RANGE:
-        explicit = (
-            execution.window_width
-            if isinstance(execution, RangeKeysetExecution)
-            else execution.range_window_width
-            if isinstance(execution, AutoKeysetExecution)
-            else None
-        )
-        width = range_window_width(
-            completion=completion,
-            page_cap=page_cap,
-            span=max(0, hi - lo - 1),
-            density_numerator=len(ascending) + len(descending),
-            density_denominator=max(
-                1,
-                max(ascending) - min(ascending) + 1 + max(descending) - min(descending) + 1,
-            ),
-            explicit=explicit,
-        )
-        count = window_count(lo=lo, upper_exclusive=hi, width=width)
-        specs = plan_windows(lo=lo, upper_exclusive=hi, width=width)
-    else:
-        specs = plan_lanes_from_anchors(lo=lo, upper_exclusive=hi, anchors=anchors)
-    if keyset.direction == "descending":
-        specs = tuple(
-            replace(
-                spec,
-                ordinal=ordinal,
-                descending=True,
-                retained_upper_anchor=(
-                    spec.bounds.lower_exclusive
-                    if selected is KeysetExecutionKind.PARTITIONED and spec.bounds.lower_exclusive != lo
-                    else None
-                ),
-            )
-            for ordinal, spec in enumerate(reversed(specs))
-        )
-    return LaneGeometry(specs, width, count)
 
 
 def lane_for_command(
@@ -362,25 +265,23 @@ def lane_for_command(
     """Resolve the immutable validation view for one correlated command."""
     if plan.phase is KeysetPhase.BOUNDARY:
         return LaneState(
-            LaneSpec(plan.lane_ordinal, LaneKind.HEAD, LaneBounds(None, None), plan.lane_ordinal == 1, True, None),
+            LaneSpec(plan.lane_ordinal, LaneKind.HEAD, LaneBounds(None, None), plan.lane_ordinal == 1, None),
             None,
             LaneStatus.OPEN,
             None,
             0,
             plan.reserved_rows,
-            deque(),
         )
-    if plan.phase in {KeysetPhase.CANARY, KeysetPhase.ANCHOR_PROBE}:
+    if plan.phase is KeysetPhase.ANCHOR_PROBE:
         bounds = planning_bounds[plan.command_id]
         descending = planning_descending.get(plan.command_id, False)
         return LaneState(
-            LaneSpec(plan.lane_ordinal, LaneKind.LANE, bounds, descending, False, None),
+            LaneSpec(plan.lane_ordinal, LaneKind.LANE, bounds, descending, None),
             bounds.upper_exclusive if descending else bounds.lower_exclusive,
             LaneStatus.OPEN,
             None,
             0,
             plan.reserved_rows,
-            deque(),
         )
     if plan.phase is KeysetPhase.FINISH:
         if finish_lane is None:

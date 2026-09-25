@@ -1,9 +1,7 @@
 """One-binding event adapter for direct sequential traversal mechanics."""
 
 from __future__ import annotations
-import hashlib
-import json
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 from uuid import uuid4
 
 from b24api.completion.closure import qualified_closure
@@ -26,11 +24,6 @@ from b24api.contracts.completion import (
 )
 from b24api.contracts.policy import KernelState
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from b24api.traversal.values import IdentityValue
-
 
 class CompletionSink(Protocol):
     """Page lifecycle methods required by the traversal driver."""
@@ -43,7 +36,7 @@ class CompletionSink(Protocol):
         """Register a physical outcome."""
         ...
 
-    def validated(self, identities: Sequence[IdentityValue], row_count: int) -> None:
+    def validated(self, row_count: int) -> None:
         """Register an admitted page."""
         ...
 
@@ -106,17 +99,15 @@ class CompletionRecorder:
             self._unknown = self._unknown or outcome is CommandSettlement.UNKNOWN
             self._current = None
 
-    def validated(self, identities: Sequence[IdentityValue], row_count: int) -> None:
-        """Record exact admitted identity order without retaining values."""
+    def validated(self, row_count: int) -> None:
+        """Record the validated row count of the current page without retaining values."""
         page_id = self._require_page()
-        digest = hashlib.sha256(json.dumps(identities, separators=(",", ":")).encode()).hexdigest()
         self.gate.emit(
             PageValidated(
                 operation_id=self.gate.operation_id,
                 sequence=self._take(),
                 binding_id=0,
                 page_id=page_id,
-                identity_digest=digest,
                 row_count=row_count,
             )
         )

@@ -5,7 +5,7 @@ import contextlib
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
-from b24api.contracts.completion import EMPTY_SOURCE_WITNESS, EmptySourceWitness
+from b24api.contracts.completion import EMPTY_SOURCE_WITNESS, CommandSettlement, EmptySourceWitness
 from b24api.contracts.json import FrozenJson, _json_type_name
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import (
@@ -42,9 +42,10 @@ from b24api.errors import (
     PaginationError,
     ResultShapeError,
 )
+from b24api.execution import WorkClass
 from b24api.traversal.control_preflight import preflight_controls
-from b24api.traversal.counted_batch import _CountedBatchMixin
-from b24api.traversal.cursor import _CursorMixin
+from b24api.traversal.counted_batch import CountedBatchStrategy, empty_source_head_eligible
+from b24api.traversal.cursor import ItemCursorStrategy
 from b24api.traversal.identity import (
     _PLAN_TYPES,
     PageFetch,
@@ -58,7 +59,7 @@ from b24api.traversal.identity import (
     _PageRejectionError,
     _validate_confirmation_policy,
 )
-from b24api.traversal.keyset import _KeysetMixin
+from b24api.traversal.keyset import KeysetStrategy
 from b24api.traversal.page_adaptation import _SourcePageState, adapt_page
 from b24api.traversal.plans import (
     CountedOffsetPlan,
@@ -69,7 +70,8 @@ from b24api.traversal.plans import (
     OffsetSequentialPlan,
     SingleResponsePlan,
 )
-from b24api.traversal.sequential import _SequentialMixin
+from b24api.traversal.sequential import CountedStrategy, OffsetStrategy, SingleResponseStrategy
+from b24api.traversal.strategy_context import PagedStrategy, PageStop, SequentialPageStrategy
 from b24api.traversal.values import (
     IdentityValue,
     _coerce_identity,
@@ -94,7 +96,20 @@ if TYPE_CHECKING:
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 
-class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _CursorMixin):
+def _strategy(plan: ListPlan) -> SequentialPageStrategy | PagedStrategy:
+    """Compose the strategy that owns a validated plan's requests and verdicts."""
+    if isinstance(plan, SingleResponsePlan):
+        return SingleResponseStrategy(plan)
+    if isinstance(plan, OffsetSequentialPlan):
+        return OffsetStrategy(plan)
+    if isinstance(plan, CountedOffsetPlan):
+        return CountedStrategy(plan)
+    if isinstance(plan, KeysetPlan):
+        return KeysetStrategy(plan)
+    return ItemCursorStrategy(plan)
+
+
+class PaginationDriver:
     """One operation-local state machine over an explicit immutable plan."""
 
     def __init__(  # noqa: PLR0913
@@ -121,9 +136,9 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self.selector = plan.selector or selector or ResultSelector.root()
         self.identity = identity
         self.context = context
-        self._fetch_override = fetch
+        self.fetch_override = fetch
         self.completion_recorder = completion_recorder
-        self._single_result_as_item = single_result_as_item
+        self.single_result_as_item = single_result_as_item
         if page_cap_hint is not None and (
             not isinstance(page_cap_hint, int) or isinstance(page_cap_hint, bool) or page_cap_hint < 1
         ):
@@ -132,7 +147,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self.page_adapter = page_adapter
         self.terminal_reason: str | None = None
         self.initial_cursor = initial_cursor
-        self.cursor_state: JsonValue = cast("JsonValue", initial_cursor)
+        self.cursor_state: JsonValue | IdentityValue = initial_cursor
         self.violations: list[Violation] = []
         self.validated_rows = 0
         self._fingerprints: set[str] = set()
@@ -162,33 +177,94 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self.empty_source_witness: EmptySourceWitness | None = None
         self._empty_source_allowance = False
 
-    async def pages(self) -> AsyncGenerator[_Page]:  # noqa: C901
+    async def pages(self) -> AsyncGenerator[_Page]:
         """Yield validated traversal pages."""
         self.begin_external_validation()
         try:
-            if isinstance(self.plan, SingleResponsePlan):
-                async for page in self._single(self.plan):
-                    yield page
-                return
-            if isinstance(self.plan, OffsetSequentialPlan):
-                async for page in self._offset(self.plan):
-                    yield page
-                return
-            if isinstance(self.plan, CountedOffsetPlan):
-                async for page in self._counted(self.plan):
-                    yield page
-                return
-            if isinstance(self.plan, KeysetPlan):
-                async for page in self._keyset(self.plan):
-                    yield page
-                return
-            if isinstance(self.plan, ItemCursorPlan):
-                async for page in self._cursor(self.plan):
-                    yield page
-                return
-            raise AssertionError("validated list plan was not dispatched")
+            strategy = _strategy(self.plan)
+            pages = strategy.pages(self) if isinstance(strategy, PagedStrategy) else self._sequential(strategy)
+            async for page in pages:
+                yield page
         finally:
             self.close_external_validation()
+
+    async def _sequential(self, strategy: SequentialPageStrategy) -> AsyncGenerator[_Page]:
+        """Own each page transaction: fetch, select, judge, validate, record the rejection or yield."""
+        request = strategy.first_request(self)
+        while True:
+            response = await self.fetch(request)
+            trace_count = self.page_trace_count
+            items: tuple[FrozenJson, ...] = ()
+            try:
+                items = self.select_page(response)
+                verdict = strategy.judge(self, response, items)
+                identities = self.validate_page(
+                    items,
+                    response=response,
+                    terminal=verdict.terminal,
+                    identities=verdict.identities,
+                )
+            except BaseException as error:
+                if self.page_trace_count == trace_count:
+                    self.reject_external_page(items, response, error)
+                raise
+            if items:
+                yield _Page(tuple(items), response, (1,) * len(items), not verdict.terminal)
+            step = strategy.advance(self, identities)
+            if isinstance(step, PageStop):
+                self.terminal_reason = step.reason
+                return
+            request = step
+
+    def counted_batch_pages(self, *, batch_size: int, page_size: int) -> AsyncGenerator[_Page]:
+        """Execute the committed direct-head/batched-tail counted traversal."""
+        return CountedBatchStrategy(batch_size=batch_size, page_size=page_size).pages(self)
+
+    def empty_source_head_eligible(
+        self,
+        response: Response,
+        source: tuple[FrozenJson, ...],
+        adapted: tuple[FrozenJson, ...],
+    ) -> bool:
+        """Return, without side effects, whether an unvalidated head may witness an empty source."""
+        return empty_source_head_eligible(self, response, source, adapted)
+
+    async def fetch(self, request: Request) -> Response:
+        """Fetch one page directly, accounting for it in the operation budget."""
+        if self.fetch_override is not None:
+            return await self.fetch_override(request)
+        recorder = self.completion_recorder
+        if recorder is not None:
+            recorder.scheduled()
+        reservation = None
+        try:
+            reservation = await self.context.reserve_page()
+            response = await self.executor.execute(
+                request,
+                context=self.context,
+                work_class=WorkClass.TRAVERSAL_DIRECT,
+            )
+            self.context.commit_page(reservation)
+            if recorder is not None:
+                recorder.settled(CommandSettlement.SUCCESS)
+        except BaseException as error:
+            if recorder is not None:
+                recorder.settled(
+                    CommandSettlement.UNKNOWN
+                    if bool(getattr(error, "_b24api_dispatch_started", False))
+                    else CommandSettlement.NOT_EXECUTED,
+                )
+            if reservation is not None:
+                self.context.release_page(reservation)
+            if bool(getattr(error, "_b24api_dispatch_started", False)):
+                self.set_page_dispatch(dispatch=PageDispatch.DIRECT)
+                self.record_unknown_page(
+                    dispatch=PageDispatch.DIRECT,
+                    batch_index=None,
+                    error=error,
+                )
+            raise
+        return response
 
     def begin_external_validation(self) -> None:
         """Start canonical contract and identity validation for an external page dispatcher."""
@@ -208,7 +284,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         """Validate one externally dispatched page with the canonical traversal state machine."""
         if self._identity_store is None:
             raise RuntimeError("page validation is not active")
-        self._validate_page(items, response=response, terminal=terminal, empty_source=empty_source)
+        self.validate_page(items, response=response, terminal=terminal, empty_source=empty_source)
 
     def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:
         """Select one scheduled page and retain value-free evidence on shape rejection."""
@@ -322,7 +398,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             consistency.confirmation_policy,
         )
 
-    def _require_identity(self, plan_name: str) -> IdentitySpec:
+    def require_identity(self, plan_name: str) -> IdentitySpec:
+        """Return the scalar identity a plan requires, or reject the plan."""
         if not isinstance(self.identity, IdentitySpec):
             raise CapabilityError(f"{plan_name} traversal requires IdentitySpec")
         return self.identity
@@ -339,7 +416,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self._confirmation_policy = effective.confirmation_policy
         preflight_controls(self)
 
-    def _validate_page(  # noqa: PLR0913
+    def validate_page(  # noqa: PLR0913
         self,
         items: tuple[FrozenJson, ...],
         *,
@@ -439,7 +516,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             self._fingerprints.update((fingerprint,) if track_fingerprint else ())
             self._record_committed_page(items, response)
             return []
-        identities = self._extract_identities(items) if identities is None else identities
+        identities = self.extract_identities(items) if identities is None else identities
         if self._order_direction is not None:
             _validate_order(identities, self._order_direction)
             if self._last_identity is not None and identities:
@@ -473,7 +550,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         if identities:
             self._last_identity = identities[-1]
         self._fingerprints.update((fingerprint,) if track_fingerprint else ())
-        self._record_committed_page(items, response, identities)
+        self._record_committed_page(items, response)
         return identities
 
     def _settle_duplicates(self, duplicates: int) -> None:
@@ -496,7 +573,6 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         self,
         items: tuple[FrozenJson, ...],
         response: Response,
-        identities: Sequence[IdentityValue] = (),
     ) -> None:
         self._append_page_record(
             PageRecord(
@@ -513,7 +589,7 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
             ),
         )
         if self.completion_recorder is not None:
-            self.completion_recorder.validated(identities, len(items))
+            self.completion_recorder.validated(len(items))
 
     def schedule_page(
         self,
@@ -594,7 +670,8 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         if self.completion_recorder is not None:
             self.completion_recorder.rejected(code.value)
 
-    def _extract_identities(self, items: tuple[FrozenJson, ...]) -> list[IdentityValue]:
+    def extract_identities(self, items: tuple[FrozenJson, ...]) -> list[IdentityValue]:
+        """Return the identities of the page's items."""
         if self.identity is None:
             return []
         composite = isinstance(self.identity, CompositeIdentitySpec)
@@ -693,6 +770,21 @@ class PaginationDriver(_CountedBatchMixin, _SequentialMixin, _KeysetMixin, _Curs
         )
         self.page_trace[:] = retained
         self.page_trace_truncated = self.page_trace_truncated or truncated
+
+    @property
+    def expected_total(self) -> int | None:
+        """Return the exact total the traversal has committed to, if any."""
+        return self._expected_total
+
+    @property
+    def confirmation_policy(self) -> ConfirmationPolicy:
+        """Return the effective completion confirmation policy."""
+        return self._confirmation_policy
+
+    @property
+    def page_offset(self) -> int | None:
+        """Return the logical offset of the scheduled page."""
+        return self._page_offset
 
     @property
     def page_trace_count(self) -> int:

@@ -16,12 +16,11 @@ from b24api.errors import (
     AmbiguousExecutionError,
     B24ApiError,
     CapabilityError,
-    EnvelopeContractError,
     PageAdaptationError,
     PaginationError,
     ProtocolError,
 )
-from b24api.traversal.keyset_range import closure_witness
+from b24api.traversal.keyset_geometry import closure_witness
 from b24api.traversal.page_adaptation import adapt_page
 from b24api.traversal.values import _coerce_identity, _extract_path, _response_items, _validate_order
 
@@ -57,8 +56,6 @@ class LaneReceipt:
     command_id: str
     rows: tuple[FrozenJson, ...]
     identities: tuple[int, ...]
-    page_full: bool
-    last_identity: int | None
     witness: ClosureWitness | None
     warnings: tuple[Violation, ...]
 
@@ -116,7 +113,7 @@ def classify_rejection(outcome: BatchOutcome) -> tuple[PageOutcome, PageRejectio
     error = outcome.error
     if isinstance(error, AmbiguousExecutionError):
         return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION
-    if isinstance(error, ProtocolError | EnvelopeContractError):
+    if isinstance(error, ProtocolError):
         summary = error.request_summary
         if summary is not None and summary.method == "batch":
             return PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE
@@ -151,7 +148,7 @@ def validate_lane_receipt(  # noqa: PLR0913
     rows: tuple[FrozenJson, ...] = ()
     try:
         rows = _response_items(outcome.response, selector or ResultSelector.root())
-        if plan.phase not in {KeysetPhase.ANCHOR_PROBE, KeysetPhase.CANARY}:
+        if plan.phase is not KeysetPhase.ANCHOR_PROBE:
             rows = adapt_page(
                 outcome.response,
                 rows,
@@ -197,8 +194,6 @@ def validate_lane_receipt(  # noqa: PLR0913
             plan.command_id,
             rows,
             identities,
-            len(rows) == effective_page_cap,
-            identities[-1] if identities else None,
             witness,
             (),
         )
@@ -257,7 +252,6 @@ def normalize_tail_receipt(
         tail,
         rows=tuple(row for row, _ in filtered),
         identities=tuple(identity for _, identity in filtered),
-        last_identity=filtered[-1][1] if filtered else None,
     ), overlap
 
 

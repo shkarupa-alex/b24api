@@ -4,10 +4,13 @@ from __future__ import annotations
 import asyncio
 import gc
 import weakref
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
 
+import b24api
 from b24api import execution as execution_module
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import ReplaySafety, Request, RouteKind
@@ -37,10 +40,21 @@ from b24api.execution.rate import (
     RatePolicyCapacityError,
 )
 from b24api.transport import httpx as httpx_transport_module
+from tests.scripting import ResponderTransport, replies
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from tests.scripting import ClientFactory
 
 EXPECTED_RETRIED_CALLS = 2
 HTTP_OK = 200
 SMALL_RESPONSE_CEILING = 8
+
+
+def _sequence(outcomes: Iterable[WireResponse | Exception]) -> ResponderTransport:
+    """Answer the n-th send with the n-th outcome; an exception outcome is raised."""
+    return ResponderTransport(replies(*outcomes))
 
 
 @pytest.mark.asyncio
@@ -158,32 +172,11 @@ async def test_transport_webhook_vault_is_opaque_and_gc_bounded() -> None:
     gc.collect()
 
     assert reference() is None
-    with pytest.raises(RuntimeError, match="credential is unavailable"):
+    with pytest.raises(TransportError, match="credential is unavailable") as refused:
         httpx_transport_module._webhook_for(handle)  # noqa: SLF001 - lifecycle regression
+    assert refused.value.phase is FailurePhase.NOT_DISPATCHED
+    assert refused.value.retryable is False
     await client.aclose()
-
-
-class SequenceTransport:
-    """Provide a deterministic test helper."""
-
-    host = "fixture.invalid"
-
-    def __init__(self, outcomes: tuple[WireResponse | Exception, ...] | list[WireResponse | Exception]) -> None:
-        """Initialize instance state."""
-        self.outcomes = list(outcomes)
-        self.calls = 0
-        self.timeouts: list[float] = []
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        """Send one transport request attempt."""
-        del request
-        assert max_response_bytes > 0
-        self.timeouts.append(attempt_timeout)
-        outcome = self.outcomes[self.calls]
-        self.calls += 1
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
 
 
 class CancellationTransport(httpx.AsyncBaseTransport):
@@ -199,6 +192,26 @@ class CancellationTransport(httpx.AsyncBaseTransport):
         self.entered.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
+
+
+_LIBRARY_ROOT = Path(b24api.__file__).resolve().parent
+
+
+def _assert_library_frames_omit(error: BaseException, fragment: str) -> None:
+    """Assert no b24api traceback frame retains the fragment, and that such frames were inspected.
+
+    A suffix filter like ``/b24api/`` would also match this repository's parent directory, and the
+    former ``b24api/execution.py`` filter matched no file at all, so the loop inspected nothing.
+    """
+    checked_frames = 0
+    traceback = error.__traceback__
+    while traceback is not None:
+        if Path(traceback.tb_frame.f_code.co_filename).resolve().is_relative_to(_LIBRARY_ROOT):
+            checked_frames += 1
+            for value in traceback.tb_frame.f_locals.values():
+                assert fragment not in repr(value)
+        traceback = traceback.tb_next
+    assert checked_frames > 0
 
 
 def test_transport_constructor_drops_webhook_when_httpx_client_initialization_fails(
@@ -217,12 +230,7 @@ def test_transport_constructor_drops_webhook_when_httpx_client_initialization_fa
     error = captured.value
     assert error.__cause__ is None
     assert error.__context__ is None
-    traceback = error.__traceback__
-    while traceback is not None:
-        if traceback.tb_frame.f_code.co_filename.endswith("b24api/execution.py"):
-            for value in traceback.tb_frame.f_locals.values():
-                assert sensitive_fragment not in repr(value)
-        traceback = traceback.tb_next
+    _assert_library_frames_omit(error, sensitive_fragment)
 
 
 @pytest.mark.asyncio
@@ -258,7 +266,7 @@ def _policy(*, attempts: int = 3, delay: float = 0.0, elapsed: float = 10.0) -> 
 
 @pytest.mark.asyncio
 async def test_terminal_negative_one_next_is_normalized() -> None:
-    transport = SequenceTransport([_success(b'{"result":[],"next":-1}')])
+    transport = _sequence([_success(b'{"result":[],"next":-1}')])
 
     response = await Executor(transport).execute(Request("mobile.disk.folder.getchildren", route=RouteKind.BARE))
 
@@ -269,26 +277,26 @@ async def test_terminal_negative_one_next_is_normalized() -> None:
 @pytest.mark.asyncio
 async def test_safe_and_unknown_retry_only_when_replay_is_proven() -> None:
     pre_dispatch = TransportError("connect", phase=FailurePhase.NOT_DISPATCHED)
-    safe_transport = SequenceTransport([pre_dispatch, _success()])
+    safe_transport = _sequence([pre_dispatch, _success()])
     safe = await Executor(safe_transport).execute(
         Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         policy=_policy(),
     )
     assert safe.result == {"ok": True}
-    assert safe_transport.calls == EXPECTED_RETRIED_CALLS
+    assert len(safe_transport.requests) == EXPECTED_RETRIED_CALLS
 
-    unknown_transport = SequenceTransport(
+    unknown_transport = _sequence(
         [TransportError("connect", phase=FailurePhase.CONNECTION_ESTABLISHED), _success()],
     )
     unknown = await Executor(unknown_transport).execute(Request("profile", route=RouteKind.BARE), policy=_policy())
     assert unknown.result == {"ok": True}
-    assert unknown_transport.calls == EXPECTED_RETRIED_CALLS
+    assert len(unknown_transport.requests) == EXPECTED_RETRIED_CALLS
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("safety", [ReplaySafety.UNKNOWN, ReplaySafety.UNSAFE])
 async def test_ambiguous_dispatch_never_retries_unproven_request(safety: ReplaySafety) -> None:
-    transport = SequenceTransport(
+    transport = _sequence(
         [TransportError("read failed", phase=FailurePhase.DISPATCH_STARTED), _success()],
     )
 
@@ -298,14 +306,14 @@ async def test_ambiguous_dispatch_never_retries_unproven_request(safety: ReplayS
             policy=_policy(),
         )
 
-    assert transport.calls == 1
+    assert len(transport.requests) == 1
     assert isinstance(captured.value.__cause__, TransportError)
     assert captured.value.__cause__.phase is FailurePhase.DISPATCH_STARTED
 
 
 @pytest.mark.asyncio
 async def test_safe_ambiguous_transport_retries_with_counted_attempts() -> None:
-    transport = SequenceTransport(
+    transport = _sequence(
         [TransportError("partial", phase=FailurePhase.BODY_PARTIALLY_RECEIVED), _success()],
     )
     executor = Executor(transport)
@@ -325,7 +333,7 @@ async def test_safe_ambiguous_transport_retries_with_counted_attempts() -> None:
 @pytest.mark.asyncio
 async def test_operation_elapsed_clock_starts_at_first_execution_not_context_construction() -> None:
     now = [0.0]
-    transport = SequenceTransport([_success()])
+    transport = _sequence([_success()])
     executor = Executor(transport, clock=lambda: now[0])
     context = executor.context(_policy(elapsed=1))
     now[0] = 100.0
@@ -342,23 +350,23 @@ async def test_retry_attempt_and_delay_budgets_terminate_before_extra_io() -> No
         TransportError("connect", phase=FailurePhase.NOT_DISPATCHED),
         TransportError("connect", phase=FailurePhase.NOT_DISPATCHED),
     )
-    transport = SequenceTransport(always_connect)
+    transport = _sequence(always_connect)
     with pytest.raises(BudgetExceededError, match="attempt"):
         await Executor(transport).execute(Request("profile", route=RouteKind.BARE), policy=_policy(attempts=2))
-    assert transport.calls == EXPECTED_RETRIED_CALLS
+    assert len(transport.requests) == EXPECTED_RETRIED_CALLS
 
-    delayed = SequenceTransport([WireResponse(status_code=503, headers=(), body=b"gateway")])
+    delayed = _sequence([WireResponse(status_code=503, headers=(), body=b"gateway")])
     with pytest.raises(BudgetExceededError, match="delay"):
         await Executor(delayed).execute(
             Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
             policy=_policy(delay=2, elapsed=1),
         )
-    assert delayed.calls == 1
+    assert len(delayed.requests) == 1
 
 
 @pytest.mark.asyncio
 async def test_structured_throttle_uses_shared_cooldown_and_safe_replay() -> None:
-    transport = SequenceTransport(
+    transport = _sequence(
         [
             WireResponse(
                 status_code=200,
@@ -376,7 +384,7 @@ async def test_structured_throttle_uses_shared_cooldown_and_safe_replay() -> Non
     snapshot = await context.snapshot()
 
     assert snapshot.retries == 1
-    assert transport.calls == EXPECTED_RETRIED_CALLS
+    assert len(transport.requests) == EXPECTED_RETRIED_CALLS
     await coordinator.close()
 
 
@@ -452,7 +460,7 @@ async def test_cancellation_after_grant_returns_capacity() -> None:
 async def test_permit_wait_is_bounded_without_counting_or_dispatching_an_attempt() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
     held = await coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"}))
-    transport = SequenceTransport([_success()])
+    transport = _sequence([_success()])
     executor = Executor(transport, coordinator=coordinator)
     context = executor.context(
         ExecutionPolicy(max_elapsed=0.02, max_retry_elapsed_per_request=0.02),
@@ -464,7 +472,7 @@ async def test_permit_wait_is_bounded_without_counting_or_dispatching_an_attempt
             context=context,
         )
 
-    assert transport.calls == 0
+    assert len(transport.requests) == 0
     assert (await context.snapshot()).counters.physical_requests == 0
     await held.release()
     await coordinator.close()
@@ -515,23 +523,28 @@ async def test_method_limit_admission_budget_and_closed_error_are_typed() -> Non
 
 
 @pytest.mark.asyncio
-async def test_unsafe_operation_time_limit_observes_method_without_replay() -> None:
-    transport = SequenceTransport(
+async def test_unsafe_operation_time_limit_waits_for_the_method_and_replays() -> None:
+    # OPERATION_TIME_LIMIT blocks the method before it runs, so even UNSAFE work is replayed after the cooldown
+    # (owner decision, 2026-09-25).
+    transport = _sequence(
         [
             WireResponse(
                 status_code=200,
                 headers=(),
                 body=b'{"error":"OPERATION_TIME_LIMIT","error_description":"wait"}',
             ),
+            WireResponse(200, (), b'{"result":true}'),
         ],
     )
     coordinator = RateCoordinator(operation_time_limit_delay=0.1)
-    with pytest.raises(ApiResponseError):
-        await Executor(transport, coordinator=coordinator).execute(
-            Request("crm.item.add", route=RouteKind.BARE, replay_safety=ReplaySafety.UNSAFE),
-        )
-    assert transport.calls == 1
-    assert (await coordinator.snapshot()).method_cooldowns == 1
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    response = await Executor(transport, coordinator=coordinator).execute(
+        Request("crm.item.add", route=RouteKind.BARE, replay_safety=ReplaySafety.UNSAFE),
+    )
+    assert response.result is True
+    assert len(transport.requests) == 2  # noqa: PLR2004 - one replay after the method cooldown
+    assert loop.time() - started >= 0.1  # noqa: PLR2004 - the replay waited for the method cooldown
     await coordinator.close()
 
 
@@ -545,7 +558,7 @@ _SAFE_PROFILE = Request("profile", route=RouteKind.BARE, replay_safety=ReplaySaf
 
 @pytest.mark.asyncio
 async def test_safe_operation_time_limit_past_the_budget_fails_at_once_with_its_cause() -> None:
-    transport = SequenceTransport([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
+    transport = _sequence([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
     coordinator = RateCoordinator()
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -555,7 +568,7 @@ async def test_safe_operation_time_limit_past_the_budget_fails_at_once_with_its_
         )
     # The default 120-second method cooldown cannot fit a 2-second budget, so nothing waits.
     assert loop.time() - started < 1.0
-    assert transport.calls == 1
+    assert len(transport.requests) == 1
     assert isinstance(captured.value.__cause__, ApiResponseError)
     assert captured.value.__cause__.normalized_code == "operation_time_limit"
     await coordinator.close()
@@ -564,7 +577,7 @@ async def test_safe_operation_time_limit_past_the_budget_fails_at_once_with_its_
 @pytest.mark.asyncio
 async def test_safe_operation_time_limit_within_the_budget_retries_after_the_cooldown() -> None:
     cooldown = 0.2
-    transport = SequenceTransport([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
+    transport = _sequence([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
     coordinator = RateCoordinator(operation_time_limit_delay=cooldown)
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -572,24 +585,23 @@ async def test_safe_operation_time_limit_within_the_budget_retries_after_the_coo
         _SAFE_PROFILE, policy=ExecutionPolicy(max_retry_elapsed_per_request=5.0)
     )
     assert response.result is True
-    assert transport.calls == len(transport.outcomes)
+    assert len(transport.requests) == 2  # noqa: PLR2004 - the time limit, then the retried success
     assert loop.time() - started >= cooldown * 0.9
     await coordinator.close()
 
 
 @pytest.mark.asyncio
-async def test_safe_traversal_page_operation_time_limit_keeps_its_typed_cause() -> None:
-    from b24api import Bitrix24  # noqa: PLC0415 - facade seam for one traversal control
+async def test_safe_traversal_page_operation_time_limit_keeps_its_typed_cause(scripted_client: ClientFactory) -> None:
 
-    transport = SequenceTransport([_OPERATION_TIME_LIMIT])
-    stream = Bitrix24._from_executor(Executor(transport)).iter_list(  # noqa: SLF001 - deterministic facade seam
+    transport = _sequence([_OPERATION_TIME_LIMIT])
+    stream = scripted_client(transport).iter_list(
         Request("crm.item.list", route=RouteKind.BARE, replay_safety=ReplaySafety.SAFE),
         page_size=50,
         policy=ExecutionPolicy(max_retry_elapsed_per_request=2.0),
     )
     with pytest.raises(BudgetExceededError) as captured:
         _ = [row async for row in stream]
-    assert transport.calls == 1
+    assert len(transport.requests) == 1
     assert isinstance(captured.value.__cause__, ApiResponseError)
     assert captured.value.__cause__.normalized_code == "operation_time_limit"
     assert stream.report is not None
@@ -864,12 +876,7 @@ async def test_out_of_range_socket_status_is_typed_and_drops_webhook_locals() ->
         error = captured.value
         assert error.__cause__ is None
         assert error.__context__ is None
-        traceback = error.__traceback__
-        while traceback is not None:
-            if traceback.tb_frame.f_code.co_filename.endswith("b24api/execution.py"):
-                for value in traceback.tb_frame.f_locals.values():
-                    assert sensitive_fragment not in repr(value)
-            traceback = traceback.tb_next
+        _assert_library_frames_omit(error, sensitive_fragment)
     finally:
         await transport.aclose()
         server.close()
@@ -916,11 +923,11 @@ async def test_socket_cancellation_propagates_and_counts_dispatched_attempt() ->
 
 @pytest.mark.asyncio
 async def test_negative_one_total_sentinel_is_preserved_but_lower_values_are_typed_errors() -> None:
-    sentinel = SequenceTransport([_success(b'{"result":[],"total":-1}')])
+    sentinel = _sequence([_success(b'{"result":[],"total":-1}')])
     response = await Executor(sentinel).execute(Request("im.recent.list", route=RouteKind.BARE), policy=_policy())
     assert response.total == -1
 
-    invalid = SequenceTransport([_success(b'{"result":[],"total":-2}')])
+    invalid = _sequence([_success(b'{"result":[],"total":-2}')])
     with pytest.raises(HTTPGatewayError) as captured:
         await Executor(invalid).execute(Request("profile", route=RouteKind.BARE), policy=_policy())
     assert captured.value.http_status == HTTP_OK
@@ -935,7 +942,7 @@ async def test_negative_one_total_sentinel_is_preserved_but_lower_values_are_typ
     ],
 )
 async def test_success_model_contract_failures_are_typed_and_keep_http_evidence(body: bytes) -> None:
-    transport = SequenceTransport([_success(body)])
+    transport = _sequence([_success(body)])
 
     with pytest.raises(ProtocolError) as captured:
         await Executor(transport).execute(Request("profile", route=RouteKind.BARE), policy=_policy())

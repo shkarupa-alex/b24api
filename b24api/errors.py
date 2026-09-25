@@ -3,72 +3,26 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
 from b24api._error_types import ErrorOrigin, FailurePhase
+from b24api.contracts.error_base import B24ApiError, BudgetExceededError
+from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.keyset_capability import KeysetCapabilityReport, KeysetCapabilityVerdict, KeysetInconclusiveReason
 from b24api.contracts.policy import AmbiguityReason, IdentityCoercion, ReplayDisposition
-from b24api.contracts.response import ResponseEvidence, ResultCollectionShape
-from b24api.redaction import DEFAULT_REDACTOR, Redactor
+from b24api.contracts.response import ResultCollectionShape
+from b24api.contracts.v3_codes import render_code
+from b24api.redaction import DEFAULT_REDACTOR, Redactor, SafeText
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from b24api._diagnostics import DiagnosticContext
     from b24api.contracts.command import CommandOutcome
     from b24api.contracts.reference import ReferenceOutcome
     from b24api.contracts.report import OperationReport
-    from b24api.contracts.request import PathPart, RequestSummary, ResultSelector
-
-
-class B24ApiError(Exception):
-    """Base error whose default text and serialization contain safe evidence only."""
-
-    default_origin: ClassVar[ErrorOrigin | None] = None
-
-    def __init__(  # noqa: PLR0913
-        self,
-        message: str,
-        *,
-        origin: ErrorOrigin | None = None,
-        description: str | None = None,
-        request_summary: RequestSummary | None = None,
-        evidence: ResponseEvidence | None = None,
-        retryable: bool = False,
-        redactor: Redactor = DEFAULT_REDACTOR,
-    ) -> None:
-        """Initialize instance state."""
-        resolved_origin = origin or self.default_origin
-        if resolved_origin is None:
-            raise TypeError("origin is required for B24ApiError")
-        self.origin = resolved_origin
-        self.description = redactor.redact_text(description) if description is not None else None
-        self.request_summary = request_summary
-        self.request = request_summary
-        self.evidence = evidence or ResponseEvidence()
-        self.retryable = retryable
-        safe_message = redactor.redact_text(message)
-        super().__init__(safe_message)
-
-    @property
-    def http_status(self) -> int | None:
-        """Return the http status."""
-        return self.evidence.http_status
-
-    def to_safe_dict(self) -> dict[str, object]:
-        """Serialize only bounded redacted fields."""
-        return {
-            "type": type(self).__name__,
-            "origin": self.origin.value,
-            "message": str(self),
-            "description": self.description,
-            "request": self.request_summary.to_dict() if self.request_summary else None,
-            "evidence": self.evidence.to_dict(),
-            "retryable": self.retryable,
-        }
-
-    def __repr__(self) -> str:
-        """Return a safe representation."""
-        return f"{type(self).__name__}({self.to_safe_dict()!r})"
+    from b24api.contracts.request import PathPart, ResultSelector
+    from b24api.contracts.request_summary import RequestSummary
 
 
 class TransportError(B24ApiError):
@@ -105,9 +59,7 @@ class TransportError(B24ApiError):
 
     def to_safe_dict(self) -> dict[str, object]:
         """Return the to safe dict representation."""
-        safe = super().to_safe_dict()
-        safe.update({"phase": self.phase.value, "possible_acceptance": self.possible_acceptance})
-        return safe
+        return {**super().to_safe_dict(), "phase": self.phase.value, "possible_acceptance": self.possible_acceptance}
 
 
 class HTTPGatewayError(B24ApiError):
@@ -116,14 +68,16 @@ class HTTPGatewayError(B24ApiError):
     default_origin = ErrorOrigin.HTTP_GATEWAY
 
 
-class EnvelopeContractError(HTTPGatewayError):
-    """A 2xx response violated the canonical Bitrix envelope contract."""
-
-
 class ProtocolError(B24ApiError):
     """Malformed or contradictory protocol envelope."""
 
     default_origin = ErrorOrigin.PROTOCOL
+
+
+class EnvelopeContractError(HTTPGatewayError, ProtocolError):
+    """A 2xx body is not a Bitrix envelope: a gateway-origin failure that ``except ProtocolError`` catches."""
+
+    default_origin = ErrorOrigin.HTTP_GATEWAY
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,37 +106,44 @@ class ApiResponseError(B24ApiError):
         origin: ErrorOrigin = ErrorOrigin.REST_MODULE,
         retryable: bool = False,
         redactor: Redactor = DEFAULT_REDACTOR,
+        diagnostics: DiagnosticContext | None = None,
     ) -> None:
-        """Initialize instance state."""
+        """Keep raw codes as attributes; render codes, message and evidence once for every output channel."""
         self.original_code = code
         self.code = str(code).lower()
         self.normalized_code = str(code) if code_is_exact else str(code).strip().casefold()
-        self.wire_code = redactor.redact_text(str(code))
+        self.wire_code = render_code(code, redactor=redactor, context=diagnostics)
+        self._safe_codes = {
+            "original_code": code if isinstance(code, int) else self.wire_code,
+            "code": render_code(self.code, redactor=redactor, context=diagnostics),
+            "normalized_code": render_code(self.normalized_code, redactor=redactor, context=diagnostics),
+        }
         self.validation = tuple(validation)
         self.truncated = truncated
-        summary = request_summary
-        safe_description = redactor.redact_text(description) if description is not None else None
+        safe_description = redactor.render_text(description, context=diagnostics) if description is not None else None
         rendered_code = self.wire_code
-        normalized_suffix = f" (normalized: {self.normalized_code})" if rendered_code != self.normalized_code else ""
+        normalized = self._safe_codes["normalized_code"]
+        normalized_suffix = f" (normalized: {normalized})" if rendered_code != normalized else ""
         if rendered_code and safe_description:
             message = f"API error [{rendered_code}]{normalized_suffix}: {safe_description}"
         elif rendered_code:
             message = f"API error [{rendered_code}]{normalized_suffix}"
         else:
             message = f"API error: {safe_description}"
-        redacted_headers = redactor.redact(dict(headers or {}))
+        redacted_headers = redactor.redact(dict(headers or {}), context=diagnostics)
         safe_headers = tuple(sorted((str(key), str(value)) for key, value in redacted_headers.items()))
         evidence = ResponseEvidence(
             http_status=http_status,
             request_id=dict(safe_headers).get("x-request-id"),
             headers=safe_headers,
+            # The codec already rendered the preview through the request context; aliases must not be re-aliased.
             body_preview=redactor.redact_text(body_preview) if body_preview is not None else None,
         )
         super().__init__(
-            message,
+            SafeText(message),  # every part above is already rendered; a second pass would hide the known code
             origin=origin,
             description=safe_description,
-            request_summary=summary,
+            request_summary=request_summary,
             evidence=evidence,
             retryable=retryable,
             redactor=redactor,
@@ -193,13 +154,7 @@ class ApiResponseError(B24ApiError):
         safe = super().to_safe_dict()
         safe.update(
             {
-                "original_code": (
-                    self.original_code
-                    if isinstance(self.original_code, int)
-                    else DEFAULT_REDACTOR.redact_text(self.original_code)
-                ),
-                "code": DEFAULT_REDACTOR.redact_text(self.code),
-                "normalized_code": DEFAULT_REDACTOR.redact_text(self.normalized_code),
+                **self._safe_codes,
                 "wire_code": self.wire_code,
                 "validation": [{"field": issue.field, "message": issue.message} for issue in self.validation],
                 "truncated": self.truncated,
@@ -426,12 +381,6 @@ class KeysetCapabilityError(CapabilityError):
         return safe
 
 
-class BudgetExceededError(B24ApiError):
-    """Execution would exceed an explicit operational budget."""
-
-    default_origin = ErrorOrigin.BUDGET
-
-
 class ResponseTooLargeError(B24ApiError):
     """A decompressed response exceeded the configured byte ceiling."""
 
@@ -537,11 +486,29 @@ class ReferenceFailed[C](B24ApiError):  # noqa: N818 - normative public name
         super().__init__("Reference traversal did not complete", origin=ErrorOrigin.PAGINATION)
 
 
-_PUBLIC_ERROR_NAMES = (
-    "AmbiguousExecutionError ApiResponseError B24ApiError BatchCommandError BatchFailed BudgetExceededError "
-    "CapabilityError EnvelopeContractError ErrorOrigin FailurePhase HTTPGatewayError IdentityContractError "
-    "IncompleteTraversalError InputSourceError PaginationError ProtocolError ReferenceFailed ResponseTooLargeError "
-    "KeysetCapabilityError PageAdaptationError PageAdaptationViolation ResultShapeError TransportError"
-    " ValidationIssue"
+__all__ = (
+    "AmbiguousExecutionError",
+    "ApiResponseError",
+    "B24ApiError",
+    "BatchCommandError",
+    "BatchFailed",
+    "BudgetExceededError",
+    "CapabilityError",
+    "EnvelopeContractError",
+    "ErrorOrigin",
+    "FailurePhase",
+    "HTTPGatewayError",
+    "IdentityContractError",
+    "IncompleteTraversalError",
+    "InputSourceError",
+    "KeysetCapabilityError",
+    "PageAdaptationError",
+    "PageAdaptationViolation",
+    "PaginationError",
+    "ProtocolError",
+    "ReferenceFailed",
+    "ResponseTooLargeError",
+    "ResultShapeError",
+    "TransportError",
+    "ValidationIssue",
 )
-__all__ = tuple(_PUBLIC_ERROR_NAMES.split())

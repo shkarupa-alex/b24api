@@ -24,11 +24,11 @@ from b24api.traversal.driver import PaginationDriver
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from b24api.contracts.evidence import ResponseEvidence
     from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.json import JsonValue
     from b24api.contracts.page import PageAdapter
     from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
-    from b24api.contracts.response import ResponseEvidence
     from b24api.execution import Executor
     from b24api.traversal.plans import CountedOffsetPlan
 
@@ -188,8 +188,6 @@ class CountedItemStream:
             state=state,
             assurance=CompletionAssurance.CALLER_ASSERTED,
             snapshot=snapshot_state,
-            plan_id="iter_list_counted",
-            dispatch_id="batch",
             emitted_rows=self._emitted,
             unique_rows=self._unique,
             duplicate_identities=self._driver.duplicate_identities,
@@ -226,7 +224,7 @@ class CountedItemStream:
         self._completion.terminal(
             closure,
             stream,
-            qualified_total=self._driver._expected_total if closure is BindingClosure.QUALIFIED_TOTAL else None,  # noqa: SLF001
+            qualified_total=self._driver.expected_total if closure is BindingClosure.QUALIFIED_TOTAL else None,
         )
 
 

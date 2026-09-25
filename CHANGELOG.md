@@ -1,7 +1,131 @@
 # Release notes
 
-## Unreleased
+## Unreleased (3.0.0)
 
+- **Breaking (3.0.0):** the `b24api` root exports 51 names instead of 165 (C7). The other 115 moved
+  to `b24api.contracts`, `b24api.errors`, `b24api.transport` or `b24api.completion`, which export
+  the same objects; no object was renamed. The old root paths do not resolve: `from b24api import
+  CommandSuccess` raises `ImportError`, `b24api.CommandSuccess` raises an `AttributeError` naming
+  the new path, and type checkers report both as `attr-defined`.
+  `python -m b24api.migration PATH...` lists every old root import, and the migration guide has the
+  full table, generated from `b24api.migration.ROOT_MOVES`. `KeysetSelectionSummary` is exported
+  only by `b24api.contracts`.
+- `HttpxTransport` is exported from the root.
+- **Breaking (3.0.0):** response bodies are decompressed inside a bounded decoder. Only identity or
+  one `gzip`/`deflate` coding is accepted; stacked, unknown, `br` and `zstd` codings are refused
+  before decompression as a body-read transport failure. `deflate` is decoded zlib-wrapped or raw, as
+  HTTPX decodes it. Library-owned requests send
+  `Accept-Encoding: gzip, deflate`; a header set by the caller or an injected client is kept (A2).
+- **Breaking (3.0.0):** a failed physical batch is replayed per command, not as a whole (A3). A
+  `SAFE` command is sent again, in a smaller physical batch, after any transient failure; an `UNSAFE`
+  or `UNKNOWN` command only when the failure proves it did not run: a transport failure before
+  dispatch, an unstructured 423, 425 or 429, or a request or time quota refusal
+  (`QUERY_LIMIT_EXCEEDED`, `OPERATION_TIME_LIMIT`) of the batch or of that command. An `UNSAFE` or
+  `UNKNOWN` command of a batch that may have run (a transport failure after dispatch, 408 or 5xx)
+  becomes `CommandOutcomeUnknown` with its own `AmbiguousExecutionError`; in 2.3 the whole batch
+  followed the least safe command. A direct `UNSAFE` or `UNKNOWN` request is now also retried after
+  such a proven refusal. The refusals are the new `AmbiguityPolicy.refusal_http_statuses` and
+  `AmbiguityPolicy.refusal_api_codes`; a code or status added only to `RetryPolicy` retries `SAFE`
+  work alone. Every send of a command, across replay rounds and the retries inside them, counts
+  against `max_attempts_per_request` and the retry time budget. A round in which a send may have
+  run, including one that was sent before the budget ran out, reports its commands as possibly
+  executed, unless its last answer was a listed refusal. A fail-fast batch is not split. A
+  transport failure marked `retryable=False` is raised once instead of exhausting the attempt
+  budget. An arbitrary exception from an injected transport becomes
+  `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause, and a
+  closed `HttpxTransport`, or one whose injected `httpx.AsyncClient` was closed before the call,
+  refuses with `TransportError(phase=NOT_DISPATCHED, retryable=False)` instead of `RuntimeError`
+  (A13). A response over `max_response_bytes` from an injected transport is refused before
+  decoding, and on
+  any transport, the bundled one included, every command of a physical batch whose response is
+  refused becomes `CommandOutcomeUnknown` instead of a `CommandFailure` (B29).
+- **Breaking (3.0.0):** error rendering is contextual. Known V3 error codes are shown verbatim, field
+  names taken from the request render as `field#N` aliases, the request's own sensitive values are
+  exact secrets, and distinct hidden mapping keys become `[REDACTED#1]`, `[REDACTED#2]`, … instead
+  of merging into one key. A registered secret of any length is hidden; one shorter than six
+  characters is replaced where it stands as a whole token. `str()`, `repr()`, `to_safe_dict()`,
+  reports and the CLI show the same text (A7).
+- **Breaking (3.0.0):** an offset traversal that starts mid-collection while a caller-qualified exact
+  total (`TotalTermination.EXACT_QUALIFIED`) closes it raises `CapabilityError` before any request,
+  instead of ending incomplete; with `TotalTermination.DISABLED` the suffix traversal still works
+  (A9).
+- **Breaking (3.0.0):** when the portal answers a boundary read wrongly, `verify_keyset_capability()`
+  raises `KeysetCapabilityError` carrying an `UNSUPPORTED` report, instead of a raw `PaginationError`
+  (order, page cap) or `CapabilityError` (identity shape). The report marks the failed boundary
+  check (`TWO_ROW_ASC` and/or `TWO_ROW_DESC`) as `ORDER_INVALID`, `CAP_EXCEEDED` or `SHAPE_INVALID`
+  and the other checks as `NOT_EXECUTED`. `KeysetCapabilityError` is a `CapabilityError`, not a
+  `PaginationError`. The CLI exits with 6 (A10).
+- **Breaking (3.0.0):** closing a logical batch early reports `EARLY_CLOSED` with the reason
+  `"stream closed before exhaustion"` (A12). A fail-fast batch reports `BatchCommandError` and the
+  violation `batch_command_failure` instead of a private carrier class (A14). A failed source close
+  after an early close publishes exactly one report, and a stream closed before its first read closes
+  the caller's source iterator once (A11). A stream raises its terminal failure once; a later read ends
+  the iteration with `StopAsyncIteration` and sends nothing, instead of raising the same exception
+  again. A cancellation during the cleanup on leaving `async with` no longer replaces the exception
+  raised in its body: that exception propagates and the cancellation lands on the next `await` (A11).
+- **Breaking (3.0.0):** `OffsetContinuation.FIXED_STEP` without an exact qualified total fails right
+  after a short page, without the unusable confirmation request (B10).
+- **Breaking (3.0.0):** `EnvelopeContractError` is also a `ProtocolError` with gateway origin (B20).
+  A fast keyset wave whose physical batch gets such a response records `BATCH_ENVELOPE` in
+  `page_trace` instead of `COMMAND_FAILURE`. A 2xx body with a top-level `error` that only the strict
+  parse rejects (invalid UTF-8, a non-finite number, a duplicate correlation key) is an
+  `EnvelopeContractError` instead of an `ApiResponseError` (B8).
+- The HTTPX log shield drops every `hpack.hpack` and `hpack.table` record while a library HTTPX
+  client is open. An HTTP/2 send is refused before I/O with `CapabilityError` when that filter was
+  removed or an injected client cannot be registered (A20). The `httpx` logger filter that hides a
+  registered webhook secret stays installed while an injected client outlives its transport.
+- **Dependencies:** `h2>=4.3.0,<4.5` and `hpack>=4.1.0,<4.3` are now direct requirements beside
+  `httpx[http2]>=0.28.1,<0.29`: the log shield filters the `hpack` logger names verified on those
+  lines, so an environment pinned below them must upgrade, and a newer line is admitted only after the
+  logger controls are rerun (C2).
+- Every keyset traversal reports `OperationReport.keyset_selection`;
+  `KeysetSelectionReason` gains `EXPLICIT_SEQUENTIAL` and `PAGE_STOP`, which exhaustive matches must
+  handle (B9).
+- `ExecutionPolicy.from_settings(settings)` returns the client's default policy; a `policy=` argument
+  replaces it wholesale (B18).
+- `X-Bitrix-RateLimit-Reset` accepts epoch seconds (≥ 1e9, against the wall clock) besides delta
+  seconds and HTTP-dates; the delay stays capped, and an unusable header never starts a cooldown (A19).
+- The client closes the rate coordinator it owns, and permits release synchronously (A5, B0). An
+  admission audit retains at most 128 violations, like a report (A16).
+- The wheel ships `py.typed` (A6), and the minimum pydantic is 2.12.0 (A4).
+- Development: `pytest-httpx` is no longer a dev dependency. Tests share one offline responder
+  transport and build clients through the public constructor, and the README, recipe and migration
+  examples are bound against the real `Bitrix24` signatures (B13, B15).
+- `Request.bare(...)` and `Request.v3(...)` build a request with the route fixed; they take the
+  constructor's other arguments unchanged, and `v3` keeps the V3 contract (a mapping, JSON only). The
+  route stays explicit and `Request(...)` is unchanged (C1, C13).
+- `Bitrix24.from_webhook(url, *, http_timeout=None, policy=None)` validates the URL through
+  `Settings` and owns the transport and coordinator it creates; `http_timeout=None` keeps the
+  `Settings` default.
+- Examples: scenario 14 (`requisite_links`) now uses the camelCase `select`, `filter` and `order` keys
+  of `crm.requisitelink.list` and reads its `requisiteLinks` collection. The live method silently
+  ignores the uppercase keys the recipe used, so the recipe's selector never matched a real response
+  (found by live probe L3).
+- The README's list traversal animation is replayed from executed traces: a test runs all three
+  lanes against one scripted portal and checks the drawn HTTP counts, batch sizes and the final
+  keyset call (§3.13). Its caption now says that an unbounded keyset ends with an empty confirmation
+  call and that a `BoundedIdentityRange` stops at its upper ID without one.
+- The README opens with a quickstart on `crm.deal.list` and `user.get` that needs four concepts:
+  the client, a request, `iter_list()` and the report. It runs in a doc-test on the real client (B26).
+- **Breaking (3.0.0):** removed never-produced report vocabulary: the `canary_requests`,
+  `canary_commands` and `canary_rows` fields of `KeysetExecutionReport`,
+  `KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS`, `ReplayDisposition.REPLAYED_DIRECT` and
+  `DIRECT_REPLAY_FAILED`, `CompletionAssurance.ORACLE_VERIFIED`, `SnapshotState.VERIFIED` and
+  `CHANGED`, and `NotExecutedReason.SCHEDULER_STOPPED` (B11). See the migration guide.
+- **Breaking (3.0.0):** `PageValidated` no longer carries `identity_digest`, and the recorders no
+  longer hash identities per page; the gate checks event order and `row_count` as before (B12).
+- A JSON success body is parsed once, strictly, instead of once by the error codec and again by the
+  envelope decoder. Structured errors and malformed bodies keep their previous classification, apart
+  from the strict-only defects listed under B20; a 16 MiB call decodes about 15% faster (B8).
+- A public operation stream's report now always carries its own cleanup result: a cleanup failure
+  that the underlying kernel did not record is added as a `cleanup_failure` violation, by the same
+  §3.1 rules as the kernel reports. Each of the five stream families has a barrier-driven test for
+  every row of the §3.1 transition table.
+- The rate coordinator and the execution ledger no longer take locks; every state change is
+  synchronous between awaits, which a test pins (C8).
+- Internal kernel copies of public values carry a `Kernel` prefix (`KernelReferenceItem`,
+  `KernelReferenceFailure`, `KernelBatchDispatch`, `KernelDirectDispatch`), so every public class name
+  has one definition; an architecture test keeps it that way (D30).
 - The PyPI release workflow accepts only canonical stable tags `MAJOR.MINOR.PATCH` (for example
   `2.2.1`, with no `fix-` or `v` prefix) and rejects any other tag before the build backend runs. It
   then requires exactly one sdist and one wheel whose filenames and metadata carry that version, and
@@ -19,6 +143,25 @@
   `total` as an observed empty source. The report completes and is exhausted with `mechanics_only`
   assurance (`identity_exact` with an identity) and never claims a count; `total: 0` keeps its
   count-matched result, and an explicit `ConsistencyPolicy` confirmation of `QUALIFIED_TOTAL` keeps such a page strict.
+
+## 2.3.0 — 2026-09-23
+
+- **Breaking:** `Request` requires `route=`, a `RouteKind` (`BARE`, `JSON` or `API_V3`). There is no
+  default route, so a V3 method can no longer reach the classic endpoint by accident. A transport
+  serves only the routes its `TransportCapabilities.routes` declare.
+- Added positional arguments (`PositionalArguments`, `PositionalLayout` and the slot markers) for
+  methods whose parameters are positional.
+- Added whole-page stops (`PageStopPolicy`, `CallerStop`, `ContinuePage`, `PageBoundary`), page index
+  and stride offsets (`PageIndex`, `PageStride`), sparse raw bounds (`SparseRawBound`,
+  `RawTotalSource`), `CursorDomain`, `BoundedIdentityRange`, `DuplicatePolicy` and the external
+  `IdentityStore`.
+- The completion gate and its events are public, and every report carries its cleanup outcome
+  (`CleanupState`, `CleanupOutcome`) and `ReplayDisposition`.
+- HTTPX log records of the client's own requests, including auth retries and redirects, are
+  attributed to that request and scrubbed of the webhook secret; other loggers' records are left alone.
+
+## 2.2.0 — 2026-09-12
+
 - Added `Bitrix24.iter_cursors()` with lazy one/many-parent scheduling, per-binding
   `Binding.start_cursor`, strict seed progression, shared physical batching and existing
   fail-fast/tolerant reference semantics. When cursor-control creation is disabled, the complete

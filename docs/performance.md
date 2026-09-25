@@ -76,8 +76,9 @@ harness-produced observations for that portal cell, not general latency promises
   contract. It pays a planning barrier even when the consumer stops early; pass
   `SequentialKeysetExecution()` explicitly to retain request-by-request traversal.
 - A returned `total` is advisory only and may raise an auto cost estimate. It never closes a lane or
-  strengthens correctness evidence. Normal range/partition reports use caller-asserted bounds and
-  retain zero-valued legacy canary counters; explicit verification is a separate operation.
+  strengthens correctness evidence. Normal range/partition reports use caller-asserted bounds
+  (`assurance_source=CALLER_ASSERTED_BOUNDS`); explicit verification is a separate operation,
+  `verify_keyset_capability()`.
 - Reference `BatchDispatch` uses an absolute, capacity-aware coalescing deadline of 20 ms per
   underfilled wave. Full waves and waves with no eligible producers leave immediately;
   `coalesce_wait=0` is the low-latency opt-out. With multiple workers, only aggregate work

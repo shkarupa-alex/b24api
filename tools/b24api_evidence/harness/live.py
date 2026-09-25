@@ -6,12 +6,21 @@ import os
 import secrets
 import uuid
 import weakref
+import zlib
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Self, cast
 from urllib.parse import urljoin
 
 import httpx
+
+from b24api.transport.decoding import (
+    BOUNDED_ACCEPT_ENCODING,
+    _BoundedDecoder,
+    _DecodedBodyTooLargeError,
+    _DecodeRefusedError,
+)
+from b24api.transport.logging_shield import HTTPX_LOG_SHIELD, webhook_credentials
 
 from .contracts import ContractError, PortalIdentity, parse_fingerprint_key, portal_identity, strict_json_loads
 
@@ -103,6 +112,20 @@ class LivePreflight:
     scopes: frozenset[str]
 
 
+def _decode_within_ceiling(response: httpx.Response) -> bytearray:
+    """Decode raw transfer bytes through the shared bounded decoder; ``iter_bytes`` inflates before counting."""
+    decoder = _BoundedDecoder.for_encoding(response.headers.get("content-encoding"), limit=MAX_RESPONSE_BYTES)
+    payload = bytearray()
+    if response.is_stream_consumed:
+        # An in-memory (mock) response arrives already read and decoded; only the ceiling remains.
+        payload.extend(_BoundedDecoder.for_encoding(None, limit=MAX_RESPONSE_BYTES).feed(response.content))
+        return payload
+    for chunk in response.iter_raw():
+        payload.extend(decoder.feed(chunk))
+    payload.extend(decoder.finish())
+    return payload
+
+
 def _bounded_response_payload(response: httpx.Response, *, method: str) -> bytes:
     """Consume a streamed response without crossing the reviewed memory ceiling."""
     content_length = response.headers.get("content-length")
@@ -120,16 +143,17 @@ def _bounded_response_payload(response: httpx.Response, *, method: str) -> bytes
     if declared is not None and declared > MAX_RESPONSE_BYTES:
         response = None  # type: ignore[assignment]
         raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
-    payload = bytearray()
-    received = 0
-    for chunk in response.iter_bytes():
-        received += len(chunk)
-        if received > MAX_RESPONSE_BYTES:
-            del chunk
-            payload.clear()
-            response = None  # type: ignore[assignment]
-            raise LiveCorrectnessError(f"live response exceeds the reviewed byte ceiling for {method}")
-        payload.extend(chunk)
+    failure: str | None = None
+    try:
+        payload = _decode_within_ceiling(response)
+    except _DecodedBodyTooLargeError:
+        failure = "exceeds the reviewed byte ceiling"
+    except (_DecodeRefusedError, zlib.error):
+        # The same correctness failure an undecodable body produced before the decoder was bounded.
+        failure = "decoding failed"
+    if failure is not None:
+        response = None  # type: ignore[assignment]
+        raise LiveCorrectnessError(f"live response {failure} for {method}")
     return bytes(payload)
 
 
@@ -179,13 +203,23 @@ class LivePortal:
         self._webhook_finalizer = weakref.finalize(self, _drop_webhook, self._webhook_handle)
         self._client = cast("httpx.Client", resolved_client)
         self.attempts = 0
+        # Registered only once the client exists, so a failed initialization leaves no registration behind.
+        HTTPX_LOG_SHIELD.register_transport(
+            credentials=webhook_credentials(cast("str", normalized_webhook)),
+            client=self._client,
+        )
+        normalized_webhook = None
+        self._shield_finalizer = weakref.finalize(self, HTTPX_LOG_SHIELD.release_transport)
 
     def close(self) -> None:
         """Close owned resources."""
         try:
             self._client.close()
         finally:
-            self._webhook_finalizer()
+            try:
+                self._webhook_finalizer()
+            finally:
+                self._shield_finalizer()
 
     def __enter__(self) -> Self:
         """Enter the context."""
@@ -208,21 +242,38 @@ class LivePortal:
         decoding_failed = False
         bounded_failure: str | None = None
         response: httpx.Response | None = None
+        request: httpx.Request | None = None
+        url = ""
+        HTTPX_LOG_SHIELD.admit_send(self._client)
         try:
-            with self._client.stream(
+            url = urljoin(_webhook_for(self._webhook_handle), method)
+            request = self._client.build_request(
                 "POST",
-                urljoin(_webhook_for(self._webhook_handle), method),
+                url,
                 json=parameters or {},
-            ) as response:
-                status_code = response.status_code
+                headers={"accept-encoding": BOUNDED_ACCEPT_ENCODING},
+            )
+            # The same shield as HttpxTransport: HTTPX logs the full method URL at INFO, and attribution by
+            # the sync client's ``_send_handling_auth`` root tells this request's records from foreign ones.
+            with HTTPX_LOG_SHIELD.request(url) as ownership:
+                url = ""
+                ownership.claim(request)
+                response = self._client.send(request, stream=True)
+                request = None
                 try:
-                    payload = _bounded_response_payload(response, method=method)
-                except LiveCorrectnessError as error:
-                    bounded_failure = str(error)
+                    status_code = response.status_code
+                    try:
+                        payload = _bounded_response_payload(response, method=method)
+                    except LiveCorrectnessError as error:
+                        bounded_failure = str(error)
+                finally:
+                    response.close()
         except httpx.DecodingError:
             decoding_failed = True
         except httpx.HTTPError:
             transport_failed = True
+        url = ""
+        request = None
         response = None
         if status_code is not None and not HTTP_STATUS_MINIMUM <= status_code <= HTTP_STATUS_MAXIMUM:
             payload = None

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 import inspect
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 from typing import is_typeddict
 
 import pytest
 
 import b24api
+import b24api.contracts
 import b24api.errors
 from b24api.contracts import (
     BatchDispatch,
@@ -67,13 +68,13 @@ def test_public_error_module_export_snapshot_is_static_contract_evidence() -> No
         "IdentityContractError",
         "IncompleteTraversalError",
         "InputSourceError",
+        "KeysetCapabilityError",
+        "PageAdaptationError",
+        "PageAdaptationViolation",
         "PaginationError",
         "ProtocolError",
         "ReferenceFailed",
         "ResponseTooLargeError",
-        "KeysetCapabilityError",
-        "PageAdaptationError",
-        "PageAdaptationViolation",
         "ResultShapeError",
         "TransportError",
         "ValidationIssue",
@@ -89,10 +90,7 @@ def test_keyset_execution_report_declaration_snapshot() -> None:
         ("assurance_source", "KeysetAssuranceSource"),
         ("planning_requests", "int"),
         ("boundary_requests", "int"),
-        ("canary_requests", "int"),
         ("anchor_probe_requests", "int"),
-        ("canary_commands", "int"),
-        ("canary_rows", "int"),
         ("anchor_probe_commands", "int"),
         ("anchor_count", "int"),
         ("empty_anchor_probes", "int"),
@@ -125,181 +123,11 @@ def test_keyset_execution_report_declaration_snapshot() -> None:
 
     assert (
         tuple(
-            (field.name, b24api.KeysetExecutionReport.__annotations__[field.name])
-            for field in fields(b24api.KeysetExecutionReport)
+            (field.name, b24api.contracts.KeysetExecutionReport.__annotations__[field.name])
+            for field in fields(b24api.contracts.KeysetExecutionReport)
         )
         == expected
     )
-
-
-def test_v2_root_export_snapshot_contains_no_engine_or_legacy_symbols() -> None:
-    assert b24api.__all__ == [
-        "AdaptedPage",
-        "AmbiguityPolicy",
-        "AmbiguityReason",
-        "AmbiguousExecutionError",
-        "ApiResponseError",
-        "AutoKeysetExecution",
-        "B24ApiError",
-        "BatchCommandError",
-        "BatchDispatch",
-        "BatchFailed",
-        "BinaryEvidence",
-        "BinaryResponse",
-        "Binding",
-        "BindingAdmitted",
-        "BindingClosure",
-        "BindingTerminal",
-        "Bitrix24",
-        "BodyEncoding",
-        "BoundedIdentityRange",
-        "BudgetExceededError",
-        "CallerStop",
-        "CapabilityError",
-        "CleanupOutcome",
-        "CleanupState",
-        "ClosureWitness",
-        "Command",
-        "CommandFailure",
-        "CommandNotExecuted",
-        "CommandOutcome",
-        "CommandOutcomeUnknown",
-        "CommandSettlement",
-        "CommandSuccess",
-        "CompletionEvent",
-        "CompletionGate",
-        "CompositeIdentitySpec",
-        "ConsistencyPolicy",
-        "ContinuePage",
-        "CountedTraversal",
-        "CursorDomain",
-        "CursorSpec",
-        "CursorTraversal",
-        "DeliveryOrder",
-        "DirectDispatch",
-        "DuplicatePolicy",
-        "EmptyArray",
-        "EmptyObject",
-        "EnvelopeContractError",
-        "ExecutionPolicy",
-        "FrozenJson",
-        "FrozenMapping",
-        "HTTPGatewayError",
-        "IdentityCoercion",
-        "IdentityComponent",
-        "IdentityContractError",
-        "IdentityPageAdapter",
-        "IdentitySpec",
-        "IdentityStore",
-        "IncompleteTraversalError",
-        "InputSourceError",
-        "KeysetAssuranceSource",
-        "KeysetCapabilityCheckName",
-        "KeysetCapabilityCheckOutcome",
-        "KeysetCapabilityCheckResult",
-        "KeysetCapabilityError",
-        "KeysetCapabilityReport",
-        "KeysetCapabilityVerdict",
-        "KeysetExecution",
-        "KeysetExecutionKind",
-        "KeysetExecutionReport",
-        "KeysetInconclusiveReason",
-        "KeysetPageCompletion",
-        "KeysetPhase",
-        "KeysetSelectionReason",
-        "KeysetSpec",
-        "KeysetTraversal",
-        "MembershipRecheck",
-        "NotExecutedReason",
-        "Null",
-        "OffsetContinuation",
-        "OffsetSpec",
-        "Omitted",
-        "OperationReport",
-        "OperationStream",
-        "PageAcknowledged",
-        "PageAdaptationError",
-        "PageAdaptationViolation",
-        "PageAdapter",
-        "PageBoundary",
-        "PageCommandOutcome",
-        "PageDelivered",
-        "PageDispatch",
-        "PageIndex",
-        "PageOutcome",
-        "PageRecord",
-        "PageRejected",
-        "PageRejectionCode",
-        "PageScheduled",
-        "PageStopPolicy",
-        "PageStride",
-        "PageValidated",
-        "PageView",
-        "PaginationError",
-        "ParameterPath",
-        "ParameterUpdate",
-        "PartialResult",
-        "PartitionedKeysetExecution",
-        "PositionalArguments",
-        "PositionalLayout",
-        "Present",
-        "ProtocolError",
-        "RangeKeysetExecution",
-        "RawTotalSource",
-        "ReferenceComplete",
-        "ReferenceEvent",
-        "ReferenceFailed",
-        "ReferenceFailure",
-        "ReferenceItem",
-        "ReferenceNotExecuted",
-        "ReferenceOutcome",
-        "ReferenceOutcomeUnknown",
-        "ReplayDisposition",
-        "ReplaySafety",
-        "Request",
-        "RequestHeaders",
-        "RequestSummary",
-        "Response",
-        "ResponseTooLargeError",
-        "ResultCollectionShape",
-        "ResultErrorShape",
-        "ResultErrorSpec",
-        "ResultSelector",
-        "ResultShapeError",
-        "RetryPolicy",
-        "RouteKind",
-        "SequentialKeysetExecution",
-        "SequentialTraversal",
-        "Settings",
-        "SlotContract",
-        "SlotShape",
-        "SparseRawBound",
-        "SplitOrderSpec",
-        "StableIntegerKeysetContract",
-        "StreamClosure",
-        "StreamTerminal",
-        "TerminalState",
-        "TotalHintMode",
-        "TotalTermination",
-        "TraceClass",
-        "Transport",
-        "TransportCapabilities",
-        "TransportError",
-        "TraversalAssurance",
-        "TraversalIdentity",
-        "UnknownRequestAudit",
-        "UnknownRequestCollector",
-        "ValidationIssue",
-        "Violation",
-        "ViolationSeverity",
-        "WireRequest",
-        "WireResponse",
-        "WireTransport",
-        "identity_store_key",
-        "partition_command_outcomes",
-        "partition_reference_outcomes",
-        "traversal_control_paths",
-    ]
 
 
 def test_keyset_cursor_streams_add_only_the_declared_fields_and_methods() -> None:
@@ -314,14 +142,14 @@ def test_keyset_cursor_streams_add_only_the_declared_fields_and_methods() -> Non
         assert tuple(field.name for field in fields(traversal))[-1] == "page_adapter"
     for traversal in (b24api.KeysetTraversal, b24api.CursorTraversal):
         assert tuple(field.name for field in fields(traversal))[-1] == "page_adapter"
-    assert tuple(field.name for field in fields(b24api.MembershipRecheck)) == (
+    assert tuple(field.name for field in fields(b24api.contracts.MembershipRecheck)) == (
         "identities",
         "still_observed",
         "no_longer_observed",
         "contradictory",
         "truncated",
     )
-    assert tuple(field.name for field in fields(b24api.KeysetCapabilityCheckResult)) == (
+    assert tuple(field.name for field in fields(b24api.contracts.KeysetCapabilityCheckResult)) == (
         "name",
         "outcome",
         "rows_selected",
@@ -331,7 +159,7 @@ def test_keyset_cursor_streams_add_only_the_declared_fields_and_methods() -> Non
         "contradictory_identities",
         "recheck",
     )
-    assert b24api.MembershipRecheck.__annotations__ == {
+    assert b24api.contracts.MembershipRecheck.__annotations__ == {
         "identities": "tuple[FrozenJson, ...]",
         "still_observed": "tuple[FrozenJson, ...]",
         "no_longer_observed": "tuple[FrozenJson, ...]",
@@ -344,8 +172,8 @@ def test_keyset_cursor_streams_add_only_the_declared_fields_and_methods() -> Non
         "extra_in_interval_identities",
         "contradictory_identities",
     ):
-        assert b24api.KeysetCapabilityCheckResult.__annotations__[name] == "tuple[FrozenJson, ...]"
-    assert b24api.PageRejectionCode.PAGE_ADAPTATION.value == "page_adaptation"
+        assert b24api.contracts.KeysetCapabilityCheckResult.__annotations__[name] == "tuple[FrozenJson, ...]"
+    assert b24api.contracts.PageRejectionCode.PAGE_ADAPTATION.value == "page_adaptation"
     assert hasattr(b24api.Bitrix24, "iter_cursors")
     assert hasattr(b24api.Bitrix24, "verify_keyset_capability")
     assert not hasattr(b24api.Bitrix24, "iter_cursor_outcomes")
@@ -364,7 +192,6 @@ def test_not_executed_reason_is_the_exact_frozen_enum() -> None:
         "halted",
         "source_failed",
         "local_validation_failed",
-        "scheduler_stopped",
     )
 
 
@@ -454,7 +281,7 @@ def test_reference_partition_retains_items_empty_completion_and_negative_variant
         ReferenceItem(0, correlation, 0, {"id": 1}),
         ReferenceComplete(0, correlation, 1),
         ReferenceFailure(1, correlation, _error(), 2),
-        ReferenceNotExecuted(2, correlation, NotExecutedReason.SCHEDULER_STOPPED),
+        ReferenceNotExecuted(2, correlation, NotExecutedReason.HALTED),
         ReferenceOutcomeUnknown(3, correlation, _error(), 0),
     )
 
@@ -518,3 +345,15 @@ def test_operation_report_terminal_properties_are_explicit() -> None:
     with_failures = OperationReport(TerminalState.COMPLETED_WITH_FAILURES, "batch", "some commands failed")
     assert not with_failures.exhausted
     assert with_failures.partial
+
+
+def test_keyset_selection_summary_is_a_closed_optional_report_field() -> None:
+    report = b24api.OperationReport(b24api.TerminalState.COMPLETED, "iter_list_keyset", "completed")
+    summary = b24api.contracts.KeysetSelectionSummary(
+        b24api.contracts.KeysetExecutionKind.AUTO,
+        b24api.contracts.KeysetExecutionKind.SEQUENTIAL,
+        b24api.contracts.KeysetSelectionReason.PAGE_STOP,
+    )
+    assert replace(report, keyset_selection=summary).keyset_selection == summary
+    with pytest.raises(TypeError, match="KeysetExecutionKind"):
+        b24api.contracts.KeysetSelectionSummary("auto", "sequential", b24api.contracts.KeysetSelectionReason.PAGE_STOP)  # type: ignore[arg-type]

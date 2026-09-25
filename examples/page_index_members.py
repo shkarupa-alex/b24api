@@ -10,7 +10,8 @@ decoded row count; live portal qualification remains separate. Run:
 from __future__ import annotations
 import asyncio
 
-from b24api import Bitrix24, OffsetSpec, PageIndex, ParameterPath, ReplaySafety, Request, RouteKind, Settings
+from b24api import Bitrix24, OffsetSpec, ParameterPath, ReplaySafety, Request, RouteKind, Settings
+from b24api.contracts import PageIndex
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 

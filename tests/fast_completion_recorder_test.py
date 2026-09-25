@@ -10,7 +10,7 @@ def test_discarded_nonempty_probe_cannot_claim_source_exhaustion() -> None:
     recorder = FastCompletionRecorder()
     recorder.schedule("probe")
     recorder.settle("probe", CommandSettlement.SUCCESS)
-    recorder.validated("probe", (1, 2))
+    recorder.validated("probe")
     recorder.recorded("probe", PageOutcome.COMMITTED)
 
     recorder.terminal(

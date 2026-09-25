@@ -5,7 +5,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
 from b24api.contracts.json import FrozenJson, _freeze_json, _thaw_json
 from b24api.contracts.policy import (
     ConfirmationPolicy,
@@ -25,7 +24,6 @@ from b24api.traversal.plans import (
     KeysetPlan,
     KeysetTerminalRule,
     ListPlan,
-    OffsetContinuation,
     OffsetSequentialPlan,
     OffsetTerminalRule,
     SingleResponsePlan,
@@ -243,35 +241,6 @@ def _replace_owned_control(  # noqa: C901, PLR0912 - exact nested path replaceme
         current[final] = replacement
 
 
-def _initial_offset(request: Request, path: ParameterPath, *, default: int = 0) -> int:
-    """Return a caller-supplied lexical control or its qualified default."""
-    positional = request.positional is not None
-    current: object = (
-        request.positional.to_wire_slots() if request.positional is not None else request.copy_parameters()
-    )
-    for part in path.path:
-        if isinstance(part, str):
-            if not isinstance(current, dict):
-                return default
-            matches = (
-                [part]
-                if positional and part in current
-                else ([] if positional else [key for key in current if key.casefold() == part.casefold()])
-            )
-            if len(matches) > 1:
-                raise CapabilityError("request contains an ambiguous initial offset path")
-            if not matches:
-                return default
-            current = current[matches[0]]
-        else:
-            if not isinstance(current, list) or part >= len(current):
-                return default
-            current = current[part]
-    if not isinstance(current, int) or isinstance(current, bool) or current < default:
-        raise CapabilityError("initial traversal control is outside its admitted range")
-    return current
-
-
 def _child_path(parent: ParameterPath, child: str) -> ParameterPath:
     return ParameterPath((*parent.path, child))
 
@@ -335,50 +304,6 @@ def _validate_confirmation_policy(
             raise CapabilityError("plan does not provide the requested boundary identity confirmation")
         return
     raise AssertionError("unhandled confirmation policy")
-
-
-def _offset_terminal(
-    plan: OffsetSequentialPlan,
-    response: Response,
-    *,
-    page_size: int,
-    accepted: int,
-    confirmation: ConfirmationPolicy,
-) -> str | None:
-    if page_size == 0 and OffsetTerminalRule.EMPTY_PAGE in plan.terminal:
-        return "empty page confirmed terminal"
-    if confirmation is ConfirmationPolicy.EMPTY_AFTER_BOUNDARY:
-        return None
-    if (
-        OffsetTerminalRule.QUALIFIED_TOTAL in plan.terminal
-        and response.total is not None
-        and response.total >= 0
-        and accepted == response.total
-        and (response.next is None or plan.continuation is OffsetContinuation.FIXED_STEP)
-    ):
-        return QUALIFIED_TOTAL_REACHED
-    return None
-
-
-def _next_offset(
-    plan: OffsetSequentialPlan | CountedOffsetPlan,
-    response: Response,
-    *,
-    current: int,
-    observed: int,
-) -> int:
-    if plan.continuation is OffsetContinuation.FIXED_STEP:
-        step = plan.fixed_step if isinstance(plan, OffsetSequentialPlan) else plan.fixed_stride
-        if step is None:
-            raise RuntimeError("fixed-step plan lacks its validated step")
-        return current + step
-    if plan.continuation is OffsetContinuation.SERVER_NEXT:
-        if response.next is None:
-            raise PaginationError("server-next traversal has no continuation")
-        return response.next
-    if plan.continuation is OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT and response.next is not None:
-        return response.next
-    return current + observed
 
 
 def _cursor_terminal(plan: ItemCursorPlan, page_size: int) -> str | None:

@@ -19,18 +19,12 @@ from pathlib import Path
 from b24api import (
     Binding,
     Bitrix24,
-    CallerStop,
-    ContinuePage,
-    CursorDomain,
     CursorSpec,
-    DeliveryOrder,
     DirectDispatch,
     IdentityCoercion,
     OperationReport,
-    PageBoundary,
     ParameterPath,
     ParameterUpdate,
-    ReferenceComplete,
     ReplaySafety,
     Request,
     ResultSelector,
@@ -38,6 +32,7 @@ from b24api import (
     Settings,
     TerminalState,
 )
+from b24api.contracts import CallerStop, ContinuePage, CursorDomain, DeliveryOrder, PageBoundary, ReferenceComplete
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 from examples._support.sqlite_sink import SqliteMirror
