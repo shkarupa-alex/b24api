@@ -84,7 +84,7 @@ B5 and B28 were never assigned (see §2).
 | C4 | Measured | — | [gate cost before and after the lifecycle move](c4-gate-cost.md): the same 70,002 events, and wall time unchanged |
 | C5 | Done | `ad9bcfa`, `e3e8157` | the planner, frozen plan and runtime split; SLF001 in `b24api/traversal` is 0 (`tests/ratchet_test.py::test_private_member_access_only_goes_down`) |
 | C6 | Decided (rejected) | — | A global noqa ignore would hide new violations. Inline noqa keeps its reason, and the `noqa_package` ratchet (162) only goes down. |
-| C7 | Done; breaking, no alias (owner decision below), in the migration guide | `05793ab` | `tests/root_surface_test.py`, the generated table in `docs/migration.md`, the positive and negative wheel smoke in `wheel-typing` |
+| C7 | Done; breaking, no alias (owner decision below), in the migration guide | `05793ab`, `577e1ab` | `tests/root_surface_test.py`, the generated table in `docs/migration.md`, the positive and negative wheel smoke in `wheel-typing` |
 | C8 | Done | `3a913e1` | [lock outcomes](c8-locks.md); `tests/internal/lock_free_state_test.py::test_every_ledger_mutator_completes_without_suspending` |
 | C9 | Done | `c333754` | See [C9](#c9-public-archive) |
 | C10 | Done | `6b7ef7d`, `434e721`, `fe66b63`, `df06ee6`, `785efee`, `ba5187c` | `OperationRunner` owns all five families; the §3.1 transition table is tested on each |
