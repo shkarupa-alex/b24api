@@ -95,7 +95,7 @@ jobs:
             echo "::error title=wheel typing::the installed wheel is reported as untyped"
             exit 1
           fi
-          # A deprecated root alias must stay invisible to type checkers: exactly one attr-defined error.
+          # An old root import must fail type checking: exactly one attr-defined error.
           if .venv/bin/python -m mypy --strict --no-incremental root_alias.py > negative.txt; then
             echo "::error title=wheel typing::an old root import type-checks without an error"
             exit 1
@@ -116,7 +116,7 @@ jobs:
           cd "$consumer/src"
           ../.venv/bin/python -c "import b24api; assert '/site-packages/' in b24api.__file__, b24api.__file__"
           ../.venv/bin/python -m pytest -p no:cacheprovider tests/readme_test.py tests/documentation_test.py \
-            tests/root_surface_test.py --deselect tests/root_surface_test.py::test_repository_uses_no_deprecated_root_alias
+            tests/root_surface_test.py --deselect tests/root_surface_test.py::test_repository_uses_no_old_root_import
 
   slow:
     runs-on: ubuntu-latest

@@ -4,8 +4,9 @@
 
 - **Breaking (3.0.0):** the `b24api` root exports 51 names instead of 165 (C7). The other 115 moved
   to `b24api.contracts`, `b24api.errors`, `b24api.transport` or `b24api.completion`, which export
-  the same objects; nothing was removed or renamed. The old root paths keep working for all of 3.x
-  with a `DeprecationWarning` naming the new path, but type checkers report them as `attr-defined`.
+  the same objects; no object was renamed. The old root paths do not resolve: `from b24api import
+  CommandSuccess` raises `ImportError`, `b24api.CommandSuccess` raises an `AttributeError` naming
+  the new path, and type checkers report both as `attr-defined`.
   `python -m b24api.migration PATH...` lists every old root import, and the migration guide has the
   full table, generated from `b24api.migration.ROOT_MOVES`. `KeysetSelectionSummary` is exported
   only by `b24api.contracts`.

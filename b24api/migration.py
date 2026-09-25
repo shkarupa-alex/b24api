@@ -1,10 +1,10 @@
 """Root import migration for the 3.0 public surface (spec §3.12, C7).
 
 ``ROOT_MOVES`` is the single source for every name that left the ``b24api`` root: it maps the name to
-the public aggregator that keeps exporting the same object. The old root paths still work for this
-major with a ``DeprecationWarning``; the migration guide's table is generated from this map.
+the public aggregator that exports the same object. The old root paths no longer resolve in 3.0; the
+migration guide's table is generated from this map.
 
-Run ``python -m b24api.migration PATH...`` to list deprecated root imports in files or directories.
+Run ``python -m b24api.migration PATH...`` to list old root imports in files or directories.
 It prints ``file:line b24api.Name -> package.Name`` for each one, rewrites nothing, and exits with 1
 when it finds any. The module itself imports nothing else from ``b24api``; running it with ``-m`` still
 imports the package root first, so the package must be importable.
@@ -176,7 +176,7 @@ WILDCARD = "*"
 
 @dataclass(frozen=True, slots=True)
 class Finding:
-    """One deprecated root import in a scanned file; ``name`` is ``*`` for a wildcard import."""
+    """One old root import in a scanned file; ``name`` is ``*`` for a wildcard import."""
 
     path: Path
     line: int
@@ -227,7 +227,7 @@ def _python_files(paths: Iterable[Path]) -> Iterator[Path]:
 
 
 def scan(paths: Iterable[Path]) -> list[Finding]:
-    """Scan files and directories (recursively, ``*.py``) for deprecated root imports."""
+    """Scan files and directories (recursively, ``*.py``) for old root imports."""
     findings: list[Finding] = []
     for path in _python_files(paths):
         findings.extend(scan_source(path.read_text(encoding="utf-8"), path))
@@ -245,7 +245,7 @@ def migration_table() -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Print every deprecated root import under the given paths; exit 1 when any is found."""
+    """Print every old root import under the given paths; exit 1 when any is found."""
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments:
         sys.stderr.write("usage: python -m b24api.migration PATH...\n")

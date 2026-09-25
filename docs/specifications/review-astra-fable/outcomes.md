@@ -84,7 +84,7 @@ B5 and B28 were never assigned (see §2).
 | C4 | Measured | — | [gate cost before and after the lifecycle move](c4-gate-cost.md): the same 70,002 events, and wall time unchanged |
 | C5 | Done | `ad9bcfa`, `e3e8157` | the planner, frozen plan and runtime split; SLF001 in `b24api/traversal` is 0 (`tests/ratchet_test.py::test_private_member_access_only_goes_down`) |
 | C6 | Decided (rejected) | — | A global noqa ignore would hide new violations. Inline noqa keeps its reason, and the `noqa_package` ratchet (162) only goes down. |
-| C7 | Done; breaking, in the migration guide | `05793ab` | `tests/root_surface_test.py`, the generated table in `docs/migration.md`, the positive and negative wheel smoke in `wheel-typing` |
+| C7 | Done; breaking, no alias (owner decision below), in the migration guide | `05793ab` | `tests/root_surface_test.py`, the generated table in `docs/migration.md`, the positive and negative wheel smoke in `wheel-typing` |
 | C8 | Done | `3a913e1` | [lock outcomes](c8-locks.md); `tests/internal/lock_free_state_test.py::test_every_ledger_mutator_completes_without_suspending` |
 | C9 | Done | `c333754` | See [C9](#c9-public-archive) |
 | C10 | Done | `6b7ef7d`, `434e721`, `fe66b63`, `df06ee6`, `785efee`, `ba5187c` | `OperationRunner` owns all five families; the §3.1 transition table is tested on each |
@@ -189,7 +189,7 @@ These steps are outward-facing or need the owner's decision, so they were not pe
 6. **Issue comments (§6.1 item 6).** Post the table "ID → PR → test or evidence → outcome" on #14
    and #15, then close both issues after the §6.1 gate.
 
-Two further observations; the first is decided, the second stays with the owner:
+Three further observations; the first two are decided, the third stays with the owner:
 
 - **Physical batch replay.** Owner decision, 2026-09-25, which replaces the whole-batch reading of
   §3.4: `SAFE` work is always replayed within the budget; `UNSAFE` and `UNKNOWN` work only when the
@@ -232,5 +232,12 @@ Two further observations; the first is decided, the second stays with the owner:
   `tests/internal/execution_boundary_test.py::test_replay_rounds_share_the_retry_time_budget_measured_from_the_first_send`, and
   `tests/execution_test.py::test_unsafe_operation_time_limit_waits_for_the_method_and_replays`.
   Migration item 9 states it.
+- **Root aliases (C7).** Owner decision, 2026-09-25, which replaces the 3.x deprecation period of
+  §3.12: the 115 names that left the root have no alias; clients are adapted instead. An old root
+  import raises `ImportError`, and attribute access raises an `AttributeError` that names the new path.
+  No `DeprecationWarning` is emitted, and nothing else in the package was deprecated. Tests:
+  `tests/root_surface_test.py::test_an_old_root_import_fails_in_3_0`,
+  `tests/root_surface_test.py::test_attribute_access_to_a_moved_name_names_its_new_path_for_every_package_kind`
+  and the negative wheel smoke in `wheel-typing`. Migration item 1 states it.
 - **HTTPX logging on injected clients.** Two W2 gaps remain: the httpcore DEBUG record of a
   redirect token, and an unbounded `aread` on injected clients.

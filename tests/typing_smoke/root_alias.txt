@@ -1,4 +1,4 @@
 # The negative half of the wheel-typing smoke (spec §3.12, C7). CI copies this file to a .py module
-# and requires mypy --strict to report exactly one error, [attr-defined]: the deprecated root
-# aliases are hidden from type checkers, so every old root import is flagged.
+# and requires mypy --strict to report exactly one error, [attr-defined]: a name that moved out
+# of the root in 3.0 is gone from it, so every old root import is flagged.
 from b24api import CommandSuccess

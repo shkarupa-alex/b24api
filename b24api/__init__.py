@@ -2,11 +2,10 @@
 
 The root exports the names a typical application needs. Every other public name lives in one of the
 public aggregators listed in ``b24api.migration.PUBLIC_NAMESPACES``. A name that left the root in 3.0
-still resolves here for this major, with a ``DeprecationWarning`` naming its new import path.
+does not resolve here; ``b24api.Name`` raises an ``AttributeError`` naming its new import path.
 """
 
 import importlib
-import warnings
 from typing import TYPE_CHECKING
 
 from b24api.client import (
@@ -126,12 +125,10 @@ __all__ = [
 ]
 
 if not TYPE_CHECKING:
-    # Hidden from type checkers, so a moved root import stays a visible ``attr-defined`` error there.
+    # Hidden from type checkers: a visible module ``__getattr__`` would let every moved root import type-check.
     def __getattr__(name: str) -> object:
-        """Resolve a name that moved out of the root, warning with its new import path."""
+        """Fail for any unknown name, naming the new import path of a name that moved out of the root."""
         # Loaded on first use, so ``python -m b24api.migration`` does not find it already imported.
         package = importlib.import_module("b24api.migration").ROOT_MOVES.get(name)
-        if package is None:
-            raise AttributeError(f"module 'b24api' has no attribute {name!r}")
-        warnings.warn(f"b24api.{name} moved to {package}.{name}", DeprecationWarning, stacklevel=2)
-        return getattr(importlib.import_module(package), name)
+        message = f"module 'b24api' has no attribute {name!r}"
+        raise AttributeError(message if package is None else f"{message}; it moved to {package}.{name} in 3.0")

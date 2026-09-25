@@ -83,12 +83,6 @@ TABLE = re.compile(
 )
 
 
-def _moved(name: str) -> object:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        return getattr(b24api, name)
-
-
 def test_root_all_is_exactly_the_specified_names() -> None:
     assert sorted(b24api.__all__) == sorted(ROOT_NAMES)
 
@@ -104,13 +98,13 @@ def test_root_and_moves_partition_the_c4cafdd_root() -> None:
 
 
 @pytest.mark.parametrize(("name", "package"), sorted(ROOT_MOVES.items()))
-def test_each_moved_name_is_the_same_object_in_its_public_package(name: str, package: str) -> None:
+def test_each_moved_name_is_exported_by_its_public_package_and_not_by_the_root(name: str, package: str) -> None:
     module = importlib.import_module(package)
 
     assert package in PUBLIC_NAMESPACES
     assert package != "b24api"
     assert name in module.__all__
-    assert _moved(name) is getattr(module, name)
+    assert name not in vars(b24api)
 
 
 def test_root_exports_are_real_attributes_and_moved_names_are_not() -> None:
@@ -119,7 +113,7 @@ def test_root_exports_are_real_attributes_and_moved_names_are_not() -> None:
     assert "CommandSuccess" not in dir(b24api)
 
 
-def test_old_root_import_warns_with_the_new_path_at_the_importing_line(tmp_path: Path) -> None:
+def test_an_old_root_import_fails_in_3_0(tmp_path: Path) -> None:
     consumer = tmp_path / "old_consumer.py"
     consumer.write_text("from b24api import CommandSuccess as LOADED\n", encoding="utf-8")
     spec = importlib.util.spec_from_file_location("old_consumer", consumer)
@@ -127,28 +121,30 @@ def test_old_root_import_warns_with_the_new_path_at_the_importing_line(tmp_path:
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
 
-    with pytest.warns(
-        DeprecationWarning, match=r"^b24api\.CommandSuccess moved to b24api\.contracts\.CommandSuccess$"
-    ) as record:
-        spec.loader.exec_module(module)
-
-    # A package's from-import reads the name twice (importlib's fromlist check, then IMPORT_FROM); both
-    # warnings name the consumer's line, so the default filter shows it once.
-    assert {(Path(warning.filename), warning.lineno) for warning in record} == {(consumer, 1)}
-    assert module.LOADED is importlib.import_module("b24api.contracts").CommandSuccess
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ImportError, match=r"^cannot import name 'CommandSuccess' from 'b24api'"):
+            spec.loader.exec_module(module)
 
 
-def test_attribute_access_warns_for_every_package_kind() -> None:
-    for name in ("FrozenJson", "WireResponse", "CompletionGate", "ResponseTooLargeError"):
-        with pytest.warns(DeprecationWarning, match=f"b24api.{name} moved to {ROOT_MOVES[name]}.{name}"):
+@pytest.mark.parametrize("name", ["FrozenJson", "WireResponse", "CompletionGate", "ResponseTooLargeError"])
+def test_attribute_access_to_a_moved_name_names_its_new_path_for_every_package_kind(name: str) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(AttributeError) as raised:
             getattr(b24api, name)
+
+    assert str(raised.value) == (
+        f"module 'b24api' has no attribute '{name}'; it moved to {ROOT_MOVES[name]}.{name} in 3.0"
+    )
+    assert not hasattr(b24api, name)
 
 
 @pytest.mark.parametrize("name", ["NoSuchName", "KeysetSelectionSummary", "migration_table"])
 def test_names_outside_the_map_raise_attribute_error_without_a_warning(name: str) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        with pytest.raises(AttributeError, match=f"module 'b24api' has no attribute '{name}'"):
+        with pytest.raises(AttributeError, match=f"^module 'b24api' has no attribute '{name}'$"):
             getattr(b24api, name)
 
 
@@ -246,7 +242,7 @@ def test_scanner_walks_directories_and_sets_the_exit_code(tmp_path: Path, capsys
     assert "usage: python -m b24api.migration PATH..." in capsys.readouterr().err
 
 
-def test_repository_uses_no_deprecated_root_alias() -> None:
+def test_repository_uses_no_old_root_import() -> None:
     paths = [ROOT / directory for directory in ("b24api", "examples", "tests", "tools")]
 
     assert [str(finding) for finding in scan(paths)] == []

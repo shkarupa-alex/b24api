@@ -6,8 +6,8 @@
 details.
 
 1. **Root imports.** The `b24api` root exports 51 names; 115 others moved to `b24api.contracts`,
-   `b24api.errors`, `b24api.transport` or `b24api.completion`. Old imports still work in 3.x with a
-   `DeprecationWarning`, and type checkers flag them. `from b24api import *` follows `__all__` and
+   `b24api.errors`, `b24api.transport` or `b24api.completion`. Old imports fail with `ImportError`
+   or `AttributeError`, and type checkers flag them. `from b24api import *` follows `__all__` and
    no longer brings the moved names; replace it with explicit imports. Run
    `python -m b24api.migration src/ tests/` to list both; see [Root imports in 3.0](#root-imports-in-30).
 2. **Removed report vocabulary.** Values no code path produced are gone from `KeysetExecutionReport`,
@@ -256,14 +256,15 @@ The `b24api` root now exports only the names a typical application needs: the cl
 settings, requests and routes, policies, traversal and dispatch specifications, the report and the
 main errors, and the transports, including `HttpxTransport`. The other 115 names moved to one of the
 public packages `b24api.contracts`, `b24api.errors`, `b24api.transport` and `b24api.completion`,
-which export the same objects. No object was removed or renamed.
+which export the same objects. No object was removed or renamed; only the root path is gone.
 
-For all of 3.x the old root paths still work: `from b24api import CommandSuccess` returns the same
-class and emits `DeprecationWarning: b24api.CommandSuccess moved to b24api.contracts.CommandSuccess`.
-Type checkers do not see these aliases, so mypy and pyright report each old root import as
-`attr-defined`; that is intentional and points at every line to change. The aliases do not cover
-`from b24api import *`: a wildcard import follows `__all__`, which lists only the 51 root names, so a
-moved name used after it raises `NameError`. The scanner reports every such import; replace it with
+The old root paths do not resolve in 3.0 and there is no deprecation period:
+`from b24api import CommandSuccess` raises `ImportError: cannot import name 'CommandSuccess' from
+'b24api'`, and `b24api.CommandSuccess` raises `AttributeError: module 'b24api' has no attribute
+'CommandSuccess'; it moved to b24api.contracts.CommandSuccess in 3.0`. Mypy and pyright report each
+old root import as `attr-defined`, which points at every line to change. A wildcard import follows
+`__all__`, which lists only the 51 root names, so a moved name used after `from b24api import *`
+raises `NameError`. The scanner reports every such import; replace it with
 explicit imports of the names the module uses. Leaf modules such as
 `b24api.contracts.request` or `b24api.transport.base` are not public paths; import from the packages
 above.
