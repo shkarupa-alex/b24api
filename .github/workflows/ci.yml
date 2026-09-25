@@ -122,6 +122,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The clean-HEAD switch regression test checks out HEAD^ in a disposable worktree.
+          fetch-depth: 2
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
