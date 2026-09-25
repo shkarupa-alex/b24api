@@ -212,12 +212,14 @@ class BatchExecutor:
                 )
                 scoped_error.__cause__ = error
                 error = scoped_error
-            if not _possibly_executed(error, attempts):
-                return _Round(tuple(_shared_failure(command, error) for command in commands))
+            # The SAFE commands are sent again after any failure a SAFE request would retry, whether or not the
+            # batch may have run and whatever its other commands are.
             replay = () if options.halt or not _safe_replay_allowed(error, context) else commands
+            safe = tuple(command for command in replay if command.request.replay_safety is ReplaySafety.SAFE)
+            if not _possibly_executed(error, attempts):
+                return _Round(tuple(_shared_failure(command, error) for command in commands), safe)
             return _Round(
-                tuple(_unknown_failure(command, error, attempts.unproven_failure) for command in commands),
-                tuple(command for command in replay if command.request.replay_safety is ReplaySafety.SAFE),
+                tuple(_unknown_failure(command, error, attempts.unproven_failure) for command in commands), safe
             )
 
         outcomes = tuple(

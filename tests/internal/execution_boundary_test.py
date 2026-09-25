@@ -575,6 +575,66 @@ async def test_a_configured_retry_code_or_status_does_not_prove_an_unsafe_reques
     assert isinstance(replayed, CommandSuccess)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["configured-status", "configured-code", "unambiguous-503"])
+async def test_the_safe_commands_of_a_mixed_batch_are_sent_again_after_a_failure_a_safe_request_retries(
+    failure: str,
+) -> None:
+    # Owner decision: SAFE work is always retried. A failure that only SAFE work may retry, and that proves nothing
+    # about the creation beside it, sends the reads again alone; the creation keeps its failure.
+    retry = RetryPolicy(initial_delay=0, maximum_delay=0, jitter=0)
+    ambiguity = AmbiguityPolicy()
+    if failure == "configured-status":
+        retry = RetryPolicy(
+            transient_http_statuses=frozenset({HTTP_CONFLICT}), initial_delay=0, maximum_delay=0, jitter=0
+        )
+        first = WireResponse(HTTP_CONFLICT, (("content-type", "text/html"),), b"<html>conflict</html>")
+    elif failure == "configured-code":
+        retry = RetryPolicy(transient_api_codes=frozenset({"after_write"}), initial_delay=0, maximum_delay=0, jitter=0)
+        first = WireResponse(
+            HTTP_BAD_REQUEST, (("content-type", "application/json"),), json.dumps(_AFTER_WRITE).encode()
+        )
+    else:
+        ambiguity = AmbiguityPolicy(ambiguous_unstructured_statuses=frozenset({408}))
+        first = WireResponse(HTTP_SERVICE_UNAVAILABLE, (("content-type", "text/html"),), b"<html>busy</html>")
+    commands = [
+        Command(_request(ReplaySafety.SAFE, "user.get"), 0),
+        Command(_request(ReplaySafety.UNSAFE, "tasks.task.add"), 1),
+    ]
+
+    def answering() -> tuple[_Script, Bitrix24]:
+        transport = _Script([])
+        _direct_answers(transport, first)
+        return transport, _client(transport)
+
+    transport, client = answering()
+    safe, unsafe = await _drain(client.batch_outcomes(commands, policy=_policy(retry=retry, ambiguity=ambiguity)))
+
+    assert len(transport.sent) == 2  # noqa: PLR2004 - the mixed batch and the reads alone
+    assert _batch_methods(transport.sent[1]) == ["user.get"]
+    assert isinstance(safe, CommandSuccess)
+    assert isinstance(unsafe, CommandFailure)
+    assert unsafe.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+
+    # A fail-fast batch is never split, and one attempt allows no replay.
+    fail_fast, client = answering()
+    with pytest.raises(BatchFailed):
+        [outcome async for outcome in client.batch(commands, policy=_policy(retry=retry, ambiguity=ambiguity))]
+    assert len(fail_fast.sent) == 1
+    single, client = answering()
+    once = _policy(retry=retry, ambiguity=ambiguity, max_attempts_per_request=1)
+    outcomes = await _drain(client.batch_outcomes(commands, policy=once))
+    assert len(single.sent) == 1
+    assert all(isinstance(outcome, CommandFailure) for outcome in outcomes)
+
+    # A failure no request retries sends nothing again.
+    permanent = _Script([])
+    _direct_answers(permanent, WireResponse(HTTP_BAD_REQUEST, (("content-type", "text/html"),), b"<html>bad</html>"))
+    failures = await _drain(_client(permanent).batch_outcomes(commands, policy=_policy()))
+    assert len(permanent.sent) == 1
+    assert all(isinstance(outcome, CommandFailure) for outcome in failures)
+
+
 def _refused_then(transport: _Script, *later: Callable[[Request], WireResponse]) -> None:
     _command_errors_then(transport, _QUERY_LIMIT, *later)
 

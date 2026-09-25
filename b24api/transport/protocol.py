@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from b24api._error_types import ErrorOrigin
 from b24api.contracts.evidence import ResponseEvidence
-from b24api.contracts.v3_codes import NON_RETRYABLE_V3_ERROR_CODES
+from b24api.contracts.v3_codes import NON_RETRYABLE_V3_ERROR_CODES, render_code
 from b24api.errors import (
     ApiResponseError,
     B24ApiError,
@@ -243,7 +243,11 @@ class ProtocolCodec:
             if not isinstance(field, str) or not isinstance(detail, str):
                 raise TypeError("V3 validation field and message must be strings")
             bounded.append(ValidationIssue(render(field), render(detail)))
-        return code[:_MAX_VALIDATION_TEXT], SafeText(render(message)), tuple(bounded), truncated
+        if len(code) > _MAX_VALIDATION_TEXT:
+            # A code is cut only after redaction, like the texts above: cutting first would turn a known secret
+            # into a prefix that exact-secret redaction no longer recognizes.
+            code = render_code(code, redactor=self._redactor, context=diagnostics)[:_MAX_VALIDATION_TEXT]
+        return code, SafeText(render(message)), tuple(bounded), truncated
 
     @staticmethod
     def _parse_body(body: bytes | str | Mapping[str, Any] | None) -> tuple[object, bool]:

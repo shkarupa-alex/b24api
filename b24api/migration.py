@@ -171,21 +171,30 @@ ROOT_MOVES: Final[Mapping[str, str]] = MappingProxyType(
 )
 
 
+WILDCARD = "*"
+
+
 @dataclass(frozen=True, slots=True)
 class Finding:
-    """One deprecated root import in a scanned file."""
+    """One deprecated root import in a scanned file; ``name`` is ``*`` for a wildcard import."""
 
     path: Path
     line: int
     name: str
 
     def __str__(self) -> str:
-        """Render ``file:line b24api.Name -> package.Name``."""
+        """Render ``file:line b24api.Name -> package.Name``, or what to do about a wildcard import."""
+        if self.name == WILDCARD:
+            return f"{self.path}:{self.line} from b24api import * -> import each name you use explicitly"
         return f"{self.path}:{self.line} b24api.{self.name} -> {ROOT_MOVES[self.name]}.{self.name}"
 
 
 def scan_source(source: str, path: Path) -> list[Finding]:
-    """Find ``from b24api import Name`` and ``b24api.Name`` uses of moved names in one module."""
+    """Find ``from b24api import Name`` and ``b24api.Name`` uses of moved names in one module.
+
+    ``from b24api import *`` is reported too: it follows the root ``__all__``, which no longer lists the
+    moved names, and which of them the module uses cannot be told from its source.
+    """
     tree = ast.parse(source, filename=str(path))
     aliases = {"b24api"}
     for node in ast.walk(tree):
@@ -194,7 +203,11 @@ def scan_source(source: str, path: Path) -> list[Finding]:
     findings: list[Finding] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "b24api" and node.level == 0:
-            findings.extend(Finding(path, node.lineno, alias.name) for alias in node.names if alias.name in ROOT_MOVES)
+            findings.extend(
+                Finding(path, node.lineno, alias.name)
+                for alias in node.names
+                if alias.name in ROOT_MOVES or alias.name == WILDCARD
+            )
         elif (
             isinstance(node, ast.Attribute)
             and isinstance(node.value, ast.Name)

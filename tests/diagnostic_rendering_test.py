@@ -134,6 +134,26 @@ def test_exact_secret_beats_known_code_recognition() -> None:
     assert error.wire_code == from_request.wire_code == REDACTED
 
 
+@pytest.mark.parametrize("prefix", ["", "x" * 200], ids=["whole-code", "across-the-cut"])
+def test_a_long_v3_code_is_redacted_before_it_is_cut(prefix: str) -> None:
+    # The code is bounded to 256 characters; cutting a longer known secret first would leave a prefix that exact
+    # redaction no longer recognizes, in every output channel and in the code attributes.
+    secret = "A" * 300 if not prefix else "B" * 100
+    codec = ProtocolCodec(redactor=Redactor(known_secrets=frozenset({secret})))
+
+    error = codec.error_from_http(status_code=400, body=_v3_body(prefix + secret, "invalid"))
+
+    assert isinstance(error, ApiResponseError)
+    assert error.truncated
+    fragment = secret[:32]
+    assert fragment not in _channels(error)
+    assert all(fragment not in str(value) for value in (error.original_code, error.normalized_code, error.wire_code))
+    # Control: a known V3 code next to the registered secret stays diagnosable.
+    known = codec.error_from_http(status_code=404, body=_v3_body(METHOD_NOT_FOUND_ERROR_CODE, "gone"))
+    assert isinstance(known, ApiResponseError)
+    assert known.wire_code == METHOD_NOT_FOUND_ERROR_CODE
+
+
 def test_hidden_mapping_keys_stay_distinct_and_keep_their_values() -> None:
     value = {USER_FIELD: "a", OTHER_USER_FIELD: "b", "visible": {USER_FIELD: 1}, "token": "x"}
 
