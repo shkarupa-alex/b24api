@@ -490,6 +490,7 @@ async def test_a_fail_fast_batch_is_never_split_for_a_replay() -> None:
 _AFTER_WRITE = {"error": "AFTER_WRITE", "error_description": "failed after the write"}
 HTTP_BAD_REQUEST = 400
 HTTP_CONFLICT = 409
+HTTP_SERVICE_UNAVAILABLE = 503
 
 
 def _command_errors_then(
@@ -656,6 +657,53 @@ async def test_a_batch_retried_after_a_send_that_may_have_run_stays_unknown_what
     assert len(transport.sent) == 2  # noqa: PLR2004 - the 502 and the retry that was not dispatched
     assert isinstance(outcome, CommandOutcomeUnknown)
     assert isinstance(outcome.error, AmbiguousExecutionError)
+    # The reason and the cause chain name the send that may have run, not the retry that never left.
+    assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    chain: list[BaseException] = []
+    cause = outcome.error.__cause__
+    while cause is not None:
+        chain.append(cause)
+        cause = cause.__cause__
+    assert any(isinstance(link, HTTPGatewayError) and link.http_status == HTTP_BAD_GATEWAY for link in chain)
+    assert outcome.error.evidence is not None
+    assert outcome.error.evidence.http_status == HTTP_BAD_GATEWAY
+
+    # Control: the same refusal without the 502 before it ran nothing and stays a failure.
+    alone = _Script([])
+
+    def refused_locally(request: Request) -> WireResponse:
+        alone.sent.append(request)
+        raise TransportError("refused locally", phase=FailurePhase.NOT_DISPATCHED, retryable=False)
+
+    alone.behaviors = [refused_locally]
+    (failure,) = await _drain(
+        _client(alone).batch_outcomes([Command(_request(ReplaySafety.SAFE, "user.get"), 0)], policy=_policy())
+    )
+    assert isinstance(failure, CommandFailure)
+    assert isinstance(failure.error, TransportError)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_outcome_is_explained_by_the_send_that_may_have_run() -> None:
+    # A lost connection may have run the batch; the 429 after it proves only that its own send did not.
+    transport = _Script([])
+
+    def lost(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        raise TransportError("connection lost", phase=FailurePhase.DISPATCH_STARTED, retryable=True)
+
+    transport.behaviors = [lost, _status(transport, HTTP_TOO_MANY_REQUESTS)]
+    stream = _client(transport).batch_outcomes(
+        [Command(_request(ReplaySafety.SAFE, "user.get"), 0)], policy=_policy(max_attempts_per_request=2)
+    )
+
+    (outcome,) = await _drain(stream)
+
+    assert len(transport.sent) == 2  # noqa: PLR2004 - the lost send and the refused retry
+    assert isinstance(outcome, CommandOutcomeUnknown)
+    assert isinstance(outcome.error, AmbiguousExecutionError)
+    assert outcome.error.reason is AmbiguityReason.CONNECTION_LOST_AFTER_DISPATCH
+    assert isinstance(outcome.error.__cause__, TransportError)
 
 
 @pytest.mark.asyncio
@@ -692,6 +740,68 @@ async def test_a_batch_answered_after_the_time_budget_reports_its_unsafe_command
     assert outcome.error.reason is (
         AmbiguityReason.DEADLINE_AFTER_DISPATCH if replay == "success" else AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["status", "structured"])
+@pytest.mark.parametrize("rounds", [1, 2], ids=["first-round", "replay-round"])
+async def test_a_listed_refusal_answered_after_the_time_budget_still_proves_nothing_ran(
+    answer: str, rounds: int
+) -> None:
+    # A 429 or a QUERY_LIMIT_EXCEEDED is a listed refusal even when it arrives after the time budget: the creation
+    # did not run, so it is not reported unknown, and a replay refused this way keeps the first batch's refusal.
+    now = [0.0]
+    transport = _Script([])
+
+    def late(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        now[0] = 100.0
+        if answer == "status":
+            return WireResponse(HTTP_TOO_MANY_REQUESTS, (("content-type", "text/html"),), b"<html>refused</html>")
+        body = json.dumps(_QUERY_LIMIT).encode()
+        return WireResponse(HTTP_SERVICE_UNAVAILABLE, (("content-type", "application/json"),), body)
+
+    if rounds == 1:
+        transport.behaviors = [late]
+    else:
+        _refused_then(transport, late)
+    executor = Executor(transport, clock=lambda: now[0])
+    request = _request(ReplaySafety.UNSAFE, "tasks.task.add")
+    policy = _policy(max_elapsed=10.0, max_retry_elapsed_per_request=10.0)
+
+    (outcome,) = await BatchExecutor(executor).execute_requests((request,), context=executor.context(policy))
+
+    assert len(transport.sent) == rounds
+    assert isinstance(outcome, BatchFailure)
+    assert not isinstance(outcome.error, AmbiguousExecutionError)
+    if rounds == 2:  # noqa: PLR2004 - the replay round
+        assert isinstance(outcome.error, BatchCommandError)
+        assert outcome.replay_disposition is ReplayDisposition.ELIGIBLE
+
+
+@pytest.mark.asyncio
+async def test_a_late_listed_refusal_after_a_send_that_may_have_run_stays_unknown() -> None:
+    # The 429 proves only that the retry did not run; the 502 before it may have, so the read stays unknown.
+    now = [0.0]
+    transport = _Script([])
+    refused = _status(transport, HTTP_TOO_MANY_REQUESTS)
+
+    def late(request: Request) -> WireResponse:
+        now[0] = 100.0
+        return refused(request)
+
+    transport.behaviors = [_status(transport, HTTP_BAD_GATEWAY), late]
+    executor = Executor(transport, clock=lambda: now[0])
+    policy = _policy(max_elapsed=10.0, max_retry_elapsed_per_request=10.0)
+
+    (outcome,) = await BatchExecutor(executor).execute_requests(
+        (_request(ReplaySafety.SAFE, "user.get"),), context=executor.context(policy)
+    )
+
+    assert len(transport.sent) == 2  # noqa: PLR2004 - the 502 and the late refusal
+    assert isinstance(outcome, BatchFailure)
+    assert isinstance(outcome.error, AmbiguousExecutionError)
+    assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
 
 
 @pytest.mark.asyncio

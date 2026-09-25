@@ -84,6 +84,8 @@ class _RequestAttempts:
     earlier_unproven: bool = False
     last_unproven: bool = False
     last_failure: B24ApiError | None = None
+    # The latest failure of the round that does not prove its send did not run: what an unknown outcome is about.
+    unproven_failure: B24ApiError | None = None
 
     def begin(self, clock: Clock) -> tuple[float, int]:
         """Start the retry clock on the first send and return it with the attempts already spent."""
@@ -106,11 +108,13 @@ class _RequestAttempts:
         self.last_failure = error
         if _proves_not_run(error, policy):
             self.last_unproven = False
+        else:
+            self.unproven_failure = error
 
     def new_round(self) -> None:
         """Forget which sends of the previous batch round may have run and how they failed."""
         self.earlier_unproven = self.last_unproven = False
-        self.last_failure = None
+        self.last_failure = self.unproven_failure = None
 
 
 class _DecodedJsonObject(dict[str, object]):
@@ -341,6 +345,7 @@ class Executor:
                 )
                 await context.record_cooldown(merged)
             _raise_for_pending_cancellation()
+            shared.settle(response_error, context.policy)
             if context.remaining_time(retry_started=retry_started) <= 0:
                 raise BudgetExceededError("transport completed after execution time budget") from response_error
             await self._prepare_retry(

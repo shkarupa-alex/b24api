@@ -216,7 +216,7 @@ class BatchExecutor:
                 return _Round(tuple(_shared_failure(command, error) for command in commands))
             replay = () if options.halt or not _safe_replay_allowed(error, context) else commands
             return _Round(
-                tuple(_unknown_failure(command, error) for command in commands),
+                tuple(_unknown_failure(command, error, attempts.unproven_failure) for command in commands),
                 tuple(command for command in replay if command.request.replay_safety is ReplaySafety.SAFE),
             )
 
@@ -621,12 +621,16 @@ def _safe_replay_allowed(error: B24ApiError, context: ExecutionContext) -> bool:
     return isinstance(cause, B24ApiError) and _is_retryable(cause, safety=ReplaySafety.SAFE, policy=context.policy)
 
 
-def _unknown_failure(command: _Command, error: B24ApiError) -> BatchFailure:
-    """Give one admitted command its own possible-execution outcome, kept unless a SAFE replay replaces it."""
-    # A budget that ended the round after a send is explained by the last failure it carries, if any.
+def _unknown_failure(command: _Command, error: B24ApiError, unproven: B24ApiError | None = None) -> BatchFailure:
+    """Give one admitted command its own possible-execution outcome, kept unless a SAFE replay replaces it.
+
+    The reason and cause name the latest failure of a send that may have run; without one (an answer that came
+    after the budget, for example), the failure that ended the round.
+    """
     source = error
     if isinstance(error, BudgetExceededError) and isinstance(error.__cause__, B24ApiError):
         source = error.__cause__
+    source = unproven or source
     if isinstance(source, AmbiguousExecutionError):
         reason = source.reason
     elif isinstance(source, ResponseTooLargeError):
@@ -642,12 +646,23 @@ def _unknown_failure(command: _Command, error: B24ApiError) -> BatchFailure:
         reason=reason,
         declared_unsafe=command.request.replay_safety is ReplaySafety.UNSAFE,
         request_summary=command.request.summary,
-        evidence=error.evidence,
+        evidence=source.evidence,
     )
     # Keep the original failure as the cause instead of the executor's batch-scoped ambiguity wrapper.
     original = error.__cause__ if isinstance(error, AmbiguousExecutionError) else None
-    ambiguous.__cause__ = original if isinstance(original, BaseException) else error
+    terminal = original if isinstance(original, BaseException) else error
+    # The chain must reach the send that may have run, even when a later failure ended the round.
+    ambiguous.__cause__ = terminal if unproven is None or _caused_by(terminal, unproven) else unproven
     return _shared_failure(command, ambiguous)
+
+
+def _caused_by(error: BaseException, cause: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if current is cause:
+            return True
+        current = current.__cause__
+    return False
 
 
 def _raise_source_error(error: Exception) -> None:

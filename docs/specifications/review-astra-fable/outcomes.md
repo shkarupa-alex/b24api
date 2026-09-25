@@ -207,7 +207,8 @@ Two further observations; the first is decided, the second stays with the owner:
   stops a replay before it is sent. A round in which any send may have run makes its commands
   unknown whatever failure ends it, including a budget that runs out after a send or a batch answered
   after the time budget; only a listed refusal as the round's last answer keeps the refused outcome.
-  The unknown outcome takes its reason from the last failure the budget error carries. A fail-fast
+  The unknown outcome takes its reason and cause from the latest failure of a send that may have run,
+  or, when the answer came after the budget, from the failure that ended the round. A fail-fast
   batch is not split. The same rule now also retries a direct `UNSAFE` request after a proven refusal.
   Tests:
   `tests/internal/execution_boundary_test.py::test_physical_batch_replay_matrix`,
@@ -221,6 +222,9 @@ Two further observations; the first is decided, the second stays with the owner:
   `tests/internal/execution_boundary_test.py::test_a_configured_retry_code_or_status_does_not_prove_an_unsafe_request_never_ran`,
   `tests/internal/execution_boundary_test.py::test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budget_stops_the_next_attempt`,
   `tests/internal/execution_boundary_test.py::test_a_batch_answered_after_the_time_budget_reports_its_unsafe_command_unknown`,
+  `tests/internal/execution_boundary_test.py::test_a_listed_refusal_answered_after_the_time_budget_still_proves_nothing_ran`,
+  `tests/internal/execution_boundary_test.py::test_an_unknown_outcome_is_explained_by_the_send_that_may_have_run`,
+  `tests/internal/execution_boundary_test.py::test_a_late_listed_refusal_after_a_send_that_may_have_run_stays_unknown`,
   `tests/internal/execution_boundary_test.py::test_a_batch_retried_after_a_send_that_may_have_run_stays_unknown_whatever_ends_the_retries`,
   `tests/internal/execution_boundary_test.py::test_replay_rounds_and_the_retries_inside_them_share_one_attempt_budget`,
   `tests/internal/execution_boundary_test.py::test_replay_rounds_share_the_retry_time_budget_measured_from_the_first_send`, and
