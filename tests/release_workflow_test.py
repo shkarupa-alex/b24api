@@ -488,6 +488,10 @@ def test_local_qc_leaves_out_the_internal_benches_that_the_slow_job_runs() -> No
     assert '"-m", "not slow and not benchmark"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert targets["bench"][1] == ["uv run --locked pytest -m slow"]
     assert "make bench" in _runs("slow")
+    # The header names what qc runs and what only CI runs, rather than promising every blocking check.
+    header = " ".join(line.lstrip("# ") for line in (ROOT / "Makefile").read_text(encoding="utf-8").splitlines()[:4])
+    assert "every blocking CI check" not in header
+    assert "The coverage floor, the 3.13 leg, min-deps and wheel-typing run in CI only." in header
 
 
 def test_blocking_jobs_run_the_specified_checks() -> None:
