@@ -155,6 +155,46 @@ def test_deflate_chooses_its_framing_once_from_a_complete_header(raw: bool, payl
     assert decoded + decoder.finish() == payload
 
 
+# A non-final stored block with a set padding bit: 0x081d passes the zlib header check, yet it is raw deflate.
+_STORED_JSON = b'{"result":"abcdefghijklmnop"}'
+_RAW_DEFLATE_PASSING_THE_ZLIB_CHECK = b"\x08\x1d\x00\xe2\xff" + _STORED_JSON + b"\x01\x00\x00\xff\xff"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunk", [1, len(_RAW_DEFLATE_PASSING_THE_ZLIB_CHECK)], ids=["one-byte", "whole"])
+async def test_raw_deflate_that_passes_the_zlib_header_check_is_replayed_as_raw(chunk: int) -> None:
+    encoded = _RAW_DEFLATE_PASSING_THE_ZLIB_CHECK
+    assert zlib.decompress(encoded, -zlib.MAX_WBITS) == _STORED_JSON
+    decoder = _BoundedDecoder.for_encoding("deflate", limit=len(_STORED_JSON))
+    decoded = b"".join(decoder.feed(encoded[index : index + chunk]) for index in range(0, len(encoded), chunk))
+    assert decoded + decoder.finish() == _STORED_JSON
+
+    transport, client = _transport(
+        lambda request: httpx.Response(
+            _OK, headers={"content-encoding": "deflate"}, stream=_RawStream(encoded, chunk_size=chunk), request=request
+        )
+    )
+    try:
+        assert await _send(transport, limit=len(_STORED_JSON)) == _STORED_JSON
+        with pytest.raises(ResponseTooLargeError, match="byte ceiling"):
+            await _send(transport, limit=len(_STORED_JSON) - 1)
+    finally:
+        await transport.aclose()
+        await client.aclose()
+
+
+def test_deflate_framing_guess_is_final_once_it_decoded_output_or_both_framings_fail() -> None:
+    corrupt = zlib.compress(_PAYLOAD)[:2] + b"\xff" * 16
+    with pytest.raises(zlib.error):
+        _BoundedDecoder.for_encoding("deflate", limit=_LIMIT).feed(corrupt)
+
+    wrapped = zlib.compress(_PAYLOAD)
+    decoder = _BoundedDecoder.for_encoding("deflate", limit=_LIMIT)
+    assert decoder.feed(wrapped[:-4]) == _PAYLOAD
+    with pytest.raises(zlib.error):
+        decoder.feed(b"\x00" * 4 + b"\xff" * 8)
+
+
 def test_raw_deflate_shorter_than_a_zlib_header_is_decided_at_finish() -> None:
     encoded = _deflate(b"", raw=True)
     decoder = _BoundedDecoder.for_encoding("deflate", limit=1)

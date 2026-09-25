@@ -12,14 +12,18 @@
 - `HttpxTransport` is exported from the root.
 - **Breaking (3.0.0):** response bodies are decompressed inside a bounded decoder. Only identity or
   one `gzip`/`deflate` coding is accepted; stacked, unknown, `br` and `zstd` codings are refused
-  before decompression as a body-read transport failure. Library-owned requests send
+  before decompression as a body-read transport failure. `deflate` is decoded zlib-wrapped or raw, as
+  HTTPX decodes it. Library-owned requests send
   `Accept-Encoding: gzip, deflate`; a header set by the caller or an injected client is kept (A2).
-- **Breaking (3.0.0):** a physical batch that may have been accepted when its transport failed is
-  never replayed, even when every command is `SAFE`; each admitted command becomes
-  `CommandOutcomeUnknown` with its own `AmbiguousExecutionError` (A3). A physical batch answered with
-  an HTTP error status and no Bitrix envelope is not replayed either, even when `SAFE`: its commands
-  become unknown after 408 or 5xx and fail after 423, 425 or 429 (in 2.3 a `SAFE` batch was replayed).
-  A transport failure marked `retryable=False` is raised once instead of exhausting the attempt budget.
+- **Breaking (3.0.0):** a failed physical batch is replayed per command, not as a whole (A3). A
+  `SAFE` command is sent again, in a smaller physical batch, after any transient failure; an `UNSAFE`
+  or `UNKNOWN` command only when the failure proves it did not run: a transport failure before
+  dispatch, an unstructured 423, 425 or 429, or a request or time quota refusal
+  (`QUERY_LIMIT_EXCEEDED`, `OPERATION_TIME_LIMIT`) of the batch or of that command. An `UNSAFE` or
+  `UNKNOWN` command of a batch that may have run (a transport failure after dispatch, 408 or 5xx)
+  becomes `CommandOutcomeUnknown` with its own `AmbiguousExecutionError`; in 2.3 the whole batch
+  followed the least safe command. A direct `UNSAFE` or `UNKNOWN` request is now also retried after
+  such a proven refusal. A fail-fast batch is not split. A transport failure marked `retryable=False` is raised once instead of exhausting the attempt budget.
   An arbitrary exception from an injected transport becomes
   `TransportError(phase=DISPATCH_STARTED, retryable=False)` with the original as its cause, and a
   closed `HttpxTransport`, or one whose injected `httpx.AsyncClient` was closed before the call,

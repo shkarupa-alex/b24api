@@ -55,16 +55,18 @@ details.
    stacked and unknown codings are refused as a transport failure. Library-owned requests send
    `Accept-Encoding: gzip, deflate`. If you inject an HTTPX client that asks for `br` or `zstd`,
    remove that header.
-9. **Possibly accepted batches are not replayed.** When the transport fails after a physical batch
-   may have reached Bitrix, or Bitrix answers it with an HTTP error status and no Bitrix envelope,
-   the batch is not retried, even when every command is `SAFE`. After a transport failure or a 408
-   or 5xx status (`AmbiguityPolicy.ambiguous_unstructured_statuses`) its commands arrive as
-   `CommandOutcomeUnknown`; reconcile them as you would an ambiguous direct call. After 423, 425 or
-   429, which mean the batch was not accepted, they arrive as `CommandFailure`. In 2.3 a batch of
-   only `SAFE` commands was replayed after such a status. Unchanged: a batch whose transport failed
-   before dispatch, and a batch that Bitrix refused as a whole with a structured error such as
-   `QUERY_LIMIT_EXCEEDED`, is retried within the budget; a direct `SAFE` request is still retried
-   after a transient status.
+9. **Batch replay is decided per command.** A failed physical batch is not retried or abandoned as
+   a whole. Each `SAFE` command is sent again, in a smaller physical batch, after any transient
+   failure. An `UNSAFE` or `UNKNOWN` command is sent again only when the failure proves it did not
+   run: a transport failure before dispatch, an unstructured 423, 425 or 429, or a
+   `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT` refusal of the batch or of that command in
+   `result_error`. When the batch may have run (a transport failure after dispatch, or a 408 or 5xx
+   status from `AmbiguityPolicy.ambiguous_unstructured_statuses`), its `UNSAFE` and `UNKNOWN`
+   commands arrive as `CommandOutcomeUnknown`; reconcile them as you would an ambiguous direct call.
+   In 2.3 the whole batch was retried or not by its least safe command. Replays share the request's
+   attempt and time budgets, and a command keeps its last outcome when they run out. A direct `UNSAFE`
+   or `UNKNOWN` request is now also retried after such a proven refusal. A fail-fast `batch()` is not
+   split.
 10. **Error text.** Error descriptions show field names from your request as `field#N`, known V3
     codes verbatim, and distinct hidden mapping keys as `[REDACTED#1]`, `[REDACTED#2]`, … Code that
     parses error strings must accept these forms.

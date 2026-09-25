@@ -85,6 +85,10 @@ class ExecutionContext:
             total_elapsed=self.elapsed,
         )
 
+    def monotonic(self) -> float:
+        """Return the clock the time budgets are measured on."""
+        return self._clock()
+
     async def record_retry(self) -> None:
         """Record the retry."""
         self._retries += 1

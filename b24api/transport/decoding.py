@@ -49,7 +49,7 @@ def _zlib_wrapped(header: bytes) -> bool:
 class _BoundedDecoder:
     """Inflate one response body without ever holding more than ``limit + 1`` decoded bytes per call."""
 
-    __slots__ = ("_coding", "_decompressor", "_limit", "_prefix", "_produced")
+    __slots__ = ("_coding", "_decompressor", "_limit", "_prefix", "_produced", "_replay")
 
     def __init__(self, coding: str, *, limit: int) -> None:
         """Bind one supported coding; use :meth:`for_encoding` to parse a response header."""
@@ -57,6 +57,8 @@ class _BoundedDecoder:
         self._limit = limit
         self._produced = 0
         self._prefix = b""
+        # Raw deflate input kept while a zlib-framing guess has decoded nothing, so the guess can be undone.
+        self._replay: bytearray | None = None
         self._decompressor: zlib._Decompress | None = zlib.decompressobj(_GZIP_WBITS) if coding == "gzip" else None
 
     @classmethod
@@ -89,10 +91,32 @@ class _BoundedDecoder:
             if len(self._prefix) < _ZLIB_HEADER_BYTES:
                 return b""
             raw, self._prefix = self._prefix, b""
-            self._decompressor = zlib.decompressobj(
-                zlib.MAX_WBITS if _zlib_wrapped(raw) else _RAW_DEFLATE_WBITS,
-            )
+            wrapped = _zlib_wrapped(raw)
+            self._decompressor = zlib.decompressobj(zlib.MAX_WBITS if wrapped else _RAW_DEFLATE_WBITS)
+            self._replay = bytearray() if wrapped else None
+        if self._replay is not None:
+            return self._inflate_framing_guess(raw, self._replay)
         return self._inflate(raw)
+
+    def _inflate_framing_guess(self, raw: bytes, replay: bytearray) -> bytes:
+        """Inflate under the zlib-framing guess while it has decoded nothing.
+
+        A raw stream whose first two bytes happen to pass the zlib header check fails under that guess before
+        any output; its input is then replayed as raw deflate, as HTTPX falls back.
+        """
+        replay += raw
+        try:
+            decoded = self._inflate(raw)
+        except zlib.error:
+            if self._produced:
+                raise
+            self._replay = None
+            self._decompressor = zlib.decompressobj(_RAW_DEFLATE_WBITS)
+            return self._inflate(bytes(replay))
+        if decoded or len(replay) > self._limit:
+            # Decoded output proves the framing; the kept input never outgrows the decoded ceiling.
+            self._replay = None
+        return decoded
 
     def finish(self) -> bytes:
         """Return what remains after the last raw chunk.

@@ -39,6 +39,7 @@ from b24api.contracts import (
     Request,
     ResultCollectionShape,
     ResultSelector,
+    RetryPolicy,
     SequentialKeysetExecution,
     SequentialTraversal,
     TerminalState,
@@ -495,12 +496,13 @@ async def test_logical_batch_preserves_kernel_replay_disposition() -> None:
                 Command(Request("unsafe.add", replay_safety=ReplaySafety.UNSAFE, route=RouteKind.BARE), "unsafe"),
                 Command(Request("unknown.get", route=RouteKind.BARE), "unknown"),
             ),
+            policy=ExecutionPolicy(retry=RetryPolicy(initial_delay=0, maximum_delay=0, jitter=0)),
         )
     ]
     assert all(isinstance(outcome, CommandFailure) for outcome in outcomes)
     failures = cast("list[CommandFailure[str]]", outcomes)
-    assert failures[0].replay_disposition is ReplayDisposition.ELIGIBLE
-    assert all(outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE for outcome in failures[1:])
+    # A quota refusal proves no command ran, so each may be replayed whatever its safety (owner decision).
+    assert all(outcome.replay_disposition is ReplayDisposition.ELIGIBLE for outcome in failures)
 
 
 @pytest.mark.asyncio
@@ -857,6 +859,7 @@ async def test_tolerant_reference_preserves_kernel_replay_disposition() -> None:
         [Binding("safe", (), "safe")],
         traversal=SequentialTraversal(),
         dispatch=BatchDispatch(batch_size=1),
+        policy=ExecutionPolicy(retry=RetryPolicy(initial_delay=0, maximum_delay=0, jitter=0)),
     )
 
     outcomes = [outcome async for outcome in stream]

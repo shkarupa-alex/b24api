@@ -114,7 +114,7 @@ def test_migration_covers_changed_completion_stop_keyset_and_replay_contracts() 
 _BREAKING_MIGRATION_ITEMS = {
     "C7": ("Root imports.",),
     "A2": ("Compressed responses.",),
-    "A3": ("Possibly accepted batches are not replayed.", "Permanent transport refusals."),
+    "A3": ("Batch replay is decided per command.", "Permanent transport refusals."),
     "A13": ("Exceptions from an injected transport.",),
     "B29": ("Oversized responses.",),
     "A7": ("Error text.",),

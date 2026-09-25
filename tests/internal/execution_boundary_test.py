@@ -17,6 +17,7 @@ from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
+    BatchCommandError,
     BudgetExceededError,
     CapabilityError,
     EnvelopeContractError,
@@ -213,8 +214,14 @@ async def test_physical_batch_replay_matrix(
     assert len(outcomes) == count
     assert all(not isinstance(outcome.error, BudgetExceededError) for outcome in outcomes if hasattr(outcome, "error"))
     assert stream.report is not None
-    if possible:
-        # A physical batch that may have been accepted is never replayed, whatever its safety or flag.
+    if retryable and (not possible or safety is ReplaySafety.SAFE):
+        # Owner decision (2026-09-25): SAFE work is replayed within the budget; other work only when nothing
+        # was dispatched.
+        assert len(transport.sent) == 2  # noqa: PLR2004 - one replay within the budget
+        assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+        assert stream.report.state is TerminalState.COMPLETED
+    elif possible:
+        # A batch that may have been accepted and may not be replayed: every admitted command is unknown.
         assert len(transport.sent) == 1
         assert all(isinstance(outcome, CommandOutcomeUnknown) for outcome in outcomes)
         for outcome in outcomes:
@@ -224,17 +231,13 @@ async def test_physical_batch_replay_matrix(
             assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
         assert stream.report.unknown == count
         assert stream.report.state is TerminalState.COMPLETED_WITH_FAILURES
-    elif not retryable:
+    else:
         assert len(transport.sent) == 1
         for outcome in outcomes:
             assert isinstance(outcome, CommandFailure)
             assert outcome.error is raised[0]
             assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
         assert stream.report.failures == count
-    else:
-        assert len(transport.sent) == 2  # noqa: PLR2004 - nothing was dispatched before the retry
-        assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
-        assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.physical_requests == len(transport.sent)
     assert stream.report.batch_requests == 1
 
@@ -252,9 +255,10 @@ async def test_physical_batch_after_an_unstructured_transient_status(
     safety: ReplaySafety,
     count: int,
 ) -> None:
-    # §3.4: a physical batch is never replayed as a whole, whatever the safety flag. Every admitted command
-    # becomes unknown after a status that may follow execution (502) and fails after one that means the
-    # batch was not accepted (429); the scripted success after the status stays unused.
+    # Owner decision (2026-09-25): a physical batch is replayed as a direct request of its combined safety would
+    # be. SAFE is replayed after any transient status; UNSAFE and UNKNOWN only after one that means the batch was
+    # not accepted (429). After a status that may follow execution (502) every admitted command becomes unknown.
+    replayed = safety is ReplaySafety.SAFE or status == HTTP_TOO_MANY_REQUESTS
     transport = _Script([])
 
     def transient(request: Request) -> WireResponse:
@@ -270,30 +274,28 @@ async def test_physical_batch_after_an_unstructured_transient_status(
     outcomes = await _drain(stream)
 
     assert stream.report is not None
-    assert len(transport.sent) == 1
     assert len(outcomes) == count
-    assert stream.report.retries == 0
-    for outcome in outcomes:
-        if status == HTTP_BAD_GATEWAY:
+    if replayed:
+        assert len(transport.sent) == 2  # noqa: PLR2004 - one replay within the budget
+        assert stream.report.retries == 1
+        assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+    else:
+        assert len(transport.sent) == 1
+        assert stream.report.retries == 0
+        for outcome in outcomes:
             assert isinstance(outcome, CommandOutcomeUnknown)
             assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
             assert isinstance(outcome.error, AmbiguousExecutionError)
             assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
             assert isinstance(outcome.error.__cause__, HTTPGatewayError)
-        else:
-            assert isinstance(outcome, CommandFailure)
-            assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
-            assert isinstance(outcome.error, HTTPGatewayError)
-            assert outcome.error.http_status == HTTP_TOO_MANY_REQUESTS
-    if status == HTTP_BAD_GATEWAY:
         assert stream.report.unknown == count
     assert stream.report.physical_requests == len(transport.sent)
 
 
 @pytest.mark.asyncio
 async def test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_direct_call_keep_their_retry() -> None:
-    # Positive controls for the rule above: a Bitrix envelope refusing the whole batch proves it did not run,
-    # so the batch is sent again; a SAFE direct request still retries after an unstructured 502.
+    # Controls for the rule above: a Bitrix envelope refusing the whole batch proves it did not run, so the batch
+    # is sent again; a SAFE direct request retries after an unstructured 502, an UNSAFE one after a 429 only.
     batch_transport = _Script([])
 
     def refused(request: Request) -> WireResponse:
@@ -319,6 +321,168 @@ async def test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_di
     direct_transport.behaviors = [transient, _counting(direct_transport)]
     await _client(direct_transport).call(_request(ReplaySafety.SAFE), policy=_policy())
     assert len(direct_transport.sent) == 2  # noqa: PLR2004 - one retry after the transient status
+
+    for status, sends in ((HTTP_TOO_MANY_REQUESTS, 2), (HTTP_BAD_GATEWAY, 1)):
+        unsafe_transport = _Script([])
+
+        def answered(request: Request, *, status: int = status, sent: _Script = unsafe_transport) -> WireResponse:
+            sent.sent.append(request)
+            return WireResponse(status, (("content-type", "text/html"),), b"<html>transient</html>")
+
+        unsafe_transport.behaviors = [answered, _counting(unsafe_transport)]
+        call = _client(unsafe_transport).call(_request(ReplaySafety.UNSAFE), policy=_policy())
+        if status == HTTP_BAD_GATEWAY:
+            with pytest.raises(AmbiguousExecutionError):
+                await call
+        else:
+            await call
+        assert len(unsafe_transport.sent) == sends
+
+
+def _batch_methods(request: Request) -> list[str]:
+    commands = request.copy_parameters()["cmd"]
+    assert isinstance(commands, dict)
+    return [str(query).split("?", 1)[0] for query in commands.values()]
+
+
+def _batch_answer(results: Mapping[str, object], errors: Mapping[str, object]) -> WireResponse:
+    body: dict[str, object] = {"result": {"result": dict(results), "result_error": dict(errors) or []}}
+    return WireResponse(HTTP_OK, (("content-type", "application/json"),), json.dumps(body).encode())
+
+
+_QUERY_LIMIT = {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "Too many requests"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["status", "connection"])
+async def test_a_mixed_batch_that_may_have_run_sends_only_its_safe_commands_again(failure: str) -> None:
+    # Owner decision (2026-09-25): profile reads and one task creation share a batch that may have run. The reads
+    # are sent again in a smaller batch; only the creation, which a replay could duplicate, is reported unknown.
+    transport = _Script([])
+
+    def broken(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        if failure == "status":
+            return WireResponse(HTTP_BAD_GATEWAY, (("content-type", "text/html"),), b"<html>bad gateway</html>")
+        raise TransportError("connection lost", phase=FailurePhase.DISPATCH_STARTED, retryable=True)
+
+    transport.behaviors = [broken, _counting(transport)]
+    commands = [Command(_request(ReplaySafety.SAFE, "user.get"), index) for index in range(SEVERAL)]
+    commands.insert(1, Command(_request(ReplaySafety.UNSAFE, "tasks.task.add"), SEVERAL))
+    stream = _client(transport).batch_outcomes(commands, policy=_policy())
+
+    outcomes = await _drain(stream)
+
+    assert [outcome.correlation for outcome in outcomes] == [command.correlation for command in commands]
+    assert len(transport.sent) == 2  # noqa: PLR2004 - the first batch and the smaller replay
+    assert _batch_methods(transport.sent[1]) == ["user.get"] * SEVERAL
+    for command, outcome in zip(commands, outcomes, strict=True):
+        if command.request.method == "tasks.task.add":
+            assert isinstance(outcome, CommandOutcomeUnknown)
+            assert isinstance(outcome.error, AmbiguousExecutionError)
+        else:
+            assert isinstance(outcome, CommandSuccess)
+    assert stream.report is not None
+    assert stream.report.retries == 1
+    assert stream.report.unknown == 1
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_batch_that_was_not_accepted_is_sent_again_whole() -> None:
+    # An unstructured 429 means nothing ran, so the task creation is sent again together with the reads.
+    transport = _Script([])
+
+    def throttled(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        return WireResponse(HTTP_TOO_MANY_REQUESTS, (("content-type", "text/html"),), b"<html>slow down</html>")
+
+    transport.behaviors = [throttled, _counting(transport)]
+    commands = [
+        Command(_request(ReplaySafety.SAFE, "user.get"), 0),
+        Command(_request(ReplaySafety.UNSAFE, "tasks.task.add"), 1),
+    ]
+
+    outcomes = await _drain(_client(transport).batch_outcomes(commands, policy=_policy()))
+
+    assert [_batch_methods(request) for request in transport.sent] == [["user.get", "tasks.task.add"]] * 2
+    assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+
+
+@pytest.mark.asyncio
+async def test_commands_refused_by_their_own_transient_error_are_sent_again_alone() -> None:
+    # A per-command QUERY_LIMIT_EXCEEDED answers before that command runs, so the SAFE read and the UNSAFE creation
+    # it hit are both sent again; a permanent per-command error is kept, and nothing that succeeded is repeated.
+    transport = _Script([])
+
+    def partial(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        keys = list(commands)
+        denied = {"error": "ACCESS_DENIED", "error_description": "no"}
+        return _batch_answer({keys[0]: True}, {keys[1]: _QUERY_LIMIT, keys[2]: _QUERY_LIMIT, keys[3]: denied})
+
+    transport.behaviors = [partial, _counting(transport)]
+    commands = [
+        Command(_request(ReplaySafety.SAFE, "user.get"), 0),
+        Command(_request(ReplaySafety.SAFE, "user.get"), 1),
+        Command(_request(ReplaySafety.UNSAFE, "tasks.task.add"), 2),
+        Command(_request(ReplaySafety.UNSAFE, "tasks.task.update"), 3),
+    ]
+    stream = _client(transport).batch_outcomes(commands, policy=_policy())
+
+    outcomes = await _drain(stream)
+
+    assert len(transport.sent) == 2  # noqa: PLR2004 - the first batch and the smaller replay
+    assert _batch_methods(transport.sent[1]) == ["user.get", "tasks.task.add"]
+    assert [type(outcome) for outcome in outcomes] == [CommandSuccess, CommandSuccess, CommandSuccess, CommandFailure]
+    denied_outcome = outcomes[3]
+    assert isinstance(denied_outcome, CommandFailure)
+    assert isinstance(denied_outcome.error, BatchCommandError)
+    assert denied_outcome.error.normalized_code == "access_denied"
+    assert stream.report is not None
+    assert stream.report.retries == 1
+
+
+@pytest.mark.asyncio
+async def test_a_command_refused_on_every_round_keeps_its_error_once_the_attempt_budget_is_spent() -> None:
+    transport = _Script([])
+
+    def refused(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return _batch_answer({}, dict.fromkeys(commands, _QUERY_LIMIT))
+
+    transport.behaviors = [refused]
+    stream = _client(transport).batch_outcomes([Command(_request(ReplaySafety.UNSAFE), 0)], policy=_policy())
+
+    outcomes = await _drain(stream)
+
+    assert len(transport.sent) == 3  # noqa: PLR2004 - max_attempts_per_request rounds
+    assert isinstance(outcomes[0], CommandFailure)
+    assert isinstance(outcomes[0].error, BatchCommandError)
+    assert outcomes[0].error.normalized_code == "query_limit_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_a_fail_fast_batch_is_never_split_for_a_replay() -> None:
+    transport = _Script([])
+
+    def partial(request: Request) -> WireResponse:
+        transport.sent.append(request)
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        keys = list(commands)
+        return _batch_answer({keys[0]: True}, {keys[1]: _QUERY_LIMIT})
+
+    transport.behaviors = [partial, _counting(transport)]
+    stream = _client(transport).batch(
+        [Command(_request(ReplaySafety.SAFE), index) for index in range(2)], policy=_policy()
+    )
+    with pytest.raises(BatchFailed):
+        [outcome async for outcome in stream]
+    assert len(transport.sent) == 1
 
 
 # --- A13 -------------------------------------------------------------------------------------

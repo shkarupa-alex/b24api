@@ -15,7 +15,7 @@ Test paths are `file::test`. The last section lists what remains for the owner.
 |---|---|---|---|
 | A1 | Done | `4cd3998` | `tools/b24api_evidence/harness/live_test.py::test_live_portal_httpx_info_record_carries_no_webhook_token`, `::test_live_portal_sync_attribution_leaves_foreign_records_on_the_same_logger_unchanged` |
 | A2 | Done; L2 confirmed | `15b5155` | `tests/internal/bounded_decoding_test.py::test_single_gzip_bomb_is_refused_inside_the_decompressor`, `::test_stacked_gzip_cascade_is_refused_before_decompression`; [L2](live-probes.md#l2-a2-content-encoding-and-the-explicit-accept-encoding) |
-| A3 | Done | `228d0f8` | `tests/internal/execution_boundary_test.py::test_direct_replay_matrix`, `::test_physical_batch_replay_matrix`, `::test_permanent_transport_refusal_is_raised_once_instead_of_exhausting_the_budget`, `::test_physical_batch_after_an_unstructured_transient_status`, `::test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_direct_call_keep_their_retry` |
+| A3 | Done | `228d0f8` | `tests/internal/execution_boundary_test.py::test_direct_replay_matrix`, `::test_physical_batch_replay_matrix`, `::test_permanent_transport_refusal_is_raised_once_instead_of_exhausting_the_budget`, `::test_physical_batch_after_an_unstructured_transient_status`, `::test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_direct_call_keep_their_retry`, `::test_a_mixed_batch_that_may_have_run_sends_only_its_safe_commands_again`, `::test_commands_refused_by_their_own_transient_error_are_sent_again_alone` |
 | A4 | Done | `06dfa00` | `pydantic>=2.12.0` in `pyproject.toml`; the `min-deps` job (`tests/release_workflow_test.py::test_blocking_jobs_run_the_specified_checks`) |
 | A5 | Done | `43fd34d` | `tests/internal/rate_coordinator_test.py::test_client_closes_its_own_coordinator_and_awaits_the_wake_task` |
 | A6 | Done | `06dfa00`, `de451d5` | `tests/release_workflow_test.py::test_wheel_check_refuses_an_untyped_wheel_or_files_beside_the_package`, `::test_wheel_typing_passes_every_canonical_import_and_flags_an_old_root_import` |
@@ -191,19 +191,26 @@ These steps are outward-facing or need the owner's decision, so they were not pe
 
 Two further observations; the first is decided, the second stays with the owner:
 
-- **Physical batch replay.** Decided by §3.4 as written: a physical batch is never replayed as a whole
-  once it may have reached the portal, even when every command is `SAFE` — neither after a transport
-  failure that may follow acceptance nor after an HTTP error status without a Bitrix envelope. Its
-  commands become unknown after a transport failure, 408 or 5xx, and fail after 423, 425 or 429. Two
-  retries stay, because nothing ran: a batch whose transport failed before dispatch
-  (`NOT_DISPATCHED`, `CONNECTION_ESTABLISHED`), and a batch Bitrix refused as a whole with a
-  structured error such as `QUERY_LIMIT_EXCEEDED`. Only a Bitrix envelope proves that Bitrix itself
-  refused the batch; an unstructured 423, 425 or 429 may come from a proxy in front of it, so those
-  commands fail instead of being replayed. Tests:
+- **Physical batch replay.** Owner decision, 2026-09-25, which replaces the whole-batch reading of
+  §3.4: `SAFE` work is always replayed within the budget; `UNSAFE` and `UNKNOWN` work only when the
+  failure proves it did not run, so a replay cannot duplicate an effect. A physical batch applies this
+  per command. The executor retries the whole batch only when every command would be retried (all
+  `SAFE`, or a proven refusal: a transport failure before dispatch, an unstructured 423, 425 or 429, a
+  structured `QUERY_LIMIT_EXCEEDED` or `OPERATION_TIME_LIMIT`). Otherwise the batch engine sends again,
+  in a smaller physical batch, the `SAFE` commands of a batch that may have run and every command that
+  its own `result_error` refused with a transient code; the `UNSAFE` and `UNKNOWN` commands of a batch
+  that may have run become unknown. Rounds are bounded by `max_attempts_per_request` and the retry time
+  budget; a command keeps its last outcome when they run out. A fail-fast batch is not split. The same
+  rule now also retries a direct `UNSAFE` request after a proven refusal. Tests:
   `tests/internal/execution_boundary_test.py::test_physical_batch_replay_matrix`,
-  `tests/internal/execution_boundary_test.py::test_physical_batch_after_an_unstructured_transient_status`
-  and
-  `tests/internal/execution_boundary_test.py::test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_direct_call_keep_their_retry`.
+  `tests/internal/execution_boundary_test.py::test_physical_batch_after_an_unstructured_transient_status`,
+  `tests/internal/execution_boundary_test.py::test_structured_refusal_of_a_safe_batch_and_a_transient_status_on_a_direct_call_keep_their_retry`,
+  `tests/internal/execution_boundary_test.py::test_a_mixed_batch_that_may_have_run_sends_only_its_safe_commands_again`,
+  `tests/internal/execution_boundary_test.py::test_a_mixed_batch_that_was_not_accepted_is_sent_again_whole`,
+  `tests/internal/execution_boundary_test.py::test_commands_refused_by_their_own_transient_error_are_sent_again_alone`,
+  `tests/internal/execution_boundary_test.py::test_a_command_refused_on_every_round_keeps_its_error_once_the_attempt_budget_is_spent`,
+  `tests/internal/execution_boundary_test.py::test_a_fail_fast_batch_is_never_split_for_a_replay`, and
+  `tests/execution_test.py::test_unsafe_operation_time_limit_waits_for_the_method_and_replays`.
   Migration item 9 states it.
 - **HTTPX logging on injected clients.** Two W2 gaps remain: the httpcore DEBUG record of a
   redirect token, and an unbounded `aread` on injected clients.

@@ -292,7 +292,6 @@ class Executor:
                     context=context,
                     retry_started=retry_started,
                     attempts=attempts,
-                    physical_batch=work_class is WorkClass.BATCH,
                 )
                 last_error = error
                 attempts += 1
@@ -327,7 +326,6 @@ class Executor:
                 attempts=attempts,
                 wire=wire,
                 method_cooldown=method_cooldown,
-                physical_batch=work_class is WorkClass.BATCH,
             )
             last_error = response_error
             attempts += 1
@@ -385,6 +383,21 @@ class Executor:
             )
         return response_error, parsed
 
+    async def pause_before_replay(
+        self, context: ExecutionContext, *, rounds: int, started: float, method_cooldown: float = 0.0
+    ) -> bool:
+        """Wait before sending part of a physical batch again; ``False`` when the budget forbids another round."""
+        if rounds >= context.policy.max_attempts_per_request:
+            return False
+        delay = max(_retry_delay(context.policy, retry_number=rounds, random_source=self._random), method_cooldown)
+        if delay >= context.remaining_time(retry_started=started):
+            return False
+        await context.record_retry()
+        # The coordinator holds the next permit until a method cooldown ends, as for a direct retry.
+        if not method_cooldown and delay > 0:
+            await self._sleep(delay)
+        return True
+
     async def _prepare_retry(  # noqa: PLR0913
         self,
         request: Request,
@@ -395,7 +408,6 @@ class Executor:
         attempts: int,
         wire: WireResponse | None = None,
         method_cooldown: float = 0.0,
-        physical_batch: bool = False,
     ) -> None:
         safety = request.replay_safety or ReplaySafety.UNKNOWN
         if isinstance(error, ResponseTooLargeError) and safety is not ReplaySafety.SAFE:
@@ -425,7 +437,7 @@ class Executor:
             and error.http_status is not None
             and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
             and error.http_status in context.policy.ambiguity.ambiguous_unstructured_statuses
-            and (safety is not ReplaySafety.SAFE or physical_batch)
+            and safety is not ReplaySafety.SAFE
         ):
             raise AmbiguousExecutionError(
                 "Request may have executed before the unstructured HTTP failure",
@@ -434,14 +446,8 @@ class Executor:
                 request_summary=request.summary,
                 evidence=error.evidence,
             ) from error
-
-        if physical_batch and (
-            (isinstance(error, TransportError) and error.possible_acceptance) or isinstance(error, HTTPGatewayError)
-        ):
-            # A physical batch that reached the portal is never replayed as a whole, even when SAFE (§3.4): after
-            # a transport failure that may follow acceptance, or after any unstructured HTTP status. Only a
-            # structured Bitrix refusal of the whole batch (ApiResponseError) keeps its retry.
-            raise error
+        # A physical batch follows the same rule with its combined safety (owner decision, 2026-09-25): SAFE is
+        # replayed within the budget; UNSAFE/UNKNOWN only when the failure proves nothing ran.
         retryable = _is_retryable(error, safety=safety, policy=context.policy)
         if not retryable:
             raise error
@@ -462,18 +468,22 @@ class Executor:
 
 
 def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: ExecutionPolicy) -> bool:
+    """SAFE work is retried after any transient failure; other work only when the failure proves nothing ran."""
     if isinstance(error, TransportError):
         return error.retryable and (not error.possible_acceptance or safety is ReplaySafety.SAFE)
-    if safety is not ReplaySafety.SAFE:
-        return False
-    if isinstance(error, ApiResponseError) and error.retryable:
-        return True
-    return (
+    if isinstance(error, ApiResponseError):
+        # A transient Bitrix refusal (a request or time quota) answers before the method runs.
+        return error.retryable
+    transient = (
         isinstance(error, HTTPGatewayError)
         and not isinstance(error, EnvelopeContractError)
         and error.http_status is not None
         and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
         and error.http_status in policy.retry.transient_http_statuses
+    )
+    # A transient status outside the ambiguous set (423, 425, 429 by default) means the request was not accepted.
+    return transient and (
+        safety is ReplaySafety.SAFE or error.http_status not in policy.ambiguity.ambiguous_unstructured_statuses
     )
 
 

@@ -85,12 +85,14 @@ may already have reached Bitrix:
 | Value | Meaning | After possible dispatch |
 |---|---|---|
 | `SAFE` | Repeating the request cannot create a second business effect. Typical reads and explicitly idempotent operations belong here. | Automatic retry is allowed within policy budgets. |
-| `UNSAFE` | Repeating the request is known to risk a duplicate effect, for example creating an entity without an idempotency key. | No automatic replay; the caller receives an ambiguous-execution error and reconciles state. |
+| `UNSAFE` | Repeating the request is known to risk a duplicate effect, for example creating an entity without an idempotency key. | No automatic replay; the caller receives an ambiguous-execution error and reconciles state. It is retried only when the failure proves it did not run. |
 | `UNKNOWN` | The caller has not established whether replay is safe. This is the default. | Same conservative behavior as `UNSAFE`, while diagnostics preserve that safety was unknown rather than known unsafe. |
 
-A failure proved to occur before dispatch may still be retried. A physical batch is never replayed
-as a whole once it may have reached Bitrix, whatever its commands' safety: each command then
-arrives as unknown or failed. Method names never imply safety;
+A failure that proves the request did not run is retried whatever its safety: a transport failure
+before dispatch, an unstructured 423, 425 or 429, or a `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT`
+refusal. A physical batch applies these rules to each command: after a failure, only the commands that
+may run again are sent again, in a smaller batch, and an `UNSAFE` command of a batch that may have run
+arrives as unknown. Method names never imply safety;
 mark a request `SAFE` only when the operation's semantics justify it.
 
 Use `ExecutionPolicy` to narrow attempts or resource budgets for one operation:

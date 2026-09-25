@@ -523,7 +523,9 @@ async def test_method_limit_admission_budget_and_closed_error_are_typed() -> Non
 
 
 @pytest.mark.asyncio
-async def test_unsafe_operation_time_limit_observes_method_without_replay() -> None:
+async def test_unsafe_operation_time_limit_waits_for_the_method_and_replays() -> None:
+    # OPERATION_TIME_LIMIT blocks the method before it runs, so even UNSAFE work is replayed after the cooldown
+    # (owner decision, 2026-09-25).
     transport = _sequence(
         [
             WireResponse(
@@ -531,15 +533,18 @@ async def test_unsafe_operation_time_limit_observes_method_without_replay() -> N
                 headers=(),
                 body=b'{"error":"OPERATION_TIME_LIMIT","error_description":"wait"}',
             ),
+            WireResponse(200, (), b'{"result":true}'),
         ],
     )
     coordinator = RateCoordinator(operation_time_limit_delay=0.1)
-    with pytest.raises(ApiResponseError):
-        await Executor(transport, coordinator=coordinator).execute(
-            Request("crm.item.add", route=RouteKind.BARE, replay_safety=ReplaySafety.UNSAFE),
-        )
-    assert len(transport.requests) == 1
-    assert (await coordinator.snapshot()).method_cooldowns == 1
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    response = await Executor(transport, coordinator=coordinator).execute(
+        Request("crm.item.add", route=RouteKind.BARE, replay_safety=ReplaySafety.UNSAFE),
+    )
+    assert response.result is True
+    assert len(transport.requests) == 2  # noqa: PLR2004 - one replay after the method cooldown
+    assert loop.time() - started >= 0.1  # noqa: PLR2004 - the replay waited for the method cooldown
     await coordinator.close()
 
 
