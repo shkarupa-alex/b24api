@@ -63,14 +63,14 @@ def test_readme_links_are_absolute_so_they_work_on_pypi() -> None:
     assert relative == []
 
 
-def test_every_maintained_doc_is_linked_and_specifications_are_an_archive() -> None:
+def test_every_maintained_doc_is_linked() -> None:
     linked = _local_links(README)
     for path in DOCS.glob("*.md"):
         linked |= _local_links(path)
     for path in sorted(DOCS.rglob("*")):
-        if not path.is_file() or path.is_relative_to(DOCS / "specifications"):
+        if not path.is_file():
             continue
-        assert path.resolve() in linked, f"{path.relative_to(ROOT)} is neither linked nor archived"
+        assert path.resolve() in linked, f"{path.relative_to(ROOT)} is not linked"
     assert MIGRATION.is_file()
 
 
@@ -180,30 +180,6 @@ def test_maintained_documentation_does_not_describe_removed_report_vocabulary_as
         text = path.read_text(encoding="utf-8")
         for term in _REMOVED_REPORT_VOCABULARY:
             assert term not in text, f"{path.relative_to(ROOT)} names removed {term}"
-
-
-def test_every_test_the_review_outcome_registry_cites_exists() -> None:
-    # The registry is the evidence map of the astra-fable review; a citation of a missing or renamed test
-    # would claim evidence that nothing runs. ``::name`` continues the file named earlier on the same line.
-    registry = DOCS / "specifications" / "review-astra-fable" / "outcomes.md"
-    citation = re.compile(r"`(?P<path>(?:tests|tools)/[\w/]+\.py)?::(?P<name>test_\w+)`")
-    missing: list[str] = []
-    cited = 0
-    for line in registry.read_text(encoding="utf-8").splitlines():
-        path: str | None = None
-        for match in citation.finditer(line):
-            path = match.group("path") or path
-            assert path is not None, f"continuation without a file: {line}"
-            functions = {
-                node.name
-                for node in ast.walk(ast.parse((ROOT / path).read_text(encoding="utf-8")))
-                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-            }
-            cited += 1
-            if match.group("name") not in functions:
-                missing.append(f"{path}::{match.group('name')}")
-    assert cited > 0
-    assert missing == []
 
 
 def test_architecture_document_names_the_complete_public_capability_family() -> None:

@@ -217,9 +217,9 @@ def _untyped_wheel(dist: Path) -> None:
     _write_wheel(dist, typed=False)
 
 
-def _wheel_with_specifications(dist: Path) -> None:
+def _wheel_with_document(dist: Path) -> None:
     _write_sdist(dist)
-    _write_wheel(dist, extra=("docs/specifications/README.md",))
+    _write_wheel(dist, extra=("docs/migration.md",))
 
 
 @pytest.mark.parametrize(
@@ -237,7 +237,7 @@ def _wheel_with_specifications(dist: Path) -> None:
         (_wheel_without_metadata, "Invalid metadata"),
         (_corrupt_sdist, "Invalid metadata"),
         (_untyped_wheel, "Missing typing marker"),
-        (_wheel_with_specifications, "Unexpected wheel contents"),
+        (_wheel_with_document, "Unexpected wheel contents"),
     ],
 )
 def test_distribution_gate_refuses_missing_extra_mismatched_or_invalid_artifacts(
@@ -352,7 +352,7 @@ def test_wheel_check_needs_no_tag_and_accepts_the_typed_package_with_its_dist_in
     ("typed", "extra", "title"),
     [
         (False, (), "Missing typing marker"),
-        (True, ("docs/specifications/b24api-issues-architecture/specification.md",), "Unexpected wheel contents"),
+        (True, ("docs/recipes.md",), "Unexpected wheel contents"),
         (True, ("docs/architecture.md",), "Unexpected wheel contents"),
         (True, ("tests/__init__.py",), "Unexpected wheel contents"),
         (True, ("tools/b24api_evidence.py",), "Unexpected wheel contents"),
