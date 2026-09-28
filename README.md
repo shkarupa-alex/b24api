@@ -240,8 +240,8 @@ but the client cannot prove that the portal did not duplicate or substitute rows
 
 An endpoint that honors `start` only at a fixed server window and signals its end only with a
 shorter page (no usable `total`, no `next`) can declare that stop rule with
-`OffsetSpec(short_page_termination=ShortPageTermination.DECLARED_TERMINAL)`; such a traversal is
-always `MECHANICS_ONLY`. See
+`OffsetSpec(short_page_termination=ShortPageTermination.DECLARED_TERMINAL)`; its successful
+exhaustion is always `MECHANICS_ONLY`. See
 [Declared short-page closure](https://github.com/shkarupa-alex/b24api/blob/master/docs/recipes.md#declared-short-page-closure).
 
 Mapping-backed collections are explicit as well. `MAPPING_VALUES` yields values from a selected

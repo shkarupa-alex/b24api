@@ -261,6 +261,40 @@ async def test_only_the_offending_binding_fails_locally_without_io(
     assert [item.correlation for item in outcomes if isinstance(item, ReferenceComplete)] == ["D"]
 
 
+@pytest.mark.parametrize(
+    ("update", "filter_key"),
+    [
+        (ParameterUpdate(ParameterPath(("filter", "=ownerId")), 1), "=id"),
+        (ParameterUpdate(ParameterPath(("filter", ">идентификатор")), 1), "идентификатор"),
+        (ParameterUpdate(ParameterPath(("filter", "ИДЕНТИФИКАТОР")), 1), "идентификатор"),
+    ],
+)
+@pytest.mark.parametrize("dispatch", [DirectDispatch(concurrency=2), BatchDispatch(batch_size=2)])
+@pytest.mark.asyncio
+async def test_non_simple_and_unicode_cursor_keys_fail_locally_without_io(
+    update: ParameterUpdate,
+    filter_key: str,
+    dispatch: DirectDispatch | BatchDispatch,
+) -> None:
+    portal = _ProductRows()
+    offending = object()
+    async with _client(portal) as client:
+        stream = client.iter_reference_outcomes(
+            _request(),
+            [Binding("offending", (update,), offending)],
+            traversal=_traversal(filter_key=filter_key),
+            dispatch=dispatch,
+        )
+        outcomes = await _drain(stream)
+
+    # A local refusal, never a per-reference CapabilityError from a driver's repeated preflight.
+    [local] = outcomes
+    assert isinstance(local, ReferenceNotExecuted)
+    assert local.correlation is offending
+    assert local.reason is NotExecutedReason.LOCAL_VALIDATION_FAILED
+    assert portal.physical == 0
+
+
 # A17.3: every other traversal control stays exclusive.
 
 

@@ -413,6 +413,25 @@ async def test_without_opt_in_an_empty_fixed_step_page_with_next_still_closes() 
             ),
             ValueError,
         ),
+        # step, wire_increment and max_decoded_rows are one window; the ordinary stride rules refuse these first.
+        (
+            lambda: OffsetSpec(
+                continuation=OffsetContinuation.FIXED_STEP,
+                step=WIDTH // 2,
+                page_stride=STRIDE,
+                short_page_termination=ShortPageTermination.DECLARED_TERMINAL,
+            ),
+            ValueError,
+        ),
+        (
+            lambda: OffsetSpec(
+                continuation=OffsetContinuation.FIXED_STEP,
+                step=WIDTH,
+                page_stride=PageStride(server_granularity=WIDTH, wire_increment=WIDTH, max_decoded_rows=WIDTH * 2),
+                short_page_termination=ShortPageTermination.DECLARED_TERMINAL,
+            ),
+            ValueError,
+        ),
         (lambda: SequentialTraversal(page_size=WIDTH - 1, offset=DECLARED), ValueError),
         (lambda: CountedTraversal(offset=DECLARED), ValueError),
     ],
@@ -767,6 +786,54 @@ async def test_early_close_keeps_the_prior_non_exhausted_outcome(reference: bool
     assert report.state is TerminalState.EARLY_CLOSED
     assert not report.exhausted
     assert report.assurance is TraversalAssurance.MECHANICS_ONLY
+
+
+class _FailingCloseBindings:
+    """One binding whose source then fails to close."""
+
+    def __init__(self) -> None:
+        self._yielded = False
+
+    def __aiter__(self) -> _FailingCloseBindings:
+        return self
+
+    async def __anext__(self) -> Binding[int]:
+        if self._yielded:
+            raise StopAsyncIteration
+        self._yielded = True
+        return Binding("one", (), 1)
+
+    async def aclose(self) -> None:
+        raise RuntimeError("binding source cleanup failed")
+
+
+@pytest.mark.parametrize("early", [False, True])
+@pytest.mark.asyncio
+async def test_cleanup_failure_is_never_an_exhausted_or_stronger_outcome(early: bool) -> None:  # noqa: FBT001
+    portal = _Portal(_booking({0: WIDTH, WIDTH: SHORT}))
+    async with _client(portal) as client:
+        stream = client.iter_reference_outcomes(
+            _request(),
+            _FailingCloseBindings(),
+            traversal=SequentialTraversal(selector=SELECTOR, page_size=WIDTH, offset=DECLARED),
+            dispatch=DirectDispatch(concurrency=1),
+        )
+
+        async def consume() -> None:
+            async with stream:
+                async for _item in stream:
+                    if early:
+                        break
+
+        with pytest.raises(RuntimeError, match="binding source cleanup failed"):
+            await consume()
+
+    report = stream.report
+    assert report is not None
+    assert report.state is (TerminalState.EARLY_CLOSED if early else TerminalState.FAILED)
+    assert not report.exhausted
+    assert report.assurance is TraversalAssurance.MECHANICS_ONLY
+    assert "cleanup_failure" in {violation.code for violation in report.violations}
 
 
 # A16.10: the normative booking recipe runs verbatim from the user documentation.

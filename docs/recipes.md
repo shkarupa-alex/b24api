@@ -302,15 +302,16 @@ another owner's requests. An update inside the keyset filter is admitted only wh
   (`id`, `>id`, `<=ID` and `=id` are all refused), and only while `filter_key` is itself a simple name;
 - a JSON scalar or a flat list of scalars.
 
-Any other update fails only that binding with `ReferenceNotExecuted(LOCAL_VALIDATION_FAILED)` before it
-sends anything, keeping its correlation; order, `start`, limit and split-order controls stay exclusive
-as before. The base request keeps its own rules: a non-mapping `filter`, or a base key equal to the
-managed cursor key (such as `>ID`), is refused with `CapabilityError` before any binding is read,
-while other identity constraints such as `<=id` remain allowed. `traversal_control_paths()` still
-lists the containers a traversal writes, including the whole filter; it names those containers and
-does not decide which binding updates compose. References still accept only
-`SequentialKeysetExecution` without a `KeysetSpec.boundary`, and the recipe does not promise that
-every REST method treats arbitrary constant filters the same way.
+Any other update is refused locally before that binding sends anything: `iter_reference_outcomes()`
+reports it as `ReferenceNotExecuted(LOCAL_VALIDATION_FAILED)` with its correlation while the other
+bindings continue, and fail-fast `iter_references()` raises `ReferenceFailed`. Order, `start`, limit
+and split-order controls stay exclusive as before. The base request keeps its own rules: a
+non-mapping `filter`, or a base key equal to the managed cursor key (such as `>ID`), is refused with
+`CapabilityError` before any binding is read, while other identity constraints such as `<=id` remain
+allowed. `traversal_control_paths()` still lists the containers a traversal writes, including the
+whole filter; it names those containers and does not decide which binding updates compose.
+References still accept only `SequentialKeysetExecution` without a `KeysetSpec.boundary`, and the
+recipe does not promise that every REST method treats arbitrary constant filters the same way.
 
 ## Mapping-backed collections
 
