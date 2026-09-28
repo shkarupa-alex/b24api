@@ -115,8 +115,15 @@ def _binding_closure_violation(binding: _Binding, event: BindingTerminal) -> str
             "completion_unknown_binding_claimed_known",
         ),
         (
+            # A declared short-page closure reports a missing page as its own witness failure below.
             binding.last_page_id < 0
-            and closure not in {BindingClosure.CALLER_STOP, BindingClosure.FAILURE, BindingClosure.UNKNOWN},
+            and closure
+            not in {
+                BindingClosure.CALLER_STOP,
+                BindingClosure.FAILURE,
+                BindingClosure.UNKNOWN,
+                BindingClosure.DECLARED_SHORT_PAGE,
+            },
             "completion_terminal_lacks_page_witness",
         ),
         (

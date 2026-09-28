@@ -45,7 +45,16 @@ class TotalTermination(StrEnum):
 
 
 class ShortPageTermination(StrEnum):
-    """Whether a caller-declared short fixed-step page closes the traversal."""
+    """Whether a short page may end a fixed-step offset traversal.
+
+    Some endpoints honor ``start`` only at a fixed server window, report no usable total and send no
+    ``next``, so the only end signal is a page shorter than that window. The client cannot prove
+    that from the wire: a short page may also mean a truncated or misbehaving response. ``DISABLED``
+    therefore keeps refusing an unexplained short page. ``DECLARED_TERMINAL`` is the caller's own
+    qualification of the endpoint: a non-empty page shorter than the declared window closes the
+    traversal as exhausted. That result proves the declared stop rule was met, not that the
+    snapshot is complete, so its assurance stays ``MECHANICS_ONLY``.
+    """
 
     DISABLED = "disabled"
     DECLARED_TERMINAL = "declared_terminal"

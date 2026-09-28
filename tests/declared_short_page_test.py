@@ -689,7 +689,7 @@ def test_gate_accepts_a_non_empty_short_last_page_against_its_window() -> None:
         (SHORT, float(WIDTH), "completion_invalid_declared_short_page_witness"),
         (1, 1, "completion_invalid_declared_short_page_witness"),
         (1, True, "completion_invalid_declared_short_page_witness"),
-        (None, WIDTH, "completion_terminal_lacks_page_witness"),
+        (None, WIDTH, "completion_invalid_declared_short_page_witness"),
     ],
 )
 def test_gate_blocks_an_invalid_declared_short_page_witness(rows: int | None, width: object, code: str) -> None:
@@ -698,6 +698,14 @@ def test_gate_blocks_an_invalid_declared_short_page_witness(rows: int | None, wi
     assert state is TerminalState.INCOMPLETE
     assert not exhausted
     assert code in codes
+
+
+def test_other_closures_without_a_page_keep_the_generic_witness_code() -> None:
+    state, exhausted, codes = _gate_decision(None, BindingClosure.SOURCE_EMPTY, None)
+
+    assert state is TerminalState.INCOMPLETE
+    assert not exhausted
+    assert codes == {"completion_terminal_lacks_page_witness"}
 
 
 @pytest.mark.parametrize("width", [0, False, WIDTH])
