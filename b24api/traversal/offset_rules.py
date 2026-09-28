@@ -3,11 +3,15 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
+from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, QUALIFIED_TOTAL_REACHED
 from b24api.contracts.policy import ConfirmationPolicy, DuplicatePolicy, IdentityRequirement, TotalSemantics
-from b24api.contracts.traversal import OffsetContinuation, OffsetSpec, TotalTermination
+from b24api.contracts.report import PageRejectionCode
+from b24api.contracts.traversal import OffsetContinuation, OffsetSpec, ShortPageTermination, TotalTermination
 from b24api.errors import CapabilityError, PaginationError
+from b24api.traversal.identity import _PageRejectionError
 from b24api.traversal.plans import OffsetSequentialPlan, OffsetTerminalRule
+
+_EMPTY_PAGE_TERMINAL = "empty page confirmed terminal"
 
 if TYPE_CHECKING:
     from b24api.contracts.request import ParameterPath, Request
@@ -19,6 +23,8 @@ def offset_terminal_rules(offset: OffsetSpec) -> frozenset[OffsetTerminalRule]:
     """Keep sparse raw closure separate from selected-row emptiness."""
     if offset.sparse_raw_bound is not None:
         return frozenset({OffsetTerminalRule.SPARSE_RAW_BOUND})
+    if offset.short_page_termination is ShortPageTermination.DECLARED_TERMINAL:
+        return frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.DECLARED_SHORT_PAGE})
     if offset.total_termination is TotalTermination.DISABLED:
         return frozenset({OffsetTerminalRule.EMPTY_PAGE})
     return frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL})
@@ -123,7 +129,7 @@ def offset_terminal(
 ) -> str | None:
     """Return the terminal reason a committed offset page proves, if any."""
     if page_size == 0 and OffsetTerminalRule.EMPTY_PAGE in plan.terminal:
-        return "empty page confirmed terminal"
+        return _EMPTY_PAGE_TERMINAL
     if confirmation is ConfirmationPolicy.EMPTY_AFTER_BOUNDARY:
         return None
     if (
@@ -135,6 +141,39 @@ def offset_terminal(
     ):
         return QUALIFIED_TOTAL_REACHED
     return None
+
+
+def declared_short_page_terminal(
+    plan: OffsetSequentialPlan,
+    response: Response,
+    *,
+    offset: int,
+    rows: int,
+) -> str | None:
+    """Return the terminal reason of a page under a caller-declared short-page closure, if any.
+
+    A full window continues at the fixed step; a server ``next`` may only agree with it. A short
+    page closes the traversal and an empty page closes it as before, but neither may carry a
+    continuation: the declared protocol has no strong witness that could outweigh that contradiction.
+    """
+    width = plan.short_page_width
+    if width is None or plan.fixed_step is None:
+        raise RuntimeError("declared short-page plan lacks its validated window")
+    if rows > width:
+        raise PaginationError("response exceeded the declared page cap")
+    if rows == width:
+        if response.next is not None and response.next != offset + plan.fixed_step:
+            raise _PageRejectionError(
+                "declared short-page traversal observed a continuation that contradicts its fixed step",
+                PageRejectionCode.RANGE_CONTRADICTION,
+            )
+        return None
+    if response.next is not None:
+        raise _PageRejectionError(
+            "declared short-page traversal observed a continuation after a short or empty page",
+            PageRejectionCode.RANGE_CONTRADICTION,
+        )
+    return _EMPTY_PAGE_TERMINAL if rows == 0 else DECLARED_SHORT_PAGE_REACHED
 
 
 def next_offset(

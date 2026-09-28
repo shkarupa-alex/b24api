@@ -18,7 +18,14 @@ from b24api.contracts.request import (
     ParameterPath,
     ResultSelector,
 )
-from b24api.contracts.traversal import CursorDomain, OffsetContinuation, PageStride, SparseRawBound, SplitOrderSpec
+from b24api.contracts.traversal import (
+    DECLARED_SHORT_PAGE_MINIMUM_WIDTH,
+    CursorDomain,
+    OffsetContinuation,
+    PageStride,
+    SparseRawBound,
+    SplitOrderSpec,
+)
 
 if TYPE_CHECKING:
     from b24api.contracts.bounded_range import BoundedIdentityRange
@@ -35,6 +42,7 @@ class OffsetTerminalRule(StrEnum):
     EMPTY_PAGE = "empty_page"
     QUALIFIED_TOTAL = "qualified_total"
     SPARSE_RAW_BOUND = "sparse_raw_bound"
+    DECLARED_SHORT_PAGE = "declared_short_page"
 
 
 class CountedOffsetMode(StrEnum):
@@ -159,6 +167,29 @@ class OffsetSequentialPlan(PlanContract):
             raise ValueError("short_page_width requires fixed-step continuation and a positive width")
         if not isinstance(self.allow_empty_after_short_window, bool):
             raise TypeError("allow_empty_after_short_window must be a boolean")
+        _validate_declared_short_page(self)
+
+
+def _validate_declared_short_page(plan: OffsetSequentialPlan) -> None:
+    """Admit a declared short-page closure only over one exact fixed window whose total is ignored."""
+    if OffsetTerminalRule.DECLARED_SHORT_PAGE not in plan.terminal:
+        return
+    stride = plan.page_stride
+    if (
+        plan.continuation is not OffsetContinuation.FIXED_STEP
+        or OffsetTerminalRule.QUALIFIED_TOTAL in plan.terminal
+        or plan.sparse_raw_bound is not None
+        or plan.allow_empty_after_short_window
+        or plan.total_semantics is not TotalSemantics.IGNORE
+    ):
+        raise ValueError("declared short-page closure requires a fixed step without a total or sparse closure")
+    if (
+        stride is None
+        or plan.short_page_width is None
+        or plan.short_page_width < DECLARED_SHORT_PAGE_MINIMUM_WIDTH
+        or not plan.fixed_step == stride.wire_increment == stride.max_decoded_rows == plan.short_page_width
+    ):
+        raise ValueError("declared short-page closure requires one decoded window of at least 2 per fixed step")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

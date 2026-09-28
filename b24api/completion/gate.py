@@ -31,6 +31,7 @@ from b24api.contracts.report import (
     Violation,
     ViolationSeverity,
 )
+from b24api.contracts.traversal import DECLARED_SHORT_PAGE_MINIMUM_WIDTH
 from b24api.contracts.violation import retain_violations
 
 if TYPE_CHECKING:
@@ -114,8 +115,15 @@ def _binding_closure_violation(binding: _Binding, event: BindingTerminal) -> str
             "completion_unknown_binding_claimed_known",
         ),
         (
+            # A declared short-page closure reports a missing page as its own witness failure below.
             binding.last_page_id < 0
-            and closure not in {BindingClosure.CALLER_STOP, BindingClosure.FAILURE, BindingClosure.UNKNOWN},
+            and closure
+            not in {
+                BindingClosure.CALLER_STOP,
+                BindingClosure.FAILURE,
+                BindingClosure.UNKNOWN,
+                BindingClosure.DECLARED_SHORT_PAGE,
+            },
             "completion_terminal_lacks_page_witness",
         ),
         (
@@ -150,8 +158,29 @@ def _binding_closure_violation(binding: _Binding, event: BindingTerminal) -> str
             ),
             "completion_missing_keyset_plan_witness",
         ),
+        (
+            closure is BindingClosure.DECLARED_SHORT_PAGE and not _declared_short_page_witnessed(binding, event),
+            "completion_invalid_declared_short_page_witness",
+        ),
+        (
+            closure is not BindingClosure.DECLARED_SHORT_PAGE and event.declared_short_page_width is not None,
+            "completion_unexpected_declared_short_page_width",
+        ),
     )
     return next((code for failed, code in checks if failed), None)
+
+
+def _declared_short_page_witnessed(binding: _Binding, event: BindingTerminal) -> bool:
+    """Require the last acknowledged page to be non-empty and shorter than the declared window."""
+    width = event.declared_short_page_width
+    rows = binding.last_acknowledged_rows
+    return (
+        type(width) is int
+        and width >= DECLARED_SHORT_PAGE_MINIMUM_WIDTH
+        and binding.acknowledged_pages > 0
+        and rows is not None
+        and 0 < rows < width
+    )
 
 
 class CompletionGate:

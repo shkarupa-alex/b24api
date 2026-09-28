@@ -27,6 +27,9 @@ def _aligned_initial_offset(driver: StrategyContext, plan: OffsetSequentialPlan)
     if stride is not None and initial_offset % stride.server_granularity:
         # The server would silently serve the floor window, repeating or skipping raw rows.
         raise CapabilityError("initial offset must align with the qualified server page granularity")
+    if initial_offset != 0 and OffsetTerminalRule.DECLARED_SHORT_PAGE in plan.terminal:
+        # A declared short page closes only the collection read from its first window.
+        raise CapabilityError("declared short-page traversal must start at offset zero")
     if initial_offset != plan.initial_control and OffsetTerminalRule.QUALIFIED_TOTAL in plan.terminal:
         # The exact total counts the whole collection; a suffix never reaches it and would end incomplete.
         raise CapabilityError(

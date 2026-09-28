@@ -47,6 +47,8 @@ from b24api.references.outcome import (
 )
 from b24api.references.support import (
     _active_limit,
+    _declared_short_page_width,
+    _done_closure,
     _finish_done_completion,
     _finish_task,
     _new_page_records,
@@ -392,6 +394,7 @@ class ReferenceScheduler:
                     run.stopped_reason,
                     driver.terminal_reason,
                     driver.expected_total,
+                    _declared_short_page_width(self.plan, driver.terminal_reason),
                 ),
             )
         except asyncio.CancelledError:
@@ -652,6 +655,7 @@ class ReferenceScheduler:
                     event.work.reference,
                     event.row_count,
                     event.stopped_reason,
+                    _done_closure(event),
                 )
             return
         request = event.work.reference.request

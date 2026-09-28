@@ -26,7 +26,7 @@ from b24api.contracts.policy import (
 from b24api.contracts.report import KeysetSelectionSummary, TraversalAssurance, Violation
 from b24api.contracts.request import IdentitySpec, RequestLike, ResultSelector, TraversalIdentity, canonical_request
 from b24api.contracts.request_summary import RouteKind
-from b24api.contracts.traversal import OffsetContinuation, TotalTermination
+from b24api.contracts.traversal import OffsetContinuation, ShortPageTermination, TotalTermination
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.counted import CountedItemStream
@@ -105,7 +105,10 @@ def sequential_stream(  # noqa: PLR0913
     """Compose conservative sequential offset/server-next traversal."""
     ledger = _checked_identity_store(identity_store, identity)
     plan = sequential_offset_plan(offset, page_size=page_size, duplicate_policy=DuplicatePolicy.REPORT)
-    if offset.total_termination is TotalTermination.EXACT_QUALIFIED:
+    if offset.short_page_termination is ShortPageTermination.DECLARED_TERMINAL:
+        # A declared short page proves the endpoint's stop rule, not that later windows are empty.
+        assurance = TraversalAssurance.MECHANICS_ONLY
+    elif offset.total_termination is TotalTermination.EXACT_QUALIFIED:
         assurance = (
             TraversalAssurance.IDENTITY_AND_COUNT_MATCHED if identity is not None else TraversalAssurance.COUNT_MATCHED
         )

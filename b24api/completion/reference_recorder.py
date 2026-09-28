@@ -64,7 +64,14 @@ class ReferenceCompletionRecorder:
         """Return the active adapter for one admitted binding."""
         return self._bindings[binding_id]
 
-    def terminal(self, binding_id: int, closure: BindingClosure, *, qualified_total: int | None = None) -> None:
+    def terminal(
+        self,
+        binding_id: int,
+        closure: BindingClosure,
+        *,
+        qualified_total: int | None = None,
+        declared_short_page_width: int | None = None,
+    ) -> None:
         """Retire one accounted binding after its final outcome is delivered."""
         self.gate.emit(
             BindingTerminal(
@@ -73,6 +80,7 @@ class ReferenceCompletionRecorder:
                 binding_id=binding_id,
                 closure=closure,
                 qualified_total=qualified_total,
+                declared_short_page_width=declared_short_page_width,
             )
         )
         del self._bindings[binding_id]

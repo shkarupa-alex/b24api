@@ -15,7 +15,7 @@ from b24api.traversal.identity import (
     _PageRejectionError,
     _request_with_controls,
 )
-from b24api.traversal.plans import OffsetSequentialPlan
+from b24api.traversal.plans import OffsetSequentialPlan, OffsetTerminalRule
 from b24api.traversal.sparse import sparse_page_terminal
 from b24api.traversal.strategy_context import PageStop, PageVerdict
 
@@ -127,6 +127,18 @@ class OffsetStrategy:
         plan, offset, sparse = self._plan, self._offset, self._plan.sparse_raw_bound
         if self._pending_short_window and items:
             raise PaginationError(_SHORT_WINDOW_UNPROVEN)
+        if OffsetTerminalRule.DECLARED_SHORT_PAGE in plan.terminal:
+            # The declared window explains a short page before the stride's unexplained-short refusal.
+            terminal = offset_rules.declared_short_page_terminal(plan, response, offset=offset, rows=len(items))
+            self._terminal, self._next_offset = (
+                terminal,
+                (
+                    None
+                    if terminal is not None
+                    else offset_rules.next_offset(plan, response, current=offset, observed=len(items))
+                ),
+            )
+            return PageVerdict(terminal is not None)
         if sparse is None:
             terminal = offset_rules.offset_terminal(
                 plan,

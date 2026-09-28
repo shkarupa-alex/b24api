@@ -1,5 +1,31 @@
 # Migration guide
 
+## Declared short-page closure and keyset binding filters
+
+Both changes are additive: existing calls keep their behavior, and the `b24api` root exports are
+unchanged. The new public names live in `b24api.contracts`.
+
+- **Declared short-page closure.** `OffsetSpec(short_page_termination=ShortPageTermination.DECLARED_TERMINAL)`
+  lets a qualified fixed-step endpoint close on a page shorter than its window. The default
+  `ShortPageTermination.DISABLED` keeps the fail-closed fixed-step behavior, including ignoring `next`.
+  A traversal that closes this way reports `exhausted=True` with `mechanics_only` assurance; see
+  [Declared short-page closure](recipes.md#declared-short-page-closure) for the strict preconditions.
+- **Completion evidence.** `BindingClosure` gains `DECLARED_SHORT_PAGE` and `BindingTerminal` gains
+  `declared_short_page_width` (default `None`); exhaustive matches over `BindingClosure` need one more
+  arm.
+- **Per-binding closure.** `ReferenceComplete` gains a last field, `closure`, naming the witness that
+  ended each successful binding (`SOURCE_EMPTY`, `QUALIFIED_TOTAL`, `DECLARED_SHORT_PAGE`,
+  `CALLER_STOP` and so on). It is excluded from equality and hashing, so existing comparisons keep
+  their results; `dataclasses.fields()`, `asdict()` and `repr()` now include it, and a value built
+  without it holds `None`.
+- **Keyset binding filters.** A `KeysetTraversal` binding may now set a simple field directly inside
+  `KeysetSpec.filter_path`, such as `filter[=ownerId]`; such bindings previously ended as
+  `ReferenceNotExecuted(LOCAL_VALIDATION_FAILED)` and now run. Updates that name the identity field,
+  reach deeper into the filter, or carry a mapping or nested list still fail locally, and every other
+  control path stays exclusive; see
+  [Keyset references with per-owner filters](recipes.md#keyset-references-with-per-owner-filters).
+  `traversal_control_paths()` is unchanged and still names the whole filter container.
+
 ## Upgrading from 2.3 to 3.0
 
 3.0.0 changes only what the list below names. Work through it in order; each item links to the

@@ -5,7 +5,7 @@ import asyncio
 import contextlib
 from typing import TYPE_CHECKING
 
-from b24api.completion.closure import qualified_closure
+from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, qualified_closure
 from b24api.contracts.completion import BindingClosure
 from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
 from b24api.traversal.plans import (
@@ -33,6 +33,13 @@ def _done_closure(event: _DoneEvent) -> BindingClosure:
     return qualified_closure(event.terminal_reason) or BindingClosure.SOURCE_EMPTY
 
 
+def _declared_short_page_width(plan: ListPlan, terminal_reason: str | None) -> int | None:
+    """Return the declared window a reference's short-page closure is witnessed against, else None."""
+    if isinstance(plan, OffsetSequentialPlan) and terminal_reason == DECLARED_SHORT_PAGE_REACHED:
+        return plan.short_page_width
+    return None
+
+
 def _finish_done_completion(completion: ReferenceCompletionRecorder, event: _DoneEvent) -> None:
     """Retire an acknowledged reference with its qualified closure evidence."""
     completion.binding(event.work.index).complete_omitted_empty()
@@ -41,6 +48,9 @@ def _finish_done_completion(completion: ReferenceCompletionRecorder, event: _Don
         event.work.index,
         closure,
         qualified_total=event.qualified_total if closure is BindingClosure.QUALIFIED_TOTAL else None,
+        declared_short_page_width=(
+            event.declared_short_page_width if closure is BindingClosure.DECLARED_SHORT_PAGE else None
+        ),
     )
 
 
