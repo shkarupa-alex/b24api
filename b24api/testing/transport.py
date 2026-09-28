@@ -242,7 +242,7 @@ def _failure_detail(error: BaseException | None) -> str | None:
 
 async def _await_bounded[T](awaitable: Awaitable[T], *, seconds: float, detail: str) -> T:
     """Await extension code without waiting indefinitely for cancellation cooperation."""
-    task = asyncio.ensure_future(awaitable)
+    task = asyncio.ensure_future(_contain_process_aborts(awaitable))
     try:
         done, _ = await asyncio.wait({task}, timeout=seconds)
     except asyncio.CancelledError:
@@ -254,6 +254,14 @@ async def _await_bounded[T](awaitable: Awaitable[T], *, seconds: float, detail: 
     task.cancel()
     task.add_done_callback(_consume_detached_task)
     raise IsolationDeadlineError(detail)
+
+
+async def _contain_process_aborts[T](awaitable: Awaitable[T]) -> T:
+    """Convert process aborts before Task re-raises them into and stops the isolated loop."""
+    try:
+        return await awaitable
+    except (KeyboardInterrupt, SystemExit) as error:
+        raise IsolationAbortError(type(error).__name__) from None
 
 
 def _consume_detached_task[T](task: asyncio.Future[T]) -> None:

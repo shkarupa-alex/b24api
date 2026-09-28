@@ -92,7 +92,7 @@ FANOUT_COMMANDS = 3
 DISTINCT_REQUESTS = 2
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterator
+    from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 
     from tests.scripting import ClientFactory
 
@@ -510,7 +510,20 @@ async def test_isolated_base_exceptions_become_outcomes_without_cancelling_calle
 @pytest.mark.parametrize("abort", [KeyboardInterrupt, SystemExit])
 async def test_isolated_process_aborts_become_value_free_outcomes(
     abort: type[BaseException],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # An abort escaping the isolated loop races its cancelled main task; widen that race.
+    run = asyncio.run
+
+    def slow_escape(main: Coroutine[object, object, None]) -> None:
+        try:
+            run(main)
+        except BaseException:
+            time.sleep(0.05)
+            raise
+
+    monkeypatch.setattr(asyncio, "run", slow_escape)
+
     class AbortingSend(ResponderTransport):
         async def send(
             self,
