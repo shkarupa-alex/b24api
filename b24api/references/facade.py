@@ -260,7 +260,7 @@ class _ReferenceEventMapper:
 
 
 def _reference_assurance(traversal: TraversalSpec) -> TraversalAssurance | None:
-    """Declare mechanics only for a declared short-page closure, which proves no later window empty."""
+    """Declare mechanics only for a declared short-page closure: it proves the stop rule, not empty later windows."""
     if (
         isinstance(traversal, SequentialTraversal)
         and traversal.offset.short_page_termination is ShortPageTermination.DECLARED_TERMINAL
