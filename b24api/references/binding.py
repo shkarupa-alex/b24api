@@ -9,7 +9,7 @@ from b24api._sources import OwnedSource
 from b24api.contracts.command import NotExecutedReason
 from b24api.contracts.json import _freeze_json
 from b24api.contracts.reference import Binding
-from b24api.contracts.traversal import CursorTraversal, TraversalSpec, traversal_control_paths
+from b24api.contracts.traversal import CursorTraversal, KeysetTraversal, TraversalSpec, traversal_control_paths
 from b24api.errors import CapabilityError, InputSourceError, PaginationError
 from b24api.references.outcome import ReferenceRequest
 from b24api.traversal.cursor_domain import validate_cursor_value
@@ -18,6 +18,7 @@ from b24api.traversal.values import _coerce_identity
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
+    from b24api.contracts.reference import ParameterUpdate
     from b24api.contracts.report import Violation
     from b24api.contracts.request import ParameterPath, Request
 
@@ -51,12 +52,71 @@ def _overlaps(left: tuple[str | int, ...], right: tuple[str | int, ...]) -> bool
     return left[:shared] == right[:shared]
 
 
+_CONTROL_COLLISION = "binding update collides with a traversal control path"
+_FILTER_COMBINATORS = frozenset({"logic", "and", "or"})
+
+
+def binding_update_conflict(traversal: TraversalSpec, update: ParameterUpdate) -> str | None:
+    """Return a stable local-validation reason, or None when this update may compose.
+
+    Every traversal control path stays exclusive, except that a keyset binding may set one simple
+    sibling field directly inside ``KeysetSpec.filter_path`` (for example ``=ownerId``): the
+    traversal writes only its own cursor key there, so a constant beside it composes with the
+    binding's own cursor. ``traversal_control_paths`` names the containers a traversal writes and
+    does not decide admission.
+    """
+    update_path = _normalized(update.path)
+    filter_path = _normalized(traversal.keyset.filter_path) if isinstance(traversal, KeysetTraversal) else None
+    for control in traversal_control_paths(traversal):
+        normalized = _normalized(control)
+        if normalized != filter_path and _overlaps(update_path, normalized):
+            return _CONTROL_COLLISION
+    if not isinstance(traversal, KeysetTraversal) or filter_path is None or not _overlaps(update_path, filter_path):
+        return None
+    return _keyset_filter_conflict(traversal, update, len(filter_path))
+
+
+def _keyset_filter_conflict(traversal: KeysetTraversal, update: ParameterUpdate, depth: int) -> str | None:
+    """Admit one scalar sibling field of the keyset filter whose name differs from the cursor field."""
+    parts = update.path.path
+    if len(parts) != depth + 1:
+        return "binding may set only a direct field inside the keyset filter"
+    cursor_field = traversal.identity.filter_key
+    if not cursor_field.isidentifier():
+        # An operator-bearing cursor key cannot be compared by field name, so nothing may sit beside it.
+        return "keyset filter key is not a simple field name"
+    field = _filter_field(parts[-1])
+    if field is None or field.casefold() in _FILTER_COMBINATORS:
+        return "binding keyset filter key is not a simple field"
+    if field.casefold() == cursor_field.casefold():
+        return "binding keyset filter key names the cursor field"
+    if not _flat_scalar(update.value):
+        return "binding keyset filter value is not a scalar or a flat scalar list"
+    return None
+
+
+def _filter_field(key: str | int) -> str | None:
+    """Strip a leading filter operator and return the remaining simple field name, if any."""
+    if not isinstance(key, str):
+        return None
+    index = 0
+    while index < len(key) and not (key[index].isalnum() or key[index] == "_"):
+        index += 1
+    field = key[index:]
+    return field if field.isidentifier() else None
+
+
+def _flat_scalar(value: JsonValue) -> bool:
+    if isinstance(value, list):
+        return all(not isinstance(item, dict | list) for item in value)
+    return not isinstance(value, dict)
+
+
 def _validate_binding_controls(binding: Binding[object], traversal: TraversalSpec) -> None:
-    controls = tuple(_normalized(path) for path in traversal_control_paths(traversal))
     for update in binding.updates:
-        update_path = _normalized(update.path)
-        if any(_overlaps(update_path, control) for control in controls):
-            raise ValueError("binding update collides with a traversal control path")
+        reason = binding_update_conflict(traversal, update)
+        if reason is not None:
+            raise ValueError(reason)
 
 
 def _matching_key(mapping: dict[str, JsonValue], requested: str) -> str | None:

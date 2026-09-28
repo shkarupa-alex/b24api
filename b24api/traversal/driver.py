@@ -14,6 +14,7 @@ from b24api.contracts.policy import (
     ExecutionPolicy,
     IdentityCoercion,
     IdentityRequirement,
+    SnapshotRequirement,
     TotalSemantics,
 )
 from b24api.contracts.report import (
@@ -68,6 +69,7 @@ from b24api.traversal.plans import (
     KeysetTerminalRule,
     ListPlan,
     OffsetSequentialPlan,
+    OffsetTerminalRule,
     SingleResponsePlan,
 )
 from b24api.traversal.sequential import CountedStrategy, OffsetStrategy, SingleResponseStrategy
@@ -391,6 +393,17 @@ class PaginationDriver:
         )
         if isinstance(plan, KeysetPlan) and plan.terminal is KeysetTerminalRule.BOUNDARY_ID_SEEN:
             raise CapabilityError("boundary-id keyset requires an externally reviewed boundary contract")
+        if (
+            isinstance(plan, OffsetSequentialPlan)
+            and OffsetTerminalRule.DECLARED_SHORT_PAGE in plan.terminal
+            and (
+                consistency.total_semantics is not TotalSemantics.IGNORE
+                or consistency.confirmation_policy is not ConfirmationPolicy.NONE
+                or consistency.snapshot_requirement is not SnapshotRequirement.TRAVERSAL_ONLY
+            )
+        ):
+            # A declared short page proves only the endpoint's stop rule, never a total, boundary or snapshot.
+            raise CapabilityError("declared short-page traversal supports only the traversal-only consistency policy")
         return _EffectiveConsistency(
             duplicate_policy,
             total_semantics,

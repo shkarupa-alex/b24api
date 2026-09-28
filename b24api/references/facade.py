@@ -23,6 +23,7 @@ from b24api.contracts.reference import (
     ReferenceOutcome,
     ReferenceOutcomeUnknown,
 )
+from b24api.contracts.report import TraversalAssurance
 from b24api.contracts.request import (
     IdentitySpec,
     Request,
@@ -35,6 +36,7 @@ from b24api.contracts.traversal import (
     CountedTraversal,
     KeysetTraversal,
     SequentialTraversal,
+    ShortPageTermination,
     TraversalSpec,
 )
 from b24api.errors import (
@@ -221,6 +223,7 @@ class _ReferenceEventMapper:
                 event.row_count,
                 exhausted=event.stopped_reason is None,
                 stop_reason=event.stopped_reason,
+                closure=event.closure,
             )
         context = cast("_BindingContext", event.correlation)
         self._item_indexes.pop(context.index, None)
@@ -254,6 +257,16 @@ class _ReferenceEventMapper:
             event.partial_rows,
             event.replay_disposition,
         )
+
+
+def _reference_assurance(traversal: TraversalSpec) -> TraversalAssurance | None:
+    """Declare mechanics only for a declared short-page closure: it proves the stop rule, not empty later windows."""
+    if (
+        isinstance(traversal, SequentialTraversal)
+        and traversal.offset.short_page_termination is ShortPageTermination.DECLARED_TERMINAL
+    ):
+        return TraversalAssurance.MECHANICS_ONLY
+    return None
 
 
 def _reference_variant(outcome: ReferenceOutcome[object]) -> str:
@@ -377,6 +390,7 @@ def reference_stream[C](
         source,
         mapper,
         operation="iter_reference_outcomes" if tolerant else "iter_references",
+        assurance=_reference_assurance(traversal),
         classify=_reference_variant,
         error_mapper=lambda error, report: _reference_error(error, report, mapper),
         error_items=lambda error: _reference_error_items(error, mapper),

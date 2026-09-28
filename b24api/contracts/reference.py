@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from b24api.contracts.command import NotExecutedReason
+    from b24api.contracts.completion import BindingClosure
     from b24api.contracts.error_base import B24ApiError
 
 _SUMMARY_MAXIMUM = 256
@@ -83,13 +84,19 @@ class ReferenceItem[C]:
 
 @dataclass(frozen=True, slots=True)
 class ReferenceComplete[C]:
-    """Successful binding terminal, with source-exhaustion evidence distinguished."""
+    """Successful binding terminal, with source-exhaustion evidence distinguished.
+
+    ``closure`` names the witness that ended this binding (for example ``SOURCE_EMPTY`` or
+    ``DECLARED_SHORT_PAGE``); it is excluded from equality and hashing, so comparisons by the
+    other fields keep their meaning, and it is ``None`` only on a value built without it.
+    """
 
     binding_index: int
     correlation: C = field(repr=False)
     row_count: int
     exhausted: bool = True
     stop_reason: str | None = None
+    closure: BindingClosure | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

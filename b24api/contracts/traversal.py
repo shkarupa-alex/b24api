@@ -23,6 +23,9 @@ _ORDER = ParameterPath(("order",))
 _ROOT_SELECTOR = ResultSelector.root()
 _SEQUENTIAL_KEYSET_EXECUTION = SequentialKeysetExecution()
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
+# A one-row window has no short page: every non-empty page would be full. The contract, the offset plan and the
+# completion gate all enforce this one bound, so they share this single definition.
+DECLARED_SHORT_PAGE_MINIMUM_WIDTH = 2
 
 
 class OffsetContinuation(StrEnum):
@@ -39,6 +42,22 @@ class TotalTermination(StrEnum):
 
     DISABLED = "disabled"
     EXACT_QUALIFIED = "exact_qualified"
+
+
+class ShortPageTermination(StrEnum):
+    """Whether a short page may end a fixed-step offset traversal.
+
+    Some endpoints honor ``start`` only at a fixed server window, report no usable total and send no
+    ``next``, so the only end signal is a page shorter than that window. The client cannot prove
+    that from the wire: a short page may also mean a truncated or misbehaving response. ``DISABLED``
+    therefore keeps refusing an unexplained short page. ``DECLARED_TERMINAL`` is the caller's own
+    qualification of the endpoint: a non-empty page shorter than the declared window closes the
+    traversal as exhausted. That result proves the declared stop rule was met, not that the
+    snapshot is complete, so its assurance stays ``MECHANICS_ONLY``.
+    """
+
+    DISABLED = "disabled"
+    DECLARED_TERMINAL = "declared_terminal"
 
 
 class CursorDomain(StrEnum):
@@ -161,6 +180,27 @@ def _validate_offset_extensions(spec: OffsetSpec) -> None:  # noqa: C901 - close
             raise ValueError("sparse raw bound requires its declared page_stride")
         if spec.total_termination is not TotalTermination.DISABLED:
             raise ValueError("sparse raw bound owns closure independently of selected count")
+    if spec.short_page_termination is ShortPageTermination.DECLARED_TERMINAL:
+        _validate_declared_short_page(spec)
+
+
+def _validate_declared_short_page(spec: OffsetSpec) -> None:
+    """Admit a declared short-page closure only over one exact fixed wire window."""
+    if (
+        spec.continuation is not OffsetContinuation.FIXED_STEP
+        or spec.total_termination is not TotalTermination.DISABLED
+    ):
+        raise ValueError("declared short-page termination requires fixed-step continuation without a total")
+    if spec.page_index is not None or spec.sparse_raw_bound is not None:
+        raise ValueError("declared short-page termination cannot combine with page_index or a sparse raw bound")
+    stride = spec.page_stride
+    if stride is None:
+        raise ValueError("declared short-page termination requires a qualified page_stride")
+    width = stride.max_decoded_rows
+    if not spec.step == stride.wire_increment == width or width < DECLARED_SHORT_PAGE_MINIMUM_WIDTH:
+        raise ValueError("declared short-page termination requires step equal to one decoded window of at least 2")
+    if stride.requested_wire_limit is not None and stride.requested_wire_limit != width:
+        raise ValueError("declared short-page termination requires a requested wire limit equal to the window")
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,12 +216,14 @@ class OffsetSpec:
     page_index: PageIndex | None = None
     page_stride: PageStride | None = None
     sparse_raw_bound: SparseRawBound | None = None
+    short_page_termination: ShortPageTermination = ShortPageTermination.DISABLED
 
     def __post_init__(self) -> None:
         """Validate offset mechanics and completion semantics."""
-        if not isinstance(self.continuation, OffsetContinuation) or not isinstance(
-            self.total_termination,
-            TotalTermination,
+        if (
+            not isinstance(self.continuation, OffsetContinuation)
+            or not isinstance(self.total_termination, TotalTermination)
+            or not isinstance(self.short_page_termination, ShortPageTermination)
         ):
             raise TypeError("offset controls must use their declared enum types")
         _validate_offset_extensions(self)
@@ -402,6 +444,7 @@ __all__ = [
     "OffsetContinuation",
     "OffsetSpec",
     "SequentialTraversal",
+    "ShortPageTermination",
     "SplitOrderSpec",
     "TotalTermination",
     "TraversalSpec",

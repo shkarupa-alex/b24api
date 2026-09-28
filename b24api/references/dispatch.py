@@ -25,6 +25,7 @@ from b24api.references.outcome import (
 
 if TYPE_CHECKING:
     from b24api.contracts.command import NotExecutedReason
+    from b24api.contracts.completion import BindingClosure
     from b24api.contracts.json import FrozenJson, JsonValue
     from b24api.contracts.report import PageRecord, Violation
     from b24api.contracts.request import Request
@@ -83,6 +84,7 @@ class _DoneEvent:
     stopped_reason: str | None = None
     terminal_reason: str | None = None
     qualified_total: int | None = None
+    declared_short_page_width: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +108,7 @@ class _KernelReferenceComplete:
     reference: ReferenceRequest
     row_count: int
     stopped_reason: str | None = None
+    closure: BindingClosure | None = None
 
 
 @dataclass(frozen=True, slots=True)
