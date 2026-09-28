@@ -749,39 +749,111 @@ async def test_caller_stop_on_a_continuing_full_page_is_a_bounded_prefix() -> No
     assert report.assurance is TraversalAssurance.BOUNDED_PREFIX
 
 
-@pytest.mark.parametrize("dispatch", [None, DirectDispatch(concurrency=1), BatchDispatch(batch_size=1)])
+def _acknowledgements(monkeypatch: pytest.MonkeyPatch) -> list[PageAcknowledged]:
+    """Record every page acknowledgement the completion gates receive."""
+    acknowledged: list[PageAcknowledged] = []
+    emit = CompletionGate.emit
+
+    def spy(gate: CompletionGate, event: object) -> None:
+        if isinstance(event, PageAcknowledged):
+            acknowledged.append(event)
+        emit(gate, event)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(CompletionGate, "emit", spy)
+    return acknowledged
+
+
+def _stopped_stream(client: Bitrix24, dispatch: DirectDispatch | BatchDispatch | None, stops: object) -> _AnyStream:
+    if dispatch is None:
+        return client.iter_list(
+            _request(),
+            selector=SELECTOR,
+            page_size=WIDTH,
+            offset=DECLARED,
+            page_stop=stops,  # type: ignore[arg-type]
+        )
+    return client.iter_reference_outcomes(
+        _request(),
+        [Binding("one", (), 1)],
+        traversal=SequentialTraversal(selector=SELECTOR, page_size=WIDTH, offset=DECLARED),
+        dispatch=dispatch,
+        page_stop=stops,  # type: ignore[arg-type]
+    )
+
+
+STOP_ROUTES = [None, DirectDispatch(concurrency=1), BatchDispatch(batch_size=1)]
+
+
+@pytest.mark.parametrize("decision", [ContinuePage.CONTINUE, CallerStop("enough")])
+@pytest.mark.parametrize("dispatch", STOP_ROUTES)
 @pytest.mark.asyncio
-async def test_caller_stop_on_the_terminal_short_page_keeps_the_natural_closure(
+async def test_terminal_short_page_is_committed_and_keeps_the_natural_closure(
+    decision: ContinuePage | CallerStop,
     dispatch: DirectDispatch | BatchDispatch | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    acknowledged = _acknowledgements(monkeypatch)
     portal = _Portal(_booking({0: SHORT}))
-    stops = _Stops(CallerStop("enough"))
+    stops = _Stops(decision)
     async with _client(portal) as client:
-        if dispatch is None:
-            stream: _AnyStream = client.iter_list(
-                _request(), selector=SELECTOR, page_size=WIDTH, offset=DECLARED, page_stop=stops
-            )
-        else:
-            stream = client.iter_reference_outcomes(
-                _request(),
-                [Binding("one", (), 1)],
-                traversal=SequentialTraversal(selector=SELECTOR, page_size=WIDTH, offset=DECLARED),
-                dispatch=dispatch,
-                page_stop=stops,
-            )
+        stream = _stopped_stream(client, dispatch, stops)
         items, error = await _drain(stream)
 
     assert error is None
+    # The callback commits the closing page too; a stop there is ignored and sends nothing more.
     assert stops.pages == [SHORT]
+    assert len(acknowledged) == 1
     assert portal.starts == [0]
     report = stream.report
     assert report is not None
+    assert report.successful
     assert report.exhausted
     assert report.assurance is TraversalAssurance.MECHANICS_ONLY
     if dispatch is not None:
         [complete] = [item for item in items if isinstance(item, ReferenceComplete)]
         assert complete.closure is BindingClosure.DECLARED_SHORT_PAGE
         assert complete.exhausted
+
+
+class _FailingStops:
+    def __init__(self, *, invalid: bool) -> None:
+        self.invalid = invalid
+
+    def on_page(self, _boundary: PageBoundary) -> ContinuePage | CallerStop:
+        if self.invalid:
+            return "committed"  # type: ignore[return-value]
+        raise RuntimeError("commit failed")
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+@pytest.mark.parametrize("dispatch", STOP_ROUTES)
+@pytest.mark.asyncio
+async def test_callback_failure_on_the_terminal_short_page_is_never_exhausted(
+    invalid: bool,  # noqa: FBT001
+    dispatch: DirectDispatch | BatchDispatch | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    acknowledged = _acknowledgements(monkeypatch)
+    portal = _Portal(_booking({0: SHORT}))
+    async with _client(portal) as client:
+        stream = _stopped_stream(client, dispatch, _FailingStops(invalid=invalid))
+        if dispatch is None:
+            with pytest.raises(TypeError if invalid else RuntimeError):
+                await _drain(stream)
+            items: list[object] = []
+        else:
+            items, _error = await _drain(stream)
+
+    assert acknowledged == []
+    assert portal.starts == [0]
+    report = stream.report
+    assert report is not None
+    assert not report.successful
+    assert not report.exhausted
+    assert report.state is (TerminalState.FAILED if dispatch is None else TerminalState.INCOMPLETE)
+    assert not any(isinstance(item, ReferenceComplete) for item in items)
+    if dispatch is not None:
+        assert any(isinstance(item, ReferenceFailure) for item in items)
 
 
 @pytest.mark.parametrize("reference", [False, True])

@@ -127,8 +127,11 @@ Each page is judged by its row count after page adaptation, with `W` the window:
 `exhausted=True` here means the declared stop rule was met, not that the snapshot is complete: the
 report stays `mechanics_only` even with an `IdentitySpec`, because a short page does not prove that
 later windows are empty. Do not use `exhausted` alone as the basis for deleting local records that
-were absent from the export. A `PageStopPolicy` stop on a continuing full page is reported as a
-bounded prefix; on the closing short page the natural closure stands.
+were absent from the export. A `page_stop` callback runs on every delivered page, the closing short
+page included, so the application can durably commit its last rows. `CallerStop` on a continuing
+full page is reported as a bounded prefix; on the closing short page it is ignored and the closure
+stays `DECLARED_SHORT_PAGE`. A callback exception or invalid result on any page fails the traversal,
+leaves that page unacknowledged and never reports it as exhausted.
 
 The same `BOOKING_OFFSET` works in references:
 `SequentialTraversal(selector=ResultSelector(("booking",)), page_size=BOOKING_PAGE, offset=BOOKING_OFFSET)`.
