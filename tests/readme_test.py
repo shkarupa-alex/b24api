@@ -25,6 +25,7 @@ from b24api.contracts import Command, CommandSuccess, IdentityCoercion, Referenc
 from b24api.contracts.request import RouteKind
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from tests.real_signature import real_signature
+from tests.scripting import ResponderTransport, client_for
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
@@ -261,25 +262,41 @@ async def test_every_readme_python_example_executes_exactly_without_io(monkeypat
             await cast("Any", result)
 
 
+def _short_booking_window(request: Request) -> object:
+    """Answer one declared short booking window, as the endpoint does, with its constant zero total."""
+    assert request.copy_parameters()["start"] == 0
+    return {"result": {"booking": [{"id": 1}, {"id": 2}], "totalCount": 0}, "total": 0}
+
+
 @pytest.mark.asyncio
 async def test_every_recipe_python_example_executes_exactly_without_io() -> None:
     """Keep copyable endpoint recipes executable as public contracts evolve."""
     client = _ExampleClient()
-    for source in PYTHON_BLOCK.findall(RECIPES.read_text(encoding="utf-8")):
-        namespace: dict[str, object] = {
-            "client": client,
-            "checkpoints": {1: 0, 2: 10},
-            "cursor": object(),
-            "identity": IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
-            "keyset": object(),
-            "parent_ids": (1, 2),
-            "request": Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
-            "write_file": lambda *_args, **_kwargs: None,
-        }
-        code = compile(source, str(RECIPES), "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-        result = eval(code, namespace)  # noqa: S307 - exact trusted repository documentation source
-        if result is not None:
-            await cast("Any", result)
+    # A recipe that asserts its own report runs against a real client over a scripted portal.
+    async with client_for(ResponderTransport(_short_booking_window)) as api:
+        for source in PYTHON_BLOCK.findall(RECIPES.read_text(encoding="utf-8")):
+            await _execute_recipe(source, client, api)
+
+
+async def _execute_recipe(source: str, client: _ExampleClient, api: Bitrix24) -> None:
+    """Execute one exact recipe block; ``api`` is a real client, ``client`` the no-I/O facade."""
+    namespace: dict[str, object] = {
+        "api": api,
+        "date_from": 1790000000,
+        "date_to": 1790086400,
+        "client": client,
+        "checkpoints": {1: 0, 2: 10},
+        "cursor": object(),
+        "identity": IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
+        "keyset": object(),
+        "parent_ids": (1, 2),
+        "request": Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        "write_file": lambda *_args, **_kwargs: None,
+    }
+    code = compile(source, str(RECIPES), "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+    result = eval(code, namespace)  # noqa: S307 - exact trusted repository documentation source
+    if result is not None:
+        await cast("Any", result)
 
 
 def _quickstart_blocks() -> list[str]:

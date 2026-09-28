@@ -14,6 +14,7 @@ SINGLE_RESPONSE_COMPLETE = "single response complete"
 QUALIFIED_TOTAL_REACHED = "qualified total reached"
 SPARSE_RAW_RANGE_COVERED = "qualified sparse raw range covered"
 ADMITTED_UPPER_BOUNDARY_REACHED = "exact admitted upper boundary reached"
+DECLARED_SHORT_PAGE_REACHED = "declared short page reached"
 
 
 def qualified_closure(terminal_reason: str | None) -> BindingClosure | None:
@@ -27,5 +28,7 @@ def qualified_closure(terminal_reason: str | None) -> BindingClosure | None:
             return BindingClosure.RAW_RANGE_COVERED
         case "exact admitted upper boundary reached":
             return BindingClosure.BOUNDARY_SEEN
+        case "declared short page reached":
+            return BindingClosure.DECLARED_SHORT_PAGE
         case _:
             return None

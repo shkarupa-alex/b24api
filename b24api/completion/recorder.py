@@ -48,9 +48,14 @@ class CompletionSink(Protocol):
 class CompletionRecorder:
     """Emit bounded correlated events in the physical traversal lifecycle."""
 
-    def __init__(self) -> None:
-        """Admit the sole binding before its first possible page dispatch."""
+    def __init__(self, *, declared_short_page_width: int | None = None) -> None:
+        """Admit the sole binding before its first possible page dispatch.
+
+        ``declared_short_page_width`` is the window of a caller-declared short-page closure; it is
+        witnessed only when the binding actually closes on such a page.
+        """
         self.gate = CompletionGate(uuid4().hex)
+        self._declared_short_page_width = declared_short_page_width
         self._sequence = 0
         self._next_page = 0
         self._current: int | None = None
@@ -153,7 +158,14 @@ class CompletionRecorder:
         )
         self._current = None
 
-    def terminal(self, closure: BindingClosure, stream: StreamClosure, *, qualified_total: int | None = None) -> None:
+    def terminal(
+        self,
+        closure: BindingClosure,
+        stream: StreamClosure,
+        *,
+        qualified_total: int | None = None,
+        declared_short_page_width: int | None = None,
+    ) -> None:
         """Settle binding and producer before owned-resource cleanup."""
         self.gate.emit(
             BindingTerminal(
@@ -162,6 +174,7 @@ class CompletionRecorder:
                 binding_id=0,
                 closure=closure,
                 qualified_total=qualified_total,
+                declared_short_page_width=declared_short_page_width,
             )
         )
         self.gate.emit(
@@ -201,7 +214,14 @@ class CompletionRecorder:
             if state is KernelState.CANCELLED
             else StreamClosure.EARLY_CLOSE
         )
-        self.terminal(closure, stream, qualified_total=qualified_total)
+        self.terminal(
+            closure,
+            stream,
+            qualified_total=qualified_total,
+            declared_short_page_width=(
+                self._declared_short_page_width if closure is BindingClosure.DECLARED_SHORT_PAGE else None
+            ),
+        )
 
     def cleanup(self, state: CleanupState) -> None:
         """Finish only after cleanup was observed."""

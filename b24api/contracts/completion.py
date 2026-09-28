@@ -26,6 +26,7 @@ class BindingClosure(StrEnum):
     SINGLE_RESPONSE = "single_response"
     BOUNDARY_SEEN = "boundary_seen"
     KEYSET_PLAN_COVERED = "keyset_plan_covered"
+    DECLARED_SHORT_PAGE = "declared_short_page"
     CALLER_STOP = "caller_stop"
     FAILURE = "failure"
     UNKNOWN = "unknown"
@@ -142,6 +143,7 @@ class BindingTerminal(CompletionEvent):
     closure: BindingClosure
     qualified_total: int | None = None
     qualified_witnesses: int | None = None
+    declared_short_page_width: int | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

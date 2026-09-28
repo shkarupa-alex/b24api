@@ -50,6 +50,100 @@ For endpoints with drifting or known-inexact totals, choose a contract that can 
 
 Scenario 17 in [examples](../examples/README.md) shows the fail-closed outcome.
 
+For an endpoint whose declared contract is exactly "step `start` by a fixed window until a page is
+shorter than that window" (no usable `total`, no `next`), declare that stop rule explicitly with
+`short_page_termination` below.
+
+## Declared short-page closure
+
+Some endpoints honor `start` only at multiples of a fixed server window, report no usable total
+(`booking.v1.booking.list` always answers `totalCount: 0`), send no `next`, and end when a page is
+shorter than the window. `ShortPageTermination.DECLARED_TERMINAL` makes that stop rule a supported
+opt-in for `FIXED_STEP`; without it a short page still fails closed as described above.
+
+```python
+from b24api import OffsetContinuation, OffsetSpec, ReplaySafety, Request, ResultSelector, RouteKind
+from b24api.contracts import PageStride, ShortPageTermination, TraversalAssurance
+
+BOOKING_PAGE = 50  # server-fixed: `start` is honored only at multiples of 50
+
+BOOKING_OFFSET = OffsetSpec(
+    # parameter_path stays the default ("start",); the endpoint has no limit parameter.
+    continuation=OffsetContinuation.FIXED_STEP,
+    step=BOOKING_PAGE,
+    page_stride=PageStride(
+        server_granularity=BOOKING_PAGE,
+        wire_increment=BOOKING_PAGE,
+        max_decoded_rows=BOOKING_PAGE,
+    ),
+    short_page_termination=ShortPageTermination.DECLARED_TERMINAL,
+)
+
+stream = api.iter_list(
+    Request(
+        "booking.v1.booking.list",
+        {
+            "filter": {"within": {"dateFrom": date_from, "dateTo": date_to}},
+            "order": {"id": "ASC"},  # required: without order the row sequence is undefined
+        },
+        replay_safety=ReplaySafety.UNKNOWN,
+        route=RouteKind.BARE,
+    ),
+    selector=ResultSelector(("booking",)),
+    page_size=BOOKING_PAGE,
+    offset=BOOKING_OFFSET,
+    # policy=None -> default ConsistencyPolicy (IGNORE / NONE / TRAVERSAL_ONLY) is compatible.
+)
+async with stream:
+    async for booking in stream:
+        ...
+report = stream.report
+assert report is not None and report.successful and report.exhausted
+assert report.assurance is TraversalAssurance.MECHANICS_ONLY
+```
+
+The declaration is strict, and everything outside it is refused before the first request:
+
+- `page_stride` is required, and `step`, `wire_increment`, `max_decoded_rows` and `page_size` are one
+  window of at least 2 rows; `total_termination`, `page_index` and `SparseRawBound` do not combine
+  with it, and `CountedTraversal` cannot use it.
+- The traversal starts at offset 0. Leave `start` out of the request (the client creates it as 0);
+  any other value raises `CapabilityError`.
+- The effective `ConsistencyPolicy` must keep `total_semantics=IGNORE`, `confirmation_policy=NONE` and
+  `snapshot_requirement=TRAVERSAL_ONLY`; a total such as `totalCount: 0` is never interpreted.
+- The client does not inspect `order`. For `booking.v1.booking.list` an explicit lowercase
+  `{"id": "ASC"}` is part of the method profile: without it the row sequence is undefined, and an
+  uppercase `ID` key is silently discarded.
+
+Each page is judged by its row count after page adaptation, with `W` the window:
+
+| Page | Outcome |
+|---|---|
+| `W` rows, `next` absent or equal to `start + W` | rows delivered, next window requested |
+| `1..W-1` rows, no `next` | rows delivered, traversal closes without another request (`declared short page reached`) |
+| 0 rows, no `next` | closes as an ordinary empty page; a source of exactly `k * W` rows still needs this page |
+| more than `W` rows, `next` on a short or empty page, or any other `next` | page rejected with none of its rows; `IncompleteTraversalError`, not exhausted |
+
+`exhausted=True` here means the declared stop rule was met, not that the snapshot is complete: the
+report stays `mechanics_only` even with an `IdentitySpec`, because a short page does not prove that
+later windows are empty. Do not use `exhausted` alone as the basis for deleting local records that
+were absent from the export. A `PageStopPolicy` stop on a continuing full page is reported as a
+bounded prefix; on the closing short page the natural closure stands.
+
+The same `BOOKING_OFFSET` works in references:
+`SequentialTraversal(selector=ResultSelector(("booking",)), page_size=BOOKING_PAGE, offset=BOOKING_OFFSET)`.
+A binding may set parameters outside `start` (for example its own `filter.within` window); every
+`ReferenceComplete` names its own `closure`, `DECLARED_SHORT_PAGE` or `SOURCE_EMPTY`, while the
+aggregate report stays `mechanics_only`.
+
+Qualify an endpoint before relying on this profile: on a portal with more than one window of data,
+confirm a full page followed by a short one, an exact multiple of the window followed by an empty
+page, a stable explicit order, and no pagination gaps against an independent listing. This is a
+one-off qualification of the method, not an extra request of every traversal; an observation of a
+single short page does not prove full-window behavior. Sibling endpoints such as
+`booking.v1.resource.list`, `booking.v1.resourcetype.list` and `booking.v1.waitlist.list` need their
+own selector, ordering and qualification; do not apply this recipe to them by analogy.
+
 ## Split keyset ordering
 
 Some endpoints use separate flat sort-field and direction controls:
@@ -146,6 +240,77 @@ stream = client.iter_cursors(
 ```
 
 Use `coalesce_wait=0` when per-wave latency matters more than physical batch density.
+
+## Keyset references with per-owner filters
+
+A keyset binding may set constant fields directly inside `KeysetSpec.filter_path`, beside the cursor
+key the traversal writes there. `crm.item.productrow.list` has no global listing and needs both owner
+fields on every page, while each owner advances its own `>id` cursor:
+
+```python
+from b24api import (
+    BatchDispatch,
+    Binding,
+    IdentityCoercion,
+    IdentitySpec,
+    KeysetSpec,
+    KeysetTraversal,
+    ParameterPath,
+    ParameterUpdate,
+    Request,
+    ResultSelector,
+    RouteKind,
+    SequentialKeysetExecution,
+)
+
+request = Request("crm.item.productrow.list", route=RouteKind.BARE)
+traversal = KeysetTraversal(
+    selector=ResultSelector(("productRows",)),
+    identity=IdentitySpec(
+        item_path=("id",), filter_key="id", order_key="id",
+        coercion=IdentityCoercion.DECIMAL_STRING_INTEGER,
+    ),
+    page_size=50,
+    keyset=KeysetSpec(
+        filter_path=ParameterPath(("filter",)),
+        order_path=ParameterPath(("order",)),
+    ),
+    execution=SequentialKeysetExecution(),
+)
+binding = Binding(
+    "deal 7573",
+    updates=(
+        ParameterUpdate(ParameterPath(("filter", "=ownerType")), "D"),
+        ParameterUpdate(ParameterPath(("filter", "=ownerId")), 7573),
+    ),
+    correlation=7573,
+)
+
+stream = client.iter_references(request, [binding], traversal=traversal, dispatch=BatchDispatch())
+async with stream:
+    async for event in stream:
+        ...
+```
+
+Every owner gets its own `filter[>id]` and `order[id]=ASC`; one owner's cursor never appears in
+another owner's requests. An update inside the keyset filter is admitted only when it is:
+
+- exactly one level below the filter (not the filter itself, and no nested structure);
+- a simple field name after an optional operator prefix such as `=`, `>=` or `!%` (not a number, and
+  not `LOGIC`, `AND` or `OR`);
+- a different field from the identity `filter_key`, compared case-insensitively whatever its operator
+  (`id`, `>id`, `<=ID` and `=id` are all refused), and only while `filter_key` is itself a simple name;
+- a JSON scalar or a flat list of scalars.
+
+Any other update fails only that binding with `ReferenceNotExecuted(LOCAL_VALIDATION_FAILED)` before it
+sends anything, keeping its correlation; order, `start`, limit and split-order controls stay exclusive
+as before. The base request keeps its own rules: a non-mapping `filter`, or a base key equal to the
+managed cursor key (such as `>ID`), is refused with `CapabilityError` before any binding is read,
+while other identity constraints such as `<=id` remain allowed. `traversal_control_paths()` still
+lists the containers a traversal writes, including the whole filter; it names those containers and
+does not decide which binding updates compose. References still accept only
+`SequentialKeysetExecution` without a `KeysetSpec.boundary`, and the recipe does not promise that
+every REST method treats arbitrary constant filters the same way.
 
 ## Mapping-backed collections
 

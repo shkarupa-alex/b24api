@@ -238,6 +238,12 @@ async with stream:
 Without `identity`, successful exhaustion is reported as `MECHANICS_ONLY`: pagination completed,
 but the client cannot prove that the portal did not duplicate or substitute rows.
 
+An endpoint that honors `start` only at a fixed server window and signals its end only with a
+shorter page (no usable `total`, no `next`) can declare that stop rule with
+`OffsetSpec(short_page_termination=ShortPageTermination.DECLARED_TERMINAL)`; such a traversal is
+always `MECHANICS_ONLY`. See
+[Declared short-page closure](https://github.com/shkarupa-alex/b24api/blob/master/docs/recipes.md#declared-short-page-closure).
+
 Mapping-backed collections are explicit as well. `MAPPING_VALUES` yields values from a selected
 mapping in insertion order; `MAPPING_VALUES_OR_EMPTY` additionally accepts only an empty terminal
 sequence and records that degradation in the operation report.
@@ -437,6 +443,10 @@ async with stream:
         elif isinstance(event, ReferenceComplete):
             record_completion(event.correlation, event.row_count)
 ```
+
+With `KeysetTraversal`, a binding may also set simple constant fields directly inside the keyset
+filter, such as `filter[=ownerId]`, while each binding keeps its own cursor; see
+[Keyset references with per-owner filters](https://github.com/shkarupa-alex/b24api/blob/master/docs/recipes.md#keyset-references-with-per-owner-filters).
 
 For messages across chats, use the same `iter_references()` shape: each binding updates the chat
 parameter and carries the chat correlation; choose `CursorTraversal` when the message endpoint is

@@ -33,7 +33,7 @@ from b24api.execution.lifecycle import (
 )
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
-from b24api.traversal.plans import ItemCursorPlan, KeysetPlan, OffsetSequentialPlan
+from b24api.traversal.plans import ItemCursorPlan, KeysetPlan, OffsetSequentialPlan, OffsetTerminalRule
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -71,7 +71,14 @@ class ItemStream(AsyncIterator[JsonValue]):
         PaginationDriver.validate_plan(plan)
         self._context = executor.context(policy)
         self._completion = (
-            CompletionRecorder()
+            CompletionRecorder(
+                declared_short_page_width=(
+                    plan.short_page_width
+                    if isinstance(plan, OffsetSequentialPlan)
+                    and OffsetTerminalRule.DECLARED_SHORT_PAGE in plan.terminal
+                    else None
+                ),
+            )
             if isinstance(
                 plan,
                 OffsetSequentialPlan | KeysetPlan | ItemCursorPlan,
