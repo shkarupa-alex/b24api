@@ -465,6 +465,27 @@ def test_declared_plan_is_one_exact_window_and_other_plans_keep_their_rules() ->
             _declared_plan(**fields)
 
 
+def test_contract_plan_and_gate_share_one_minimum_window_definition() -> None:
+    package = Path(__file__).resolve().parents[1] / "b24api"
+    definitions: list[str] = []
+    importers: set[str] = set()
+    for module in sorted(package.rglob("*.py")):
+        tree = ast.parse(module.read_text("utf-8"))
+        relative = module.relative_to(package.parent).as_posix()
+        for node in ast.walk(tree):
+            targets = node.targets if isinstance(node, ast.Assign) else []
+            definitions += [
+                relative
+                for target in targets
+                if isinstance(target, ast.Name) and target.id.endswith("DECLARED_SHORT_PAGE_MINIMUM_WIDTH")
+            ]
+            if isinstance(node, ast.ImportFrom) and node.module == "b24api.contracts.traversal":
+                importers |= {relative for alias in node.names if alias.name == "DECLARED_SHORT_PAGE_MINIMUM_WIDTH"}
+
+    assert definitions == ["b24api/contracts/traversal.py"]
+    assert importers == {"b24api/completion/gate.py", "b24api/traversal/plans.py"}
+
+
 def _declared_plan(**fields: object) -> OffsetSequentialPlan:
     values: dict[str, object] = {
         "continuation": OffsetContinuation.FIXED_STEP,

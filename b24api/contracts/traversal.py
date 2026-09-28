@@ -23,8 +23,9 @@ _ORDER = ParameterPath(("order",))
 _ROOT_SELECTOR = ResultSelector.root()
 _SEQUENTIAL_KEYSET_EXECUTION = SequentialKeysetExecution()
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
-# A one-row window has no short page: every non-empty page would be full.
-_DECLARED_SHORT_PAGE_MINIMUM_WIDTH = 2
+# A one-row window has no short page: every non-empty page would be full. The contract, the offset plan and the
+# completion gate all enforce this one bound, so they share this single definition.
+DECLARED_SHORT_PAGE_MINIMUM_WIDTH = 2
 
 
 class OffsetContinuation(StrEnum):
@@ -187,7 +188,7 @@ def _validate_declared_short_page(spec: OffsetSpec) -> None:
     if stride is None:
         raise ValueError("declared short-page termination requires a qualified page_stride")
     width = stride.max_decoded_rows
-    if not spec.step == stride.wire_increment == width or width < _DECLARED_SHORT_PAGE_MINIMUM_WIDTH:
+    if not spec.step == stride.wire_increment == width or width < DECLARED_SHORT_PAGE_MINIMUM_WIDTH:
         raise ValueError("declared short-page termination requires step equal to one decoded window of at least 2")
     if stride.requested_wire_limit is not None and stride.requested_wire_limit != width:
         raise ValueError("declared short-page termination requires a requested wire limit equal to the window")

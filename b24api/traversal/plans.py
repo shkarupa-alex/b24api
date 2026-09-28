@@ -18,7 +18,14 @@ from b24api.contracts.request import (
     ParameterPath,
     ResultSelector,
 )
-from b24api.contracts.traversal import CursorDomain, OffsetContinuation, PageStride, SparseRawBound, SplitOrderSpec
+from b24api.contracts.traversal import (
+    DECLARED_SHORT_PAGE_MINIMUM_WIDTH,
+    CursorDomain,
+    OffsetContinuation,
+    PageStride,
+    SparseRawBound,
+    SplitOrderSpec,
+)
 
 if TYPE_CHECKING:
     from b24api.contracts.bounded_range import BoundedIdentityRange
@@ -27,7 +34,6 @@ _START_PATH = ParameterPath(("start",))
 _FILTER_PATH = ParameterPath(("filter",))
 _ORDER_PATH = ParameterPath(("order",))
 _LAST_ID_PATH = ParameterPath(("LAST_ID",))
-_DECLARED_SHORT_PAGE_MINIMUM_WIDTH = 2
 
 
 class OffsetTerminalRule(StrEnum):
@@ -180,7 +186,7 @@ def _validate_declared_short_page(plan: OffsetSequentialPlan) -> None:
     if (
         stride is None
         or plan.short_page_width is None
-        or plan.short_page_width < _DECLARED_SHORT_PAGE_MINIMUM_WIDTH
+        or plan.short_page_width < DECLARED_SHORT_PAGE_MINIMUM_WIDTH
         or not plan.fixed_step == stride.wire_increment == stride.max_decoded_rows == plan.short_page_width
     ):
         raise ValueError("declared short-page closure requires one decoded window of at least 2 per fixed step")

@@ -31,6 +31,7 @@ from b24api.contracts.report import (
     Violation,
     ViolationSeverity,
 )
+from b24api.contracts.traversal import DECLARED_SHORT_PAGE_MINIMUM_WIDTH
 from b24api.contracts.violation import retain_violations
 
 if TYPE_CHECKING:
@@ -40,7 +41,6 @@ if TYPE_CHECKING:
 
 _MAX_ID_LENGTH = 128
 _MAX_VIOLATIONS = 128
-_DECLARED_SHORT_PAGE_MINIMUM_WIDTH = 2
 
 
 class _Stage(IntEnum):
@@ -169,7 +169,7 @@ def _declared_short_page_witnessed(binding: _Binding, event: BindingTerminal) ->
     rows = binding.last_acknowledged_rows
     return (
         type(width) is int
-        and width >= _DECLARED_SHORT_PAGE_MINIMUM_WIDTH
+        and width >= DECLARED_SHORT_PAGE_MINIMUM_WIDTH
         and binding.acknowledged_pages > 0
         and rows is not None
         and 0 < rows < width
