@@ -1,4 +1,4 @@
-# b24api 3.x
+# b24api 2.x
 
 `b24api` is a thin asynchronous Bitrix24 REST client for Python 3.12+. It knows how to send
 requests, split logical batches, traverse lists, retry safely, preserve caller correlation and
