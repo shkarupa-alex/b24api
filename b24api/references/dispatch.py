@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+from collections import deque
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
@@ -139,6 +140,7 @@ class _PendingBatch:
     future: asyncio.Future[_DispatchedPage]
     admitted: asyncio.Future[None]
     settled: asyncio.Future[None]
+    dispatch_started: bool = False
 
 
 @dataclass(slots=True)
@@ -147,6 +149,7 @@ class _ProducerState:
 
     runnable: set[str]
     indexes: dict[str, int]
+    caps: dict[str, int] = field(default_factory=dict)
     admitting: set[str] = field(default_factory=set)
     pending_continuations: set[str] = field(default_factory=set)
     next_key: str | None = None
@@ -391,6 +394,9 @@ class _BatchPageDispatcher:
         self._producer_state = producer_state
         self._buffer = buffer
         self._page_cap = page_cap
+        # Pages drained from the queue wait here per producer, in first-arrival order, so one producer's
+        # queued tail cannot keep a later producer's page out of the next wave (round-robin fairness).
+        self._backlog: dict[str, deque[_PendingBatch]] = {}
         self._pending_continuations_can_progress = pending_continuations_can_progress
         self._assembler: asyncio.Task[None] | None = None
         self._workers: tuple[asyncio.Task[None], ...] = ()
@@ -426,7 +432,7 @@ class _BatchPageDispatcher:
                 if self._producer_state is not None:
                     self._producer_state.touch()
                 return response
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             future.cancel()
             if not admitted.done():
                 admitted.set_result(None)
@@ -435,6 +441,9 @@ class _BatchPageDispatcher:
             self.context.release_page(reservation)
             if self._producer_state is not None:
                 self._producer_state.touch()
+            if pending.dispatch_started:
+                # A page cancelled after its wave was sent may have executed; settlement must say so.
+                error.__dict__["_b24api_dispatch_started"] = True
             raise
         except TimeoutError as error:
             future.cancel()
@@ -476,12 +485,13 @@ class _BatchPageDispatcher:
                 else:
                     first = await get_task
                     get_task = None
-                if first.future.done():
+                self._enqueue(first)
+                chunk: list[_PendingBatch] = []
+                self._drain_nowait(chunk)
+                if not chunk:
                     self._send_slots.release()
                     slot_acquired = False
                     continue
-                chunk = [first]
-                self._drain_nowait(chunk)
                 deadline = self._time() + self.plan.coalesce_wait
                 coalescing_delay = 0.0
                 while len(chunk) < self.plan.batch_size:
@@ -512,10 +522,8 @@ class _BatchPageDispatcher:
                     )
                     coalescing_delay += self._time() - wait_started
                     if get_task.done():
-                        pending = get_task.result()
+                        self._enqueue(get_task.result())
                         get_task = None
-                        if not pending.future.done():
-                            chunk.append(pending)
                         self._drain_nowait(chunk)
                 self._observe_wave(len(chunk), coalescing_delay)
                 await self._send_queue.put(chunk)
@@ -528,14 +536,33 @@ class _BatchPageDispatcher:
                 with contextlib.suppress(asyncio.CancelledError):
                     await get_task
 
+    def _enqueue(self, pending: _PendingBatch) -> None:
+        if not pending.future.done():
+            self._backlog.setdefault(pending.reference_id, deque()).append(pending)
+
     def _drain_nowait(self, chunk: list[_PendingBatch]) -> None:
-        while len(chunk) < self.plan.batch_size:
+        """Move every queued page to the backlog, then fill the chunk round-robin across producers."""
+        while True:
             try:
-                pending = self._queue.get_nowait()
+                self._enqueue(self._queue.get_nowait())
             except asyncio.QueueEmpty:
+                break
+        while len(chunk) < self.plan.batch_size and self._backlog:
+            progressed = False
+            for key in tuple(self._backlog):
+                waiting = self._backlog[key]
+                while waiting and waiting[0].future.done():
+                    waiting.popleft()
+                if waiting and len(chunk) < self.plan.batch_size:
+                    chunk.append(waiting.popleft())
+                    progressed = True
+                if not waiting:
+                    del self._backlog[key]
+            if not progressed:
                 return
-            if not pending.future.done():
-                chunk.append(pending)
+
+    def _pending_count(self) -> int:
+        return self._queue.qsize() + sum(len(waiting) for waiting in self._backlog.values())
 
     def _observe_wave(self, command_count: int, coalescing_delay: float) -> None:
         """Test/benchmark seam for per-wave coalescing-cost accounting."""
@@ -543,26 +570,26 @@ class _BatchPageDispatcher:
 
     def _potential(self, chunk_keys: set[str]) -> int:
         state, buffer = self._producer_state, self._buffer
-        if state is None or buffer is None or state.closing or self._queue.qsize() >= self._queue.maxsize:
+        if state is None or buffer is None or state.closing or self._pending_count() >= self._queue.maxsize:
             return 0
         admitted = sum(
             key not in chunk_keys
             and self.context.can_reserve_page(reference=key)
-            and buffer.can_reserve(state.indexes[key], self._page_cap)
+            and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
             for key in state.runnable
             if key in state.indexes
         )
         admitting = sum(
             key not in chunk_keys
             and self.context.can_reserve_page(reference=key)
-            and buffer.can_reserve(state.indexes[key], self._page_cap)
+            and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
             for key in state.admitting
             if self._pending_continuations_can_progress and key in state.indexes
         )
         continuations = sum(
             key not in chunk_keys
             and self.context.can_reserve_page(reference=key)
-            and buffer.can_reserve(state.indexes[key], self._page_cap)
+            and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
             for key in state.pending_continuations
             if self._pending_continuations_can_progress and key in state.indexes
         )
@@ -579,7 +606,8 @@ class _BatchPageDispatcher:
             key not in chunk_keys
             and key in state.indexes
             and not (
-                self.context.can_reserve_page(reference=key) and buffer.can_reserve(state.indexes[key], self._page_cap)
+                self.context.can_reserve_page(reference=key)
+                and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
             )
             for key in state.admitting
             if self._pending_continuations_can_progress and (self._active_sends > 0 or self._settling_waves > 0)
@@ -638,6 +666,8 @@ class _BatchPageDispatcher:
             self._active_sends += 1
             if self._producer_state is not None:
                 self._producer_state.touch()
+            for item in chunk:
+                item.dispatch_started = True
             try:
                 await self._send(chunk)
                 self._settling_waves += 1
@@ -690,12 +720,15 @@ class _BatchPageDispatcher:
                         item.settled.set_result(None)
             while True:
                 try:
-                    pending = self._queue.get_nowait()
+                    self._enqueue(self._queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
-                if not pending.future.done():
-                    pending.future.cancel()
-                if not pending.admitted.done():
-                    pending.admitted.set_result(None)
-                if not pending.settled.done():
-                    pending.settled.set_result(None)
+            for waiting in self._backlog.values():
+                for pending in waiting:
+                    if not pending.future.done():
+                        pending.future.cancel()
+                    if not pending.admitted.done():
+                        pending.admitted.set_result(None)
+                    if not pending.settled.done():
+                        pending.settled.set_result(None)
+            self._backlog.clear()
