@@ -97,6 +97,8 @@ SINGLE_HEADER_CASES: tuple[tuple[str, str, str | None, FilenameStatus], ...] = (
     ("control-nul", 'attachment; filename="a\x00.txt"', None, MALFORMED),
     ("control-del", 'attachment; filename="a\x7f.txt"', None, MALFORMED),
     ("control-outside-filename", 'attachment; x="\x01"; filename="a.txt"', None, MALFORMED),
+    ("c1-control-outside-filename", 'attachment; x="a\x85b"; filename=ok.txt', None, MALFORMED),
+    ("c1-free-outside-filename", 'attachment; x="ab"; filename=ok.txt', "ok.txt", PARSED),
     ("parameter-without-equals", 'attachment; foo; filename="a.txt"', None, MALFORMED),
     ("parameter-without-name", 'attachment; ="a"; filename="a.txt"', None, MALFORMED),
     ("parameter-name-folds-to-filename", 'attachment; \ufb01lename="a.txt"', None, MALFORMED),

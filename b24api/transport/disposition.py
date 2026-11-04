@@ -6,6 +6,7 @@ and no rejection reason here carries the header value, so nothing of the name re
 
 from __future__ import annotations
 import re
+import unicodedata
 
 from b24api.contracts.response import FilenameStatus, _usable_filename
 
@@ -52,7 +53,8 @@ def _parameters(values: list[str]) -> dict[str, str]:
     value = values[0]
     if len(value) > _HEADER_MAXIMUM or len(value.encode("utf-8", errors="surrogatepass")) > _HEADER_MAXIMUM:
         raise _MalformedError
-    if any(char != "\t" and (char < " " or char == "\x7f") for char in value):
+    # A control code point anywhere in the raw header (C0, DEL or C1; HTAB is whitespace) makes it malformed.
+    if any(char != "\t" and unicodedata.category(char) == "Cc" for char in value):
         raise _MalformedError
     disposition_type, *segments = _split_outside_quotes(value)
     if not _TOKEN.fullmatch(disposition_type.strip(" \t")):
