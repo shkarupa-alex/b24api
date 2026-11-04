@@ -359,11 +359,15 @@ class ReferenceScheduler:
         return program
 
     def _admit_program(self, work: _Work) -> None:
-        """Record an admitted reference's row cap; an INPUT head reserves its own program's cap."""
+        """Record an admitted reference's row cap; under INPUT the frontier reserve covers every admitted cap.
+
+        Any admitted binding may become the frontier while rows behind it stay held, so the reserve
+        is the largest admitted cap, not only the current head's.
+        """
         cap = self._program(work).page_cap
         self._caps[work.index] = cap
         if self.output_order is ReferenceOutputOrder.INPUT:
-            self.buffer.raise_head_reserve(work.index, cap)
+            self.buffer.raise_head_reserve(cap)
 
     def _head_cap(self, index: int) -> int:
         return self._caps.get(index, self.page_cap if self.default_program is not None else 0)
@@ -470,10 +474,16 @@ class ReferenceScheduler:
         index = run.work.index
         self._fast_active.add(index)
         self._fast_waiting += 1
+        # A binding waiting for its lease cannot add a command, so no wave may wait to coalesce with it.
+        self.producer_state.runnable.discard(run.producer_key)
+        self.producer_state.touch()
         try:
-            return await self.buffer.lease(index, functools.partial(self._lease_grant, fast, index))
+            lease = await self.buffer.lease(index, functools.partial(self._lease_grant, fast, index))
         finally:
             self._fast_waiting -= 1
+        self.producer_state.runnable.add(run.producer_key)
+        self.producer_state.touch()
+        return lease
 
     def _lease_grant(self, fast: FastKeysetProgram, index: int, free: int) -> int | None:
         """Size one fast lease from the free rows (S3 allocation), or return None to wait.
@@ -730,7 +740,7 @@ class ReferenceScheduler:
             admission.slots.release()
             await self._wake_lease_waiters()
             next_head = min(admission.tasks) if admission.tasks else head + 1
-            await self.buffer.advance_head(next_head, self._head_cap(next_head))
+            await self.buffer.advance_head(next_head, max(self._caps.values(), default=self._head_cap(next_head)))
         await producer
 
     def _record_event_violations(self, event: _Event) -> None:

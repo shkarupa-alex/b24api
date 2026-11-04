@@ -283,7 +283,7 @@ class _RowBuffer:
 
     @property
     def head_reserve(self) -> int:
-        """Return the rows kept free for the INPUT frontier's next page."""
+        """Return the rows kept free for the next page of whichever admitted binding becomes the INPUT frontier."""
         return self._head_reserve
 
     async def reserve(self, index: int, amount: int) -> _Reservation:
@@ -303,11 +303,13 @@ class _RowBuffer:
             return False
         if self._head_reserve == 0 or index == self._head_index:
             return True
-        head_has_capacity = any(
-            reservation.index == self._head_index and reservation.amount > 0 for reservation in self._reservations
+        # Rows the frontier holds come back to it; only the rest of its reserve must stay free. A
+        # frontier page accepted short returns its unused rows, and those stay the frontier's: if
+        # another binding took them, rows held behind the frontier could never be released.
+        head_held = sum(
+            reservation.amount for reservation in self._reservations if reservation.index == self._head_index
         )
-        required_head_reserve = 0 if head_has_capacity else self._head_reserve
-        return self._available - amount >= required_head_reserve
+        return self._available - amount >= self._head_reserve - head_held
 
     def can_reserve(self, index: int, amount: int) -> bool:
         """Return whether a reservation can be admitted immediately."""
@@ -402,10 +404,9 @@ class _RowBuffer:
         async with self._condition:
             self._condition.notify_all()
 
-    def raise_head_reserve(self, index: int, reserve: int) -> None:
+    def raise_head_reserve(self, reserve: int) -> None:
         """Reserve more rows for the INPUT frontier, synchronously: a stricter reserve wakes no waiter."""
-        if index == self._head_index and reserve > self._head_reserve:
-            self._head_reserve = reserve
+        self._head_reserve = max(self._head_reserve, min(reserve, self.maximum))
 
     async def advance_head(self, index: int, reserve: int) -> None:
         async with self._condition:
