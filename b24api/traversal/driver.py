@@ -471,6 +471,10 @@ class PaginationDriver:
             raise CapabilityError(f"{plan_name} traversal requires IdentitySpec")
         return self.identity
 
+    def preflight_capabilities(self) -> None:
+        """Reject the request's controls and the plan's capabilities before any input is read or sent."""
+        self._validate_capabilities()
+
     def _validate_capabilities(self) -> None:
         effective = self.validate_contract(
             self.plan,

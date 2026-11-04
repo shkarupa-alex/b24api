@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     )
     from b24api.traversal.values import IdentityValue
 
-type ReferenceSource = Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]
+type ReferenceRequestSource = Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]
 type _WaitFirst = Callable[[tuple[asyncio.Future[object], ...], float], Awaitable[None]]
 _MISSING = object()
 
@@ -341,6 +341,11 @@ class _RowBuffer:
             self._touch()
         if reservation.accepted:
             await self.context.adjust_buffered_rows(-amount)
+
+    def raise_head_reserve(self, index: int, reserve: int) -> None:
+        """Reserve more rows for the INPUT frontier, synchronously: a stricter reserve wakes no waiter."""
+        if index == self._head_index and reserve > self._head_reserve:
+            self._head_reserve = reserve
 
     async def advance_head(self, index: int, reserve: int) -> None:
         async with self._condition:

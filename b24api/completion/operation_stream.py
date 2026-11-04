@@ -78,12 +78,15 @@ class MappedOperationStream[S, T]:
         source_violations: Callable[[], tuple[Violation, ...]] | None = None,
         deregister: Callable[[MappedOperationStream[S, T]], None] | None = None,
         keyset_selection: KeysetSelectionSummary | None = None,
+        assurance_source: Callable[[], TraversalAssurance | None] | None = None,
     ) -> None:
         """Initialize without starting or prefetching the source."""
         self._source = source
         self._mapper = mapper
         self._operation = operation
         self._assurance = assurance
+        # A heterogeneous operation learns its declared assurance only from the sources it admits.
+        self._assurance_source = assurance_source
         self._classify = classify
         self._error_mapper = error_mapper
         self._error_items = error_items
@@ -235,7 +238,7 @@ class MappedOperationStream[S, T]:
         return CompletionReportFacts(
             source=source,
             operation=self._operation,
-            assurance=self._assurance,
+            assurance=self._assurance if self._assurance_source is None else self._assurance_source(),
             admitted=max(self._admitted, _read_source_counter(self._source_admitted)),
             emitted=self._emitted,
             successes=self._successes,

@@ -318,7 +318,7 @@ class ReferenceScheduler:
                 self.completion.admit(next_index)
                 next_index += 1
                 if reference.not_executed_reason is None:
-                    await self._admit_program(work)
+                    self._admit_program(work)
                 queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue(maxsize=1)
                 admission.queues[work.index] = queue
                 run = (
@@ -342,16 +342,12 @@ class ReferenceScheduler:
             raise RuntimeError("heterogeneous reference lacks its lowered program")
         return program
 
-    async def _admit_program(self, work: _Work) -> None:
+    def _admit_program(self, work: _Work) -> None:
         """Record an admitted reference's row cap; an INPUT head reserves its own program's cap."""
         cap = self._program(work).page_cap
         self._caps[work.index] = cap
-        if (
-            self.output_order is ReferenceOutputOrder.INPUT
-            and work.index == self.buffer.head_index
-            and cap != self.buffer.head_reserve
-        ):
-            await self.buffer.advance_head(work.index, cap)
+        if self.output_order is ReferenceOutputOrder.INPUT:
+            self.buffer.raise_head_reserve(work.index, cap)
 
     def _head_cap(self, index: int) -> int:
         return self._caps.get(index, self.page_cap if self.default_program is not None else 0)

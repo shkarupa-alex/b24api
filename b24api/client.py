@@ -30,6 +30,7 @@ from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
 from b24api.references.fanout import command_source as fanout_command_source
 from b24api.references.fanout import fanout_stream
+from b24api.references.sources import SourceAdmission
 from b24api.settings import Settings, api_settings
 from b24api.transport.protocol import ProtocolCodec
 from b24api.traversal.keyset_verifier import verify_keyset_capability as _verify_keyset_capability
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from b24api.contracts.traversal import CursorSpec, TraversalSpec
     from b24api.execution.rate import RateCoordinator
     from b24api.references.binding import BindingSource
+    from b24api.references.sources import ReferenceSources
 
 _DEFAULT_REFERENCE_DISPATCH = BatchDispatch()
 _DEFAULT_FANOUT_DISPATCH = DirectDispatch()
@@ -388,6 +390,46 @@ class Bitrix24(_TraversalFacade):
                 dispatch=dispatch,
                 policy=policy or self._default_policy,
                 page_stop=page_stop,
+                tolerant=True,
+                audit=self._audit_unknown,
+                deregister=self._discard_stream,
+            ),
+        )
+
+    def iter_reference_sources[C](
+        self,
+        sources: ReferenceSources[C],
+        *,
+        dispatch: DispatchSpec = _DEFAULT_REFERENCE_DISPATCH,
+        policy: ExecutionPolicy | None = None,
+    ) -> OperationStream[ReferenceEvent[C]]:
+        """Traverse heterogeneous reference sources fail-fast in one shared operation.
+
+        Each ``ReferenceSource`` brings its own request template, traversal, binding and page stop;
+        all sources share one dispatcher, row pool, policy and completion gate, so compatible pages
+        of different methods coalesce into the same physical batch.
+        """
+        self._require_open()
+        stream = SourceAdmission(self._executor, dispatch, policy or self._default_policy).stream(
+            sources,
+            tolerant=False,
+            audit=self._audit_unknown,
+            deregister=self._discard_stream,
+        )
+        return cast("OperationStream[ReferenceEvent[C]]", self._register_stream(stream))
+
+    def iter_reference_source_outcomes[C](
+        self,
+        sources: ReferenceSources[C],
+        *,
+        dispatch: DispatchSpec = _DEFAULT_REFERENCE_DISPATCH,
+        policy: ExecutionPolicy | None = None,
+    ) -> OperationStream[ReferenceOutcome[C]]:
+        """Traverse heterogeneous reference sources, retaining each source's correlated terminal state."""
+        self._require_open()
+        return self._register_stream(
+            SourceAdmission(self._executor, dispatch, policy or self._default_policy).stream(
+                sources,
                 tolerant=True,
                 audit=self._audit_unknown,
                 deregister=self._discard_stream,

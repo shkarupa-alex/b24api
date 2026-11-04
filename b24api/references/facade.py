@@ -6,7 +6,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal, Protocol, Self, cast
 
 from b24api.completion.operation_stream import MappedOperationStream
-from b24api.contracts.dispatch import DirectDispatch, DispatchSpec
 from b24api.contracts.keyset_execution import SequentialKeysetExecution
 from b24api.contracts.policy import (
     DuplicatePolicy,
@@ -52,6 +51,7 @@ from b24api.errors import (
     ReferenceFailed,
 )
 from b24api.references.binding import BindingSource, _BindingContext, _BindingSourceError, binding_source
+from b24api.references.compatibility import source_incompatibility
 from b24api.references.dispatch import (
     _KernelReferenceComplete,
     _ReferenceWindowError,
@@ -74,6 +74,7 @@ from b24api.traversal.plans import (
 )
 
 if TYPE_CHECKING:
+    from b24api.contracts.dispatch import DispatchSpec
     from b24api.contracts.page_stop import PageStopPolicy
     from b24api.contracts.report import OperationReport, Violation
     from b24api.contracts.stream import OperationStream
@@ -351,10 +352,9 @@ def kernel_reference_stream[C](
 
     if not isinstance(executor, Executor):
         raise TypeError("executor must be an Executor")
-    if isinstance(traversal, CountedTraversal) and isinstance(dispatch, DirectDispatch):
-        raise CapabilityError("counted reference traversal requires BatchDispatch")
-    if isinstance(traversal, CountedTraversal) and page_stop is not None:
-        raise CapabilityError("counted physical batch tail does not support page stop")
+    incompatible = source_incompatibility(base, traversal, dispatch, page_stop)
+    if incompatible is not None:
+        raise incompatible
     plan, selector, identity = _kernel_plan(traversal)
     preflight = PaginationDriver(
         executor,
@@ -365,7 +365,7 @@ def kernel_reference_stream[C](
         context=executor.context(policy),
         page_adapter=traversal.page_adapter,
     )
-    preflight._validate_capabilities()  # noqa: SLF001 - reject base controls before consuming caller input
+    preflight.preflight_capabilities()
     executor.preflight_request(base)
     dispatch_plan = kernel_dispatch(dispatch, policy)
     stream = _iter_references(
@@ -402,8 +402,6 @@ def reference_stream[C](
 ) -> OperationStream[ReferenceOutcome[C]]:
     """Compose the public bound-reference stream over the scheduler kernel."""
     base = canonical_request(request)
-    if not isinstance(dispatch, DirectDispatch) and (base.encoding.value != "json" or base.headers.items):
-        raise CapabilityError("physical batch supports JSON requests without scoped headers; use direct dispatch")
     source = kernel_reference_stream(
         executor,
         base,

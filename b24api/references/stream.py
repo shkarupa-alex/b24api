@@ -28,7 +28,7 @@ from b24api.execution.lifecycle import (
 )
 from b24api.execution.snapshot import KernelReport
 from b24api.references.dispatch import (
-    ReferenceSource,
+    ReferenceRequestSource,
     ReferenceStreamItem,
 )
 from b24api.references.outcome import KernelReferenceItem, ReferenceRequest
@@ -58,7 +58,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     def __init__(
         self,
         scheduler: ReferenceScheduler,
-        source: ReferenceSource | OwnedSource[ReferenceRequest],
+        source: ReferenceRequestSource | OwnedSource[ReferenceRequest],
         *,
         assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
     ) -> None:
@@ -213,7 +213,9 @@ def _accept_reference(item: object, _index: int) -> ReferenceRequest:
     return item
 
 
-def own_reference_source(source: ReferenceSource | OwnedSource[ReferenceRequest]) -> OwnedSource[ReferenceRequest]:
+def own_reference_source(
+    source: ReferenceRequestSource | OwnedSource[ReferenceRequest],
+) -> OwnedSource[ReferenceRequest]:
     """Adopt a raw reference source; a family that already owns its source passes it through."""
     if isinstance(source, OwnedSource):
         return cast("OwnedSource[ReferenceRequest]", source)
@@ -222,7 +224,7 @@ def own_reference_source(source: ReferenceSource | OwnedSource[ReferenceRequest]
 
 def iter_references(  # noqa: PLR0913
     executor: Executor,
-    requests: ReferenceSource | OwnedSource[ReferenceRequest],
+    requests: ReferenceRequestSource | OwnedSource[ReferenceRequest],
     *,
     plan: ListPlan,
     dispatch: DispatchPlan,

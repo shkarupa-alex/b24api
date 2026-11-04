@@ -102,6 +102,7 @@ from b24api.contracts.reference import (
     ReferenceOutcomeUnknown,
     partition_reference_outcomes,
 )
+from b24api.contracts.reference_source import ReferenceSource
 from b24api.contracts.report import (
     KeysetExecutionReport,
     KeysetSelectionSummary,
@@ -267,6 +268,7 @@ __all__ = [
     "ReferenceNotExecuted",
     "ReferenceOutcome",
     "ReferenceOutcomeUnknown",
+    "ReferenceSource",
     "ReplayDisposition",
     "ReplaySafety",
     "Request",
