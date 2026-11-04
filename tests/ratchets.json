@@ -1,6 +1,6 @@
 {
   "slf001_tests": 119,
-  "slf001_package": 31,
+  "slf001_package": 29,
   "noqa_package": 158,
   "homemade_transports": 35,
   "long_functions": {
@@ -9,7 +9,7 @@
       "justification": "one independent arm per ConformanceCase, read as a flat table next to the enum; not touched in Ф3"
     },
     "b24api/transport/httpx.py::HttpxTransport._send_wire_impl": {
-      "lines": 141,
+      "lines": 137,
       "justification": "keeps the credential-bearing httpx request and response in one frame so every exit clears them before raising (A2, W2); not touched in Ф3"
     }
   }

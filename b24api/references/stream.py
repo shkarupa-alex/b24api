@@ -177,6 +177,8 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             retries=snapshot.retries,
             cooldown_seconds=snapshot.cooldown_seconds,
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
+            ambiguous_physical_attempts=snapshot.ambiguous_physical_attempts,
+            batch_isolation_requests=snapshot.batch_isolation_requests,
             violations=violations,
             terminal_reason=reason,
             caller_stopped=bool(self._scheduler.stopped_bindings),

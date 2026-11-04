@@ -3,7 +3,7 @@
 from __future__ import annotations
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 from b24api.contracts.policy import BudgetCounters, ExecutionPolicy
@@ -27,6 +27,8 @@ class ExecutionSnapshot:
     retries: int
     cooldown_seconds: float
     elapsed: float
+    ambiguous_physical_attempts: int = field(default=0, kw_only=True)
+    batch_isolation_requests: int = field(default=0, kw_only=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +61,8 @@ class ExecutionContext:
         self._counters = BudgetCounters()
         self._retries = 0
         self._cooldown_seconds = 0.0
+        self._ambiguous_physical_attempts = 0
+        self._batch_isolation_requests = 0
         self._page_sequence = 0
         self._page_reservations: dict[PageReservation, None] = {}
         self._retained_identity_keys = 0
@@ -92,6 +96,16 @@ class ExecutionContext:
     async def record_cooldown(self, seconds: float) -> None:
         """Record the cooldown."""
         self._cooldown_seconds += max(0.0, seconds)
+
+    def record_ambiguous_physical_attempt(self) -> None:
+        """Count one dispatched batch envelope that left its commands without attributable outcomes."""
+        self._ambiguous_physical_attempts += 1
+
+    def record_batch_isolation_requests(self, count: int) -> None:
+        """Count individual requests sent to attribute commands an ambiguous batch envelope left unresolved."""
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("isolation request count must be a non-negative integer")
+        self._batch_isolation_requests += count
 
     async def reserve_page(self, *, reference: str | None = None) -> PageReservation:
         """Reserve page capacity before I/O without charging the response counter."""
@@ -199,6 +213,8 @@ class ExecutionContext:
             retries=self._retries,
             cooldown_seconds=self._cooldown_seconds,
             elapsed=self.elapsed,
+            ambiguous_physical_attempts=self._ambiguous_physical_attempts,
+            batch_isolation_requests=self._batch_isolation_requests,
         )
 
 

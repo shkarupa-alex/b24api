@@ -492,3 +492,15 @@ def test_no_public_class_name_is_defined_twice() -> None:
             if isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
                 owners.setdefault(node.name, []).append(path.relative_to(PACKAGE).as_posix())
     assert {name: paths for name, paths in owners.items() if len(paths) > 1} == {}
+
+
+def test_v3_batch_envelope_constructor_is_called_only_from_the_batch_package() -> None:
+    # Only the batch engine builds a native v3 envelope (#21); every other layer sends ordinary requests.
+    callers = {
+        f"{path.relative_to(PACKAGE).as_posix()}:{node.lineno}"
+        for path in _sources()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_v3_batch"
+    }
+    assert callers
+    assert {site for site in callers if not site.startswith("batch/")} == set()

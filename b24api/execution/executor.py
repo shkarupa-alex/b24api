@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import dataclasses
 import hashlib
 import json
 import math
@@ -10,7 +11,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from b24api._error_types import FailurePhase
 from b24api.contracts.evidence import ResponseEvidence
@@ -29,13 +30,14 @@ from b24api.errors import (
     B24ApiError,
     BatchCommandError,
     BudgetExceededError,
+    CapabilityError,
     EnvelopeContractError,
     HTTPGatewayError,
     ProtocolError,
     ResponseTooLargeError,
     TransportError,
 )
-from b24api.execution.boundary import send_transport
+from b24api.execution.boundary import send_transport, send_wire_envelope
 from b24api.execution.context import (
     ExecutionContext,
     _checkpoint_pending_cancellation,
@@ -44,7 +46,13 @@ from b24api.execution.context import (
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
-from b24api.transport.base import WireRequest, WireTransport, preflight_transport
+from b24api.transport.base import (
+    WireRequest,
+    WireTransport,
+    preflight_transport,
+    preflight_wire,
+    transport_supports_json_array_body,
+)
 from b24api.transport.disposition import disposition_filename
 from b24api.transport.protocol import ProtocolCodec
 
@@ -118,6 +126,23 @@ class _RequestAttempts:
         self.last_failure = self.unproven_failure = None
 
 
+@dataclass(frozen=True, slots=True)
+class PhysicalAttemptOutcome:
+    """What one physical send of a batch envelope produced, before any dialect classification or retry.
+
+    ``dispatch_started`` comes from dispatch facts (an attempt was reserved and handed to the transport),
+    never from the absence of a response. ``transport_proves_not_accepted`` is set only when nothing
+    reached the server: the attempt failed before dispatch, or the transport proved it was not accepted.
+    """
+
+    kind: Literal["response", "error", "cancelled"]
+    wire: WireResponse | None = dataclasses.field(repr=False)
+    response: Response | None = dataclasses.field(repr=False)
+    error: BaseException | None = dataclasses.field(repr=False)
+    dispatch_started: bool
+    transport_proves_not_accepted: bool
+
+
 class _DecodedJsonObject(dict[str, object]):
     """Last-member-wins JSON object retaining duplicate-name evidence."""
 
@@ -175,6 +200,15 @@ class Executor:
     def preflight_request(self, request: Request) -> None:
         """Validate transport representation without reserving budget or dispatching."""
         preflight_transport(self._wire_transport, request)
+
+    def preflight_wire(self, wire: WireRequest) -> None:
+        """Validate a transport-facing representation, such as a v3 batch envelope, before reservation."""
+        preflight_wire(self._wire_transport, wire)
+
+    @property
+    def supports_v3_batch(self) -> bool:
+        """Return whether the transport declares native REST v3 batch envelopes."""
+        return transport_supports_json_array_body(self._wire_transport)
 
     def context(self, policy: ExecutionPolicy | None = None) -> ExecutionContext:
         """Create an operation execution context."""
@@ -365,15 +399,128 @@ class Executor:
             last_error = response_error
             attempts += 1
 
+    async def _execute_physical_batch_attempt(
+        self,
+        envelope: WireRequest,
+        *,
+        context: ExecutionContext,
+        attempts: _RequestAttempts,
+        methods: frozenset[str],
+    ) -> PhysicalAttemptOutcome:
+        """Send one batch envelope once and report what happened, without generic retry or refusal handling.
+
+        The caller classifies the outcome by its dialect before any retry: a structured error that would
+        prove a single request refused does not prove that an envelope's commands did not run. Dispatch is
+        proven by the attempt reservation, never by the absence of a response.
+        """
+        try:
+            self.preflight_wire(envelope)
+        except CapabilityError as error:
+            return _local_attempt_failure(error)
+        await _checkpoint_pending_cancellation()
+        await context.start()
+        retry_started, spent = attempts.begin(self._clock)
+        try:
+            wire = await self._send_envelope(envelope, context=context, attempts=attempts, methods=methods)
+        except asyncio.CancelledError as error:
+            if attempts.used == spent:
+                raise
+            return _dispatched_attempt("cancelled", error=error)
+        except B24ApiError as error:
+            if attempts.used == spent:
+                return _local_attempt_failure(error)
+            proven = isinstance(error, TransportError) and not error.possible_acceptance
+            return _dispatched_attempt("error", error=error, proven_not_accepted=proven)
+        return await self._classify_envelope(envelope, wire, context=context, retry_started=retry_started)
+
+    async def _send_envelope(
+        self,
+        envelope: WireRequest,
+        *,
+        context: ExecutionContext,
+        attempts: _RequestAttempts,
+        methods: frozenset[str],
+    ) -> WireResponse:
+        """Acquire a permit, reserve one attempt and send the envelope; budget failures precede dispatch."""
+        wire_transport = self._wire_transport
+        if wire_transport is None:  # pragma: no cover - preflight_wire refuses a send-only transport
+            raise CapabilityError("send-only transport does not support wire envelopes")
+        retry_started, spent = attempts.begin(self._clock)
+        if (remaining := context.remaining_time(retry_started=retry_started)) <= 0:
+            raise BudgetExceededError("execution time budget exhausted")
+        try:
+            async with asyncio.timeout(remaining):
+                permit = await context.coordinator.acquire(
+                    WorkClass.BATCH if spent == 0 else WorkClass.RETRY,
+                    methods=methods,
+                    budget=DeadlineBudget(self._clock() + remaining),
+                )
+        except TimeoutError as error:
+            raise BudgetExceededError("permit wait exhausted execution time budget") from error
+        async with permit:
+            remaining = context.remaining_time(retry_started=retry_started)
+            if remaining <= 0:
+                raise BudgetExceededError("execution time budget exhausted before dispatch")
+            await context.reserve_attempt(attempts_for_request=spent, retry_started=retry_started)
+            attempts.dispatched()
+            try:
+                async with asyncio.timeout(remaining):
+                    return await send_wire_envelope(
+                        wire_transport,
+                        envelope,
+                        attempt_timeout=remaining,
+                        max_response_bytes=context.policy.max_response_bytes,
+                    )
+            except TimeoutError as error:
+                raise TransportError(
+                    "Transport attempt exceeded its elapsed budget",
+                    phase=FailurePhase.DISPATCH_STARTED,
+                    request_summary=envelope.summary,
+                ) from error
+
+    async def _classify_envelope(
+        self,
+        envelope: WireRequest,
+        wire: WireResponse,
+        *,
+        context: ExecutionContext,
+        retry_started: float,
+    ) -> PhysicalAttemptOutcome:
+        """Classify one envelope response with the shared primitives, observing any host throttle hint."""
+        summary = envelope.summary
+        response_error, parsed = self._classify_response(
+            None, wire, context=context, mode=_BodyMode.JSON, summary=summary
+        )
+        throttle_delay = _retry_after_seconds(wire) if response_error is not None else None
+        if response_error is not None and throttle_delay is not None:
+            merged = await context.coordinator.observe_throttle(throttle_delay, reason=_throttle_reason(response_error))
+            await context.record_cooldown(merged)
+        if _cancellation_pending():
+            return _dispatched_attempt("cancelled", wire=wire, error=asyncio.CancelledError())
+        if response_error is None and context.remaining_time(retry_started=retry_started) <= 0:
+            response_error = BudgetExceededError("transport completed after execution time budget")
+        if response_error is not None:
+            return _dispatched_attempt("error", wire=wire, error=response_error)
+        try:
+            response = _decode_success(wire, parsed, request_summary=summary)
+        except ProtocolError as error:
+            return _dispatched_attempt("error", wire=wire, error=error)
+        return _dispatched_attempt("response", wire=wire, response=response)
+
     def _classify_response(
         self,
-        request: Request,
+        request: Request | None,
         wire: WireResponse,
         *,
         context: ExecutionContext,
         mode: _BodyMode,
+        summary: RequestSummary | None = None,
     ) -> tuple[B24ApiError | None, _ParsedBody | None]:
-        """Classify one conclusive response, parsing a JSON success body exactly once."""
+        """Classify one conclusive response, parsing a JSON success body exactly once.
+
+        An envelope with no canonical ``Request`` form passes ``request=None`` and its own ``summary``.
+        """
+        request_summary = request.summary if request is not None else summary
         success = _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM
         if success and mode is _BodyMode.BINARY:
             return None, None
@@ -399,21 +546,21 @@ class Executor:
         ):
             return HTTPGatewayError(
                 f"HTTP gateway error {wire.status_code}",
-                request_summary=request.summary,
+                request_summary=request_summary,
                 evidence=_wire_evidence(wire),
             ), parsed
         response_error = self.codec.error_from_http(
             status_code=wire.status_code,
             body=body,
-            request_summary=request.summary,
+            request_summary=request_summary,
             headers=wire.header_map,
             retry_codes=context.policy.retry.transient_api_codes,
-            diagnostics=diagnostic_context(request),
+            diagnostics=diagnostic_context(request) if request is not None else None,
         )
         if response_error is None and not success:
             response_error = HTTPGatewayError(
                 f"HTTP gateway error {wire.status_code}",
-                request_summary=request.summary,
+                request_summary=request_summary,
                 evidence=_wire_evidence(wire),
             )
         return response_error, parsed
@@ -509,6 +656,31 @@ class Executor:
             await self._sleep(delay)
 
 
+def _local_attempt_failure(error: B24ApiError) -> PhysicalAttemptOutcome:
+    """An attempt that failed before dispatch: nothing reached the transport."""
+    return PhysicalAttemptOutcome(
+        "error", None, None, error, dispatch_started=False, transport_proves_not_accepted=True
+    )
+
+
+def _dispatched_attempt(
+    kind: Literal["response", "error", "cancelled"],
+    *,
+    wire: WireResponse | None = None,
+    response: Response | None = None,
+    error: BaseException | None = None,
+    proven_not_accepted: bool = False,
+) -> PhysicalAttemptOutcome:
+    return PhysicalAttemptOutcome(
+        kind, wire, response, error, dispatch_started=True, transport_proves_not_accepted=proven_not_accepted
+    )
+
+
+def _cancellation_pending() -> bool:
+    task = asyncio.current_task()
+    return task is not None and bool(task.cancelling())
+
+
 def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: ExecutionPolicy) -> bool:
     """SAFE work is retried after any transient failure; other work only when the failure proves nothing ran."""
     if isinstance(error, TransportError | ApiResponseError):
@@ -569,7 +741,13 @@ def _result_protocol_error(
     error = ProtocolError(message, request_summary=request.summary)
     error.observed_type = _json_type_name(observed)  # type: ignore[attr-defined]
     error.path = path  # type: ignore[attr-defined]
+    error.__dict__["_b24api_embedded_result"] = True
     return error
+
+
+def _is_embedded_result_error(error: BaseException) -> bool:
+    """Return whether a protocol error is a request-local embedded-result shape failure, not an envelope one."""
+    return isinstance(error, ProtocolError) and error.__dict__.get("_b24api_embedded_result") is True
 
 
 def _raise_embedded_result_error(  # noqa: C901, PLR0912, PLR0913

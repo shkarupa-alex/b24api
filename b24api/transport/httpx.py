@@ -33,6 +33,7 @@ from b24api.transport.logging_shield import HTTPX_LOG_SHIELD, OwnedRequestReplac
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
+    from b24api.contracts.json import JsonValue
     from b24api.contracts.request import Request
     from b24api.transport.logging_shield import LogOwnership
 
@@ -131,6 +132,7 @@ class HttpxTransport:
         scoped_headers=True,
         positional_json=True,
         routes=frozenset(RouteKind),
+        json_array_body=True,
     )
 
     def __init__(self, webhook_url: str, *, client: httpx.AsyncClient | None = None) -> None:
@@ -243,12 +245,8 @@ class HttpxTransport:
             request_headers = self._with_bounded_accept_encoding(dict(_validate_headers(request.headers.items)))
             if request.encoding is BodyEncoding.JSON:
                 request_headers["content-type"] = "application/json"
-                if request.positional is not None:
-                    content = json.dumps(
-                        request.positional.to_wire_slots(),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ).encode()
+                if (json_body := _json_array_content(request)) is not None:
+                    content = json.dumps(json_body, ensure_ascii=False, separators=(",", ":")).encode()
                     http_request = self._client.build_request(
                         "POST",
                         method_url,
@@ -376,6 +374,16 @@ class HttpxTransport:
                 self._webhook_finalizer()
             finally:
                 self._shield_finalizer()
+
+
+def _json_array_content(request: WireRequest) -> list[JsonValue] | None:
+    """Return a JSON body sent as a top-level array: a v3 batch envelope or exact positional slots."""
+    if request.array_body is not None:
+        # Native REST v3 batch: a top-level JSON array of {method, query}, in input order.
+        return request.array_body.to_wire()
+    if request.positional is not None:
+        return request.positional.to_wire_slots()
+    return None
 
 
 def _httpx_default_accept_encoding() -> str:

@@ -7,12 +7,20 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from b24api._error_types import ErrorOrigin
+from b24api.batch.correlation import (
+    _BatchNotExecutedError,
+    _Command,
+    _command_failure,
+    _command_success,
+    _shared_failure,
+)
 from b24api.batch.outcome import (
     BatchCommandEvidence,
     BatchFailure,
     BatchOutcome,
     BatchSuccess,
 )
+from b24api.batch.v3 import _V3Resolution
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.policy import (
     AmbiguityReason,
@@ -50,10 +58,8 @@ if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
 
 _MISSING = object()
-
-
-class _BatchNotExecutedError(ProtocolError):
-    """Internal correlated marker for a fail-fast window stopped before dispatch."""
+_UNSUPPORTED_COMMAND = "physical batch supports BARE JSON requests without scoped headers; use direct dispatch"
+_UNSUPPORTED_V3_TRANSPORT = "transport does not support native REST v3 batch envelopes; use direct dispatch"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,14 +71,6 @@ class _BatchInput:
 type _BatchItem = Request | _BatchInput
 type BatchSource = Iterable[_BatchItem] | AsyncIterable[_BatchItem]
 type BatchStreamItem = BatchOutcome
-
-
-@dataclass(frozen=True, slots=True)
-class _Command:
-    index: int
-    stable_key: str
-    request: Request
-    correlation: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +117,7 @@ class BatchExecutor:
         self.executor = executor
         self.portal_command_cap = portal_command_cap
 
-    async def _execute_chunk(  # noqa: PLR0913
+    async def execute_chunk(  # noqa: PLR0913
         self,
         commands: tuple[_Command, ...],
         *,
@@ -129,7 +127,8 @@ class BatchExecutor:
         strict_envelope: bool = False,
         strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
-        eligible, rejected = _partition_capabilities(commands)
+        """Execute one admitted chunk: classic BARE and native v3 commands never share an envelope."""
+        eligible, rejected = self._partition_capabilities(commands)
         if halt and rejected:
             first_rejected = next(command.index for command in commands if command.index in rejected)
             return tuple(
@@ -149,6 +148,27 @@ class BatchExecutor:
             return tuple(rejected[command.index] for command in commands)
         options = _RoundOptions(halt, advisory_totals, strict_envelope, strict_json_members)
         settled: dict[int, BatchOutcome] = {}
+        for group in _envelope_groups(eligible):
+            if halt and any(not isinstance(outcome, BatchSuccess) for outcome in settled.values()):
+                # Fail-fast: a later envelope of the accepted chunk is not sent after a failed one.
+                settled.update((command.index, _halted_failure(command)) for command in group)
+                continue
+            if group[0].request.route is RouteKind.API_V3:
+                outcomes = await _V3Resolution(self.executor, context).run(group)
+            else:
+                outcomes = await self._execute_bare(group, context=context, options=options)
+            settled.update((outcome.command_index, outcome) for outcome in outcomes)
+        return _merge_outcomes(commands, tuple(settled.values()), rejected)
+
+    async def _execute_bare(
+        self,
+        eligible: tuple[_Command, ...],
+        *,
+        context: ExecutionContext,
+        options: _RoundOptions,
+    ) -> tuple[BatchOutcome, ...]:
+        """Run one classic batch envelope and its replay rounds."""
+        settled: dict[int, BatchOutcome] = {}
         # Every command of a replay round was sent in each round before it, so one count bounds them all.
         pending, rounds, attempts = eligible, 0, _RequestAttempts()
         while pending:
@@ -167,7 +187,7 @@ class BatchExecutor:
             ):
                 break
             pending = sent.replay
-        return _merge_outcomes(commands, tuple(settled.values()), rejected)
+        return tuple(settled.values())
 
     async def _dispatch_round(
         self,
@@ -257,21 +277,50 @@ class BatchExecutor:
         )
         return _Round(outcomes, replay, method_cooldown)
 
-    @staticmethod
-    def _will_dispatch_commands(commands: tuple[_Command, ...], *, halt: bool) -> bool:
+    def will_dispatch_commands(self, commands: tuple[_Command, ...], *, halt: bool) -> bool:
         """Return whether capability preflight admits a physical batch envelope."""
-        eligible = any(_batch_request_eligible(command.request) for command in commands)
-        rejected = any(not _batch_request_eligible(command.request) for command in commands)
+        eligible = any(self._batch_route(command.request) is not None for command in commands)
+        rejected = any(self._batch_route(command.request) is None for command in commands)
         return eligible and not (halt and rejected)
 
-    @staticmethod
-    def _will_dispatch_requests(requests: tuple[Request, ...], *, halt: bool = False) -> bool:
+    def _will_dispatch_requests(self, requests: tuple[Request, ...], *, halt: bool = False) -> bool:
         """Return whether scheduler-owned requests admit a physical batch envelope."""
         commands = tuple(
             _Command(index=index, stable_key=f"c{index:012d}", request=request, correlation=None)
             for index, request in enumerate(requests)
         )
-        return BatchExecutor._will_dispatch_commands(commands, halt=halt)
+        return self.will_dispatch_commands(commands, halt=halt)
+
+    def _batch_route(self, request: Request) -> RouteKind | None:
+        """Return the envelope dialect a request can travel in, or ``None`` when no envelope represents it."""
+        if request.encoding.value != "json" or request.positional is not None or request.headers.items:
+            return None
+        if request.route is RouteKind.BARE and not request.method.endswith(".json"):
+            return RouteKind.BARE
+        if request.route is RouteKind.API_V3 and self.executor.supports_v3_batch:
+            return RouteKind.API_V3
+        return None
+
+    def _partition_capabilities(
+        self,
+        commands: tuple[_Command, ...],
+    ) -> tuple[tuple[_Command, ...], dict[int, BatchOutcome]]:
+        """Separate tolerant commands that physical batch cannot represent."""
+        eligible: list[_Command] = []
+        rejected: dict[int, BatchOutcome] = {}
+        for command in commands:
+            if self._batch_route(command.request) is not None:
+                eligible.append(command)
+                continue
+            # A v3 command is refused before any reservation when the transport cannot send the array body.
+            message = _UNSUPPORTED_V3_TRANSPORT if _v3_representable(command.request) else _UNSUPPORTED_COMMAND
+            error = CapabilityError(message, request_summary=command.request.summary)
+            rejected[command.index] = _command_failure(
+                command,
+                error,
+                evidence=BatchCommandEvidence(command.index, command.stable_key),
+            )
+        return tuple(eligible), rejected
 
     def _decode_command(
         self,
@@ -349,14 +398,7 @@ class BatchExecutor:
             )
             protocol_error.__cause__ = error
             return _command_failure(command, protocol_error, evidence=evidence)
-        return BatchSuccess._from_response(  # noqa: SLF001 - trusted correlated decoder fast path
-            command.index,
-            command.stable_key,
-            command.request,
-            command_response,
-            command.correlation,
-            evidence,
-        )
+        return _command_success(command, command_response, evidence)
 
     async def execute_requests(
         self,
@@ -379,7 +421,7 @@ class BatchExecutor:
             )
             for index, request in enumerate(requests)
         )
-        return await self._execute_chunk(
+        return await self.execute_chunk(
             commands,
             context=context,
             halt=False,
@@ -541,67 +583,48 @@ def _merge_outcomes(
     return tuple(by_index[command.index] for command in commands)
 
 
-def _partition_capabilities(
-    commands: tuple[_Command, ...],
-) -> tuple[tuple[_Command, ...], dict[int, BatchOutcome]]:
-    """Separate tolerant commands that physical batch cannot represent."""
-    eligible: list[_Command] = []
-    rejected: dict[int, BatchOutcome] = {}
-    for command in commands:
-        if _batch_request_eligible(command.request):
-            eligible.append(command)
-            continue
-        error = CapabilityError(
-            "physical batch supports BARE JSON requests without scoped headers; use direct dispatch",
-            request_summary=command.request.summary,
-        )
-        rejected[command.index] = _command_failure(
-            command,
-            error,
-            evidence=BatchCommandEvidence(command.index, command.stable_key),
-        )
-    return tuple(eligible), rejected
-
-
-def _batch_request_eligible(request: Request) -> bool:
-    """Return whether one request has a physical-batch representation."""
+def _v3_representable(request: Request) -> bool:
+    """Return whether a request has a native v3 batch command form, whatever the transport supports."""
     return (
-        request.route is RouteKind.BARE
-        and not request.method.endswith(".json")
+        request.route is RouteKind.API_V3
         and request.encoding.value == "json"
         and request.positional is None
         and not request.headers.items
     )
 
 
-def _command_failure(
-    command: _Command,
-    error: B24ApiError,
-    *,
-    evidence: BatchCommandEvidence,
-    refused: bool = False,
-) -> BatchFailure:
-    safety = command.request.replay_safety or ReplaySafety.UNKNOWN
-    # A listed Bitrix refusal of the command, or a transport failure before dispatch, proves it did not run.
-    proven_not_run = refused or (isinstance(error, TransportError) and not error.possible_acceptance)
-    eligible = error.retryable and (safety is ReplaySafety.SAFE or proven_not_run)
-    return BatchFailure(
-        command.index,
-        command.stable_key,
-        command.request,
-        error,
-        replay_safety=safety,
-        replay_disposition=ReplayDisposition.ELIGIBLE if eligible else ReplayDisposition.NOT_ELIGIBLE,
-        correlation=command.correlation,
-        evidence=evidence,
-    )
+def _envelope_groups(eligible: tuple[_Command, ...]) -> tuple[tuple[_Command, ...], ...]:
+    """Split admitted commands into envelopes, ordered by their first command.
+
+    Classic commands share one envelope as before. Native v3 commands form contiguous runs of one safety
+    class: a SAFE run never carries an UNSAFE or UNKNOWN command, and UNSAFE and UNKNOWN travel together.
+    """
+    groups: list[tuple[_Command, ...]] = []
+    bare = tuple(command for command in eligible if command.request.route is RouteKind.BARE)
+    if bare:
+        groups.append(bare)
+    run: list[_Command] = []
+    for command in (item for item in eligible if item.request.route is RouteKind.API_V3):
+        if run and _is_safe(run[-1]) != _is_safe(command):
+            groups.append(tuple(run))
+            run = []
+        run.append(command)
+    if run:
+        groups.append(tuple(run))
+    return tuple(sorted(groups, key=lambda group: group[0].index))
 
 
-def _shared_failure(command: _Command, error: B24ApiError) -> BatchFailure:
-    return _command_failure(
+def _is_safe(command: _Command) -> bool:
+    return command.request.replay_safety is ReplaySafety.SAFE
+
+
+def _halted_failure(command: _Command) -> BatchFailure:
+    return _shared_failure(
         command,
-        error,
-        evidence=BatchCommandEvidence(command.index, command.stable_key),
+        _BatchNotExecutedError(
+            "physical batch command was not executed after a fail-fast envelope failure",
+            request_summary=command.request.summary,
+        ),
     )
 
 
