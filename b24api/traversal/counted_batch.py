@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from b24api.batch.engine import _BatchInput
-from b24api.batch.outcome import BatchFailure
 from b24api.completion.recorder import CountedCompletionRecorder
 from b24api.contracts.policy import ConfirmationPolicy, KernelState
 from b24api.contracts.report import PageDispatch
@@ -297,18 +296,18 @@ class CountedBatchStrategy:
         receipt: TailReceipt,
     ) -> tuple[Response, tuple[FrozenJson, ...], bool]:
         """Validate one tail page against the planned exact range, or record its rejection."""
-        outcome = receipt.outcome
+        failure = receipt.failure
         tail.settle(receipt)
         start = self._stride * (receipt.ordinal + 1)
         ctx.schedule_page(offset=start, dispatch=PageDispatch.BATCH, batch_index=receipt.batch_index)
-        if isinstance(outcome, BatchFailure):
-            error = outcome.error
+        if failure is not None:
+            error = failure.error
             recorded = (
                 error if isinstance(error, BaseException) else CapabilityError("parallel counted batch command failed")
             )
             ctx.record_unknown_page(dispatch=PageDispatch.BATCH, batch_index=receipt.batch_index, error=recorded)
-            raise tail.failure(receipt, outcome)
-        response, total, stride = outcome.response, self._total, self._stride
+            raise tail.failure(receipt, failure)
+        response, total, stride = receipt.response, self._total, self._stride
         if response is None:
             raise CapabilityError("parallel counted batch outcome lacks correlated response evidence")
         trace_count = ctx.page_trace_count

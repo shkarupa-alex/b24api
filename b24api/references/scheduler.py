@@ -3,7 +3,7 @@
 from __future__ import annotations
 import asyncio
 import functools
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from inspect import isawaitable
 from typing import TYPE_CHECKING, cast
 
@@ -14,13 +14,14 @@ from b24api.contracts.page_stop import CallerStop, ContinuePage, PageBoundary, P
 from b24api.contracts.report import PageDispatch, PageRecord, Violation, ViolationSeverity, retain_page_trace
 from b24api.contracts.request import ReplaySafety, Request, ResultSelector, TraversalIdentity
 from b24api.contracts.violation import retain_violations
-from b24api.errors import AmbiguousExecutionError, ApiResponseError, BudgetExceededError, CapabilityError
+from b24api.errors import BudgetExceededError, CapabilityError
 from b24api.execution import (
     AsyncIteratorController,
     Executor,
     await_cleanup_resistant,
     rearm_cancellation,
 )
+from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
     ReferenceStreamItem,
     _AdmissionState,
@@ -30,13 +31,14 @@ from b24api.references.dispatch import (
     _DispatchedPage,
     _DoneEvent,
     _Event,
+    _failed_dispatch,
+    _failed_settlement,
     _FailureEvent,
     _KernelFanOutSuccess,
     _KernelReferenceComplete,
     _PageEvent,
     _ProducerState,
     _ReferenceWindowError,
-    _Reservation,
     _RowBuffer,
     _Work,
 )
@@ -45,6 +47,8 @@ from b24api.references.outcome import (
     KernelReferenceItem,
     ReferenceRequest,
 )
+from b24api.references.program import SourceProgram
+from b24api.references.run import _ReferenceRun
 from b24api.references.support import (
     _active_limit,
     _declared_short_page_width,
@@ -60,6 +64,7 @@ from b24api.references.support import (
 )
 from b24api.traversal import PaginationDriver
 from b24api.traversal.plans import (
+    CountedOffsetPlan,
     DispatchPlan,
     KernelBatchDispatch,
     KernelDirectDispatch,
@@ -71,56 +76,12 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from b24api._sources import OwnedSource
-    from b24api.completion.reference_recorder import ReferenceBindingRecorder
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.response import Response
     from b24api.traversal.identity import _Page
 
 type _PageDispatcher = _DirectPageDispatcher | _BatchPageDispatcher
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
-
-
-def _failed_settlement(error: BaseException) -> CommandSettlement:
-    """Classify a page whose dispatch raised: ambiguous, failed, possibly sent, or never sent."""
-    if isinstance(error, _BatchPageError) and isinstance(error.failure.error, AmbiguousExecutionError):
-        return CommandSettlement.UNKNOWN
-    if isinstance(error, _BatchPageError | ApiResponseError):
-        return CommandSettlement.FAILURE
-    if bool(getattr(error, "_b24api_dispatch_started", False)):
-        return CommandSettlement.UNKNOWN
-    return CommandSettlement.NOT_EXECUTED
-
-
-@dataclass(slots=True)
-class _ReferenceRun:
-    """Mutable state of one reference transaction, shared by the driver's fetch hook and the page loop."""
-
-    work: _Work
-    output: asyncio.Queue[_Event]
-    completion: ReferenceBindingRecorder
-    producer_key: str
-    driver: PaginationDriver = field(init=False)
-    reservation: _Reservation | None = None
-    partial_rows: int = 0
-    page_state: int = 0
-    violation_offset: int = 0
-    trace_offset: int = 0
-    scheduled_sequences: list[int] = field(default_factory=list)
-    stopped_reason: str | None = None
-    page_admission: asyncio.Future[None] | None = None
-    settlement: asyncio.Future[None] | None = None
-
-    def admit_page(self) -> None:
-        """Release the dispatcher's admission slot once the page is in the row buffer."""
-        if self.page_admission is not None and not self.page_admission.done():
-            self.page_admission.set_result(None)
-        self.page_admission = None
-
-    def settle_page(self) -> None:
-        """Release the dispatcher's settlement wait for the current page."""
-        if self.settlement is not None and not self.settlement.done():
-            self.settlement.set_result(None)
-        self.settlement = None
 
 
 class ReferenceScheduler:
@@ -130,7 +91,7 @@ class ReferenceScheduler:
         self,
         executor: Executor,
         *,
-        plan: ListPlan,
+        plan: ListPlan | None,
         dispatch: DispatchPlan,
         selector: ResultSelector | None,
         identity: TraversalIdentity | None,
@@ -162,16 +123,32 @@ class ReferenceScheduler:
         self.stopped_bindings = 0
         self.completion = ReferenceCompletionRecorder()
         self.context = executor.context(policy)
-        self.page_cap = _page_cap(
-            plan,
-            dispatch,
-            policy,
-            whole_result=whole_result,
-            page_cap_hint=page_cap_hint,
+        # Without a default plan every admitted reference carries its own lowered program (heterogeneous).
+        self.default_program: SourceProgram | None = None
+        if plan is not None:
+            counted = isinstance(plan, CountedOffsetPlan) and isinstance(dispatch, KernelBatchDispatch)
+            self.default_program = SourceProgram(
+                plan,
+                selector,
+                identity,
+                page_adapter,
+                _page_cap(plan, dispatch, policy, whole_result=whole_result, page_cap_hint=page_cap_hint),
+                page_cap_hint=page_cap_hint,
+                page_stop=page_stop,
+                whole_result=whole_result,
+                counted_page_size=page_cap_hint if counted and not whole_result else None,
+            )
+        self.page_cap = 1 if self.default_program is None else self.default_program.page_cap
+        self.active_limit = (
+            policy.max_active_references
+            if self.default_program is None
+            else _active_limit(output_order, policy, self.page_cap)
         )
-        self.active_limit = _active_limit(output_order, policy, self.page_cap)
         self.producer_state = _ProducerState(set(), {})
-        head_reserve = self.page_cap if output_order is ReferenceOutputOrder.INPUT else 0
+        self._caps: dict[int, int] = {}
+        head_reserve = (
+            self.page_cap if output_order is ReferenceOutputOrder.INPUT and self.default_program is not None else 0
+        )
         self.buffer = _RowBuffer(
             policy.max_buffered_rows,
             self.context,
@@ -201,11 +178,12 @@ class ReferenceScheduler:
 
     async def outcomes(self, source: OwnedSource[ReferenceRequest]) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912
         """Yield correlated operation outcomes."""
-        PaginationDriver.validate_contract(
-            self.plan,
-            self.identity,
-            self.context.policy,
-        )
+        if self.default_program is not None:
+            PaginationDriver.validate_contract(
+                self.default_program.plan,
+                self.default_program.identity,
+                self.context.policy,
+            )
         await self.context.start()
         iterator = AsyncIteratorController(
             source,
@@ -339,6 +317,8 @@ class ReferenceScheduler:
                 work = _Work(next_index, reference)
                 self.completion.admit(next_index)
                 next_index += 1
+                if reference.not_executed_reason is None:
+                    await self._admit_program(work)
                 queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue(maxsize=1)
                 admission.queues[work.index] = queue
                 run = (
@@ -356,28 +336,50 @@ class ReferenceScheduler:
             self.producer_state.touch()
             admission.changed.set()
 
+    def _program(self, work: _Work) -> SourceProgram:
+        program = work.reference.program or self.default_program
+        if program is None:
+            raise RuntimeError("heterogeneous reference lacks its lowered program")
+        return program
+
+    async def _admit_program(self, work: _Work) -> None:
+        """Record an admitted reference's row cap; an INPUT head reserves its own program's cap."""
+        cap = self._program(work).page_cap
+        self._caps[work.index] = cap
+        if (
+            self.output_order is ReferenceOutputOrder.INPUT
+            and work.index == self.buffer.head_index
+            and cap != self.buffer.head_reserve
+        ):
+            await self.buffer.advance_head(work.index, cap)
+
+    def _head_cap(self, index: int) -> int:
+        return self._caps.get(index, self.page_cap if self.default_program is not None else 0)
+
     async def _run_reference(self, work: _Work, output: asyncio.Queue[_Event]) -> None:
         """Own one reference transaction from its first page to its terminal event."""
-        run = _ReferenceRun(work, output, self.completion.binding(work.index), f"r{work.index}")
+        program = self._program(work)
+        run = _ReferenceRun(work, output, self.completion.binding(work.index), f"r{work.index}", program)
         self.producer_state.runnable.add(run.producer_key)
         self.producer_state.indexes[run.producer_key] = work.index
+        self.producer_state.caps[run.producer_key] = program.page_cap
         self.producer_state.touch()
         await asyncio.sleep(0)
         driver = run.driver = PaginationDriver(
             self.executor,
             work.reference.request,
-            self.plan,
-            selector=self.selector,
-            identity=self.identity,
+            program.plan,
+            selector=program.selector,
+            identity=program.identity,
             context=self.context,
             fetch=functools.partial(self._fetch_page, run),
-            single_result_as_item=self.whole_result,
-            page_cap_hint=self.page_cap,
-            page_adapter=self.page_adapter,
+            single_result_as_item=program.whole_result,
+            page_cap_hint=program.page_cap,
+            page_adapter=program.page_adapter,
             initial_cursor=work.reference.initial_cursor,
             completion_recorder=run.completion,
         )
-        pages = driver.pages()
+        pages = self._pages(run)
         try:
             async for page in pages:
                 if not await self._deliver_page(run, page):
@@ -394,7 +396,7 @@ class ReferenceScheduler:
                     run.stopped_reason,
                     driver.terminal_reason,
                     driver.expected_total,
-                    _declared_short_page_width(self.plan, driver.terminal_reason),
+                    _declared_short_page_width(program.plan, driver.terminal_reason),
                 ),
             )
         except asyncio.CancelledError:
@@ -412,52 +414,82 @@ class ReferenceScheduler:
             self.producer_state.admitting.discard(run.producer_key)
             self.producer_state.pending_continuations.discard(run.producer_key)
             self.producer_state.indexes.pop(run.producer_key, None)
+            self.producer_state.caps.pop(run.producer_key, None)
             self.producer_state.touch()
             if run.reservation is not None:
                 await self.buffer.abort(run.reservation)
 
-    async def _fetch_page(self, run: _ReferenceRun, request: Request) -> Response:
-        """Reserve buffer capacity and dispatch one page; the driver calls this as its fetch hook."""
+    def _pages(self, run: _ReferenceRun) -> AsyncGenerator[_Page]:
+        """Run a counted program's head and dense tail on the shared queue, any other on its driver."""
+        page_size = run.program.counted_page_size
+        if page_size is None or not isinstance(self.dispatch, KernelBatchDispatch):
+            return run.driver.pages()
+        return run.driver.counted_batch_pages(
+            batch_size=self.dispatch.batch_size,
+            page_size=page_size,
+            io=SharedCountedWaveIO(self, run),
+        )
+
+    def take_page_sequence(self) -> int:
+        """Return the next operation-wide page sequence, in scheduling order."""
+        sequence = self._next_page_sequence
+        self._next_page_sequence += 1
+        return sequence
+
+    async def dispatch_page(self, run: _ReferenceRun, request: Request) -> _DispatchedPage:
+        """Schedule one page, reserve its row capacity and dispatch it; the caller settles it."""
         self.producer_state.runnable.discard(run.producer_key)
         self.producer_state.admitting.add(run.producer_key)
         self.producer_state.touch()
-        sequence = self._next_page_sequence
-        self._next_page_sequence += 1
-        run.scheduled_sequences.append(sequence)
+        run.scheduled_sequences.append(self.take_page_sequence())
         run.completion.scheduled()
+        run.reservation = await self.buffer.reserve(run.work.index, run.program.page_cap)
+        dispatched = await self.dispatcher.fetch(request, run.producer_key)
+        run.page_admission = dispatched.admission
+        run.settlement = dispatched.settlement
+        run.page_state += 1
+        return dispatched
+
+    async def abandon_page(self, run: _ReferenceRun) -> None:
+        """Return the row capacity of a page whose dispatch raised."""
+        self.producer_state.admitting.discard(run.producer_key)
+        self.producer_state.touch()
+        if run.reservation is not None:
+            await self.buffer.abort(run.reservation)
+        run.reservation = None
+
+    @property
+    def page_dispatch(self) -> PageDispatch:
+        """Return the physical dispatch every page of this operation travels by."""
+        return PageDispatch.BATCH if isinstance(self.dispatch, KernelBatchDispatch) else PageDispatch.DIRECT
+
+    async def _fetch_page(self, run: _ReferenceRun, request: Request) -> Response:
+        """Reserve buffer capacity and dispatch one page; the driver calls this as its fetch hook."""
         try:
-            run.reservation = await self.buffer.reserve(run.work.index, self.page_cap)
-            dispatched: _DispatchedPage = await self.dispatcher.fetch(request, run.producer_key)
-            run.page_admission = dispatched.admission
-            run.settlement = dispatched.settlement
+            dispatched = await self.dispatch_page(run, request)
         except BaseException as error:
             run.completion.settled(_failed_settlement(error))
-            self.producer_state.admitting.discard(run.producer_key)
-            self.producer_state.touch()
-            if run.reservation is not None:
-                await self.buffer.abort(run.reservation)
-            run.reservation = None
+            await self.abandon_page(run)
             if isinstance(error, _BatchPageError) or bool(getattr(error, "_b24api_dispatch_started", False)):
-                dispatch = PageDispatch.BATCH if isinstance(self.dispatch, KernelBatchDispatch) else PageDispatch.DIRECT
-                batch_index = error.failure.command_index if isinstance(error, _BatchPageError) else None
-                report_error = (
-                    error.failure.error
-                    if isinstance(error, _BatchPageError) and isinstance(error.failure.error, BaseException)
-                    else error
+                failed = _failed_dispatch(self.page_dispatch, error)
+                run.driver.set_page_dispatch(dispatch=failed.dispatch, batch_index=failed.batch_index)
+                run.driver.record_unknown_page(
+                    dispatch=failed.dispatch,
+                    batch_index=failed.batch_index,
+                    error=failed.error or error,
                 )
-                run.driver.set_page_dispatch(dispatch=dispatch, batch_index=batch_index)
-                run.driver.record_unknown_page(dispatch=dispatch, batch_index=batch_index, error=report_error)
             raise
         run.driver.set_page_dispatch(dispatch=dispatched.dispatch, batch_index=dispatched.batch_index)
         run.completion.settled(CommandSettlement.SUCCESS)
-        run.page_state += 1
         return dispatched.response
 
     async def _deliver_page(self, run: _ReferenceRun, page: _Page) -> bool:
         """Hand one validated page to the consumer; return False when the caller stops the reference."""
         if run.reservation is None:
             raise RuntimeError("page completed without a buffer reservation")
-        await self.buffer.accept(run.reservation, page.retained_rows)
+        if not run.reservation.accepted:
+            # A counted head's rows were already charged when it was selected (LeaseCountedRowAccount).
+            await self.buffer.accept(run.reservation, page.retained_rows)
         # The physical sender owns capacity only until the decoded page is
         # admitted to the bounded row buffer.  Holding that slot until a
         # READY consumer acknowledges every row would serialize consumer
@@ -466,7 +498,8 @@ class ReferenceScheduler:
         if self.output_order is ReferenceOutputOrder.INPUT:
             run.settle_page()
         acknowledged = asyncio.get_running_loop().create_future()
-        if page.continuing:
+        # A dense counted tail reports its own pending pages to the dispatcher (ReferenceTailStream).
+        if page.continuing and not run.tail_active:
             self.producer_state.pending_continuations.add(run.producer_key)
             self.producer_state.touch()
         page_violations = tuple(run.driver.violations[run.violation_offset :])
@@ -496,18 +529,19 @@ class ReferenceScheduler:
             run.completion.acknowledged()
             return False
         run.completion.acknowledged()
-        if page.continuing:
+        if page.continuing and not run.tail_active:
             self.producer_state.runnable.add(run.producer_key)
             self.producer_state.touch()
         return True
 
     async def _caller_stopped(self, run: _ReferenceRun, page: _Page, page_records: tuple[PageRecord, ...]) -> bool:
         """Ask the page stop policy about a delivered page; True stops a reference that would continue."""
-        if self.page_stop is None:
+        page_stop = run.program.page_stop
+        if page_stop is None:
             return False
         if len(page_records) != 1:
             raise RuntimeError("validated reference page lacks completion provenance")
-        decision = self.page_stop.on_page(PageBoundary(run.work.index, page_records[0], tuple(page.items)))
+        decision = page_stop.on_page(PageBoundary(run.work.index, page_records[0], tuple(page.items)))
         if isawaitable(decision):
             decision = await decision
         if not isinstance(decision, ContinuePage | CallerStop):
@@ -572,6 +606,7 @@ class ReferenceScheduler:
                 continue
             await _finish_task(admission.tasks, event.work.index)
             admission.queues.pop(event.work.index, None)
+            self._caps.pop(event.work.index, None)
             admission.slots.release()
         await producer
 
@@ -593,9 +628,10 @@ class ReferenceScheduler:
                 continue
             await _finish_task(admission.tasks, head)
             admission.queues.pop(head, None)
+            self._caps.pop(head, None)
             admission.slots.release()
             next_head = min(admission.tasks) if admission.tasks else head + 1
-            await self.buffer.advance_head(next_head, self.page_cap)
+            await self.buffer.advance_head(next_head, self._head_cap(next_head))
         await producer
 
     def _record_event_violations(self, event: _Event) -> None:

@@ -22,6 +22,7 @@ from b24api.contracts.completion import (
     StreamClosure,
     StreamTerminal,
 )
+from b24api.contracts.report import PageRejectionCode
 
 
 class _PageFields(TypedDict):
@@ -118,20 +119,50 @@ class ReferenceBindingRecorder:
         self._current: int | None = None
         self._delivered = False
         self._validated_rows: int | None = None
+        self._reserved: set[int] = set()
         self.unknown = False
 
     def _emit(self, event: CompletionEvidence) -> None:
         self._operation.gate.emit(event)
 
-    def _fields(self) -> _PageFields:
-        if self._current is None:
+    def _fields(self, page_id: int | None = None) -> _PageFields:
+        current = self._current if page_id is None else page_id
+        if current is None:
             raise RuntimeError("reference completion event lacks a scheduled page")
         return {
             "operation_id": self._operation.gate.operation_id,
             "sequence": self._operation._take(),  # noqa: SLF001 - one correlated operation sequence
             "binding_id": self.binding_id,
-            "page_id": self._current,
+            "page_id": current,
         }
+
+    def reserve(self) -> int:
+        """Schedule a planned page whose command may be sent before the active page is acknowledged."""
+        page_id = self._next_page
+        self._next_page += 1
+        self._emit(PageScheduled(**self._fields(page_id)))
+        self._reserved.add(page_id)
+        return page_id
+
+    def activate(self, page_id: int) -> None:
+        """Make one reserved page the binding's current page, in planned order."""
+        if self._current is not None or page_id not in self._reserved:
+            raise RuntimeError("reference page activation lacks a reserved page")
+        self._reserved.discard(page_id)
+        self._current = page_id
+        self._delivered = False
+        self._validated_rows = None
+
+    def abandon_reserved(self, page_id: int, outcome: CommandSettlement) -> None:
+        """Settle a reserved page its producer will never commit: negative, or successful but unconsumed."""
+        if page_id not in self._reserved:
+            raise RuntimeError("reference page abandonment lacks a reserved page")
+        self._reserved.discard(page_id)
+        self._emit(PageCommandOutcome(**self._fields(page_id), outcome=outcome))
+        if outcome is CommandSettlement.SUCCESS:
+            self._emit(PageRejected(**self._fields(page_id), reason=PageRejectionCode.TRANSACTION_ABORTED.value))
+        elif outcome is CommandSettlement.UNKNOWN:
+            self.unknown = True
 
     def scheduled(self) -> None:
         """Record a page before its buffer reservation and physical dispatch."""

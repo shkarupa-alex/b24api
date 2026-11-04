@@ -10,9 +10,10 @@ from typing import TYPE_CHECKING, cast
 
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure
+from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.report import PageDispatch
-from b24api.errors import BudgetExceededError, CapabilityError
+from b24api.errors import AmbiguousExecutionError, ApiResponseError, BudgetExceededError, CapabilityError
 from b24api.execution import (
     ExecutionContext,
     Executor,
@@ -201,6 +202,34 @@ class _BatchPageError(Exception):
         super().__init__("batch page command failed")
 
 
+def _failed_settlement(error: BaseException) -> CommandSettlement:
+    """Classify a page whose dispatch raised: ambiguous, failed, possibly sent, or never sent."""
+    if isinstance(error, _BatchPageError) and isinstance(error.failure.error, AmbiguousExecutionError):
+        return CommandSettlement.UNKNOWN
+    if isinstance(error, _BatchPageError | ApiResponseError):
+        return CommandSettlement.FAILURE
+    if bool(getattr(error, "_b24api_dispatch_started", False)):
+        return CommandSettlement.UNKNOWN
+    return CommandSettlement.NOT_EXECUTED
+
+
+@dataclass(frozen=True, slots=True)
+class _FailedDispatch:
+    dispatch: PageDispatch
+    batch_index: int | None
+    error: BaseException | None
+
+
+def _failed_dispatch(dispatch: PageDispatch, error: BaseException) -> _FailedDispatch:
+    """Return the dispatch provenance and the reportable error of a page whose dispatch raised."""
+    if isinstance(error, _BatchPageError):
+        cause = error.failure.error
+        return _FailedDispatch(
+            dispatch, error.failure.command_index, cause if isinstance(cause, BaseException) else None
+        )
+    return _FailedDispatch(dispatch, None, None)
+
+
 class _RowBuffer:
     """Reserve page capacity before I/O and account decoded retained rows exactly."""
 
@@ -221,6 +250,16 @@ class _RowBuffer:
         self._condition = asyncio.Condition()
         self._reservations: list[_Reservation] = []
         self._producer_state = producer_state
+
+    @property
+    def head_index(self) -> int:
+        """Return the INPUT frontier whose page capacity is held in reserve."""
+        return self._head_index
+
+    @property
+    def head_reserve(self) -> int:
+        """Return the rows kept free for the INPUT frontier's next page."""
+        return self._head_reserve
 
     async def reserve(self, index: int, amount: int) -> _Reservation:
         if amount > self.maximum:

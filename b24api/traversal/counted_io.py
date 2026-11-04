@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
     from b24api.batch.engine import _BatchInput
-    from b24api.batch.outcome import BatchOutcome
     from b24api.completion.recorder import CountedCompletionRecorder
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.request import Request
@@ -46,10 +45,11 @@ class HeadAttempt:
 
 @dataclass(frozen=True, slots=True)
 class TailReceipt:
-    """One dense tail command outcome, yielded in planned offset order."""
+    """One dense tail command outcome, yielded in planned offset order: a response or a failure."""
 
     ordinal: int
-    outcome: BatchOutcome = field(repr=False)
+    response: Response | None = field(repr=False)
+    failure: BatchFailure | None = field(repr=False)
     batch_index: int | None
 
 
@@ -174,18 +174,17 @@ class _FlatTailStream:
 
     async def __aiter__(self) -> AsyncIterator[TailReceipt]:
         async for outcome in self._outcomes:
-            if not isinstance(outcome, BatchFailure) and (
-                not isinstance(outcome, BatchSuccess) or outcome.response is None
-            ):
+            if isinstance(outcome, BatchFailure):
+                yield TailReceipt(outcome.command_index, None, outcome, outcome.command_index)
+                continue
+            if not isinstance(outcome, BatchSuccess) or outcome.response is None:
                 raise CapabilityError("parallel counted batch outcome lacks correlated response evidence")
-            yield TailReceipt(outcome.command_index, outcome, outcome.command_index)
+            yield TailReceipt(outcome.command_index, outcome.response, None, outcome.command_index)
 
     def settle(self, receipt: TailReceipt) -> None:
         if self._recorder is not None:
             self._recorder.activate(receipt.ordinal + 1)
-            self._recorder.settled(
-                CommandSettlement.SUCCESS if isinstance(receipt.outcome, BatchSuccess) else CommandSettlement.FAILURE
-            )
+            self._recorder.settled(CommandSettlement.SUCCESS if receipt.failure is None else CommandSettlement.FAILURE)
 
     def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
         del receipt
