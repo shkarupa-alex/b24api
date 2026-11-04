@@ -82,9 +82,9 @@ class EnvelopeContractError(HTTPGatewayError, ProtocolError):
 
 @dataclass(frozen=True, slots=True)
 class ValidationIssue:
-    """One redacted V3 validation location and message."""
+    """One redacted V3 validation location and message; ``field`` is None when the server names no field."""
 
-    field: str
+    field: str | None
     message: str
 
 
