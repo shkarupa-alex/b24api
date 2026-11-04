@@ -28,6 +28,7 @@ from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
     BatchCommandError,
+    BudgetExceededError,
     CapabilityError,
     ProtocolError,
     ResultShapeError,
@@ -507,6 +508,36 @@ async def test_a21_mixed_bare_and_v3_never_share_an_envelope() -> None:
     assert [call.request is not None for call in transport.wire_calls] == [True, False]
     assert report.physical_requests == TWO
     transport.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_a21_mixed_a_group_the_budget_stops_before_its_send_is_not_a_batch_request() -> None:
+    """A21-MIXED: batch_requests counts an envelope only once its first physical attempt is reserved."""
+    bare = Request("x.item.get", {"id": 1}, SAFE, route=RouteKind.BARE)
+    v3 = _v3(2)
+    transport = ScriptedTransport((ScriptedExchange.batch((bare,), (_item(1),), total=1),))
+
+    outcomes, report = await _run(transport, [bare, v3], policy=_policy(max_requests=1))
+
+    assert isinstance(outcomes[0], CommandSuccess)
+    assert isinstance(outcomes[1], CommandFailure)
+    assert isinstance(outcomes[1].error, BudgetExceededError)
+    assert len(transport.wire_calls) == 1
+    assert report.physical_requests == 1
+    assert report.batch_requests == 1
+    transport.assert_exhausted()
+
+    both = ScriptedTransport(
+        (
+            ScriptedExchange.batch((bare,), (_item(1),), total=1),
+            ScriptedExchange.v3_batch((v3,), (_item(2),)),
+        ),
+    )
+    outcomes, report = await _run(both, [bare, v3], policy=_policy(max_requests=TWO))
+
+    assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+    assert report.physical_requests == report.batch_requests == TWO
+    both.assert_exhausted()
 
 
 def _classic_at(index: int, request: Request, result: object) -> ScriptedExchange:

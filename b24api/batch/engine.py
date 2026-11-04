@@ -130,8 +130,9 @@ class BatchExecutor:
     ) -> tuple[BatchOutcome, ...]:
         """Execute one admitted chunk: classic BARE and native v3 commands never share an envelope.
 
-        ``on_envelope`` is called once before each envelope group's first physical round is dispatched, so a
-        caller counts the batch requests a chunk really sends; replay rounds and halted groups are not counted.
+        ``on_envelope`` is called once when an envelope group's first physical attempt is reserved, so a caller
+        counts the batch requests a chunk really dispatches; a group the budget stops before its first send, a
+        halted group, replay rounds, envelope retries and isolation requests are not counted.
         """
         eligible, rejected = self._partition_capabilities(commands)
         if halt and rejected:
@@ -158,12 +159,11 @@ class BatchExecutor:
                 # Fail-fast: a later envelope of the accepted chunk is not sent after a failed one.
                 settled.update((command.index, _halted_failure(command)) for command in group)
                 continue
-            if on_envelope is not None:
-                on_envelope()
+            attempts = _RequestAttempts(on_first_dispatch=on_envelope)
             if group[0].request.route is RouteKind.API_V3:
-                outcomes = await _V3Resolution(self.executor, context).run(group)
+                outcomes = await _V3Resolution(self.executor, context, attempts).run(group)
             else:
-                outcomes = await self._execute_bare(group, context=context, options=options)
+                outcomes = await self._execute_bare(group, context=context, options=options, attempts=attempts)
             settled.update((outcome.command_index, outcome) for outcome in outcomes)
         return _merge_outcomes(commands, tuple(settled.values()), rejected)
 
@@ -173,11 +173,12 @@ class BatchExecutor:
         *,
         context: ExecutionContext,
         options: _RoundOptions,
+        attempts: _RequestAttempts,
     ) -> tuple[BatchOutcome, ...]:
         """Run one classic batch envelope and its replay rounds."""
         settled: dict[int, BatchOutcome] = {}
         # Every command of a replay round was sent in each round before it, so one count bounds them all.
-        pending, rounds, attempts = eligible, 0, _RequestAttempts()
+        pending, rounds = eligible, 0
         while pending:
             sent = await self._dispatch_round(pending, context=context, options=options, attempts=attempts)
             # A replay the budget stops before it runs leaves each command the outcome it last received.

@@ -95,6 +95,8 @@ class _RequestAttempts:
     last_failure: B24ApiError | None = None
     # The latest failure of the round that does not prove its send did not run: what an unknown outcome is about.
     unproven_failure: B24ApiError | None = None
+    # Called once when the lineage's first send is reserved: a batch counts the envelopes it really dispatches.
+    on_first_dispatch: Callable[[], None] | None = None
 
     def begin(self, clock: Clock) -> tuple[float, int]:
         """Start the retry clock on the first send and return it with the attempts already spent."""
@@ -104,6 +106,8 @@ class _RequestAttempts:
 
     def dispatched(self) -> None:
         """Record a send, which may have run until its failure proves otherwise."""
+        if self.used == 0 and self.on_first_dispatch is not None:
+            self.on_first_dispatch()
         self.earlier_unproven = self.earlier_unproven or self.last_unproven
         self.last_unproven = True
         self.used += 1
