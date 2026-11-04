@@ -15,20 +15,26 @@ QUALIFIED_TOTAL_REACHED = "qualified total reached"
 SPARSE_RAW_RANGE_COVERED = "qualified sparse raw range covered"
 ADMITTED_UPPER_BOUNDARY_REACHED = "exact admitted upper boundary reached"
 DECLARED_SHORT_PAGE_REACHED = "declared short page reached"
+RESPONSE_FLAG_DECLARED_TERMINAL = "response flag declared terminal page"
+CONTINUATION_RULE_DECLARED_END = "continuation rule declared end of source"
 
 
 def qualified_closure(terminal_reason: str | None) -> BindingClosure | None:
     """Return the qualified closure a completed traversal's reason proves, or ``None`` for plain exhaustion."""
+    closure: BindingClosure | None = None
     match terminal_reason:
         case "single response complete":
-            return BindingClosure.SINGLE_RESPONSE
+            closure = BindingClosure.SINGLE_RESPONSE
         case "qualified total reached":
-            return BindingClosure.QUALIFIED_TOTAL
+            closure = BindingClosure.QUALIFIED_TOTAL
         case "qualified sparse raw range covered":
-            return BindingClosure.RAW_RANGE_COVERED
+            closure = BindingClosure.RAW_RANGE_COVERED
         case "exact admitted upper boundary reached":
-            return BindingClosure.BOUNDARY_SEEN
+            closure = BindingClosure.BOUNDARY_SEEN
         case "declared short page reached":
-            return BindingClosure.DECLARED_SHORT_PAGE
-        case _:
-            return None
+            closure = BindingClosure.DECLARED_SHORT_PAGE
+        case "response flag declared terminal page":
+            closure = BindingClosure.DECLARED_RESPONSE_TERMINAL
+        case "continuation rule declared end of source":
+            closure = BindingClosure.RULE_DECLARED_END
+    return closure

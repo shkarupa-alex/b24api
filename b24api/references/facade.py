@@ -33,7 +33,10 @@ from b24api.contracts.request import (
     canonical_request,
 )
 from b24api.contracts.traversal import (
+    ContinuationTraversal,
     CountedTraversal,
+    CursorTraversal,
+    InclusiveWindowTraversal,
     KeysetTraversal,
     SequentialTraversal,
     ShortPageTermination,
@@ -57,6 +60,7 @@ from b24api.references.dispatch_plan import kernel_dispatch
 from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem
 from b24api.references.stream import iter_references as _iter_references
 from b24api.traversal.driver import PaginationDriver
+from b24api.traversal.facade_support import _cursor_page_contract, declared_traversal_plan
 from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import (
     CountedOffsetMode,
@@ -169,8 +173,16 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
             traversal.selector,
             traversal.identity,
         )
+    if isinstance(traversal, ContinuationTraversal | InclusiveWindowTraversal):
+        declared, declared_selector, declared_identity, _page_cap = declared_traversal_plan(traversal)
+        return declared, declared_selector, declared_identity
+    return _cursor_kernel_plan(traversal)
+
+
+def _cursor_kernel_plan(traversal: CursorTraversal) -> tuple[ListPlan, ResultSelector, TraversalIdentity | None]:
     cursor_mechanics = traversal.cursor
     direction = _direction(cursor_mechanics.direction)
+    page_order, order_semantics = _cursor_page_contract(cursor_mechanics)
     identity = traversal.identity
     if identity is None:
         identity = IdentitySpec(
@@ -192,12 +204,21 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
             allow_create_controls=cursor_mechanics.allow_create_controls,
             domain=cursor_mechanics.domain,
             identity_requirement=IdentityRequirement.REQUIRED,
-            order_semantics=OrderSemantics.ASCENDING if direction == "asc" else OrderSemantics.DESCENDING,
+            order_semantics=order_semantics,
             duplicate_policy=DuplicatePolicy.ERROR,
+            page_order=page_order,
+            response_terminal=cursor_mechanics.continuation,
         ),
         traversal.selector,
         identity,
     )
+
+
+def _reference_page_cap(traversal: TraversalSpec) -> int:
+    """Return the decoded rows one reference request may hold; each dispatch reserves this many."""
+    if isinstance(traversal, InclusiveWindowTraversal):
+        return traversal.max_decoded_rows
+    return traversal.page_size
 
 
 class _ReferenceEventMapper:
@@ -264,6 +285,11 @@ def _reference_assurance(traversal: TraversalSpec) -> TraversalAssurance | None:
     if (
         isinstance(traversal, SequentialTraversal)
         and traversal.offset.short_page_termination is ShortPageTermination.DECLARED_TERMINAL
+    ):
+        return TraversalAssurance.MECHANICS_ONLY
+    # A response flag or a continuation rule likewise proves a declared stop rule, not an observed end.
+    if isinstance(traversal, ContinuationTraversal | InclusiveWindowTraversal) or (
+        isinstance(traversal, CursorTraversal) and traversal.cursor.continuation is not None
     ):
         return TraversalAssurance.MECHANICS_ONLY
     return None
@@ -350,7 +376,7 @@ def kernel_reference_stream[C](
         policy=policy,
         _emit_complete=True,
         _capture_fail_fast=not tolerant,
-        _page_cap_hint=traversal.page_size,
+        _page_cap_hint=_reference_page_cap(traversal),
         _page_adapter=traversal.page_adapter,
         _page_stop=page_stop,
     )

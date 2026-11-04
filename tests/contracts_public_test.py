@@ -61,6 +61,8 @@ def test_public_error_module_export_snapshot_is_static_contract_evidence() -> No
         "BatchFailed",
         "BudgetExceededError",
         "CapabilityError",
+        "ContinuationError",
+        "ContinuationReason",
         "EnvelopeContractError",
         "ErrorOrigin",
         "FailurePhase",
