@@ -121,7 +121,7 @@ from b24api.contracts.request import (
     TraversalIdentity,
 )
 from b24api.contracts.request_summary import RequestSummary, RouteKind
-from b24api.contracts.response import BinaryEvidence, BinaryResponse, Response, ResultCollectionShape
+from b24api.contracts.response import BinaryEvidence, BinaryResponse, FilenameStatus, Response, ResultCollectionShape
 from b24api.contracts.stream import OperationStream, PartialResult
 from b24api.contracts.traversal import (
     CountedTraversal,
@@ -185,6 +185,7 @@ __all__ = [
     "EmptyArray",
     "EmptyObject",
     "ExecutionPolicy",
+    "FilenameStatus",
     "FrozenJson",
     "FrozenMapping",
     "IdentityCoercion",

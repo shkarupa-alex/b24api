@@ -45,6 +45,7 @@ from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 from b24api.transport.base import WireRequest, WireTransport, preflight_transport
+from b24api.transport.disposition import disposition_filename
 from b24api.transport.protocol import ProtocolCodec
 
 if TYPE_CHECKING:
@@ -257,8 +258,11 @@ class Executor:
             raise
         content_type = wire.content_type
         digest = hashlib.sha256(wire.body).hexdigest() if context.policy.binary_digest else None
-        evidence = BinaryEvidence(wire.status_code, content_type, wire.byte_length, digest)
-        return BinaryResponse(wire.body, content_type=content_type, evidence=evidence)
+        filename, filename_status = disposition_filename(wire.headers)
+        evidence = BinaryEvidence(
+            wire.status_code, content_type, wire.byte_length, digest, filename_status=filename_status
+        )
+        return BinaryResponse(wire.body, content_type=content_type, evidence=evidence, filename=filename)
 
     async def _execute_wire_attempts(  # noqa: C901, PLR0913, PLR0915
         self,

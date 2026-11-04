@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, cast
@@ -21,6 +22,8 @@ _HTTP_STATUS_MINIMUM = 100
 _HTTP_STATUS_MAXIMUM = 599
 _MEDIA_TYPE_MAXIMUM = 127
 _MEDIA_TYPE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_FILENAME_MAXIMUM = 1024
+_FILENAME_FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cs"})
 
 
 def _safe_media_type(value: str | None) -> str | None:
@@ -31,6 +34,23 @@ def _safe_media_type(value: str | None) -> str | None:
         raise TypeError("content type must be a string or None")
     media_type = value.split(";", 1)[0].strip().casefold()
     return media_type if len(media_type) <= _MEDIA_TYPE_MAXIMUM and _MEDIA_TYPE.fullmatch(media_type) else None
+
+
+def _usable_filename(value: object) -> bool:
+    """Return whether a decoded filename is non-empty, bounded and free of control and surrogate code points."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= _FILENAME_MAXIMUM
+        and not any(unicodedata.category(char) in _FILENAME_FORBIDDEN_CATEGORIES for char in value)
+    )
+
+
+class FilenameStatus(StrEnum):
+    """Value-free outcome of reading a binary response's Content-Disposition filename."""
+
+    ABSENT = "absent"
+    PARSED = "parsed"
+    MALFORMED = "malformed"
 
 
 class ResultCollectionShape(StrEnum):
@@ -49,9 +69,12 @@ class BinaryEvidence:
     content_type: str | None
     byte_length: int
     sha256: str | None = None
+    filename_status: FilenameStatus = FilenameStatus.ABSENT
 
     def __post_init__(self) -> None:
         """Validate evidence fields."""
+        if not isinstance(self.filename_status, FilenameStatus):
+            raise TypeError("binary response filename status must be a FilenameStatus")
         if not _is_plain_int(self.status_code) or not _HTTP_STATUS_MINIMUM <= self.status_code <= _HTTP_STATUS_MAXIMUM:
             raise ValueError("binary response status must be between 100 and 599")
         if not _is_plain_int(self.byte_length) or self.byte_length < 0:
@@ -63,14 +86,31 @@ class BinaryEvidence:
 
 @dataclass(frozen=True, slots=True, init=False)
 class BinaryResponse:
-    """Explicit byte response with body-free diagnostics."""
+    """Explicit byte response with body-free diagnostics.
+
+    ``filename`` is decoded Content-Disposition metadata, not a path: it is never normalized, truncated or
+    reduced to a basename, and it stays out of the evidence, the representation and every diagnostic.
+    """
 
     content_type: str | None
     evidence: BinaryEvidence
     _body: bytes = field(repr=False)
+    filename: str | None = field(default=None, repr=False)
 
-    def __init__(self, body: bytes, *, content_type: str | None, evidence: BinaryEvidence) -> None:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        content_type: str | None,
+        evidence: BinaryEvidence,
+        filename: str | None = None,
+    ) -> None:
         """Copy and retain bounded response bytes."""
+        if evidence.filename_status is FilenameStatus.PARSED:
+            if not _usable_filename(filename):
+                raise ValueError("a parsed binary response filename must be a usable non-empty name")
+        elif filename is not None:
+            raise ValueError("only a parsed filename status carries a binary response filename")
         copied = bytes(body)
         if len(copied) != evidence.byte_length:
             raise ValueError("binary evidence length does not match body")
@@ -81,6 +121,7 @@ class BinaryResponse:
         object.__setattr__(self, "content_type", evidence.content_type)
         object.__setattr__(self, "evidence", evidence)
         object.__setattr__(self, "_body", copied)
+        object.__setattr__(self, "filename", filename)
 
     @property
     def body(self) -> bytes:
