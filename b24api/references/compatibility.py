@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from b24api.contracts.dispatch import DirectDispatch
 from b24api.contracts.keyset_execution import AutoKeysetExecution, SequentialKeysetExecution
+from b24api.contracts.request import RouteKind
 from b24api.contracts.traversal import CountedTraversal, KeysetTraversal
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
@@ -26,12 +27,17 @@ def source_incompatibility(
     traversal: TraversalSpec,
     dispatch: DispatchSpec,
     page_stop: PageStopPolicy | None,
+    *,
+    v3_batch: bool,
 ) -> CapabilityError | None:
-    """Return why one source cannot run under the operation's dispatch, or None when it can."""
-    if not isinstance(dispatch, DirectDispatch) and (
-        request.encoding is not BodyEncoding.JSON or request.headers.items
-    ):
-        return CapabilityError("physical batch supports JSON requests without scoped headers; use direct dispatch")
+    """Return why one source cannot run under the operation's dispatch, or None when it can.
+
+    ``v3_batch`` is the operation transport's declared support for native REST v3 batch envelopes.
+    """
+    if not isinstance(dispatch, DirectDispatch):
+        unbatchable = _batch_incompatibility(request, v3_batch=v3_batch)
+        if unbatchable is not None:
+            return unbatchable
     if isinstance(traversal, CountedTraversal) and isinstance(dispatch, DirectDispatch):
         return CapabilityError("counted reference traversal requires BatchDispatch")
     if isinstance(traversal, CountedTraversal) and page_stop is not None:
@@ -44,6 +50,15 @@ def source_incompatibility(
             return CapabilityError("page stop requires sequential keyset execution")
         if page_stop is None and isinstance(dispatch, DirectDispatch):
             return CapabilityError("fast keyset reference traversal requires BatchDispatch")
+    return None
+
+
+def _batch_incompatibility(request: Request, *, v3_batch: bool) -> CapabilityError | None:
+    """Return why one request cannot travel in a physical batch envelope, or None when it can."""
+    if request.encoding is not BodyEncoding.JSON or request.headers.items:
+        return CapabilityError("physical batch supports JSON requests without scoped headers; use direct dispatch")
+    if request.route is RouteKind.API_V3 and not v3_batch:
+        return CapabilityError("transport does not support native REST v3 batch envelopes; use direct dispatch")
     return None
 
 

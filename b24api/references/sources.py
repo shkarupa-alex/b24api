@@ -101,7 +101,13 @@ class SourceAdmission:
         return replace(reference, program=program)
 
     def _program(self, source: ReferenceSource[object]) -> SourceProgram:
-        incompatible = source_incompatibility(source.request, source.traversal, self._dispatch, source.page_stop)
+        incompatible = source_incompatibility(
+            source.request,
+            source.traversal,
+            self._dispatch,
+            source.page_stop,
+            v3_batch=self._executor.supports_v3_batch,
+        )
         if incompatible is not None:
             raise incompatible
         program = self._lower(source.traversal, source.page_stop)

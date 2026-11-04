@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -41,13 +42,16 @@ from b24api.contracts import (
     ReferenceSource,
     RequestHeaders,
 )
+from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError, CapabilityError, InputSourceError
+from b24api.transport import TransportCapabilities, WireResponse
 from tests.scripting import BatchPortal, Envelope, Query
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
 
     from b24api.contracts import OperationReport, OperationStream, ReferenceOutcome, TraversalSpec
+    from b24api.transport import WireRequest
 
 ID = IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER)
 CURSOR = CursorSpec(ParameterPath(("BEFORE",)), ("ID",), IdentityCoercion.EXACT_INTEGER, "descending", "last")
@@ -282,6 +286,71 @@ async def test_a28_matrix_the_homogeneous_facade_keeps_its_preflight_rejection()
                 dispatch=DirectDispatch(),
             )
     assert portal.queries == []
+
+
+@dataclass
+class _WirePortal(BatchPortal):
+    """A wire transport serving every route; ``json_array_body`` decides native v3 batch support."""
+
+    v3_batch: bool = False
+    v3_envelopes: int = 0
+
+    @property
+    def capabilities(self) -> TransportCapabilities:
+        return TransportCapabilities(routes=frozenset(RouteKind), json_array_body=self.v3_batch)
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        if request.array_body is not None:
+            self.v3_envelopes += 1
+            return WireResponse(200, (("content-type", "application/json"),), b'{"result":[{"error":"scripted"}]}')
+        canonical = Request(request.method, request.copy_parameters(), request.replay_safety, route=request.route)
+        return await self.send(canonical, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
+
+
+def _v3_beta(parent: int) -> ReferenceSource[int]:
+    return ReferenceSource(Request.v3("beta.list", {}, ReplaySafety.SAFE), BETA, _binding(parent))
+
+
+@pytest.mark.asyncio
+async def test_a28_matrix_a_v3_source_without_native_batch_support_is_not_executed() -> None:
+    """S4/S6: a v3 source on a transport without JSON-array bodies is rejected before any reservation."""
+    portal = _WirePortal(_answer)
+    async with _client(portal) as api:
+        events, report = await _collect(api, [_v3_beta(5), _beta(9)], dispatch=BatchDispatch())
+
+    not_executed = [event for event in events if isinstance(event, ReferenceNotExecuted)]
+    assert [(event.binding_index, event.correlation, event.reason) for event in not_executed] == [
+        (0, 5, NotExecutedReason.LOCAL_VALIDATION_FAILED)
+    ]
+    assert not any(isinstance(event, ReferenceFailure) for event in events)
+    assert _rows(events, 1) == [4]
+    assert portal.v3_envelopes == 0
+    assert all(query["PARENT"] != "5" for query in portal.queries)
+    assert report.not_executed == 1
+    assert report.failures == 0
+
+
+@pytest.mark.asyncio
+async def test_a28_matrix_the_homogeneous_facade_rejects_v3_without_native_batch_support() -> None:
+    portal = _WirePortal(_answer)
+    async with _client(portal) as api:
+        with pytest.raises(CapabilityError, match="native REST v3 batch"):
+            api.iter_references(
+                Request.v3("beta.list", {}, ReplaySafety.SAFE), [_binding(5)], traversal=BETA, dispatch=BatchDispatch()
+            )
+    assert portal.queries == []
+    assert portal.v3_envelopes == 0
+
+
+@pytest.mark.asyncio
+async def test_a28_matrix_a_v3_source_with_native_batch_support_is_admitted() -> None:
+    portal = _WirePortal(_answer, v3_batch=True)
+    async with _client(portal) as api:
+        events, _report = await _collect(api, [_v3_beta(5), _beta(9)], dispatch=BatchDispatch())
+
+    assert not any(isinstance(event, ReferenceNotExecuted) for event in events)
+    assert portal.v3_envelopes >= 1
+    assert _rows(events, 1) == [4]
 
 
 @pytest.mark.asyncio

@@ -412,7 +412,7 @@ def kernel_reference_stream[C](
 
     if not isinstance(executor, Executor):
         raise TypeError("executor must be an Executor")
-    incompatible = source_incompatibility(base, traversal, dispatch, page_stop)
+    incompatible = source_incompatibility(base, traversal, dispatch, page_stop, v3_batch=executor.supports_v3_batch)
     if incompatible is not None:
         raise incompatible
     plan, selector, identity = _kernel_plan(traversal)
