@@ -67,6 +67,40 @@ async def send_transport(  # noqa: PLR0913 - keeps legacy and wire boundaries ex
     return wire
 
 
+async def send_wire_envelope(
+    wire_transport: WireTransport,
+    wire_request: WireRequest,
+    *,
+    attempt_timeout: float,
+    max_response_bytes: int,
+) -> WireResponse:
+    """Call ``send_wire`` once for a request with no canonical ``Request`` form, such as a v3 batch envelope.
+
+    Failures escaping the transport are classified exactly as in :func:`send_transport`.
+    """
+    capabilities = wire_transport.capabilities
+    if not isinstance(capabilities, TransportCapabilities):
+        raise CapabilityError("transport exposes malformed capabilities")
+    try:
+        wire = await wire_transport.send_wire(
+            wire_request,
+            attempt_timeout=attempt_timeout,
+            max_response_bytes=max_response_bytes,
+        )
+    except (B24ApiError, TimeoutError):
+        raise
+    except Exception as error:
+        raise TransportError(
+            _UNCLASSIFIED_TRANSPORT_FAILURE,
+            phase=FailurePhase.DISPATCH_STARTED,
+            request_summary=wire_request.summary,
+            retryable=False,
+        ) from error
+    if len(wire.body) > max_response_bytes:
+        raise ResponseTooLargeError(_RESPONSE_CEILING_EXCEEDED, request_summary=wire_request.summary)
+    return wire
+
+
 def enforce_response_ceiling(wire: WireResponse, request: Request, *, max_response_bytes: int) -> None:
     """Reject a returned body over the policy ceiling before it reaches a decoder.
 
@@ -77,4 +111,4 @@ def enforce_response_ceiling(wire: WireResponse, request: Request, *, max_respon
         raise ResponseTooLargeError(_RESPONSE_CEILING_EXCEEDED, request_summary=request.summary)
 
 
-__all__ = ["enforce_response_ceiling", "send_transport"]
+__all__ = ["enforce_response_ceiling", "send_transport", "send_wire_envelope"]

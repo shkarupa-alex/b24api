@@ -543,6 +543,8 @@ class CompletionGate:
                 if source.keyset_execution is not None
                 else facts.keyset_selection
             ),
+            ambiguous_physical_attempts=source.ambiguous_physical_attempts,
+            batch_isolation_requests=source.batch_isolation_requests,
         )
         self._published = report
         return report

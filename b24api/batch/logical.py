@@ -1,13 +1,14 @@
 """Canonical arbitrary-length logical batch over bounded physical Bitrix batches."""
 
-# ruff: noqa: SLF001, PLR0912 - bounded orchestration state machine
+# ruff: noqa: PLR0912 - bounded orchestration state machine
 
 from __future__ import annotations
 from collections.abc import AsyncGenerator, AsyncIterable, Iterable
 from typing import TYPE_CHECKING, Self, cast
 
 from b24api._sources import OwnedSource
-from b24api.batch.engine import BatchExecutor, _BatchInput, _BatchItem, _BatchNotExecutedError
+from b24api.batch.correlation import _BatchNotExecutedError
+from b24api.batch.engine import BatchExecutor, _BatchInput, _BatchItem
 from b24api.batch.outcome import BatchFailure as KernelFailure
 from b24api.batch.outcome import BatchSuccess as KernelSuccess
 from b24api.batch.stream import _next_chunk
@@ -29,6 +30,7 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     SnapshotState,
 )
+from b24api.contracts.request_summary import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
     B24ApiError,
@@ -129,8 +131,15 @@ def _public_outcomes(
                 ),
             )
             continue
-        # A malformed 2xx envelope may follow execution, so it is never reported as halted.
-        if halt and halted and isinstance(error, ProtocolError) and not isinstance(error, EnvelopeContractError):
+        # A malformed 2xx envelope may follow execution, so it is never reported as halted; a classic halt
+        # stops the envelope, while a complete v3 array proves every one of its commands ran.
+        if (
+            halt
+            and halted
+            and outcome.request.route is RouteKind.BARE
+            and isinstance(error, ProtocolError)
+            and not isinstance(error, EnvelopeContractError)
+        ):
             converted.append(
                 CommandNotExecuted(
                     outcome.command_index,
@@ -303,10 +312,10 @@ class LogicalBatchKernelStream[C]:
                 raise InputSourceError("Logical batch input source failed") from chunk.source_error
             for command in chunk.commands:
                 self._completion.binding(command.index).scheduled()
-            if self._batch_executor._will_dispatch_commands(chunk.commands, halt=self._fail_fast):
+            if self._batch_executor.will_dispatch_commands(chunk.commands, halt=self._fail_fast):
                 self._batch_requests += 1
             self._batch_commands += len(chunk.commands)
-            kernel = await self._batch_executor._execute_chunk(
+            kernel = await self._batch_executor.execute_chunk(
                 chunk.commands,
                 context=self._context,
                 halt=self._fail_fast,
@@ -370,6 +379,8 @@ class LogicalBatchKernelStream[C]:
             retries=snapshot.retries,
             cooldown_seconds=snapshot.cooldown_seconds,
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
+            ambiguous_physical_attempts=snapshot.ambiguous_physical_attempts,
+            batch_isolation_requests=snapshot.batch_isolation_requests,
             terminal_reason=reason,
         )
         self._completion.stream_terminal(
