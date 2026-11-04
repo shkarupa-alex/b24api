@@ -507,6 +507,97 @@ async def test_a21_mixed_bare_and_v3_never_share_an_envelope() -> None:
     transport.assert_exhausted()
 
 
+def _classic_at(index: int, request: Request, result: object) -> ScriptedExchange:
+    """Return a one-command classic batch fixture for the command at ``index`` of its chunk."""
+    exchange = ScriptedExchange.batch((request,), (result,), total=1)
+    key = f"c{index:012d}"
+    parameters = exchange.request.copy_parameters()
+    commands = parameters["cmd"]
+    assert isinstance(commands, dict)
+    parameters["cmd"] = {key: next(iter(commands.values()))}
+    payload = json.loads(exchange.response.body)
+    envelope = payload["result"]
+    envelope["result"] = {key: result}
+    envelope["result_total"] = {key: 1}
+    return ScriptedExchange.json(Request("batch", parameters, SAFE, route=RouteKind.BARE), payload)
+
+
+@pytest.mark.asyncio
+async def test_a21_mixed_interleaved_dialects_are_sent_as_contiguous_runs_in_input_order() -> None:
+    """A21-MIXED: BARE, API_V3, BARE goes out as three envelopes in input order, never BARE+BARE first."""
+    first = Request("x.item.get", {"id": 1}, SAFE, route=RouteKind.BARE)
+    update = _v3(2, method="x.item.update", safety=UNSAFE)
+    last = Request("x.item.get", {"id": 3}, SAFE, route=RouteKind.BARE)
+    transport = ScriptedTransport(
+        (
+            ScriptedExchange.batch((first,), (_item(1),), total=1),
+            ScriptedExchange.v3_batch((update,), (_item(2),)),
+            _classic_at(2, last, _item(3)),
+        ),
+    )
+
+    outcomes, report = await _run(transport, [first, update, last])
+
+    assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+    assert [outcome.index for outcome in outcomes] == [0, 1, 2]
+    assert [call.v3_wire is not None for call in transport.wire_calls] == [False, True, False]
+    assert report.physical_requests == THREE
+    transport.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_a21_mixed_v3_runs_split_by_a_classic_command_stay_two_envelopes() -> None:
+    """A21-MIXED: SAFE v3, BARE, SAFE v3 sends two v3 envelopes around the classic one, in input order."""
+    head = _v3(1)
+    bare = Request("x.item.get", {"id": 2}, SAFE, route=RouteKind.BARE)
+    tail = _v3(3)
+    transport = ScriptedTransport(
+        (
+            ScriptedExchange.v3_batch((head,), (_item(1),)),
+            _classic_at(1, bare, _item(2)),
+            ScriptedExchange.v3_batch((tail,), (_item(3),)),
+        ),
+    )
+
+    outcomes, report = await _run(transport, [head, bare, tail])
+
+    assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+    assert [call.v3_wire for call in transport.wire_calls] == [_wire(head), None, _wire(tail)]
+    assert report.physical_requests == THREE
+    transport.assert_exhausted()
+
+
+def _fail_fast(exchange: ScriptedExchange) -> ScriptedExchange:
+    """Return a classic batch fixture as a fail-fast chunk sends it (``halt=1``)."""
+    parameters = {**exchange.request.copy_parameters(), "halt": 1}
+    return ScriptedExchange(Request("batch", parameters, SAFE, route=RouteKind.BARE), exchange.response)
+
+
+@pytest.mark.asyncio
+async def test_a21_halt_a_classic_command_after_a_failed_v3_command_is_never_sent() -> None:
+    """A21-HALT: fail-fast BARE, API_V3, BARE halts the classic tail once the earlier v3 command fails."""
+    first = Request("x.item.get", {"id": 1}, SAFE, route=RouteKind.BARE)
+    update = _v3(2, method="x.item.update", safety=UNSAFE)
+    last = Request("x.item.get", {"id": 3}, SAFE, route=RouteKind.BARE)
+    transport = ScriptedTransport(
+        (
+            _fail_fast(ScriptedExchange.batch((first,), (_item(1),), total=1)),
+            ScriptedExchange.v3_batch((update,), payload=_abort("SYNTHETIC_VALIDATION"), status=400),
+        ),
+    )
+    async with client_for(transport, policy=_policy()) as api:
+        stream = api.batch([Command(request, index) for index, request in enumerate((first, update, last))])
+        delivered, failure = await _drain(stream)
+
+    assert [outcome.index for outcome in delivered] == [0]
+    assert failure is not None
+    assert [type(outcome) for outcome in failure.outcomes] == [CommandOutcomeUnknown, CommandNotExecuted]
+    assert isinstance(failure.outcomes[1], CommandNotExecuted)
+    assert failure.outcomes[1].reason is NotExecutedReason.HALTED
+    assert [call.v3_wire is not None for call in transport.wire_calls] == [False, True]
+    transport.assert_exhausted()
+
+
 # A21-PRESPONSE ---------------------------------------------------------------------------------------------
 
 

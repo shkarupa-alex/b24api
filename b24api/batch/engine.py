@@ -594,24 +594,28 @@ def _v3_representable(request: Request) -> bool:
 
 
 def _envelope_groups(eligible: tuple[_Command, ...]) -> tuple[tuple[_Command, ...], ...]:
-    """Split admitted commands into envelopes, ordered by their first command.
+    """Split admitted commands into contiguous envelopes that keep their input order.
 
-    Classic commands share one envelope as before. Native v3 commands form contiguous runs of one safety
-    class: a SAFE run never carries an UNSAFE or UNKNOWN command, and UNSAFE and UNKNOWN travel together.
+    A run of classic commands shares one envelope as before; a native v3 run carries one safety class:
+    a SAFE run never carries an UNSAFE or UNKNOWN command, and UNSAFE and UNKNOWN travel together. A
+    change of dialect or v3 safety class closes the run, so no command is sent before an earlier one.
     """
     groups: list[tuple[_Command, ...]] = []
-    bare = tuple(command for command in eligible if command.request.route is RouteKind.BARE)
-    if bare:
-        groups.append(bare)
     run: list[_Command] = []
-    for command in (item for item in eligible if item.request.route is RouteKind.API_V3):
-        if run and _is_safe(run[-1]) != _is_safe(command):
+    for command in eligible:
+        if run and _envelope_kind(run[-1]) != _envelope_kind(command):
             groups.append(tuple(run))
             run = []
         run.append(command)
     if run:
         groups.append(tuple(run))
-    return tuple(sorted(groups, key=lambda group: group[0].index))
+    return tuple(groups)
+
+
+def _envelope_kind(command: _Command) -> tuple[RouteKind, bool]:
+    """Return what an envelope must share: the dialect and, for native v3, the safety class."""
+    route = command.request.route
+    return route, route is RouteKind.API_V3 and _is_safe(command)
 
 
 def _is_safe(command: _Command) -> bool:

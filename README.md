@@ -177,10 +177,11 @@ async with client.batch_outcomes(commands) as stream:
 
 Commands whose request uses `RouteKind.API_V3` travel in native REST 3.0 batch envelopes: one JSON
 array of at most 50 commands, never mixed with classic commands and grouped into contiguous runs of
-one replay safety (`UNSAFE` and `UNKNOWN` share a run). The transport must advertise JSON-array
-bodies, as `HttpxTransport` does; otherwise such a command fails with `CapabilityError` before any
-request. Each array element is checked against its own request's embedded-error contract, so one
-failed command neither fails nor resends its successful neighbours.
+one replay safety (`UNSAFE` and `UNKNOWN` share a run). Envelopes go out in input order: a classic
+command between two v3 commands travels in its own envelope between theirs. The transport must
+advertise JSON-array bodies, as `HttpxTransport` does; otherwise such a command fails with
+`CapabilityError` before any request. Each array element is checked against its own request's
+embedded-error contract, so one failed command neither fails nor resends its successful neighbours.
 
 <!-- tested: tests/v3_batch_test.py::test_a21_wire_four_safe_v3_reads_travel_in_one_envelope_in_input_order -->
 ```python
