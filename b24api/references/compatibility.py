@@ -62,4 +62,20 @@ def _batch_incompatibility(request: Request, *, v3_batch: bool) -> CapabilityErr
     return None
 
 
-__all__ = ["source_incompatibility"]
+def source_route_incompatibility(request: Request, dispatch: DispatchSpec) -> CapabilityError | None:
+    """Return why a heterogeneous source's request no batch envelope can carry, or None when one can.
+
+    Physical batch carries only the classic route and native REST v3, without positional slots. A
+    heterogeneous source refused here is a correlated local non-execution before any reservation. The
+    homogeneous facades keep the 2.5.2 contract instead: such a template fails each binding at dispatch.
+    """
+    if isinstance(dispatch, DirectDispatch):
+        return None
+    if request.route not in {RouteKind.BARE, RouteKind.API_V3} or request.positional is not None:
+        return CapabilityError(
+            "physical batch carries classic and REST v3 requests without positional slots; use direct dispatch"
+        )
+    return None
+
+
+__all__ = ["source_incompatibility", "source_route_incompatibility"]

@@ -21,7 +21,7 @@ from b24api.references.binding import (
     _BindingSourceError,
     _local_validation_failure,
 )
-from b24api.references.compatibility import source_incompatibility
+from b24api.references.compatibility import source_incompatibility, source_route_incompatibility
 from b24api.references.dispatch_plan import kernel_dispatch
 from b24api.references.facade import (
     ReferenceKernelStream,
@@ -107,7 +107,7 @@ class SourceAdmission:
             self._dispatch,
             source.page_stop,
             v3_batch=self._executor.supports_v3_batch,
-        )
+        ) or source_route_incompatibility(source.request, self._dispatch)
         if incompatible is not None:
             raise incompatible
         program = self._lower(source.traversal, source.page_stop)

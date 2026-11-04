@@ -43,7 +43,7 @@ from b24api.contracts import (
     RequestHeaders,
 )
 from b24api.contracts.request import RouteKind
-from b24api.errors import BudgetExceededError, CapabilityError, InputSourceError
+from b24api.errors import BudgetExceededError, CapabilityError, InputSourceError, ReferenceFailed
 from b24api.transport import TransportCapabilities, WireResponse
 from tests.scripting import BatchPortal, Envelope, Query
 
@@ -351,6 +351,40 @@ async def test_a28_matrix_a_v3_source_with_native_batch_support_is_admitted() ->
     assert not any(isinstance(event, ReferenceNotExecuted) for event in events)
     assert portal.v3_envelopes >= 1
     assert _rows(events, 1) == [4]
+
+
+@pytest.mark.asyncio
+async def test_a28_matrix_a_json_route_source_under_batch_is_not_executed() -> None:
+    """S6: a source whose request no batch envelope carries is a local non-execution before reservation."""
+    portal = _WirePortal(_answer)
+    request = Request("beta.list", {}, ReplaySafety.SAFE, route=RouteKind.JSON)
+    async with _client(portal) as api:
+        events, report = await _collect(api, [ReferenceSource(request, BETA, _binding(5)), _beta(9)])
+
+    not_executed = [event for event in events if isinstance(event, ReferenceNotExecuted)]
+    assert [(event.binding_index, event.correlation, event.reason) for event in not_executed] == [
+        (0, 5, NotExecutedReason.LOCAL_VALIDATION_FAILED)
+    ]
+    assert not any(isinstance(event, ReferenceFailure) for event in events)
+    assert _rows(events, 1) == [4]
+    assert all(query["PARENT"] != "5" for query in portal.queries)
+    assert all(record.reference_index != 0 for record in report.page_trace)
+    assert report.not_executed == 1
+    assert report.failures == 0
+
+
+@pytest.mark.asyncio
+async def test_a28_matrix_fail_fast_rejects_a_json_route_source_before_any_request() -> None:
+    portal = _WirePortal(_answer)
+    request = Request("beta.list", {}, ReplaySafety.SAFE, route=RouteKind.JSON)
+    async with _client(portal) as api:
+        stream = api.iter_reference_sources([ReferenceSource(request, BETA, _binding(5)), _beta(9)])
+        with pytest.raises(ReferenceFailed) as raised:
+            async with stream:
+                _ = [event async for event in stream]
+    assert raised.value.report is not None
+    assert raised.value.report.terminal_reason == "CapabilityError"
+    assert portal.queries == []
 
 
 @pytest.mark.asyncio
