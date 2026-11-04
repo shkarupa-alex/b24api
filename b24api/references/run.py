@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     import asyncio
 
     from b24api.completion.reference_recorder import ReferenceBindingRecorder
-    from b24api.references.dispatch import _Event, _Reservation, _Work
+    from b24api.references.dispatch import _Event, _FailureEvent, _Reservation, _Work
     from b24api.references.program import SourceProgram
     from b24api.traversal import PaginationDriver
 
@@ -33,6 +33,8 @@ class _ReferenceRun:
     page_admission: asyncio.Future[None] | None = None
     settlement: asyncio.Future[None] | None = None
     tail_active: bool = False
+    # A fast keyset binding prepares its own terminal failure before re-raising into the scheduler.
+    failure: _FailureEvent | None = None
 
     def admit_page(self) -> None:
         """Release the dispatcher's admission slot once the page is in the row buffer."""

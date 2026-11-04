@@ -27,13 +27,14 @@ from b24api.traversal.keyset_transaction_contract import KeysetTransactionState
 from b24api.traversal.keyset_transactions import execute_body_wave, execute_finish_page, execute_wave
 
 if TYPE_CHECKING:
-    from b24api.batch.engine import BatchExecutor
+    from b24api.completion.fast_recorder import FastPageLedger
     from b24api.contracts.json import FrozenJson
     from b24api.contracts.page import PageAdapter
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
     from b24api.contracts.response import Response, ResultCollectionShape
     from b24api.contracts.traversal import KeysetSpec
-    from b24api.execution import ExecutionContext, Executor
+    from b24api.execution import Executor
+    from b24api.traversal.keyset_context import KeysetContext, WaveEngine
     from b24api.traversal.keyset_observation import FastTraceRecorder
 
 
@@ -52,10 +53,11 @@ class KeysetRuntime:
         page_size: int,
         effective_page_cap: int,
         execution: RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
-        context: ExecutionContext,
-        engine: BatchExecutor,
+        context: KeysetContext,
+        engine: WaveEngine,
         trace: FastTraceRecorder,
         page_adapter: PageAdapter,
+        completion_recorder: FastPageLedger | None = None,
     ) -> None:
         """Initialize isolated planning, admission, and reporting state."""
         self.executor = executor
@@ -66,7 +68,8 @@ class KeysetRuntime:
         self.page_size, self.effective_page_cap = page_size, effective_page_cap
         self.execution, self.context, self.engine, self.trace = execution, context, engine, trace
         self.page_adapter = page_adapter
-        self.completion_recorder = FastCompletionRecorder()
+        # A flat traversal owns its gate; a reference binding records into the shared operation gate.
+        self.completion_recorder: FastPageLedger = completion_recorder or FastCompletionRecorder()
         self.completion = execution.contract.page_completion
         requested_batch = getattr(execution, "batch_size", None) or PORTAL_BATCH_CAP
         self.batch_capacity = min(

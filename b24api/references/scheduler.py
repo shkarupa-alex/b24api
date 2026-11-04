@@ -42,12 +42,13 @@ from b24api.references.dispatch import (
     _RowBuffer,
     _Work,
 )
+from b24api.references.keyset_run import run_fast_keyset
 from b24api.references.outcome import (
     KernelReferenceFailure,
     KernelReferenceItem,
     ReferenceRequest,
 )
-from b24api.references.program import SourceProgram
+from b24api.references.program import FastKeysetProgram, SourceProgram
 from b24api.references.run import _ReferenceRun
 from b24api.references.support import (
     _active_limit,
@@ -77,7 +78,9 @@ if TYPE_CHECKING:
 
     from b24api._sources import OwnedSource
     from b24api.contracts.policy import ExecutionPolicy
+    from b24api.contracts.report import KeysetSelectionSummary
     from b24api.contracts.response import Response
+    from b24api.references.dispatch import _Reservation
     from b24api.traversal.identity import _Page
 
 type _PageDispatcher = _DirectPageDispatcher | _BatchPageDispatcher
@@ -105,6 +108,8 @@ class ReferenceScheduler:
         page_cap_hint: int | None = None,
         page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
         page_stop: PageStopPolicy | None = None,
+        fast: FastKeysetProgram | None = None,
+        keyset_selection: KeysetSelectionSummary | None = None,
     ) -> None:
         """Initialize instance state."""
         self.executor = executor
@@ -137,6 +142,8 @@ class ReferenceScheduler:
                 page_stop=page_stop,
                 whole_result=whole_result,
                 counted_page_size=page_cap_hint if counted and not whole_result else None,
+                fast=fast,
+                keyset_selection=keyset_selection,
             )
         self.page_cap = 1 if self.default_program is None else self.default_program.page_cap
         self.active_limit = (
@@ -175,6 +182,12 @@ class ReferenceScheduler:
         self._source_controller: AsyncIteratorController[ReferenceRequest] | None = None
         self.active_references_high_water = 0
         self._next_page_sequence = 0
+        # Lease decisions read the admitted set, source exhaustion and the fast bindings holding or
+        # awaiting a lease; a change of either wakes lease waiters only while one is waiting.
+        self._admission: _AdmissionState | None = None
+        self._source_exhausted = False
+        self._fast_active: set[int] = set()
+        self._fast_waiting = 0
 
     async def outcomes(self, source: OwnedSource[ReferenceRequest]) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912
         """Yield correlated operation outcomes."""
@@ -198,6 +211,7 @@ class ReferenceScheduler:
             slots=asyncio.Semaphore(self.active_limit),
             changed=asyncio.Event(),
         )
+        self._admission = admission
         producer = asyncio.create_task(self._produce(iterator, admission))
         primary_error: BaseException | None = None
         pending_cancellation: asyncio.CancelledError | None = None
@@ -302,6 +316,8 @@ class ReferenceScheduler:
                     self.producer_state.next_index = None
                     self.producer_state.touch()
                     admission.slots.release()
+                    self._source_exhausted = True
+                    await self._wake_lease_waiters()
                     return
                 except BaseException:
                     self.producer_state.source_pull_in_flight = False
@@ -361,7 +377,31 @@ class ReferenceScheduler:
         self.producer_state.caps[run.producer_key] = program.page_cap
         self.producer_state.touch()
         await asyncio.sleep(0)
-        driver = run.driver = PaginationDriver(
+        pages = None if program.fast is not None else self._driven_pages(run)
+        try:
+            if program.fast is not None:
+                await run_fast_keyset(self, run, program.fast)
+            elif pages is not None:
+                await self._drive(run, pages)
+        except asyncio.CancelledError:
+            raise
+        except _BatchPageError as error:
+            failure = self._failure_event(run, cast("BaseException", error.failure.error))
+            await output.put(replace(failure, replay_disposition=error.failure.replay_disposition))
+        except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
+            await output.put(self._failure_event(run, error))
+        finally:
+            if pages is not None:
+                await pages.aclose()
+            self._retire_producer(run)
+            self._fast_active.discard(work.index)
+            if run.reservation is not None:
+                await self.buffer.abort(run.reservation)
+
+    def _driven_pages(self, run: _ReferenceRun) -> AsyncGenerator[_Page]:
+        """Build the binding's pagination driver and return its page stream."""
+        program, work = run.program, run.work
+        run.driver = PaginationDriver(
             self.executor,
             work.reference.request,
             program.plan,
@@ -375,45 +415,104 @@ class ReferenceScheduler:
             initial_cursor=work.reference.initial_cursor,
             completion_recorder=run.completion,
         )
-        pages = self._pages(run)
+        return self._pages(run)
+
+    async def _drive(self, run: _ReferenceRun, pages: AsyncGenerator[_Page]) -> None:
+        """Deliver the driver's pages, then the binding's terminal event."""
+        driver, program = run.driver, run.program
+        async for page in pages:
+            if not await self._deliver_page(run, page):
+                break
+        if run.reservation is not None:
+            await self.buffer.abort(run.reservation)
+            run.reservation = None
+        await run.output.put(
+            _DoneEvent(
+                run.work,
+                run.partial_rows,
+                tuple(driver.violations[run.violation_offset :]),
+                self._pending_page_records(run),
+                run.stopped_reason,
+                driver.terminal_reason,
+                driver.expected_total,
+                _declared_short_page_width(program.plan, driver.terminal_reason),
+                keyset_selection=program.keyset_selection,
+            ),
+        )
+
+    def _retire_producer(self, run: _ReferenceRun) -> None:
+        """Release the run's dispatcher waits and remove it from the advisory producer state."""
+        run.admit_page()
+        run.settle_page()
+        self.producer_state.runnable.discard(run.producer_key)
+        self.producer_state.admitting.discard(run.producer_key)
+        self.producer_state.pending_continuations.discard(run.producer_key)
+        self.producer_state.indexes.pop(run.producer_key, None)
+        self.producer_state.caps.pop(run.producer_key, None)
+        self.producer_state.touch()
+
+    @property
+    def batch_dispatcher(self) -> _BatchPageDispatcher:
+        """Return the shared batch dispatcher fast keyset waves travel through."""
+        if not isinstance(self.dispatcher, _BatchPageDispatcher):
+            raise CapabilityError("fast keyset reference traversal requires BatchDispatch")
+        return self.dispatcher
+
+    @property
+    def wave_command_cap(self) -> int:
+        """Return the shared physical batch size: one fast wave fits one shared batch."""
+        if not isinstance(self.dispatch, KernelBatchDispatch):
+            raise CapabilityError("fast keyset reference traversal requires BatchDispatch")
+        return self.dispatch.batch_size
+
+    async def lease_rows(self, run: _ReferenceRun, fast: FastKeysetProgram) -> _Reservation:
+        """Wait for the binding's fixed row lease ``G``; it is held until the binding's terminal."""
+        index = run.work.index
+        self._fast_active.add(index)
+        self._fast_waiting += 1
         try:
-            async for page in pages:
-                if not await self._deliver_page(run, page):
-                    break
-            if run.reservation is not None:
-                await self.buffer.abort(run.reservation)
-                run.reservation = None
-            await output.put(
-                _DoneEvent(
-                    work,
-                    run.partial_rows,
-                    tuple(driver.violations[run.violation_offset :]),
-                    self._pending_page_records(run),
-                    run.stopped_reason,
-                    driver.terminal_reason,
-                    driver.expected_total,
-                    _declared_short_page_width(program.plan, driver.terminal_reason),
-                ),
-            )
-        except asyncio.CancelledError:
-            raise
-        except _BatchPageError as error:
-            failure = self._failure_event(run, cast("BaseException", error.failure.error))
-            await output.put(replace(failure, replay_disposition=error.failure.replay_disposition))
-        except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
-            await output.put(self._failure_event(run, error))
+            return await self.buffer.lease(index, functools.partial(self._lease_grant, fast, index))
         finally:
-            await pages.aclose()
-            run.admit_page()
-            run.settle_page()
-            self.producer_state.runnable.discard(run.producer_key)
-            self.producer_state.admitting.discard(run.producer_key)
-            self.producer_state.pending_continuations.discard(run.producer_key)
-            self.producer_state.indexes.pop(run.producer_key, None)
-            self.producer_state.caps.pop(run.producer_key, None)
-            self.producer_state.touch()
-            if run.reservation is not None:
-                await self.buffer.abort(run.reservation)
+            self._fast_waiting -= 1
+
+    def _lease_grant(self, fast: FastKeysetProgram, index: int, free: int) -> int | None:
+        """Size one fast lease from the free rows (S3 allocation), or return None to wait.
+
+        P = 3C+A is the floor a bounded plan needs and Q = 4C+A the comfortable quota. A binding
+        keeps the existing frontier reserve R free while any other source is active or unread, and
+        takes at most an even share of the pool among the fast sources that are active or may still
+        arrive. AUTO below the floor runs exclusively on the whole pool, like a flat traversal. The
+        INPUT frontier never waits on rows that only its own progress could release: it takes what
+        is free, or fails finitely.
+        """
+        pool = self.buffer.maximum
+        frontier = self.output_order is ReferenceOutputOrder.INPUT and index == self.buffer.head_index
+        stranded = frontier and not self.buffer.releasable_elsewhere(index)
+        if fast.automatic and pool < fast.floor:
+            if free == pool:
+                return pool
+            if stranded:
+                if free >= 2 * fast.effective_page_cap:
+                    return free
+                raise BudgetExceededError("fast keyset lease cannot fit the boundary wave at the INPUT frontier")
+            return None
+        admission = self._admission
+        others = admission is not None and len(admission.tasks) > 1
+        keep = 0 if frontier or not (others or not self._source_exhausted) else self.buffer.head_reserve
+        sources = len(self._fast_active) + (0 if self._source_exhausted else 1)
+        cap = max(fast.floor, (pool - keep) // sources)
+        available = free - keep
+        if available >= min(fast.quota, cap):
+            return min(available, cap)
+        if stranded:
+            if free >= fast.floor:
+                return min(free, cap)
+            raise BudgetExceededError("fast keyset lease cannot fit its plan at the INPUT frontier")
+        return None
+
+    async def _wake_lease_waiters(self) -> None:
+        if self._fast_waiting:
+            await self.buffer.poke()
 
     def _pages(self, run: _ReferenceRun) -> AsyncGenerator[_Page]:
         """Run a counted program's head and dense tail on the shared queue, any other on its driver."""
@@ -558,6 +657,8 @@ class ReferenceScheduler:
 
     def _failure_event(self, run: _ReferenceRun, error: BaseException) -> _FailureEvent:
         """Build the terminal failure event with the partial progress the reference reached."""
+        if run.failure is not None:
+            return run.failure  # a fast keyset binding prepared its own evidence before re-raising
         return _FailureEvent(
             run.work,
             error,
@@ -604,6 +705,7 @@ class ReferenceScheduler:
             admission.queues.pop(event.work.index, None)
             self._caps.pop(event.work.index, None)
             admission.slots.release()
+            await self._wake_lease_waiters()
         await producer
 
     async def _input(
@@ -626,6 +728,7 @@ class ReferenceScheduler:
             admission.queues.pop(head, None)
             self._caps.pop(head, None)
             admission.slots.release()
+            await self._wake_lease_waiters()
             next_head = min(admission.tasks) if admission.tasks else head + 1
             await self.buffer.advance_head(next_head, self._head_cap(next_head))
         await producer
@@ -652,33 +755,48 @@ class ReferenceScheduler:
             for record in records
         )
 
+    async def _consume_page(self, event: _PageEvent) -> AsyncGenerator[ReferenceStreamItem]:
+        """Yield one page's rows; acknowledge the page however the consumer leaves it."""
+        try:
+            reservation = event.reservation
+            if event.emitted is None and reservation is None:
+                raise RuntimeError("reference page lacks its row reservation")
+            if self.emit_response and reservation is not None:
+                if event.response is None:
+                    raise RuntimeError("fan-out page lacks its response")
+                yield _KernelFanOutSuccess(event.work.reference, event.response)
+                for weight in event.item_weights:
+                    await self.buffer.release(reservation, weight)
+                self.completion.binding(event.work.index).delivered()
+                return
+            for item, weight, is_unique in zip(
+                event.items,
+                event.item_weights,
+                event.unique_mask,
+                strict=True,
+            ):
+                outcome = KernelReferenceItem._from_frozen(  # noqa: SLF001 - trusted frozen traversal row
+                    event.work.reference.reference_key,
+                    item,
+                    event.work.reference.correlation,
+                )
+                self._delivery_uniqueness[id(outcome)] = (outcome, is_unique)
+                yield outcome
+                if event.emitted is not None:
+                    # A fast keyset row stays charged to its binding's lease; its runtime acknowledges pages.
+                    event.emitted(weight)
+                elif reservation is not None:
+                    await self.buffer.release(reservation, weight)
+            if event.emitted is None:
+                self.completion.binding(event.work.index).delivered()
+        finally:
+            if not event.acknowledged.done():
+                event.acknowledged.set_result(None)
+
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
         if isinstance(event, _PageEvent):
-            try:
-                if self.emit_response:
-                    yield _KernelFanOutSuccess(event.work.reference, event.response)
-                    for weight in event.item_weights:
-                        await self.buffer.release(event.reservation, weight)
-                    self.completion.binding(event.work.index).delivered()
-                    return
-                for item, weight, is_unique in zip(
-                    event.items,
-                    event.item_weights,
-                    event.unique_mask,
-                    strict=True,
-                ):
-                    outcome = KernelReferenceItem._from_frozen(  # noqa: SLF001 - trusted frozen traversal row
-                        event.work.reference.reference_key,
-                        item,
-                        event.work.reference.correlation,
-                    )
-                    self._delivery_uniqueness[id(outcome)] = (outcome, is_unique)
-                    yield outcome
-                    await self.buffer.release(event.reservation, weight)
-                self.completion.binding(event.work.index).delivered()
-            finally:
-                if not event.acknowledged.done():
-                    event.acknowledged.set_result(None)
+            async for outcome in self._consume_page(event):
+                yield outcome
             return
         if isinstance(event, _DoneEvent):
             _finish_done_completion(self.completion, event)
@@ -688,6 +806,8 @@ class ReferenceScheduler:
                     event.row_count,
                     event.stopped_reason,
                     _done_closure(event),
+                    event.keyset_selection,
+                    event.keyset_execution,
                 )
             return
         request = event.work.reference.request

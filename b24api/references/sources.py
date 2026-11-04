@@ -26,6 +26,7 @@ from b24api.references.dispatch_plan import kernel_dispatch
 from b24api.references.facade import (
     ReferenceKernelStream,
     _kernel_plan,
+    _keyset_program,
     _reference_assurance,
     _reference_error,
     _reference_error_items,
@@ -33,6 +34,7 @@ from b24api.references.facade import (
     _reference_terminal,
     _reference_variant,
     _ReferenceEventMapper,
+    preflight_fast_keyset,
 )
 from b24api.references.program import SourceProgram
 from b24api.references.scheduler import ReferenceScheduler
@@ -113,6 +115,8 @@ class SourceAdmission:
             page_adapter=program.page_adapter,
         ).preflight_capabilities()
         self._executor.preflight_request(source.request)
+        if program.fast is not None:
+            preflight_fast_keyset(self._executor, source.request, program.fast, self._policy)
         return program
 
     def _lower(self, traversal: TraversalSpec, page_stop: PageStopPolicy | None) -> SourceProgram:
@@ -122,7 +126,8 @@ class SourceAdmission:
             return cached.program
         plan, selector, identity = _kernel_plan(traversal)
         PaginationDriver.validate_contract(plan, identity, self._policy)
-        hint = _reference_page_cap(traversal)
+        fast, keyset_selection = _keyset_program(traversal, page_stop)
+        hint = _reference_page_cap(traversal) if fast is None else fast.effective_page_cap
         counted = isinstance(plan, CountedOffsetPlan) and isinstance(self._dispatch_plan, KernelBatchDispatch)
         program = SourceProgram(
             plan,
@@ -134,6 +139,8 @@ class SourceAdmission:
             page_stop=page_stop,
             counted_page_size=hint if counted else None,
             assurance=_reference_assurance(traversal),
+            fast=fast,
+            keyset_selection=keyset_selection,
         )
         if len(self._lowered) >= _LOWERED_CONTRACTS:
             self._lowered.clear()

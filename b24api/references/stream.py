@@ -48,8 +48,10 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from b24api.contracts.page_stop import PageStopPolicy
+    from b24api.contracts.report import KeysetSelectionSummary
     from b24api.contracts.request import ResultSelector, TraversalIdentity
     from b24api.execution import Executor
+    from b24api.references.program import FastKeysetProgram
 
 
 class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
@@ -241,6 +243,8 @@ def iter_references(  # noqa: PLR0913
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
     _page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
     _page_stop: PageStopPolicy | None = None,
+    _fast: FastKeysetProgram | None = None,
+    _keyset_selection: KeysetSelectionSummary | None = None,
 ) -> ReferenceStream:
     """Construct a lazy bounded reference traversal stream without I/O."""
     PaginationDriver.validate_plan(plan)
@@ -270,6 +274,8 @@ def iter_references(  # noqa: PLR0913
         page_cap_hint=_page_cap_hint,
         page_adapter=_page_adapter,
         page_stop=_page_stop,
+        fast=_fast,
+        keyset_selection=_keyset_selection,
     )
     return ReferenceStream(
         scheduler,

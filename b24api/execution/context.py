@@ -69,6 +69,11 @@ class ExecutionContext:
         self._page_changed = asyncio.Event()
 
     @property
+    def execution_context(self) -> ExecutionContext:
+        """Return this context: a flat traversal plans and executes on the operation context itself."""
+        return self
+
+    @property
     def elapsed(self) -> float:
         """Return the elapsed."""
         if self._start is None:

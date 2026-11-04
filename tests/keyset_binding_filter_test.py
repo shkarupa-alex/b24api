@@ -10,7 +10,6 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from b24api import (
-    AutoKeysetExecution,
     BatchDispatch,
     Binding,
     Bitrix24,
@@ -21,14 +20,11 @@ from b24api import (
     KeysetTraversal,
     ParameterPath,
     ParameterUpdate,
-    PartitionedKeysetExecution,
-    RangeKeysetExecution,
     ReplaySafety,
     Request,
     ResultSelector,
     RouteKind,
     SequentialKeysetExecution,
-    StableIntegerKeysetContract,
     TerminalState,
 )
 from b24api.contracts import (
@@ -401,7 +397,8 @@ def test_positional_request_binding_remains_a_local_refusal() -> None:
         _bind_request(request, binding, 0, traversal)
 
 
-# A17.5: the public container helper and the reference execution limits are unchanged.
+# A17.5: the public container helper and the bounded-range reference limit are unchanged; fast and
+# automatic reference keysets run on the shared queue (#27, tests/keyset_references_test.py).
 
 
 def test_control_paths_still_name_the_whole_filter_container() -> None:
@@ -415,9 +412,6 @@ def test_control_paths_still_name_the_whole_filter_container() -> None:
 @pytest.mark.parametrize(
     "traversal",
     [
-        _traversal(execution=RangeKeysetExecution(StableIntegerKeysetContract())),
-        _traversal(execution=PartitionedKeysetExecution(StableIntegerKeysetContract())),
-        _traversal(execution=AutoKeysetExecution(StableIntegerKeysetContract())),
         _traversal(
             keyset=KeysetSpec(
                 boundary=BoundedIdentityRange.capture(
@@ -433,7 +427,7 @@ def test_control_paths_still_name_the_whole_filter_container() -> None:
     ],
 )
 @pytest.mark.asyncio
-async def test_references_still_refuse_fast_and_bounded_keyset(traversal: KeysetTraversal) -> None:
+async def test_references_still_refuse_a_bounded_keyset(traversal: KeysetTraversal) -> None:
     portal = _ProductRows()
     async with _client(portal) as client:
         with pytest.raises(CapabilityError):

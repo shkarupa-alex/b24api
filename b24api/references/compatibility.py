@@ -9,7 +9,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from b24api.contracts.dispatch import DirectDispatch
-from b24api.contracts.traversal import CountedTraversal
+from b24api.contracts.keyset_execution import AutoKeysetExecution, SequentialKeysetExecution
+from b24api.contracts.traversal import CountedTraversal, KeysetTraversal
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 
@@ -35,6 +36,14 @@ def source_incompatibility(
         return CapabilityError("counted reference traversal requires BatchDispatch")
     if isinstance(traversal, CountedTraversal) and page_stop is not None:
         return CapabilityError("counted physical batch tail does not support page stop")
+    if isinstance(traversal, KeysetTraversal) and not isinstance(traversal.execution, SequentialKeysetExecution):
+        # AUTO with a page stop settles on sequential execution before planning; an explicit fast
+        # execution cannot honour a stop decided between ordered pages.
+        automatic = isinstance(traversal.execution, AutoKeysetExecution)
+        if page_stop is not None and not automatic:
+            return CapabilityError("page stop requires sequential keyset execution")
+        if page_stop is None and isinstance(dispatch, DirectDispatch):
+            return CapabilityError("fast keyset reference traversal requires BatchDispatch")
     return None
 
 

@@ -11,9 +11,8 @@ from b24api.traversal import keyset_step
 from b24api.traversal.keyset_page_validation import LaneCommandPlan
 
 if TYPE_CHECKING:
-    from b24api.batch.engine import BatchExecutor
     from b24api.batch.outcome import BatchOutcome
-    from b24api.completion.fast_recorder import FastCompletionRecorder
+    from b24api.completion.fast_recorder import FastPageLedger
     from b24api.contracts.json import FrozenJson
     from b24api.contracts.keyset_execution import (
         AutoKeysetExecution,
@@ -27,7 +26,8 @@ if TYPE_CHECKING:
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
     from b24api.contracts.response import Response, ResultCollectionShape
     from b24api.contracts.traversal import KeysetSpec
-    from b24api.execution import ExecutionContext, Executor
+    from b24api.execution import Executor
+    from b24api.traversal.keyset_context import KeysetContext, WaveEngine
     from b24api.traversal.keyset_fast_plan import LaneBounds, LaneState
     from b24api.traversal.keyset_observation import FastTraceRecorder
     from b24api.traversal.keyset_ordered_admission import OrderedAdmissionState
@@ -75,11 +75,11 @@ class KeysetTransactionHost(Protocol):
     page_size: int
     effective_page_cap: int
     execution: RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution
-    context: ExecutionContext
-    engine: BatchExecutor
+    context: KeysetContext
+    engine: WaveEngine
     trace: FastTraceRecorder
     page_adapter: PageAdapter
-    completion_recorder: FastCompletionRecorder
+    completion_recorder: FastPageLedger
     completion: KeysetPageCompletion
     batch_capacity: int
     admission: OrderedAdmissionState
