@@ -7,8 +7,15 @@ from b24api.contracts.keyset_execution import AutoKeysetExecution, KeysetExecuti
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.request import IdentitySpec, RequestLike, ResultSelector, TraversalIdentity, canonical_request
 from b24api.contracts.response import ResultCollectionShape
-from b24api.contracts.traversal import CursorSpec, KeysetSpec, OffsetSpec, TotalTermination
-from b24api.traversal.facade import counted_stream, cursor_stream, keyset_stream, sequential_stream
+from b24api.contracts.traversal import (
+    ContinuationTraversal,
+    CursorSpec,
+    InclusiveWindowTraversal,
+    KeysetSpec,
+    OffsetSpec,
+    TotalTermination,
+)
+from b24api.traversal.facade import counted_stream, cursor_stream, declared_stream, keyset_stream, sequential_stream
 
 if TYPE_CHECKING:
     from b24api.contracts.identity_store import IdentityStore
@@ -187,6 +194,55 @@ class _TraversalFacade:
                 page_stop=page_stop,
                 policy=policy or self._default_policy,
                 deregister=self._discard_stream,
+                audit_violations=(() if audit_violation is None else (audit_violation,)),
+            ),
+        )
+
+    def iter_list_continuation(
+        self,
+        request: RequestLike,
+        *,
+        traversal: ContinuationTraversal,
+        policy: ExecutionPolicy | None = None,
+        page_stop: PageStopPolicy | None = None,
+    ) -> OperationStream[JsonValue]:
+        """Return a pure caller-rule continuation over SDK-owned controls."""
+        if not isinstance(traversal, ContinuationTraversal):
+            raise TypeError("traversal must be a ContinuationTraversal")
+        return self._declared(request, traversal=traversal, policy=policy, page_stop=page_stop)
+
+    def iter_list_window(
+        self,
+        request: RequestLike,
+        *,
+        traversal: InclusiveWindowTraversal,
+        policy: ExecutionPolicy | None = None,
+        page_stop: PageStopPolicy | None = None,
+    ) -> OperationStream[JsonValue]:
+        """Return a descending inclusive-timestamp window traversal with classified paging rows."""
+        if not isinstance(traversal, InclusiveWindowTraversal):
+            raise TypeError("traversal must be an InclusiveWindowTraversal")
+        return self._declared(request, traversal=traversal, policy=policy, page_stop=page_stop)
+
+    def _declared(
+        self,
+        request: RequestLike,
+        *,
+        traversal: ContinuationTraversal | InclusiveWindowTraversal,
+        policy: ExecutionPolicy | None,
+        page_stop: PageStopPolicy | None,
+    ) -> OperationStream[JsonValue]:
+        self._require_open()
+        canonical = canonical_request(request)
+        audit_violation = self._audit_unknown(canonical)
+        return self._register_stream(
+            declared_stream(
+                self._executor,
+                canonical,
+                traversal=traversal,
+                policy=policy or self._default_policy,
+                deregister=self._discard_stream,
+                page_stop=page_stop,
                 audit_violations=(() if audit_violation is None else (audit_violation,)),
             ),
         )

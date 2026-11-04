@@ -27,6 +27,8 @@ class BindingClosure(StrEnum):
     BOUNDARY_SEEN = "boundary_seen"
     KEYSET_PLAN_COVERED = "keyset_plan_covered"
     DECLARED_SHORT_PAGE = "declared_short_page"
+    DECLARED_RESPONSE_TERMINAL = "declared_response_terminal"
+    RULE_DECLARED_END = "rule_declared_end"
     CALLER_STOP = "caller_stop"
     FAILURE = "failure"
     UNKNOWN = "unknown"

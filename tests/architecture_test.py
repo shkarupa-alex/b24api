@@ -462,6 +462,11 @@ def test_closure_reason_constants_map_to_their_qualified_closure() -> None:
     assert closure.qualified_closure(closure.QUALIFIED_TOTAL_REACHED) is BindingClosure.QUALIFIED_TOTAL
     assert closure.qualified_closure(closure.SPARSE_RAW_RANGE_COVERED) is BindingClosure.RAW_RANGE_COVERED
     assert closure.qualified_closure(closure.ADMITTED_UPPER_BOUNDARY_REACHED) is BindingClosure.BOUNDARY_SEEN
+    assert closure.qualified_closure(closure.DECLARED_SHORT_PAGE_REACHED) is BindingClosure.DECLARED_SHORT_PAGE
+    assert (
+        closure.qualified_closure(closure.RESPONSE_FLAG_DECLARED_TERMINAL) is BindingClosure.DECLARED_RESPONSE_TERMINAL
+    )
+    assert closure.qualified_closure(closure.CONTINUATION_RULE_DECLARED_END) is BindingClosure.RULE_DECLARED_END
     assert closure.qualified_closure("source exhausted") is None
     assert closure.qualified_closure(None) is None
 
@@ -474,7 +479,7 @@ def test_pagination_driver_composes_strategies_instead_of_inheriting_them() -> N
 
     assert PaginationDriver.__bases__ == (object,)
     assert isinstance(CountedBatchStrategy(batch_size=1, page_size=1), PagedStrategy)
-    strategy_modules = ("sequential", "keyset", "cursor", "counted_batch")
+    strategy_modules = ("sequential", "keyset", "cursor", "counted_batch", "continuation", "inclusive_window")
     mixins = [
         node.name
         for module in strategy_modules

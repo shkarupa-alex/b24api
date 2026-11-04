@@ -3,9 +3,10 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, cast
 
 from b24api.contracts.bounded_range import BoundedIdentityRange
+from b24api.contracts.continuation import ContinuationRule, ResponseCursorRule, ResponseFlagTerminal, WindowClassifier
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     KeysetExecution,
@@ -16,6 +17,7 @@ from b24api.contracts.keyset_execution import (
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.request import (
+    CompositeIdentitySpec,
     IdentitySpec,
     ParameterPath,
     ResultSelector,
@@ -317,6 +319,10 @@ class CursorSpec:
     limit_path: ParameterPath | None = None
     allow_create_controls: bool = True
     domain: CursorDomain = CursorDomain.OPAQUE
+    # In-page order independent of the between-page boundary ``direction``; ``None`` keeps one order for both.
+    page_order: Literal["ascending", "descending"] | None = field(default=None, kw_only=True)
+    # A response flag that closes even a non-empty page; ``None`` keeps the empty-page confirmation.
+    continuation: ResponseFlagTerminal | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate and freeze cursor mechanics."""
@@ -328,6 +334,13 @@ class CursorSpec:
             raise ValueError("direction must be ascending or descending")
         if self.take not in {"first", "last"}:
             raise ValueError("take must be first or last")
+        if self.page_order is not None and self.page_order not in {"ascending", "descending"}:
+            raise ValueError("page_order must be ascending, descending or None")
+        if self.page_order is not None and self.page_order != self.direction and self.take != "first":
+            # The next boundary is the page extreme nearest the next page: the first row of a reversed page.
+            raise ValueError("a page order opposite to the cursor direction requires take='first'")
+        if self.continuation is not None and not isinstance(self.continuation, ResponseFlagTerminal):
+            raise TypeError("continuation must be a ResponseFlagTerminal or None")
         if not isinstance(self.domain, CursorDomain):
             raise TypeError("domain must be a CursorDomain")
         if self.domain is CursorDomain.EXCLUSIVE_POSITIVE_INTEGER and self.coercion not in {
@@ -432,7 +445,129 @@ class CursorTraversal:
         _validate_collection_shape(self.selector, self.collection_shape)
 
 
-type TraversalSpec = SequentialTraversal | CountedTraversal | KeysetTraversal | CursorTraversal
+_CONTINUATION_MAXIMUM_CONTROLS = 16
+
+
+def _positive_int(value: object, name: str) -> None:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+
+
+def _require_identity(identity: object) -> None:
+    if not isinstance(identity, IdentitySpec | CompositeIdentitySpec):
+        raise TypeError("identity must be an IdentitySpec or CompositeIdentitySpec")
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuationTraversal:
+    """Pure caller-rule continuation over SDK-owned controls.
+
+    The request carries the head's controls as the caller wrote them; after each page ``rule``
+    returns the complete next vector for exactly ``controls`` or ends the source. The SDK owns the
+    page transaction, identity, cycle detection and terminal evidence.
+    """
+
+    selector: ResultSelector
+    identity: TraversalIdentity
+    controls: tuple[ParameterPath, ...]
+    rule: ContinuationRule
+    limit_path: ParameterPath | None = None
+    allow_create_controls: bool = True
+    page_size: int = 50
+    collection_shape: ResultCollectionShape = field(default=ResultCollectionShape.SEQUENCE, kw_only=True)
+    page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER
+
+    def __post_init__(self) -> None:
+        """Validate the declared controls, rule and page cap."""
+        object.__setattr__(self, "controls", tuple(self.controls))
+        if not isinstance(self.selector, ResultSelector):
+            raise TypeError("selector must be a ResultSelector")
+        _require_identity(self.identity)
+        if not 0 < len(self.controls) <= _CONTINUATION_MAXIMUM_CONTROLS:
+            raise ValueError(f"continuation requires 1..{_CONTINUATION_MAXIMUM_CONTROLS} declared controls")
+        if any(not isinstance(path, ParameterPath) for path in self.controls):
+            raise TypeError("controls must contain only ParameterPath values")
+        if self.limit_path is not None and not isinstance(self.limit_path, ParameterPath):
+            raise TypeError("limit_path must be a ParameterPath or None")
+        _require_disjoint_paths(*self.controls, *((self.limit_path,) if self.limit_path is not None else ()))
+        if not callable(getattr(self.rule, "evaluate", None)):
+            raise TypeError("rule must implement evaluate(page)")
+        if isinstance(self.rule, ResponseCursorRule) and self.controls != (self.rule.parameter_path,):
+            raise ValueError("a response cursor rule owns exactly its parameter_path control")
+        if not isinstance(self.allow_create_controls, bool):
+            raise TypeError("allow_create_controls must be a boolean")
+        _positive_page_size(self.page_size)
+        _validate_collection_shape(self.selector, self.collection_shape)
+
+
+@dataclass(frozen=True, slots=True)
+class InclusiveWindowTraversal:
+    """Descending inclusive-timestamp window traversal with caller-classified paging rows.
+
+    ``classifier`` splits each page into paging rows (inside the timestamp window) and supplemental
+    rows (for example pinned entries). The next request carries the raw minimum paging timestamp
+    and the response flag closes the source. Identities repeated by the inclusive overlap are
+    delivered once; a boundary that does not move fails as non-progress instead of being nudged.
+    """
+
+    selector: ResultSelector
+    identity: TraversalIdentity
+    timestamp_path: tuple[str | int, ...]
+    parameter_path: ParameterPath
+    terminal: ResponseFlagTerminal
+    classifier: WindowClassifier
+    max_decoded_rows: int
+    limit_path: ParameterPath | None = None
+    requested_window_size: int | None = None
+    allow_create_controls: bool = True
+    collection_shape: ResultCollectionShape = field(default=ResultCollectionShape.SEQUENCE, kw_only=True)
+    page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER
+
+    def __post_init__(self) -> None:
+        """Validate the window controls, caps and classifier."""
+        object.__setattr__(self, "timestamp_path", tuple(self.timestamp_path))
+        ParameterPath(self.timestamp_path)
+        if not isinstance(self.selector, ResultSelector):
+            raise TypeError("selector must be a ResultSelector")
+        _require_identity(self.identity)
+        if not isinstance(self.parameter_path, ParameterPath):
+            raise TypeError("parameter_path must be a ParameterPath")
+        if self.limit_path is not None and not isinstance(self.limit_path, ParameterPath):
+            raise TypeError("limit_path must be a ParameterPath or None")
+        if not isinstance(self.terminal, ResponseFlagTerminal):
+            raise TypeError("terminal must be a ResponseFlagTerminal")
+        if not callable(getattr(self.classifier, "classify", None)):
+            raise TypeError("classifier must implement classify(page)")
+        _validate_window_caps(self.max_decoded_rows, self.requested_window_size, self.limit_path)
+        _require_disjoint_paths(self.parameter_path, *((self.limit_path,) if self.limit_path is not None else ()))
+        if not isinstance(self.allow_create_controls, bool):
+            raise TypeError("allow_create_controls must be a boolean")
+        _validate_collection_shape(self.selector, self.collection_shape)
+
+
+def _validate_window_caps(
+    max_decoded_rows: object,
+    requested_window_size: object,
+    limit_path: ParameterPath | None,
+) -> None:
+    """Bound the decoded page and the requested window; a sent limit needs the requested size."""
+    _positive_int(max_decoded_rows, "max_decoded_rows")
+    if requested_window_size is not None:
+        _positive_int(requested_window_size, "requested_window_size")
+        if cast("int", requested_window_size) > cast("int", max_decoded_rows):
+            raise ValueError("requested_window_size must not exceed max_decoded_rows")
+    if limit_path is not None and requested_window_size is None:
+        raise ValueError("limit_path requires requested_window_size")
+
+
+type TraversalSpec = (
+    SequentialTraversal
+    | CountedTraversal
+    | KeysetTraversal
+    | CursorTraversal
+    | ContinuationTraversal
+    | InclusiveWindowTraversal
+)
 
 
 def traversal_control_paths(spec: TraversalSpec) -> tuple[ParameterPath, ...]:
@@ -455,13 +590,19 @@ def traversal_control_paths(spec: TraversalSpec) -> tuple[ParameterPath, ...]:
             )
             if path is not None
         )
+    if isinstance(spec, ContinuationTraversal):
+        return tuple(path for path in (*spec.controls, spec.limit_path) if path is not None)
+    if isinstance(spec, InclusiveWindowTraversal):
+        return tuple(path for path in (spec.parameter_path, spec.limit_path) if path is not None)
     return tuple(path for path in (spec.cursor.parameter_path, spec.cursor.limit_path) if path is not None)
 
 
 __all__ = [
+    "ContinuationTraversal",
     "CountedTraversal",
     "CursorSpec",
     "CursorTraversal",
+    "InclusiveWindowTraversal",
     "KeysetSpec",
     "KeysetTraversal",
     "OffsetContinuation",

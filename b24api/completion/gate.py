@@ -150,6 +150,12 @@ def _binding_closure_violation(binding: _Binding, event: BindingTerminal) -> str
             "completion_missing_range_witness",
         ),
         (
+            # A response flag or a continuation rule closes only after at least one acknowledged page.
+            closure in {BindingClosure.DECLARED_RESPONSE_TERMINAL, BindingClosure.RULE_DECLARED_END}
+            and binding.acknowledged_pages == 0,
+            "completion_missing_declared_end_witness",
+        ),
+        (
             closure is BindingClosure.KEYSET_PLAN_COVERED
             and (
                 type(event.qualified_witnesses) is not int
