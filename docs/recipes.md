@@ -313,8 +313,98 @@ non-mapping `filter`, or a base key equal to the managed cursor key (such as `>I
 `CapabilityError` before any binding is read, while other identity constraints such as `<=id` remain
 allowed. `traversal_control_paths()` still lists the containers a traversal writes, including the
 whole filter; it names those containers and does not decide which binding updates compose.
-References still accept only `SequentialKeysetExecution` without a `KeysetSpec.boundary`, and the
-recipe does not promise that every REST method treats arbitrary constant filters the same way.
+The same filter updates apply to automatic, range and partitioned keyset references, which need
+`BatchDispatch`; a `KeysetSpec.boundary` remains unavailable in references, and the recipe does not
+promise that every REST method treats arbitrary constant filters the same way.
+
+## Paired continuation controls
+
+Some lists continue from two values of the last row, for example an ID and a row type whose next
+value depends on the type just seen. A pure rule returns both values; the client sends exactly the
+declared controls, rejects anything else and fails on a repeated pair instead of looping:
+
+```python
+from b24api import ParameterPath, ParameterUpdate, ResultSelector
+from b24api.contracts import ContinuationTraversal, ContinueWith, EndOfSource
+
+LAST_ID = ParameterPath(("LAST_ID",))
+LAST_TYPE = ParameterPath(("LAST_TYPE",))
+
+
+class LastRowRule:
+    def evaluate(self, page):
+        if not page.items:
+            return EndOfSource()
+        last = page.items[-1]
+        return ContinueWith(
+            (
+                ParameterUpdate(LAST_ID, last["id"]),
+                ParameterUpdate(LAST_TYPE, 1 if last["type"] == 1 else 3),
+            )
+        )
+
+
+stream = client.iter_list_continuation(
+    request,
+    traversal=ContinuationTraversal(
+        selector=ResultSelector(("items",)),
+        identity=identity,
+        controls=(LAST_ID, LAST_TYPE),
+        rule=LastRowRule(),
+        limit_path=ParameterPath(("LIMIT",)),
+        page_size=50,
+    ),
+)
+```
+
+The rule sees one immutable page and keeps no state; the first request carries the initial controls
+as the caller wrote them. Monotonic progress is not required, so an ID may rise when the row type
+changes. `Binding.start_cursor` does not apply: a binding of a continuation reference sets its
+initial controls through the request it updates.
+
+## Inclusive timestamp windows
+
+A newest-first list that resumes from `dateLessOrEqual`-style inclusive timestamps repeats the
+boundary rows on the next page and may add pinned rows that are not part of the window. A classifier
+splits every page into paging rows, which move the boundary, and supplemental rows, which are only
+delivered:
+
+```python
+from b24api import ParameterPath, ResultSelector
+from b24api.contracts import InclusiveWindowTraversal, ResponseFlagTerminal, WindowRows
+
+
+class PinnedRows:
+    def classify(self, page):
+        paging = tuple(index for index, row in enumerate(page.items) if not row.get("pinned"))
+        pinned = tuple(index for index, row in enumerate(page.items) if row.get("pinned"))
+        return WindowRows(paging_indexes=paging, supplemental_indexes=pinned)
+
+
+stream = client.iter_list_window(
+    request,
+    traversal=InclusiveWindowTraversal(
+        selector=ResultSelector(("items",)),
+        identity=identity,
+        timestamp_path=("createdAt",),
+        parameter_path=ParameterPath(("dateLessOrEqual",)),
+        terminal=ResponseFlagTerminal(ResultSelector(("hasNextPage",))),
+        classifier=PinnedRows(),
+        max_decoded_rows=60,
+        limit_path=ParameterPath(("limit",)),
+        requested_window_size=50,
+    ),
+)
+```
+
+Timestamps must be JSON strings of the form `2026-11-04T10:15:00+03:00` (optional fraction of up to
+six digits, `Z` or a `±HH:MM` offset); the client compares instants but sends the oldest paging
+value back exactly as received. Every request reserves `max_decoded_rows` rows. Rows repeated by
+the inclusive overlap are delivered once, while a repeated identity inside one page is rejected. A
+`False` flag closes the source, even on a page of pinned rows only. A non-terminal page whose
+boundary does not move fails with `ContinuationError` (`window_nonprogress`) without another
+request: rows sharing one timestamp beyond a full page cannot be reached through this endpoint
+contract, and the client reports that instead of nudging the timestamp.
 
 ## Mapping-backed collections
 

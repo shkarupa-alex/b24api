@@ -17,9 +17,12 @@ client does not contain endpoint catalogs, persistence, business reconciliation 
 | Counted list | `iter_list_counted()` | Direct head, batched tail and exact total/range/identity validation. |
 | No-count keyset | `iter_list_keyset()` | Deterministic auto default plus explicit sequential, range, or partitioned execution for caller-asserted stable integer keysets. |
 | Dependent cursor | `iter_list_cursor()` | Strict unique monotonic cursor progress. |
+| Response-driven continuation | `iter_list_continuation()` | Pure caller rule over declared controls, cycle detection and a rule-declared end. |
+| Inclusive timestamp window | `iter_list_window()` | Classified paging rows, strict boundary progress and overlap delivered once. |
 | Correlated cursor set | `iter_cursors()` | Lazy one/many-parent cursor traversal with isolated seeds and shared batching. |
 | Keyset qualification | `verify_keyset_capability()` | Explicit fail-closed strict-bound report for one portal and request shape. |
 | Per-parent traversal | `iter_references()` / `iter_reference_outcomes()` | Isolated traversal state and correlation for every accepted binding. |
+| Heterogeneous references | `iter_reference_sources()` / `iter_reference_source_outcomes()` | Per-source request, traversal and state over one shared dispatcher, row pool and report. |
 | Shell access | `b24api call` / `b24api list` | JSON/JSONL stdout and diagnostics on stderr. |
 
 ## Failure ownership
@@ -61,6 +64,29 @@ outcome.
   claim completion.
 - The client owns its default transport and active streams; injected transports remain caller-owned.
 
+## Reference scheduling
+
+Every reference source, homogeneous or not, is lowered once into a per-source program before its
+binding is admitted; a single pure compatibility check refuses what the operation cannot run as a
+correlated local non-execution before any request. One scheduler holds at most one pending pull from
+the source, one dispatcher coalesces ready pages of every binding into physical batches whose
+commands share decoding options, and one completion gate builds the terminal report after cleanup.
+
+Ordinary and counted bindings reserve rows per page from one shared row pool and release them when
+the consumer acknowledges the rows. Under `INPUT` delivery, rows behind the frontier stay held until
+it advances, so the pool keeps the frontier's next page free: rows the frontier already holds count
+toward that reserve, and the reserve covers the largest page of any admitted binding; a counted binding reads its head and its known tail offsets as
+ordinary pages of that pool and commits them in offset order. A fast or automatic keyset binding
+instead holds one fixed row lease from activation to its terminal event. Its runtime plans and fits
+every wave against a view of the operation policy that differs only in `max_buffered_rows`, equal to
+the lease; requests, pages, attempts, elapsed time and response bytes are charged to the single
+operation context, and each buffered-row change is applied once to the shared counter. The lease
+never grows or shrinks: a binding is granted at least its planning floor and at most the larger of
+that floor and an equal share of the pool among active fast bindings, rows kept for ordinary pages
+excepted; an automatic binding whose floor exceeds the whole pool waits to run
+alone with it, and a binding that cannot obtain its floor while no other binding can release rows
+fails finitely.
+
 ## Package boundaries
 
 Architecture tests enforce one-way imports, absence of removed compatibility modules and module-size
@@ -75,7 +101,10 @@ payload conventions, public low-level execution plans or mutable global registri
 `Request` owns an explicit route, immutable body encoding, scoped headers, replay safety, and an optional declarative
 embedded-result error contract. Legacy transports continue to support ordinary JSON requests;
 advanced request representations require an advertised `WireTransport` capability and fail before
-I/O otherwise. No ordinary wire value can name an absolute destination.
+I/O otherwise. No ordinary wire value can name an absolute destination. Native REST 3.0 batch commands travel as
+an internal JSON-array envelope that the transport must advertise; one physical-attempt classifier
+decides, before any retry, whether an envelope failure proves non-execution, attributes per-command
+results, or leaves the envelope unresolved for bounded `SAFE` isolation.
 
 Traversal contracts separately declare progression (`server next`, observed width, or fixed step),
 completion (empty confirmation or caller-qualified exact total), collection shape, and identity.
