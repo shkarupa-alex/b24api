@@ -63,6 +63,14 @@ def _fingerprint(encoded: bytes) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _bounded_fingerprint(vector: list[tuple[tuple[str | int, ...], bool, JsonValue]]) -> str:
+    """Fingerprint one canonical control vector, the head's included, no larger than the bound."""
+    encoded = _canonical(vector)
+    if len(encoded) > CONTROL_VECTOR_MAXIMUM_BYTES:
+        raise ContinuationError(ContinuationReason.INVALID_UPDATES, "continuation control vector is too large")
+    return _fingerprint(encoded)
+
+
 class ContinuationStrategy:
     """Apply a pure rule to each validated page; repeat no control vector, carry no token into diagnostics."""
 
@@ -83,7 +91,7 @@ class ContinuationStrategy:
         for path in plan.controls:
             present, value = _path_lookup(parameters, path)
             vector.append((_normalized(path), present, _thaw_json(_freeze_json(value)) if present else None))
-        self._seen.add(_fingerprint(_canonical(vector)))
+        self._seen.add(_bounded_fingerprint(vector))
         return self._request(ctx, {})
 
     def _request(self, ctx: StrategyContext, controls: dict[ParameterPath, object]) -> Request:
@@ -144,10 +152,7 @@ class ContinuationStrategy:
                 ContinuationReason.INVALID_UPDATES,
                 "continuation updates must set each declared control exactly once",
             )
-        encoded = _canonical(vector)
-        if len(encoded) > CONTROL_VECTOR_MAXIMUM_BYTES:
-            raise ContinuationError(ContinuationReason.INVALID_UPDATES, "continuation control vector is too large")
-        fingerprint = _fingerprint(encoded)
+        fingerprint = _bounded_fingerprint(vector)
         if fingerprint in self._seen:
             raise ContinuationError(ContinuationReason.CONTINUATION_CYCLE, "continuation control vector repeated")
         return fingerprint, controls

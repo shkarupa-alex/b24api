@@ -502,6 +502,9 @@ class _BatchPageDispatcher:
         # Pages drained from the queue wait here per producer, in first-arrival order, so one producer's
         # queued tail cannot keep a later producer's page out of the next wave (round-robin fairness).
         self._backlog: dict[str, deque[_PendingBatch]] = {}
+        # The assembler's outstanding coalescing read of the queue. A page it has taken belongs in the
+        # backlog before any chunk forms, or a backlog that never empties would keep it out of every wave.
+        self._getter: asyncio.Task[_PendingBatch] | None = None
         self._pending_continuations_can_progress = pending_continuations_can_progress
         self._assembler: asyncio.Task[None] | None = None
         self._workers: tuple[asyncio.Task[None], ...] = ()
@@ -592,20 +595,20 @@ class _BatchPageDispatcher:
         self._workers = (self._assembler, *senders)
 
     async def _run(self) -> None:  # noqa: C901, PLR0912, PLR0915
-        get_task: asyncio.Task[_PendingBatch] | None = None
         slot_acquired = False
         try:
             while not self._closed:
                 await self._send_slots.acquire()
                 slot_acquired = True
+                self._collect_getter()
                 # Pages left in the backlog by a full chunk form the next one without a new arrival:
                 # their producers may all be waiting on these very pages.
                 if not self._backlog_pending():
-                    if get_task is None:
+                    if self._getter is None:
                         first = await self._queue.get()
                     else:
-                        first = await get_task
-                        get_task = None
+                        first = await self._getter
+                        self._getter = None
                     self._enqueue(first)
                 chunk: list[_PendingBatch] = []
                 self._drain_nowait(chunk)
@@ -633,29 +636,37 @@ class _BatchPageDispatcher:
                     if state is None:
                         break
                     seen = state.revision
-                    if get_task is None:
-                        get_task = asyncio.create_task(self._queue.get())
+                    if self._getter is None:
+                        self._getter = asyncio.create_task(self._queue.get())
                     wake = state.changed(seen)
                     wait_started = self._time()
                     await self._wait(
-                        (cast("asyncio.Future[object]", get_task), cast("asyncio.Future[object]", wake)),
+                        (cast("asyncio.Future[object]", self._getter), cast("asyncio.Future[object]", wake)),
                         remaining,
                     )
                     coalescing_delay += self._time() - wait_started
-                    if get_task.done():
-                        self._enqueue(get_task.result())
-                        get_task = None
-                        self._drain_nowait(chunk)
                 self._observe_wave(len(chunk), coalescing_delay)
                 await self._send_queue.put(chunk)
                 slot_acquired = False
         finally:
             if slot_acquired:
                 self._send_slots.release()
-            if get_task is not None and not get_task.done():
-                get_task.cancel()
+            getter = self._getter
+            if getter is not None and not getter.done():
+                getter.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await get_task
+                    await getter
+            # A page the read took before it was cancelled stays reachable for cleanup to cancel.
+            self._collect_getter()
+
+    def _collect_getter(self) -> None:
+        """Move a page the coalescing read has already taken from the queue into the backlog."""
+        getter = self._getter
+        if getter is None or not getter.done():
+            return
+        self._getter = None
+        if not getter.cancelled():
+            self._enqueue(getter.result())
 
     def _enqueue(self, pending: _PendingBatch) -> None:
         if not pending.future.done():
@@ -663,6 +674,8 @@ class _BatchPageDispatcher:
 
     def _drain_nowait(self, chunk: list[_PendingBatch]) -> None:
         """Move every queued page to the backlog, then fill the chunk round-robin across producers."""
+        # The coalescing read took its page before anything still queued arrived: arrival order holds.
+        self._collect_getter()
         while True:
             try:
                 self._enqueue(self._queue.get_nowait())

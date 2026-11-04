@@ -11,6 +11,7 @@ every fast row lease and leave no buffered row behind. The only tolerated failur
 
 from __future__ import annotations
 import asyncio
+import itertools
 import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
@@ -391,3 +392,43 @@ async def test_a_contended_input_frontier_sends_its_own_pages_before_a_later_hea
     ]  # fmt: skip
     completes = {event.correlation: event.row_count for event in events if isinstance(event, ReferenceComplete)}
     assert completes == {"p0": 25, "p1": 3, "p2": 0, "p3": 41}
+
+
+@pytest.mark.asyncio
+async def test_ready_sequential_bindings_share_small_waves_round_robin() -> None:
+    """No binding with a page pending sits out more than one round-robin pass of two-command waves."""
+    sizes = {f"p{index}": 200 for index in range(5)}
+    portal = BatchPortal(_sized_offset_answer(sizes))
+    async with client_for(portal, policy=ExecutionPolicy(max_pages=1_000, max_requests=1_000)) as client:
+        stream = client.iter_reference_outcomes(
+            Request.bare("offset.list", {}, ReplaySafety.SAFE),
+            [Binding(parent, (ParameterUpdate(_PARENT, parent),), parent) for parent in sizes],
+            traversal=SequentialTraversal(identity=_identity(), page_size=PAGE),
+            dispatch=BatchDispatch(batch_size=2, output_order=DeliveryOrder.READY),
+        )
+
+        async def drain() -> list[ReferenceOutcome[str]]:
+            async with stream:
+                return [event async for event in stream]
+
+        events = await asyncio.wait_for(drain(), timeout=30)
+    completes = {event.correlation: event.row_count for event in events if isinstance(event, ReferenceComplete)}
+    assert completes == sizes
+    queries = iter(portal.queries)
+    waves = [{next(queries)["PARENT"] for _ in range(size)} for size in portal.waves]
+    for parent in sizes:
+        present = [index for index, wave in enumerate(waves) if parent in wave]
+        assert max(b - a - 1 for a, b in itertools.pairwise(present)) <= -(-len(sizes) // 2) + 1
+
+
+def _sized_offset_answer(sizes: dict[str, int]) -> Callable[[str, Query], Envelope]:
+    def answer(method: str, query: Query) -> Envelope:
+        del method
+        size = sizes[query["PARENT"]]
+        offset = int(query.get("start", "0"))
+        envelope: Envelope = {"result": _page(list(range(offset + 1, min(offset + PAGE, size) + 1))), "total": size}
+        if offset + PAGE < size:
+            envelope["next"] = offset + PAGE
+        return envelope
+
+    return answer

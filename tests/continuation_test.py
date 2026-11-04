@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from b24api import (
+    BatchDispatch,
     Binding,
     CapabilityError,
     DirectDispatch,
@@ -55,11 +56,12 @@ from b24api.contracts.completion import (
 from b24api.contracts.report import TerminalState
 from b24api.errors import ContinuationError, ContinuationReason
 from b24api.testing.scripted import ScriptedExchange, ScriptedTransport
-from b24api.traversal.continuation import CONTROL_VECTOR_MAXIMUM_BYTES
+from b24api.traversal.continuation import CONTROL_VECTOR_MAXIMUM_BYTES, _canonical, _normalized
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from b24api.contracts.json import JsonValue
     from tests.scripting import ClientFactory
 
 _RULE_END = "continuation rule declared end of source"
@@ -449,6 +451,84 @@ async def test_a22_n_invalid_decisions_fail_closed_without_commit(
     assert stream.report is not None
     assert not stream.report.exhausted
     assert stream.report.emitted == 0
+
+
+def _head_of_vector_size(size: int) -> Request:
+    """Return a notification head whose canonical initial control vector is exactly ``size`` bytes."""
+
+    def vector(padding: str) -> list[tuple[tuple[str | int, ...], bool, JsonValue]]:
+        return [(_normalized(_LAST_ID), True, padding), (_normalized(_LAST_TYPE), True, 1)]
+
+    padding = "x" * (size - len(_canonical(vector(""))))
+    assert len(_canonical(vector(padding))) == size
+    return _notify(LAST_ID=padding, LAST_TYPE=1)
+
+
+def _notification_traversal(rule: _NotificationRule | _ScriptedRule) -> ContinuationTraversal:
+    return ContinuationTraversal(
+        ResultSelector(("notifications",)),
+        _ID,
+        (_LAST_ID, _LAST_TYPE),
+        rule,
+        limit_path=ParameterPath(("LIMIT",)),
+        page_size=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a22_n_oversized_initial_vector_fails_before_any_request(scripted_client: ClientFactory) -> None:
+    """A22-N: the head's own control vector is bounded like a rule's, before it reaches the transport."""
+    transport = ScriptedTransport(())
+    head = _head_of_vector_size(CONTROL_VECTOR_MAXIMUM_BYTES + 1)
+    traversal = _notification_traversal(_NotificationRule())
+    stream = scripted_client(transport).iter_list_continuation(head, traversal=traversal)
+    rows, failure = await _drain(stream)
+    assert rows == []
+    assert isinstance(failure, IncompleteTraversalError)
+    assert isinstance(failure.error, ContinuationError)
+    assert failure.error.reason is ContinuationReason.INVALID_UPDATES
+    assert "x" * 64 not in str(failure.error)
+    transport.assert_exhausted()
+    assert stream.report is not None
+    assert not stream.report.exhausted
+    assert stream.report.emitted == 0
+
+
+@pytest.mark.asyncio
+async def test_a22_n_initial_vector_at_the_bound_is_sent(scripted_client: ClientFactory) -> None:
+    """A22-N: a head vector of exactly the bound is admitted and the rule's end closes the source."""
+    head = _head_of_vector_size(CONTROL_VECTOR_MAXIMUM_BYTES)
+    transport = ScriptedTransport((ScriptedExchange.json(head, _notifications((5, 1))),))
+    traversal = _notification_traversal(_ScriptedRule(lambda _page: EndOfSource()))
+    stream = scripted_client(transport).iter_list_continuation(head, traversal=traversal)
+    rows, failure = await _drain(stream)
+    assert failure is None
+    assert [row["id"] for row in rows] == [5]  # type: ignore[index]
+    transport.assert_exhausted()
+    assert stream.report is not None
+    assert stream.report.exhausted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch", [DirectDispatch(), BatchDispatch()], ids=["direct", "batch"])
+async def test_a22_n_oversized_initial_vector_fails_its_reference_without_a_request(
+    dispatch: DirectDispatch | BatchDispatch, scripted_client: ClientFactory
+) -> None:
+    """A22-N: a reference whose head vector is oversized fails locally; nothing is dispatched."""
+    transport = ScriptedTransport(())
+    head = _head_of_vector_size(CONTROL_VECTOR_MAXIMUM_BYTES + 1)
+    binding = Binding("user 3", (ParameterUpdate(ParameterPath(("userId",)), 3),), 3)
+    stream = scripted_client(transport).iter_reference_outcomes(
+        head, [binding], traversal=_notification_traversal(_NotificationRule()), dispatch=dispatch
+    )
+    outcomes, failure = await _drain(stream)
+    assert failure is None
+    transport.assert_exhausted()
+    assert [type(outcome) for outcome in outcomes] == [ReferenceFailure]
+    error = cast("ReferenceFailure[int]", outcomes[0]).error
+    assert isinstance(error, IncompleteTraversalError)
+    assert isinstance(error.error, ContinuationError)
+    assert error.error.reason is ContinuationReason.INVALID_UPDATES
 
 
 @pytest.mark.asyncio

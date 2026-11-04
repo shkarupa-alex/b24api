@@ -523,7 +523,9 @@ class ReferenceScheduler:
         sources = len(self._fast_active) + (0 if self._source_exhausted else 1)
         cap = max(fast.floor, (pool - keep) // sources)
         available = free - keep
-        if available >= min(fast.quota, cap):
+        # G = clamp(free - R_keep, P, G_cap): a share below the quota Q starts from the floor P, while a
+        # share that can hold Q waits for it rather than plan below the comfortable quota.
+        if available >= (fast.floor if cap < fast.quota else fast.quota):
             return min(available, cap)
         if stranded:
             if free >= fast.floor:
