@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import asyncio
-from collections.abc import AsyncIterable, Iterable, Mapping
+from collections.abc import AsyncIterable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -126,8 +126,13 @@ class BatchExecutor:
         advisory_totals: bool = False,
         strict_envelope: bool = False,
         strict_json_members: bool = False,
+        on_envelope: Callable[[], None] | None = None,
     ) -> tuple[BatchOutcome, ...]:
-        """Execute one admitted chunk: classic BARE and native v3 commands never share an envelope."""
+        """Execute one admitted chunk: classic BARE and native v3 commands never share an envelope.
+
+        ``on_envelope`` is called once before each envelope group's first physical round is dispatched, so a
+        caller counts the batch requests a chunk really sends; replay rounds and halted groups are not counted.
+        """
         eligible, rejected = self._partition_capabilities(commands)
         if halt and rejected:
             first_rejected = next(command.index for command in commands if command.index in rejected)
@@ -153,6 +158,8 @@ class BatchExecutor:
                 # Fail-fast: a later envelope of the accepted chunk is not sent after a failed one.
                 settled.update((command.index, _halted_failure(command)) for command in group)
                 continue
+            if on_envelope is not None:
+                on_envelope()
             if group[0].request.route is RouteKind.API_V3:
                 outcomes = await _V3Resolution(self.executor, context).run(group)
             else:
@@ -277,20 +284,6 @@ class BatchExecutor:
         )
         return _Round(outcomes, replay, method_cooldown)
 
-    def will_dispatch_commands(self, commands: tuple[_Command, ...], *, halt: bool) -> bool:
-        """Return whether capability preflight admits a physical batch envelope."""
-        eligible = any(self._batch_route(command.request) is not None for command in commands)
-        rejected = any(self._batch_route(command.request) is None for command in commands)
-        return eligible and not (halt and rejected)
-
-    def _will_dispatch_requests(self, requests: tuple[Request, ...], *, halt: bool = False) -> bool:
-        """Return whether scheduler-owned requests admit a physical batch envelope."""
-        commands = tuple(
-            _Command(index=index, stable_key=f"c{index:012d}", request=request, correlation=None)
-            for index, request in enumerate(requests)
-        )
-        return self.will_dispatch_commands(commands, halt=halt)
-
     def _batch_route(self, request: Request) -> RouteKind | None:
         """Return the envelope dialect a request can travel in, or ``None`` when no envelope represents it."""
         if request.encoding.value != "json" or request.positional is not None or request.headers.items:
@@ -400,7 +393,7 @@ class BatchExecutor:
             return _command_failure(command, protocol_error, evidence=evidence)
         return _command_success(command, command_response, evidence)
 
-    async def execute_requests(
+    async def execute_requests(  # noqa: PLR0913 - mirrors execute_chunk's round options
         self,
         requests: tuple[Request, ...],
         *,
@@ -408,6 +401,7 @@ class BatchExecutor:
         advisory_totals: bool = False,
         strict_envelope: bool = False,
         strict_json_members: bool = False,
+        on_envelope: Callable[[], None] | None = None,
     ) -> tuple[BatchOutcome, ...]:
         """Execute one scheduler-owned chunk with total per-command correlation."""
         if not requests or len(requests) > self.portal_command_cap:
@@ -428,6 +422,7 @@ class BatchExecutor:
             advisory_totals=advisory_totals,
             strict_envelope=strict_envelope,
             strict_json_members=strict_json_members,
+            on_envelope=on_envelope,
         )
 
     def _command_error(

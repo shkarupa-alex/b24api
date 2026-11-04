@@ -760,9 +760,12 @@ class _BatchPageDispatcher:
         )
         return admitted + admitting + continuations + pending_pull + settling_admission
 
+    def _count_batch_request(self) -> None:
+        """Count one physical batch envelope the chunk sends in its first round."""
+        self.batch_requests += 1
+
     async def _send(self, chunk: list[_PendingBatch]) -> None:
         requests = tuple(item.request for item in chunk)
-        self.batch_requests += int(self._executor._will_dispatch_requests(requests))  # noqa: SLF001
         self.batch_commands += len(chunk)
         options = chunk[0].options
         try:
@@ -772,6 +775,7 @@ class _BatchPageDispatcher:
                 advisory_totals=options.advisory_totals,
                 strict_envelope=options.strict_envelope,
                 strict_json_members=options.strict_json_members,
+                on_envelope=self._count_batch_request,
             )
         except asyncio.CancelledError:
             for item in chunk:

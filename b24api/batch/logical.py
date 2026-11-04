@@ -1,7 +1,5 @@
 """Canonical arbitrary-length logical batch over bounded physical Bitrix batches."""
 
-# ruff: noqa: PLR0912 - bounded orchestration state machine
-
 from __future__ import annotations
 from collections.abc import AsyncGenerator, AsyncIterable, Iterable
 from typing import TYPE_CHECKING, Self, cast
@@ -255,6 +253,10 @@ class LogicalBatchKernelStream[C]:
         """Close input and pending work idempotently; the report is published after cleanup."""
         await self._runner.aclose()
 
+    def _count_batch_request(self) -> None:
+        """Count one physical batch envelope the chunk sends in its first round."""
+        self._batch_requests += 1
+
     async def _run(self) -> AsyncGenerator[CommandOutcome[object]]:  # noqa: C901
         await self._context.start()
         controller: AsyncIteratorController[_BatchItem] = AsyncIteratorController(
@@ -312,13 +314,12 @@ class LogicalBatchKernelStream[C]:
                 raise InputSourceError("Logical batch input source failed") from chunk.source_error
             for command in chunk.commands:
                 self._completion.binding(command.index).scheduled()
-            if self._batch_executor.will_dispatch_commands(chunk.commands, halt=self._fail_fast):
-                self._batch_requests += 1
             self._batch_commands += len(chunk.commands)
             kernel = await self._batch_executor.execute_chunk(
                 chunk.commands,
                 context=self._context,
                 halt=self._fail_fast,
+                on_envelope=self._count_batch_request,
             )
             buffered_rows = sum(outcome.decoded_rows if isinstance(outcome, KernelSuccess) else 1 for outcome in kernel)
             outcomes = _public_outcomes(kernel, halt=self._fail_fast)

@@ -429,6 +429,7 @@ async def test_a21_embedded_safe_transient_is_retried_once_alone_with_inherited_
     assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
     assert [call.v3_wire for call in transport.wire_calls] == [_wire(first, second), _wire(second)]
     assert report.physical_requests == TWO
+    assert report.batch_requests == 1
     assert report.retries == 1
     assert report.ambiguous_physical_attempts == 0
     assert report.batch_isolation_requests == 0
@@ -481,6 +482,7 @@ async def test_a21_mixed_safety_groups_keep_input_order_and_a_non_safe_abort_is_
     ]
     assert [call.replay_safety for call in transport.wire_calls] == [SAFE, UNSAFE, SAFE]
     assert report.physical_requests == THREE
+    assert report.batch_requests == THREE
     assert report.unknown == TWO
     assert report.ambiguous_physical_attempts == 1
     assert report.batch_isolation_requests == 0
@@ -542,6 +544,7 @@ async def test_a21_mixed_interleaved_dialects_are_sent_as_contiguous_runs_in_inp
     assert [outcome.index for outcome in outcomes] == [0, 1, 2]
     assert [call.v3_wire is not None for call in transport.wire_calls] == [False, True, False]
     assert report.physical_requests == THREE
+    assert report.batch_requests == THREE
     transport.assert_exhausted()
 
 
@@ -564,6 +567,7 @@ async def test_a21_mixed_v3_runs_split_by_a_classic_command_stay_two_envelopes()
     assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
     assert [call.v3_wire for call in transport.wire_calls] == [_wire(head), None, _wire(tail)]
     assert report.physical_requests == THREE
+    assert report.batch_requests == THREE
     transport.assert_exhausted()
 
 
@@ -595,6 +599,9 @@ async def test_a21_halt_a_classic_command_after_a_failed_v3_command_is_never_sen
     assert isinstance(failure.outcomes[1], CommandNotExecuted)
     assert failure.outcomes[1].reason is NotExecutedReason.HALTED
     assert [call.v3_wire is not None for call in transport.wire_calls] == [False, True]
+    # The halted classic tail is never sent, so only the two dispatched envelopes count.
+    assert failure.report is not None
+    assert failure.report.batch_requests == TWO
     transport.assert_exhausted()
 
 

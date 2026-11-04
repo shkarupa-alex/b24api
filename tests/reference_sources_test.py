@@ -346,11 +346,13 @@ async def test_a28_matrix_the_homogeneous_facade_rejects_v3_without_native_batch
 async def test_a28_matrix_a_v3_source_with_native_batch_support_is_admitted() -> None:
     portal = _WirePortal(_answer, v3_batch=True)
     async with _client(portal) as api:
-        events, _report = await _collect(api, [_v3_beta(5), _beta(9)], dispatch=BatchDispatch())
+        events, report = await _collect(api, [_v3_beta(5), _beta(9)], dispatch=BatchDispatch())
 
     assert not any(isinstance(event, ReferenceNotExecuted) for event in events)
     assert portal.v3_envelopes >= 1
     assert _rows(events, 1) == [4]
+    # A wave mixing the classic and the v3 dialect sends one envelope per dialect, and each one counts.
+    assert report.batch_requests == report.physical_requests == portal.v3_envelopes + len(portal.waves)
 
 
 @pytest.mark.asyncio

@@ -131,8 +131,6 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             next_index += len(chunk.commands)
             if chunk.source_error is not None:
                 _raise_source_error(chunk.source_error)
-            if self._executor.will_dispatch_commands(chunk.commands, halt=False):
-                self._batch_requests += 1
             self._batch_commands += len(chunk.commands)
             outcomes = await self._execute(chunk.commands)
             buffered_rows = sum(_batch_outcome_row_weight(outcome) for outcome in outcomes)
@@ -144,6 +142,10 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
                 buffered_rows -= outcome_rows
                 await self._context.set_buffered_rows(buffered_rows)
 
+    def _count_batch_request(self) -> None:
+        """Count one physical batch envelope the chunk sends in its first round."""
+        self._batch_requests += 1
+
     async def _execute(self, commands: tuple[_Command, ...]) -> tuple[BatchStreamItem, ...]:
         """Execute one chunk; a page per command is reserved first and settled by its outcome."""
         reservations = []
@@ -152,7 +154,9 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
                 for _ in commands:
                     reservation = await self._context.reserve_page()
                     reservations.append(reservation)
-            outcomes = await self._executor.execute_chunk(commands, context=self._context, halt=False)
+            outcomes = await self._executor.execute_chunk(
+                commands, context=self._context, halt=False, on_envelope=self._count_batch_request
+            )
         except BaseException:
             for reservation in reservations:
                 self._context.release_page(reservation)
