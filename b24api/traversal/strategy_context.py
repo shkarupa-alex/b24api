@@ -137,6 +137,14 @@ class StrategyContext(Protocol):
         """Fetch one page directly, accounting for it in the operation budget."""
         ...
 
+    def continue_sequential(
+        self,
+        strategy: SequentialPageStrategy,
+        identities: list[IdentityValue],
+    ) -> AsyncGenerator[_Page]:
+        """Continue a sequential strategy after an externally committed seed page."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class PageVerdict:

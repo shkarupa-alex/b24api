@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from b24api.contracts.response import Response
     from b24api.execution import ExecutionContext, Executor
     from b24api.execution.snapshot import KernelReport
+    from b24api.traversal.counted_io import CountedWaveIO
 
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
@@ -192,7 +193,23 @@ class PaginationDriver:
 
     async def _sequential(self, strategy: SequentialPageStrategy) -> AsyncGenerator[_Page]:
         """Own each page transaction: fetch, select, judge, validate, record the rejection or yield."""
-        request = strategy.first_request(self)
+        async for page in self._sequential_from(strategy, strategy.first_request(self)):
+            yield page
+
+    async def continue_sequential(
+        self,
+        strategy: SequentialPageStrategy,
+        identities: list[IdentityValue],
+    ) -> AsyncGenerator[_Page]:
+        """Continue a sequential strategy after an externally committed seed page."""
+        step = strategy.advance(self, identities)
+        if isinstance(step, PageStop):
+            self.terminal_reason = step.reason
+            return
+        async for page in self._sequential_from(strategy, step):
+            yield page
+
+    async def _sequential_from(self, strategy: SequentialPageStrategy, request: Request) -> AsyncGenerator[_Page]:
         while True:
             response = await self.fetch(request)
             trace_count = self.page_trace_count
@@ -218,9 +235,15 @@ class PaginationDriver:
                 return
             request = step
 
-    def counted_batch_pages(self, *, batch_size: int, page_size: int) -> AsyncGenerator[_Page]:
-        """Execute the committed direct-head/batched-tail counted traversal."""
-        return CountedBatchStrategy(batch_size=batch_size, page_size=page_size).pages(self)
+    def counted_batch_pages(
+        self,
+        *,
+        batch_size: int,
+        page_size: int,
+        io: CountedWaveIO | None = None,
+    ) -> AsyncGenerator[_Page]:
+        """Execute the committed counted head transaction and its dense tail or sequential continuation."""
+        return CountedBatchStrategy(batch_size=batch_size, page_size=page_size, io=io).pages(self)
 
     def empty_source_head_eligible(
         self,
