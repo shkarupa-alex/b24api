@@ -83,9 +83,10 @@ the lease; requests, pages, attempts, elapsed time and response bytes are charge
 operation context, and each buffered-row change is applied once to the shared counter. The lease
 never grows or shrinks: a binding is granted at least its planning floor and at most the larger of
 that floor and an equal share of the pool among active fast bindings, rows kept for ordinary pages
-excepted; an automatic binding whose floor exceeds the whole pool waits to run
-alone with it, and a binding that cannot obtain its floor while no other binding can release rows
-fails finitely.
+excepted; an automatic binding whose floor exceeds the whole pool waits to run alone with it (under
+`INPUT` delivery only as the frontier, since rows behind the frontier cannot be released), a binding
+that cannot obtain its floor while no other binding can release rows fails finitely, and every lease
+wait is bounded by the operation's elapsed budget.
 
 ## Package boundaries
 

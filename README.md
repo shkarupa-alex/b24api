@@ -354,8 +354,8 @@ contract or when the previous request-by-request behavior is required.
 Static incompatibility with the auto contract raises `CapabilityError` from the
 `iter_list_keyset(...)` call before iteration begins. A portal that accepts but contradicts the
 declared controls fails before emission with `IncompleteTraversalError`; auto never restarts that
-operation silently. Every binding of a reference traversal makes the same selection on its own;
-see [Keyset references](#keyset-references). The
+operation silently. Reference traversal can opt into the same selection for each binding; see
+[Keyset references](#keyset-references). The
 terminal report carries a compact `keyset_selection` (`requested_kind`, `selected_kind`, `reason`)
 for every keyset traversal. A `page_stop` callback needs the ordered page stream, so auto reports
 `AUTO`, `SEQUENTIAL`, `PAGE_STOP`; an explicit `SequentialKeysetExecution()` reports
@@ -591,20 +591,23 @@ rather than fabricating a reference outcome. Already accepted bindings retain th
 
 ### Keyset references
 
-`KeysetTraversal` bindings use automatic execution by default, as `iter_list_keyset()` does. A
+`KeysetTraversal` bindings run sequentially by default (`SequentialKeysetExecution()`), unlike
+`iter_list_keyset()`, whose default is automatic. Pass `AutoKeysetExecution`,
+`RangeKeysetExecution` or `PartitionedKeysetExecution` as the traversal's `execution` to opt in. A
 binding with automatic, range or partitioned execution runs its own planning barrier and selection;
 its waves travel through the shared batch queue beside other bindings' pages, and its
 `ReferenceComplete` carries the binding's `keyset_selection` and, when the fast path ran, its
 `keyset_execution`. From its first request to its terminal event the binding holds a fixed share of
 `ExecutionPolicy.max_buffered_rows` and plans every wave within it; requests, pages, attempts and
 elapsed time stay on the one operation budget. An automatic binding whose planning floor exceeds the
-whole row budget waits to run alone with all of it; a binding that cannot obtain its floor while no
-other binding can release rows fails with `BudgetExceededError` instead of waiting indefinitely.
+whole row budget waits to run alone with all of it (under `INPUT` delivery, once it is the next
+binding to deliver); a binding that cannot obtain its floor while no other binding can release rows
+fails with `BudgetExceededError`, and waiting for a share never outlasts `max_elapsed`.
 
 Fast and automatic keyset references need `BatchDispatch`. With a `page_stop`, automatic execution
 runs sequentially and reports `PAGE_STOP`; an explicit fast mode with a `page_stop` or
 `DirectDispatch` is refused before any request. A `KeysetSpec.boundary` remains unavailable in
-references. Pass `SequentialKeysetExecution()` to keep the request-by-request behavior.
+references.
 
 ### Counted references
 
