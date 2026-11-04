@@ -41,7 +41,7 @@ from b24api.contracts import (
     ReferenceSource,
     RequestHeaders,
 )
-from b24api.errors import CapabilityError, InputSourceError
+from b24api.errors import BudgetExceededError, CapabilityError, InputSourceError
 from tests.scripting import BatchPortal, Envelope, Query
 
 if TYPE_CHECKING:
@@ -396,7 +396,7 @@ async def test_a28_pending_holds_at_most_one_pull_and_closes_the_source_once_at_
     async with _client(portal) as api:
         stream = api.iter_reference_source_outcomes(source, policy=ExecutionPolicy(max_elapsed=0.2))
         events: list[ReferenceOutcome[int]] = []
-        with pytest.raises(Exception):  # noqa: B017, PT011 - the deadline's typed failure
+        with pytest.raises(BudgetExceededError, match="reference input exceeded operation time budget"):
             async with asyncio.timeout(5), stream:
                 events.extend([event async for event in stream])
     assert source.max_in_flight == 1

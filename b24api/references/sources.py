@@ -1,4 +1,4 @@
-"""Heterogeneous reference sources (#28): each source lowered to its own program in one operation.
+"""Heterogeneous reference sources: each source lowered to its own program in one operation.
 
 Every admitted ``ReferenceSource`` is checked by the same pure compatibility rule the homogeneous
 facades apply before reading bindings, lowered once per distinct traversal contract, preflighted

@@ -478,7 +478,15 @@ class ReferenceScheduler:
         self.producer_state.runnable.discard(run.producer_key)
         self.producer_state.touch()
         try:
-            lease = await self.buffer.lease(index, functools.partial(self._lease_grant, fast, index))
+            # The wait is bounded by the operation's elapsed budget, as every dispatch wait is.
+            remaining = self.context.policy.max_elapsed - self.context.elapsed
+            if remaining <= 0:
+                raise BudgetExceededError("operation elapsed budget exhausted before the fast keyset lease")
+            try:
+                async with asyncio.timeout(remaining):
+                    lease = await self.buffer.lease(index, functools.partial(self._lease_grant, fast, index))
+            except TimeoutError as error:
+                raise BudgetExceededError("fast keyset lease wait exceeded the operation time budget") from error
         finally:
             self._fast_waiting -= 1
         self.producer_state.runnable.add(run.producer_key)
@@ -486,12 +494,13 @@ class ReferenceScheduler:
         return lease
 
     def _lease_grant(self, fast: FastKeysetProgram, index: int, free: int) -> int | None:
-        """Size one fast lease from the free rows (S3 allocation), or return None to wait.
+        """Size one fast lease from the free rows, or return None to wait.
 
         P = 3C+A is the floor a bounded plan needs and Q = 4C+A the comfortable quota. A binding
         keeps the existing frontier reserve R free while any other source is active or unread, and
         takes at most an even share of the pool among the fast sources that are active or may still
-        arrive. AUTO below the floor runs exclusively on the whole pool, like a flat traversal. The
+        arrive. AUTO below the floor runs exclusively on the whole pool, like a flat traversal, and
+        under INPUT only once it is the frontier. The
         INPUT frontier never waits on rows that only its own progress could release: it takes what
         is free, or fails finitely.
         """
@@ -499,7 +508,9 @@ class ReferenceScheduler:
         frontier = self.output_order is ReferenceOutputOrder.INPUT and index == self.buffer.head_index
         stranded = frontier and not self.buffer.releasable_elsewhere(index)
         if fast.automatic and pool < fast.floor:
-            if free == pool:
+            # Under INPUT only the frontier may take the whole pool: a binding behind it would hold
+            # every row while the frontier, which its own rows wait for, could reserve nothing.
+            if free == pool and (frontier or self.output_order is not ReferenceOutputOrder.INPUT):
                 return pool
             if stranded:
                 if free >= 2 * fast.effective_page_cap:

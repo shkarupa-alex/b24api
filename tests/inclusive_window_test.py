@@ -617,3 +617,23 @@ def test_a29_contract_caps_are_validated_locally() -> None:
             4,
             limit_path=_LIMIT,
         )
+
+
+@pytest.mark.asyncio
+async def test_a_moving_page_of_only_repeated_rows_is_not_a_repeated_page(scripted_client: ClientFactory) -> None:
+    """Progress is the boundary: a page whose rows were all seen still moves it, and the flag then closes."""
+    transport = ScriptedTransport(
+        (
+            ScriptedExchange.json(_request(), _page(_row(10, _T5), _row(5, _T1, pinned=True), more=True)),
+            ScriptedExchange.json(_request(_T5), _page(_row(10, _T5), _row(5, _T1), more=True)),
+            ScriptedExchange.json(_request(_T1), _page(_row(5, _T1), more=False)),
+        )
+    )
+    stream = scripted_client(transport).iter_list_window(_request(limit=None), traversal=_window())
+    rows, failure = await _drain(stream)
+    assert failure is None
+    assert _ids(rows) == [10, 5]
+    transport.assert_exhausted()
+    assert stream.report is not None
+    assert stream.report.exhausted
+    assert stream.report.terminal_reason == _FLAG_END

@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from b24api.contracts.continuation import ContinuationRule, ResponseFlagTerminal, WindowClassifier
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
@@ -77,6 +77,10 @@ class ReferenceOutputOrder(StrEnum):
 class PlanContract:
     """Correctness contract shared by every traversal plan."""
 
+    # A repeated page of rows proves a stalled server continuation. Plans whose progress is proven by
+    # their own controls instead (a rule's control vector, a moving window boundary) may legitimately
+    # commit two pages without new rows, so they opt out.
+    row_fingerprints: ClassVar[bool] = True
     selector: ResultSelector | None = None
     identity_requirement: IdentityRequirement = IdentityRequirement.OPTIONAL
     order_semantics: OrderSemantics = OrderSemantics.UNORDERED
@@ -327,6 +331,8 @@ def _validate_cursor_page_contract(plan: ItemCursorPlan) -> None:
 class ContinuationPlan(PlanContract):
     """Caller-rule continuation whose rule returns the next complete control vector or the end."""
 
+    # Progress is the control vector, which has its own cycle detection.
+    row_fingerprints: ClassVar[bool] = False
     controls: tuple[ParameterPath, ...]
     rule: ContinuationRule
     limit_path: ParameterPath | None = None
@@ -351,6 +357,8 @@ class ContinuationPlan(PlanContract):
 class InclusiveWindowPlan(PlanContract):
     """Descending inclusive-timestamp window over caller-classified paging rows."""
 
+    # Progress is the strictly moving boundary; a page of only repeated rows admits nothing yet moves it.
+    row_fingerprints: ClassVar[bool] = False
     timestamp_path: tuple[str | int, ...]
     parameter_path: ParameterPath
     terminal: ResponseFlagTerminal

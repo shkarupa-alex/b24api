@@ -96,6 +96,8 @@ class SharedWaveEngine:
                 tuple(_settlement(task, errors.get(index)) for index, task in enumerate(tasks)),
             )
             raise
+        # Each command's error is already recorded in ``errors``; retrieve it so it is not logged as lost.
+        await asyncio.gather(*tasks, return_exceptions=True)
         self._state.runnable.add(key)
         self._state.touch()
         outcomes: list[BatchOutcome] = []

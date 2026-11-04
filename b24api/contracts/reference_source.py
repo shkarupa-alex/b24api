@@ -1,4 +1,4 @@
-"""One heterogeneous reference source (#28)."""
+"""One heterogeneous reference source."""
 
 from __future__ import annotations
 from dataclasses import dataclass, field

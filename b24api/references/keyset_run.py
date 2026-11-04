@@ -1,4 +1,4 @@
-"""One fast or automatic keyset reference binding on the shared queue (#27).
+"""One fast or automatic keyset reference binding on the shared queue.
 
 Each binding runs its own ``KeysetRuntime`` (fingerprints, bounds, identity, planning, ordered
 admission) under a fixed row lease ``G`` taken from the shared row pool at activation and returned

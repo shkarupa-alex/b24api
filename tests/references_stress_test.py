@@ -322,3 +322,72 @@ async def test_a_binding_waiting_for_its_lease_never_holds_a_wave_back_to_coales
     completes = {event.correlation: event.row_count for event in events if isinstance(event, ReferenceComplete)}
     assert completes == {"p0": 50, "p1": 0}
     assert len(portal.waves) > 100
+
+
+@pytest.mark.parametrize("frontier", ["offset", "cursor"])
+@pytest.mark.parametrize("batch_size", [2, 50])
+@pytest.mark.asyncio
+async def test_an_automatic_binding_behind_an_ordinary_frontier_never_takes_the_whole_pool(
+    frontier: str, batch_size: int, pool: _Pool
+) -> None:
+    """INPUT order, row budget below the automatic floor: only the frontier may run alone on the pool.
+
+    The automatic binding used to take the whole pool the moment the ordinary frontier's first page
+    was delivered; the frontier could then reserve nothing while the automatic rows waited behind it.
+    """
+    sources = [_Source(frontier, "p0", tuple(range(1, 101))), _Source("auto", "p1", tuple(range(1, 101)))]
+    portal = BatchPortal(_portal(sources))
+    async with client_for(portal, policy=ExecutionPolicy(max_buffered_rows=30)) as client:
+        stream = client.iter_reference_source_outcomes(
+            [_reference(source) for source in sources],
+            dispatch=BatchDispatch(batch_size=batch_size, output_order=DeliveryOrder.INPUT),
+        )
+
+        async def drain() -> list[ReferenceOutcome[str]]:
+            async with stream:
+                return [event async for event in stream]
+
+        events = await asyncio.wait_for(drain(), timeout=10)
+    rows = [cast("dict[str, int]", event.item)["ID"] for event in events if isinstance(event, ReferenceItem)]
+    completes = {event.correlation: event.row_count for event in events if isinstance(event, ReferenceComplete)}
+    assert completes == {"p0": 100, "p1": 100}
+    assert rows == sources[0].expected + sources[1].expected
+    assert pool.outstanding == 0
+
+
+def _offset_answer(method: str, query: Query) -> Envelope:
+    del method
+    size = {"p0": 25, "p1": 3, "p2": 0, "p3": 41}[query["PARENT"]]
+    offset = int(query.get("start", "0"))
+    envelope: Envelope = {"result": _page(list(range(offset + 1, min(offset + PAGE, size) + 1))), "total": size}
+    if offset + PAGE < size:
+        envelope["next"] = offset + PAGE
+    return envelope
+
+
+@pytest.mark.asyncio
+async def test_a_contended_input_frontier_sends_its_own_pages_before_a_later_head() -> None:
+    """Declared homogeneous delta: under INPUT contention the frontier keeps its returned rows.
+
+    With 20 buffered rows the frontier's short pages give rows back. The 2.5.2 scheduler let the
+    third binding's head take them, sending ``p0@0, p1@0, p2@0, p0@10, p0@20, p0@25, ...``; the
+    frontier reserve now keeps them for the frontier, so ``p2@0`` follows ``p0``'s pages. Events and
+    the report are unchanged; only this physical send order differs.
+    """
+    portal = BatchPortal(_offset_answer)
+    async with client_for(portal, policy=ExecutionPolicy(max_buffered_rows=20)) as client:
+        stream = client.iter_reference_outcomes(
+            Request.bare("offset.list", {}, ReplaySafety.SAFE),
+            [Binding(parent, (ParameterUpdate(_PARENT, parent),), parent) for parent in ("p0", "p1", "p2", "p3")],
+            traversal=SequentialTraversal(identity=_identity(), page_size=PAGE),
+            dispatch=BatchDispatch(batch_size=2, output_order=DeliveryOrder.INPUT, coalesce_wait=0.0),
+        )
+        async with stream:
+            events = [event async for event in stream]
+    sent = [(query["PARENT"], query.get("start", "0")) for query in portal.queries]
+    assert sent == [
+        ("p0", "0"), ("p1", "0"), ("p0", "10"), ("p0", "20"), ("p0", "25"), ("p2", "0"), ("p1", "3"),
+        ("p3", "0"), ("p3", "10"), ("p3", "20"), ("p3", "30"), ("p3", "40"), ("p3", "41"),
+    ]  # fmt: skip
+    completes = {event.correlation: event.row_count for event in events if isinstance(event, ReferenceComplete)}
+    assert completes == {"p0": 25, "p1": 3, "p2": 0, "p3": 41}

@@ -616,3 +616,48 @@ def test_a22_end_declared_end_closures_need_an_acknowledged_page(closure: Bindin
         "completion_missing_declared_end_witness",
         "completion_terminal_lacks_page_witness",
     }
+
+
+@dataclass(frozen=True)
+class _PhaseRule:
+    """Pure caller rule: an empty phase-1 page moves to phase 2; an empty phase-2 page ends the source."""
+
+    def evaluate(self, page: PageView, /) -> ContinueWith | EndOfSource:
+        phase = page.result["phase"]  # type: ignore[index, call-overload]
+        if page.items:
+            return ContinueWith(
+                (
+                    ParameterUpdate(_LAST_ID, page.items[-1]["id"]),  # type: ignore[index, call-overload]
+                    ParameterUpdate(_LAST_TYPE, 1 if phase == 1 else 3),
+                )
+            )
+        if phase == 1:
+            return ContinueWith((ParameterUpdate(_LAST_ID, 0), ParameterUpdate(_LAST_TYPE, 3)))
+        return EndOfSource()
+
+
+@pytest.mark.asyncio
+async def test_two_empty_pages_with_a_changed_control_vector_end_by_the_rule(scripted_client: ClientFactory) -> None:
+    """Progress is the control vector: two empty pages are not a repeated page when the vector moved."""
+    transport = ScriptedTransport(
+        (
+            ScriptedExchange.json(_notify(), {"result": {"notifications": [], "phase": 1}}),
+            ScriptedExchange.json(_notify(LAST_ID=0, LAST_TYPE=3), {"result": {"notifications": [], "phase": 2}}),
+        )
+    )
+    traversal = ContinuationTraversal(
+        ResultSelector(("notifications",)),
+        _ID,
+        (_LAST_ID, _LAST_TYPE),
+        _PhaseRule(),
+        limit_path=ParameterPath(("LIMIT",)),
+        page_size=1,
+    )
+    stream = scripted_client(transport).iter_list_continuation(_notify(), traversal=traversal)
+    rows, failure = await _drain(stream)
+    assert failure is None
+    assert rows == []
+    transport.assert_exhausted()
+    assert stream.report is not None
+    assert stream.report.exhausted
+    assert stream.report.terminal_reason == _RULE_END

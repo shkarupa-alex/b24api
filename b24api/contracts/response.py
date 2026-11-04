@@ -69,7 +69,7 @@ class BinaryEvidence:
     content_type: str | None
     byte_length: int
     sha256: str | None = None
-    filename_status: FilenameStatus = FilenameStatus.ABSENT
+    filename_status: FilenameStatus = field(default=FilenameStatus.ABSENT, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate evidence fields."""

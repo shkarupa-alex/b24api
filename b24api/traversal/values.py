@@ -124,8 +124,9 @@ def _page_fingerprint(items: Iterable[FrozenJson]) -> str:
 
 
 def _page_fingerprint_policy(items: tuple[FrozenJson, ...], plan: object) -> tuple[str, bool]:
-    """Allow sparse raw windows to have several empty selected pages."""
-    return _page_fingerprint(items), bool(items) or getattr(plan, "sparse_raw_bound", None) is None
+    """Allow sparse raw windows several empty selected pages; skip plans that prove progress by their controls."""
+    track = getattr(plan, "row_fingerprints", True) and (bool(items) or getattr(plan, "sparse_raw_bound", None) is None)
+    return _page_fingerprint(items), track
 
 
 def _extract_path(value: FrozenJson, path: tuple[str | int, ...]) -> FrozenJson:

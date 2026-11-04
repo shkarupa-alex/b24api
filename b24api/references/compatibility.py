@@ -1,4 +1,4 @@
-"""The one pure source-compatibility rule of reference operations (S6).
+"""The one pure source-compatibility rule of reference operations.
 
 Homogeneous facades call it before any binding is read and raise its error; a heterogeneous
 operation calls it for each admitted source and turns its error into a correlated local

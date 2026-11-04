@@ -1,4 +1,4 @@
-"""A fast keyset reference binding's budget view of the shared operation context (#27).
+"""A fast keyset reference binding's budget view of the shared operation context.
 
 The binding holds one fixed row lease ``G`` in the shared row pool from activation to terminal. Its
 runtime plans and fits every wave against a projection of the operation policy that differs only in

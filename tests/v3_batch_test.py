@@ -531,6 +531,7 @@ async def test_a21_presponse_non_safe_outcomes_after_dispatch_are_unknown_withou
 
     outcomes, report = await _run(transport, requests)
 
+    transport.assert_exhausted()
     assert all(isinstance(outcome, CommandOutcomeUnknown) for outcome in outcomes), label
     assert all(
         isinstance(outcome.error, AmbiguousExecutionError) and outcome.error.declared_unsafe
