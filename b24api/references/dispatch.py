@@ -574,7 +574,11 @@ class _BatchPageDispatcher:
                 self.context.release_page(reservation)
             if self._producer_state is not None:
                 self._producer_state.touch()
-            raise BudgetExceededError("batch scheduler admission exceeded operation time budget") from error
+            exceeded = BudgetExceededError("batch scheduler admission exceeded operation time budget")
+            if pending.dispatch_started:
+                # The deadline passed while the page's wave was being sent: it may have executed.
+                exceeded.__dict__["_b24api_dispatch_started"] = True
+            raise exceeded from error
         except BaseException:
             if not admitted.done():
                 admitted.set_result(None)

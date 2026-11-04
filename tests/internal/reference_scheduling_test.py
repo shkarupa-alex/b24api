@@ -13,9 +13,17 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from b24api import ExecutionPolicy, Request
+from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.request import RouteKind
+from b24api.errors import BudgetExceededError
 from b24api.execution import Executor
-from b24api.references.dispatch import _BatchPageDispatcher, _PendingBatch, _ProducerState, _RowBuffer
+from b24api.references.dispatch import (
+    _BatchPageDispatcher,
+    _failed_settlement,
+    _PendingBatch,
+    _ProducerState,
+    _RowBuffer,
+)
 from b24api.references.scheduler import ReferenceScheduler
 from b24api.traversal.plans import KernelBatchDispatch, ReferenceOutputOrder
 from tests.scripting import BatchPortal
@@ -140,3 +148,42 @@ def test_a_fast_lease_is_the_free_rows_clamped_between_the_floor_and_the_share(
 ) -> None:
     """S3 allocation: G = clamp(free - R_keep, P, G_cap); G < Q only while G_cap < Q."""
     assert _grant(pool, free) == granted
+
+
+@pytest.mark.asyncio
+async def test_a_page_whose_wave_was_sent_when_the_deadline_passed_settles_unknown() -> None:
+    """A deadline after the send began proves nothing about execution; a still-queued page was never sent."""
+    portal = BatchPortal(lambda _method, _query: {"result": []})
+    executor = Executor(portal)
+    context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10, max_elapsed=0.2))
+    await context.start()
+    state = _ProducerState({"a", "b"}, {"a": 0, "b": 1})
+    buffer = _RowBuffer(10, context, producer_state=state)
+    dispatcher = _BatchPageDispatcher(
+        executor,
+        context,
+        KernelBatchDispatch(batch_size=1, concurrency=1, coalesce_wait=0.0),
+        producer_state=state,
+        buffer=buffer,
+        page_cap=1,
+    )
+    sending = asyncio.Event()
+
+    async def in_flight(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        sending.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    dispatcher._executor.execute_requests = in_flight  # type: ignore[method-assign, assignment]  # noqa: SLF001
+    sent = asyncio.create_task(dispatcher.fetch(Request("item.list", {"PARENT": "a"}, route=RouteKind.BARE), "a"))
+    await asyncio.wait_for(sending.wait(), timeout=5)
+    queued = asyncio.create_task(dispatcher.fetch(Request("item.list", {"PARENT": "b"}, route=RouteKind.BARE), "b"))
+    results = await asyncio.gather(sent, queued, return_exceptions=True)
+    await dispatcher.aclose()
+    await buffer.close()
+
+    assert all(isinstance(result, BudgetExceededError) for result in results)
+    assert [_failed_settlement(cast("BaseException", result)) for result in results] == [
+        CommandSettlement.UNKNOWN,
+        CommandSettlement.NOT_EXECUTED,
+    ]
