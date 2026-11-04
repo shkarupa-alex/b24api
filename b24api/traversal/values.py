@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, cast
 
 from b24api.contracts.json import FrozenJson, FrozenMapping, _json_type_name
 from b24api.contracts.policy import IdentityCoercion
-from b24api.contracts.request import ResultSelector
+from b24api.contracts.request import (
+    ResultSelector,
+    _MappingValuesResultSelector,
+    _TolerantMappingValuesResultSelector,
+)
 from b24api.contracts.response import ResultCollectionShape, result_snapshot
 from b24api.errors import CapabilityError, PaginationError, ResultShapeError
 
@@ -21,14 +25,6 @@ if TYPE_CHECKING:
 
 type IdentityValue = str | int | tuple[str | int, ...]
 _MISSING = object()
-
-
-class _MappingValuesResultSelector(ResultSelector):
-    pass
-
-
-class _TolerantMappingValuesResultSelector(_MappingValuesResultSelector):
-    pass
 
 
 def _mapping_values(response: Response, selector: ResultSelector) -> tuple[FrozenJson, ...]:

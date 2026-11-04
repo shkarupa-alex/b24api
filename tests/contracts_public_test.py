@@ -138,10 +138,16 @@ def test_keyset_cursor_streams_add_only_the_declared_fields_and_methods() -> Non
         "output_order",
         "coalesce_wait",
     )
-    for traversal in (b24api.SequentialTraversal, b24api.CountedTraversal):
-        assert tuple(field.name for field in fields(traversal))[-1] == "page_adapter"
-    for traversal in (b24api.KeysetTraversal, b24api.CursorTraversal):
-        assert tuple(field.name for field in fields(traversal))[-1] == "page_adapter"
+    for traversal in (
+        b24api.SequentialTraversal,
+        b24api.CountedTraversal,
+        b24api.KeysetTraversal,
+        b24api.CursorTraversal,
+    ):
+        positional = tuple(field.name for field in fields(traversal) if not field.kw_only)
+        keyword_only = tuple(field.name for field in fields(traversal) if field.kw_only)
+        assert positional[-1] == "page_adapter"
+        assert keyword_only == ("collection_shape",)
     assert tuple(field.name for field in fields(b24api.contracts.MembershipRecheck)) == (
         "identities",
         "still_observed",

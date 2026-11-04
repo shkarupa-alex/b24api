@@ -4,8 +4,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
 from b24api.contracts.identity_store import IdentityStore
+from b24api.contracts.request import _MappingValuesResultSelector, _TolerantMappingValuesResultSelector
 from b24api.contracts.response import ResultCollectionShape
-from b24api.traversal.values import _MappingValuesResultSelector, _TolerantMappingValuesResultSelector
 
 if TYPE_CHECKING:
     from b24api.contracts.request import ResultSelector, TraversalIdentity
@@ -16,10 +16,14 @@ def _direction(value: str) -> Literal["asc", "desc"]:
 
 
 def _collection_selector(selector: ResultSelector, shape: ResultCollectionShape) -> ResultSelector:
+    """Lower a declared collection shape into its private selector, exactly once per operation."""
     if not isinstance(shape, ResultCollectionShape):
         raise TypeError("collection_shape must be a ResultCollectionShape")
     if shape is ResultCollectionShape.SEQUENCE:
         return selector
+    already_lowered = isinstance(selector, _MappingValuesResultSelector)
+    if already_lowered:
+        raise ValueError("selector is already lowered to a mapping collection; pass a plain ResultSelector")
     if shape is ResultCollectionShape.MAPPING_VALUES_OR_EMPTY:
         return _TolerantMappingValuesResultSelector(selector.path)
     return _MappingValuesResultSelector(selector.path)

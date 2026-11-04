@@ -57,6 +57,7 @@ from b24api.references.dispatch_plan import kernel_dispatch
 from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem
 from b24api.references.stream import iter_references as _iter_references
 from b24api.traversal.driver import PaginationDriver
+from b24api.traversal.facade_support import _collection_selector
 from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import (
     CountedOffsetMode,
@@ -103,6 +104,12 @@ def _direction(value: str) -> Literal["asc", "desc"]:
 
 
 def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, TraversalIdentity | None]:
+    """Lower one traversal contract, including its collection shape, at the single reference lowering point."""
+    plan, identity = _kernel_list_plan(traversal)
+    return plan, _collection_selector(traversal.selector, traversal.collection_shape), identity
+
+
+def _kernel_list_plan(traversal: TraversalSpec) -> tuple[ListPlan, TraversalIdentity | None]:
     if isinstance(traversal, SequentialTraversal):
         if traversal.offset.sparse_raw_bound is not None:
             # Reference pages carry one provenance record per delivered page; an empty raw window the
@@ -114,7 +121,6 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
                 page_size=traversal.page_size,
                 duplicate_policy=DuplicatePolicy.ERROR,
             ),
-            traversal.selector,
             traversal.identity,
         )
     if isinstance(traversal, CountedTraversal):
@@ -138,7 +144,6 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
                 ),
                 fixed_stride=counted_mechanics.step,
             ),
-            traversal.selector,
             traversal.identity,
         )
     if isinstance(traversal, KeysetTraversal):
@@ -166,7 +171,6 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
                 duplicate_policy=DuplicatePolicy.ERROR,
                 total_semantics=TotalSemantics.IGNORE,
             ),
-            traversal.selector,
             traversal.identity,
         )
     cursor_mechanics = traversal.cursor
@@ -195,7 +199,6 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
             order_semantics=OrderSemantics.ASCENDING if direction == "asc" else OrderSemantics.DESCENDING,
             duplicate_policy=DuplicatePolicy.ERROR,
         ),
-        traversal.selector,
         identity,
     )
 

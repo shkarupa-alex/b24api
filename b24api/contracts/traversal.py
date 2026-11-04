@@ -1,7 +1,7 @@
 """Method-agnostic public list traversal mechanics."""
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal
 
@@ -15,7 +15,14 @@ from b24api.contracts.keyset_execution import (
 )
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import IdentityCoercion
-from b24api.contracts.request import IdentitySpec, ParameterPath, ResultSelector, TraversalIdentity
+from b24api.contracts.request import (
+    IdentitySpec,
+    ParameterPath,
+    ResultSelector,
+    TraversalIdentity,
+    _MappingValuesResultSelector,
+)
+from b24api.contracts.response import ResultCollectionShape
 
 _START = ParameterPath(("start",))
 _FILTER = ParameterPath(("filter",))
@@ -148,6 +155,14 @@ class SparseRawBound:
 def _positive_page_size(value: object) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError("page_size must be a positive integer")
+
+
+def _validate_collection_shape(selector: ResultSelector, shape: object) -> None:
+    """Admit a declared collection shape once; a privately lowered selector already carries one."""
+    if not isinstance(shape, ResultCollectionShape):
+        raise TypeError("collection_shape must be a ResultCollectionShape")
+    if shape is not ResultCollectionShape.SEQUENCE and isinstance(selector, _MappingValuesResultSelector):
+        raise ValueError("selector is already lowered to a mapping collection; pass a plain ResultSelector")
 
 
 def _require_disjoint_paths(*paths: ParameterPath) -> None:
@@ -331,10 +346,12 @@ class SequentialTraversal:
     page_size: int = 50
     offset: OffsetSpec = OffsetSpec()
     page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER
+    collection_shape: ResultCollectionShape = field(default=ResultCollectionShape.SEQUENCE, kw_only=True)
 
     def __post_init__(self) -> None:
-        """Validate page cap."""
+        """Validate page cap and collection shape."""
         _positive_page_size(self.page_size)
+        _validate_collection_shape(self.selector, self.collection_shape)
         if self.offset.page_stride is not None and self.page_size != self.offset.page_stride.max_decoded_rows:
             raise ValueError("page_size must match page_stride max_decoded_rows")
         if self.offset.page_index is not None and self.page_size != self.offset.page_index.max_rows:
@@ -356,10 +373,12 @@ class CountedTraversal:
     page_size: int = 50
     offset: OffsetSpec = _COUNTED_OFFSET
     page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER
+    collection_shape: ResultCollectionShape = field(default=ResultCollectionShape.SEQUENCE, kw_only=True)
 
     def __post_init__(self) -> None:
-        """Validate required identity and page cap."""
+        """Validate required identity, page cap and collection shape."""
         _positive_page_size(self.page_size)
+        _validate_collection_shape(self.selector, self.collection_shape)
         if self.offset.page_index is not None:
             raise ValueError("counted physical batch does not support page_index")
         if self.offset.total_termination is not TotalTermination.EXACT_QUALIFIED:
@@ -383,10 +402,12 @@ class KeysetTraversal:
     keyset: KeysetSpec = KeysetSpec()
     execution: KeysetExecution = _SEQUENTIAL_KEYSET_EXECUTION
     page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER
+    collection_shape: ResultCollectionShape = field(default=ResultCollectionShape.SEQUENCE, kw_only=True)
 
     def __post_init__(self) -> None:
-        """Validate page cap."""
+        """Validate page cap and collection shape."""
         _positive_page_size(self.page_size)
+        _validate_collection_shape(self.selector, self.collection_shape)
         if not isinstance(
             self.execution,
             SequentialKeysetExecution | RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
@@ -403,10 +424,12 @@ class CursorTraversal:
     identity: IdentitySpec | None = None
     page_size: int = 50
     page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER
+    collection_shape: ResultCollectionShape = field(default=ResultCollectionShape.SEQUENCE, kw_only=True)
 
     def __post_init__(self) -> None:
-        """Validate page cap."""
+        """Validate page cap and collection shape."""
         _positive_page_size(self.page_size)
+        _validate_collection_shape(self.selector, self.collection_shape)
 
 
 type TraversalSpec = SequentialTraversal | CountedTraversal | KeysetTraversal | CursorTraversal

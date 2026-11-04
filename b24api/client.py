@@ -32,7 +32,6 @@ from b24api.references.fanout import command_source as fanout_command_source
 from b24api.references.fanout import fanout_stream
 from b24api.settings import Settings, api_settings
 from b24api.transport.protocol import ProtocolCodec
-from b24api.traversal.facade_support import _collection_selector
 from b24api.traversal.keyset_verifier import verify_keyset_capability as _verify_keyset_capability
 
 if TYPE_CHECKING:
@@ -356,11 +355,12 @@ class Bitrix24(_TraversalFacade):
             request,
             bindings,
             traversal=CursorTraversal(
-                selector=_collection_selector(selector, collection_shape),
+                selector=selector,
                 cursor=cursor,
                 identity=identity,
                 page_size=page_size,
                 page_adapter=page_adapter,
+                collection_shape=collection_shape,
             ),
             dispatch=dispatch,
             policy=policy,
