@@ -193,9 +193,10 @@ class BatchPortal:
                 errors[key] = {"error": envelope["error"], "error_description": envelope.get("error_description")}
                 continue
             result[key] = envelope["result"]
-            if "total" in envelope:
+            # A classic batch carries a total or a next only as an integer entry; null means absent.
+            if envelope.get("total") is not None:
                 totals[key] = envelope["total"]
-            if "next" in envelope:
+            if envelope.get("next") is not None:
                 nexts[key] = envelope["next"]
         self.methods.append(tuple(methods))
         body = {
