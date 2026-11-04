@@ -42,6 +42,7 @@ from b24api.contracts import (
 )
 from b24api.contracts.completion import BindingClosure
 from b24api.contracts.policy import ConfirmationPolicy, SnapshotRequirement
+from b24api.errors import BudgetExceededError
 from b24api.execution import ExecutionContext
 from tests.scripting import BatchPortal, Envelope, Query
 
@@ -323,6 +324,36 @@ async def test_a20_variable_a_short_head_continues_sequentially_then_fails_witho
     assert [failure.partial_rows for failure in events if isinstance(failure, ReferenceFailure)] == [1]
     # The head is fetched, adapted and committed once; the next offset is the head's row count.
     assert [int(query.get("start", "0")) for query in portal.queries] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_a20_provenance_a_sent_head_is_unknown_at_the_deadline_and_a_queued_one_is_not_recorded() -> None:
+    """A head whose batch was sent may have executed; a head still queued at the deadline was never sent."""
+
+    async def answer(method: str, query: Query) -> Envelope:
+        del method, query
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    portal = BatchPortal(answer)
+    async with _client(portal) as api:
+        stream = api.iter_reference_outcomes(
+            _request(),
+            _bindings(1, 2),
+            traversal=CountedTraversal(page_size=WIDTH),
+            dispatch=BatchDispatch(batch_size=1, concurrency=1),
+            policy=ExecutionPolicy(max_elapsed=0.2),
+        )
+        with pytest.raises(BudgetExceededError):
+            async with asyncio.timeout(5), stream:
+                _ = [event async for event in stream]
+
+    assert portal.waves == [1]
+    assert [query["PARENT"] for query in portal.queries] == ["1"]
+    trace = _report(stream).page_trace
+    assert [(record.reference_index, record.offset, record.dispatch, record.outcome) for record in trace] == [
+        (0, 0, PageDispatch.BATCH, PageOutcome.UNKNOWN)
+    ]
 
 
 @pytest.mark.asyncio
