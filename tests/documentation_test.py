@@ -109,6 +109,16 @@ def test_migration_covers_changed_completion_stop_keyset_and_replay_contracts() 
     assert "partial_rows" in reference
 
 
+def test_v3_envelope_grouping_reads_the_same_in_the_readme_and_the_migration_guide() -> None:
+    """S4: SAFE runs never carry a non-SAFE command; UNSAFE and UNKNOWN share one run."""
+    readme = " ".join(README.read_text(encoding="utf-8").split())
+    migration = " ".join(MIGRATION.read_text(encoding="utf-8").split())
+
+    assert "`UNSAFE` and `UNKNOWN` share a run" in readme
+    assert "`UNSAFE` and `UNKNOWN` share a run" in migration
+    assert "equal replay safety" not in migration
+
+
 @pytest.mark.parametrize("name", ["h2", "hpack"])
 def test_migration_guide_states_the_hpack_stack_bounds(name: str) -> None:
     # 3.0.0 made both direct requirements (C2); a consumer pinned outside them learns it before resolving.

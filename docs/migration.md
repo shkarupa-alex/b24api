@@ -149,12 +149,12 @@ that choice. The CLI likewise requires `--route bare|json|api_v3` for `call`, `l
 `verify-keyset`. A classic webhook base must have the form `/rest/<user>/<token>/`. The transport
 resolves bare and `.json` suffixes or `/rest/api/<user>/<token>/` at dispatch. Classic physical
 batches carry only `BARE` commands; `JSON` commands need direct dispatch. `API_V3` commands travel in
-native REST 3.0 batch envelopes (one JSON array per run of equal replay safety) on a transport that
-advertises JSON-array bodies, such as `HttpxTransport`; on any other transport they are refused with
-`CapabilityError` before any request. Before this native envelope existed, every non-`BARE` batch
-command was refused, so code that relied on that refusal for `API_V3` commands now sends them;
-`UNSAFE` and `UNKNOWN` commands of an envelope that may have run arrive as unknown and are never
-resent. V3 accepts a JSON
+native REST 3.0 batch envelopes (one JSON array per contiguous run of `SAFE` commands or of non-`SAFE`
+commands, so `UNSAFE` and `UNKNOWN` share a run) on a transport that advertises JSON-array bodies,
+such as `HttpxTransport`; on any other transport they are refused with `CapabilityError` before any
+request. Before this native envelope existed, every non-`BARE` batch command was refused, so code
+that relied on that refusal for `API_V3` commands now sends them; `UNSAFE` and `UNKNOWN` commands of
+an envelope that may have run arrive as unknown and are never resent. V3 accepts a JSON
 body and reports object-valued API errors with typed validation details. A transport serves only the
 routes it declares in `TransportCapabilities.routes`, which defaults to `BARE`; `HttpxTransport`
 declares all three. A custom send-only transport, which cannot declare routes, serves only `BARE`.

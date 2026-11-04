@@ -1,8 +1,10 @@
-"""The one pure source-compatibility rule of reference operations.
+"""Pure source-compatibility rules of reference operations.
 
-Homogeneous facades call it before any binding is read and raise its error; a heterogeneous
-operation calls it for each admitted source and turns its error into a correlated local
-non-execution of that source, before any HTTP request.
+Homogeneous facades call ``source_incompatibility`` before any binding is read and raise its
+error; a heterogeneous operation calls it for each admitted source and turns its error into a
+correlated local non-execution of that source, before any HTTP request. ``source_route_incompatibility``
+is heterogeneous-only: it refuses a request no batch envelope carries, which the homogeneous
+facades keep failing per binding at dispatch, as in 2.5.2.
 """
 
 from __future__ import annotations
