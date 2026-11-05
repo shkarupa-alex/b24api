@@ -511,8 +511,8 @@ async def test_a21_mixed_bare_and_v3_never_share_an_envelope() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a21_mixed_a_group_the_budget_stops_before_its_send_is_not_a_batch_request() -> None:
-    """A21-MIXED: batch_requests counts an envelope only once its first physical attempt is reserved."""
+async def test_a21_mixed_a_group_the_budget_stops_before_its_send_counts_like_a_chunk() -> None:
+    """A21-MIXED: an admitted envelope group counts as it starts, as a 2.5.2 chunk did, even if the budget stops it."""
     bare = Request("x.item.get", {"id": 1}, SAFE, route=RouteKind.BARE)
     v3 = _v3(2)
     transport = ScriptedTransport((ScriptedExchange.batch((bare,), (_item(1),), total=1),))
@@ -524,7 +524,7 @@ async def test_a21_mixed_a_group_the_budget_stops_before_its_send_is_not_a_batch
     assert isinstance(outcomes[1].error, BudgetExceededError)
     assert len(transport.wire_calls) == 1
     assert report.physical_requests == 1
-    assert report.batch_requests == 1
+    assert report.batch_requests == TWO
     transport.assert_exhausted()
 
     both = ScriptedTransport(
