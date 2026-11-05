@@ -592,17 +592,39 @@ async def test_ax_closing_mid_tail_cleans_up_once_without_deadlock(order: Delive
 
 @pytest.mark.asyncio
 async def test_ax_cancelling_the_consumer_keeps_the_primary_cancellation() -> None:
-    portal = BatchPortal(_slow_first_tail_wave(ROWS))
+    """The cancellation reaches the consumer while it waits inside the stream, with a tail wave in flight."""
+    tail_sent = asyncio.Event()
+
+    async def answer(method: str, query: Query) -> Envelope:
+        if int(query.get("start", "0")) == WIDTH:
+            tail_sent.set()
+            await asyncio.sleep(0.05)
+        return _dense(ROWS)(method, query)
+
+    portal = BatchPortal(answer)
     async with _client(portal) as api:
         stream = api.iter_reference_outcomes(_request(), _bindings(1, 2), traversal=CountedTraversal(page_size=WIDTH))
+        waiting = False
 
         async def consume() -> None:
+            nonlocal waiting
             async with stream:
-                async for _event in stream:
+                events = aiter(stream)
+                while True:
+                    waiting = True
+                    try:
+                        await anext(events)
+                    except StopAsyncIteration:
+                        return
+                    finally:
+                        waiting = False
                     await asyncio.sleep(0)
 
         task = asyncio.create_task(consume())
-        await asyncio.sleep(0.01)
+        await tail_sent.wait()
+        # Cancel only once the consumer is suspended inside the stream, not in its own loop body.
+        while not waiting:  # noqa: ASYNC110 - an Event wake-up could arrive after the consumer left the stream
+            await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

@@ -56,7 +56,7 @@ from b24api.references.dispatch import _RowBuffer
 from tests.scripting import BatchPortal, client_for
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
 
     from b24api.contracts import ReferenceOutcome, TraversalSpec
     from tests.scripting import Envelope, Query
@@ -374,12 +374,20 @@ async def test_a_contended_input_frontier_sends_its_own_pages_before_a_later_hea
     third binding's head take them, sending ``p0@0, p1@0, p2@0, p0@10, p0@20, p0@25, ...``; the
     frontier reserve now keeps them for the frontier, so ``p2@0`` follows ``p0``'s pages. Events and
     the report are unchanged; only this physical send order differs.
+
+    The bindings come from an async iterable, read on the event loop: a list is pulled in a worker
+    thread, so when a later head reaches the queue would depend on thread scheduling.
     """
+
+    async def bindings() -> AsyncIterator[Binding[str]]:
+        for parent in ("p0", "p1", "p2", "p3"):
+            yield Binding(parent, (ParameterUpdate(_PARENT, parent),), parent)
+
     portal = BatchPortal(_offset_answer)
     async with client_for(portal, policy=ExecutionPolicy(max_buffered_rows=20)) as client:
         stream = client.iter_reference_outcomes(
             Request.bare("offset.list", {}, ReplaySafety.SAFE),
-            [Binding(parent, (ParameterUpdate(_PARENT, parent),), parent) for parent in ("p0", "p1", "p2", "p3")],
+            bindings(),
             traversal=SequentialTraversal(identity=_identity(), page_size=PAGE),
             dispatch=BatchDispatch(batch_size=2, output_order=DeliveryOrder.INPUT, coalesce_wait=0.0),
         )
@@ -387,8 +395,8 @@ async def test_a_contended_input_frontier_sends_its_own_pages_before_a_later_hea
             events = [event async for event in stream]
     sent = [(query["PARENT"], query.get("start", "0")) for query in portal.queries]
     assert sent == [
-        ("p0", "0"), ("p1", "0"), ("p0", "10"), ("p0", "20"), ("p0", "25"), ("p2", "0"), ("p1", "3"),
-        ("p3", "0"), ("p3", "10"), ("p3", "20"), ("p3", "30"), ("p3", "40"), ("p3", "41"),
+        ("p0", "0"), ("p1", "0"), ("p0", "10"), ("p0", "20"), ("p0", "25"), ("p2", "0"), ("p3", "0"),
+        ("p1", "3"), ("p3", "10"), ("p3", "20"), ("p3", "30"), ("p3", "40"), ("p3", "41"),
     ]  # fmt: skip
     completes = {event.correlation: event.row_count for event in events if isinstance(event, ReferenceComplete)}
     assert completes == {"p0": 25, "p1": 3, "p2": 0, "p3": 41}

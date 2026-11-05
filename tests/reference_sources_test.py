@@ -135,13 +135,20 @@ def _rows(events: list[ReferenceOutcome[int]], index: int) -> list[object]:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
 async def test_a28_different_templates_share_the_dispatcher_and_keep_separate_state(order: DeliveryOrder) -> None:
+    # An async source is read on the event loop; a list is pulled in a worker thread, whose timing
+    # would decide whether the second source's head reaches the first wave.
+    async def sources() -> AsyncIterator[ReferenceSource[int]]:
+        yield _alpha()
+        yield _beta()
+
     portal = BatchPortal(_answer)
     async with _client(portal) as api:
-        events, report = await _collect(api, [_alpha(), _beta()], dispatch=BatchDispatch(output_order=order))
+        events, report = await _collect(api, sources(), dispatch=BatchDispatch(output_order=order))
 
-    # Pages of both methods coalesce into shared physical batches (INPUT coalesces as the homogeneous facade does).
-    assert any(sorted(wave) == ["alpha.list", "beta.list"] for wave in portal.methods)
     if order is DeliveryOrder.READY:
+        # Pages of both methods coalesce into shared physical batches. Under INPUT, as on the homogeneous
+        # facade, a wave forms only from pages ready at the same moment, so sharing one is opportunistic.
+        assert any(sorted(wave) == ["alpha.list", "beta.list"] for wave in portal.methods)
         assert portal.waves == [2, 2, 1]
     assert _rows(events, 0) == [4, 3, 2, 1]
     assert _rows(events, 1) == [4]
