@@ -874,6 +874,42 @@ async def test_tolerant_reference_preserves_kernel_replay_disposition() -> None:
     assert violation.replay_disposition is ReplayDisposition.ELIGIBLE
 
 
+@pytest.mark.asyncio
+async def test_homogeneous_reference_chunk_the_budget_stops_still_counts_as_in_2_5_2() -> None:
+    """AHOMO: an admitted one-page batch counts as a batch request even when the budget stops its send."""
+
+    def handler(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {
+            "result": {
+                "result": {key: [] for key in commands},
+                "result_error": [],
+                "result_total": [],
+                "result_next": [],
+            }
+        }
+
+    transport = ResponderTransport(handler)
+    stream = _client(transport).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        [Binding("a", (), "a"), Binding("b", (), "b")],
+        traversal=SequentialTraversal(),
+        dispatch=BatchDispatch(batch_size=1),
+        policy=ExecutionPolicy(max_requests=1),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+
+    assert isinstance(outcomes[0], ReferenceComplete)
+    assert isinstance(outcomes[1], ReferenceFailure)
+    assert isinstance(outcomes[1].error, BudgetExceededError)
+    assert len(transport.requests) == 1
+    assert stream.report is not None
+    assert stream.report.physical_requests == 1
+    assert stream.report.batch_requests == REFERENCE_BINDINGS
+
+
 def test_counted_reference_rejects_direct_dispatch_before_binding_pull_or_io() -> None:
     pulled = False
 

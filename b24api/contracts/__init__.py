@@ -28,6 +28,15 @@ from b24api.contracts.completion import (
     StreamClosure,
     StreamTerminal,
 )
+from b24api.contracts.continuation import (
+    ContinuationRule,
+    ContinueWith,
+    EndOfSource,
+    ResponseCursorRule,
+    ResponseFlagTerminal,
+    WindowClassifier,
+    WindowRows,
+)
 from b24api.contracts.dispatch import BatchDispatch, DeliveryOrder, DirectDispatch, DispatchSpec
 from b24api.contracts.identity_store import IdentityStore, identity_store_key
 from b24api.contracts.json import FrozenJson, FrozenMapping, JsonScalar, JsonValue
@@ -93,6 +102,7 @@ from b24api.contracts.reference import (
     ReferenceOutcomeUnknown,
     partition_reference_outcomes,
 )
+from b24api.contracts.reference_source import ReferenceSource
 from b24api.contracts.report import (
     KeysetExecutionReport,
     KeysetSelectionSummary,
@@ -121,13 +131,15 @@ from b24api.contracts.request import (
     TraversalIdentity,
 )
 from b24api.contracts.request_summary import RequestSummary, RouteKind
-from b24api.contracts.response import BinaryEvidence, BinaryResponse, Response, ResultCollectionShape
+from b24api.contracts.response import BinaryEvidence, BinaryResponse, FilenameStatus, Response, ResultCollectionShape
 from b24api.contracts.stream import OperationStream, PartialResult
 from b24api.contracts.traversal import (
+    ContinuationTraversal,
     CountedTraversal,
     CursorDomain,
     CursorSpec,
     CursorTraversal,
+    InclusiveWindowTraversal,
     KeysetSpec,
     KeysetTraversal,
     OffsetContinuation,
@@ -173,7 +185,10 @@ __all__ = [
     "CompletionEvent",
     "CompositeIdentitySpec",
     "ConsistencyPolicy",
+    "ContinuationRule",
+    "ContinuationTraversal",
     "ContinuePage",
+    "ContinueWith",
     "CountedTraversal",
     "CursorDomain",
     "CursorSpec",
@@ -184,7 +199,9 @@ __all__ = [
     "DuplicatePolicy",
     "EmptyArray",
     "EmptyObject",
+    "EndOfSource",
     "ExecutionPolicy",
+    "FilenameStatus",
     "FrozenJson",
     "FrozenMapping",
     "IdentityCoercion",
@@ -192,6 +209,7 @@ __all__ = [
     "IdentityPageAdapter",
     "IdentitySpec",
     "IdentityStore",
+    "InclusiveWindowTraversal",
     "JsonScalar",
     "JsonValue",
     "KeysetAssuranceSource",
@@ -250,6 +268,7 @@ __all__ = [
     "ReferenceNotExecuted",
     "ReferenceOutcome",
     "ReferenceOutcomeUnknown",
+    "ReferenceSource",
     "ReplayDisposition",
     "ReplaySafety",
     "Request",
@@ -258,6 +277,8 @@ __all__ = [
     "RequestSpec",
     "RequestSummary",
     "Response",
+    "ResponseCursorRule",
+    "ResponseFlagTerminal",
     "ResultCollectionShape",
     "ResultErrorShape",
     "ResultErrorSpec",
@@ -285,6 +306,8 @@ __all__ = [
     "UnknownRequestCollector",
     "Violation",
     "ViolationSeverity",
+    "WindowClassifier",
+    "WindowRows",
     "identity_store_key",
     "partition_command_outcomes",
     "partition_reference_outcomes",

@@ -238,11 +238,13 @@ class ProtocolCodec:
         for issue in issues[:_MAX_VALIDATION_ITEMS]:
             if not isinstance(issue, Mapping):
                 raise TypeError("V3 validation item must be an object")
+            # The server omits ``field`` for a refusal that names no field: absent stays None, never invented.
+            # A present key, including an explicit null, must still be a string.
             field = issue.get("field")
             detail = issue.get("message")
-            if not isinstance(field, str) or not isinstance(detail, str):
-                raise TypeError("V3 validation field and message must be strings")
-            bounded.append(ValidationIssue(render(field), render(detail)))
+            if ("field" in issue and not isinstance(field, str)) or not isinstance(detail, str):
+                raise TypeError("V3 validation field, when present, and message must be strings")
+            bounded.append(ValidationIssue(None if field is None else render(field), render(detail)))
         if len(code) > _MAX_VALIDATION_TEXT:
             # A code is cut only after redaction, like the texts above: cutting first would turn a known secret
             # into a prefix that exact-secret redaction no longer recognizes.

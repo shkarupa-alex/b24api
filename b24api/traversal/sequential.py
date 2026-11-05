@@ -200,6 +200,14 @@ class CountedStrategy:
         ctx.cursor_state = 0
         return self._request(ctx, 0)
 
+    def seed_head(self, ctx: StrategyContext) -> None:
+        """Adopt an already dispatched offset-zero head instead of requesting it again."""
+        if self._visited:
+            raise RuntimeError("counted sequential strategy was already started")
+        ctx.cursor_state = 0
+        self._visited.add(0)
+        self._offset = 0
+
     def _request(self, ctx: StrategyContext, offset: int) -> Request:
         if offset in self._visited:
             raise PaginationError("counted offset cycle detected")

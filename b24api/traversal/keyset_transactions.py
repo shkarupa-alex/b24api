@@ -99,7 +99,7 @@ async def execute_wave(
         )
         outcomes = await host.engine.execute_requests(
             tuple(plan.request for plan in plans),
-            context=host.context,
+            context=host.context.execution_context,
             advisory_totals=advisory,
             strict_envelope=True,
             strict_json_members=True,
@@ -340,7 +340,7 @@ async def execute_finish_page(
     try:
         await host.adjust_buffer(host.effective_page_cap)
         host.completion_recorder.schedule(plan.command_id)
-        response = await host.executor.execute(request, context=host.context)
+        response = await host.executor.execute(request, context=host.context.execution_context)
         host.completion_recorder.settle(plan.command_id, CommandSettlement.SUCCESS)
         host.context.commit_page(reservation)
         outcome = BatchSuccess(0, "finish", request, response.result, response=response)

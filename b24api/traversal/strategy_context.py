@@ -120,6 +120,10 @@ class StrategyContext(Protocol):
         """Return the identities of the page's items."""
         ...
 
+    def identity_seen(self, value: IdentityValue) -> bool:
+        """Return whether a committed page of this traversal already held the identity."""
+        ...
+
     def require_identity(self, plan_name: str) -> IdentitySpec:
         """Return the scalar identity a plan requires, or reject the plan."""
         ...
@@ -137,6 +141,14 @@ class StrategyContext(Protocol):
         """Fetch one page directly, accounting for it in the operation budget."""
         ...
 
+    def continue_sequential(
+        self,
+        strategy: SequentialPageStrategy,
+        identities: list[IdentityValue],
+    ) -> AsyncGenerator[_Page]:
+        """Continue a sequential strategy after an externally committed seed page."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class PageVerdict:
@@ -144,6 +156,10 @@ class PageVerdict:
 
     terminal: bool
     identities: list[IdentityValue] | None = None
+    # Row indexes the page admits, in source order; ``None`` admits every row.
+    admitted: tuple[int, ...] | None = None
+    # Deliver a valid page even when it admits no row, so a page-stop policy still sees it.
+    deliver_empty: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from b24api.contracts.command import NotExecutedReason
     from b24api.contracts.completion import BindingClosure
     from b24api.contracts.error_base import B24ApiError
+    from b24api.contracts.report import KeysetExecutionReport, KeysetSelectionSummary
 
 _SUMMARY_MAXIMUM = 256
 
@@ -89,6 +90,11 @@ class ReferenceComplete[C]:
     ``closure`` names the witness that ended this binding (for example ``SOURCE_EMPTY`` or
     ``DECLARED_SHORT_PAGE``); it is excluded from equality and hashing, so comparisons by the
     other fields keep their meaning, and it is ``None`` only on a value built without it.
+
+    ``keyset_selection`` and ``keyset_execution`` describe a keyset binding run with an explicit
+    fast or automatic execution: which strategy the caller asked for, which one ran and why, and the
+    redacted execution evidence of a fast run. Both are ``None`` for every other binding and are
+    likewise excluded from equality and hashing.
     """
 
     binding_index: int
@@ -97,6 +103,8 @@ class ReferenceComplete[C]:
     exhausted: bool = True
     stop_reason: str | None = None
     closure: BindingClosure | None = field(default=None, compare=False)
+    keyset_selection: KeysetSelectionSummary | None = field(default=None, compare=False, repr=False, kw_only=True)
+    keyset_execution: KeysetExecutionReport | None = field(default=None, compare=False, repr=False, kw_only=True)
 
 
 @dataclass(frozen=True, slots=True)

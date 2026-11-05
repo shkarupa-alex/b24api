@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from b24api._error_types import ErrorOrigin, FailurePhase
+from b24api.contracts.continuation import ContinuationReason
 from b24api.contracts.error_base import B24ApiError, BudgetExceededError
 from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.keyset_capability import KeysetCapabilityReport, KeysetCapabilityVerdict, KeysetInconclusiveReason
@@ -82,9 +83,9 @@ class EnvelopeContractError(HTTPGatewayError, ProtocolError):
 
 @dataclass(frozen=True, slots=True)
 class ValidationIssue:
-    """One redacted V3 validation location and message."""
+    """One redacted V3 validation location and message; ``field`` is None when the server names no field."""
 
-    field: str
+    field: str | None
     message: str
 
 
@@ -182,6 +183,34 @@ class PaginationError(B24ApiError):
     """Pagination invariant violation."""
 
     default_origin = ErrorOrigin.PAGINATION
+
+
+class ContinuationError(PaginationError):
+    """A continuation rule or inclusive window could not prove the next page; the source is not exhausted.
+
+    The message names only the closed ``reason`` and a fixed explanation: control values, cursor
+    tokens, timestamps and callback text never enter it.
+    """
+
+    def __init__(
+        self,
+        reason: ContinuationReason,
+        message: str,
+        *,
+        request_summary: RequestSummary | None = None,
+        redactor: Redactor = DEFAULT_REDACTOR,
+    ) -> None:
+        """Build value-free continuation diagnostics."""
+        if not isinstance(reason, ContinuationReason):
+            raise TypeError("reason must be a ContinuationReason")
+        self.reason = reason
+        super().__init__(f"{message} ({reason.value})", request_summary=request_summary, redactor=redactor)
+
+    def to_safe_dict(self) -> dict[str, object]:
+        """Return structured value-free continuation evidence."""
+        safe = super().to_safe_dict()
+        safe["reason"] = self.reason.value
+        return safe
 
 
 class IdentityContractError(PaginationError):
@@ -494,6 +523,8 @@ __all__ = (
     "BatchFailed",
     "BudgetExceededError",
     "CapabilityError",
+    "ContinuationError",
+    "ContinuationReason",
     "EnvelopeContractError",
     "ErrorOrigin",
     "FailurePhase",

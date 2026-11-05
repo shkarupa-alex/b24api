@@ -172,6 +172,22 @@ class _ExampleClient:
     ) -> _ExampleStream[object]:
         return self._references(bindings)
 
+    @real_signature
+    def iter_list_continuation(self, _request: Request, **_kwargs: object) -> _ExampleStream[object]:
+        return self._rows()
+
+    @real_signature
+    def iter_list_window(self, _request: Request, **_kwargs: object) -> _ExampleStream[object]:
+        return self._rows()
+
+    @real_signature
+    def iter_reference_sources(self, sources: Iterable[object], **_kwargs: object) -> _ExampleStream[object]:
+        return self._references(cast("Any", source).binding for source in sources)
+
+    @real_signature
+    def iter_reference_source_outcomes(self, sources: Iterable[object], **_kwargs: object) -> _ExampleStream[object]:
+        return self.iter_reference_sources(sources)
+
     @staticmethod
     def _references(bindings: Iterable[object]) -> _ExampleStream[object]:
         binding = next(iter(bindings))

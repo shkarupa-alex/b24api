@@ -1,7 +1,7 @@
 """Immutable public values shared by execution and evidence layers."""
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from b24api.contracts.completion import EmptySourceWitness
@@ -39,6 +39,8 @@ class KernelReport:
     page_trace_truncated: bool = False
     keyset_execution: KeysetExecutionReport | None = None
     empty_source_witness: EmptySourceWitness | None = None
+    ambiguous_physical_attempts: int = field(default=0, kw_only=True)
+    batch_isolation_requests: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:  # noqa: C901 - one flat validation of every report field
         """Validate and normalize instance state."""
@@ -65,6 +67,8 @@ class KernelReport:
             self.batch_commands,
             self.retries,
             self.buffered_rows_high_water,
+            self.ambiguous_physical_attempts,
+            self.batch_isolation_requests,
         )
         if any(not _is_plain_int(value) or value < 0 for value in counters) or self.cooldown_seconds < 0:
             raise ValueError("report counters must be non-negative")

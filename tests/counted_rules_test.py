@@ -1,10 +1,11 @@
 """Table R: counted contradiction rules, observed on the batched and the sequential counted paths.
 
 Each row serves the same offset-keyed pages to ``iter_list_counted`` (direct head plus batched tail)
-and to a counted reference binding (sequential ``_counted`` behind the batch queue). The expected
-outcome per path pins today's behavior: only R2 (``continuation_after_total``) is shared, so the
-sequential path newly rejects a page that reaches its total while a positive ``next`` remains, and
-keeps accepting variable-width pages that only the parallel plan's prerequisites reject.
+and to a counted reference binding (head and dense tail in the shared batch queue, #20). Both share
+the counted head transaction: a head whose width is proven goes dense and its tail is judged by the
+same range rules on both paths, while a reference head that does not prove its width continues on
+the sequential counted rules, which keep accepting what only the parallel plan's prerequisites
+reject (``next_out_of_range``).
 """
 
 from __future__ import annotations
@@ -69,8 +70,8 @@ _FIXED_STRIDE = OffsetSpec(
     page_stride=PageStride(server_granularity=PAGE, wire_increment=PAGE, max_decoded_rows=PAGE),
 )
 TABLE_R = (
-    # The sequential path requires a total on every page; only the batched head witnesses an empty source.
-    Row("empty_head", {0: (0, None, None)}, "completed:0", "_PageRejectionError: ended before its exact total"),
+    # Both paths share the counted head transaction, so an empty head without a total witnesses an empty source (#11).
+    Row("empty_head", {0: (0, None, None)}, "completed:0", "completed:0"),
     Row("zero_total_no_next", {0: (0, 0, None)}, "completed:0", "completed:0"),
     # Shared driver rule: an empty page may not keep a continuation unless the plan is FIXED_STEP.
     Row(
@@ -96,11 +97,12 @@ TABLE_R = (
         "CapabilityError: head length contradicts the planned exact range",
         "completed:4",
     ),
+    # A full declared head with a consistent next proves the dense width; the tail drift stops it on both paths.
     Row(
         "total_changed",
         {0: (2, 4, 2), 2: (2, 5, None)},
         "CapabilityError: page total contradicts the head total",
-        "_PageRejectionError: exact total drifted",
+        "CapabilityError: page total contradicts the head total",
     ),
     # R2, the only rule the sequential path takes over from the batched head (A8).
     Row(
@@ -109,12 +111,20 @@ TABLE_R = (
         "CapabilityError: completed while continuation remained",
         "CapabilityError: completed while continuation remained",
     ),
-    # H5/T1 is a fixed-width prerequisite of the parallel plan, never applied to sequential pages.
+    # A dense head plans a fixed-width tail; a short tail page then contradicts that range (A20-VARIABLE).
     Row(
         "variable_width",
         {0: (2, 5, 2), 2: (1, 5, 3), 3: (2, 5, None), 4: (1, 5, None)},
         "CapabilityError: page length contradicts the planned exact range",
-        "completed:5",
+        "CapabilityError: page length contradicts the planned exact range",
+    ),
+    # A short head (no full declared page) proves no width: the flat tail strides by the observed next,
+    # while the reference continues on the sequential counted rules from offset head_rows.
+    Row(
+        "short_head",
+        {0: (1, 4, 1), 1: (1, 4, 2), 2: (1, 4, 3), 3: (1, 4, None)},
+        "completed:4",
+        "completed:4",
     ),
     Row("fixed_step_ignores_next", {0: (2, 3, 2), 2: (1, 3, 1)}, "completed:3", "completed:3", _FIXED_STEP),
     Row("fixed_stride", {0: (2, 3, 2), 2: (1, 3, None)}, "completed:3", "completed:3", _FIXED_STRIDE),

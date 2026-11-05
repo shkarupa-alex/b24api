@@ -28,7 +28,7 @@ from b24api.execution.lifecycle import (
 )
 from b24api.execution.snapshot import KernelReport
 from b24api.references.dispatch import (
-    ReferenceSource,
+    ReferenceRequestSource,
     ReferenceStreamItem,
 )
 from b24api.references.outcome import KernelReferenceItem, ReferenceRequest
@@ -48,8 +48,10 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from b24api.contracts.page_stop import PageStopPolicy
+    from b24api.contracts.report import KeysetSelectionSummary
     from b24api.contracts.request import ResultSelector, TraversalIdentity
     from b24api.execution import Executor
+    from b24api.references.program import FastKeysetProgram
 
 
 class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
@@ -58,7 +60,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     def __init__(
         self,
         scheduler: ReferenceScheduler,
-        source: ReferenceSource | OwnedSource[ReferenceRequest],
+        source: ReferenceRequestSource | OwnedSource[ReferenceRequest],
         *,
         assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
     ) -> None:
@@ -177,6 +179,8 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             retries=snapshot.retries,
             cooldown_seconds=snapshot.cooldown_seconds,
             buffered_rows_high_water=snapshot.counters.buffered_rows_high_water,
+            ambiguous_physical_attempts=snapshot.ambiguous_physical_attempts,
+            batch_isolation_requests=snapshot.batch_isolation_requests,
             violations=violations,
             terminal_reason=reason,
             caller_stopped=bool(self._scheduler.stopped_bindings),
@@ -211,7 +215,9 @@ def _accept_reference(item: object, _index: int) -> ReferenceRequest:
     return item
 
 
-def own_reference_source(source: ReferenceSource | OwnedSource[ReferenceRequest]) -> OwnedSource[ReferenceRequest]:
+def own_reference_source(
+    source: ReferenceRequestSource | OwnedSource[ReferenceRequest],
+) -> OwnedSource[ReferenceRequest]:
     """Adopt a raw reference source; a family that already owns its source passes it through."""
     if isinstance(source, OwnedSource):
         return cast("OwnedSource[ReferenceRequest]", source)
@@ -220,7 +226,7 @@ def own_reference_source(source: ReferenceSource | OwnedSource[ReferenceRequest]
 
 def iter_references(  # noqa: PLR0913
     executor: Executor,
-    requests: ReferenceSource | OwnedSource[ReferenceRequest],
+    requests: ReferenceRequestSource | OwnedSource[ReferenceRequest],
     *,
     plan: ListPlan,
     dispatch: DispatchPlan,
@@ -237,6 +243,8 @@ def iter_references(  # noqa: PLR0913
     _assurance: CompletionAssurance = CompletionAssurance.CALLER_ASSERTED,
     _page_adapter: PageAdapter = _IDENTITY_PAGE_ADAPTER,
     _page_stop: PageStopPolicy | None = None,
+    _fast: FastKeysetProgram | None = None,
+    _keyset_selection: KeysetSelectionSummary | None = None,
 ) -> ReferenceStream:
     """Construct a lazy bounded reference traversal stream without I/O."""
     PaginationDriver.validate_plan(plan)
@@ -266,6 +274,8 @@ def iter_references(  # noqa: PLR0913
         page_cap_hint=_page_cap_hint,
         page_adapter=_page_adapter,
         page_stop=_page_stop,
+        fast=_fast,
+        keyset_selection=_keyset_selection,
     )
     return ReferenceStream(
         scheduler,

@@ -26,11 +26,23 @@ from b24api.contracts.policy import (
 from b24api.contracts.report import KeysetSelectionSummary, TraversalAssurance, Violation
 from b24api.contracts.request import IdentitySpec, RequestLike, ResultSelector, TraversalIdentity, canonical_request
 from b24api.contracts.request_summary import RouteKind
-from b24api.contracts.traversal import OffsetContinuation, ShortPageTermination, TotalTermination
+from b24api.contracts.traversal import (
+    ContinuationTraversal,
+    InclusiveWindowTraversal,
+    OffsetContinuation,
+    ShortPageTermination,
+    TotalTermination,
+)
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.counted import CountedItemStream
-from b24api.traversal.facade_support import _checked_identity_store, _collection_selector, _direction
+from b24api.traversal.facade_support import (
+    _checked_identity_store,
+    _collection_selector,
+    _cursor_page_contract,
+    _direction,
+    declared_traversal_plan,
+)
 from b24api.traversal.keyset_eligibility import validate_fast_keyset
 from b24api.traversal.keyset_fast_stream import KeysetFastStream
 from b24api.traversal.keyset_observation import FastTraceRecorder
@@ -326,6 +338,7 @@ def cursor_stream(  # noqa: PLR0913
         coercion=cursor.coercion,
     )
     direction = _direction(cursor.direction)
+    page_order, order_semantics = _cursor_page_contract(cursor)
     plan = ItemCursorPlan(
         cursor_request_path=cursor.parameter_path,
         cursor_item_path=cursor.item_path,
@@ -338,8 +351,10 @@ def cursor_stream(  # noqa: PLR0913
         allow_create_controls=cursor.allow_create_controls,
         domain=cursor.domain,
         identity_requirement=IdentityRequirement.REQUIRED,
-        order_semantics=OrderSemantics.ASCENDING if direction == "asc" else OrderSemantics.DESCENDING,
+        order_semantics=order_semantics,
         duplicate_policy=DuplicatePolicy.ERROR,
+        page_order=page_order,
+        response_terminal=cursor.continuation,
     )
     return _plan_stream(
         executor,
@@ -353,9 +368,56 @@ def cursor_stream(  # noqa: PLR0913
         page_stop=page_stop,
         policy=policy,
         operation="iter_list_cursor",
-        assurance=TraversalAssurance.IDENTITY_EXACT,
+        # A response flag proves the endpoint's stop rule, not an observed empty confirmation.
+        assurance=(
+            TraversalAssurance.MECHANICS_ONLY if cursor.continuation is not None else TraversalAssurance.IDENTITY_EXACT
+        ),
         deregister=deregister,
         audit_violations=audit_violations,
+    )
+
+
+class _DeclaredOptions(TypedDict, total=False):
+    """Optional caller choices of a continuation or window stream."""
+
+    page_stop: PageStopPolicy | None
+    audit_violations: tuple[Violation, ...]
+
+
+def declared_stream(
+    executor: Executor,
+    request: RequestLike,
+    *,
+    traversal: ContinuationTraversal | InclusiveWindowTraversal,
+    policy: ExecutionPolicy,
+    deregister: Deregister,
+    **options: Unpack[_DeclaredOptions],
+) -> OperationStream[JsonValue]:
+    """Compose a caller-rule continuation or an inclusive-window traversal.
+
+    Both close on a declared response or rule witness, never on an observed count, so the report
+    claims mechanics only.
+    """
+    page_stop = options.get("page_stop")
+    audit_violations = options.get("audit_violations", ())
+    plan, selector, identity, page_cap = declared_traversal_plan(traversal)
+    source = _iter_list(
+        executor,
+        canonical_request(request),
+        plan=plan,
+        selector=selector,
+        identity=identity,
+        policy=policy,
+        _page_cap_hint=page_cap,
+        _page_adapter=traversal.page_adapter,
+        _page_stop=page_stop,
+    )
+    return _mapped_stream(
+        source,
+        operation=("iter_list_continuation" if isinstance(traversal, ContinuationTraversal) else "iter_list_window"),
+        assurance=TraversalAssurance.MECHANICS_ONLY,
+        deregister=deregister,
+        initial_violations=audit_violations,
     )
 
 
@@ -400,4 +462,4 @@ def _plan_stream(  # noqa: PLR0913
     )
 
 
-__all__ = ["counted_stream", "cursor_stream", "keyset_stream", "sequential_stream"]
+__all__ = ["counted_stream", "cursor_stream", "declared_stream", "keyset_stream", "sequential_stream"]

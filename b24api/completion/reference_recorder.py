@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import TypedDict
 from uuid import uuid4
 
+from b24api.completion.fast_recorder import FastPageLedger
 from b24api.completion.gate import CompletionGate
 from b24api.contracts.completion import (
     BindingAdmitted,
@@ -22,6 +23,7 @@ from b24api.contracts.completion import (
     StreamClosure,
     StreamTerminal,
 )
+from b24api.contracts.report import PageRejectionCode
 
 
 class _PageFields(TypedDict):
@@ -71,6 +73,7 @@ class ReferenceCompletionRecorder:
         *,
         qualified_total: int | None = None,
         declared_short_page_width: int | None = None,
+        qualified_witnesses: int | None = None,
     ) -> None:
         """Retire one accounted binding after its final outcome is delivered."""
         self.gate.emit(
@@ -80,6 +83,7 @@ class ReferenceCompletionRecorder:
                 binding_id=binding_id,
                 closure=closure,
                 qualified_total=qualified_total,
+                qualified_witnesses=qualified_witnesses,
                 declared_short_page_width=declared_short_page_width,
             )
         )
@@ -118,20 +122,64 @@ class ReferenceBindingRecorder:
         self._current: int | None = None
         self._delivered = False
         self._validated_rows: int | None = None
+        self._reserved: set[int] = set()
         self.unknown = False
 
     def _emit(self, event: CompletionEvidence) -> None:
         self._operation.gate.emit(event)
 
-    def _fields(self) -> _PageFields:
-        if self._current is None:
+    def _fields(self, page_id: int | None = None) -> _PageFields:
+        current = self._current if page_id is None else page_id
+        if current is None:
             raise RuntimeError("reference completion event lacks a scheduled page")
         return {
             "operation_id": self._operation.gate.operation_id,
             "sequence": self._operation._take(),  # noqa: SLF001 - one correlated operation sequence
             "binding_id": self.binding_id,
-            "page_id": self._current,
+            "page_id": current,
         }
+
+    def allocate_page(self) -> int:
+        """Return the binding's next page id for a page scheduled outside the sequential protocol."""
+        page_id = self._next_page
+        self._next_page += 1
+        return page_id
+
+    def emit_page(self, event_type: type, page_id: int, **fields: object) -> None:
+        """Emit one page event of this binding under the operation's correlated sequence."""
+        self._emit(event_type(**self._fields(page_id), **fields))
+
+    def mark_unknown(self) -> None:
+        """Record that one of the binding's commands has an unknown outcome."""
+        self.unknown = True
+
+    def reserve(self) -> int:
+        """Schedule a planned page whose command may be sent before the active page is acknowledged."""
+        page_id = self._next_page
+        self._next_page += 1
+        self._emit(PageScheduled(**self._fields(page_id)))
+        self._reserved.add(page_id)
+        return page_id
+
+    def activate(self, page_id: int) -> None:
+        """Make one reserved page the binding's current page, in planned order."""
+        if self._current is not None or page_id not in self._reserved:
+            raise RuntimeError("reference page activation lacks a reserved page")
+        self._reserved.discard(page_id)
+        self._current = page_id
+        self._delivered = False
+        self._validated_rows = None
+
+    def abandon_reserved(self, page_id: int, outcome: CommandSettlement) -> None:
+        """Settle a reserved page its producer will never commit: negative, or successful but unconsumed."""
+        if page_id not in self._reserved:
+            raise RuntimeError("reference page abandonment lacks a reserved page")
+        self._reserved.discard(page_id)
+        self._emit(PageCommandOutcome(**self._fields(page_id), outcome=outcome))
+        if outcome is CommandSettlement.SUCCESS:
+            self._emit(PageRejected(**self._fields(page_id), reason=PageRejectionCode.TRANSACTION_ABORTED.value))
+        elif outcome is CommandSettlement.UNKNOWN:
+            self.unknown = True
 
     def scheduled(self) -> None:
         """Record a page before its buffer reservation and physical dispatch."""
@@ -178,3 +226,46 @@ class ReferenceBindingRecorder:
         self._emit(PageAcknowledged(**self._fields()))
         self._current = None
         self._delivered = False
+
+
+class ReferenceFastLedger(FastPageLedger):
+    """Fast keyset page evidence of one reference binding, emitted into the shared operation gate."""
+
+    def __init__(self, binding: ReferenceBindingRecorder) -> None:
+        """Bind the binding recorder whose page ids and sequence the fast pages use."""
+        super().__init__()
+        self._binding = binding
+
+    def _new_page(self) -> int:
+        return self._binding.allocate_page()
+
+    def _emit_page(self, event_type: type, page_id: int, **fields: object) -> None:
+        self._binding.emit_page(event_type, page_id, **fields)
+
+    def settle(self, command_id: str, outcome: CommandSettlement) -> None:
+        """Record one settlement; an unknown outcome makes the binding's closure unknown."""
+        super().settle(command_id, outcome)
+        if outcome is CommandSettlement.UNKNOWN:
+            self._binding.mark_unknown()
+
+    def settle_wave(self, outcomes: tuple[CommandSettlement, ...]) -> None:
+        """Settle the trailing scheduled pages of a wave whose engine call raised, in schedule order."""
+        unsettled = [command_id for command_id, page in self._active.items() if not page.settled]
+        if len(outcomes) > len(unsettled):
+            raise RuntimeError("fast wave settlement exceeds its scheduled pages")
+        for command_id, outcome in zip(unsettled[len(unsettled) - len(outcomes) :], outcomes, strict=True):
+            self.settle(command_id, outcome)
+
+    def close(self, *, successful: bool, reason: str, unsettled: CommandSettlement) -> None:
+        """Retire every open page before the binding terminal: discarded probes, or a failed traversal."""
+        if successful:
+            self.discard_unadmitted()
+            if not self._active:
+                return
+        for command_id, page in tuple(self._active.items()):
+            if not page.settled:
+                self.settle(command_id, unsettled)
+        self._reject_active(reason)
+
+
+__all__ = ["ReferenceBindingRecorder", "ReferenceCompletionRecorder", "ReferenceFastLedger"]

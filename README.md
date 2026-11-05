@@ -67,6 +67,12 @@ archive = await client.call_bytes(Request("example.export.download", replay_safe
 payload = archive.body
 ```
 
+`archive.filename` is the name decoded from `Content-Disposition` (`filename*` takes precedence
+over `filename`), or `None`; `archive.evidence.filename_status` records whether that header was
+absent, parsed or malformed. The name is caller-facing metadata, not a safe path: it is never
+normalized, truncated or reduced to a basename, and it stays out of the representation and
+diagnostics. Sanitize it before using it on a filesystem.
+
 <!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
 ```python
 from b24api import RouteKind
@@ -169,6 +175,36 @@ async with client.batch_outcomes(commands) as stream:
                 handle(outcome)
 ```
 
+Commands whose request uses `RouteKind.API_V3` travel in native REST 3.0 batch envelopes: one JSON
+array of at most 50 commands, never mixed with classic commands and grouped into contiguous runs of
+one replay safety (`UNSAFE` and `UNKNOWN` share a run). Envelopes go out in input order: a classic
+command between two v3 commands travels in its own envelope between theirs. The transport must
+advertise JSON-array bodies, as `HttpxTransport` does; otherwise such a command fails with
+`CapabilityError` before any request. Each array element is checked against its own request's
+embedded-error contract, so one failed command neither fails nor resends its successful neighbours.
+
+<!-- tested: tests/v3_batch_test.py::test_a21_wire_four_safe_v3_reads_travel_in_one_envelope_in_input_order -->
+```python
+from b24api import RouteKind
+from b24api.contracts import Command
+
+v3_commands = (
+    Command(Request("example.item.get", {"id": item_id}, ReplaySafety.SAFE, route=RouteKind.API_V3), item_id)
+    for item_id in source_ids
+)
+async with client.batch_outcomes(v3_commands) as stream:
+    async for outcome in stream:
+        handle(outcome)
+```
+
+REST 3.0 does not roll a batch back. When a whole envelope fails after it may have run, `SAFE`
+commands of a transient failure get one envelope retry within their attempt budget, and commands
+still unresolved are sent individually (`RetryPolicy.isolate_safe_batch_abort`, enabled by default)
+under the same attempt lineage; `UNSAFE` and `UNKNOWN` commands arrive
+as `CommandOutcomeUnknown` without a resend. The report counts `ambiguous_physical_attempts` and
+`batch_isolation_requests`. Fail-fast `batch()` finishes resolving the envelope it already sent and
+then raises without reading further input.
+
 For independently dispatchable commands, use `fan_out()` or `fan_out_outcomes()` with
 `DirectDispatch` or `BatchDispatch`. Delivery order is explicitly `READY` or `INPUT`.
 
@@ -183,8 +219,11 @@ more specialized mechanics have explicit names and explicit preconditions.
 | `iter_list_counted` | The first response provides an exact filtered `total` and stable offset pages. | Head page is direct; all known tail offsets are grouped into physical Bitrix batches. | Exact total, ranges and identities. |
 | `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique integer identity. | Auto by default: it plans first, then selects boundary-only, sequential, range, or partitioned execution; runtime sends no diagnostic canaries. | Caller-asserted keyset contract, strict monotonic identity, active bound validation, and terminal empty confirmation. |
 | `iter_list_cursor` | Each next request depends on a cursor from the previous response. | Sequential dependent cursor requests. | Strict unique monotonic cursor and empty terminal page. |
+| `iter_list_continuation` | The next request is described by values on the current page, such as a response cursor object or a pair of controls. | Sequential requests; a pure caller rule returns the next values of declared controls or ends the source. | Rule-declared end; undeclared updates and repeated control vectors fail closed. |
+| `iter_list_window` | A newest-first list resumes from an inclusive timestamp boundary and may also return pinned rows. | Sequential requests carrying the oldest paging timestamp of the previous page. | Strict boundary progress, overlap delivered once, and a response flag that closes the source. |
 | `iter_cursors` | One or many parent-bound cursor traversals need correlation and shared batching. | Lazy per-parent drivers share the reference batch queue; each binding may have `start_cursor`. | Isolated strict cursor progress and terminal event per binding. |
 | `iter_references` | The same list method must run for many parent parameter sets, such as comments per owner or messages per chat. | Bindings are scheduled with direct or physical-batch dispatch; each binding has its own traversal state. | Per-binding rows, completion/failure and caller correlation. |
+| `iter_reference_sources` | Parents need different methods or traversals in one operation. | Each source brings its own request and traversal; compatible pages of all sources share one batch queue. | Per-source rows, terminal event and correlation. |
 
 `page_size` is a local decoded-page cap. It is sent to Bitrix only when you provide the endpoint's
 exact `limit_path`; the client never guesses method-specific parameter names.
@@ -316,7 +355,8 @@ contract or when the previous request-by-request behavior is required.
 Static incompatibility with the auto contract raises `CapabilityError` from the
 `iter_list_keyset(...)` call before iteration begins. A portal that accepts but contradicts the
 declared controls fails before emission with `IncompleteTraversalError`; auto never restarts that
-operation silently. `KeysetTraversal` inside reference traversal remains sequential-only. The
+operation silently. Reference traversal can opt into the same selection for each binding; see
+[Keyset references](#keyset-references). The
 terminal report carries a compact `keyset_selection` (`requested_kind`, `selected_kind`, `reason`)
 for every keyset traversal. A `page_stop` callback needs the ordered page stream, so auto reports
 `AUTO`, `SEQUENTIAL`, `PAGE_STOP`; an explicit `SequentialKeysetExecution()` reports
@@ -397,6 +437,58 @@ stream = client.iter_list_cursor(
 
 Cursor values must be unique and strictly monotonic. If an endpoint exposes only a non-unique
 boundary, use an application-owned direct-call workflow or supply a unique tie-breaker.
+
+Some message endpoints move the boundary toward older rows but return each page oldest-first.
+Declare that page order separately with `page_order="ascending"` beside `direction="descending"` and
+`take="first"`: rows must be strictly ordered inside the page and every value must lie beyond the
+previous boundary. `continuation=ResponseFlagTerminal(ResultSelector(("hasNextPage",)))` closes the
+traversal on a `False` flag, even on a non-empty page, instead of requesting an empty confirmation
+page; a missing or non-boolean flag fails closed. An explicit global ascending or descending
+`ConsistencyPolicy` order contradicting a reversed page order is refused before any request.
+
+### Response-driven continuation
+
+When the next request is fully described by the current page, `iter_list_continuation()` keeps the
+request transaction, identity checks and terminal evidence in the client and asks a pure rule only
+for the next control values. `ResponseCursorRule` carries a response cursor, whole and unchanged
+(an object cursor keeps every field and its full precision), while a boolean response flag says more
+pages exist:
+
+<!-- tested: tests/continuation_test.py::test_a22_a_response_object_cursor_is_carried_whole_and_rule_ends_nonempty_page -->
+```python
+from b24api import ParameterPath, ResultSelector, RouteKind
+from b24api.contracts import ContinuationTraversal, ResponseCursorRule, ResponseFlagTerminal
+
+cursor_control = ParameterPath(("cursor",))
+stream = client.iter_list_continuation(
+    Request("example.event.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+    traversal=ContinuationTraversal(
+        selector=ResultSelector(("items",)),
+        identity=identity,
+        controls=(cursor_control,),
+        rule=ResponseCursorRule(
+            cursor_selector=ResultSelector(("cursor",)),
+            parameter_path=cursor_control,
+            terminal=ResponseFlagTerminal(ResultSelector(("hasMore",))),
+        ),
+    ),
+)
+async with stream:
+    async for item in stream:
+        consume(item)
+```
+
+A custom rule implements `evaluate(page)` and returns `ContinueWith(updates)` for exactly the
+declared controls, or `EndOfSource()`. Rows of the page that ends the source are still delivered,
+and the report closes with `rule_declared_end`. The client rejects updates to undeclared controls,
+control vectors over 64 KiB and a repeated control vector with `ContinuationError`; such a failure
+never reports the source as exhausted.
+
+For newest-first lists that resume from an inclusive timestamp and may also return pinned rows,
+`iter_list_window()` sends the oldest paging timestamp of each page unchanged, delivers rows
+repeated by the overlap once and fails as non-progress, without another request, when the boundary
+does not move. See
+[Inclusive timestamp windows](https://github.com/shkarupa-alex/b24api/blob/master/docs/recipes.md#inclusive-timestamp-windows).
 
 For multiple parent-bound cursor chains, `iter_cursors()` keeps cursor progress and correlation
 isolated per binding while ready pages share the physical batch queue.
@@ -497,6 +589,76 @@ messages = client.iter_references(
 `ReferenceNotExecuted` and `ReferenceOutcomeUnknown`. A malformed source object that is not a
 `Binding` has no valid caller correlation, so it terminates the source with `InputSourceError`
 rather than fabricating a reference outcome. Already accepted bindings retain their real outcomes.
+
+### Keyset references
+
+`KeysetTraversal` bindings run sequentially by default (`SequentialKeysetExecution()`), unlike
+`iter_list_keyset()`, whose default is automatic. Pass `AutoKeysetExecution`,
+`RangeKeysetExecution` or `PartitionedKeysetExecution` as the traversal's `execution` to opt in. A
+binding with automatic, range or partitioned execution runs its own planning barrier and selection;
+its waves travel through the shared batch queue beside other bindings' pages, and its
+`ReferenceComplete` carries the binding's `keyset_selection` and, when the fast path ran, its
+`keyset_execution`. From its first request to its terminal event the binding holds a fixed share of
+`ExecutionPolicy.max_buffered_rows` and plans every wave within it; requests, pages, attempts and
+elapsed time stay on the one operation budget. An automatic binding whose planning floor exceeds the
+whole row budget waits to run alone with all of it (under `INPUT` delivery, once it is the next
+binding to deliver); a binding that cannot obtain its floor while no other binding can release rows
+fails with `BudgetExceededError`, and waiting for a share never outlasts `max_elapsed`.
+
+Fast and automatic keyset references need `BatchDispatch`. With a `page_stop`, automatic execution
+runs sequentially and reports `PAGE_STOP`; an explicit fast mode with a `page_stop` or
+`DirectDispatch` is refused before any request. A `KeysetSpec.boundary` remains unavailable in
+references.
+
+### Counted references
+
+`CountedTraversal` bindings read their head page and every known tail offset through the shared
+batch queue, so one physical batch can carry pages of several bindings and the HTTP count drops
+accordingly; each subrequest still performs its own server-side COUNT. Pages are committed in
+offset order per binding. Counted references need `BatchDispatch` and do not accept a `page_stop`.
+
+### Different methods in one operation
+
+`iter_reference_sources()` accepts a lazy source of `ReferenceSource` values, each with its own
+request template, traversal, binding and optional `page_stop`. All sources share one dispatcher,
+row pool, `ExecutionPolicy` and terminal report, so compatible pages of different methods coalesce
+into the same physical batch, and late sources start as capacity frees up rather than after earlier
+sources finish. Identities and page state belong to each source: equal child IDs under different
+sources are never conflated.
+
+<!-- tested: tests/reference_sources_test.py::test_a28_different_templates_share_the_dispatcher_and_keep_separate_state -->
+```python
+from b24api import Binding, ParameterPath, ParameterUpdate, RouteKind, SequentialTraversal
+from b24api.contracts import ReferenceItem, ReferenceSource
+
+
+def owned(method, owner_id):
+    return ReferenceSource(
+        Request(method, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        SequentialTraversal(selector=ResultSelector(("items",)), identity=identity),
+        Binding(
+            summary=f"{method} for owner {owner_id}",
+            updates=(ParameterUpdate(ParameterPath(("filter", "OWNER_ID")), owner_id),),
+            correlation=(method, owner_id),
+        ),
+    )
+
+
+sources = (
+    owned(method, owner_id)
+    for owner_id in parent_ids
+    for method in ("example.comment.list", "example.activity.list")
+)
+stream = client.iter_reference_sources(sources)
+async with stream:
+    async for event in stream:
+        if isinstance(event, ReferenceItem):
+            consume(event.correlation, event.item)
+```
+
+`iter_reference_source_outcomes()` additionally yields correlated failures. A valid source the
+operation cannot run, such as a counted source under `DirectDispatch`, becomes a correlated
+`ReferenceNotExecuted` before any request while the other sources continue.
 
 ## Streams, partial results and reports
 

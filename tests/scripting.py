@@ -12,9 +12,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
+from urllib.parse import parse_qsl, urlsplit
 
 from b24api import Bitrix24, ExecutionPolicy, Settings
+from b24api.encoding import encode_php_query
 from b24api.transport import WireResponse
 
 if TYPE_CHECKING:
@@ -129,3 +132,82 @@ class Blocker:
 def attached_report(error: BaseException) -> object:
     """Return the report an operation attached to its exception, or ``None``."""
     return getattr(error, "report", None)
+
+
+# Offline portal answering direct and classic batch requests command by command: tests describe the
+# server as one function from ``(method, flat query)`` to a REST envelope, and the portal records every
+# physical request with its command count so a test can assert waves without scripting each request.
+
+type Query = dict[str, str]
+type Envelope = dict[str, object]
+type Answer = Callable[[str, Query], Envelope | Awaitable[Envelope]]
+
+
+def flat_query(parameters: Mapping[str, object]) -> Query:
+    """Flatten parameters with the PHP bracket encoding batch commands use on the wire."""
+    return dict(parse_qsl(encode_php_query(cast("Mapping[str | int, object]", parameters)), keep_blank_values=True))
+
+
+@dataclass
+class BatchPortal:
+    """Serve envelopes from ``answer`` and record each physical request's command count."""
+
+    answer: Answer
+    host: str = HOST
+    waves: list[int] = field(default_factory=list)
+    methods: list[tuple[str, ...]] = field(default_factory=list)
+    queries: list[Query] = field(default_factory=list)
+
+    async def _envelope(self, method: str, query: Query) -> Envelope:
+        self.queries.append(query)
+        envelope = self.answer(method, query)
+        if inspect.isawaitable(envelope):
+            envelope = await envelope
+        return envelope
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        """Answer one direct request or one classic physical batch."""
+        del attempt_timeout, max_response_bytes
+        parameters = request.copy_parameters()
+        if request.method != "batch":
+            self.waves.append(1)
+            self.methods.append((request.method,))
+            body = await self._envelope(request.method, flat_query(parameters))
+            return WireResponse(200, _JSON, json.dumps(body, separators=(",", ":")).encode())
+        commands = parameters["cmd"]
+        if not isinstance(commands, dict):
+            raise TypeError("batch commands must be a mapping")
+        self.waves.append(len(commands))
+        result: dict[str, object] = {}
+        totals: dict[str, object] = {}
+        nexts: dict[str, object] = {}
+        errors: dict[str, object] = {}
+        methods: list[str] = []
+        for key, command in commands.items():
+            if not isinstance(command, str):
+                raise TypeError("batch command must be a string")
+            split = urlsplit(command)
+            methods.append(split.path)
+            envelope = await self._envelope(split.path, dict(parse_qsl(split.query, keep_blank_values=True)))
+            if "error" in envelope:
+                errors[key] = {"error": envelope["error"], "error_description": envelope.get("error_description")}
+                continue
+            result[key] = envelope["result"]
+            # A classic batch carries a total or a next only as an integer entry; null means absent.
+            if envelope.get("total") is not None:
+                totals[key] = envelope["total"]
+            if envelope.get("next") is not None:
+                nexts[key] = envelope["next"]
+        self.methods.append(tuple(methods))
+        body = {
+            "result": {
+                "result": result,
+                "result_error": errors,
+                "result_total": totals,
+                "result_next": nexts,
+            }
+        }
+        return WireResponse(200, _JSON, json.dumps(body, separators=(",", ":")).encode())
+
+    async def aclose(self) -> None:
+        """Nothing to release."""

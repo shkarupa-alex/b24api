@@ -7,6 +7,7 @@ from b24api.contracts.command import NotExecutedReason
 from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _is_plain_int, _thaw_json
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ReplaySafety, Request
+from b24api.references.program import SourceProgram
 
 STABLE_KEY_MAXIMUM = 100
 type IdentityValue = str | int | tuple[str | int, ...]
@@ -33,9 +34,12 @@ class ReferenceRequest:
     correlation: object = field(default=None, repr=False)
     not_executed_reason: NotExecutedReason | None = None
     initial_cursor: IdentityValue | None = None
+    program: SourceProgram | None = field(default=None, repr=False, compare=False, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
+        if self.program is not None and not isinstance(self.program, SourceProgram):
+            raise TypeError("program must be a SourceProgram or None")
         if not isinstance(self.request, Request):
             raise TypeError("reference request must contain a canonical Request")
         if not self.reference_key or len(self.reference_key) > STABLE_KEY_MAXIMUM:

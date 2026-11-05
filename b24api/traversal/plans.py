@@ -4,8 +4,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
+from b24api.contracts.continuation import ContinuationRule, ResponseFlagTerminal, WindowClassifier
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.policy import (
     DuplicatePolicy,
@@ -76,6 +77,10 @@ class ReferenceOutputOrder(StrEnum):
 class PlanContract:
     """Correctness contract shared by every traversal plan."""
 
+    # A repeated page of rows proves a stalled server continuation. Plans whose progress is proven by
+    # their own controls instead (a rule's control vector, a moving window boundary) may legitimately
+    # commit two pages without new rows, so they opt out.
+    row_fingerprints: ClassVar[bool] = True
     selector: ResultSelector | None = None
     identity_requirement: IdentityRequirement = IdentityRequirement.OPTIONAL
     order_semantics: OrderSemantics = OrderSemantics.UNORDERED
@@ -282,10 +287,13 @@ class ItemCursorPlan(PlanContract):
     terminal: CursorTerminalRule = CursorTerminalRule.EMPTY_CONFIRMATION
     allow_create_controls: bool = True
     domain: CursorDomain = CursorDomain.OPAQUE
+    page_order: Literal["asc", "desc"] | None = None
+    response_terminal: ResponseFlagTerminal | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
         super(ItemCursorPlan, self).__post_init__()
+        _validate_cursor_page_contract(self)
         object.__setattr__(self, "cursor_item_path", tuple(self.cursor_item_path))
         if not self.cursor_item_path:
             raise ValueError("cursor_item_path must not be empty")
@@ -304,6 +312,83 @@ class ItemCursorPlan(PlanContract):
         _require_disjoint_paths(self.cursor_request_path, self.limit_path)
         if self.identity_requirement is not IdentityRequirement.REQUIRED:
             raise ValueError("item cursor plan requires identity")
+
+
+def _validate_cursor_page_contract(plan: ItemCursorPlan) -> None:
+    """Admit an in-page order independent of the boundary only with a first-row boundary and no global order."""
+    if plan.page_order not in {None, "asc", "desc"}:
+        raise ValueError("cursor page_order must be asc, desc or None")
+    reversed_page = plan.page_order is not None and plan.page_order != plan.direction
+    if reversed_page and plan.cursor_take != "first":
+        raise ValueError("a reversed cursor page order requires cursor_take first")
+    if reversed_page and plan.order_semantics is not OrderSemantics.UNORDERED:
+        raise ValueError("a reversed cursor page order has no global row order")
+    if plan.response_terminal is not None and not isinstance(plan.response_terminal, ResponseFlagTerminal):
+        raise TypeError("response_terminal must be a ResponseFlagTerminal or None")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ContinuationPlan(PlanContract):
+    """Caller-rule continuation whose rule returns the next complete control vector or the end."""
+
+    # Progress is the control vector, which has its own cycle detection.
+    row_fingerprints: ClassVar[bool] = False
+    controls: tuple[ParameterPath, ...]
+    rule: ContinuationRule
+    limit_path: ParameterPath | None = None
+    requested_page_size: int | None = None
+    allow_create_controls: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
+        super(ContinuationPlan, self).__post_init__()
+        object.__setattr__(self, "controls", tuple(self.controls))
+        if not self.controls or any(not isinstance(path, ParameterPath) for path in self.controls):
+            raise ValueError("continuation plan requires declared ParameterPath controls")
+        if not callable(getattr(self.rule, "evaluate", None)):
+            raise TypeError("continuation rule must implement evaluate(page)")
+        _validate_page_size(self.limit_path, self.requested_page_size)
+        _require_disjoint_paths(*self.controls, self.limit_path)
+        if self.identity_requirement is not IdentityRequirement.REQUIRED:
+            raise ValueError("continuation plan requires identity")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InclusiveWindowPlan(PlanContract):
+    """Descending inclusive-timestamp window over caller-classified paging rows."""
+
+    # Progress is the strictly moving boundary; a page of only repeated rows admits nothing yet moves it.
+    row_fingerprints: ClassVar[bool] = False
+    timestamp_path: tuple[str | int, ...]
+    parameter_path: ParameterPath
+    terminal: ResponseFlagTerminal
+    classifier: WindowClassifier
+    max_decoded_rows: int
+    limit_path: ParameterPath | None = None
+    requested_window_size: int | None = None
+    allow_create_controls: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate and normalize instance state."""
+        super(InclusiveWindowPlan, self).__post_init__()
+        object.__setattr__(self, "timestamp_path", tuple(self.timestamp_path))
+        ParameterPath(self.timestamp_path)
+        if not isinstance(self.terminal, ResponseFlagTerminal):
+            raise TypeError("window terminal must be a ResponseFlagTerminal")
+        if not callable(getattr(self.classifier, "classify", None)):
+            raise TypeError("window classifier must implement classify(page)")
+        if not _is_plain_int(self.max_decoded_rows) or self.max_decoded_rows < 1:
+            raise ValueError("max_decoded_rows must be positive")
+        if self.requested_window_size is not None and (
+            not _is_plain_int(self.requested_window_size)
+            or not 1 <= self.requested_window_size <= self.max_decoded_rows
+        ):
+            raise ValueError("requested_window_size must be within 1..max_decoded_rows")
+        if self.limit_path is not None and self.requested_window_size is None:
+            raise ValueError("window limit_path requires requested_window_size")
+        _require_disjoint_paths(self.parameter_path, self.limit_path)
+        if self.identity_requirement is not IdentityRequirement.REQUIRED:
+            raise ValueError("inclusive window plan requires identity")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -345,7 +430,15 @@ class KernelDirectDispatch:
             raise TypeError("output_order must be a ReferenceOutputOrder")
 
 
-type ListPlan = SingleResponsePlan | OffsetSequentialPlan | CountedOffsetPlan | KeysetPlan | ItemCursorPlan
+type ListPlan = (
+    SingleResponsePlan
+    | OffsetSequentialPlan
+    | CountedOffsetPlan
+    | KeysetPlan
+    | ItemCursorPlan
+    | ContinuationPlan
+    | InclusiveWindowPlan
+)
 type DispatchPlan = KernelBatchDispatch | KernelDirectDispatch
 
 
@@ -374,10 +467,12 @@ def _is_plain_int(value: object) -> bool:
 
 
 __all__ = [
+    "ContinuationPlan",
     "CountedOffsetMode",
     "CountedOffsetPlan",
     "CursorTerminalRule",
     "DispatchPlan",
+    "InclusiveWindowPlan",
     "ItemCursorPlan",
     "KernelBatchDispatch",
     "KernelDirectDispatch",

@@ -134,6 +134,27 @@ async def test_non_bare_inner_command_is_correlated_rejection_before_batch_dispa
 
 
 @pytest.mark.asyncio
+async def test_a_chunk_the_budget_stops_before_its_send_still_counts_as_in_2_5_2() -> None:
+    """AFLAT: an admitted chunk counts as a batch request even when the request budget stops its first send."""
+    transport = ResponderTransport(_echo_batch)
+    stream = batch_outcome_stream(
+        BatchExecutor(Executor(transport)),
+        [Request("profile", route=RouteKind.BARE), Request("app.info", route=RouteKind.BARE)],
+        batch_size=1,
+        policy=ExecutionPolicy(max_requests=1, max_attempts_per_request=1),
+    )
+
+    outcomes = [item async for item in stream]
+
+    assert isinstance(outcomes[0], BatchSuccess)
+    assert isinstance(outcomes[1], BatchFailure)
+    assert isinstance(outcomes[1].error, BudgetExceededError)
+    assert len(transport.requests) == 1
+    assert stream.report.physical_requests == 1
+    assert stream.report.batch_requests == PARTIAL_COMMAND_COUNT
+
+
+@pytest.mark.asyncio
 async def test_fully_rejected_window_does_not_count_a_physical_batch_request() -> None:
     transport = ResponderTransport(_echo_batch)
     stream = batch_outcome_stream(

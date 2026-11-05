@@ -18,8 +18,10 @@ from b24api.contracts.response import Response, inject_controls
 from b24api.errors import CapabilityError, PaginationError
 from b24api.traversal.identity_ledger import _ExternalIdentityStore
 from b24api.traversal.plans import (
+    ContinuationPlan,
     CountedOffsetPlan,
     CursorTerminalRule,
+    InclusiveWindowPlan,
     ItemCursorPlan,
     KeysetPlan,
     KeysetTerminalRule,
@@ -46,6 +48,8 @@ _PLAN_TYPES = (
     CountedOffsetPlan,
     KeysetPlan,
     ItemCursorPlan,
+    ContinuationPlan,
+    InclusiveWindowPlan,
 )
 
 

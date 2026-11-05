@@ -33,7 +33,14 @@ from b24api.execution.lifecycle import (
 )
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
-from b24api.traversal.plans import ItemCursorPlan, KeysetPlan, OffsetSequentialPlan, OffsetTerminalRule
+from b24api.traversal.plans import (
+    ContinuationPlan,
+    InclusiveWindowPlan,
+    ItemCursorPlan,
+    KeysetPlan,
+    OffsetSequentialPlan,
+    OffsetTerminalRule,
+)
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -81,7 +88,7 @@ class ItemStream(AsyncIterator[JsonValue]):
             )
             if isinstance(
                 plan,
-                OffsetSequentialPlan | KeysetPlan | ItemCursorPlan,
+                OffsetSequentialPlan | KeysetPlan | ItemCursorPlan | ContinuationPlan | InclusiveWindowPlan,
             )
             else None
         )
