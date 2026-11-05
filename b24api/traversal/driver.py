@@ -14,6 +14,7 @@ from b24api.contracts.policy import (
     ExecutionPolicy,
     IdentityCoercion,
     IdentityRequirement,
+    OrderSemantics,
     SnapshotRequirement,
     TotalSemantics,
 )
@@ -44,6 +45,7 @@ from b24api.errors import (
     ResultShapeError,
 )
 from b24api.execution import WorkClass
+from b24api.traversal.continuation import ContinuationStrategy
 from b24api.traversal.control_preflight import preflight_controls
 from b24api.traversal.counted_batch import CountedBatchStrategy, empty_source_head_eligible
 from b24api.traversal.cursor import ItemCursorStrategy
@@ -60,10 +62,13 @@ from b24api.traversal.identity import (
     _PageRejectionError,
     _validate_confirmation_policy,
 )
+from b24api.traversal.inclusive_window import InclusiveWindowStrategy
 from b24api.traversal.keyset import KeysetStrategy
 from b24api.traversal.page_adaptation import _SourcePageState, adapt_page
 from b24api.traversal.plans import (
+    ContinuationPlan,
     CountedOffsetPlan,
+    InclusiveWindowPlan,
     ItemCursorPlan,
     KeysetPlan,
     KeysetTerminalRule,
@@ -94,21 +99,29 @@ if TYPE_CHECKING:
     from b24api.contracts.response import Response
     from b24api.execution import ExecutionContext, Executor
     from b24api.execution.snapshot import KernelReport
+    from b24api.traversal.counted_io import CountedWaveIO
 
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 
 def _strategy(plan: ListPlan) -> SequentialPageStrategy | PagedStrategy:
     """Compose the strategy that owns a validated plan's requests and verdicts."""
+    strategy: SequentialPageStrategy | PagedStrategy
     if isinstance(plan, SingleResponsePlan):
-        return SingleResponseStrategy(plan)
-    if isinstance(plan, OffsetSequentialPlan):
-        return OffsetStrategy(plan)
-    if isinstance(plan, CountedOffsetPlan):
-        return CountedStrategy(plan)
-    if isinstance(plan, KeysetPlan):
-        return KeysetStrategy(plan)
-    return ItemCursorStrategy(plan)
+        strategy = SingleResponseStrategy(plan)
+    elif isinstance(plan, OffsetSequentialPlan):
+        strategy = OffsetStrategy(plan)
+    elif isinstance(plan, CountedOffsetPlan):
+        strategy = CountedStrategy(plan)
+    elif isinstance(plan, KeysetPlan):
+        strategy = KeysetStrategy(plan)
+    elif isinstance(plan, ContinuationPlan):
+        strategy = ContinuationStrategy(plan)
+    elif isinstance(plan, InclusiveWindowPlan):
+        strategy = InclusiveWindowStrategy(plan)
+    else:
+        strategy = ItemCursorStrategy(plan)
+    return strategy
 
 
 class PaginationDriver:
@@ -192,7 +205,23 @@ class PaginationDriver:
 
     async def _sequential(self, strategy: SequentialPageStrategy) -> AsyncGenerator[_Page]:
         """Own each page transaction: fetch, select, judge, validate, record the rejection or yield."""
-        request = strategy.first_request(self)
+        async for page in self._sequential_from(strategy, strategy.first_request(self)):
+            yield page
+
+    async def continue_sequential(
+        self,
+        strategy: SequentialPageStrategy,
+        identities: list[IdentityValue],
+    ) -> AsyncGenerator[_Page]:
+        """Continue a sequential strategy after an externally committed seed page."""
+        step = strategy.advance(self, identities)
+        if isinstance(step, PageStop):
+            self.terminal_reason = step.reason
+            return
+        async for page in self._sequential_from(strategy, step):
+            yield page
+
+    async def _sequential_from(self, strategy: SequentialPageStrategy, request: Request) -> AsyncGenerator[_Page]:
         while True:
             response = await self.fetch(request)
             trace_count = self.page_trace_count
@@ -200,6 +229,8 @@ class PaginationDriver:
             try:
                 items = self.select_page(response)
                 verdict = strategy.judge(self, response, items)
+                if verdict.admitted is not None:
+                    items = self._admit(items, verdict.admitted)
                 identities = self.validate_page(
                     items,
                     response=response,
@@ -210,7 +241,7 @@ class PaginationDriver:
                 if self.page_trace_count == trace_count:
                     self.reject_external_page(items, response, error)
                 raise
-            if items:
+            if items or verdict.deliver_empty:
                 yield _Page(tuple(items), response, (1,) * len(items), not verdict.terminal)
             step = strategy.advance(self, identities)
             if isinstance(step, PageStop):
@@ -218,9 +249,25 @@ class PaginationDriver:
                 return
             request = step
 
-    def counted_batch_pages(self, *, batch_size: int, page_size: int) -> AsyncGenerator[_Page]:
-        """Execute the committed direct-head/batched-tail counted traversal."""
-        return CountedBatchStrategy(batch_size=batch_size, page_size=page_size).pages(self)
+    def _admit(self, items: tuple[FrozenJson, ...], admitted: tuple[int, ...]) -> tuple[FrozenJson, ...]:
+        """Narrow a judged page, and its retained source rows, to the admitted indexes in source order."""
+        source = self.source_page.current(items)
+        self.source_page.remember(tuple(source[index] for index in admitted))
+        return tuple(items[index] for index in admitted)
+
+    def identity_seen(self, value: IdentityValue) -> bool:
+        """Return whether a committed page of this traversal already held the identity."""
+        return self._store.contains(value)
+
+    def counted_batch_pages(
+        self,
+        *,
+        batch_size: int,
+        page_size: int,
+        io: CountedWaveIO | None = None,
+    ) -> AsyncGenerator[_Page]:
+        """Execute the committed counted head transaction and its dense tail or sequential continuation."""
+        return CountedBatchStrategy(batch_size=batch_size, page_size=page_size, io=io).pages(self)
 
     def empty_source_head_eligible(
         self,
@@ -386,6 +433,13 @@ class PaginationDriver:
         )
         if order_direction is not None and identity is None:
             raise CapabilityError("ordered traversal requires IdentitySpec")
+        if (
+            isinstance(plan, ItemCursorPlan)
+            and plan.page_order not in {None, plan.direction}
+            and consistency.order_semantics in {OrderSemantics.ASCENDING, OrderSemantics.DESCENDING}
+        ):
+            # Pages ordered against the boundary have no single global row order to verify.
+            raise CapabilityError("a cursor page order opposite to its direction has no global row order")
         _validate_confirmation_policy(
             plan,
             consistency.confirmation_policy,
@@ -416,6 +470,10 @@ class PaginationDriver:
         if not isinstance(self.identity, IdentitySpec):
             raise CapabilityError(f"{plan_name} traversal requires IdentitySpec")
         return self.identity
+
+    def preflight_capabilities(self) -> None:
+        """Reject the request's controls and the plan's capabilities before any input is read or sent."""
+        self._validate_capabilities()
 
     def _validate_capabilities(self) -> None:
         effective = self.validate_contract(

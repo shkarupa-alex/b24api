@@ -7,8 +7,11 @@ from b24api.errors import CapabilityError
 from b24api.traversal import offset_rules
 from b24api.traversal.cursor_domain import cursor_controls_replace, cursor_probe_updates
 from b24api.traversal.identity import _child_path, _request_with_controls
+from b24api.traversal.inclusive_window import initial_window_boundary
 from b24api.traversal.plans import (
+    ContinuationPlan,
     CountedOffsetPlan,
+    InclusiveWindowPlan,
     ItemCursorPlan,
     KeysetPlan,
     OffsetSequentialPlan,
@@ -39,8 +42,45 @@ def _aligned_initial_offset(driver: StrategyContext, plan: OffsetSequentialPlan)
     return initial_offset
 
 
+# Structurally valid probe values for a window boundary: two distinct timestamps of the declared grammar.
+_WINDOW_PROBES = ("2000-01-02T00:00:00Z", "2000-01-01T00:00:00Z")
+
+
+def _declared_probes(
+    plan: ContinuationPlan | InclusiveWindowPlan,
+) -> tuple[dict[ParameterPath, object], dict[ParameterPath, object], frozenset[ParameterPath]]:
+    """Return two successor control sets for SDK-owned continuation or window controls and the owned paths."""
+    if isinstance(plan, ContinuationPlan):
+        first: dict[ParameterPath, object] = dict.fromkeys(plan.controls, 0)
+        second: dict[ParameterPath, object] = dict.fromkeys(plan.controls, 1)
+        limit, size, owned = plan.limit_path, plan.requested_page_size, frozenset(plan.controls)
+    else:
+        first = {plan.parameter_path: _WINDOW_PROBES[0]}
+        second = {plan.parameter_path: _WINDOW_PROBES[1]}
+        limit, size, owned = plan.limit_path, plan.requested_window_size, frozenset({plan.parameter_path})
+    if limit is not None and size is not None:
+        first[limit] = size
+        second[limit] = size
+    return first, second, owned
+
+
 def preflight_controls(driver: StrategyContext) -> None:
     """Validate first and successor wire controls against the caller request."""
+    plan = driver.plan
+    if not isinstance(plan, ContinuationPlan | InclusiveWindowPlan):
+        _preflight_traversal_controls(driver)
+        return
+    if driver.request.positional is not None:
+        raise CapabilityError("continuation and window traversals require named request parameters")
+    if isinstance(plan, InclusiveWindowPlan):
+        initial_window_boundary(driver.request, plan)
+    first, second, owned = _declared_probes(plan)
+    _request_with_controls(driver.request, first, allow_create=plan.allow_create_controls, replace=owned)
+    _request_with_controls(driver.request, second, allow_create=plan.allow_create_controls, replace=owned)
+
+
+def _preflight_traversal_controls(driver: StrategyContext) -> None:
+    """Probe the offset, keyset and item-cursor controls the traversal writes."""
     plan = driver.plan
     first: dict[ParameterPath, object] = {}
     second: dict[ParameterPath, object] = {}

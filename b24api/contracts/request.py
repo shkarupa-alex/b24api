@@ -99,6 +99,14 @@ class ResultSelector:
         return cls(())
 
 
+class _MappingValuesResultSelector(ResultSelector):
+    """Private lowered selector reading the values of a selected mapping (``MAPPING_VALUES``)."""
+
+
+class _TolerantMappingValuesResultSelector(_MappingValuesResultSelector):
+    """Private lowered selector that also reads an empty sequence as an empty mapping."""
+
+
 @dataclass(frozen=True, slots=True)
 class IdentitySpec:
     """Independent item, filter, and order identity roles."""

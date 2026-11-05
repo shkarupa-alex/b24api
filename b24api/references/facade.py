@@ -6,8 +6,12 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal, Protocol, Self, cast
 
 from b24api.completion.operation_stream import MappedOperationStream
-from b24api.contracts.dispatch import DirectDispatch, DispatchSpec
-from b24api.contracts.keyset_execution import SequentialKeysetExecution
+from b24api.contracts.keyset_execution import (
+    AutoKeysetExecution,
+    KeysetExecutionKind,
+    KeysetSelectionReason,
+    SequentialKeysetExecution,
+)
 from b24api.contracts.policy import (
     DuplicatePolicy,
     ExecutionPolicy,
@@ -23,7 +27,7 @@ from b24api.contracts.reference import (
     ReferenceOutcome,
     ReferenceOutcomeUnknown,
 )
-from b24api.contracts.report import TraversalAssurance
+from b24api.contracts.report import KeysetSelectionSummary, TraversalAssurance
 from b24api.contracts.request import (
     IdentitySpec,
     Request,
@@ -33,7 +37,10 @@ from b24api.contracts.request import (
     canonical_request,
 )
 from b24api.contracts.traversal import (
+    ContinuationTraversal,
     CountedTraversal,
+    CursorTraversal,
+    InclusiveWindowTraversal,
     KeysetTraversal,
     SequentialTraversal,
     ShortPageTermination,
@@ -49,14 +56,18 @@ from b24api.errors import (
     ReferenceFailed,
 )
 from b24api.references.binding import BindingSource, _BindingContext, _BindingSourceError, binding_source
+from b24api.references.compatibility import source_incompatibility
 from b24api.references.dispatch import (
     _KernelReferenceComplete,
     _ReferenceWindowError,
 )
 from b24api.references.dispatch_plan import kernel_dispatch
 from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem
+from b24api.references.program import FastKeysetProgram
 from b24api.references.stream import iter_references as _iter_references
 from b24api.traversal.driver import PaginationDriver
+from b24api.traversal.facade_support import _collection_selector, _cursor_page_contract, declared_traversal_plan
+from b24api.traversal.keyset_eligibility import _effective_cap, validate_fast_keyset
 from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import (
     CountedOffsetMode,
@@ -70,9 +81,11 @@ from b24api.traversal.plans import (
 )
 
 if TYPE_CHECKING:
+    from b24api.contracts.dispatch import DispatchSpec
     from b24api.contracts.page_stop import PageStopPolicy
     from b24api.contracts.report import OperationReport, Violation
     from b24api.contracts.stream import OperationStream
+    from b24api.execution import Executor
     from b24api.execution.snapshot import KernelReport
 
 type KernelReferenceEvent = KernelReferenceItem | KernelReferenceFailure | _KernelReferenceComplete
@@ -103,6 +116,17 @@ def _direction(value: str) -> Literal["asc", "desc"]:
 
 
 def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, TraversalIdentity | None]:
+    """Lower one traversal contract, including its collection shape, at the single reference lowering point."""
+    if isinstance(traversal, ContinuationTraversal | InclusiveWindowTraversal):
+        declared, declared_selector, declared_identity, _page_cap = declared_traversal_plan(traversal)
+        return declared, declared_selector, declared_identity
+    plan, identity = _kernel_list_plan(traversal)
+    return plan, _collection_selector(traversal.selector, traversal.collection_shape), identity
+
+
+def _kernel_list_plan(
+    traversal: SequentialTraversal | CountedTraversal | KeysetTraversal | CursorTraversal,
+) -> tuple[ListPlan, TraversalIdentity | None]:
     if isinstance(traversal, SequentialTraversal):
         if traversal.offset.sparse_raw_bound is not None:
             # Reference pages carry one provenance record per delivered page; an empty raw window the
@@ -114,7 +138,6 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
                 page_size=traversal.page_size,
                 duplicate_policy=DuplicatePolicy.ERROR,
             ),
-            traversal.selector,
             traversal.identity,
         )
     if isinstance(traversal, CountedTraversal):
@@ -138,12 +161,9 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
                 ),
                 fixed_stride=counted_mechanics.step,
             ),
-            traversal.selector,
             traversal.identity,
         )
     if isinstance(traversal, KeysetTraversal):
-        if not isinstance(traversal.execution, SequentialKeysetExecution):
-            raise CapabilityError("reference keyset traversal supports sequential execution only")
         keyset_mechanics = traversal.keyset
         if keyset_mechanics.boundary is not None:
             # A bounded range is fingerprinted to one request filter; bindings rewrite parameters,
@@ -166,11 +186,67 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
                 duplicate_policy=DuplicatePolicy.ERROR,
                 total_semantics=TotalSemantics.IGNORE,
             ),
-            traversal.selector,
             traversal.identity,
         )
+    return _cursor_kernel_plan(traversal)
+
+
+def _keyset_program(
+    traversal: TraversalSpec,
+    page_stop: PageStopPolicy | None,
+) -> tuple[FastKeysetProgram | None, KeysetSelectionSummary | None]:
+    """Return a keyset source's fast runtime inputs, or the selection of AUTO settled on sequential.
+
+    A sequential keyset (and every other traversal) runs on the lowered sequential plan unchanged.
+    AUTO with a page stop settles on sequential execution before planning, like a flat traversal.
+    """
+    if not isinstance(traversal, KeysetTraversal) or isinstance(traversal.execution, SequentialKeysetExecution):
+        return None, None
+    execution = traversal.execution
+    if page_stop is not None:
+        if not isinstance(execution, AutoKeysetExecution):
+            raise CapabilityError("page stop requires sequential keyset execution")
+        return None, KeysetSelectionSummary(
+            KeysetExecutionKind.AUTO,
+            KeysetExecutionKind.SEQUENTIAL,
+            KeysetSelectionReason.PAGE_STOP,
+        )
+    return (
+        FastKeysetProgram(
+            traversal.identity,
+            traversal.keyset,
+            execution,
+            _collection_selector(traversal.selector, traversal.collection_shape),
+            traversal.collection_shape,
+            traversal.page_size,
+            _effective_cap(execution, traversal.keyset, traversal.page_size),
+        ),
+        None,
+    )
+
+
+def preflight_fast_keyset(
+    executor: Executor,
+    request: Request,
+    fast: FastKeysetProgram,
+    policy: ExecutionPolicy,
+) -> None:
+    """Prove a fast keyset source's static prerequisites against one request, before any I/O."""
+    validate_fast_keyset(
+        executor,
+        request,
+        identity=fast.identity,
+        keyset=fast.keyset,
+        page_size=fast.page_size,
+        execution=fast.execution,
+        policy=policy,
+    )
+
+
+def _cursor_kernel_plan(traversal: CursorTraversal) -> tuple[ListPlan, TraversalIdentity | None]:
     cursor_mechanics = traversal.cursor
     direction = _direction(cursor_mechanics.direction)
+    page_order, order_semantics = _cursor_page_contract(cursor_mechanics)
     identity = traversal.identity
     if identity is None:
         identity = IdentitySpec(
@@ -192,12 +268,20 @@ def _kernel_plan(traversal: TraversalSpec) -> tuple[ListPlan, ResultSelector, Tr
             allow_create_controls=cursor_mechanics.allow_create_controls,
             domain=cursor_mechanics.domain,
             identity_requirement=IdentityRequirement.REQUIRED,
-            order_semantics=OrderSemantics.ASCENDING if direction == "asc" else OrderSemantics.DESCENDING,
+            order_semantics=order_semantics,
             duplicate_policy=DuplicatePolicy.ERROR,
+            page_order=page_order,
+            response_terminal=cursor_mechanics.continuation,
         ),
-        traversal.selector,
         identity,
     )
+
+
+def _reference_page_cap(traversal: TraversalSpec) -> int:
+    """Return the decoded rows one reference request may hold; each dispatch reserves this many."""
+    if isinstance(traversal, InclusiveWindowTraversal):
+        return traversal.max_decoded_rows
+    return traversal.page_size
 
 
 class _ReferenceEventMapper:
@@ -224,6 +308,8 @@ class _ReferenceEventMapper:
                 exhausted=event.stopped_reason is None,
                 stop_reason=event.stopped_reason,
                 closure=event.closure,
+                keyset_selection=event.keyset_selection,
+                keyset_execution=event.keyset_execution,
             )
         context = cast("_BindingContext", event.correlation)
         self._item_indexes.pop(context.index, None)
@@ -264,6 +350,11 @@ def _reference_assurance(traversal: TraversalSpec) -> TraversalAssurance | None:
     if (
         isinstance(traversal, SequentialTraversal)
         and traversal.offset.short_page_termination is ShortPageTermination.DECLARED_TERMINAL
+    ):
+        return TraversalAssurance.MECHANICS_ONLY
+    # A response flag or a continuation rule likewise proves a declared stop rule, not an observed end.
+    if isinstance(traversal, ContinuationTraversal | InclusiveWindowTraversal) or (
+        isinstance(traversal, CursorTraversal) and traversal.cursor.continuation is not None
     ):
         return TraversalAssurance.MECHANICS_ONLY
     return None
@@ -321,10 +412,9 @@ def kernel_reference_stream[C](
 
     if not isinstance(executor, Executor):
         raise TypeError("executor must be an Executor")
-    if isinstance(traversal, CountedTraversal) and isinstance(dispatch, DirectDispatch):
-        raise CapabilityError("counted reference traversal requires BatchDispatch")
-    if isinstance(traversal, CountedTraversal) and page_stop is not None:
-        raise CapabilityError("counted physical batch tail does not support page stop")
+    incompatible = source_incompatibility(base, traversal, dispatch, page_stop, v3_batch=executor.supports_v3_batch)
+    if incompatible is not None:
+        raise incompatible
     plan, selector, identity = _kernel_plan(traversal)
     preflight = PaginationDriver(
         executor,
@@ -335,8 +425,11 @@ def kernel_reference_stream[C](
         context=executor.context(policy),
         page_adapter=traversal.page_adapter,
     )
-    preflight._validate_capabilities()  # noqa: SLF001 - reject base controls before consuming caller input
+    preflight.preflight_capabilities()
     executor.preflight_request(base)
+    fast, keyset_selection = _keyset_program(traversal, page_stop)
+    if fast is not None:
+        preflight_fast_keyset(executor, base, fast, policy)
     dispatch_plan = kernel_dispatch(dispatch, policy)
     stream = _iter_references(
         executor,
@@ -350,9 +443,11 @@ def kernel_reference_stream[C](
         policy=policy,
         _emit_complete=True,
         _capture_fail_fast=not tolerant,
-        _page_cap_hint=traversal.page_size,
+        _page_cap_hint=_reference_page_cap(traversal) if fast is None else fast.effective_page_cap,
         _page_adapter=traversal.page_adapter,
         _page_stop=page_stop,
+        _fast=fast,
+        _keyset_selection=keyset_selection,
     )
     return cast("ReferenceKernelStream", stream)
 
@@ -372,8 +467,6 @@ def reference_stream[C](
 ) -> OperationStream[ReferenceOutcome[C]]:
     """Compose the public bound-reference stream over the scheduler kernel."""
     base = canonical_request(request)
-    if not isinstance(dispatch, DirectDispatch) and (base.encoding.value != "json" or base.headers.items):
-        raise CapabilityError("physical batch supports JSON requests without scoped headers; use direct dispatch")
     source = kernel_reference_stream(
         executor,
         base,

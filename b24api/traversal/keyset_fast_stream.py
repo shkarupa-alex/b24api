@@ -7,6 +7,7 @@ import asyncio
 from collections import deque
 from typing import TYPE_CHECKING, Self
 
+from b24api.completion.fast_recorder import FastCompletionRecorder
 from b24api.contracts.completion import CleanupState
 from b24api.contracts.json import FrozenJson, JsonValue, _thaw_json
 from b24api.contracts.policy import (
@@ -35,7 +36,11 @@ class KeysetFastStream:
 
     def __init__(self, runtime: KeysetRuntime) -> None:
         """Initialize without starting planning or I/O."""
+        recorder = runtime.completion_recorder
+        if not isinstance(recorder, FastCompletionRecorder):
+            raise TypeError("a flat fast keyset stream owns its own completion gate")
         self._runtime = runtime
+        self._recorder = recorder
         self._buffer: deque[FrozenJson] = deque()
         self._closed = False
         self.report = KernelReport()
@@ -47,7 +52,7 @@ class KeysetFastStream:
     @property
     def completion_gate(self) -> CompletionGate:
         """Expose the active fast-keyset completion evidence to the public adapter."""
-        return self._runtime.completion_recorder.gate
+        return self._recorder.gate
 
     async def __anext__(self) -> JsonValue:
         """Return the next admitted row or finalize terminal evidence."""
@@ -161,7 +166,7 @@ class KeysetFastStream:
             else CleanupState.SUCCESS
         )
         closure, qualified_witnesses = self._runtime.completion_closure()
-        self._runtime.completion_recorder.terminal(
+        self._recorder.terminal(
             state,
             rows_emitted=counters.emitted_rows,
             rows_admitted=counters.admitted_rows,

@@ -30,6 +30,8 @@ def _done_closure(event: _DoneEvent) -> BindingClosure:
     """Translate the validated source termination into its gate witness class."""
     if event.stopped_reason:
         return BindingClosure.CALLER_STOP
+    if event.closure is not None:
+        return event.closure
     return qualified_closure(event.terminal_reason) or BindingClosure.SOURCE_EMPTY
 
 
@@ -51,6 +53,7 @@ def _finish_done_completion(completion: ReferenceCompletionRecorder, event: _Don
         declared_short_page_width=(
             event.declared_short_page_width if closure is BindingClosure.DECLARED_SHORT_PAGE else None
         ),
+        qualified_witnesses=event.qualified_witnesses if closure is BindingClosure.KEYSET_PLAN_COVERED else None,
     )
 
 

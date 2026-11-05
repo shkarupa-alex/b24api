@@ -150,6 +150,12 @@ def _binding_closure_violation(binding: _Binding, event: BindingTerminal) -> str
             "completion_missing_range_witness",
         ),
         (
+            # A response flag or a continuation rule closes only after at least one acknowledged page.
+            closure in {BindingClosure.DECLARED_RESPONSE_TERMINAL, BindingClosure.RULE_DECLARED_END}
+            and binding.acknowledged_pages == 0,
+            "completion_missing_declared_end_witness",
+        ),
+        (
             closure is BindingClosure.KEYSET_PLAN_COVERED
             and (
                 type(event.qualified_witnesses) is not int
@@ -543,6 +549,8 @@ class CompletionGate:
                 if source.keyset_execution is not None
                 else facts.keyset_selection
             ),
+            ambiguous_physical_attempts=source.ambiguous_physical_attempts,
+            batch_isolation_requests=source.batch_isolation_requests,
         )
         self._published = report
         return report

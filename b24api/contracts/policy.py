@@ -193,9 +193,14 @@ class RetryPolicy:
     maximum_delay: float = 30.0
     backoff: float = 2.0
     jitter: float = 0.1
+    # After a native v3 batch abort leaves SAFE commands unresolved, run them once more individually (one
+    # bounded attribution phase within the commands' inherited attempt and retry-time budgets).
+    isolate_safe_batch_abort: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
+        if not isinstance(self.isolate_safe_batch_abort, bool):
+            raise TypeError("isolate_safe_batch_abort must be a bool")
         object.__setattr__(self, "transient_http_statuses", frozenset(self.transient_http_statuses))
         object.__setattr__(
             self,

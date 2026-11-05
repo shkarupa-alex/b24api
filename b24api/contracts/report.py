@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 from b24api.contracts.keyset_execution import (
@@ -306,6 +306,10 @@ class OperationReport:
     page_trace_truncated: bool = False
     keyset_execution: KeysetExecutionReport | None = None
     keyset_selection: KeysetSelectionSummary | None = None
+    # Native v3 batch envelopes sent after which no attributable per-command outcome was observed, and
+    # the individual requests sent to attribute SAFE commands such an envelope left unresolved.
+    ambiguous_physical_attempts: int = field(default=0, kw_only=True)
+    batch_isolation_requests: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate bounded terminal evidence."""
@@ -332,6 +336,8 @@ class OperationReport:
             self.buffered_commands_high_water,
             self.buffered_rows_high_water,
             self.active_references_high_water,
+            self.ambiguous_physical_attempts,
+            self.batch_isolation_requests,
         )
         if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in counters):
             raise ValueError("report counters must be non-negative integers")

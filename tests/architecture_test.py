@@ -398,7 +398,7 @@ def test_module_sizes_are_recorded(record_property: Callable[[str, object], None
 def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
     fast_sources = tuple(sorted((PACKAGE / "traversal").glob("keyset_*.py")))
     # Protective (B21): the runtime is the only owner of the fast buffered-row counter.
-    delta_callers = {path.name for path in fast_sources if "adjust_buffered_rows(" in path.read_text(encoding="utf-8")}
+    delta_callers = {path.name for path in fast_sources if ".adjust_buffered_rows(" in path.read_text(encoding="utf-8")}
     assert delta_callers == {"keyset_runtime.py"}
     assert all("set_buffered_rows(" not in path.read_text(encoding="utf-8") for path in fast_sources)
     # Protective (B21, §3.6): the transaction host is a protocol, never a shared scheduler-state bag.
@@ -444,6 +444,53 @@ def test_fast_keyset_state_and_selector_boundaries_are_enforced() -> None:
     )
 
 
+def test_keyset_context_has_one_view_and_buffer_resets_stay_with_their_owners() -> None:
+    fast_sources = tuple(sorted((PACKAGE / "traversal").glob("keyset_*.py")))
+    # Traversal never imports references: the reference budget view meets the runtime in a protocol.
+    for path in fast_sources:
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom) and node.module is not None:
+                assert not node.module.startswith("b24api.references"), f"{path.name} imports references"
+    # BindingBudgetView is the only KeysetContext besides the flat operation ExecutionContext.
+    implementers = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in _sources()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "execution_context"
+    }
+    assert implementers == {"execution/context.py", "references/budget_view.py", "traversal/keyset_context.py"}
+    view = (PACKAGE / "references" / "budget_view.py").read_text(encoding="utf-8")
+    assert view.count("shared.adjust_buffered_rows(") == 1
+    assert "set_buffered_rows(" not in view
+    # Only the flat counted row account replaces the operation counter on the counted path, and in
+    # references only the pool's own close does; every shared pool change is a signed delta.
+    counted = {
+        site for path in sorted((PACKAGE / "traversal").glob("counted*.py")) for site in _set_buffered_rows_sites(path)
+    }
+    references = {
+        site for path in sorted((PACKAGE / "references").glob("*.py")) for site in _set_buffered_rows_sites(path)
+    }
+    assert {owner for owner, _method in counted} == {"FlatCountedRowAccount"}
+    assert references == {("_RowBuffer", "close")}
+
+
+def _set_buffered_rows_sites(path: Path) -> set[tuple[str, str]]:
+    """Return the (class, method) pairs in one module that call ``set_buffered_rows``."""
+    return {
+        (owner.name, method.name)
+        for owner in ast.parse(path.read_text(encoding="utf-8")).body
+        if isinstance(owner, ast.ClassDef)
+        for method in owner.body
+        if isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef)
+        and any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "set_buffered_rows"
+            for node in ast.walk(method)
+        )
+    }
+
+
 def test_only_completion_gate_constructs_terminal_operation_reports() -> None:
     constructors = {
         path.relative_to(PACKAGE).as_posix()
@@ -462,6 +509,11 @@ def test_closure_reason_constants_map_to_their_qualified_closure() -> None:
     assert closure.qualified_closure(closure.QUALIFIED_TOTAL_REACHED) is BindingClosure.QUALIFIED_TOTAL
     assert closure.qualified_closure(closure.SPARSE_RAW_RANGE_COVERED) is BindingClosure.RAW_RANGE_COVERED
     assert closure.qualified_closure(closure.ADMITTED_UPPER_BOUNDARY_REACHED) is BindingClosure.BOUNDARY_SEEN
+    assert closure.qualified_closure(closure.DECLARED_SHORT_PAGE_REACHED) is BindingClosure.DECLARED_SHORT_PAGE
+    assert (
+        closure.qualified_closure(closure.RESPONSE_FLAG_DECLARED_TERMINAL) is BindingClosure.DECLARED_RESPONSE_TERMINAL
+    )
+    assert closure.qualified_closure(closure.CONTINUATION_RULE_DECLARED_END) is BindingClosure.RULE_DECLARED_END
     assert closure.qualified_closure("source exhausted") is None
     assert closure.qualified_closure(None) is None
 
@@ -474,7 +526,7 @@ def test_pagination_driver_composes_strategies_instead_of_inheriting_them() -> N
 
     assert PaginationDriver.__bases__ == (object,)
     assert isinstance(CountedBatchStrategy(batch_size=1, page_size=1), PagedStrategy)
-    strategy_modules = ("sequential", "keyset", "cursor", "counted_batch")
+    strategy_modules = ("sequential", "keyset", "cursor", "counted_batch", "continuation", "inclusive_window")
     mixins = [
         node.name
         for module in strategy_modules
@@ -492,3 +544,15 @@ def test_no_public_class_name_is_defined_twice() -> None:
             if isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
                 owners.setdefault(node.name, []).append(path.relative_to(PACKAGE).as_posix())
     assert {name: paths for name, paths in owners.items() if len(paths) > 1} == {}
+
+
+def test_v3_batch_envelope_constructor_is_called_only_from_the_batch_package() -> None:
+    # Only the batch engine builds a native v3 envelope (#21); every other layer sends ordinary requests.
+    callers = {
+        f"{path.relative_to(PACKAGE).as_posix()}:{node.lineno}"
+        for path in _sources()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_v3_batch"
+    }
+    assert callers
+    assert {site for site in callers if not site.startswith("batch/")} == set()

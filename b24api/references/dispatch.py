@@ -3,15 +3,17 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+from collections import deque
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 from b24api.batch.engine import BatchExecutor
-from b24api.batch.outcome import BatchFailure
+from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.report import PageDispatch
-from b24api.errors import BudgetExceededError, CapabilityError
+from b24api.errors import AmbiguousExecutionError, ApiResponseError, BudgetExceededError, CapabilityError
 from b24api.execution import (
     ExecutionContext,
     Executor,
@@ -27,7 +29,7 @@ if TYPE_CHECKING:
     from b24api.contracts.command import NotExecutedReason
     from b24api.contracts.completion import BindingClosure
     from b24api.contracts.json import FrozenJson, JsonValue
-    from b24api.contracts.report import PageRecord, Violation
+    from b24api.contracts.report import KeysetExecutionReport, KeysetSelectionSummary, PageRecord, Violation
     from b24api.contracts.request import Request
     from b24api.contracts.response import Response
     from b24api.traversal.plans import (
@@ -36,7 +38,7 @@ if TYPE_CHECKING:
     )
     from b24api.traversal.values import IdentityValue
 
-type ReferenceSource = Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]
+type ReferenceRequestSource = Iterable[ReferenceRequest] | AsyncIterable[ReferenceRequest]
 type _WaitFirst = Callable[[tuple[asyncio.Future[object], ...], float], Awaitable[None]]
 _MISSING = object()
 
@@ -60,19 +62,24 @@ class _Reservation:
     index: int
     amount: int
     accepted: bool = False
+    # A fast keyset lease: fixed capacity from activation to terminal, charged by its own budget view.
+    lease: bool = False
 
 
 @dataclass(slots=True)
 class _PageEvent:
     work: _Work
     items: tuple[FrozenJson, ...]
-    response: Response
+    response: Response | None
     item_weights: tuple[int, ...]
     unique_mask: tuple[bool, ...]
     violations: tuple[Violation, ...]
     page_records: tuple[PageRecord, ...]
-    reservation: _Reservation
+    reservation: _Reservation | None
     acknowledged: asyncio.Future[None]
+    # A fast keyset row group is held by its binding's lease, not a page reservation: each delivered
+    # row is reported to the binding's runtime instead of being released to the shared pool.
+    emitted: Callable[[int], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +92,10 @@ class _DoneEvent:
     terminal_reason: str | None = None
     qualified_total: int | None = None
     declared_short_page_width: int | None = None
+    closure: BindingClosure | None = None
+    qualified_witnesses: int | None = None
+    keyset_selection: KeysetSelectionSummary | None = None
+    keyset_execution: KeysetExecutionReport | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +120,8 @@ class _KernelReferenceComplete:
     row_count: int
     stopped_reason: str | None = None
     closure: BindingClosure | None = None
+    keyset_selection: KeysetSelectionSummary | None = None
+    keyset_execution: KeysetExecutionReport | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +145,18 @@ class _ReferenceWindowError(Exception):
             self.__cause__ = self.report_cause
 
 
+@dataclass(frozen=True, slots=True)
+class _DecodeOptions:
+    """Envelope decoding options; one physical batch carries pages with equal options only."""
+
+    advisory_totals: bool = False
+    strict_envelope: bool = False
+    strict_json_members: bool = False
+
+
+_PLAIN_DECODING = _DecodeOptions()
+
+
 @dataclass(slots=True)
 class _PendingBatch:
     request: Request
@@ -139,6 +164,8 @@ class _PendingBatch:
     future: asyncio.Future[_DispatchedPage]
     admitted: asyncio.Future[None]
     settled: asyncio.Future[None]
+    dispatch_started: bool = False
+    options: _DecodeOptions = _PLAIN_DECODING
 
 
 @dataclass(slots=True)
@@ -147,6 +174,7 @@ class _ProducerState:
 
     runnable: set[str]
     indexes: dict[str, int]
+    caps: dict[str, int] = field(default_factory=dict)
     admitting: set[str] = field(default_factory=set)
     pending_continuations: set[str] = field(default_factory=set)
     next_key: str | None = None
@@ -181,6 +209,7 @@ class _DispatchedPage:
     batch_index: int | None = None
     admission: asyncio.Future[None] | None = None
     settlement: asyncio.Future[None] | None = None
+    outcome: BatchSuccess | None = field(default=None, repr=False)
 
 
 @dataclass(slots=True)
@@ -196,6 +225,34 @@ class _BatchPageError(Exception):
     def __init__(self, failure: BatchFailure) -> None:
         self.failure = failure
         super().__init__("batch page command failed")
+
+
+def _failed_settlement(error: BaseException) -> CommandSettlement:
+    """Classify a page whose dispatch raised: ambiguous, failed, possibly sent, or never sent."""
+    if isinstance(error, _BatchPageError) and isinstance(error.failure.error, AmbiguousExecutionError):
+        return CommandSettlement.UNKNOWN
+    if isinstance(error, _BatchPageError | ApiResponseError):
+        return CommandSettlement.FAILURE
+    if bool(getattr(error, "_b24api_dispatch_started", False)):
+        return CommandSettlement.UNKNOWN
+    return CommandSettlement.NOT_EXECUTED
+
+
+@dataclass(frozen=True, slots=True)
+class _FailedDispatch:
+    dispatch: PageDispatch
+    batch_index: int | None
+    error: BaseException | None
+
+
+def _failed_dispatch(dispatch: PageDispatch, error: BaseException) -> _FailedDispatch:
+    """Return the dispatch provenance and the reportable error of a page whose dispatch raised."""
+    if isinstance(error, _BatchPageError):
+        cause = error.failure.error
+        return _FailedDispatch(
+            dispatch, error.failure.command_index, cause if isinstance(cause, BaseException) else None
+        )
+    return _FailedDispatch(dispatch, None, None)
 
 
 class _RowBuffer:
@@ -219,6 +276,16 @@ class _RowBuffer:
         self._reservations: list[_Reservation] = []
         self._producer_state = producer_state
 
+    @property
+    def head_index(self) -> int:
+        """Return the INPUT frontier whose page capacity is held in reserve."""
+        return self._head_index
+
+    @property
+    def head_reserve(self) -> int:
+        """Return the rows kept free for the next page of whichever admitted binding becomes the INPUT frontier."""
+        return self._head_reserve
+
     async def reserve(self, index: int, amount: int) -> _Reservation:
         if amount > self.maximum:
             raise BudgetExceededError("one decoded page exceeds the global row buffer")
@@ -236,11 +303,13 @@ class _RowBuffer:
             return False
         if self._head_reserve == 0 or index == self._head_index:
             return True
-        head_has_capacity = any(
-            reservation.index == self._head_index and reservation.amount > 0 for reservation in self._reservations
+        # Rows the frontier holds come back to it; only the rest of its reserve must stay free. A
+        # frontier page accepted short returns its unused rows, and those stay the frontier's: if
+        # another binding took them, rows held behind the frontier could never be released.
+        head_held = sum(
+            reservation.amount for reservation in self._reservations if reservation.index == self._head_index
         )
-        required_head_reserve = 0 if head_has_capacity else self._head_reserve
-        return self._available - amount >= required_head_reserve
+        return self._available - amount >= self._head_reserve - head_held
 
     def can_reserve(self, index: int, amount: int) -> bool:
         """Return whether a reservation can be admitted immediately."""
@@ -299,6 +368,45 @@ class _RowBuffer:
             self._touch()
         if reservation.accepted:
             await self.context.adjust_buffered_rows(-amount)
+
+    async def lease(self, index: int, grant: Callable[[int], int | None]) -> _Reservation:
+        """Hold one fixed capacity until terminal; ``grant`` sizes it from the free rows or asks to wait.
+
+        ``grant`` runs under the pool condition, so the decision and the reservation are atomic. It
+        may raise to refuse a lease no releaser can ever satisfy.
+        """
+        async with self._condition:
+            while True:
+                if self._closed:
+                    raise asyncio.CancelledError
+                amount = grant(self._available)
+                if amount is not None:
+                    break
+                await self._condition.wait()
+            if isinstance(amount, bool) or not 0 < amount <= self._available:
+                raise RuntimeError("fast keyset lease exceeds the free row pool")
+            self._available -= amount
+            reservation = _Reservation(index, amount, lease=True)
+            self._reservations.append(reservation)
+            self._condition.notify_all()
+            self._touch()
+            return reservation
+
+    def releasable_elsewhere(self, index: int) -> bool:
+        """Return whether a page of another binding may still return unused capacity when it settles."""
+        return any(
+            reservation.index != index and not reservation.accepted and not reservation.lease
+            for reservation in self._reservations
+        )
+
+    async def poke(self) -> None:
+        """Wake capacity waiters after a scheduling fact a lease decision depends on has changed."""
+        async with self._condition:
+            self._condition.notify_all()
+
+    def raise_head_reserve(self, reserve: int) -> None:
+        """Reserve more rows for the INPUT frontier, synchronously: a stricter reserve wakes no waiter."""
+        self._head_reserve = max(self._head_reserve, min(reserve, self.maximum))
 
     async def advance_head(self, index: int, reserve: int) -> None:
         async with self._condition:
@@ -391,6 +499,12 @@ class _BatchPageDispatcher:
         self._producer_state = producer_state
         self._buffer = buffer
         self._page_cap = page_cap
+        # Pages drained from the queue wait here per producer, in first-arrival order, so one producer's
+        # queued tail cannot keep a later producer's page out of the next wave (round-robin fairness).
+        self._backlog: dict[str, deque[_PendingBatch]] = {}
+        # The assembler's outstanding coalescing read of the queue. A page it has taken belongs in the
+        # backlog before any chunk forms, or a backlog that never empties would keep it out of every wave.
+        self._getter: asyncio.Task[_PendingBatch] | None = None
         self._pending_continuations_can_progress = pending_continuations_can_progress
         self._assembler: asyncio.Task[None] | None = None
         self._workers: tuple[asyncio.Task[None], ...] = ()
@@ -401,17 +515,26 @@ class _BatchPageDispatcher:
         self.batch_requests = 0
         self.batch_commands = 0
 
-    async def fetch(self, request: Request, reference_id: str) -> _DispatchedPage:  # noqa: C901, PLR0912, PLR0915
+    async def fetch(  # noqa: C901, PLR0912, PLR0915
+        self,
+        request: Request,
+        reference_id: str,
+        *,
+        options: _DecodeOptions = _PLAIN_DECODING,
+        page_reserved: bool = False,
+    ) -> _DispatchedPage:
+        """Queue one page; a fast keyset wave has already reserved its logical pages (``page_reserved``)."""
         if self._closed:
             raise RuntimeError("batch page dispatcher is closed")
-        reservation = await self.context.reserve_page(reference=reference_id)
+        reservation = None if page_reserved else await self.context.reserve_page(reference=reference_id)
         future: asyncio.Future[_DispatchedPage] = asyncio.get_running_loop().create_future()
         admitted: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        pending = _PendingBatch(request, reference_id, future, admitted, settled)
+        pending = _PendingBatch(request, reference_id, future, admitted, settled, options=options)
         remaining = self.context.policy.max_elapsed - self.context.elapsed
         if remaining <= 0:
-            self.context.release_page(reservation)
+            if reservation is not None:
+                self.context.release_page(reservation)
             raise BudgetExceededError("operation elapsed budget exhausted before batch admission")
         try:
             async with asyncio.timeout(remaining):
@@ -422,19 +545,24 @@ class _BatchPageDispatcher:
                 if self._producer_state is not None:
                     self._producer_state.touch()
                 response = await future
-                self.context.commit_page(reservation)
+                if reservation is not None:
+                    self.context.commit_page(reservation)
                 if self._producer_state is not None:
                     self._producer_state.touch()
                 return response
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             future.cancel()
             if not admitted.done():
                 admitted.set_result(None)
             if not settled.done():
                 settled.set_result(None)
-            self.context.release_page(reservation)
+            if reservation is not None:
+                self.context.release_page(reservation)
             if self._producer_state is not None:
                 self._producer_state.touch()
+            if pending.dispatch_started:
+                # A page cancelled after its wave was sent may have executed; settlement must say so.
+                error.__dict__["_b24api_dispatch_started"] = True
             raise
         except TimeoutError as error:
             future.cancel()
@@ -442,16 +570,22 @@ class _BatchPageDispatcher:
                 admitted.set_result(None)
             if not settled.done():
                 settled.set_result(None)
-            self.context.release_page(reservation)
+            if reservation is not None:
+                self.context.release_page(reservation)
             if self._producer_state is not None:
                 self._producer_state.touch()
-            raise BudgetExceededError("batch scheduler admission exceeded operation time budget") from error
+            exceeded = BudgetExceededError("batch scheduler admission exceeded operation time budget")
+            if pending.dispatch_started:
+                # The deadline passed while the page's wave was being sent: it may have executed.
+                exceeded.__dict__["_b24api_dispatch_started"] = True
+            raise exceeded from error
         except BaseException:
             if not admitted.done():
                 admitted.set_result(None)
             if not settled.done():
                 settled.set_result(None)
-            self.context.release_page(reservation)
+            if reservation is not None:
+                self.context.release_page(reservation)
             if self._producer_state is not None:
                 self._producer_state.touch()
             raise
@@ -465,23 +599,27 @@ class _BatchPageDispatcher:
         self._workers = (self._assembler, *senders)
 
     async def _run(self) -> None:  # noqa: C901, PLR0912, PLR0915
-        get_task: asyncio.Task[_PendingBatch] | None = None
         slot_acquired = False
         try:
             while not self._closed:
                 await self._send_slots.acquire()
                 slot_acquired = True
-                if get_task is None:
-                    first = await self._queue.get()
-                else:
-                    first = await get_task
-                    get_task = None
-                if first.future.done():
+                self._collect_getter()
+                # Pages left in the backlog by a full chunk form the next one without a new arrival:
+                # their producers may all be waiting on these very pages.
+                if not self._backlog_pending():
+                    if self._getter is None:
+                        first = await self._queue.get()
+                    else:
+                        first = await self._getter
+                        self._getter = None
+                    self._enqueue(first)
+                chunk: list[_PendingBatch] = []
+                self._drain_nowait(chunk)
+                if not chunk:
                     self._send_slots.release()
                     slot_acquired = False
                     continue
-                chunk = [first]
-                self._drain_nowait(chunk)
                 deadline = self._time() + self.plan.coalesce_wait
                 coalescing_delay = 0.0
                 while len(chunk) < self.plan.batch_size:
@@ -502,40 +640,75 @@ class _BatchPageDispatcher:
                     if state is None:
                         break
                     seen = state.revision
-                    if get_task is None:
-                        get_task = asyncio.create_task(self._queue.get())
+                    if self._getter is None:
+                        self._getter = asyncio.create_task(self._queue.get())
                     wake = state.changed(seen)
                     wait_started = self._time()
                     await self._wait(
-                        (cast("asyncio.Future[object]", get_task), cast("asyncio.Future[object]", wake)),
+                        (cast("asyncio.Future[object]", self._getter), cast("asyncio.Future[object]", wake)),
                         remaining,
                     )
                     coalescing_delay += self._time() - wait_started
-                    if get_task.done():
-                        pending = get_task.result()
-                        get_task = None
-                        if not pending.future.done():
-                            chunk.append(pending)
-                        self._drain_nowait(chunk)
                 self._observe_wave(len(chunk), coalescing_delay)
                 await self._send_queue.put(chunk)
                 slot_acquired = False
         finally:
             if slot_acquired:
                 self._send_slots.release()
-            if get_task is not None and not get_task.done():
-                get_task.cancel()
+            getter = self._getter
+            if getter is not None and not getter.done():
+                getter.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await get_task
+                    await getter
+            # A page the read took before it was cancelled stays reachable for cleanup to cancel.
+            self._collect_getter()
+
+    def _collect_getter(self) -> None:
+        """Move a page the coalescing read has already taken from the queue into the backlog."""
+        getter = self._getter
+        if getter is None or not getter.done():
+            return
+        self._getter = None
+        if not getter.cancelled():
+            self._enqueue(getter.result())
+
+    def _enqueue(self, pending: _PendingBatch) -> None:
+        if not pending.future.done():
+            self._backlog.setdefault(pending.reference_id, deque()).append(pending)
 
     def _drain_nowait(self, chunk: list[_PendingBatch]) -> None:
-        while len(chunk) < self.plan.batch_size:
+        """Move every queued page to the backlog, then fill the chunk round-robin across producers."""
+        # The coalescing read took its page before anything still queued arrived: arrival order holds.
+        self._collect_getter()
+        while True:
             try:
-                pending = self._queue.get_nowait()
+                self._enqueue(self._queue.get_nowait())
             except asyncio.QueueEmpty:
+                break
+        while len(chunk) < self.plan.batch_size and self._backlog:
+            progressed = False
+            for key in tuple(self._backlog):
+                waiting = self._backlog[key]
+                while waiting and waiting[0].future.done():
+                    waiting.popleft()
+                # One envelope is decoded with one set of options; a page with other options waits.
+                if (
+                    waiting
+                    and len(chunk) < self.plan.batch_size
+                    and (not chunk or waiting[0].options == chunk[0].options)
+                ):
+                    chunk.append(waiting.popleft())
+                    progressed = True
+                if not waiting:
+                    del self._backlog[key]
+            if not progressed:
                 return
-            if not pending.future.done():
-                chunk.append(pending)
+
+    def _backlog_pending(self) -> bool:
+        return any(not pending.future.done() for waiting in self._backlog.values() for pending in waiting)
+
+    def _pending_count(self) -> int:
+        return self._queue.qsize() + sum(len(waiting) for waiting in self._backlog.values())
 
     def _observe_wave(self, command_count: int, coalescing_delay: float) -> None:
         """Test/benchmark seam for per-wave coalescing-cost accounting."""
@@ -543,26 +716,26 @@ class _BatchPageDispatcher:
 
     def _potential(self, chunk_keys: set[str]) -> int:
         state, buffer = self._producer_state, self._buffer
-        if state is None or buffer is None or state.closing or self._queue.qsize() >= self._queue.maxsize:
+        if state is None or buffer is None or state.closing or self._pending_count() >= self._queue.maxsize:
             return 0
         admitted = sum(
             key not in chunk_keys
             and self.context.can_reserve_page(reference=key)
-            and buffer.can_reserve(state.indexes[key], self._page_cap)
+            and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
             for key in state.runnable
             if key in state.indexes
         )
         admitting = sum(
             key not in chunk_keys
             and self.context.can_reserve_page(reference=key)
-            and buffer.can_reserve(state.indexes[key], self._page_cap)
+            and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
             for key in state.admitting
             if self._pending_continuations_can_progress and key in state.indexes
         )
         continuations = sum(
             key not in chunk_keys
             and self.context.can_reserve_page(reference=key)
-            and buffer.can_reserve(state.indexes[key], self._page_cap)
+            and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
             for key in state.pending_continuations
             if self._pending_continuations_can_progress and key in state.indexes
         )
@@ -579,21 +752,30 @@ class _BatchPageDispatcher:
             key not in chunk_keys
             and key in state.indexes
             and not (
-                self.context.can_reserve_page(reference=key) and buffer.can_reserve(state.indexes[key], self._page_cap)
+                self.context.can_reserve_page(reference=key)
+                and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
             )
             for key in state.admitting
             if self._pending_continuations_can_progress and (self._active_sends > 0 or self._settling_waves > 0)
         )
         return admitted + admitting + continuations + pending_pull + settling_admission
 
+    def _count_batch_request(self) -> None:
+        """Count one physical batch envelope the chunk sends in its first round."""
+        self.batch_requests += 1
+
     async def _send(self, chunk: list[_PendingBatch]) -> None:
         requests = tuple(item.request for item in chunk)
-        self.batch_requests += int(self._executor._will_dispatch_requests(requests))  # noqa: SLF001
         self.batch_commands += len(chunk)
+        options = chunk[0].options
         try:
             outcomes = await self._executor.execute_requests(
                 requests,
                 context=self.context,
+                advisory_totals=options.advisory_totals,
+                strict_envelope=options.strict_envelope,
+                strict_json_members=options.strict_json_members,
+                on_envelope=self._count_batch_request,
             )
         except asyncio.CancelledError:
             for item in chunk:
@@ -621,6 +803,7 @@ class _BatchPageDispatcher:
                     success.command_index,
                     item.admitted,
                     item.settled,
+                    success,
                 ),
             )
 
@@ -638,6 +821,8 @@ class _BatchPageDispatcher:
             self._active_sends += 1
             if self._producer_state is not None:
                 self._producer_state.touch()
+            for item in chunk:
+                item.dispatch_started = True
             try:
                 await self._send(chunk)
                 self._settling_waves += 1
@@ -690,12 +875,15 @@ class _BatchPageDispatcher:
                         item.settled.set_result(None)
             while True:
                 try:
-                    pending = self._queue.get_nowait()
+                    self._enqueue(self._queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
-                if not pending.future.done():
-                    pending.future.cancel()
-                if not pending.admitted.done():
-                    pending.admitted.set_result(None)
-                if not pending.settled.done():
-                    pending.settled.set_result(None)
+            for waiting in self._backlog.values():
+                for pending in waiting:
+                    if not pending.future.done():
+                        pending.future.cancel()
+                    if not pending.admitted.done():
+                        pending.admitted.set_result(None)
+                    if not pending.settled.done():
+                        pending.settled.set_result(None)
+            self._backlog.clear()

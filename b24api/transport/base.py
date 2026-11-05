@@ -10,6 +10,7 @@ from b24api.contracts.request import ReplaySafety, Request, ResultErrorSpec
 from b24api.contracts.request_summary import RequestSummary, RouteKind
 from b24api.contracts.response import _safe_media_type
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
+from b24api.contracts.wire_body import V3_BATCH_METHOD, V3BatchBody
 from b24api.errors import CapabilityError
 
 if TYPE_CHECKING:
@@ -68,6 +69,9 @@ class TransportCapabilities:
     # A route is served only when declared: a transport that ignores it would answer a V3 or .json
     # request from the classic handler, which silently reaches another endpoint.
     routes: frozenset[RouteKind] = frozenset({RouteKind.BARE})
+    # A top-level JSON array body (the native REST v3 batch envelope) is sent only to a transport that
+    # declares it: ``send_wire`` must serialize ``WireRequest.array_body`` instead of named parameters.
+    json_array_body: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate and freeze advertised capabilities."""
@@ -83,6 +87,8 @@ class TransportCapabilities:
             raise TypeError("scoped_headers must be a bool")
         if not isinstance(self.positional_json, bool):
             raise TypeError("positional_json must be a bool")
+        if not isinstance(self.json_array_body, bool):
+            raise TypeError("json_array_body must be a bool")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -97,6 +103,7 @@ class WireRequest:
     result_error: ResultErrorSpec | None
     _parameters: FrozenMapping = field(repr=False)
     _positional: PositionalArguments | None = field(repr=False)
+    _array_body: V3BatchBody | None = field(repr=False)
 
     def __init__(self, request: Request) -> None:
         """Build from an already-canonical request."""
@@ -110,6 +117,36 @@ class WireRequest:
         object.__setattr__(self, "result_error", request.result_error)
         object.__setattr__(self, "_parameters", request._parameters)  # noqa: SLF001 - canonical immutable handoff
         object.__setattr__(self, "_positional", request.positional)
+        object.__setattr__(self, "_array_body", None)
+
+    @classmethod
+    def _v3_batch(cls, body: V3BatchBody, *, replay_safety: ReplaySafety) -> WireRequest:
+        """Build the native REST v3 batch envelope; the only constructor of the array-body variant.
+
+        The envelope is the ``batch`` method on ``RouteKind.API_V3`` with a JSON array body, no scoped
+        headers, no named or positional parameters and no embedded-error contract: each command's own
+        contract is applied by the SDK to its correlated array element.
+        """
+        if not isinstance(body, V3BatchBody):
+            raise TypeError("v3 batch envelope requires a V3BatchBody")
+        if not isinstance(replay_safety, ReplaySafety):
+            raise TypeError("replay_safety must be a ReplaySafety")
+        wire = object.__new__(cls)
+        object.__setattr__(wire, "method", V3_BATCH_METHOD)
+        object.__setattr__(wire, "route", RouteKind.API_V3)
+        object.__setattr__(wire, "replay_safety", replay_safety)
+        object.__setattr__(wire, "encoding", BodyEncoding.JSON)
+        object.__setattr__(wire, "headers", RequestHeaders())
+        object.__setattr__(wire, "result_error", None)
+        object.__setattr__(wire, "_parameters", FrozenMapping({}))
+        object.__setattr__(wire, "_positional", None)
+        object.__setattr__(wire, "_array_body", body)
+        return wire
+
+    @property
+    def array_body(self) -> V3BatchBody | None:
+        """Return the native v3 batch array body, when this is the envelope variant."""
+        return self._array_body
 
     @property
     def positional(self) -> PositionalArguments | None:
@@ -125,11 +162,16 @@ class WireRequest:
         """Return a detached mutable parameter tree."""
         if self._positional is not None:
             raise ValueError("positional arguments have no named parameter mapping")
+        if self._array_body is not None:
+            raise ValueError("a v3 batch array body has no named parameter mapping")
         return cast("dict[str, JsonValue]", _thaw_json(self._parameters))
 
     @property
     def summary(self) -> RequestSummary:
         """Return bounded value-free request evidence."""
+        if self._array_body is not None:
+            # Inner methods, keys and values never reach envelope evidence; each command keeps its own summary.
+            return RequestSummary(method=V3_BATCH_METHOD, parameter_keys=("@v3_batch",), route=RouteKind.API_V3)
         return RequestSummary(
             method=self.method,
             parameter_keys=(f"@{self._positional.layout_id}",) if self._positional else tuple(sorted(self._parameters)),
@@ -211,3 +253,35 @@ def preflight_transport(transport: WireTransport | None, request: Request) -> No
         raise CapabilityError(f"transport does not support {request.encoding.value} request bodies")
     if request.headers.items and not capabilities.scoped_headers:
         raise CapabilityError("transport does not support scoped request headers")
+
+
+def transport_supports_json_array_body(transport: WireTransport | None) -> bool:
+    """Return whether a transport declares the native v3 batch envelope and the API_V3 route."""
+    if transport is None:
+        return False
+    capabilities = transport.capabilities
+    return (
+        isinstance(capabilities, TransportCapabilities)
+        and capabilities.json_array_body
+        and RouteKind.API_V3 in capabilities.routes
+    )
+
+
+def preflight_wire(transport: WireTransport | None, wire: WireRequest) -> None:
+    """Reject an unsupported wire representation before budget reservation or I/O.
+
+    An array body requires a ``WireTransport`` that declares ``json_array_body`` and the API_V3 route; a
+    send-only transport never receives it, because ``send(Request)`` cannot represent an array body.
+    """
+    if not isinstance(wire, WireRequest):
+        raise TypeError("wire preflight requires a WireRequest")
+    if wire.array_body is None:
+        if transport is None and wire.route is not RouteKind.BARE:
+            raise CapabilityError(f"transport does not build the {wire.route.value} route")
+        return
+    if transport is None:
+        raise CapabilityError("send-only transport does not support native v3 batch array bodies")
+    if not isinstance(transport.capabilities, TransportCapabilities):
+        raise CapabilityError("transport exposes malformed capabilities")
+    if not transport_supports_json_array_body(transport):
+        raise CapabilityError("transport does not support native v3 batch array bodies on the api_v3 route")

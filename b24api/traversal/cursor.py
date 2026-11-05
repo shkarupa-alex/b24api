@@ -3,7 +3,10 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from b24api.errors import PaginationError
+from b24api.completion.closure import RESPONSE_FLAG_DECLARED_TERMINAL
+from b24api.contracts.continuation import ContinuationReason
+from b24api.errors import ContinuationError, PaginationError
+from b24api.traversal.continuation import response_more
 from b24api.traversal.cursor_domain import validate_cursor_progression, validate_cursor_value, validate_initial_cursor
 from b24api.traversal.identity import _cursor_terminal, _request_with_controls
 from b24api.traversal.strategy_context import PageStop, PageVerdict
@@ -67,20 +70,35 @@ class ItemCursorStrategy:
 
     def judge(self, ctx: StrategyContext, response: Response, items: tuple[FrozenJson, ...]) -> PageVerdict:
         """Check the page's cursors are valid, ordered and strictly past the current cursor."""
-        del response
         plan, cursor = self._plan, self._cursor
         cursor_values = self._cursor_values = _cursor_values(ctx.source_page.current(items), plan)
         for value in cursor_values:
             validate_cursor_progression(value, plan.domain)
-        _validate_order(cursor_values, plan.direction)
+        _validate_order(cursor_values, plan.page_order or plan.direction)
         if cursor is not None and cursor_values:
-            comparison = _compare_identities(cursor_values[0], cursor)
-            if plan.direction == "asc" and comparison <= 0:
-                raise PaginationError("item cursor page ignored its lower bound")
-            if plan.direction == "desc" and comparison >= 0:
-                raise PaginationError("item cursor page ignored its upper bound")
-        self._terminal = _cursor_terminal(plan, len(items))
+            # A declared page order checks every row: the boundary row need not lead the page.
+            for value in cursor_values if plan.page_order is not None else cursor_values[:1]:
+                comparison = _compare_identities(value, cursor)
+                if plan.direction == "asc" and comparison <= 0:
+                    raise PaginationError("item cursor page ignored its lower bound")
+                if plan.direction == "desc" and comparison >= 0:
+                    raise PaginationError("item cursor page ignored its upper bound")
+        self._terminal = self._page_terminal(response, len(items))
         return PageVerdict(self._terminal is not None)
+
+    def _page_terminal(self, response: Response, row_count: int) -> str | None:
+        """Close on the declared response flag when one exists, else on the empty confirmation page."""
+        flag = self._plan.response_terminal
+        if flag is None:
+            return _cursor_terminal(self._plan, row_count)
+        if not response_more(response, flag):
+            return RESPONSE_FLAG_DECLARED_TERMINAL
+        if not row_count:
+            raise ContinuationError(
+                ContinuationReason.MISSING_CONTINUATION,
+                "response flag declares more pages but the page carries no cursor",
+            )
+        return None
 
     def advance(self, ctx: StrategyContext, identities: list[IdentityValue]) -> Request | PageStop:
         """Stop on the terminal page, else take the next cursor, which must move strictly forward."""

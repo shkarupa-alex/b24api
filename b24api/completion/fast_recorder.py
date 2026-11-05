@@ -34,37 +34,38 @@ class _CommandPage:
     remaining: int | None = None
 
 
-class FastCompletionRecorder:
-    """Track bounded in-flight physical commands through scheduler acceptance."""
+class FastPageLedger:
+    """Correlate fast keyset commands with completion evidence, independent of where it is emitted.
+
+    A flat traversal emits into its own operation gate as binding 0; a reference binding emits into
+    the shared operation gate under its own binding id. The page protocol is identical.
+    """
 
     def __init__(self) -> None:
-        """Admit the sole keyset binding before any physical scheduling."""
-        self.gate = CompletionGate(uuid4().hex)
-        self._sequence = 0
-        self._page_id = 0
+        """Start with no scheduled command."""
         self._active: dict[str, _CommandPage] = {}
         self._negative = False
-        self._terminal = False
-        self._emit(BindingAdmitted, binding_id=0)
 
-    def _emit(self, event_type: type, **fields: object) -> None:
-        self.gate.emit(
-            event_type(
-                operation_id=self.gate.operation_id,
-                sequence=self._sequence,
-                **fields,
-            )
-        )
-        self._sequence += 1
+    @property
+    def negative(self) -> bool:
+        """Return whether any page of this binding settled or was retired negatively."""
+        return self._negative
+
+    def _new_page(self) -> int:
+        """Return the next page id of this binding."""
+        raise NotImplementedError
+
+    def _emit_page(self, event_type: type, page_id: int, **fields: object) -> None:
+        """Emit one page event of this binding."""
+        raise NotImplementedError
 
     def schedule(self, command_id: str) -> None:
         """Register a logical page before its containing physical batch dispatch."""
         if command_id in self._active:
             raise RuntimeError("fast command was scheduled twice")
-        page_id = self._page_id
-        self._page_id += 1
+        page_id = self._new_page()
         self._active[command_id] = _CommandPage(page_id)
-        self._emit(PageScheduled, binding_id=0, page_id=page_id)
+        self._emit_page(PageScheduled, page_id)
 
     def settle(self, command_id: str, outcome: CommandSettlement) -> None:
         """Record one correlated physical command settlement."""
@@ -72,7 +73,7 @@ class FastCompletionRecorder:
         if page.settled:
             raise RuntimeError("fast command settled twice")
         page.settled = True
-        self._emit(PageCommandOutcome, binding_id=0, page_id=page.page_id, outcome=outcome)
+        self._emit_page(PageCommandOutcome, page.page_id, outcome=outcome)
         if outcome is not CommandSettlement.SUCCESS:
             self._negative = True
             del self._active[command_id]
@@ -96,7 +97,7 @@ class FastCompletionRecorder:
                 raise RuntimeError("fast accepted page was not validated")
             page.recorded = True
         else:
-            self._emit(PageRejected, binding_id=0, page_id=page.page_id, reason=outcome.value)
+            self._emit_page(PageRejected, page.page_id, reason=outcome.value)
             self._negative = True
             del self._active[command_id]
 
@@ -108,7 +109,7 @@ class FastCompletionRecorder:
         if page is None or not page.recorded or page.remaining is not None or count < 0:
             raise RuntimeError("fast page admission lacks a committed physical page")
         page.remaining = count
-        self._emit(PageValidated, binding_id=0, page_id=page.page_id, row_count=count)
+        self._emit_page(PageValidated, page.page_id, row_count=count)
         if count == 0:
             self._acknowledge(command_id)
 
@@ -123,8 +124,8 @@ class FastCompletionRecorder:
 
     def _acknowledge(self, command_id: str) -> None:
         page = self._active[command_id]
-        self._emit(PageDelivered, binding_id=0, page_id=page.page_id)
-        self._emit(PageAcknowledged, binding_id=0, page_id=page.page_id)
+        self._emit_page(PageDelivered, page.page_id)
+        self._emit_page(PageAcknowledged, page.page_id)
         del self._active[command_id]
 
     def discard_unadmitted(self) -> None:
@@ -132,6 +133,44 @@ class FastCompletionRecorder:
         for command_id, page in tuple(self._active.items()):
             if page.recorded and page.remaining is None:
                 self.admit(command_id, 0)
+
+    def _reject_active(self, reason: str) -> None:
+        """Retire every page still open after an unsuccessful traversal."""
+        for command_id, page in tuple(self._active.items()):
+            self._emit_page(PageRejected, page.page_id, reason=reason)
+            self._negative = True
+            del self._active[command_id]
+
+
+class FastCompletionRecorder(FastPageLedger):
+    """Track bounded in-flight physical commands of one flat traversal through scheduler acceptance."""
+
+    def __init__(self) -> None:
+        """Admit the sole keyset binding before any physical scheduling."""
+        super().__init__()
+        self.gate = CompletionGate(uuid4().hex)
+        self._sequence = 0
+        self._page_id = 0
+        self._terminal = False
+        self._emit(BindingAdmitted, binding_id=0)
+
+    def _emit(self, event_type: type, **fields: object) -> None:
+        self.gate.emit(
+            event_type(
+                operation_id=self.gate.operation_id,
+                sequence=self._sequence,
+                **fields,
+            )
+        )
+        self._sequence += 1
+
+    def _new_page(self) -> int:
+        page_id = self._page_id
+        self._page_id += 1
+        return page_id
+
+    def _emit_page(self, event_type: type, page_id: int, **fields: object) -> None:
+        self._emit(event_type, binding_id=0, page_id=page_id, **fields)
 
     def terminal(  # noqa: PLR0913
         self,
@@ -150,10 +189,7 @@ class FastCompletionRecorder:
         if state is KernelState.COMPLETED and rows_emitted == rows_admitted:
             self.discard_unadmitted()
         else:
-            for command_id, page in tuple(self._active.items()):
-                self._emit(PageRejected, binding_id=0, page_id=page.page_id, reason=state.value)
-                self._negative = True
-                del self._active[command_id]
+            self._reject_active(state.value)
         successful = state is KernelState.COMPLETED and rows_emitted == rows_admitted
         if successful and closure not in {BindingClosure.SOURCE_EMPTY, BindingClosure.KEYSET_PLAN_COVERED}:
             closure = BindingClosure.FAILURE
@@ -181,4 +217,4 @@ class FastCompletionRecorder:
         self._emit(CleanupOutcome, state=cleanup)
 
 
-__all__ = ["FastCompletionRecorder"]
+__all__ = ["FastCompletionRecorder", "FastPageLedger"]
