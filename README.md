@@ -141,20 +141,22 @@ API error [BITRIX_REST_V3_EXCEPTION_ACCESSDENIEDEXCEPTION]: Access denied
 API error [NOTE_EMPTY_UPDATE]: Nothing to update
 ```
 
-A REST 3.0 `error.code` is shown verbatim whenever it is a snake-case identifier in one letter
-case, such as `BITRIX_REST_V3_EXCEPTION_INVALIDSELECTEXCEPTION`, `FEATURE_NOT_AVAILABLE_ON_CURRENT_PLAN`
-or `invalid_select_field`; the server's set is open, so no list is kept. Error texts, classic
+A REST 3.0 `error.code` is shown verbatim whenever it is a snake-case identifier: upper case, such
+as `BITRIX_REST_V3_EXCEPTION_INVALIDSELECTEXCEPTION` or `FEATURE_NOT_AVAILABLE_ON_CURRENT_PLAN`, or
+lower case of letters only, such as `invalid_select_field`; the server's set is open, so no list is
+kept. Error texts, classic
 `{"error": ...}` codes and response previews keep the conservative redaction, so a long run of
 letters and digits there still renders as `[REDACTED]`. A code that equals or contains your
-webhook token or a credential of the request is always `[REDACTED]`, and one that names a field of
-your request is shown as its `field#N` alias.
+webhook token or a credential of the request, in any letter case, is always `[REDACTED]`; one that
+names a field of your request is shown as its `field#N` alias, or as `[REDACTED]` when only its
+letter case differs.
 
 Recognizing a code does not make it retryable. By default only the REST 3.0 load limits are retried,
 after the server's `Retry-After`:
 
 | Code | Status | Retried |
 |---|---|---|
-| `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` | 429 | Any request: the limiter refuses before the method runs. |
+| `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` | 429 | Any direct request: the limiter refuses before the method runs. In a REST 3.0 batch envelope only `SAFE` commands, as for any structured envelope error. |
 | `BITRIX_REST_V3_EXCEPTION_LIMITER_QUERYTIMELIMITEXCEPTION` | 503 | `SAFE` requests only: the method may have run. |
 
 Every other REST 3.0 code is a deterministic refusal and is raised at once, including a 429 or 503
@@ -162,7 +164,8 @@ that a module declares for a longer-lived state (`LANDING_AI_SITE_MODERATION_BLO
 `LANDING_AI_MODULE_UNAVAILABLE`). List more codes in `RetryPolicy.transient_api_codes` (and in
 `AmbiguityPolicy.refusal_api_codes` when the code proves the method did not run). The request
 faults `BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION` and
-`BITRIX_REST_V3_EXCEPTION_METHODNOTFOUNDEXCEPTION` are never retried, even when listed.
+`BITRIX_REST_V3_EXCEPTION_METHODNOTFOUNDEXCEPTION` in a REST 3.0 error envelope are never retried,
+even when listed.
 
 ## Logical batch and correlation
 

@@ -14,6 +14,8 @@
   `AmbiguityPolicy.refusal_api_codes` lists the rate limit, which the server refuses before the
   method runs. A policy built with its own code sets keeps exactly those sets. Every other code keeps
   its previous retry behavior.
+- **`b24api.contracts.v3_codes`.** `KNOWN_V3_ERROR_CODES` now also holds the two load limit codes and
+  is no longer the non-retryable set; use `NON_RETRYABLE_V3_ERROR_CODES` for that.
 
 ## Declared short-page closure and keyset binding filters
 

@@ -230,7 +230,9 @@ def test_every_server_code_is_shown_verbatim_in_every_channel(code: str) -> None
     error = _decode(code)
 
     assert render_code(code, v3_envelope=True) == code
-    assert render_code(code.lower(), v3_envelope=True) == code.lower()
+    # On its own, a lower-case code is recognized only as letters; the error's lower-cased ``code`` follows the wire.
+    lower_shown = code in KNOWN_V3_ERROR_CODES or not any(character.isdigit() for character in code)
+    assert render_code(code.lower(), v3_envelope=True) == (code.lower() if lower_shown else REDACTED)
     assert str(error) == f"API error [{code}]: refused"
     safe = error.to_safe_dict()
     assert safe["wire_code"] == safe["original_code"] == safe["normalized_code"] == error.wire_code == code
@@ -279,6 +281,36 @@ def test_other_shapes_keep_the_free_text_redaction(code: str) -> None:
 def test_only_ascii_counts_for_the_shape() -> None:
     assert not is_v3_code_shape("NOTE_REST_V3_ÉMPTY_UPDATE")
     assert not is_v3_code_shape("ß_note_update")  # upper-cases to ASCII ``SS_NOTE_UPDATE``
+
+
+@pytest.mark.parametrize(
+    "code", ["sk_live_a1b2c3d4e5f6g7h8i9", "invalid_token_abcd1234efgh5678", "rest_v3_request_refused"]
+)
+def test_a_lower_case_code_with_a_digit_keeps_the_free_text_redaction(code: str) -> None:
+    error = _decode(code)
+
+    assert not is_v3_code_shape(code)
+    assert error.wire_code == REDACTED
+    assert code not in _channels(error)
+
+
+@pytest.mark.parametrize(
+    ("field", "code"),
+    [
+        ("uf_crm_privatefield_a1", "UF_CRM_PRIVATEFIELD_A1"),
+        ("UF_CRM_PRIVATEFIELD_A1", "uf_crm_privatefield_a1"),
+        ("UF_CRM_PRIVATEFIELD", "uf_crm_privatefield"),
+        ("NOTE_PRIVATE_FIELD", "note_private_field"),
+    ],
+)
+def test_a_request_field_name_in_another_letter_case_is_never_shown(field: str, code: str) -> None:
+    request = Request("note.list", {"select": [field]}, route=RouteKind.API_V3)
+
+    error = _decode(code, diagnostics=diagnostic_context(request))
+
+    assert error.wire_code == REDACTED
+    assert code.casefold() not in _code_channels(error).casefold()
+    assert field.casefold() not in _code_channels(error).casefold()
 
 
 def test_registered_and_request_secrets_beat_the_shape() -> None:
@@ -370,7 +402,7 @@ def _ok() -> WireResponse:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("safety", [ReplaySafety.SAFE, ReplaySafety.UNKNOWN])
+@pytest.mark.parametrize("safety", [ReplaySafety.SAFE, ReplaySafety.UNSAFE, ReplaySafety.UNKNOWN])
 async def test_a_rate_limit_refusal_is_retried_whatever_the_safety(safety: ReplaySafety) -> None:
     transport = ResponderTransport(replies(_v3_wire(RATE_LIMIT_ERROR_CODE, 429), _ok()))
     request = Request("note.document.add", {"title": "x"}, safety, route=RouteKind.BARE)

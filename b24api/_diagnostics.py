@@ -29,7 +29,7 @@ _MAX_SECRET_DEPTH = 32
 class DiagnosticContext:
     """Aliases and exact secrets of one canonical request, resolved on first use."""
 
-    __slots__ = ("_aliases", "_headers", "_parameters", "_pattern", "_secrets")
+    __slots__ = ("_aliases", "_folded_pattern", "_headers", "_parameters", "_pattern", "_secrets")
 
     def __init__(
         self,
@@ -42,6 +42,7 @@ class DiagnosticContext:
         self._headers = tuple(headers)
         self._aliases: dict[str, str] | None = None
         self._pattern: re.Pattern[str] | None = None
+        self._folded_pattern: re.Pattern[str] | None = None
         self._secrets: frozenset[str] = frozenset()
 
     def __repr__(self) -> str:
@@ -71,9 +72,17 @@ class DiagnosticContext:
         return contains_secret(text, self._secrets)
 
     def aliases_text(self, text: str) -> bool:
-        """Report whether ``text`` holds a whole declared field name that rendering would alias."""
+        """Report whether ``text`` holds a whole declared field name, ignoring letter case.
+
+        Rendering aliases only the exact spelling; Bitrix field names are case-insensitive, so this check
+        also reports a field name the server echoed in another letter case.
+        """
         self._resolved()
-        return self._pattern is not None and self._pattern.search(text) is not None
+        if self._pattern is None:
+            return False
+        if self._folded_pattern is None:
+            self._folded_pattern = re.compile(self._pattern.pattern, re.IGNORECASE)
+        return self._folded_pattern.search(text) is not None
 
     def replace_secrets(self, text: str) -> str:
         """Replace the request's own exact secrets wherever they occur."""

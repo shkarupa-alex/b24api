@@ -279,10 +279,12 @@ v3_shaped_tokens = st.from_regex(r"[A-Z][A-Z0-9]{2,9}(?:_[A-Z][A-Z0-9]{2,9}){1,5
 
 
 @settings(max_examples=60, suppress_health_check=[HealthCheck.too_slow])
-@given(token=v3_shaped_tokens, lower=st.booleans())
-def test_a_v3_shaped_token_is_shown_only_as_the_v3_envelope_code(token: str, *, lower: bool) -> None:
-    token = token.lower() if lower else token
+@given(v3_shaped_tokens)
+def test_a_v3_shaped_token_is_shown_only_as_the_v3_envelope_code(token: str) -> None:
     shown = _render_everywhere(token, codec=ProtocolCodec())
+    # A lower-case code is recognized only as letters, so the same token lower-cased stays hidden everywhere.
+    lowered = token.lower()
+    assert lowered not in _error_channels(_render_everywhere(lowered, codec=ProtocolCodec()))
     elsewhere = ProtocolCodec().error_from_http(
         status_code=400,
         body={

@@ -7,17 +7,18 @@ Recognition decides only whether a code may be shown verbatim. A REST 3.0 server
 thrown exception (``BITRIX_REST_V3_EXCEPTION_ACCESSDENIEDEXCEPTION``), but any module may subclass the
 server exception and override the code (``NOTE_EMPTY_UPDATE``, ``FEATURE_NOT_AVAILABLE_ON_CURRENT_PLAN``,
 lower-case ``invalid_select_field``). A closed list would drift, so the structured ``error.code`` of a
-REST 3.0 envelope is recognized by shape: an ASCII snake-case identifier of at least two words, each
-word starting with a letter, in one letter case. That shape is applied to nothing else: free text, a
-classic ``{"error": ...}`` code and every other channel keep the conservative bare-credential
-redaction, which hides any 16+ character run of letters and digits. Recognition never overrides a
-registered exact secret, the request's own secrets or its field names: a code holding a secret is
-redacted whole, and one holding a request field name is aliased like free text.
+REST 3.0 envelope is recognized by shape: an ASCII snake-case identifier of at least two words, upper
+case with each word starting with a letter, or lower case of letters only. That shape is applied to
+nothing else: free text, a classic ``{"error": ...}`` code and every other channel keep the conservative
+bare-credential redaction, which hides any 16+ character run of letters and digits. Recognition never
+overrides a registered exact secret, the request's own secrets or its field names: a code holding a
+secret in any letter case is redacted whole, and one holding a request field name is aliased, or
+redacted when only its letter case differs from the request's spelling.
 
 Retry is decided by the policy, not by recognition. ``RetryPolicy.transient_api_codes`` and
 ``AmbiguityPolicy.refusal_api_codes`` include the server's load limiter codes by default; every other
-code, recognized or not, is a deterministic refusal unless the caller lists it. The two codes in
-``NON_RETRYABLE_V3_ERROR_CODES`` are never retried, even when a caller lists them.
+code, recognized or not, is a deterministic refusal unless the caller lists it. A REST 3.0 envelope
+with one of the two codes in ``NON_RETRYABLE_V3_ERROR_CODES`` is never retried, even when listed.
 """
 
 from __future__ import annotations
@@ -45,7 +46,10 @@ REFUSAL_V3_ERROR_CODES = frozenset({RATE_LIMIT_ERROR_CODE})
 # The codes b24api names itself. They render verbatim in every channel; any other code only by shape.
 KNOWN_V3_ERROR_CODES = NON_RETRYABLE_V3_ERROR_CODES | TRANSIENT_V3_ERROR_CODES
 _KNOWN_FOLDED = frozenset(code.casefold() for code in KNOWN_V3_ERROR_CODES)
-_V3_CODE_SHAPE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+")
+# Upper-case codes carry digits only in version words (``V2``, ``V3``, ``B2E``); every lower-case code the
+# server sends is letters only, which keeps lower-case credentials such as ``sk_live_a1b2c3...`` out.
+_UPPER_CODE_SHAPE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+")
+_LOWER_CODE_SHAPE = re.compile(r"[a-z]+(?:_[a-z]+)+")
 
 
 def is_known_v3_code(code: str) -> bool:
@@ -56,13 +60,12 @@ def is_known_v3_code(code: str) -> bool:
 def is_v3_code_shape(code: str) -> bool:
     """Report whether a string has the shape of a REST 3.0 ``error.code``, in upper or lower case.
 
-    The shape is ASCII snake case of at least two words, each starting with a letter:
-    ``BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION``, ``NOTE_EMPTY_UPDATE`` or ``invalid_select_field``.
-    Mixed case, a word starting with a digit (``UF_CRM_1700000000123``) or any other character is not.
+    The shape is ASCII snake case of at least two words: upper case with each word starting with a
+    letter (``BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION``, ``NOTE_EMPTY_UPDATE``), or lower case of
+    letters only (``invalid_select_field``). Mixed case, a word starting with a digit
+    (``UF_CRM_1700000000123``), a lower-case digit or any other character is not.
     """
-    if not code.isascii() or not (code.isupper() or code.islower()):
-        return False
-    return _V3_CODE_SHAPE.fullmatch(code.upper()) is not None
+    return _UPPER_CODE_SHAPE.fullmatch(code) is not None or _LOWER_CODE_SHAPE.fullmatch(code) is not None
 
 
 def render_code(
@@ -78,7 +81,8 @@ def render_code(
     secret, in any letter case, is redacted whole. A known literal is recognized up to letter case, so the
     lower-cased public ``code`` attribute stays diagnosable. With ``v3_envelope``, the code came from
     ``error.code`` of a REST 3.0 envelope, and a code of the V3 shape is shown unless it holds a request
-    field name, which is aliased as free text. Anything else is free text.
+    field name in any letter case, which is aliased, or redacted when only its case differs. Anything
+    else is free text.
     """
     text = str(code)
     # Free-text replacement is case-sensitive, and a code is also shown lower-cased: a code that holds a
@@ -87,8 +91,12 @@ def render_code(
         return REDACTED
     if is_known_v3_code(text):
         return text
-    if v3_envelope and is_v3_code_shape(text) and (context is None or not context.aliases_text(text)):
-        return text
+    if v3_envelope and is_v3_code_shape(text):
+        if context is None or not context.aliases_text(text):
+            return text
+        # A request field name, possibly in another letter case than the request spelled it, is never shown.
+        rendered = redactor.render_text(text, context=context)
+        return rendered if rendered != text else REDACTED
     return redactor.render_text(text, context=context)
 
 
