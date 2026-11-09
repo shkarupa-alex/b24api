@@ -24,6 +24,7 @@ from b24api.contracts import (
     ResultSelector,
 )
 from b24api.contracts.report import OperationReport, TerminalState
+from b24api.contracts.v3_codes import RATE_LIMIT_ERROR_CODE
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
@@ -792,6 +793,38 @@ async def test_a21_throttle_structured_quota_safe_abort_is_retried_once_as_an_en
     assert transport.calls == ()
     assert report.ambiguous_physical_attempts == 1
     assert report.batch_isolation_requests == 0
+    transport.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_a21_throttle_v3_rate_limit_safe_abort_is_retried_once_as_an_envelope() -> None:
+    """Issue 31: the REST 3.0 rate limit aborting a SAFE envelope is a transient code, retried as one envelope."""
+    requests = tuple(_v3(identifier) for identifier in (1, 2, 3))
+    fixture = ScriptedExchange.v3_batch(requests, tuple(_item(i) for i in (1, 2, 3)))
+    limited = ScriptedExchange.v3_batch(requests, payload=_abort(RATE_LIMIT_ERROR_CODE), status=429)
+    transport = ScriptedTransport((limited, fixture))
+
+    outcomes, report = await _run(transport, requests)
+
+    assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+    assert report.physical_requests == TWO
+    assert transport.calls == ()
+    transport.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_a21_refusal_v3_rate_limit_of_an_envelope_proves_nothing_for_non_safe() -> None:
+    """Issue 31: a structured envelope error proves nothing about a possibly executed v3 prefix, rate limit too."""
+    requests = (_v3(1, method="x.item.add", safety=UNSAFE), _v3(2, method="x.item.add", safety=UNKNOWN))
+    transport = ScriptedTransport(
+        (ScriptedExchange.v3_batch(requests, payload=_abort(RATE_LIMIT_ERROR_CODE), status=429),),
+    )
+
+    outcomes, report = await _run(transport, requests)
+
+    assert all(isinstance(outcome, CommandOutcomeUnknown) for outcome in outcomes)
+    assert report.physical_requests == 1
+    assert report.retries == 0
     transport.assert_exhausted()
 
 

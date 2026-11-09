@@ -1,5 +1,22 @@
 # Migration guide
 
+## REST 3.0 error codes
+
+- **Codes are shown verbatim.** A REST 3.0 `error.code` of snake-case identifier shape now appears
+  as is in the `ApiResponseError` message, `wire_code`, `normalized_code`, `code` and
+  `to_safe_dict()`. Before, all but two such codes of 16 or more characters with a digit in them
+  (such as `BITRIX_REST_V3_EXCEPTION_ACCESSDENIEDEXCEPTION`) rendered as `[REDACTED]`. Code that matched
+  `[REDACTED]` to detect a REST 3.0 failure should match the code instead. A structured code that
+  contains a registered or request secret in any letter case is now `[REDACTED]` as a whole.
+- **Two REST 3.0 load limits are retried.** `RetryPolicy.transient_api_codes` now also lists
+  `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` and
+  `BITRIX_REST_V3_EXCEPTION_LIMITER_QUERYTIMELIMITEXCEPTION`, and
+  `AmbiguityPolicy.refusal_api_codes` lists the rate limit, which the server refuses before the
+  method runs. A policy built with its own code sets keeps exactly those sets. Every other code keeps
+  its previous retry behavior.
+- **`b24api.contracts.v3_codes`.** `KNOWN_V3_ERROR_CODES` now also holds the two load limit codes and
+  is no longer the non-retryable set; use `NON_RETRYABLE_V3_ERROR_CODES` for that.
+
 ## Declared short-page closure and keyset binding filters
 
 Both changes are additive: existing calls keep their behavior, and the `b24api` root exports are

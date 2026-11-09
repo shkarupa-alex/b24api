@@ -30,7 +30,12 @@ from hypothesis import strategies as st
 from b24api import Bitrix24, ReplaySafety, Request, RouteKind, Settings, cli
 from b24api.contracts import Violation, ViolationSeverity
 from b24api.contracts.request import diagnostic_context
-from b24api.contracts.v3_codes import KNOWN_V3_ERROR_CODES, METHOD_NOT_FOUND_ERROR_CODE, VALIDATION_ERROR_CODE
+from b24api.contracts.v3_codes import (
+    KNOWN_V3_ERROR_CODES,
+    METHOD_NOT_FOUND_ERROR_CODE,
+    VALIDATION_ERROR_CODE,
+    is_v3_code_shape,
+)
 from b24api.errors import ApiResponseError
 from b24api.redaction import REDACTED, Redactor
 from b24api.testing import ScriptedExchange, ScriptedTransport
@@ -262,9 +267,39 @@ def test_registered_secret_of_any_shape_is_absent_from_every_channel(token: str)
 
 
 @settings(max_examples=60, suppress_health_check=[HealthCheck.too_slow])
-@given(tokens)
+@given(tokens.filter(lambda token: not is_v3_code_shape(token)))
 def test_unregistered_heuristic_tokens_stay_hidden_as_before(token: str) -> None:
     assert token not in _error_channels(_render_everywhere(token, codec=ProtocolCodec()))
+
+
+# Snake-case identifiers of the REST 3.0 ``error.code`` shape that the bare-credential heuristic hides in free text.
+v3_shaped_tokens = st.from_regex(r"[A-Z][A-Z0-9]{2,9}(?:_[A-Z][A-Z0-9]{2,9}){1,5}", fullmatch=True).filter(
+    lambda token: len(token) >= 16 and any(character.isdigit() for character in token)  # noqa: PLR2004
+)
+
+
+@settings(max_examples=60, suppress_health_check=[HealthCheck.too_slow])
+@given(v3_shaped_tokens)
+def test_a_v3_shaped_token_is_shown_only_as_the_v3_envelope_code(token: str) -> None:
+    shown = _render_everywhere(token, codec=ProtocolCodec())
+    # A lower-case code is recognized only as letters, so the same token lower-cased stays hidden everywhere.
+    lowered = token.lower()
+    assert lowered not in _error_channels(_render_everywhere(lowered, codec=ProtocolCodec()))
+    elsewhere = ProtocolCodec().error_from_http(
+        status_code=400,
+        body={
+            "error": {"code": "NOTE_EMPTY_UPDATE", "message": f"failed: {token}", "validation": []},
+            "echo": {token: token},
+        },
+    )
+    classic = ProtocolCodec().error_from_http(status_code=400, body={"error": token, "error_description": token})
+
+    assert shown.wire_code == token
+    assert token not in str(shown).replace(f"[{token}]", "", 1)
+    assert isinstance(elsewhere, ApiResponseError)
+    assert isinstance(classic, ApiResponseError)
+    assert token not in _error_channels(elsewhere)
+    assert token not in _error_channels(classic).casefold()
 
 
 @pytest.mark.parametrize("code", sorted(KNOWN_V3_ERROR_CODES))
