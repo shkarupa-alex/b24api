@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
-from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _thaw_json
+from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, thaw_json
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ParameterPath
 from b24api.redaction import DEFAULT_REDACTOR
@@ -37,7 +37,7 @@ class ParameterUpdate:
     @property
     def value(self) -> JsonValue:
         """Return a detached update value."""
-        return _thaw_json(self._value)
+        return thaw_json(self._value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +70,7 @@ class Binding[C]:
         object.__setattr__(self, "summary", safe)
         object.__setattr__(self, "updates", updates)
         if self.start_cursor is not None:
-            object.__setattr__(self, "start_cursor", _thaw_json(_freeze_json(self.start_cursor)))
+            object.__setattr__(self, "start_cursor", thaw_json(_freeze_json(self.start_cursor)))
 
 
 @dataclass(frozen=True, slots=True)

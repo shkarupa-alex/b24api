@@ -10,7 +10,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, cast
 
 from b24api.contracts.evidence import ResponseEvidence
-from b24api.contracts.json import FrozenJson, FrozenMapping, JsonValue, _freeze_json, _is_plain_int, _thaw_json
+from b24api.contracts.json import FrozenJson, FrozenMapping, JsonValue, _freeze_json, _is_plain_int, thaw_json
 from b24api.contracts.request import PathPart, ResultSelector
 
 if TYPE_CHECKING:
@@ -198,7 +198,7 @@ class Response:
     @property
     def result(self) -> JsonValue:
         """Return the result."""
-        return _thaw_json(self._result)
+        return thaw_json(self._result)
 
     def _frozen_result(self) -> FrozenJson:
         """Return the operation-internal immutable result snapshot."""
@@ -242,14 +242,14 @@ def inject_controls(
     frozen = _freeze_json(parameters)
     if not isinstance(frozen, FrozenMapping):
         raise TypeError("parameters must be a mapping")
-    result = cast("dict[str, JsonValue]", _thaw_json(frozen))
+    result = cast("dict[str, JsonValue]", thaw_json(frozen))
     normalized_paths: set[tuple[PathPart, ...]] = set()
     for path, value in updates.items():
         normalized = tuple(part.casefold() if isinstance(part, str) else part for part in path.path)
         if normalized in normalized_paths:
             raise ValueError("two injected controls address the same case-insensitive path")
         normalized_paths.add(normalized)
-        _inject_one(result, path.path, _thaw_json(_freeze_json(value)), allow_create=allow_create)
+        _inject_one(result, path.path, thaw_json(_freeze_json(value)), allow_create=allow_create)
     return result
 
 

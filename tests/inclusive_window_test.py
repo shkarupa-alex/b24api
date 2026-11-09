@@ -1,13 +1,14 @@
 """#29: descending inclusive-timestamp windows with classified paging rows (A29-*)."""
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
 
 from b24api import (
+    BatchDispatch,
     Binding,
     CapabilityError,
     DirectDispatch,
@@ -23,6 +24,7 @@ from b24api import (
     TraversalAssurance,
 )
 from b24api.contracts import (
+    AdaptedPage,
     BindingClosure,
     InclusiveWindowTraversal,
     PageView,
@@ -32,16 +34,18 @@ from b24api.contracts import (
     ResponseFlagTerminal,
     WindowRows,
 )
-from b24api.contracts.page_stop import CallerStop, ContinuePage
+from b24api.contracts.json import FrozenMapping, _freeze_json, thaw_json
+from b24api.contracts.page_stop import CallerStop, ContinuePage, PageBoundary
+from b24api.contracts.report import PageDispatch, PageOutcome, PageRecord
 from b24api.errors import ContinuationError, ContinuationReason
 from b24api.testing.scripted import ScriptedExchange, ScriptedTransport
 from b24api.traversal.inclusive_window import parse_window_timestamp
+from tests.scripting import BatchPortal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from b24api.contracts.page_stop import PageBoundary
-    from tests.scripting import ClientFactory
+    from tests.scripting import ClientFactory, Envelope, Query
 
 _FLAG_END = "response flag declared terminal page"
 _METHOD = "im.chat.message.window"
@@ -637,3 +641,162 @@ async def test_a_moving_page_of_only_repeated_rows_is_not_a_repeated_page(script
     assert stream.report is not None
     assert stream.report.exhausted
     assert stream.report.terminal_reason == _FLAG_END
+
+
+# #34: response-level metadata reaches the page stop on every response, empty and overlap-only pages included.
+
+
+def _popup_page(*rows: dict[str, object], more: bool, revision: int) -> dict[str, object]:
+    return {"result": {"messages": list(rows), "hasMore": more, "popup": {"revision": revision}}}
+
+
+@dataclass
+class _Popups:
+    """Merge the response-level popup of every offered page, as a consumer of page metadata does."""
+
+    seen: list[tuple[int, int, int]] = field(default_factory=list)
+
+    def on_page(self, boundary: PageBoundary) -> ContinuePage:
+        result = boundary.result
+        assert isinstance(result, FrozenMapping)
+        popup = result["popup"]
+        assert isinstance(popup, FrozenMapping)
+        revision = popup["revision"]
+        assert isinstance(revision, int)
+        self.seen.append((boundary.binding_id, len(boundary.rows), revision))
+        return ContinuePage.CONTINUE
+
+
+@pytest.mark.asyncio
+async def test_page_metadata_of_an_empty_terminal_window_page_reaches_the_page_stop(
+    scripted_client: ClientFactory,
+) -> None:
+    """#34: the terminal page has no row but carries the newest popup revision; the page stop receives it."""
+    transport = ScriptedTransport(
+        (
+            ScriptedExchange.json(_request(), _popup_page(_row(20, _T3), more=True, revision=1)),
+            ScriptedExchange.json(_request(_T3), _popup_page(more=False, revision=2)),
+        )
+    )
+    popups = _Popups()
+    stream = scripted_client(transport).iter_list_window(_request(), traversal=_window(), page_stop=popups)
+    rows, failure = await _drain(stream)
+    assert failure is None
+    assert _ids(rows) == [20]
+    assert popups.seen == [(0, 1, 1), (0, 0, 2)]
+    transport.assert_exhausted()
+    assert stream.report is not None
+    assert stream.report.exhausted
+    assert stream.report.terminal_reason == _FLAG_END
+
+
+@pytest.mark.asyncio
+async def test_page_metadata_is_the_server_result_beside_the_admitted_and_adapted_rows(
+    scripted_client: ClientFactory,
+) -> None:
+    """#34: an overlap-only page admits no row; its result is still the whole server result, unadapted."""
+    transport = ScriptedTransport(
+        (
+            ScriptedExchange.json(_request(), _popup_page(_row(20, _T3), _row(19, _T2), more=True, revision=1)),
+            ScriptedExchange.json(_request(_T2), _popup_page(_row(19, _T2), more=False, revision=2)),
+        )
+    )
+    results: list[tuple[int, object]] = []
+    offered: list[object] = []
+    adapted: list[object] = []
+
+    class _Results:
+        def on_page(self, boundary: PageBoundary) -> ContinuePage:
+            assert boundary.result is not None
+            offered.append(boundary.result)
+            results.append((len(boundary.rows), thaw_json(boundary.result)))
+            return ContinuePage.CONTINUE
+
+    class _Tag:
+        def adapt(self, page: PageView, /) -> AdaptedPage:
+            adapted.append(page.result)
+            return AdaptedPage({**row, "tagged": True} for row in page.items)  # type: ignore[dict-item]
+
+    window = replace(_window(), page_adapter=_Tag())
+    stream = scripted_client(transport).iter_list_window(_request(), traversal=window, page_stop=_Results())
+    rows, failure = await _drain(stream)
+    assert failure is None
+    assert _ids(rows) == [20, 19]
+    assert all(_field(row, "tagged") for row in rows)
+    assert results == [
+        (2, {"messages": [_row(20, _T3), _row(19, _T2)], "hasMore": True, "popup": {"revision": 1}}),
+        (0, {"messages": [_row(19, _T2)], "hasMore": False, "popup": {"revision": 2}}),
+    ]
+    # The page stop sees the very snapshot the page adapter saw, not a copy.
+    assert len(offered) == len(adapted) == len(results)
+    assert all(seen is view for seen, view in zip(offered, adapted, strict=True))
+
+
+@pytest.mark.asyncio
+async def test_page_metadata_reaches_a_reference_page_stop_per_binding(scripted_client: ClientFactory) -> None:
+    """#34: every binding's pages, its empty terminal page included, carry their own server result."""
+    transport = ScriptedTransport(
+        tuple(
+            exchange
+            for chat in (1, 2)
+            for exchange in (
+                ScriptedExchange.json(_request(chatId=chat), _popup_page(_row(20, _T3), more=True, revision=chat)),
+                ScriptedExchange.json(_request(_T3, chatId=chat), _popup_page(more=False, revision=10 * chat)),
+            )
+        )
+    )
+    bindings = [Binding(f"chat {chat}", (ParameterUpdate(ParameterPath(("chatId",)), chat),), chat) for chat in (1, 2)]
+    popups = _Popups()
+    stream = scripted_client(transport).iter_reference_outcomes(
+        _request(), bindings, traversal=_window(), dispatch=DirectDispatch(), page_stop=popups
+    )
+    outcomes, failure = await _drain(stream)
+    assert failure is None
+    transport.assert_exhausted()
+    assert sorted(popups.seen) == [(0, 0, 10), (0, 1, 1), (1, 0, 20), (1, 1, 2)]
+    completes = [outcome for outcome in outcomes if isinstance(outcome, ReferenceComplete)]
+    assert len(completes) == len(bindings)
+    assert all(outcome.exhausted for outcome in completes)
+
+
+@pytest.mark.asyncio
+async def test_page_metadata_of_sibling_commands_in_one_shared_batch_stays_with_its_binding(
+    scripted_client: ClientFactory,
+) -> None:
+    """#34: bindings whose pages share physical batches each receive their own command's result."""
+
+    def answer(method: str, query: Query) -> Envelope:
+        assert method == _METHOD
+        chat = int(query["chatId"])
+        if "lastDate" not in query:
+            return _popup_page(_row(20, _T3), more=True, revision=chat)
+        return _popup_page(more=False, revision=10 * chat)
+
+    portal = BatchPortal(answer)
+    bindings = [Binding(f"chat {chat}", (ParameterUpdate(ParameterPath(("chatId",)), chat),), chat) for chat in (1, 2)]
+    popups = _Popups()
+    stream = scripted_client(portal).iter_reference_outcomes(
+        _request(), bindings, traversal=_window(), dispatch=BatchDispatch(), page_stop=popups
+    )
+    outcomes, failure = await _drain(stream)
+    assert failure is None
+    assert portal.waves == [2, 2]
+    assert sorted(popups.seen) == [(0, 0, 10), (0, 1, 1), (1, 0, 20), (1, 1, 2)]
+    completes = [outcome for outcome in outcomes if isinstance(outcome, ReferenceComplete)]
+    assert len(completes) == len(bindings)
+    assert all(outcome.exhausted for outcome in completes)
+
+
+def test_a_page_boundary_built_by_application_code_has_no_result() -> None:
+    """#34: ``result`` is keyword-only and optional, so existing constructions keep working."""
+    record = PageRecord(0, None, PageDispatch.DIRECT, None, 0, 0, None, None, PageOutcome.COMMITTED, None)
+    result = _freeze_json({"popup": 1})
+    assert PageBoundary(0, record, ()).result is None
+    assert PageBoundary(0, record, (), result=result).result is result
+    with pytest.raises(TypeError):
+        PageBoundary(0, record, (), result)  # type: ignore[misc]
+    with pytest.raises(TypeError, match="frozen JSON"):
+        PageBoundary(0, record, (), result={"popup": 1})  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="frozen JSON"):
+        PageBoundary(0, record, (), result=[1])  # type: ignore[arg-type]
+    assert "popup" not in repr(PageBoundary(0, record, (), result=result))

@@ -53,6 +53,8 @@ from b24api.contracts.completion import (
     StreamClosure,
     StreamTerminal,
 )
+from b24api.contracts.json import thaw_json
+from b24api.contracts.page_stop import ContinuePage, PageBoundary
 from b24api.contracts.report import TerminalState
 from b24api.errors import ContinuationError, ContinuationReason
 from b24api.testing.scripted import ScriptedExchange, ScriptedTransport
@@ -741,3 +743,38 @@ async def test_two_empty_pages_with_a_changed_control_vector_end_by_the_rule(scr
     assert stream.report is not None
     assert stream.report.exhausted
     assert stream.report.terminal_reason == _RULE_END
+
+
+@pytest.mark.asyncio
+async def test_page_stop_receives_the_server_result_of_every_empty_continuation_page(
+    scripted_client: ClientFactory,
+) -> None:
+    """#34: a continuation offers each rule-evaluated page, empty ones included, with its own server result."""
+    transport = ScriptedTransport(
+        (
+            ScriptedExchange.json(_notify(), {"result": {"notifications": [], "phase": 1}}),
+            ScriptedExchange.json(_notify(LAST_ID=0, LAST_TYPE=3), {"result": {"notifications": [], "phase": 2}}),
+        )
+    )
+    seen: list[tuple[int, JsonValue]] = []
+
+    class _Results:
+        def on_page(self, boundary: PageBoundary) -> ContinuePage:
+            assert boundary.result is not None
+            seen.append((len(boundary.rows), thaw_json(boundary.result)))
+            return ContinuePage.CONTINUE
+
+    traversal = ContinuationTraversal(
+        ResultSelector(("notifications",)),
+        _ID,
+        (_LAST_ID, _LAST_TYPE),
+        _PhaseRule(),
+        limit_path=ParameterPath(("LIMIT",)),
+        page_size=1,
+    )
+    stream = scripted_client(transport).iter_list_continuation(_notify(), traversal=traversal, page_stop=_Results())
+    rows, failure = await _drain(stream)
+    assert failure is None
+    assert rows == []
+    assert seen == [(0, {"notifications": [], "phase": 1}), (0, {"notifications": [], "phase": 2})]
+    transport.assert_exhausted()

@@ -75,18 +75,28 @@ commands share decoding options, and one completion gate builds the terminal rep
 Ordinary and counted bindings reserve rows per page from one shared row pool and release them when
 the consumer acknowledges the rows. Under `INPUT` delivery, rows behind the frontier stay held until
 it advances, so the pool keeps the frontier's next page free: rows the frontier already holds count
-toward that reserve, and the reserve covers the largest page of any admitted binding; a counted binding reads its head and its known tail offsets as
-ordinary pages of that pool and commits them in offset order. A fast or automatic keyset binding
-instead holds one fixed row lease from activation to its terminal event. Its runtime plans and fits
-every wave against a view of the operation policy that differs only in `max_buffered_rows`, equal to
-the lease; requests, pages, attempts, elapsed time and response bytes are charged to the single
-operation context, and each buffered-row change is applied once to the shared counter. The lease
-never grows or shrinks: a binding is granted at least its planning floor and at most the larger of
-that floor and an equal share of the pool among active fast bindings, rows kept for ordinary pages
-excepted; an automatic binding whose floor exceeds the whole pool waits to run alone with it (under
-`INPUT` delivery only as the frontier, since rows behind the frontier cannot be released), a binding
-that cannot obtain its floor while no other binding can release rows fails finitely, and every lease
-wait is bounded by the operation's elapsed budget.
+toward that reserve, and the reserve covers the largest page of any admitted binding; a counted
+binding reads its head and its known tail offsets as ordinary pages of that pool and commits them in
+offset order. A fast or automatic keyset binding instead holds one row lease from activation to its
+terminal event. Its runtime plans and fits every wave against a view of the operation policy that
+differs only in `max_buffered_rows`, equal to the lease; requests, pages, attempts, elapsed time and
+response bytes are charged to the single operation context, and each buffered-row change is applied
+once to the shared counter. Its waves and its sequential finish pages are commands of the shared
+dispatcher, and under `READY` delivery a binding awaiting the consumer's acknowledgement that has
+not reached its terminal, and so will hand over another row group or send its next command, is a
+pending continuation the dispatcher waits for, as an ordinary binding's page is. A command whose
+batch was lost in transit leaves its binding unknown, as a direct page does. The lease never grows:
+a binding is granted at least its planning floor and at most the larger of that floor and an equal
+share of the pool among active fast bindings, rows kept for ordinary pages excepted. Once the plan
+is chosen at the granted lease, a sequential or boundary-only plan, which only drains the rows it
+holds and then holds one finish page at a time, trims the lease to that bound and gives the rest
+back to the pool; a lane plan keeps it whole. Under `INPUT` delivery the pool hands rows out in
+binding order: while a binding waits for its lease, no later binding is granted a lease or reserves
+an ordinary page, and the frontier waits for a lease that has not been settled by its binding's plan
+yet, since that lease may still shrink. An automatic binding whose floor exceeds the whole pool
+waits to run alone with it (under `INPUT` delivery only as the frontier, since rows behind the
+frontier cannot be released), a binding that cannot obtain its floor while no other binding can
+release rows fails finitely, and every lease wait is bounded by the operation's elapsed budget.
 
 ## Package boundaries
 

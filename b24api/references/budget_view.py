@@ -1,9 +1,11 @@
 """A fast keyset reference binding's budget view of the shared operation context.
 
-The binding holds one fixed row lease ``G`` in the shared row pool from activation to terminal. Its
+The binding holds one row lease ``G`` in the shared row pool from activation to terminal. Its
 runtime plans and fits every wave against a projection of the operation policy that differs only in
 ``max_buffered_rows=G``; requests, attempts, pages, deadline and bytes stay on the shared context,
-which is the only context the engine and the executor ever receive.
+which is the only context the engine and the executor ever receive. Once its plan bounds the rows
+it can still hold, the binding trims ``G`` to that bound and gives the rest back to the pool; a
+lease never grows.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True, eq=False)
 class RowLease:
-    """A fixed capacity in the shared row pool and the rows currently held against it."""
+    """A capacity in the shared row pool, which may only shrink, and the rows currently held against it."""
 
     capacity: int
     held: int = field(default=0, init=False)
@@ -28,7 +30,7 @@ class RowLease:
 
     @classmethod
     def of(cls, reservation: _Reservation) -> RowLease:
-        """Lease the fixed capacity of one pool reservation."""
+        """Lease the capacity of one pool reservation."""
         return cls(reservation.amount, reservation)
 
     @property
@@ -37,7 +39,7 @@ class RowLease:
         return self.reservation is not None and self.reservation.amount == 0
 
     def __post_init__(self) -> None:
-        """Validate the fixed capacity."""
+        """Validate the capacity."""
         if isinstance(self.capacity, bool) or not isinstance(self.capacity, int) or self.capacity < 1:
             raise ValueError("row lease capacity must be a positive integer")
 
@@ -49,6 +51,14 @@ class RowLease:
             raise BudgetExceededError("fast keyset rows exceed the binding's row lease")
         self.held += rows
 
+    def trim(self, capacity: int) -> None:
+        """Lower the capacity to ``capacity`` rows: never below the rows held, never above the capacity."""
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("row lease capacity must be a positive integer")
+        if not self.held <= capacity <= self.capacity:
+            raise RuntimeError("a row lease trims only to a capacity between its held rows and its capacity")
+        self.capacity = capacity
+
     def receipt(self, rows: int) -> None:
         """Return held rows to the lease."""
         if rows < 0 or rows > self.held:
@@ -56,7 +66,7 @@ class RowLease:
         self.held -= rows
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True, eq=False)
 class BindingBudgetView:
     """``KeysetContext`` of one fast keyset reference binding over the shared operation context."""
 
@@ -68,6 +78,11 @@ class BindingBudgetView:
     def over(cls, shared: ExecutionContext, lease: RowLease) -> BindingBudgetView:
         """Project the operation policy onto the lease: only ``max_buffered_rows`` changes."""
         return cls(shared, lease, replace(shared.policy, max_buffered_rows=lease.capacity))
+
+    def trim(self, capacity: int) -> None:
+        """Trim the lease and the projection together: the policy always names the lease's capacity."""
+        self.lease.trim(capacity)
+        self.projection = replace(self.projection, max_buffered_rows=capacity)
 
     @property
     def policy(self) -> ExecutionPolicy:

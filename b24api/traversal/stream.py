@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Self, cast
 
 from b24api.completion.recorder import CompletionRecorder
 from b24api.contracts.completion import CleanupState
-from b24api.contracts.json import JsonValue, _thaw_json
+from b24api.contracts.json import JsonValue, thaw_json
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.page_stop import CallerStop, ContinuePage, PageBoundary, PageStopPolicy
 from b24api.contracts.policy import (
@@ -20,6 +20,7 @@ from b24api.contracts.policy import (
     SnapshotState,
 )
 from b24api.contracts.report import Violation, ViolationSeverity, retain_page_trace
+from b24api.contracts.response import result_snapshot
 from b24api.errors import IncompleteTraversalError, PaginationError
 from b24api.execution.lifecycle import (
     CleanupAttempt,
@@ -165,7 +166,7 @@ class ItemStream(AsyncIterator[JsonValue]):
                 await self._context.set_buffered_rows(len(buffered) + 1)
                 self._emitted += 1
                 self._unique_emitted += is_unique
-                yield _thaw_json(item)
+                yield thaw_json(item)
                 await self._context.set_buffered_rows(len(buffered))
             if page.items and self._completion is not None:
                 self._completion.delivered()
@@ -179,7 +180,8 @@ class ItemStream(AsyncIterator[JsonValue]):
         record = self._driver.last_page_record
         if record is None:
             raise RuntimeError("validated page lacks completion provenance")
-        decision = cast("PageStopPolicy", self._page_stop).on_page(PageBoundary(0, record, tuple(page.items)))
+        boundary = PageBoundary(0, record, tuple(page.items), result=result_snapshot(page.response))
+        decision = cast("PageStopPolicy", self._page_stop).on_page(boundary)
         if isawaitable(decision):
             decision = await decision
         if not isinstance(decision, ContinuePage | CallerStop):

@@ -524,7 +524,8 @@ never reports the source as exhausted.
 For newest-first lists that resume from an inclusive timestamp and may also return pinned rows,
 `iter_list_window()` sends the oldest paging timestamp of each page unchanged, delivers rows
 repeated by the overlap once and fails as non-progress, without another request, when the boundary
-does not move. See
+does not move. Its `page_stop` callback receives every validated page, empty closing page
+included, and `PageBoundary.result` carries that page's server result for response-level fields. See
 [Inclusive timestamp windows](https://github.com/shkarupa-alex/b24api/blob/master/docs/recipes.md#inclusive-timestamp-windows).
 
 For multiple parent-bound cursor chains, `iter_cursors()` keeps cursor progress and correlation
@@ -630,17 +631,23 @@ rather than fabricating a reference outcome. Already accepted bindings retain th
 ### Keyset references
 
 `KeysetTraversal` bindings run sequentially by default (`SequentialKeysetExecution()`), unlike
-`iter_list_keyset()`, whose default is automatic. Pass `AutoKeysetExecution`,
-`RangeKeysetExecution` or `PartitionedKeysetExecution` as the traversal's `execution` to opt in. A
-binding with automatic, range or partitioned execution runs its own planning barrier and selection;
-its waves travel through the shared batch queue beside other bindings' pages, and its
-`ReferenceComplete` carries the binding's `keyset_selection` and, when the fast path ran, its
-`keyset_execution`. From its first request to its terminal event the binding holds a fixed share of
-`ExecutionPolicy.max_buffered_rows` and plans every wave within it; requests, pages, attempts and
-elapsed time stay on the one operation budget. An automatic binding whose planning floor exceeds the
-whole row budget waits to run alone with all of it (under `INPUT` delivery, once it is the next
-binding to deliver); a binding that cannot obtain its floor while no other binding can release rows
-fails with `BudgetExceededError`, and waiting for a share never outlasts `max_elapsed`.
+`iter_list_keyset()`, whose default is automatic. Pass `AutoKeysetExecution`, `RangeKeysetExecution`
+or `PartitionedKeysetExecution` as the traversal's `execution` to opt in. A binding with automatic,
+range or partitioned execution runs its own planning barrier and selection; its waves and its final
+confirmation pages travel through the shared batch queue beside other bindings' pages, so a cohort
+of small parents shares physical batches instead of confirming each parent with a direct request.
+Its `ReferenceComplete` carries the binding's `keyset_selection` and, when the fast path ran, its
+`keyset_execution`. From its first request to its terminal event the binding holds a share of
+`ExecutionPolicy.max_buffered_rows` and plans every wave within it; once a sequential or
+boundary-only plan is chosen, the binding keeps only the rows that plan can still hold and returns
+the rest to the bindings waiting for a share. Under `INPUT` delivery row capacity is granted in
+binding order: while a binding waits for its share, no later binding is granted a share or reserves
+an ordinary page. A binding whose batch was lost in transit ends with `ReferenceOutcomeUnknown`.
+Requests, pages, attempts and elapsed time stay on the one operation budget. An automatic binding
+whose planning floor exceeds the whole row budget waits to run alone with all of it (under `INPUT`
+delivery, once it is the next binding to deliver); a binding that cannot obtain its floor while no
+other binding can release rows fails with `BudgetExceededError`, and waiting for a share never
+outlasts `max_elapsed`.
 
 Fast and automatic keyset references need `BatchDispatch`. With a `page_stop`, automatic execution
 runs sequentially and reports `PAGE_STOP`; an explicit fast mode with a `page_stop` or
