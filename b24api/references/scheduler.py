@@ -489,9 +489,15 @@ class ReferenceScheduler:
                 raise BudgetExceededError("fast keyset lease wait exceeded the operation time budget") from error
         finally:
             self._fast_waiting -= 1
+        # Every page of a leased binding is charged to its lease, none to the free pool rows.
+        self.producer_state.caps[run.producer_key] = 0
         self.producer_state.runnable.add(run.producer_key)
         self.producer_state.touch()
         return lease
+
+    async def trim_lease(self, lease: _Reservation, rows: int) -> None:
+        """Give the rows above ``rows`` of a binding's lease back to the pool for the bindings awaiting one."""
+        await self.buffer.trim_lease(lease, rows)
 
     def _lease_grant(self, fast: FastKeysetProgram, index: int, free: int) -> int | None:
         """Size one fast lease from the free rows, or return None to wait.

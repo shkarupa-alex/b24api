@@ -1,5 +1,23 @@
 # Migration guide
 
+## Fast keyset references: shared final confirmations
+
+Public signatures are unchanged; what changes is how a fast or automatic keyset binding on the shared
+reference queue spends physical requests.
+
+- **Final confirmations are batched.** A binding's sequential finish pages, including the final empty
+  confirmation, are now commands of the shared batch queue instead of direct requests. Their
+  `PageRecord.dispatch` is `BATCH` instead of `DIRECT`, and the binding's `keyset_execution`
+  `batch_requests` and `batch_commands` count them. A flat `iter_list_keyset()` still sends its
+  finish page directly.
+- **A refused finish page fails like a refused wave command.** In a shared batch, a finish command the
+  server refuses ends the binding with an `IncompleteTraversalError` that wraps the command error and
+  carries its replay disposition, and its page record shows the classified rejection
+  (`COMMAND_FAILURE`, `AMBIGUOUS_EXECUTION`, ...) instead of `RANGE_CONTRADICTION`.
+- **Small plans give rows back.** Once a binding selects a sequential or boundary-only plan, it trims
+  its row lease to the rows that plan can still hold, so the bindings waiting for a lease start
+  sooner. The plan itself is still chosen at the full lease, so selection and geometry are as before.
+
 ## REST 3.0 error codes
 
 - **Codes are shown verbatim.** A REST 3.0 `error.code` of snake-case identifier shape now appears

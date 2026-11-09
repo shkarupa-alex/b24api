@@ -223,9 +223,16 @@ def _abort_wave(
             )
     host.admission.record_raw(selected_rows, discarded=True)
     rejection = next((receipt for receipt in rejections if receipt.error is not None), None)
-    if rejection is None or rejection.error is None:
+    if rejection is None:
         raise PaginationError("fast keyset wave validation failed")
+    _raise_rejection(rejection)
+
+
+def _raise_rejection(rejection: ReceiptRejection) -> NoReturn:
+    """Raise a rejected command's cause; a failed command ends the traversal incomplete, with its replay."""
     cause = rejection.error
+    if cause is None:
+        raise PaginationError(rejection.detail)
     if isinstance(cause, B24ApiError) and rejection.violation.code == "command_failure":
         raise IncompleteTraversalError(
             report=None,
@@ -330,20 +337,25 @@ async def execute_finish_page(
     finish_plan: KeysetPlan,
     request: Request,
 ) -> None:
-    """Execute one direct sequential finish page and record its final admission outcome."""
+    """Execute one sequential finish page through the engine and record its final admission outcome.
+
+    The engine decides how the page travels: a flat traversal sends it direct, a reference binding
+    sends it as a command of a physical batch it shares with the other bindings' commands.
+    """
     if host.transactions.finish_cursor is None:
         host.transactions.terminal = True
         return
     finish_lane = host.transactions.finish_lane = _finish_lane(host.transactions.finish_cursor, finish_plan)
     plan = build_lane_plan(host, finish_lane, phase=KeysetPhase.FINISH, request=request)
+    dispatch = host.engine.page_dispatch
     reservation = await host.context.reserve_page()
     try:
         await host.adjust_buffer(host.effective_page_cap)
         host.completion_recorder.schedule(plan.command_id)
-        response = await host.executor.execute(request, context=host.context.execution_context)
-        host.completion_recorder.settle(plan.command_id, CommandSettlement.SUCCESS)
-        host.context.commit_page(reservation)
-        outcome = BatchSuccess(0, "finish", request, response.result, response=response)
+        outcome = await host.engine.execute_page(request, context=host.context.execution_context)
+        _record_finish_dispatch(host, plan, outcome, dispatch)
+        commit = host.context.commit_page if isinstance(outcome, BatchSuccess) else host.context.release_page
+        commit(reservation)
         receipt = validate_lane_receipt(
             plan=plan,
             lane=finish_lane,
@@ -356,13 +368,14 @@ async def execute_finish_page(
             page_adapter=host.page_adapter,
         )
         if isinstance(receipt, ReceiptRejection):
-            _reject_finish_receipt(host, plan, receipt)
+            _reject_finish_receipt(host, plan, outcome, receipt, dispatch)
+        response = outcome.response if isinstance(outcome, BatchSuccess) else None
         host.completion_recorder.validated(plan.command_id)
         terminal = keyset_step.keyset_page_terminal(finish_plan, len(receipt.rows))
         await host.adjust_buffer(-host.effective_page_cap + len(receipt.rows))
         host.admission.record_raw(len(receipt.rows))
         try:
-            commit = host.admission.validate_and_commit(receipt)
+            admitted = host.admission.validate_and_commit(receipt)
         except PaginationError:
             host.admission.record_discarded(len(receipt.rows))
             host.record_page(
@@ -374,23 +387,23 @@ async def execute_finish_page(
                 rejection=PageRejectionCode.RANGE_CONTRADICTION,
                 response=response,
                 witness=receipt.witness,
-                dispatch=PageDispatch.DIRECT,
+                dispatch=dispatch,
             )
             raise
         host.record_page(
             plan,
             index=None,
             selected=len(receipt.rows),
-            admitted=len(commit.rows),
+            admitted=len(admitted.rows),
             response=response,
             witness=receipt.witness,
-            dispatch=PageDispatch.DIRECT,
+            dispatch=dispatch,
         )
-        host.trace.admit(receipt.command_id, len(commit.rows))
-        host.completion_recorder.admit(plan.command_id, len(commit.rows))
-        if commit.rows:
-            host.transactions.pending.append(commit.rows)
-            host.add_pending_owner(((plan.command_id, len(commit.rows)),))
+        host.trace.admit(receipt.command_id, len(admitted.rows))
+        host.completion_recorder.admit(plan.command_id, len(admitted.rows))
+        if admitted.rows:
+            host.transactions.pending.append(admitted.rows)
+            host.add_pending_owner(((plan.command_id, len(admitted.rows)),))
         if terminal is not None:
             _require_closure_witness(receipt)
             host.record_completion_witness()
@@ -408,6 +421,22 @@ async def execute_finish_page(
         raise RuntimeError("fast host buffer accounting escaped policy")
 
 
+def _record_finish_dispatch(
+    host: KeysetTransactionHost,
+    plan: LaneCommandPlan,
+    outcome: BatchOutcome,
+    dispatch: PageDispatch,
+) -> None:
+    """Settle the finish command before its receipt is validated; a batched page counts as a one-command wave."""
+    host.completion_recorder.settle(
+        plan.command_id,
+        CommandSettlement.SUCCESS if isinstance(outcome, BatchSuccess) else CommandSettlement.FAILURE,
+    )
+    if dispatch is PageDispatch.BATCH:
+        host.batch_requests += 1
+        host.batch_commands += 1
+
+
 def _require_closure_witness(receipt: LaneReceipt) -> None:
     if receipt.witness is None:
         raise RuntimeError("terminal fast finish page lacked a closure witness")
@@ -420,27 +449,30 @@ def _finish_lane(cursor: int, finish_plan: KeysetPlan) -> LaneState:
     return LaneState(LaneSpec(0, LaneKind.FINISH, bounds, descending, None), cursor, LaneStatus.OPEN, None, 0, 0)
 
 
-def _reject_finish_receipt(host: KeysetTransactionHost, plan: LaneCommandPlan, receipt: ReceiptRejection) -> NoReturn:
-    """Record a rejected finish page, discard its rows, and raise its cause."""
+def _reject_finish_receipt(
+    host: KeysetTransactionHost,
+    plan: LaneCommandPlan,
+    outcome: BatchOutcome,
+    receipt: ReceiptRejection,
+    dispatch: PageDispatch,
+) -> NoReturn:
+    """Record a rejected finish page as a rejected wave command is recorded, discard its rows, and raise."""
     host.violations.append(receipt.violation)
     host.admission.record_raw(receipt.selected_rows, discarded=True)
+    page_outcome, rejection_code = classify_rejection(outcome)
+    if isinstance(receipt.error, PageAdaptationError):
+        rejection_code = PageRejectionCode.PAGE_ADAPTATION
     host.record_page(
         plan,
         index=None,
         selected=receipt.selected_rows,
         admitted=0,
-        outcome=PageOutcome.REJECTED,
-        rejection=(
-            PageRejectionCode.PAGE_ADAPTATION
-            if isinstance(receipt.error, PageAdaptationError)
-            else PageRejectionCode.RANGE_CONTRADICTION
-        ),
+        outcome=page_outcome,
+        rejection=rejection_code,
         violation=receipt.violation,
-        dispatch=PageDispatch.DIRECT,
+        dispatch=dispatch,
     )
-    if receipt.error is not None:
-        raise receipt.error
-    raise PaginationError(receipt.detail)
+    _raise_rejection(receipt)
 
 
 __all__ = [

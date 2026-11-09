@@ -1,8 +1,10 @@
 """One fast or automatic keyset reference binding on the shared queue.
 
 Each binding runs its own ``KeysetRuntime`` (fingerprints, bounds, identity, planning, ordered
-admission) under a fixed row lease ``G`` taken from the shared row pool at activation and returned
-once at terminal. The runtime plans and fits against a budget view whose policy differs from the
+admission) under a row lease ``G`` taken from the shared row pool at activation and returned once at
+terminal. A plan that bounds the rows it can still hold (sequential, boundary-only) trims ``G`` to
+that bound as soon as it is chosen, so a cohort of small parents does not wait on rows none of them
+can use. The runtime plans and fits against a budget view whose policy differs from the
 operation policy only in ``max_buffered_rows=G``; its atomic waves travel through the shared
 dispatcher, and its page evidence is recorded into the shared operation gate under its binding id.
 """
@@ -52,7 +54,11 @@ class FastKeysetHost(WaveHost, Protocol):
         ...
 
     async def lease_rows(self, run: _ReferenceRun, fast: FastKeysetProgram) -> _Reservation:
-        """Wait for and hold the binding's fixed row lease in the shared pool."""
+        """Wait for and hold the binding's row lease in the shared pool."""
+        ...
+
+    async def trim_lease(self, lease: _Reservation, rows: int) -> None:
+        """Give the rows above ``rows`` of the binding's lease back to the shared pool."""
         ...
 
 
@@ -75,8 +81,8 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
             policy=host.context.policy,
         )
         lease = await host.lease_rows(run, fast)
+        view = BindingBudgetView.over(host.context, RowLease.of(lease))
         runtime = KeysetRuntime(
-            executor=host.executor,
             request=request,
             identity=fast.identity,
             keyset=fast.keyset,
@@ -85,12 +91,18 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
             page_size=fast.page_size,
             effective_page_cap=fast.effective_page_cap,
             execution=fast.execution,
-            context=BindingBudgetView.over(host.context, RowLease.of(lease)),
+            context=view,
             engine=SharedWaveEngine(host, run, ledger),
             trace=trace,
             page_adapter=run.program.page_adapter,
             completion_recorder=ledger,
         )
+        await runtime.plan_barrier()
+        bound = runtime.held_row_bound()
+        if bound is not None and bound < view.lease.capacity:
+            # The plan was chosen at the full lease; the rows it can never use go to the bindings awaiting one.
+            view.trim(bound)
+            await host.trim_lease(lease, bound)
         while rows := await runtime.next_rows():
             await _deliver(host, run, runtime, rows)
         closure, witnesses = runtime.completion_closure()
@@ -140,9 +152,17 @@ async def _deliver(
     runtime: KeysetRuntime,
     rows: tuple[FrozenJson, ...],
 ) -> None:
-    """Hand one admitted row group to the consumer; its rows stay charged to the lease until acknowledged."""
+    """Hand one admitted row group to the consumer; its rows stay charged to the lease until acknowledged.
+
+    A binding that will send another command after the acknowledgement is a pending continuation, as a
+    sequential reference page is: the shared dispatcher waits for its next command to coalesce with
+    the other bindings' instead of sending a batch the acknowledged bindings could have joined.
+    """
     state, key = host.producer_state, run.producer_key
+    continuing = not runtime.terminal
     state.runnable.discard(key)
+    if continuing:
+        state.pending_continuations.add(key)
     state.touch()
     acknowledged = asyncio.get_running_loop().create_future()
     await run.output.put(
@@ -161,6 +181,7 @@ async def _deliver(
     )
     await acknowledged
     run.partial_rows += len(rows)
+    state.pending_continuations.discard(key)
     state.runnable.add(key)
     state.touch()
 

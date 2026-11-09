@@ -493,7 +493,8 @@ async def test_the_budget_view_projects_only_the_lease_and_keeps_execution_on_th
 
     assert set(_completes(outcomes)) == {"p0", "p1"}
     assert len(views) == 2
-    for view, granted in views:
+    _assert_only_bounded_plans_trim(views, _completes(outcomes))
+    for view, _granted in views:
         shared_policy = view.shared.policy
         differing = {
             item.name
@@ -501,7 +502,6 @@ async def test_the_budget_view_projects_only_the_lease_and_keeps_execution_on_th
             if getattr(view.policy, item.name) != getattr(shared_policy, item.name)
         }
         assert differing <= {"max_buffered_rows"}
-        assert view.policy.max_buffered_rows == granted == view.lease.capacity
         assert view.execution_context is view.shared
         assert view.lease.held == 0
     assert per_adjust
@@ -512,6 +512,23 @@ async def test_the_budget_view_projects_only_the_lease_and_keeps_execution_on_th
     assert all(context is views[0][0].shared for context in engine_contexts)
     assert balances
     assert all(balance == held for balance, held in balances)
+
+
+def _assert_only_bounded_plans_trim(
+    views: list[tuple[BindingBudgetView, int]],
+    completes: Mapping[object, ReferenceComplete[object]],
+) -> None:
+    """A plan that bounds the rows it can still hold trims its lease (#33); a lane plan keeps the grant."""
+    bounded = sum(
+        complete.keyset_execution is not None
+        and complete.keyset_execution.selected_kind
+        in {KeysetExecutionKind.SEQUENTIAL, KeysetExecutionKind.BOUNDARY_ONLY}
+        for complete in completes.values()
+    )
+    assert sum(view.lease.capacity < granted for view, granted in views) == bounded
+    for view, granted in views:
+        assert view.policy.max_buffered_rows == view.lease.capacity <= granted
+        assert view.lease.capacity in {granted, PAGE}
 
 
 def test_keyset_context_names_exactly_the_members_fast_keyset_uses() -> None:

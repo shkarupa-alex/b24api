@@ -4,7 +4,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, TypedDict, Unpack, cast
 
-from b24api.batch.engine import BatchExecutor
 from b24api.batch.facade import resolve_batch_size
 from b24api.completion.operation_stream import MappedOperationStream, _ClosableIterator
 from b24api.contracts.keyset_execution import (
@@ -44,6 +43,7 @@ from b24api.traversal.facade_support import (
     declared_traversal_plan,
 )
 from b24api.traversal.keyset_eligibility import validate_fast_keyset
+from b24api.traversal.keyset_engine import FlatWaveEngine
 from b24api.traversal.keyset_fast_stream import KeysetFastStream
 from b24api.traversal.keyset_observation import FastTraceRecorder
 from b24api.traversal.keyset_runtime import KeysetRuntime
@@ -194,7 +194,6 @@ def keyset_stream(  # noqa: PLR0913
         context = executor.context(policy)
         trace = FastTraceRecorder(policy.page_trace_limit)
         runtime = KeysetRuntime(
-            executor=executor,
             request=canonical,
             identity=identity,
             keyset=keyset,
@@ -204,7 +203,7 @@ def keyset_stream(  # noqa: PLR0913
             effective_page_cap=effective_cap,
             execution=execution,
             context=context,
-            engine=BatchExecutor(executor),
+            engine=FlatWaveEngine(executor),
             trace=trace,
             page_adapter=page_adapter,
         )

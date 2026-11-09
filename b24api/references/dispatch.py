@@ -62,7 +62,7 @@ class _Reservation:
     index: int
     amount: int
     accepted: bool = False
-    # A fast keyset lease: fixed capacity from activation to terminal, charged by its own budget view.
+    # A fast keyset lease: held from activation to terminal, only ever trimmed, charged by its own budget view.
     lease: bool = False
 
 
@@ -301,6 +301,9 @@ class _RowBuffer:
     def _can_reserve(self, index: int, amount: int) -> bool:
         if self._available < amount:
             return False
+        # A page charged to a fast keyset lease reserves no pool rows: it cannot take the frontier's reserve.
+        if amount == 0:
+            return True
         if self._head_reserve == 0 or index == self._head_index:
             return True
         # Rows the frontier holds come back to it; only the rest of its reserve must stay free. A
@@ -391,6 +394,24 @@ class _RowBuffer:
             self._condition.notify_all()
             self._touch()
             return reservation
+
+    async def trim_lease(self, reservation: _Reservation, amount: int) -> None:
+        """Give a lease's rows above ``amount`` back to the pool and wake the capacity waiters.
+
+        A lease is never accepted, so the shared row counter holds only what its binding charged;
+        trimming moves free pool rows only. A pool closed meanwhile has already reclaimed the lease.
+        """
+        if not reservation.lease or amount <= 0:
+            raise RuntimeError("only a lease trims, and never to nothing")
+        async with self._condition:
+            if self._closed or reservation.amount == 0:
+                return
+            if amount > reservation.amount:
+                raise RuntimeError("a lease cannot grow")
+            self._available += reservation.amount - amount
+            reservation.amount = amount
+            self._condition.notify_all()
+            self._touch()
 
     def releasable_elsewhere(self, index: int) -> bool:
         """Return whether a page of another binding may still return unused capacity when it settles."""
