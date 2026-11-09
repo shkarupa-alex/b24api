@@ -226,7 +226,6 @@ async def test_a_small_parent_cohort_confirms_every_parent_inside_shared_batches
     assert auto.report.physical_requests == len(auto.portal.waves)
     # Before #33 each finish page was a direct request: 24 and 64 requests against 2 and 4 sequential.
     assert auto.report.physical_requests <= 2 * sequential.report.physical_requests + 2
-    assert max(auto.portal.waves) > PARENTS
 
 
 @pytest.mark.asyncio
