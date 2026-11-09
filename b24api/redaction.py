@@ -122,6 +122,20 @@ def replace_secrets(text: str, secrets: frozenset[str]) -> str:
     return text
 
 
+def contains_secret(text: str, secrets: frozenset[str]) -> bool:
+    """Report whether ``replace_secrets`` would hide any part of ``text`` once letter case is ignored."""
+    folded = text.casefold()
+    for secret in secrets:
+        needle = secret.casefold()
+        if needle not in folded:
+            continue
+        if len(secret) >= MINIMUM_SECRET_LENGTH:
+            return True
+        if re.search(rf"(?<![{_WORD_RUN}]){re.escape(needle)}(?![{_WORD_RUN}])", folded):
+            return True
+    return False
+
+
 @dataclass(slots=True)
 class _RenderState:
     """State of one rendering call: the recursion guard and this call's hidden-key numbering."""
@@ -168,6 +182,10 @@ class Redactor:
     def is_known_secret(self, value: str, *, ignore_case: bool = False) -> bool:
         """Report whether a whole value equals a registered exact secret, optionally up to letter case."""
         return is_secret(value, self.known_secrets, ignore_case=ignore_case)
+
+    def contains_known_secret(self, text: str) -> bool:
+        """Report whether any registered exact secret occurs in ``text``, ignoring letter case."""
+        return contains_secret(text, self.known_secrets)
 
     def redact_text(self, value: str) -> str:
         """Scrub credential-bearing textual forms and apply a hard length bound."""

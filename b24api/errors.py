@@ -113,11 +113,22 @@ class ApiResponseError(B24ApiError):
         self.original_code = code
         self.code = str(code).lower()
         self.normalized_code = str(code) if code_is_exact else str(code).strip().casefold()
-        self.wire_code = render_code(code, redactor=redactor, context=diagnostics)
+        # Only a REST 3.0 envelope's ``error.code`` may be recognized by its shape, and only as it came on the
+        # wire. Its derived forms follow that one decision: a shown code is shown lower-cased too (the secret
+        # and field checks ignore case), and a hidden or aliased one is rendered exactly as the wire code was,
+        # since a second, case-sensitive pass over another spelling could miss what the first one hid.
+        self.wire_code = render_code(code, redactor=redactor, context=diagnostics, v3_envelope=code_is_exact)
+        if code_is_exact:
+            shown = self.wire_code == str(code)
+            safe_code = self.code if shown else self.wire_code
+            safe_normalized = self.normalized_code if shown else self.wire_code
+        else:
+            safe_code = render_code(self.code, redactor=redactor, context=diagnostics)
+            safe_normalized = render_code(self.normalized_code, redactor=redactor, context=diagnostics)
         self._safe_codes = {
             "original_code": code if isinstance(code, int) else self.wire_code,
-            "code": render_code(self.code, redactor=redactor, context=diagnostics),
-            "normalized_code": render_code(self.normalized_code, redactor=redactor, context=diagnostics),
+            "code": safe_code,
+            "normalized_code": safe_normalized,
         }
         self.validation = tuple(validation)
         self.truncated = truncated
