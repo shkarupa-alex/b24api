@@ -267,6 +267,7 @@ class _RowBuffer:
         *,
         head_reserve: int = 0,
         producer_state: _ProducerState | None = None,
+        ordered: bool = False,
     ) -> None:
         self.maximum = maximum
         self.context = context
@@ -277,7 +278,9 @@ class _RowBuffer:
         self._condition = asyncio.Condition()
         self._reservations: list[_Reservation] = []
         self._producer_state = producer_state
-        # Bindings inside ``lease``: a lease decision may depend on which earlier binding still waits.
+        # INPUT delivery: rows go to bindings in binding order, so no binding takes rows while an
+        # earlier one, which becomes the frontier first, waits for its lease.
+        self._ordered = ordered
         self._lease_waiting: set[int] = set()
 
     @property
@@ -308,6 +311,8 @@ class _RowBuffer:
         # A page charged to a fast keyset lease reserves no pool rows: it cannot take the frontier's reserve.
         if amount == 0:
             return True
+        if self._behind_lease_waiter(index):
+            return False
         if self._head_reserve == 0 or index == self._head_index:
             return True
         # Rows the frontier holds come back to it; only the rest of its reserve must stay free. A
@@ -380,8 +385,9 @@ class _RowBuffer:
         """Hold one fixed capacity until terminal; ``grant`` sizes it from the free rows or asks to wait.
 
         ``grant`` runs under the pool condition, so the decision and the reservation are atomic. It
-        may raise to refuse a lease no releaser can ever satisfy. A binding leaving the wait, with a
-        lease or without one, wakes the others: a decision may depend on whether it still waits.
+        may raise to refuse a lease no releaser can ever satisfy. An ordered pool asks it only once no
+        earlier binding waits for a lease. A binding leaving the wait, with a lease or without one,
+        wakes the others: whether it still waits decides whether a later binding may take rows.
         """
         async with self._condition:
             self._lease_waiting.add(index)
@@ -389,7 +395,7 @@ class _RowBuffer:
                 while True:
                     if self._closed:
                         raise asyncio.CancelledError
-                    amount = grant(self._available)
+                    amount = None if self._behind_lease_waiter(index) else grant(self._available)
                     if amount is not None:
                         break
                     await self._condition.wait()
@@ -404,9 +410,9 @@ class _RowBuffer:
                 self._touch()
             return reservation
 
-    def lease_waiting_before(self, index: int) -> bool:
-        """Return whether a binding earlier than ``index`` is waiting for its lease."""
-        return any(waiting < index for waiting in self._lease_waiting)
+    def _behind_lease_waiter(self, index: int) -> bool:
+        """Return whether an ordered pool holds rows back from ``index`` for an earlier lease waiter."""
+        return self._ordered and any(waiting < index for waiting in self._lease_waiting)
 
     async def settle_lease(self, reservation: _Reservation, amount: int) -> None:
         """Fix a planned binding's lease at ``amount`` rows, give the rest back and wake the capacity waiters.

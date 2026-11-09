@@ -7,19 +7,28 @@ reference queue spends physical requests.
 
 - **Final confirmations are batched.** A binding's sequential finish pages, including the final empty
   confirmation, are now commands of the shared batch queue instead of direct requests. Their
-  `PageRecord.dispatch` is `BATCH` instead of `DIRECT`, and the binding's `keyset_execution`
-  `batch_requests` and `batch_commands` count them. A flat `iter_list_keyset()` still sends its
-  finish page directly.
+  `PageRecord.dispatch` is `BATCH` instead of `DIRECT`, and the operation report's `batch_requests`
+  and `batch_commands` count them with the other commands of the shared batches. A flat
+  `iter_list_keyset()` still sends its finish page directly.
 - **A refused finish page fails like a refused wave command.** In a shared batch, a finish command the
   server refuses ends the binding with an `IncompleteTraversalError` that wraps the command error and
-  carries its replay disposition, and its page record shows the classified rejection
-  (`COMMAND_FAILURE`, `AMBIGUOUS_EXECUTION`, ...) instead of `RANGE_CONTRADICTION`. A failure of the
+  carries its replay disposition, and its page record shows the classified rejection (such as
+  `COMMAND_FAILURE`) instead of `RANGE_CONTRADICTION`. A failure of the
   whole batch envelope (a timeout, a malformed envelope) now ends every binding with a command in that
   batch, as it already did for wave commands, instead of only the binding whose finish page it was.
-- **`INPUT` leases follow binding order.** Under `DeliveryOrder.INPUT` a binding is granted its row
-  lease only when no earlier binding is still waiting for one, and the next frontier waits for a
-  lease that has not been sized by its plan yet. A tight `max_buffered_rows` that used to fail a
-  frontier with `BudgetExceededError`, depending on timing, now lets it start.
+- **A command lost in transit leaves its binding unknown.** When the batch carrying a fast binding's
+  wave or finish command is ambiguous (for example, the connection drops after it was sent), the
+  binding now ends with `ReferenceOutcomeUnknown` carrying the `AmbiguousExecutionError` and is
+  counted in the report's `unknown`, as a binding whose direct page was lost already was. Before, a
+  wave command ended it with a `ReferenceFailure` wrapping that error in an
+  `IncompleteTraversalError`. A flat fast `iter_list_keyset()` raises the `AmbiguousExecutionError`
+  itself in that case.
+- **`INPUT` hands rows out in binding order.** Under `DeliveryOrder.INPUT`, while a fast or automatic
+  binding waits for its row lease, no later binding is granted a lease or reserves an ordinary page,
+  and the next frontier waits for a lease that its binding's plan has not settled yet. A tight
+  `max_buffered_rows` that used to fail a frontier with `BudgetExceededError`, depending on timing,
+  now lets it start, also when keyset, ordinary and automatic sources are mixed. Later bindings
+  prefetch less while an earlier one waits.
 - **Small plans give rows back.** Once a binding selects a sequential or boundary-only plan, it trims
   its row lease to the rows that plan can still hold, so the bindings waiting for a lease start
   sooner. The plan itself is still chosen at the full lease, so selection and geometry are as before.

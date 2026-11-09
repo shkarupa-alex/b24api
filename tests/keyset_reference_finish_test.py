@@ -41,10 +41,12 @@ from b24api.contracts import (
     ReferenceComplete,
     ReferenceFailure,
     ReferenceItem,
+    ReferenceOutcomeUnknown,
+    ReferenceSource,
 )
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
 from b24api.contracts.request import RouteKind
-from b24api.errors import IncompleteTraversalError
+from b24api.errors import AmbiguousExecutionError, IncompleteTraversalError
 from b24api.execution import ExecutionContext, RateCoordinator
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _RowBuffer
@@ -389,19 +391,87 @@ async def test_a_tight_input_pool_completes_every_parent_in_binding_order(cohort
 
 
 @pytest.mark.asyncio
-async def test_an_unsettled_lease_is_releasable_and_lease_waiters_are_known_in_order() -> None:
+async def test_an_unsettled_lease_is_releasable() -> None:
     pool = _RowBuffer(100, _shared(100), head_reserve=10)
     behind = await pool.lease(3, lambda _free: 60)
     # A lease whose binding has not planned yet may still be trimmed: the frontier waits for it.
     assert pool.releasable_elsewhere(2)
     await pool.settle_lease(behind, 60)
     assert not pool.releasable_elsewhere(2)
-    assert not pool.lease_waiting_before(5)
-    later = asyncio.create_task(pool.lease(5, lambda _free: None))
+
+
+@pytest.mark.parametrize("ordered", [True, False], ids=["input", "ready"])
+@pytest.mark.asyncio
+async def test_an_ordered_pool_keeps_rows_for_an_earlier_lease_waiter(*, ordered: bool) -> None:
+    pool = _RowBuffer(100, _shared(100), ordered=ordered)
+    waiter = asyncio.create_task(pool.lease(5, lambda _free: None))
     await asyncio.sleep(0)
-    assert pool.lease_waiting_before(6)
-    assert not pool.lease_waiting_before(5)
-    later.cancel()
+    # Under INPUT neither a later page nor a later lease takes rows while binding 5 waits; earlier ones may.
+    assert pool.can_reserve(4, PAGE)
+    assert pool.can_reserve(6, PAGE) is not ordered
+    later = asyncio.create_task(pool.lease(6, lambda free: free))
+    await asyncio.sleep(0)
+    assert later.done() is not ordered
+    waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await later
-    assert not pool.lease_waiting_before(6)
+        await waiter
+    # The waiter leaving wakes the later binding.
+    assert (await later).amount == 100
+
+
+@pytest.mark.asyncio
+async def test_rows_a_trim_frees_under_input_wait_for_the_earlier_waiting_binding_not_later_pages() -> None:
+    """Pooled pages of later sequential sources must not take the rows an earlier AUTO binding waits for."""
+    data = {"p0": _ids(1, 3, 1), "p1": _ids(1, 5, 1), "p2": _ids(1, 25, 1), "p3": _ids(1, 2, 1)}
+    executions: dict[str, Execution] = {
+        "p0": AutoKeysetExecution(_CONTRACT),
+        "p1": AutoKeysetExecution(_CONTRACT),
+        "p2": SequentialKeysetExecution(),
+        "p3": SequentialKeysetExecution(),
+    }
+    portal = BatchPortal(_answer(data))
+    policy = ExecutionPolicy(max_buffered_rows=30, page_trace_limit=1024)
+    async with client_for(portal, policy=policy) as client:
+        outcomes, report = await _drain(
+            client.iter_reference_source_outcomes(
+                [ReferenceSource(_base(), _traversal(executions[name]), _parent(name)) for name in data],
+                dispatch=BatchDispatch(output_order=DeliveryOrder.INPUT),
+            )
+        )
+
+    assert [outcome for outcome in outcomes if isinstance(outcome, ReferenceFailure)] == []
+    assert report.state is TerminalState.COMPLETED
+    delivered = [
+        (outcome.correlation, cast("dict[str, int]", outcome.item)["id"])
+        for outcome in outcomes
+        if isinstance(outcome, ReferenceItem)
+    ]
+    assert delivered == [(name, value) for name, ids in data.items() for value in ids]
+
+
+@pytest.mark.parametrize("page", ["boundary", "finish"])
+@pytest.mark.asyncio
+async def test_an_ambiguous_shared_command_leaves_its_binding_unknown_not_failed(page: str) -> None:
+    """A batch lost in transit may have executed: its binding ends unknown, as with a direct page."""
+    base = _answer({"p0": (1,)})
+
+    def answer(method: str, query: Query) -> Envelope:
+        if ("filter[>ID]" in query) is (page == "finish"):
+            raise ConnectionResetError("connection lost after the batch was sent")
+        return base(method, query)
+
+    portal = BatchPortal(answer)
+    async with client_for(portal, policy=_POLICY) as client:
+        outcomes, report = await _drain(
+            client.iter_reference_outcomes(
+                _base(),
+                [_parent("p0")],
+                traversal=_traversal(AutoKeysetExecution(_CONTRACT)),
+                dispatch=BatchDispatch(),
+            )
+        )
+
+    (outcome,) = [outcome for outcome in outcomes if not isinstance(outcome, ReferenceItem)]
+    assert isinstance(outcome, ReferenceOutcomeUnknown)
+    assert isinstance(outcome.error, AmbiguousExecutionError)
+    assert (report.failures, report.unknown) == (0, 1)

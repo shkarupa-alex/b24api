@@ -161,6 +161,7 @@ class ReferenceScheduler:
             self.context,
             head_reserve=head_reserve,
             producer_state=self.producer_state,
+            ordered=output_order is ReferenceOutputOrder.INPUT,
         )
         self.dispatcher: _PageDispatcher
         if isinstance(dispatch, KernelDirectDispatch):
@@ -484,7 +485,7 @@ class ReferenceScheduler:
                 raise BudgetExceededError("operation elapsed budget exhausted before the fast keyset lease")
             try:
                 async with asyncio.timeout(remaining):
-                    lease = await self.buffer.lease(index, functools.partial(self._lease_grant, fast, index))
+                    lease = await self.buffer.lease(index, functools.partial(self._lease_size, fast, index))
             except TimeoutError as error:
                 raise BudgetExceededError("fast keyset lease wait exceeded the operation time budget") from error
         finally:
@@ -498,16 +499,6 @@ class ReferenceScheduler:
     async def settle_lease(self, lease: _Reservation, rows: int) -> None:
         """Fix a planned binding's lease at ``rows``, giving the rest back to the bindings awaiting one."""
         await self.buffer.settle_lease(lease, rows)
-
-    def _lease_grant(self, fast: FastKeysetProgram, index: int, free: int) -> int | None:
-        """Grant one fast lease in delivery order, or return None to wait.
-
-        INPUT delivers in binding order, so leases are granted in it: a later binding never takes the
-        rows an earlier one, which becomes the frontier first, is waiting for.
-        """
-        if self.output_order is ReferenceOutputOrder.INPUT and self.buffer.lease_waiting_before(index):
-            return None
-        return self._lease_size(fast, index, free)
 
     def _lease_size(self, fast: FastKeysetProgram, index: int, free: int) -> int | None:
         """Size one fast lease from the free rows, or return None to wait.

@@ -639,8 +639,10 @@ parent with a direct request. Its `ReferenceComplete` carries the binding's `key
 when the fast path ran, its `keyset_execution`. From its first request to its terminal event the
 binding holds a share of `ExecutionPolicy.max_buffered_rows` and plans every wave within it; once a
 sequential or boundary-only plan is chosen, the binding keeps only the rows that plan can still hold
-and returns the rest to the bindings waiting for a share. Requests, pages, attempts and elapsed time
-stay on the one operation budget. An automatic binding whose planning floor exceeds the
+and returns the rest to the bindings waiting for a share. Under `INPUT` delivery rows go out in
+binding order: while a binding waits for its share, later bindings take no rows. A binding whose
+batch was lost in transit ends with `ReferenceOutcomeUnknown`. Requests, pages, attempts and elapsed
+time stay on the one operation budget. An automatic binding whose planning floor exceeds the
 whole row budget waits to run alone with all of it (under `INPUT` delivery, once it is the next
 binding to deliver); a binding that cannot obtain its floor while no other binding can release rows
 fails with `BudgetExceededError`, and waiting for a share never outlasts `max_elapsed`.

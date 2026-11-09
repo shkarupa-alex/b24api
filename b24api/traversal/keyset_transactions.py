@@ -8,6 +8,7 @@ from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
 from b24api.errors import (
+    AmbiguousExecutionError,
     B24ApiError,
     BudgetExceededError,
     IncompleteTraversalError,
@@ -134,10 +135,7 @@ def _record_wave_dispatch(
 ) -> None:
     """Settle every command and count the physical request before any receipt is validated."""
     for plan, outcome in zip(plans, outcomes, strict=True):
-        host.completion_recorder.settle(
-            plan.command_id,
-            CommandSettlement.SUCCESS if isinstance(outcome, BatchSuccess) else CommandSettlement.FAILURE,
-        )
+        host.completion_recorder.settle(plan.command_id, _settlement(outcome))
     host.transactions.boundary_totals = boundary_totals(plans, outcomes)
     host.batch_requests += 1
     host.batch_commands += len(plans)
@@ -228,12 +226,29 @@ def _abort_wave(
     _raise_rejection(rejection)
 
 
+def _settlement(outcome: BatchOutcome) -> CommandSettlement:
+    """Classify one correlated command: an ambiguous failure may have executed, so it is unknown."""
+    if isinstance(outcome, BatchSuccess):
+        return CommandSettlement.SUCCESS
+    if isinstance(outcome.error, AmbiguousExecutionError):
+        return CommandSettlement.UNKNOWN
+    return CommandSettlement.FAILURE
+
+
 def _raise_rejection(rejection: ReceiptRejection) -> NoReturn:
-    """Raise a rejected command's cause; a failed command ends the traversal incomplete, with its replay."""
+    """Raise a rejected command's cause; a failed command ends the traversal incomplete, with its replay.
+
+    An ambiguous command is raised as is, as a direct page's is: whether it executed is unknown, so
+    the binding's outcome is unknown rather than failed.
+    """
     cause = rejection.error
     if cause is None:
         raise PaginationError(rejection.detail)
-    if isinstance(cause, B24ApiError) and rejection.violation.code == "command_failure":
+    if (
+        isinstance(cause, B24ApiError)
+        and not isinstance(cause, AmbiguousExecutionError)
+        and rejection.violation.code == "command_failure"
+    ):
         raise IncompleteTraversalError(
             report=None,
             error=cause,
@@ -428,10 +443,7 @@ def _record_finish_dispatch(
     dispatch: PageDispatch,
 ) -> None:
     """Settle the finish command before its receipt is validated; a batched page counts as a one-command wave."""
-    host.completion_recorder.settle(
-        plan.command_id,
-        CommandSettlement.SUCCESS if isinstance(outcome, BatchSuccess) else CommandSettlement.FAILURE,
-    )
+    host.completion_recorder.settle(plan.command_id, _settlement(outcome))
     if dispatch is PageDispatch.BATCH:
         host.batch_requests += 1
         host.batch_commands += 1
