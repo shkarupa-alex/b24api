@@ -14,8 +14,11 @@ reference queue spends physical requests and how it reports a failed or lost com
   instead of running beside the batch in flight. Under `INPUT` delivery a binding confirms its end
   only once it is the frontier, so with many small parents and the default
   `BatchDispatch(concurrency=1)` the confirmations queue one after another behind the batches in
-  flight: 100 parents of 3 rows each take about 1.5 times as long at 10-100 ms per request, with
-  fewer requests. `BatchDispatch(concurrency=2)` brings wall time back to what it was. Under
+  flight. How much longer depends on how many pages `max_buffered_rows` holds: 100 parents of 3
+  rows each, at 10-100 ms per request, took from about 1.1 times as long (default budget, page size
+  10) through 1.5 times (default budget, page size 50) to 1.7 times (300 rows, page size 10), while
+  sending fewer requests. Where the cost appears, `BatchDispatch(concurrency=2)` brings wall time
+  back to what it was. Under
   `READY` delivery the dispatcher now also waits up to `coalesce_wait` for a fast binding that is
   about to send its next command, so far fewer requests are sent; at very low latency this waiting
   can cost more wall time than the saved requests.
@@ -46,6 +49,10 @@ reference queue spends physical requests and how it reports a failed or lost com
 - **Small plans give rows back.** Once a binding selects a sequential or boundary-only plan, it trims
   its row lease to the rows that plan can still hold, so the bindings waiting for a lease start
   sooner. The plan itself is still chosen at the full lease, so selection and geometry are as before.
+  A lease never grows, so a dense binding admitted right after a cohort of small ones is sized while
+  their leases are still active and can get a smaller share than before: 20 one-row parents followed
+  by a 5000-row parent send about 15% more requests (428 instead of 373 under `READY`), and a tight
+  pool can make it up to 40%. Across mixed cohorts the total request count still drops.
 
 ## REST 3.0 error codes
 

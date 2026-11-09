@@ -155,9 +155,10 @@ async def _deliver(
 ) -> None:
     """Hand one admitted row group to the consumer; its rows stay charged to the lease until acknowledged.
 
-    A binding that will send another command after the acknowledgement is a pending continuation, as a
-    sequential reference page is: the shared dispatcher waits for its next command to coalesce with
-    the other bindings' instead of sending a batch the acknowledged bindings could have joined.
+    A binding that has not reached its terminal is a pending continuation, as a sequential reference
+    page is: after the acknowledgement it sends its next command, or hands over another row group
+    and then sends it, so the shared dispatcher waits for it to coalesce with the other bindings'
+    commands instead of sending a batch the acknowledged bindings could have joined.
     """
     state, key = host.producer_state, run.producer_key
     continuing = not runtime.terminal

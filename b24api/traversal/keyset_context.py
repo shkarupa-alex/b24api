@@ -76,8 +76,9 @@ class WaveEngine(Protocol):
     async def execute_page(self, request: Request, *, context: ExecutionContext) -> BatchOutcome:
         """Execute one sequential finish page and return its correlated outcome.
 
-        A failure the page's dispatch proves is returned as a ``BatchFailure``, as a wave command's
-        is; a failure that leaves the page unresolved is raised, as a direct request raises it.
+        A command failure of a shared batch, refused or lost, is returned as a ``BatchFailure``, as a
+        wave command's is; a direct page raises its failure, as a direct request does, and so does a
+        failure of the whole shared batch envelope.
         """
         ...
 
