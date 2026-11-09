@@ -13,7 +13,13 @@ reference queue spends physical requests.
 - **A refused finish page fails like a refused wave command.** In a shared batch, a finish command the
   server refuses ends the binding with an `IncompleteTraversalError` that wraps the command error and
   carries its replay disposition, and its page record shows the classified rejection
-  (`COMMAND_FAILURE`, `AMBIGUOUS_EXECUTION`, ...) instead of `RANGE_CONTRADICTION`.
+  (`COMMAND_FAILURE`, `AMBIGUOUS_EXECUTION`, ...) instead of `RANGE_CONTRADICTION`. A failure of the
+  whole batch envelope (a timeout, a malformed envelope) now ends every binding with a command in that
+  batch, as it already did for wave commands, instead of only the binding whose finish page it was.
+- **`INPUT` leases follow binding order.** Under `DeliveryOrder.INPUT` a binding is granted its row
+  lease only when no earlier binding is still waiting for one, and the next frontier waits for a
+  lease that has not been sized by its plan yet. A tight `max_buffered_rows` that used to fail a
+  frontier with `BudgetExceededError`, depending on timing, now lets it start.
 - **Small plans give rows back.** Once a binding selects a sequential or boundary-only plan, it trims
   its row lease to the rows that plan can still hold, so the bindings waiting for a lease start
   sooner. The plan itself is still chosen at the full lease, so selection and geometry are as before.

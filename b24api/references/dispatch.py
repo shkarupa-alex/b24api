@@ -64,6 +64,8 @@ class _Reservation:
     accepted: bool = False
     # A fast keyset lease: held from activation to terminal, only ever trimmed, charged by its own budget view.
     lease: bool = False
+    # A lease whose binding has chosen its plan: it keeps its size, so it returns rows only at terminal.
+    settled: bool = False
 
 
 @dataclass(slots=True)
@@ -275,6 +277,8 @@ class _RowBuffer:
         self._condition = asyncio.Condition()
         self._reservations: list[_Reservation] = []
         self._producer_state = producer_state
+        # Bindings inside ``lease``: a lease decision may depend on which earlier binding still waits.
+        self._lease_waiting: set[int] = set()
 
     @property
     def head_index(self) -> int:
@@ -376,33 +380,44 @@ class _RowBuffer:
         """Hold one fixed capacity until terminal; ``grant`` sizes it from the free rows or asks to wait.
 
         ``grant`` runs under the pool condition, so the decision and the reservation are atomic. It
-        may raise to refuse a lease no releaser can ever satisfy.
+        may raise to refuse a lease no releaser can ever satisfy. A binding leaving the wait, with a
+        lease or without one, wakes the others: a decision may depend on whether it still waits.
         """
         async with self._condition:
-            while True:
-                if self._closed:
-                    raise asyncio.CancelledError
-                amount = grant(self._available)
-                if amount is not None:
-                    break
-                await self._condition.wait()
-            if isinstance(amount, bool) or not 0 < amount <= self._available:
-                raise RuntimeError("fast keyset lease exceeds the free row pool")
-            self._available -= amount
-            reservation = _Reservation(index, amount, lease=True)
-            self._reservations.append(reservation)
-            self._condition.notify_all()
-            self._touch()
+            self._lease_waiting.add(index)
+            try:
+                while True:
+                    if self._closed:
+                        raise asyncio.CancelledError
+                    amount = grant(self._available)
+                    if amount is not None:
+                        break
+                    await self._condition.wait()
+                if isinstance(amount, bool) or not 0 < amount <= self._available:
+                    raise RuntimeError("fast keyset lease exceeds the free row pool")
+                self._available -= amount
+                reservation = _Reservation(index, amount, lease=True)
+                self._reservations.append(reservation)
+            finally:
+                self._lease_waiting.discard(index)
+                self._condition.notify_all()
+                self._touch()
             return reservation
 
-    async def trim_lease(self, reservation: _Reservation, amount: int) -> None:
-        """Give a lease's rows above ``amount`` back to the pool and wake the capacity waiters.
+    def lease_waiting_before(self, index: int) -> bool:
+        """Return whether a binding earlier than ``index`` is waiting for its lease."""
+        return any(waiting < index for waiting in self._lease_waiting)
 
-        A lease is never accepted, so the shared row counter holds only what its binding charged;
-        trimming moves free pool rows only. A pool closed meanwhile has already reclaimed the lease.
+    async def settle_lease(self, reservation: _Reservation, amount: int) -> None:
+        """Fix a planned binding's lease at ``amount`` rows, give the rest back and wake the capacity waiters.
+
+        Until its binding has planned, a lease may still shrink, so a waiting INPUT frontier counts it
+        as releasable; settling it, trimmed or not, is the fact that frontier waits for. A lease is never
+        accepted, so the shared row counter holds only what its binding charged; trimming moves free
+        pool rows only. A pool closed meanwhile has already reclaimed the lease.
         """
         if not reservation.lease or amount <= 0:
-            raise RuntimeError("only a lease trims, and never to nothing")
+            raise RuntimeError("only a lease settles, and never to nothing")
         async with self._condition:
             if self._closed or reservation.amount == 0:
                 return
@@ -410,13 +425,20 @@ class _RowBuffer:
                 raise RuntimeError("a lease cannot grow")
             self._available += reservation.amount - amount
             reservation.amount = amount
+            reservation.settled = True
             self._condition.notify_all()
             self._touch()
 
     def releasable_elsewhere(self, index: int) -> bool:
-        """Return whether a page of another binding may still return unused capacity when it settles."""
+        """Return whether another binding may still return capacity without this one's progress.
+
+        An unaccepted page returns its unused rows when it settles, and an unsettled lease may be trimmed
+        once its binding has planned, which needs no delivery.
+        """
         return any(
-            reservation.index != index and not reservation.accepted and not reservation.lease
+            reservation.index != index
+            and not reservation.accepted
+            and (not reservation.lease or not reservation.settled)
             for reservation in self._reservations
         )
 

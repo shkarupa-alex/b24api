@@ -126,7 +126,7 @@ def _grant(pool: int, free: int) -> int | None:
         _source_exhausted=True,
         _fast_active={0, 1},
     )
-    grant = ReferenceScheduler._lease_grant  # noqa: SLF001
+    grant = ReferenceScheduler._lease_size  # noqa: SLF001
     return grant(cast("ReferenceScheduler", scheduler), cast("FastKeysetProgram", fast), 1, free)
 
 

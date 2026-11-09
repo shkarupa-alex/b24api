@@ -57,8 +57,8 @@ class FastKeysetHost(WaveHost, Protocol):
         """Wait for and hold the binding's row lease in the shared pool."""
         ...
 
-    async def trim_lease(self, lease: _Reservation, rows: int) -> None:
-        """Give the rows above ``rows`` of the binding's lease back to the shared pool."""
+    async def settle_lease(self, lease: _Reservation, rows: int) -> None:
+        """Fix the planned binding's lease at ``rows``, giving the rest back to the shared pool."""
         ...
 
 
@@ -102,7 +102,8 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
         if bound is not None and bound < view.lease.capacity:
             # The plan was chosen at the full lease; the rows it can never use go to the bindings awaiting one.
             view.trim(bound)
-            await host.trim_lease(lease, bound)
+        # Settled, trimmed or not: a waiting INPUT frontier no longer counts on this lease shrinking.
+        await host.settle_lease(lease, view.lease.capacity)
         while rows := await runtime.next_rows():
             await _deliver(host, run, runtime, rows)
         closure, witnesses = runtime.completion_closure()

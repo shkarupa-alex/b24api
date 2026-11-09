@@ -35,6 +35,7 @@ from b24api import (
     TerminalState,
 )
 from b24api.contracts import (
+    DeliveryOrder,
     KeysetExecutionKind,
     KeysetPhase,
     ReferenceComplete,
@@ -172,7 +173,7 @@ class _Trims:
 @pytest.fixture
 def trims(monkeypatch: pytest.MonkeyPatch) -> _Trims:
     spy = _Trims()
-    lease, trim = _RowBuffer.lease, _RowBuffer.trim_lease
+    lease, trim = _RowBuffer.lease, _RowBuffer.settle_lease
 
     async def tracked_lease(self: _RowBuffer, index: int, grant: Callable[[int], int | None]) -> object:
         reservation = await lease(self, index, grant)
@@ -182,10 +183,11 @@ def trims(monkeypatch: pytest.MonkeyPatch) -> _Trims:
     async def tracked_trim(self: _RowBuffer, reservation: object, amount: int) -> None:
         before = cast("int", getattr(reservation, "amount", 0))
         await trim(self, reservation, amount)  # type: ignore[arg-type]
-        spy.trimmed.append((before, amount))
+        if amount < before:
+            spy.trimmed.append((before, amount))
 
     monkeypatch.setattr(_RowBuffer, "lease", tracked_lease)
-    monkeypatch.setattr(_RowBuffer, "trim_lease", tracked_trim)
+    monkeypatch.setattr(_RowBuffer, "settle_lease", tracked_trim)
     return spy
 
 
@@ -314,16 +316,16 @@ async def test_a_trimmed_lease_wakes_the_binding_waiting_for_rows() -> None:
     waiting = asyncio.create_task(pool.lease(1, lambda free: 40 if free >= 40 else None))
     await asyncio.sleep(0)
     assert not waiting.done()
-    await pool.trim_lease(first, 60)
+    await pool.settle_lease(first, 60)
     second = await asyncio.wait_for(waiting, 1)
     assert (first.amount, second.amount) == (60, 40)
     with pytest.raises(RuntimeError, match="cannot grow"):
-        await pool.trim_lease(first, 61)
+        await pool.settle_lease(first, 61)
     page = await pool.reserve(2, 0)
-    with pytest.raises(RuntimeError, match="only a lease"):
-        await pool.trim_lease(page, 1)
+    with pytest.raises(RuntimeError, match="only a lease settles"):
+        await pool.settle_lease(page, 1)
     await pool.close()
-    await pool.trim_lease(first, 1)
+    await pool.settle_lease(first, 1)
     assert first.amount == 0
 
 
@@ -335,3 +337,71 @@ async def test_a_page_charged_to_a_lease_is_admissible_behind_the_input_frontier
     # The free pool is exhausted, so a pooled page behind the frontier waits; a leased page reserves nothing.
     assert not pool.can_reserve(1, PAGE)
     assert pool.can_reserve(1, 0)
+
+
+# Under INPUT delivery a trimmed lease must not strand the next frontier.
+
+
+def _ids(start: int, size: int, step: int) -> tuple[int, ...]:
+    return tuple(range(start, start + size * step, step))
+
+
+_TIGHT_INPUT_COHORTS = {
+    # A binding behind the frontier leased first; the next frontier must wait for it to plan and trim.
+    "behind_the_frontier_not_yet_planned": {"p0": (5,), "p1": _ids(20, 19, 7), "p2": (), "p3": _ids(37, 5, 1)},
+    # Freed rows must go to the earlier waiting binding, which becomes the frontier first.
+    "earlier_waiter_first": {
+        "p0": _ids(44, 2, 7),
+        "p1": _ids(34, 5, 1),
+        "p2": _ids(13, 20, 1),
+        "p3": _ids(46, 40, 7),
+        "p4": _ids(3, 11, 2),
+        "p5": _ids(25, 21, 1),
+        "p6": _ids(27, 15, 2),
+    },
+}
+
+
+@pytest.mark.parametrize("cohort", sorted(_TIGHT_INPUT_COHORTS))
+@pytest.mark.asyncio
+async def test_a_tight_input_pool_completes_every_parent_in_binding_order(cohort: str) -> None:
+    data = _TIGHT_INPUT_COHORTS[cohort]
+    portal = BatchPortal(_answer(data))
+    policy = ExecutionPolicy(max_buffered_rows=40, page_trace_limit=1024)
+    async with client_for(portal, policy=policy) as client:
+        outcomes, report = await _drain(
+            client.iter_reference_outcomes(
+                _base(),
+                [_parent(name) for name in data],
+                traversal=_traversal(RangeKeysetExecution(_CONTRACT)),
+                dispatch=BatchDispatch(batch_size=2, output_order=DeliveryOrder.INPUT),
+            )
+        )
+
+    assert [outcome for outcome in outcomes if isinstance(outcome, ReferenceFailure)] == []
+    assert report.state is TerminalState.COMPLETED
+    delivered = [
+        (outcome.correlation, cast("dict[str, int]", outcome.item)["id"])
+        for outcome in outcomes
+        if isinstance(outcome, ReferenceItem)
+    ]
+    assert delivered == [(name, value) for name, ids in data.items() for value in sorted(ids)]
+
+
+@pytest.mark.asyncio
+async def test_an_unsettled_lease_is_releasable_and_lease_waiters_are_known_in_order() -> None:
+    pool = _RowBuffer(100, _shared(100), head_reserve=10)
+    behind = await pool.lease(3, lambda _free: 60)
+    # A lease whose binding has not planned yet may still be trimmed: the frontier waits for it.
+    assert pool.releasable_elsewhere(2)
+    await pool.settle_lease(behind, 60)
+    assert not pool.releasable_elsewhere(2)
+    assert not pool.lease_waiting_before(5)
+    later = asyncio.create_task(pool.lease(5, lambda _free: None))
+    await asyncio.sleep(0)
+    assert pool.lease_waiting_before(6)
+    assert not pool.lease_waiting_before(5)
+    later.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await later
+    assert not pool.lease_waiting_before(6)

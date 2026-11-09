@@ -495,11 +495,21 @@ class ReferenceScheduler:
         self.producer_state.touch()
         return lease
 
-    async def trim_lease(self, lease: _Reservation, rows: int) -> None:
-        """Give the rows above ``rows`` of a binding's lease back to the pool for the bindings awaiting one."""
-        await self.buffer.trim_lease(lease, rows)
+    async def settle_lease(self, lease: _Reservation, rows: int) -> None:
+        """Fix a planned binding's lease at ``rows``, giving the rest back to the bindings awaiting one."""
+        await self.buffer.settle_lease(lease, rows)
 
     def _lease_grant(self, fast: FastKeysetProgram, index: int, free: int) -> int | None:
+        """Grant one fast lease in delivery order, or return None to wait.
+
+        INPUT delivers in binding order, so leases are granted in it: a later binding never takes the
+        rows an earlier one, which becomes the frontier first, is waiting for.
+        """
+        if self.output_order is ReferenceOutputOrder.INPUT and self.buffer.lease_waiting_before(index):
+            return None
+        return self._lease_size(fast, index, free)
+
+    def _lease_size(self, fast: FastKeysetProgram, index: int, free: int) -> int | None:
         """Size one fast lease from the free rows, or return None to wait.
 
         P = 3C+A is the floor a bounded plan needs and Q = 4C+A the comfortable quota. A binding
@@ -508,7 +518,8 @@ class ReferenceScheduler:
         arrive. AUTO below the floor runs exclusively on the whole pool, like a flat traversal, and
         under INPUT only once it is the frontier. The
         INPUT frontier never waits on rows that only its own progress could release: it takes what
-        is free, or fails finitely.
+        is free, or fails finitely; a lease whose binding has not planned yet may still be trimmed, so
+        the frontier waits for it to settle.
         """
         pool = self.buffer.maximum
         frontier = self.output_order is ReferenceOutputOrder.INPUT and index == self.buffer.head_index
