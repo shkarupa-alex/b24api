@@ -13,6 +13,7 @@ from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.page_stop import CallerStop, ContinuePage, PageBoundary, PageStopPolicy
 from b24api.contracts.report import PageDispatch, PageRecord, Violation, ViolationSeverity, retain_page_trace
 from b24api.contracts.request import ReplaySafety, Request, ResultSelector, TraversalIdentity
+from b24api.contracts.response import result_snapshot
 from b24api.contracts.violation import retain_violations
 from b24api.errors import BudgetExceededError, CapabilityError
 from b24api.execution import (
@@ -667,7 +668,13 @@ class ReferenceScheduler:
             return False
         if len(page_records) != 1:
             raise RuntimeError("validated reference page lacks completion provenance")
-        decision = page_stop.on_page(PageBoundary(run.work.index, page_records[0], tuple(page.items)))
+        boundary = PageBoundary(
+            run.work.index,
+            page_records[0],
+            tuple(page.items),
+            result=result_snapshot(page.response),
+        )
+        decision = page_stop.on_page(boundary)
         if isawaitable(decision):
             decision = await decision
         if not isinstance(decision, ContinuePage | CallerStop):

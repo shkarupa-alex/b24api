@@ -305,6 +305,7 @@ async def _execute_recipe(source: str, client: _ExampleClient, api: Bitrix24) ->
         "cursor": object(),
         "identity": IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.DECIMAL_STRING_INTEGER),
         "keyset": object(),
+        "window": object(),
         "parent_ids": (1, 2),
         "request": Request("example.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         "write_file": lambda *_args, **_kwargs: None,

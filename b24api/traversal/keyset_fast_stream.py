@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Self
 
 from b24api.completion.fast_recorder import FastCompletionRecorder
 from b24api.contracts.completion import CleanupState
-from b24api.contracts.json import FrozenJson, JsonValue, _thaw_json
+from b24api.contracts.json import FrozenJson, JsonValue, thaw_json
 from b24api.contracts.policy import (
     CompletionAssurance,
     KernelState,
@@ -68,7 +68,7 @@ class KeysetFastStream:
                 self._buffer.extend(rows)
             item = self._buffer.popleft()
             self._runtime.mark_emitted(1)
-            return _thaw_json(item)
+            return thaw_json(item)
         except StopAsyncIteration:
             raise
         except asyncio.CancelledError as error:

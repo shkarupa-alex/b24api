@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from b24api.contracts.json import FrozenJson, _freeze_json, _thaw_json
+from b24api.contracts.json import FrozenJson, _freeze_json, thaw_json
 from b24api.contracts.policy import (
     ConfirmationPolicy,
     DuplicatePolicy,
@@ -229,7 +229,7 @@ def _replace_owned_control(  # noqa: C901, PLR0912 - exact nested path replaceme
                 raise KeyError("control list index is missing")
             current = current[part]
     final = parts[-1]
-    replacement = _thaw_json(_freeze_json(value))
+    replacement = thaw_json(_freeze_json(value))
     if isinstance(final, str):
         if not isinstance(current, dict):
             raise TypeError("control path terminates in a non-mapping value")

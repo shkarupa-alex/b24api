@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from b24api.contracts.json import FrozenJson, _freeze_json, _thaw_json
+from b24api.contracts.json import FrozenJson, _freeze_json, thaw_json
 from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
 
 if TYPE_CHECKING:
@@ -201,23 +201,21 @@ class KeysetCapabilityReport:
                     "name": check.name,
                     "outcome": check.outcome,
                     "rows_selected": check.rows_selected,
-                    "out_of_interval_identities": tuple(
-                        _thaw_json(value) for value in check.out_of_interval_identities
-                    ),
+                    "out_of_interval_identities": tuple(thaw_json(value) for value in check.out_of_interval_identities),
                     "missing_in_interval_identities": tuple(
-                        _thaw_json(value) for value in check.missing_in_interval_identities
+                        thaw_json(value) for value in check.missing_in_interval_identities
                     ),
                     "extra_in_interval_identities": tuple(
-                        _thaw_json(value) for value in check.extra_in_interval_identities
+                        thaw_json(value) for value in check.extra_in_interval_identities
                     ),
-                    "contradictory_identities": tuple(_thaw_json(value) for value in check.contradictory_identities),
+                    "contradictory_identities": tuple(thaw_json(value) for value in check.contradictory_identities),
                     "recheck": None
                     if check.recheck is None
                     else {
-                        "identities": tuple(_thaw_json(value) for value in check.recheck.identities),
-                        "still_observed": tuple(_thaw_json(value) for value in check.recheck.still_observed),
-                        "no_longer_observed": tuple(_thaw_json(value) for value in check.recheck.no_longer_observed),
-                        "contradictory": tuple(_thaw_json(value) for value in check.recheck.contradictory),
+                        "identities": tuple(thaw_json(value) for value in check.recheck.identities),
+                        "still_observed": tuple(thaw_json(value) for value in check.recheck.still_observed),
+                        "no_longer_observed": tuple(thaw_json(value) for value in check.recheck.no_longer_observed),
+                        "contradictory": tuple(thaw_json(value) for value in check.recheck.contradictory),
                         "truncated": check.recheck.truncated,
                     },
                 }

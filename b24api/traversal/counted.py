@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Self
 
 from b24api.completion.recorder import CountedCompletionRecorder
 from b24api.contracts.completion import BindingClosure, CleanupState, StreamClosure
-from b24api.contracts.json import _thaw_json
+from b24api.contracts.json import thaw_json
 from b24api.contracts.policy import (
     CompletionAssurance,
     ExecutionPolicy,
@@ -120,7 +120,7 @@ class CountedItemStream:
                 for item, is_unique in zip(page.items, self._driver.last_page_unique_mask, strict=True):
                     self._emitted += 1
                     self._unique += int(is_unique)
-                    yield _thaw_json(item)
+                    yield thaw_json(item)
                 if page.items:
                     self._completion.delivered()
                     self._completion.acknowledged()

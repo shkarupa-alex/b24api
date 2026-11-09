@@ -1,10 +1,11 @@
 """Public whole-page callback and bounded-prefix stop decision."""
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
+from b24api.contracts.json import FrozenMapping
 from b24api.contracts.report import PageRecord
 from b24api.redaction import DEFAULT_REDACTOR
 
@@ -18,11 +19,20 @@ _MAX_REASON_LENGTH = 128
 
 @dataclass(frozen=True, slots=True)
 class PageBoundary:
-    """One validated whole page offered after all its rows were consumed."""
+    """One validated whole page offered after all its rows were consumed.
+
+    ``result`` is the page's immutable server result, the same snapshot a page adapter, a window
+    classifier and a continuation rule see as ``PageView.result``: response-level fields beside the
+    rows, such as a flag or a popup object, reach the application on every offered page, including
+    a page that admits no row. It is ``None`` only for a boundary built by application code. Only
+    its top-level type is checked: anything but a JSON scalar, a tuple or a ``FrozenMapping`` is
+    rejected, and nested values are the frozen values the library builds or the caller's concern.
+    """
 
     binding_id: int
     record: PageRecord
     rows: tuple[FrozenJson, ...]
+    result: FrozenJson = field(default=None, kw_only=True, repr=False)
 
     def __post_init__(self) -> None:
         """Keep correlation and page content immutable and exact."""
@@ -33,6 +43,8 @@ class PageBoundary:
         object.__setattr__(self, "rows", tuple(self.rows))
         if len(self.rows) != self.record.rows_admitted:
             raise ValueError("page boundary must contain all admitted rows")
+        if self.result is not None and not isinstance(self.result, str | int | float | tuple | FrozenMapping):
+            raise TypeError("result must be frozen JSON: a JSON scalar, a tuple or a FrozenMapping")
 
 
 class ContinuePage(StrEnum):

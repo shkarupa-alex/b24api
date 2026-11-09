@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import TypedDict, cast
 
 from b24api._diagnostics import DiagnosticContext
-from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, _thaw_json
+from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, thaw_json
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.positional import PositionalArguments
 from b24api.contracts.request_summary import RequestSummary, RouteKind
@@ -314,7 +314,7 @@ class Request:
         """Return a mutable copy of the immutable request parameters."""
         if self._positional is not None:
             raise ValueError("positional arguments have no named parameter mapping")
-        return cast("dict[str, JsonValue]", _thaw_json(self._parameters))
+        return cast("dict[str, JsonValue]", thaw_json(self._parameters))
 
     def to_wire_parameters(self) -> dict[str, JsonValue]:
         """Return the to wire parameters representation."""
