@@ -508,3 +508,33 @@ async def test_a_flat_traversal_raises_a_lost_wave_as_it_raises_a_lost_direct_pa
 
     assert stream.report is not None
     assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_a_lost_part_of_a_split_wave_leaves_its_binding_unknown_even_after_a_refused_part() -> None:
+    """A wave split across two batches, the first refusing its commands and the second lost, ends unknown."""
+    data = {"A": _ids(1, 399, 1), "B": _ids(1, 399, 1)}
+    base = _answer(data)
+
+    def answer(method: str, query: Query) -> Envelope:
+        if len(portal.waves) == 2 and query.get("filter[=parent]") == "A":
+            return {"error": "INTERNAL_SERVER_ERROR", "error_description": "refused"}
+        if len(portal.waves) == 3:
+            raise ConnectionResetError("connection lost after the batch was sent")
+        return base(method, query)
+
+    portal = BatchPortal(answer)
+    async with client_for(portal, policy=_POLICY) as client:
+        outcomes, report = await _drain(
+            client.iter_reference_outcomes(
+                _base(),
+                [_parent(name) for name in data],
+                traversal=_traversal(RangeKeysetExecution(_CONTRACT)),
+                dispatch=BatchDispatch(batch_size=3),
+            )
+        )
+
+    terminals = {outcome.correlation: outcome for outcome in outcomes if not isinstance(outcome, ReferenceItem)}
+    assert portal.waves[:3] == [3, 3, 3]
+    assert all(isinstance(outcome, ReferenceOutcomeUnknown) for outcome in terminals.values())
+    assert (report.failures, report.unknown) == (0, 2)

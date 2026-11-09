@@ -207,7 +207,11 @@ def _abort_wave(
     rejections: list[ReceiptRejection],
     selected_rows: int,
 ) -> NoReturn:
-    """Reject the valid pages of a failed wave too, discard its rows, and raise the first cause."""
+    """Reject the valid pages of a failed wave too, discard its rows, and raise its cause.
+
+    An ambiguous command wins over a refused one wherever it sits in the wave: if any command may
+    have executed, the binding's outcome is unknown, not failed.
+    """
     successful = {receipt.command_id: receipt for receipt in receipts}
     for index, plan in enumerate(plans):
         if plan.command_id in successful:
@@ -220,7 +224,11 @@ def _abort_wave(
                 rejection=PageRejectionCode.TRANSACTION_ABORTED,
             )
     host.admission.record_raw(selected_rows, discarded=True)
-    rejection = next((receipt for receipt in rejections if receipt.error is not None), None)
+    causes = [receipt for receipt in rejections if receipt.error is not None]
+    rejection = next(
+        (receipt for receipt in causes if isinstance(receipt.error, AmbiguousExecutionError)),
+        causes[0] if causes else None,
+    )
     if rejection is None:
         raise PaginationError("fast keyset wave validation failed")
     _raise_rejection(rejection)

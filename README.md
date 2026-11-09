@@ -630,22 +630,23 @@ rather than fabricating a reference outcome. Already accepted bindings retain th
 ### Keyset references
 
 `KeysetTraversal` bindings run sequentially by default (`SequentialKeysetExecution()`), unlike
-`iter_list_keyset()`, whose default is automatic. Pass `AutoKeysetExecution`,
-`RangeKeysetExecution` or `PartitionedKeysetExecution` as the traversal's `execution` to opt in. A
-binding with automatic, range or partitioned execution runs its own planning barrier and selection;
-its waves and its final confirmation pages travel through the shared batch queue beside other
-bindings' pages, so a cohort of small parents shares physical batches instead of confirming each
-parent with a direct request. Its `ReferenceComplete` carries the binding's `keyset_selection` and,
-when the fast path ran, its `keyset_execution`. From its first request to its terminal event the
-binding holds a share of `ExecutionPolicy.max_buffered_rows` and plans every wave within it; once a
-sequential or boundary-only plan is chosen, the binding keeps only the rows that plan can still hold
-and returns the rest to the bindings waiting for a share. Under `INPUT` delivery rows go out in
-binding order: while a binding waits for its share, later bindings take no rows. A binding whose
-batch was lost in transit ends with `ReferenceOutcomeUnknown`. Requests, pages, attempts and elapsed
-time stay on the one operation budget. An automatic binding whose planning floor exceeds the
-whole row budget waits to run alone with all of it (under `INPUT` delivery, once it is the next
-binding to deliver); a binding that cannot obtain its floor while no other binding can release rows
-fails with `BudgetExceededError`, and waiting for a share never outlasts `max_elapsed`.
+`iter_list_keyset()`, whose default is automatic. Pass `AutoKeysetExecution`, `RangeKeysetExecution`
+or `PartitionedKeysetExecution` as the traversal's `execution` to opt in. A binding with automatic,
+range or partitioned execution runs its own planning barrier and selection; its waves and its final
+confirmation pages travel through the shared batch queue beside other bindings' pages, so a cohort
+of small parents shares physical batches instead of confirming each parent with a direct request.
+Its `ReferenceComplete` carries the binding's `keyset_selection` and, when the fast path ran, its
+`keyset_execution`. From its first request to its terminal event the binding holds a share of
+`ExecutionPolicy.max_buffered_rows` and plans every wave within it; once a sequential or
+boundary-only plan is chosen, the binding keeps only the rows that plan can still hold and returns
+the rest to the bindings waiting for a share. Under `INPUT` delivery rows go out in binding order:
+while a binding waits for its share, no later binding is granted a share or reserves an ordinary
+page. A binding whose batch was lost in transit ends with `ReferenceOutcomeUnknown`. Requests,
+pages, attempts and elapsed time stay on the one operation budget. An automatic binding whose
+planning floor exceeds the whole row budget waits to run alone with all of it (under `INPUT`
+delivery, once it is the next binding to deliver); a binding that cannot obtain its floor while no
+other binding can release rows fails with `BudgetExceededError`, and waiting for a share never
+outlasts `max_elapsed`.
 
 Fast and automatic keyset references need `BatchDispatch`. With a `page_stop`, automatic execution
 runs sequentially and reports `PAGE_STOP`; an explicit fast mode with a `page_stop` or

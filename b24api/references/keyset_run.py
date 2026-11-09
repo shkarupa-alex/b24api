@@ -18,7 +18,7 @@ from b24api.completion.reference_recorder import ReferenceFastLedger
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import KeysetSelectionSummary, Violation, ViolationSeverity
-from b24api.errors import AmbiguousExecutionError, PaginationError
+from b24api.errors import PaginationError
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _DoneEvent, _failed_settlement, _FailureEvent, _PageEvent
 from b24api.references.wave_engine import SharedWaveEngine, WaveHost
@@ -129,7 +129,7 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
         # The scheduler's per-reference boundary turns the error into this binding's terminal event.
         if runtime is not None and not runtime.closed:
             await runtime.aclose()
-        ledger.close(successful=False, reason=KernelState.FAILED.value, unsettled=_unsettled(error))
+        ledger.close(successful=False, reason=KernelState.FAILED.value, unsettled=_failed_settlement(error))
         run.failure = _FailureEvent(
             run.work,
             error,
@@ -209,13 +209,6 @@ def _binding_violations(violations: list[Violation]) -> tuple[Violation, ...]:
     evidence blocking; a tolerant operation completes with failures, a fail-fast one fails on it.
     """
     return tuple(replace(violation, severity=ViolationSeverity.WARNING) for violation in violations)
-
-
-def _unsettled(error: BaseException) -> CommandSettlement:
-    """Classify a page still unsettled when the traversal failed (a direct finish page)."""
-    if isinstance(error, AmbiguousExecutionError):
-        return CommandSettlement.UNKNOWN
-    return _failed_settlement(error)
 
 
 __all__ = ["FastKeysetHost", "run_fast_keyset"]

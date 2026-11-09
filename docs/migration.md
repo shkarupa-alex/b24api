@@ -9,10 +9,16 @@ reference queue spends physical requests and how it reports a failed or lost com
   confirmation, are now commands of the shared batch queue instead of direct requests. Their
   `PageRecord.dispatch` is `BATCH` instead of `DIRECT`, and the operation report's `batch_requests`
   and `batch_commands` count them with the other commands of the shared batches. A flat
-  `iter_list_keyset()` still sends its finish page directly. A finish page now waits for a free batch
-  slot instead of running beside the batch in flight, so where few commands coalesce, as under
-  `INPUT` delivery with the default `BatchDispatch(concurrency=1)`, wall time can grow slightly at
-  an equal request count; a higher `concurrency` overlaps the batches again.
+  `iter_list_keyset()` still sends its finish page directly.
+- **Batching trades request count for waiting.** A finish page now waits for a free batch slot
+  instead of running beside the batch in flight. Under `INPUT` delivery a binding confirms its end
+  only once it is the frontier, so with many small parents and the default
+  `BatchDispatch(concurrency=1)` the confirmations queue one after another behind the batches in
+  flight: 100 parents of 3 rows each take about 1.5 times as long at 10-100 ms per request, with
+  fewer requests. `BatchDispatch(concurrency=2)` brings wall time back to what it was. Under
+  `READY` delivery the dispatcher now also waits up to `coalesce_wait` for a fast binding that is
+  about to send its next command, so far fewer requests are sent; at very low latency this waiting
+  can cost more wall time than the saved requests.
 - **A refused finish page fails like a refused wave command.** Before, the server's refusal of the
   direct finish request was the binding's error itself (an `ApiResponseError`), and the page trace
   had no record of that page. Now the binding ends with an `IncompleteTraversalError` whose `error`

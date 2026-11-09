@@ -549,7 +549,7 @@ def test_keyset_context_names_exactly_the_members_fast_keyset_uses() -> None:
     }
 
 
-# A27-RETAIN / A27-WAVE1: a fixed lease; the wave fit and the charge use the same capacity.
+# A27-RETAIN / A27-WAVE1: a lease never grows; the wave fit and the charge use the same capacity.
 
 
 def _shared(rows: int = 2500) -> ExecutionContext:
@@ -600,7 +600,7 @@ async def test_one_free_page_runs_two_candidates_as_two_atomic_one_command_waves
 
 
 @pytest.mark.asyncio
-async def test_a_fixed_lease_returns_to_the_pool_and_its_neighbour_exhausts(leases: _Leases) -> None:
+async def test_a_lease_returns_to_the_pool_and_its_neighbour_exhausts(leases: _Leases) -> None:
     portal = BatchPortal(_answer({"fast": DISTRIBUTIONS["dense"], "plain": tuple(range(1, 31))}))
     policy = ExecutionPolicy(max_buffered_rows=40)
     async with client_for(portal, policy=policy) as client:
