@@ -702,15 +702,19 @@ async def test_page_metadata_is_the_server_result_beside_the_admitted_and_adapte
         )
     )
     results: list[tuple[int, object]] = []
+    offered: list[object] = []
+    adapted: list[object] = []
 
     class _Results:
         def on_page(self, boundary: PageBoundary) -> ContinuePage:
             assert boundary.result is not None
+            offered.append(boundary.result)
             results.append((len(boundary.rows), thaw_json(boundary.result)))
             return ContinuePage.CONTINUE
 
     class _Tag:
         def adapt(self, page: PageView, /) -> AdaptedPage:
+            adapted.append(page.result)
             return AdaptedPage({**row, "tagged": True} for row in page.items)  # type: ignore[dict-item]
 
     window = replace(_window(), page_adapter=_Tag())
@@ -723,6 +727,9 @@ async def test_page_metadata_is_the_server_result_beside_the_admitted_and_adapte
         (2, {"messages": [_row(20, _T3), _row(19, _T2)], "hasMore": True, "popup": {"revision": 1}}),
         (0, {"messages": [_row(19, _T2)], "hasMore": False, "popup": {"revision": 2}}),
     ]
+    # The page stop sees the very snapshot the page adapter saw, not a copy.
+    assert len(offered) == len(adapted) == len(results)
+    assert all(seen is view for seen, view in zip(offered, adapted, strict=True))
 
 
 @pytest.mark.asyncio
@@ -790,4 +797,6 @@ def test_a_page_boundary_built_by_application_code_has_no_result() -> None:
         PageBoundary(0, record, (), result)  # type: ignore[misc]
     with pytest.raises(TypeError, match="frozen JSON"):
         PageBoundary(0, record, (), result={"popup": 1})  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="frozen JSON"):
+        PageBoundary(0, record, (), result=[1])  # type: ignore[arg-type]
     assert "popup" not in repr(PageBoundary(0, record, (), result=result))

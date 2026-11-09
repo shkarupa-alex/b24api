@@ -24,13 +24,15 @@ class PageBoundary:
     ``result`` is the page's immutable server result, the same snapshot a page adapter, a window
     classifier and a continuation rule see as ``PageView.result``: response-level fields beside the
     rows, such as a flag or a popup object, reach the application on every offered page, including
-    a page that admits no row. It is ``None`` only for a boundary built by application code.
+    a page that admits no row. It is ``None`` only for a boundary built by application code. Like
+    ``rows``, it is checked at its top level only: a mutable mapping or list there is rejected, and
+    nested values are the frozen values the library builds or the caller's responsibility.
     """
 
     binding_id: int
     record: PageRecord
     rows: tuple[FrozenJson, ...]
-    result: FrozenJson | None = field(default=None, kw_only=True, repr=False)
+    result: FrozenJson = field(default=None, kw_only=True, repr=False)
 
     def __post_init__(self) -> None:
         """Keep correlation and page content immutable and exact."""
@@ -41,8 +43,8 @@ class PageBoundary:
         object.__setattr__(self, "rows", tuple(self.rows))
         if len(self.rows) != self.record.rows_admitted:
             raise ValueError("page boundary must contain all admitted rows")
-        if self.result is not None and not isinstance(self.result, (str, int, float, tuple, FrozenMapping)):
-            raise TypeError("result must be frozen JSON")
+        if self.result is not None and not isinstance(self.result, str | int | float | tuple | FrozenMapping):
+            raise TypeError("result must be frozen JSON, not a mutable mapping or list")
 
 
 class ContinuePage(StrEnum):
