@@ -13,6 +13,60 @@
   value (dicts and lists), for example to store a field of `boundary.result`. It replaces the private
   `b24api.contracts.json._thaw_json`.
 
+## Fast keyset references: shared final confirmations
+
+Public signatures are unchanged; what changes is how a fast or automatic keyset binding on the shared
+reference queue spends physical requests and how it reports a failed or lost command.
+
+- **Final confirmations are batched.** A binding's sequential finish pages, including the final empty
+  confirmation, are now commands of the shared batch queue instead of direct requests. Their
+  `PageRecord.dispatch` is `BATCH` instead of `DIRECT`, and the operation report's `batch_requests`
+  and `batch_commands` count them with the other commands of the shared batches. A flat
+  `iter_list_keyset()` still sends its finish page directly.
+- **Batching trades request count for waiting.** A finish page now waits for a free batch slot
+  instead of running beside the batch in flight. Under `INPUT` delivery a binding confirms its end
+  only once it is the frontier, so with many small parents and the default
+  `BatchDispatch(concurrency=1)` the confirmations queue one after another behind the batches in
+  flight. How much longer depends on how many pages `max_buffered_rows` holds: 100 parents of 3
+  rows each, at 10-100 ms per request, took from about 1.1 times as long (default budget, page size
+  10) through 1.5 times (default budget, page size 50) to 1.7 times (300 rows, page size 10), while
+  sending fewer requests. Where the cost appears, `BatchDispatch(concurrency=2)` brings wall time
+  back to what it was. Under
+  `READY` delivery the dispatcher now also waits up to `coalesce_wait` for a fast binding that is
+  about to send its next command, so far fewer requests are sent; at very low latency this waiting
+  can cost more wall time than the saved requests.
+- **A refused finish page fails like a refused wave command.** Before, the server's refusal of the
+  direct finish request was the binding's error itself (an `ApiResponseError`), and the page trace
+  had no record of that page. Now the binding ends with an `IncompleteTraversalError` whose `error`
+  is the command's `BatchCommandError` (an `ApiResponseError` subclass) and which carries its replay
+  disposition, and the page is recorded as `BATCH`, `REJECTED`, `COMMAND_FAILURE`. Code that matched
+  `ApiResponseError` on such a binding should look at `IncompleteTraversalError.error`. A malformed
+  batch envelope now fails every binding with a command in that batch, and a lost one leaves all of
+  them unknown, as it already did for wave commands, instead of affecting only the binding whose
+  finish page it was.
+- **A command lost in transit leaves its binding unknown.** When the batch carrying a fast binding's
+  wave or finish command is ambiguous (for example, the connection drops after it was sent), the
+  binding now ends with `ReferenceOutcomeUnknown` carrying the `AmbiguousExecutionError` and is
+  counted in the report's `unknown`, as a binding whose direct page was lost already was. Before, a
+  wave command ended it with a `ReferenceFailure` wrapping that error in an
+  `IncompleteTraversalError`. Likewise, a flat range, partitioned or automatic `iter_list_keyset()`
+  whose wave is lost now raises the `AmbiguousExecutionError` itself and ends `FAILED`, as a flat
+  sequential stream whose page is lost already did, instead of raising `IncompleteTraversalError`
+  and ending `INCOMPLETE`.
+- **`INPUT` hands rows out in binding order.** Under `DeliveryOrder.INPUT`, while a fast or automatic
+  binding waits for its row lease, no later binding is granted a lease or reserves an ordinary page,
+  and the next frontier waits for a lease that its binding's plan has not settled yet. A tight
+  `max_buffered_rows` that used to fail a frontier with `BudgetExceededError`, depending on timing,
+  now lets it start, also when keyset, ordinary and automatic sources are mixed. Later bindings
+  prefetch less while an earlier one waits.
+- **Small plans give rows back.** Once a binding selects a sequential or boundary-only plan, it trims
+  its row lease to the rows that plan can still hold, so the bindings waiting for a lease start
+  sooner. The plan itself is still chosen at the full lease, so selection and geometry are as before.
+  A lease never grows, so a dense binding admitted right after a cohort of small ones is sized while
+  their leases are still active and can get a smaller share than before: 20 one-row parents followed
+  by a 5000-row parent send about 15% more requests (428 instead of 373 under `READY`), and a tight
+  pool can make it up to 40%. Across mixed cohorts the total request count still drops.
+
 ## REST 3.0 error codes
 
 - **Codes are shown verbatim.** A REST 3.0 `error.code` of snake-case identifier shape now appears

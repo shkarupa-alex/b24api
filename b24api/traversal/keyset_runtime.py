@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
     from b24api.contracts.response import Response, ResultCollectionShape
     from b24api.contracts.traversal import KeysetSpec
-    from b24api.execution import Executor
     from b24api.traversal.keyset_context import KeysetContext, WaveEngine
     from b24api.traversal.keyset_observation import FastTraceRecorder
 
@@ -44,7 +43,6 @@ class KeysetRuntime:
     def __init__(  # noqa: PLR0913
         self,
         *,
-        executor: Executor,
         request: Request,
         identity: IdentitySpec,
         keyset: KeysetSpec,
@@ -60,7 +58,6 @@ class KeysetRuntime:
         completion_recorder: FastPageLedger | None = None,
     ) -> None:
         """Initialize isolated planning, admission, and reporting state."""
-        self.executor = executor
         self.request = request
         self.identity = identity
         self.keyset = keyset
@@ -130,6 +127,19 @@ class KeysetRuntime:
         if witnesses < 1:
             return None, 0
         return BindingClosure.KEYSET_PLAN_COVERED, witnesses
+
+    def held_row_bound(self) -> int | None:
+        """Return the most rows this planned runtime can still hold, once its plan bounds them.
+
+        A sequential or boundary-only plan has no lane wave left: the rows it holds now only drain,
+        and afterwards it holds one finish page at a time. A lane plan fits its waves to whatever its
+        budget leaves free, so it has no bound below that budget (None).
+        """
+        if self.plan is None:
+            raise RuntimeError("an unplanned fast keyset runtime has no row bound")
+        if self.plan.kind not in {KeysetExecutionKind.SEQUENTIAL, KeysetExecutionKind.BOUNDARY_ONLY}:
+            return None
+        return max(self.transactions.buffer_balance, self.effective_page_cap)
 
     def mark_emitted(self, count: int) -> None:
         """Record rows delivered to the caller."""

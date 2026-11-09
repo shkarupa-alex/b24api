@@ -1,9 +1,11 @@
-"""A fast keyset reference binding's wave engine: atomic waves through the shared page dispatcher.
+"""A fast keyset reference binding's wave engine: waves and finish pages through the shared dispatcher.
 
 The binding's runtime fits each wave into its own row lease before calling the engine and reserves
 the wave's logical pages itself, so the engine only queues the commands in the shared dispatcher
 (which coalesces them with other bindings' commands of the same decoding options) and returns one
-correlated outcome per command once every command has settled.
+correlated outcome per command once every command has settled. A sequential finish page is a
+one-command wave: it shares a physical batch with the other bindings' commands instead of costing
+a direct request of its own.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import asyncio
 from typing import TYPE_CHECKING, Protocol
 
 from b24api.contracts.completion import CommandSettlement
+from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError
 from b24api.references.dispatch import _BatchPageError, _DecodeOptions, _failed_settlement
 
@@ -63,6 +66,21 @@ class SharedWaveEngine:
     def portal_command_cap(self) -> int:
         """Return the shared dispatcher's command cap: one wave fits one shared physical batch."""
         return self._cap
+
+    @property
+    def page_dispatch(self) -> PageDispatch:
+        """Return ``BATCH``: a finish page travels as one command of a shared physical batch."""
+        return PageDispatch.BATCH
+
+    async def execute_page(self, request: Request, *, context: ExecutionContext) -> BatchOutcome:
+        """Queue one finish page as a one-command wave, decoded as strictly as every wave command."""
+        (outcome,) = await self.execute_requests(
+            (request,),
+            context=context,
+            strict_envelope=True,
+            strict_json_members=True,
+        )
+        return outcome
 
     async def execute_requests(
         self,

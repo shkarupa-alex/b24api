@@ -3,9 +3,10 @@
 Acceptance: A27, A27-SHARED, A27-N, A27-VIEW, A27-RETAIN, A27-WAVE1, A27-GRANT-LOW, A27-GRANT-OK,
 A27-INPUT-TIGHT, A27-INPUT-OK.
 
-Every binding runs its own keyset runtime under a fixed row lease ``G`` of the shared row pool and
-sends its waves through the shared dispatcher. The oracle for a binding is the flat traversal of
-the same selection under ``max_buffered_rows=G``: selection, geometry and cost must match it.
+Every binding runs its own keyset runtime under a row lease ``G`` of the shared row pool and sends
+its waves through the shared dispatcher; a bounded plan may trim ``G`` once it has planned. The
+oracle for a binding is the flat traversal of the same selection under ``max_buffered_rows=G``:
+selection, geometry and cost must match it.
 """
 
 # ruff: noqa: PLR2004
@@ -493,7 +494,8 @@ async def test_the_budget_view_projects_only_the_lease_and_keeps_execution_on_th
 
     assert set(_completes(outcomes)) == {"p0", "p1"}
     assert len(views) == 2
-    for view, granted in views:
+    _assert_only_bounded_plans_trim(views, _completes(outcomes))
+    for view, _granted in views:
         shared_policy = view.shared.policy
         differing = {
             item.name
@@ -501,7 +503,6 @@ async def test_the_budget_view_projects_only_the_lease_and_keeps_execution_on_th
             if getattr(view.policy, item.name) != getattr(shared_policy, item.name)
         }
         assert differing <= {"max_buffered_rows"}
-        assert view.policy.max_buffered_rows == granted == view.lease.capacity
         assert view.execution_context is view.shared
         assert view.lease.held == 0
     assert per_adjust
@@ -512,6 +513,23 @@ async def test_the_budget_view_projects_only_the_lease_and_keeps_execution_on_th
     assert all(context is views[0][0].shared for context in engine_contexts)
     assert balances
     assert all(balance == held for balance, held in balances)
+
+
+def _assert_only_bounded_plans_trim(
+    views: list[tuple[BindingBudgetView, int]],
+    completes: Mapping[object, ReferenceComplete[object]],
+) -> None:
+    """A plan that bounds the rows it can still hold trims its lease (#33); a lane plan keeps the grant."""
+    bounded = sum(
+        complete.keyset_execution is not None
+        and complete.keyset_execution.selected_kind
+        in {KeysetExecutionKind.SEQUENTIAL, KeysetExecutionKind.BOUNDARY_ONLY}
+        for complete in completes.values()
+    )
+    assert sum(view.lease.capacity < granted for view, granted in views) == bounded
+    for view, granted in views:
+        assert view.policy.max_buffered_rows == view.lease.capacity <= granted
+        assert view.lease.capacity in {granted, PAGE}
 
 
 def test_keyset_context_names_exactly_the_members_fast_keyset_uses() -> None:
@@ -531,7 +549,7 @@ def test_keyset_context_names_exactly_the_members_fast_keyset_uses() -> None:
     }
 
 
-# A27-RETAIN / A27-WAVE1: a fixed lease; the wave fit and the charge use the same capacity.
+# A27-RETAIN / A27-WAVE1: a lease never grows; the wave fit and the charge use the same capacity.
 
 
 def _shared(rows: int = 2500) -> ExecutionContext:
@@ -582,7 +600,7 @@ async def test_one_free_page_runs_two_candidates_as_two_atomic_one_command_waves
 
 
 @pytest.mark.asyncio
-async def test_a_fixed_lease_returns_to_the_pool_and_its_neighbour_exhausts(leases: _Leases) -> None:
+async def test_a_lease_returns_to_the_pool_and_its_neighbour_exhausts(leases: _Leases) -> None:
     portal = BatchPortal(_answer({"fast": DISTRIBUTIONS["dense"], "plain": tuple(range(1, 31))}))
     policy = ExecutionPolicy(max_buffered_rows=40)
     async with client_for(portal, policy=policy) as client:

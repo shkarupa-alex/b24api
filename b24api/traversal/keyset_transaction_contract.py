@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
     from b24api.contracts.response import Response, ResultCollectionShape
     from b24api.contracts.traversal import KeysetSpec
-    from b24api.execution import Executor
     from b24api.traversal.keyset_context import KeysetContext, WaveEngine
     from b24api.traversal.keyset_fast_plan import LaneBounds, LaneState
     from b24api.traversal.keyset_observation import FastTraceRecorder
@@ -66,7 +65,6 @@ class KeysetTransactionState:
 class KeysetTransactionHost(Protocol):
     """Everything the planner and the stateless transactions need from the runtime that owns them."""
 
-    executor: Executor
     request: Request
     identity: IdentitySpec
     keyset: KeysetSpec
