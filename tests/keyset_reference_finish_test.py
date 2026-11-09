@@ -46,7 +46,7 @@ from b24api.contracts import (
 )
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
 from b24api.contracts.request import RouteKind
-from b24api.errors import AmbiguousExecutionError, IncompleteTraversalError
+from b24api.errors import AmbiguousExecutionError, BatchCommandError, IncompleteTraversalError
 from b24api.execution import ExecutionContext, RateCoordinator
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _RowBuffer
@@ -258,6 +258,7 @@ async def test_a_refused_shared_finish_fails_its_binding_closed_while_the_cohort
     failures = [outcome for outcome in run.outcomes if isinstance(outcome, ReferenceFailure)]
     assert [failure.correlation for failure in failures] == ["p3"]
     assert isinstance(failures[0].error, IncompleteTraversalError)
+    assert isinstance(failures[0].error.error, BatchCommandError)
     # The row the boundary wave admitted reached the caller; the binding never claims exhaustion.
     assert failures[0].partial_rows == 1
     assert set(run.completes) == set(data) - {"p3"}
@@ -475,3 +476,35 @@ async def test_an_ambiguous_shared_command_leaves_its_binding_unknown_not_failed
     assert isinstance(outcome, ReferenceOutcomeUnknown)
     assert isinstance(outcome.error, AmbiguousExecutionError)
     assert (report.failures, report.unknown) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [SequentialKeysetExecution(), RangeKeysetExecution(_CONTRACT)],
+    ids=["sequential-direct-page", "range-batched-wave"],
+)
+@pytest.mark.asyncio
+async def test_a_flat_traversal_raises_a_lost_wave_as_it_raises_a_lost_direct_page(execution: Execution) -> None:
+    """A flat stream whose second request is lost raises the ambiguity itself, whether it was a page or a wave."""
+    base = _answer({"": _ids(1, 199, 1)})
+
+    def answer(method: str, query: Query) -> Envelope:
+        if len(portal.waves) == 2:
+            raise ConnectionResetError("connection lost after the request was sent")
+        return base(method, query)
+
+    portal = BatchPortal(answer)
+    async with client_for(portal, policy=_POLICY) as client:
+        stream = client.iter_list_keyset(
+            _base(),
+            selector=ResultSelector.root(),
+            identity=IdentitySpec(("id",), "ID", "id", IdentityCoercion.EXACT_INTEGER),
+            page_size=PAGE,
+            keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+            execution=execution,
+        )
+        with pytest.raises(AmbiguousExecutionError):
+            await _drain(stream)
+
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.FAILED

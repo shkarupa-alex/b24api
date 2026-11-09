@@ -30,7 +30,7 @@ class RowLease:
 
     @classmethod
     def of(cls, reservation: _Reservation) -> RowLease:
-        """Lease the fixed capacity of one pool reservation."""
+        """Lease the capacity of one pool reservation."""
         return cls(reservation.amount, reservation)
 
     @property
@@ -39,7 +39,7 @@ class RowLease:
         return self.reservation is not None and self.reservation.amount == 0
 
     def __post_init__(self) -> None:
-        """Validate the fixed capacity."""
+        """Validate the capacity."""
         if isinstance(self.capacity, bool) or not isinstance(self.capacity, int) or self.capacity < 1:
             raise ValueError("row lease capacity must be a positive integer")
 

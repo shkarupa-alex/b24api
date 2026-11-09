@@ -471,7 +471,7 @@ class ReferenceScheduler:
         return self.dispatch.batch_size
 
     async def lease_rows(self, run: _ReferenceRun, fast: FastKeysetProgram) -> _Reservation:
-        """Wait for the binding's fixed row lease ``G``; it is held until the binding's terminal."""
+        """Wait for the binding's row lease ``G``; it is held, never grown, until the binding's terminal."""
         index = run.work.index
         self._fast_active.add(index)
         self._fast_waiting += 1

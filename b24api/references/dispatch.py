@@ -382,7 +382,7 @@ class _RowBuffer:
             await self.context.adjust_buffered_rows(-amount)
 
     async def lease(self, index: int, grant: Callable[[int], int | None]) -> _Reservation:
-        """Hold one fixed capacity until terminal; ``grant`` sizes it from the free rows or asks to wait.
+        """Hold one capacity until terminal, never grown; ``grant`` sizes it from the free rows or asks to wait.
 
         ``grant`` runs under the pool condition, so the decision and the reservation are atomic. It
         may raise to refuse a lease no releaser can ever satisfy. An ordered pool asks it only once no

@@ -3,26 +3,34 @@
 ## Fast keyset references: shared final confirmations
 
 Public signatures are unchanged; what changes is how a fast or automatic keyset binding on the shared
-reference queue spends physical requests.
+reference queue spends physical requests and how it reports a failed or lost command.
 
 - **Final confirmations are batched.** A binding's sequential finish pages, including the final empty
   confirmation, are now commands of the shared batch queue instead of direct requests. Their
   `PageRecord.dispatch` is `BATCH` instead of `DIRECT`, and the operation report's `batch_requests`
   and `batch_commands` count them with the other commands of the shared batches. A flat
-  `iter_list_keyset()` still sends its finish page directly.
-- **A refused finish page fails like a refused wave command.** In a shared batch, a finish command the
-  server refuses ends the binding with an `IncompleteTraversalError` that wraps the command error and
-  carries its replay disposition, and its page record shows the classified rejection (such as
-  `COMMAND_FAILURE`) instead of `RANGE_CONTRADICTION`. A failure of the
-  whole batch envelope (a timeout, a malformed envelope) now ends every binding with a command in that
-  batch, as it already did for wave commands, instead of only the binding whose finish page it was.
+  `iter_list_keyset()` still sends its finish page directly. A finish page now waits for a free batch
+  slot instead of running beside the batch in flight, so where few commands coalesce, as under
+  `INPUT` delivery with the default `BatchDispatch(concurrency=1)`, wall time can grow slightly at
+  an equal request count; a higher `concurrency` overlaps the batches again.
+- **A refused finish page fails like a refused wave command.** Before, the server's refusal of the
+  direct finish request was the binding's error itself (an `ApiResponseError`), and the page trace
+  had no record of that page. Now the binding ends with an `IncompleteTraversalError` whose `error`
+  is the command's `BatchCommandError` (an `ApiResponseError` subclass) and which carries its replay
+  disposition, and the page is recorded as `BATCH`, `REJECTED`, `COMMAND_FAILURE`. Code that matched
+  `ApiResponseError` on such a binding should look at `IncompleteTraversalError.error`. A malformed
+  batch envelope now fails every binding with a command in that batch, and a lost one leaves all of
+  them unknown, as it already did for wave commands, instead of affecting only the binding whose
+  finish page it was.
 - **A command lost in transit leaves its binding unknown.** When the batch carrying a fast binding's
   wave or finish command is ambiguous (for example, the connection drops after it was sent), the
   binding now ends with `ReferenceOutcomeUnknown` carrying the `AmbiguousExecutionError` and is
   counted in the report's `unknown`, as a binding whose direct page was lost already was. Before, a
   wave command ended it with a `ReferenceFailure` wrapping that error in an
-  `IncompleteTraversalError`. A flat fast `iter_list_keyset()` raises the `AmbiguousExecutionError`
-  itself in that case.
+  `IncompleteTraversalError`. Likewise, a flat range, partitioned or automatic `iter_list_keyset()`
+  whose wave is lost now raises the `AmbiguousExecutionError` itself and ends `FAILED`, as a flat
+  sequential stream whose page is lost already did, instead of raising `IncompleteTraversalError`
+  and ending `INCOMPLETE`.
 - **`INPUT` hands rows out in binding order.** Under `DeliveryOrder.INPUT`, while a fast or automatic
   binding waits for its row lease, no later binding is granted a lease or reserves an ordinary page,
   and the next frontier waits for a lease that its binding's plan has not settled yet. A tight

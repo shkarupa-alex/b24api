@@ -3,9 +3,10 @@
 Acceptance: A27, A27-SHARED, A27-N, A27-VIEW, A27-RETAIN, A27-WAVE1, A27-GRANT-LOW, A27-GRANT-OK,
 A27-INPUT-TIGHT, A27-INPUT-OK.
 
-Every binding runs its own keyset runtime under a fixed row lease ``G`` of the shared row pool and
-sends its waves through the shared dispatcher. The oracle for a binding is the flat traversal of
-the same selection under ``max_buffered_rows=G``: selection, geometry and cost must match it.
+Every binding runs its own keyset runtime under a row lease ``G`` of the shared row pool and sends
+its waves through the shared dispatcher; a bounded plan may trim ``G`` once it has planned. The
+oracle for a binding is the flat traversal of the same selection under ``max_buffered_rows=G``:
+selection, geometry and cost must match it.
 """
 
 # ruff: noqa: PLR2004
