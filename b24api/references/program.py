@@ -69,7 +69,7 @@ class SourceProgram:
     ``counted_page_size`` is set only for a counted traversal on the shared batch queue: its head
     and dense tail then travel through the shared dispatcher (``SharedCountedWaveIO``) instead of
     the sequential counted strategy. ``fast`` is set only for a fast or automatic keyset: the binding
-    then runs its own keyset runtime under a fixed row lease and sends its waves through the shared
+    then runs its own keyset runtime under a row lease that never grows and sends its waves through the shared
     dispatcher.
     """
 

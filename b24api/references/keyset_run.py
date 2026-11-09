@@ -1,8 +1,10 @@
 """One fast or automatic keyset reference binding on the shared queue.
 
 Each binding runs its own ``KeysetRuntime`` (fingerprints, bounds, identity, planning, ordered
-admission) under a fixed row lease ``G`` taken from the shared row pool at activation and returned
-once at terminal. The runtime plans and fits against a budget view whose policy differs from the
+admission) under a row lease ``G`` taken from the shared row pool at activation and returned once at
+terminal. A plan that bounds the rows it can still hold (sequential, boundary-only) trims ``G`` to
+that bound as soon as it is chosen, so a cohort of small parents does not wait on rows none of them
+can use. The runtime plans and fits against a budget view whose policy differs from the
 operation policy only in ``max_buffered_rows=G``; its atomic waves travel through the shared
 dispatcher, and its page evidence is recorded into the shared operation gate under its binding id.
 """
@@ -16,7 +18,7 @@ from b24api.completion.reference_recorder import ReferenceFastLedger
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import KeysetSelectionSummary, Violation, ViolationSeverity
-from b24api.errors import AmbiguousExecutionError, PaginationError
+from b24api.errors import PaginationError
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _DoneEvent, _failed_settlement, _FailureEvent, _PageEvent
 from b24api.references.wave_engine import SharedWaveEngine, WaveHost
@@ -52,7 +54,11 @@ class FastKeysetHost(WaveHost, Protocol):
         ...
 
     async def lease_rows(self, run: _ReferenceRun, fast: FastKeysetProgram) -> _Reservation:
-        """Wait for and hold the binding's fixed row lease in the shared pool."""
+        """Wait for and hold the binding's row lease in the shared pool."""
+        ...
+
+    async def settle_lease(self, lease: _Reservation, rows: int) -> None:
+        """Fix the planned binding's lease at ``rows``, giving the rest back to the shared pool."""
         ...
 
 
@@ -75,8 +81,8 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
             policy=host.context.policy,
         )
         lease = await host.lease_rows(run, fast)
+        view = BindingBudgetView.over(host.context, RowLease.of(lease))
         runtime = KeysetRuntime(
-            executor=host.executor,
             request=request,
             identity=fast.identity,
             keyset=fast.keyset,
@@ -85,12 +91,19 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
             page_size=fast.page_size,
             effective_page_cap=fast.effective_page_cap,
             execution=fast.execution,
-            context=BindingBudgetView.over(host.context, RowLease.of(lease)),
+            context=view,
             engine=SharedWaveEngine(host, run, ledger),
             trace=trace,
             page_adapter=run.program.page_adapter,
             completion_recorder=ledger,
         )
+        await runtime.plan_barrier()
+        bound = runtime.held_row_bound()
+        if bound is not None and bound < view.lease.capacity:
+            # The plan was chosen at the full lease; the rows it can never use go to the bindings awaiting one.
+            view.trim(bound)
+        # Settled, trimmed or not: a waiting INPUT frontier no longer counts on this lease shrinking.
+        await host.settle_lease(lease, view.lease.capacity)
         while rows := await runtime.next_rows():
             await _deliver(host, run, runtime, rows)
         closure, witnesses = runtime.completion_closure()
@@ -116,7 +129,7 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
         # The scheduler's per-reference boundary turns the error into this binding's terminal event.
         if runtime is not None and not runtime.closed:
             await runtime.aclose()
-        ledger.close(successful=False, reason=KernelState.FAILED.value, unsettled=_unsettled(error))
+        ledger.close(successful=False, reason=KernelState.FAILED.value, unsettled=_failed_settlement(error))
         run.failure = _FailureEvent(
             run.work,
             error,
@@ -140,9 +153,18 @@ async def _deliver(
     runtime: KeysetRuntime,
     rows: tuple[FrozenJson, ...],
 ) -> None:
-    """Hand one admitted row group to the consumer; its rows stay charged to the lease until acknowledged."""
+    """Hand one admitted row group to the consumer; its rows stay charged to the lease until acknowledged.
+
+    A binding that has not reached its terminal is a pending continuation, as a sequential reference
+    page is: after the acknowledgement it sends its next command, or hands over another row group
+    and then sends it, so the shared dispatcher waits for it to coalesce with the other bindings'
+    commands instead of sending a batch the acknowledged bindings could have joined.
+    """
     state, key = host.producer_state, run.producer_key
+    continuing = not runtime.terminal
     state.runnable.discard(key)
+    if continuing:
+        state.pending_continuations.add(key)
     state.touch()
     acknowledged = asyncio.get_running_loop().create_future()
     await run.output.put(
@@ -161,6 +183,7 @@ async def _deliver(
     )
     await acknowledged
     run.partial_rows += len(rows)
+    state.pending_continuations.discard(key)
     state.runnable.add(key)
     state.touch()
 
@@ -187,13 +210,6 @@ def _binding_violations(violations: list[Violation]) -> tuple[Violation, ...]:
     evidence blocking; a tolerant operation completes with failures, a fail-fast one fails on it.
     """
     return tuple(replace(violation, severity=ViolationSeverity.WARNING) for violation in violations)
-
-
-def _unsettled(error: BaseException) -> CommandSettlement:
-    """Classify a page still unsettled when the traversal failed (a direct finish page)."""
-    if isinstance(error, AmbiguousExecutionError):
-        return CommandSettlement.UNKNOWN
-    return _failed_settlement(error)
 
 
 __all__ = ["FastKeysetHost", "run_fast_keyset"]

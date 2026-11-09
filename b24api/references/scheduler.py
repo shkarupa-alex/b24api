@@ -161,6 +161,7 @@ class ReferenceScheduler:
             self.context,
             head_reserve=head_reserve,
             producer_state=self.producer_state,
+            ordered=output_order is ReferenceOutputOrder.INPUT,
         )
         self.dispatcher: _PageDispatcher
         if isinstance(dispatch, KernelDirectDispatch):
@@ -470,7 +471,7 @@ class ReferenceScheduler:
         return self.dispatch.batch_size
 
     async def lease_rows(self, run: _ReferenceRun, fast: FastKeysetProgram) -> _Reservation:
-        """Wait for the binding's fixed row lease ``G``; it is held until the binding's terminal."""
+        """Wait for the binding's row lease ``G``; it is held, never grown, until the binding's terminal."""
         index = run.work.index
         self._fast_active.add(index)
         self._fast_waiting += 1
@@ -484,16 +485,22 @@ class ReferenceScheduler:
                 raise BudgetExceededError("operation elapsed budget exhausted before the fast keyset lease")
             try:
                 async with asyncio.timeout(remaining):
-                    lease = await self.buffer.lease(index, functools.partial(self._lease_grant, fast, index))
+                    lease = await self.buffer.lease(index, functools.partial(self._lease_size, fast, index))
             except TimeoutError as error:
                 raise BudgetExceededError("fast keyset lease wait exceeded the operation time budget") from error
         finally:
             self._fast_waiting -= 1
+        # Every page of a leased binding is charged to its lease, none to the free pool rows.
+        self.producer_state.caps[run.producer_key] = 0
         self.producer_state.runnable.add(run.producer_key)
         self.producer_state.touch()
         return lease
 
-    def _lease_grant(self, fast: FastKeysetProgram, index: int, free: int) -> int | None:
+    async def settle_lease(self, lease: _Reservation, rows: int) -> None:
+        """Fix a planned binding's lease at ``rows``, giving the rest back to the bindings awaiting one."""
+        await self.buffer.settle_lease(lease, rows)
+
+    def _lease_size(self, fast: FastKeysetProgram, index: int, free: int) -> int | None:
         """Size one fast lease from the free rows, or return None to wait.
 
         P = 3C+A is the floor a bounded plan needs and Q = 4C+A the comfortable quota. A binding
@@ -502,7 +509,8 @@ class ReferenceScheduler:
         arrive. AUTO below the floor runs exclusively on the whole pool, like a flat traversal, and
         under INPUT only once it is the frontier. The
         INPUT frontier never waits on rows that only its own progress could release: it takes what
-        is free, or fails finitely.
+        is free, or fails finitely; a lease whose binding has not planned yet may still be trimmed, so
+        the frontier waits for it to settle.
         """
         pool = self.buffer.maximum
         frontier = self.output_order is ReferenceOutputOrder.INPUT and index == self.buffer.head_index
