@@ -39,7 +39,7 @@ from b24api.contracts.continuation import (
 )
 from b24api.contracts.dispatch import BatchDispatch, DeliveryOrder, DirectDispatch, DispatchSpec
 from b24api.contracts.identity_store import IdentityStore, identity_store_key
-from b24api.contracts.json import FrozenJson, FrozenMapping, JsonScalar, JsonValue
+from b24api.contracts.json import FrozenJson, FrozenMapping, JsonScalar, JsonValue, thaw_json
 from b24api.contracts.keyset_capability import (
     KeysetCapabilityCheckName,
     KeysetCapabilityCheckOutcome,
@@ -311,5 +311,6 @@ __all__ = [
     "identity_store_key",
     "partition_command_outcomes",
     "partition_reference_outcomes",
+    "thaw_json",
     "traversal_control_paths",
 ]

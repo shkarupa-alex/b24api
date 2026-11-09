@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Self
 
-from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _is_plain_int, _thaw_json
+from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _is_plain_int, thaw_json
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ReplaySafety, Request
 from b24api.contracts.response import Response
@@ -70,7 +70,7 @@ class BatchSuccess:
         if response is not None and not isinstance(response, Response):
             raise TypeError("response must be a Response or None")
         frozen_result = _freeze_json(result)
-        if response is not None and response.result != _thaw_json(frozen_result):
+        if response is not None and response.result != thaw_json(frozen_result):
             raise ValueError("batch response result must match the correlated command result")
         object.__setattr__(self, "command_index", command_index)
         object.__setattr__(self, "stable_key", stable_key)
@@ -118,7 +118,7 @@ class BatchSuccess:
     @property
     def result(self) -> JsonValue:
         """Return the result."""
-        return _thaw_json(self._result)
+        return thaw_json(self._result)
 
     @property
     def decoded_rows(self) -> int:

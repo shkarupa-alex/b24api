@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
-from b24api.contracts.json import FrozenMapping, _thaw_json
+from b24api.contracts.json import FrozenMapping, thaw_json
 from b24api.contracts.request import ReplaySafety
 
 if TYPE_CHECKING:
@@ -32,7 +32,7 @@ class V3BatchCommand:
 
     def to_wire(self) -> dict[str, JsonValue]:
         """Return the detached ``{"method": ..., "query": ...}`` array element."""
-        return {"method": self.method, "query": _thaw_json(self.query)}
+        return {"method": self.method, "query": thaw_json(self.query)}
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,5 +1,18 @@
 # Migration guide
 
+## Page-level response fields
+
+- **`PageBoundary.result`.** A `page_stop` callback now receives the page's immutable server result
+  as `boundary.result`, the same snapshot a page adapter, a window classifier and a continuation rule
+  see as `PageView.result`. Window and continuation traversals offer every page, including an empty
+  or overlap-only closing page, so a field that the endpoint returns beside the rows on every response
+  can be merged there instead of through a manual response walk or an impure page adapter. The field
+  is keyword-only and `None` for a `PageBoundary` built by application code, so existing
+  constructions keep working; a value that is not frozen JSON is rejected with `TypeError`.
+- **`thaw_json` is public.** `b24api.contracts.thaw_json` returns a plain mutable copy of a frozen
+  value (dicts and lists), for example to store a field of `boundary.result`. It replaces the private
+  `b24api.contracts.json._thaw_json`.
+
 ## REST 3.0 error codes
 
 - **Codes are shown verbatim.** A REST 3.0 `error.code` of snake-case identifier shape now appears

@@ -108,11 +108,12 @@ def _freeze_json(  # noqa: C901 - closed JSON scalar/container variants
     raise TypeError(f"unsupported JSON value type: {type(value).__name__}")
 
 
-def _thaw_json(value: FrozenJson) -> JsonValue:
+def thaw_json(value: FrozenJson) -> JsonValue:
+    """Return a plain mutable JSON copy of a frozen value: dicts for mappings, lists for arrays."""
     if isinstance(value, FrozenMapping):
-        return {key: _thaw_json(item) for key, item in value.items()}
+        return {key: thaw_json(item) for key, item in value.items()}
     if isinstance(value, tuple):
-        return [_thaw_json(item) for item in value]
+        return [thaw_json(item) for item in value]
     return value
 
 

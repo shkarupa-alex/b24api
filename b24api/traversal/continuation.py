@@ -13,7 +13,7 @@ from b24api.contracts.continuation import (
     _ContinuationContractError,
     _response_more,
 )
-from b24api.contracts.json import _freeze_json, _thaw_json
+from b24api.contracts.json import _freeze_json, thaw_json
 from b24api.contracts.page import PageView
 from b24api.contracts.reference import ParameterUpdate
 from b24api.contracts.response import result_snapshot
@@ -90,7 +90,7 @@ class ContinuationStrategy:
         vector: list[tuple[tuple[str | int, ...], bool, JsonValue]] = []
         for path in plan.controls:
             present, value = _path_lookup(parameters, path)
-            vector.append((_normalized(path), present, _thaw_json(_freeze_json(value)) if present else None))
+            vector.append((_normalized(path), present, thaw_json(_freeze_json(value)) if present else None))
         self._seen.add(_bounded_fingerprint(vector))
         return self._request(ctx, {})
 

@@ -524,7 +524,8 @@ never reports the source as exhausted.
 For newest-first lists that resume from an inclusive timestamp and may also return pinned rows,
 `iter_list_window()` sends the oldest paging timestamp of each page unchanged, delivers rows
 repeated by the overlap once and fails as non-progress, without another request, when the boundary
-does not move. See
+does not move. Its `page_stop` callback receives every validated page, empty closing page
+included, and `PageBoundary.result` carries that page's server result for response-level fields. See
 [Inclusive timestamp windows](https://github.com/shkarupa-alex/b24api/blob/master/docs/recipes.md#inclusive-timestamp-windows).
 
 For multiple parent-bound cursor chains, `iter_cursors()` keeps cursor progress and correlation

@@ -406,6 +406,40 @@ boundary does not move fails with `ContinuationError` (`window_nonprogress`) wit
 request: rows sharing one timestamp beyond a full page cannot be reached through this endpoint
 contract, and the client reports that instead of nudging the timestamp.
 
+Fields beside the rows, such as a `copilot` popup that the endpoint returns with every response,
+belong to the page, not to a row. A `page_stop` callback receives every validated window page after
+its rows were delivered, including a page whose rows were all delivered before and an empty closing
+page, and `boundary.result` is that page's immutable server result (`None` only for a boundary the
+application builds itself). Merge such fields there and keep the page adapter a pure row projection:
+
+```python
+from b24api.contracts import ContinuePage, FrozenMapping, thaw_json
+
+
+class LatestPopup:
+    def __init__(self):
+        self.popup = None
+
+    def on_page(self, boundary):
+        result = boundary.result
+        if isinstance(result, FrozenMapping) and "copilot" in result:
+            self.popup = thaw_json(result["copilot"])
+        return ContinuePage.CONTINUE
+
+
+popup = LatestPopup()
+stream = client.iter_list_window(request, traversal=window, page_stop=popup)
+```
+
+`thaw_json` returns a plain mutable copy of a frozen value. The callback is the page's durable
+acknowledgement: an exception or an invalid decision fails the traversal and leaves that page
+unacknowledged, and a rejected or failed response never reaches it.
+
+A continuation traversal offers every page its rule evaluates the same way, empty pages between two
+control vectors and its closing page included. Other traversals offer only pages that deliver rows,
+so their empty closing page is not passed to `page_stop`. A `page_stop` makes automatic keyset
+execution sequential, and counted references do not accept one.
+
 ## Mapping-backed collections
 
 Use strict mapping values when the selected collection is always an ID-keyed object:

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import cast
 
-from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _thaw_json
+from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, thaw_json
 
 type SlotPathPart = str | int
 _LAYOUT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
@@ -107,7 +107,7 @@ class Present:
     @property
     def value(self) -> JsonValue:
         """Return a detached JSON value."""
-        return _thaw_json(self._value)
+        return thaw_json(self._value)
 
     def __repr__(self) -> str:
         """Exclude caller data from diagnostics."""
@@ -201,7 +201,7 @@ class PositionalArguments:
             for part in path[1:-1]:
                 parent = _existing_child(parent, part)
             last = path[-1]
-            _set_existing_child(parent, last, _thaw_json(_freeze_json(value)))
+            _set_existing_child(parent, last, thaw_json(_freeze_json(value)))
             replacement = Present(root)
         revised = list(self.slots)
         revised[slot_index] = replacement

@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from b24api.contracts.command import NotExecutedReason
-from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _is_plain_int, _thaw_json
+from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _is_plain_int, thaw_json
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ReplaySafety, Request
 from b24api.references.program import SourceProgram
@@ -80,7 +80,7 @@ class KernelReferenceItem:
     @property
     def item(self) -> JsonValue:
         """Return the item."""
-        return _thaw_json(self._item)
+        return thaw_json(self._item)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -140,4 +140,4 @@ class KernelReferenceFailure:
     @property
     def cursor(self) -> JsonValue:
         """Return the cursor."""
-        return _thaw_json(self._cursor)
+        return thaw_json(self._cursor)
