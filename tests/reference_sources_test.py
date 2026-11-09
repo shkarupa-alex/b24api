@@ -178,20 +178,33 @@ async def test_a28_fail_fast_facade_yields_reference_events() -> None:
 
 # --- A28-LATE -----------------------------------------------------------------------------------
 
+_ACTIVATION_TURNS = 200
+
 
 @pytest.mark.asyncio
 async def test_a28_late_sources_activate_before_the_counted_source_finishes() -> None:
-    async def slow(method: str, query: Query) -> Envelope:
-        await asyncio.sleep(0.002)
+    # Ordered by events, not by wall time: the late sources arrive once the counted tail is in
+    # flight, and that batch is held until they have queued their first pages behind it.
+    tail_started = asyncio.Event()
+    late_yielded = asyncio.Event()
+
+    async def answer(method: str, query: Query) -> Envelope:
+        if method == "gamma.list" and "start" in query and not tail_started.is_set():
+            tail_started.set()
+            await late_yielded.wait()
+            # Activating a source is in-loop work only, so loop turns, not time, bound it.
+            for _ in range(_ACTIVATION_TURNS):
+                await asyncio.sleep(0)
         return _answer(method, query)
 
     async def sources() -> AsyncIterator[ReferenceSource[int]]:
         yield _gamma()
-        await asyncio.sleep(0.03)
+        await tail_started.wait()
         for parent in (2, 3, 4):
             yield _beta(parent)
+        late_yielded.set()
 
-    portal = BatchPortal(slow)
+    portal = BatchPortal(answer)
     async with _client(portal) as api:
         events, report = await _collect(api, sources(), dispatch=BatchDispatch(batch_size=10))
 
