@@ -248,7 +248,9 @@ class ProtocolCodec:
         if len(code) > _MAX_VALIDATION_TEXT:
             # A code is cut only after redaction, like the texts above: cutting first would turn a known secret
             # into a prefix that exact-secret redaction no longer recognizes.
-            code = render_code(code, redactor=self._redactor, context=diagnostics)[:_MAX_VALIDATION_TEXT]
+            code = render_code(code, redactor=self._redactor, context=diagnostics, v3_envelope=True)[
+                :_MAX_VALIDATION_TEXT
+            ]
         return code, SafeText(render(message)), tuple(bounded), truncated
 
     @staticmethod

@@ -100,9 +100,11 @@ def test_every_known_code_renders_verbatim_and_its_neighbours_do_not() -> None:
 @pytest.mark.parametrize(
     "code",
     [
-        "BITRIX_REST_V3_EXCEPTION_SOMENEWEXCEPTION",
-        f"{METHOD_NOT_FOUND_ERROR_CODE}X",
-        f"X{METHOD_NOT_FOUND_ERROR_CODE}",
+        # Not the V3 code shape: mixed case, a word that starts with a digit, a hyphen, an empty word.
+        "Bitrix_Rest_V3_Exception_SomeNewException",
+        "BITRIX_REST_V3_EXCEPTION_1SOMENEWEXCEPTION",
+        METHOD_NOT_FOUND_ERROR_CODE.replace("_", "-"),
+        f"{METHOD_NOT_FOUND_ERROR_CODE}_",
         USER_FIELD,
         "ufCrm5_1700000000123",
         "123e4567-e89b-12d3-a456-426614174000",

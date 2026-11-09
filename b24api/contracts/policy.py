@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from b24api.contracts.error_base import BudgetExceededError
 from b24api.contracts.json import _is_plain_int
+from b24api.contracts.v3_codes import REFUSAL_V3_ERROR_CODES, TRANSIENT_V3_ERROR_CODES
 
 if TYPE_CHECKING:
     from b24api.contracts.request_summary import RequestSummary
@@ -129,7 +130,10 @@ class AmbiguityPolicy:
 
     ambiguous_unstructured_statuses: frozenset[int] = frozenset({408, *range(500, 600)})
     refusal_http_statuses: frozenset[int] = frozenset({423, 425, 429})
-    refusal_api_codes: frozenset[str] = frozenset({"query_limit_exceeded", "operation_time_limit"})
+    # The classic request and time quotas, and the REST 3.0 load limiter's refusal.
+    refusal_api_codes: frozenset[str] = frozenset(
+        {"query_limit_exceeded", "operation_time_limit", *REFUSAL_V3_ERROR_CODES}
+    )
 
     def __post_init__(self) -> None:
         """Validate and freeze the status and code sets."""
@@ -188,7 +192,10 @@ class RetryPolicy:
     """Explicit retry classifications and delay bounds."""
 
     transient_http_statuses: frozenset[int] = frozenset({423, 425, 429, 500, 502, 503, 507})
-    transient_api_codes: frozenset[str] = frozenset({"query_limit_exceeded", "operation_time_limit"})
+    # The classic request and time quotas, and the REST 3.0 load limits; codes compare without letter case.
+    transient_api_codes: frozenset[str] = frozenset(
+        {"query_limit_exceeded", "operation_time_limit", *TRANSIENT_V3_ERROR_CODES}
+    )
     initial_delay: float = 0.5
     maximum_delay: float = 30.0
     backoff: float = 2.0

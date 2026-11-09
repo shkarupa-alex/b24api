@@ -14,7 +14,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import NoReturn
 
-from b24api.redaction import DEFAULT_SENSITIVE_KEYS, is_secret, replace_secrets, secret_values
+from b24api.redaction import DEFAULT_SENSITIVE_KEYS, contains_secret, is_secret, replace_secrets, secret_values
 
 _ALIASED_PARAMETERS = frozenset({"filter", "order", "fields", "select"})
 _SENSITIVE_NAMES = frozenset(name.casefold().replace("-", "_") for name in DEFAULT_SENSITIVE_KEYS)
@@ -64,6 +64,16 @@ class DiagnosticContext:
         if self._aliases is None:
             self._resolved()
         return is_secret(value, self._secrets, ignore_case=ignore_case)
+
+    def contains_known_secret(self, text: str) -> bool:
+        """Report whether any of the request's own exact secrets occurs in ``text``, ignoring letter case."""
+        self._resolved()
+        return contains_secret(text, self._secrets)
+
+    def aliases_text(self, text: str) -> bool:
+        """Report whether ``text`` holds a whole declared field name that rendering would alias."""
+        self._resolved()
+        return self._pattern is not None and self._pattern.search(text) is not None
 
     def replace_secrets(self, text: str) -> str:
         """Replace the request's own exact secrets wherever they occur."""

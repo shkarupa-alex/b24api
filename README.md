@@ -96,8 +96,9 @@ may already have reached Bitrix:
 
 A failure that proves the request did not run is retried whatever its safety: a transport failure
 before dispatch, or a refusal listed in `AmbiguityPolicy`, which by default is an unstructured 423, 425
-or 429 (`refusal_http_statuses`) or a `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT` refusal
-(`refusal_api_codes`). A code or status added only to `RetryPolicy` is retried for `SAFE` work alone.
+or 429 (`refusal_http_statuses`) or a `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT` /
+REST 3.0 `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` refusal (`refusal_api_codes`). A code or
+status added only to `RetryPolicy` is retried for `SAFE` work alone.
 A physical batch applies these rules to each command: after a failure, only the commands that
 may run again are sent again, in a smaller batch, and an `UNSAFE` command of a batch that may have run
 arrives as unknown. Replay rounds spend the same attempt and retry-time budget as the sends before
@@ -129,6 +130,39 @@ from b24api import ExecutionPolicy
 one_attempt = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_attempts_per_request=1)
 result = await client.call(request, policy=one_attempt)
 ```
+
+### Error codes
+
+A structured refusal raises `ApiResponseError`. Its message, `wire_code`, `normalized_code`, `code`
+(lower case) and `to_safe_dict()` name the server's code, so failures can be told apart:
+
+```text
+API error [BITRIX_REST_V3_EXCEPTION_ACCESSDENIEDEXCEPTION]: Access denied
+API error [NOTE_EMPTY_UPDATE]: Nothing to update
+```
+
+A REST 3.0 `error.code` is shown verbatim whenever it is a snake-case identifier in one letter
+case, such as `BITRIX_REST_V3_EXCEPTION_INVALIDSELECTEXCEPTION`, `FEATURE_NOT_AVAILABLE_ON_CURRENT_PLAN`
+or `invalid_select_field`; the server's set is open, so no list is kept. Error texts, classic
+`{"error": ...}` codes and response previews keep the conservative redaction, so a long run of
+letters and digits there still renders as `[REDACTED]`. A code that equals or contains your
+webhook token or a credential of the request is always `[REDACTED]`, and one that names a field of
+your request is shown as its `field#N` alias.
+
+Recognizing a code does not make it retryable. By default only the REST 3.0 load limits are retried,
+after the server's `Retry-After`:
+
+| Code | Status | Retried |
+|---|---|---|
+| `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` | 429 | Any request: the limiter refuses before the method runs. |
+| `BITRIX_REST_V3_EXCEPTION_LIMITER_QUERYTIMELIMITEXCEPTION` | 503 | `SAFE` requests only: the method may have run. |
+
+Every other REST 3.0 code is a deterministic refusal and is raised at once, including a 429 or 503
+that a module declares for a longer-lived state (`LANDING_AI_SITE_MODERATION_BLOCK_LIMIT`,
+`LANDING_AI_MODULE_UNAVAILABLE`). List more codes in `RetryPolicy.transient_api_codes` (and in
+`AmbiguityPolicy.refusal_api_codes` when the code proves the method did not run). The request
+faults `BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION` and
+`BITRIX_REST_V3_EXCEPTION_METHODNOTFOUNDEXCEPTION` are never retried, even when listed.
 
 ## Logical batch and correlation
 

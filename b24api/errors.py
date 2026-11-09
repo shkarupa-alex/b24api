@@ -113,11 +113,16 @@ class ApiResponseError(B24ApiError):
         self.original_code = code
         self.code = str(code).lower()
         self.normalized_code = str(code) if code_is_exact else str(code).strip().casefold()
-        self.wire_code = render_code(code, redactor=redactor, context=diagnostics)
+        # Only a REST 3.0 envelope's ``error.code`` may be recognized by its shape, and only as it came on the
+        # wire: a derived lower-cased form is recognized by shape only when the wire code itself was shown.
+        self.wire_code = render_code(code, redactor=redactor, context=diagnostics, v3_envelope=code_is_exact)
+        shown = code_is_exact and self.wire_code == str(code)
         self._safe_codes = {
             "original_code": code if isinstance(code, int) else self.wire_code,
-            "code": render_code(self.code, redactor=redactor, context=diagnostics),
-            "normalized_code": render_code(self.normalized_code, redactor=redactor, context=diagnostics),
+            "code": render_code(self.code, redactor=redactor, context=diagnostics, v3_envelope=shown),
+            "normalized_code": render_code(
+                self.normalized_code, redactor=redactor, context=diagnostics, v3_envelope=shown
+            ),
         }
         self.validation = tuple(validation)
         self.truncated = truncated
