@@ -8,8 +8,8 @@
   or overlap-only closing page, so a field that the endpoint returns beside the rows on every response
   can be merged there instead of through a manual response walk or an impure page adapter. The field
   is keyword-only and `None` for a `PageBoundary` built by application code, so existing
-  constructions keep working. Its top-level value is checked as `rows` are: a mutable dict or list
-  there is rejected with `TypeError`.
+  constructions keep working. Only its top-level type is checked: anything but a JSON scalar, a
+  tuple or a `FrozenMapping` (a dict or a list, for example) is rejected with `TypeError`.
 - **`thaw_json` is public.** `b24api.contracts.thaw_json` returns a plain mutable copy of a frozen
   value (dicts and lists), for example to store a field of `boundary.result`. It replaces the private
   `b24api.contracts.json._thaw_json`.
