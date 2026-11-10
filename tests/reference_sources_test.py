@@ -48,7 +48,7 @@ from b24api.transport import TransportCapabilities, WireResponse
 from tests.scripting import BatchPortal, Envelope, Query, VirtualClock
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Callable, Iterable
 
     from b24api.contracts import OperationReport, OperationStream, ReferenceOutcome, TraversalSpec
     from b24api.transport import WireRequest
@@ -119,6 +119,12 @@ async def _collect(
     async with stream:
         events = [event async for event in stream]
     return events, _report(stream)
+
+
+async def _on_loop(sources: Iterable[ReferenceSource[int]]) -> AsyncIterator[ReferenceSource[int]]:
+    """Yield ``sources`` on the event loop; a list is pulled in a worker thread, whose pace no virtual clock sets."""
+    for source in sources:
+        yield source
 
 
 def _rows(events: list[ReferenceOutcome[int]], index: int) -> list[object]:
@@ -293,7 +299,7 @@ async def test_a28_a_draining_consumer_refills_the_counted_tail_in_full_batches(
     async with _client(portal) as api:
         events, report = await _collect(
             api,
-            [_gamma(parent) for parent in range(1, sources + 1)],
+            _on_loop([_gamma(parent) for parent in range(1, sources + 1)]),
             dispatch=BatchDispatch(batch_size=10, output_order=order),
         )
 
@@ -314,7 +320,7 @@ async def test_a28_a_tail_window_filling_the_row_pool_refills_from_the_rows_its_
     async with _client(portal) as api:
         events, report = await _collect(
             api,
-            [_gamma()],
+            _on_loop([_gamma()]),
             dispatch=BatchDispatch(batch_size=50, output_order=order),
             policy=ExecutionPolicy(max_buffered_rows=500),
         )
@@ -341,7 +347,7 @@ async def test_a28_a_tail_whose_consumer_waits_for_the_chunk_is_not_waited_for(
     async with _client(portal) as api:
         events, report = await _collect(
             api,
-            [_gamma()],
+            _on_loop([_gamma()]),
             dispatch=BatchDispatch(batch_size=10, output_order=order),
             policy=ExecutionPolicy(max_buffered_rows=100),
         )
@@ -361,7 +367,7 @@ async def test_a28_a_slow_tail_consumer_bounds_each_refill_wait_by_the_deadline(
     portal = BatchPortal(_answer)
     events: list[ReferenceOutcome[int]] = []
     async with _client(portal) as api:
-        stream = api.iter_reference_source_outcomes([_gamma()], dispatch=BatchDispatch(batch_size=10))
+        stream = api.iter_reference_source_outcomes(_on_loop([_gamma()]), dispatch=BatchDispatch(batch_size=10))
         async with stream:
             async for event in stream:
                 events.append(event)
