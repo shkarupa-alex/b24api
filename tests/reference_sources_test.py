@@ -45,7 +45,7 @@ from b24api.contracts import (
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError, CapabilityError, InputSourceError, ReferenceFailed
 from b24api.transport import TransportCapabilities, WireResponse
-from tests.scripting import BatchPortal, Envelope, Query
+from tests.scripting import BatchPortal, Envelope, Query, VirtualClock
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -178,20 +178,39 @@ async def test_a28_fail_fast_facade_yields_reference_events() -> None:
 
 # --- A28-LATE -----------------------------------------------------------------------------------
 
+_ACTIVATION_TURNS = 200
+_EVENT_TIMEOUT = 5.0
+
 
 @pytest.mark.asyncio
 async def test_a28_late_sources_activate_before_the_counted_source_finishes() -> None:
-    async def slow(method: str, query: Query) -> Envelope:
-        await asyncio.sleep(0.002)
+    # Ordered by events, not by wall time: the late sources arrive once the counted head is
+    # answered and the first tail batch is in flight, and that batch is held until they have queued
+    # their first pages behind it. Their next pages then leave with tail pages the counted source
+    # still has to send, so a batch carries both sources while the counted one is unfinished.
+    tail_started = asyncio.Event()
+    late_yielded = asyncio.Event()
+
+    async def answer(method: str, query: Query) -> Envelope:
+        tail = method == "gamma.list" and query.get("start", "0") != "0"
+        if tail and not tail_started.is_set():
+            tail_started.set()
+            async with asyncio.timeout(_EVENT_TIMEOUT):
+                await late_yielded.wait()
+            # Activating a source is in-loop work only, so loop turns, not time, bound it.
+            for _turn in range(_ACTIVATION_TURNS):
+                await asyncio.sleep(0)
         return _answer(method, query)
 
     async def sources() -> AsyncIterator[ReferenceSource[int]]:
         yield _gamma()
-        await asyncio.sleep(0.03)
+        async with asyncio.timeout(_EVENT_TIMEOUT):
+            await tail_started.wait()
         for parent in (2, 3, 4):
             yield _beta(parent)
+        late_yielded.set()
 
-    portal = BatchPortal(slow)
+    portal = BatchPortal(answer)
     async with _client(portal) as api:
         events, report = await _collect(api, sources(), dispatch=BatchDispatch(batch_size=10))
 
@@ -205,6 +224,48 @@ async def test_a28_late_sources_activate_before_the_counted_source_finishes() ->
     terminal_order = [event.binding_index for event in events if isinstance(event, ReferenceComplete)]
     assert terminal_order[-1] == 0
     assert report.state is TerminalState.COMPLETED
+
+
+@pytest.mark.parametrize("turns", [3, 64, 1000])
+@pytest.mark.asyncio
+async def test_a28_late_pages_wait_for_a_counted_tail_on_its_way_to_the_queue(
+    monkeypatch: pytest.MonkeyPatch, turns: int
+) -> None:
+    """Late pages queued while the counted head is answered leave with the tail its answer starts.
+
+    The counted source stops being runnable as soon as its tail window is full, one or two loop turns
+    before those tail pages reach the queue; while they are on the way they still count as potential.
+    """
+    VirtualClock(turns).install(monkeypatch)
+    head_sent = asyncio.Event()
+    late_yielded = asyncio.Event()
+
+    async def answer(method: str, query: Query) -> Envelope:
+        if method == "gamma.list" and not head_sent.is_set():
+            head_sent.set()
+            async with asyncio.timeout(_EVENT_TIMEOUT):
+                await late_yielded.wait()
+            for _turn in range(_ACTIVATION_TURNS):
+                await asyncio.sleep(0)
+        return _answer(method, query)
+
+    async def sources() -> AsyncIterator[ReferenceSource[int]]:
+        yield _gamma()
+        async with asyncio.timeout(_EVENT_TIMEOUT):
+            await head_sent.wait()
+        for parent in (2, 3, 4):
+            yield _beta(parent)
+        late_yielded.set()
+
+    portal = BatchPortal(answer)
+    async with _client(portal) as api:
+        _events, report = await _collect(api, sources(), dispatch=BatchDispatch(batch_size=10))
+
+    assert report.state is TerminalState.COMPLETED
+    # The head travels alone; the late first pages then leave with the first tail pages, not before them.
+    assert portal.methods[0] == ("gamma.list",)
+    assert sorted(set(portal.methods[1])) == ["beta.list", "gamma.list"], portal.methods
+    assert portal.methods[1].count("beta.list") == 3  # noqa: PLR2004
 
 
 # --- A28-MATRIX ---------------------------------------------------------------------------------

@@ -18,10 +18,13 @@ from urllib.parse import parse_qsl, urlsplit
 
 from b24api import Bitrix24, ExecutionPolicy, Settings
 from b24api.encoding import encode_php_query
+from b24api.references import dispatch as dispatch_module
 from b24api.transport import WireResponse
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
+
+    import pytest
 
     from b24api import Request, Transport
     from b24api.contracts import UnknownRequestAudit
@@ -127,6 +130,39 @@ class Blocker:
         except asyncio.CancelledError:
             self.cancelled.set()
             raise
+
+
+class VirtualClock:
+    """Coalescing clock in loop turns: a wait ends by an event within ``turns`` turns, else its timer fires.
+
+    Installed over the batch dispatcher's clock and timed wait, it makes coalescing structural: no
+    wall time is read, and ``timer_firings`` counts every wait that ended by its deadline.
+    """
+
+    def __init__(self, turns: int = 64) -> None:
+        """Start at time zero with no timer fired."""
+        self.now = 0.0
+        self.turns = turns
+        self.timer_firings = 0
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> VirtualClock:
+        """Replace the dispatcher's clock and timed wait for the rest of the test."""
+        monkeypatch.setattr(dispatch_module, "_loop_time", self.time)
+        monkeypatch.setattr(dispatch_module, "_wait_first", self.wait)
+        return self
+
+    def time(self) -> float:
+        """Return the virtual time."""
+        return self.now
+
+    async def wait(self, futures: tuple[asyncio.Future[object], ...], seconds: float) -> None:
+        """End when a future is done within the turn bound, else advance the clock past the deadline."""
+        for _turn in range(self.turns):
+            if any(future.done() for future in futures):
+                return
+            await asyncio.sleep(0)
+        self.now += seconds
+        self.timer_firings += 1
 
 
 def attached_report(error: BaseException) -> object:
