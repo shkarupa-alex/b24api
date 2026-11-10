@@ -16,6 +16,7 @@ import pytest
 from b24api import (
     AutoKeysetExecution,
     BatchDispatch,
+    CountedTraversal,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
@@ -241,6 +242,49 @@ async def test_every_fast_keyset_wave_command_is_counted_in_transit_until_it_is_
     assert stream.report.state is TerminalState.COMPLETED
     assert commands
     assert all(commands)
+
+
+@pytest.mark.asyncio
+async def test_every_counted_tail_page_reaches_fetch_in_transit_and_leaves_it_reserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tail page counts in transit from its start, gated by the page budget until fetch reserves its page."""
+    fetch = _BatchPageDispatcher.fetch
+    pages: list[tuple[bool, bool]] = []
+
+    async def tracked(
+        self: _BatchPageDispatcher,
+        request: Request,
+        reference_id: str,
+        *,
+        transit: _Transit | None = None,
+        **options: object,
+    ) -> _DispatchedPage:
+        if transit is None:
+            return await fetch(self, request, reference_id, **options)  # type: ignore[arg-type]
+        entered = not transit.arrived and not transit.page_reserved
+        dispatched = await fetch(self, request, reference_id, transit=transit, **options)  # type: ignore[arg-type]
+        pages.append((entered, transit.arrived and transit.page_reserved))
+        return dispatched
+
+    monkeypatch.setattr(_BatchPageDispatcher, "fetch", tracked)
+
+    def answer(_method: str, query: Query) -> Envelope:
+        offset = int(query.get("start", "0"))
+        envelope: Envelope = {"result": [{"ID": row} for row in range(offset, min(offset + 50, 151))], "total": 151}
+        if offset + 50 < 151:  # noqa: PLR2004 - the counted fixture's size
+            envelope["next"] = offset + 50
+        return envelope
+
+    binding = Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), 1),), 1)
+    source = ReferenceSource(Request.bare("gamma.list", {}), CountedTraversal(), binding)
+    async with client_for(BatchPortal(answer)) as api:
+        stream = api.iter_reference_source_outcomes([source], dispatch=BatchDispatch())
+        async with stream:
+            _events = [event async for event in stream]
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED
+    assert pages == [(True, True)] * 3  # offsets 50, 100 and 150
 
 
 def _grant(pool: int, free: int) -> int | None:
