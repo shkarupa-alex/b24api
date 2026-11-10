@@ -145,5 +145,6 @@ until it is queued or its task ends, since its producer may already have left th
 that must still reserve its logical page counts only while the page budget admits it. A counted tail
 whose next page waits only for its consumer to move past a receipt it holds is a pending refill: its
 consumer frees window slots one by one, and those pages coalesce. Unlike a pending continuation, its
-own pages already in the batch do not exclude it, and under `INPUT` delivery only the frontier's
-refill is waited for, as only the frontier's consumer progresses on its own.
+own pages already in the batch do not exclude it, the rows the held receipt returns count toward the
+next page's reservation (a window may hold the whole row pool), and under `INPUT` delivery only the
+frontier's refill is waited for, as only the frontier's consumer progresses on its own.

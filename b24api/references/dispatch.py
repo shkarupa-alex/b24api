@@ -179,9 +179,10 @@ class _ProducerState:
     caps: dict[str, int] = field(default_factory=dict)
     admitting: set[str] = field(default_factory=set)
     pending_continuations: set[str] = field(default_factory=set)
-    # Windowed producers (a counted tail) whose next page waits only for their consumer to free a
-    # window slot. Unlike a pending continuation, their pages already in a chunk do not exclude them.
-    pending_refills: set[str] = field(default_factory=set)
+    # Windowed producers (a counted tail) whose next page waits only for their consumer. Unlike a
+    # pending continuation, their pages already in a chunk do not exclude them. Each maps to the rows
+    # its consumer returns to the pool before that page reserves its own, if any.
+    pending_refills: dict[str, _Reservation | None] = field(default_factory=dict)
     # Pages whose rows and dispatch are committed but which have not reached the queue yet: a
     # producer that leaves ``runnable`` right after starting their tasks still has them on the way.
     # ``reserving`` holds those that must still reserve their logical page, ``in_transit`` the rest.
@@ -358,8 +359,9 @@ class _RowBuffer:
             self._reservations.append(reservation)
             return reservation
 
-    def _can_reserve(self, index: int, amount: int) -> bool:
-        if self._available < amount:
+    def _can_reserve(self, index: int, amount: int, returning: int = 0) -> bool:
+        available = self._available + returning
+        if available < amount:
             return False
         # A page charged to a fast keyset lease reserves no pool rows: it cannot take the frontier's reserve.
         if amount == 0:
@@ -374,11 +376,11 @@ class _RowBuffer:
         head_held = sum(
             reservation.amount for reservation in self._reservations if reservation.index == self._head_index
         )
-        return self._available - amount >= self._head_reserve - head_held
+        return available - amount >= self._head_reserve - head_held
 
-    def can_reserve(self, index: int, amount: int) -> bool:
-        """Return whether a reservation can be admitted immediately."""
-        return not self._closed and self._can_reserve(index, amount)
+    def can_reserve(self, index: int, amount: int, *, returning: int = 0) -> bool:
+        """Return whether a reservation can be admitted immediately, or once ``returning`` rows come back."""
+        return not self._closed and self._can_reserve(index, amount, returning)
 
     def _touch(self) -> None:
         if self._producer_state is not None:
@@ -875,8 +877,12 @@ class _BatchPageDispatcher:
         refills = sum(
             (self._pending_continuations_can_progress or state.indexes[key] == buffer.head_index)
             and self.context.can_reserve_page(reference=key)
-            and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
-            for key in state.pending_refills
+            and buffer.can_reserve(
+                state.indexes[key],
+                state.caps.get(key, self._page_cap),
+                returning=0 if returned is None else returned.amount,
+            )
+            for key, returned in state.pending_refills.items()
             if key in state.indexes
         )
         # A page on its way to the queue arrives without any consumer progress, under either order;

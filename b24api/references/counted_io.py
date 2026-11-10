@@ -250,10 +250,13 @@ class ReferenceTailStream:
         one. While the consumer itself waits for an in-flight page, the tail adds nothing on its own.
         """
         state, key = self._host.producer_state, self._run.producer_key
-        if self._in_hand and (self._slot_taken or self._slot_freed or self._holding):
-            state.pending_refills.add(key)
+        if self._in_hand and (self._slot_taken or self._slot_freed):
+            state.pending_refills[key] = None
+        elif self._in_hand and self._holding:
+            # The held receipt's rows come back to the pool before the page reserves its own.
+            state.pending_refills[key] = self._run.reservation
         else:
-            state.pending_refills.discard(key)
+            state.pending_refills.pop(key, None)
         state.touch()
 
     async def _submit(self) -> None:
