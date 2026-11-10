@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from b24api.completion.reference_recorder import ReferenceFastLedger
     from b24api.contracts.request import Request
     from b24api.execution import ExecutionContext
-    from b24api.references.dispatch import _BatchPageDispatcher, _DispatchedPage, _ProducerState
+    from b24api.references.dispatch import _BatchPageDispatcher, _DispatchedPage, _ProducerState, _Transit
     from b24api.references.run import _ReferenceRun
 
 
@@ -101,9 +101,7 @@ class SharedWaveEngine:
         key = self._run.producer_key
         self._state.runnable.discard(key)
         self._state.touch()
-        tasks = tuple(
-            asyncio.create_task(self._fetch(index, request, options, errors)) for index, request in enumerate(requests)
-        )
+        tasks = self._start(requests, options, errors)
         try:
             await asyncio.wait(tasks)
         except BaseException:
@@ -142,12 +140,28 @@ class SharedWaveEngine:
             raise failure
         return tuple(outcomes)
 
+    def _start(
+        self,
+        requests: tuple[Request, ...],
+        options: _DecodeOptions,
+        errors: dict[int, BaseException],
+    ) -> tuple[asyncio.Task[_DispatchedPage], ...]:
+        """Start one task per command, each counted in transit until its command reaches the queue."""
+        tasks: list[asyncio.Task[_DispatchedPage]] = []
+        for index, request in enumerate(requests):
+            transit = self._state.depart(self._run.producer_key)
+            task = asyncio.create_task(self._fetch(index, request, options, errors, transit))
+            transit.carried_by(task)
+            tasks.append(task)
+        return tuple(tasks)
+
     async def _fetch(
         self,
         index: int,
         request: Request,
         options: _DecodeOptions,
         errors: dict[int, BaseException],
+        transit: _Transit,
     ) -> _DispatchedPage:
         try:
             dispatched = await self._dispatcher.fetch(
@@ -155,6 +169,7 @@ class SharedWaveEngine:
                 self._run.producer_key,
                 options=options,
                 page_reserved=True,
+                transit=transit,
             )
         except BaseException as error:
             errors[index] = error

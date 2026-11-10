@@ -44,6 +44,7 @@ from b24api.contracts import (
 )
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError, CapabilityError, InputSourceError, ReferenceFailed
+from b24api.references import dispatch as dispatch_module
 from b24api.transport import TransportCapabilities, WireResponse
 from tests.scripting import BatchPortal, Envelope, Query
 
@@ -223,6 +224,68 @@ async def test_a28_late_sources_activate_before_the_counted_source_finishes() ->
     terminal_order = [event.binding_index for event in events if isinstance(event, ReferenceComplete)]
     assert terminal_order[-1] == 0
     assert report.state is TerminalState.COMPLETED
+
+
+class _TurnClock:
+    """Coalescing clock in loop turns: a wait ends by an event within ``turns`` turns, else its timer fires."""
+
+    def __init__(self, turns: int) -> None:
+        self.now = 0.0
+        self.turns = turns
+
+    def time(self) -> float:
+        return self.now
+
+    async def wait(self, futures: tuple[asyncio.Future[object], ...], seconds: float) -> None:
+        for _turn in range(self.turns):
+            if any(future.done() for future in futures):
+                return
+            await asyncio.sleep(0)
+        self.now += seconds
+
+
+@pytest.mark.parametrize("turns", [3, 64, 1000])
+@pytest.mark.asyncio
+async def test_a28_late_pages_wait_for_a_counted_tail_on_its_way_to_the_queue(
+    monkeypatch: pytest.MonkeyPatch, turns: int
+) -> None:
+    """Late pages queued while the counted head is answered leave with the tail its answer starts.
+
+    The counted source stops being runnable as soon as its tail window is full, one or two loop turns
+    before those tail pages reach the queue; while they are on the way they still count as potential.
+    """
+    clock = _TurnClock(turns)
+    monkeypatch.setattr(dispatch_module, "_loop_time", clock.time)
+    monkeypatch.setattr(dispatch_module, "_wait_first", clock.wait)
+    head_sent = asyncio.Event()
+    late_yielded = asyncio.Event()
+
+    async def answer(method: str, query: Query) -> Envelope:
+        if method == "gamma.list" and not head_sent.is_set():
+            head_sent.set()
+            async with asyncio.timeout(_EVENT_TIMEOUT):
+                await late_yielded.wait()
+            for _turn in range(_ACTIVATION_TURNS):
+                await asyncio.sleep(0)
+        return _answer(method, query)
+
+    async def sources() -> AsyncIterator[ReferenceSource[int]]:
+        yield _gamma()
+        async with asyncio.timeout(_EVENT_TIMEOUT):
+            await head_sent.wait()
+        for parent in (2, 3, 4):
+            yield _beta(parent)
+        late_yielded.set()
+
+    portal = BatchPortal(answer)
+    async with _client(portal) as api:
+        _events, report = await _collect(api, sources(), dispatch=BatchDispatch(batch_size=10))
+
+    assert report.state is TerminalState.COMPLETED
+    # The head travels alone; the late first pages then leave with the first tail pages, not before them.
+    assert portal.methods[0] == ("gamma.list",)
+    assert sorted(set(portal.methods[1])) == ["beta.list", "gamma.list"], portal.methods
+    assert portal.methods[1].count("beta.list") == 3  # noqa: PLR2004
 
 
 # --- A28-MATRIX ---------------------------------------------------------------------------------

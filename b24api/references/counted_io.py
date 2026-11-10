@@ -28,13 +28,15 @@ if TYPE_CHECKING:
     from b24api.contracts.request import Request
     from b24api.execution import ExecutionContext
     from b24api.execution.snapshot import KernelReport
-    from b24api.references.dispatch import _DispatchedPage, _ProducerState, _Reservation, _RowBuffer
+    from b24api.references.dispatch import _DispatchedPage, _ProducerState, _Reservation, _RowBuffer, _Transit
     from b24api.references.run import _ReferenceRun
     from b24api.traversal.strategy_context import StrategyContext
 
 
 class _PageFetcher(Protocol):
-    async def fetch(self, request: Request, reference_id: str) -> _DispatchedPage: ...
+    async def fetch(
+        self, request: Request, reference_id: str, *, transit: _Transit | None = None
+    ) -> _DispatchedPage: ...
 
 
 class CountedHost(Protocol):
@@ -238,16 +240,18 @@ class ReferenceTailStream:
                 slot = _TailSlot(ordinal, run.completion.reserve(), host.take_page_sequence())
                 self._slots[ordinal] = slot
                 slot.reservation = await host.buffer.reserve(run.work.index, run.program.page_cap)
-                slot.task = asyncio.create_task(self._fetch(slot, item.request))
+                transit = state.depart(key)
+                slot.task = asyncio.create_task(self._fetch(slot, item.request, transit))
+                transit.carried_by(slot.task)
                 self._changed.set()
         finally:
             state.runnable.discard(key)
             state.touch()
             self._changed.set()
 
-    async def _fetch(self, slot: _TailSlot, request: Request) -> _DispatchedPage:
+    async def _fetch(self, slot: _TailSlot, request: Request, transit: _Transit) -> _DispatchedPage:
         try:
-            dispatched = await self._host.dispatcher.fetch(request, self._run.producer_key)
+            dispatched = await self._host.dispatcher.fetch(request, self._run.producer_key, transit=transit)
         except BaseException as error:
             slot.error = error
             raise
