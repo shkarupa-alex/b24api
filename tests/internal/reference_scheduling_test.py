@@ -1,8 +1,9 @@
-"""White-box reference scheduling: the batch assembler's coalescing read and fast lease sizing.
+"""White-box reference scheduling: the batch assembler's coalescing read and potential, fast lease sizing.
 
 S3 shares one batch queue and one row pool among every reference binding. A page the assembler's
-coalescing read took joins the round-robin backlog before the next chunk forms, and a fast keyset
-lease is ``clamp(free - R_keep, P, G_cap)``.
+coalescing read took joins the round-robin backlog before the next chunk forms, a page on its way to
+the queue counts as coalescing potential until it arrives, and a fast keyset lease is
+``clamp(free - R_keep, P, G_cap)``.
 """
 
 from __future__ import annotations
@@ -12,7 +13,21 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from b24api import ExecutionPolicy, Request
+from b24api import (
+    AutoKeysetExecution,
+    BatchDispatch,
+    ExecutionPolicy,
+    IdentityCoercion,
+    IdentitySpec,
+    KeysetSpec,
+    KeysetTraversal,
+    ParameterPath,
+    Request,
+    ResultSelector,
+    StableIntegerKeysetContract,
+    TerminalState,
+)
+from b24api.contracts import Binding, ParameterUpdate, ReferenceSource
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError
@@ -26,10 +41,12 @@ from b24api.references.dispatch import (
 )
 from b24api.references.scheduler import ReferenceScheduler
 from b24api.traversal.plans import KernelBatchDispatch, ReferenceOutputOrder
-from tests.scripting import BatchPortal
+from tests.scripting import BatchPortal, client_for
 
 if TYPE_CHECKING:
+    from b24api.references.dispatch import _DispatchedPage, _Transit
     from b24api.references.program import FastKeysetProgram
+    from tests.scripting import Envelope, Query
 
 
 def _dispatcher_page(key: str) -> _PendingBatch:
@@ -109,6 +126,121 @@ async def test_closing_the_dispatcher_cancels_a_page_the_coalescing_read_took() 
     await dispatcher.aclose()
     assert late.future.cancelled()
     assert all(page.future.done() for page in pages)
+
+
+@pytest.mark.asyncio
+async def test_a_page_on_its_way_to_the_queue_is_potential_until_it_arrives() -> None:
+    """A started command whose producer left the runnable set counts once, whichever way it ends.
+
+    One that must still reserve its logical page counts only while the page budget admits it; one
+    holding its reservation counts regardless. Neither depends on the chunk being formed, and a
+    retired producer's commands never count.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy(max_pages=1, max_pages_per_reference=1))
+    await context.start()
+    state = _ProducerState(set(), {"r0": 0})
+    buffer = _RowBuffer(10, context, producer_state=state)
+    dispatcher = _BatchPageDispatcher(
+        executor,
+        context,
+        KernelBatchDispatch(batch_size=2, coalesce_wait=1),
+        producer_state=state,
+        buffer=buffer,
+        page_cap=1,
+    )
+    potential = dispatcher._potential  # noqa: SLF001 - the assembler's coalescing read
+    assert potential(set()) == 0
+
+    reserved = state.depart("r0", page_reserved=True)
+    assert potential({"r0"}) == 1
+    reserved.arrive()
+    reserved.arrive()
+    assert potential(set()) == 0
+    assert not state.in_transit
+
+    reserving = state.depart("r0", page_reserved=False)
+    assert potential(set()) == 1
+    page = await context.reserve_page(reference="r0")
+    assert potential(set()) == 0
+    reserving.reserved()
+    assert potential(set()) == 1
+    reserving.arrive()
+    context.release_page(page)
+    assert not state.in_transit
+    assert not state.reserving
+
+    retired = state.depart("r0", page_reserved=True)
+    del state.indexes["r0"]
+    assert potential(set()) == 0
+    retired.arrive()
+
+    async def never_started() -> _DispatchedPage:
+        raise AssertionError("cancelled before its first step")
+
+    cancelled = state.depart("r1", page_reserved=False)
+    task = asyncio.create_task(never_started())
+    cancelled.carried_by(task)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert not state.reserving
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_every_fast_keyset_wave_command_is_counted_in_transit_until_it_is_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wave engine leaves the runnable set as it starts a wave: each command counts until queued."""
+    fetch = _BatchPageDispatcher.fetch
+    commands: list[bool] = []
+
+    async def tracked(
+        self: _BatchPageDispatcher,
+        request: Request,
+        reference_id: str,
+        *,
+        transit: _Transit | None = None,
+        **options: object,
+    ) -> _DispatchedPage:
+        if options.get("page_reserved"):
+            commands.append(transit is not None and not transit.arrived and transit.page_reserved)
+        return await fetch(self, request, reference_id, transit=transit, **options)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_BatchPageDispatcher, "fetch", tracked)
+
+    def answer(_method: str, query: Query) -> Envelope:
+        rows = [
+            row
+            for row in range(1, 26)
+            if row > int(query.get("filter[>ID]", "0")) and row < int(query.get("filter[<ID]", "26"))
+        ]
+        rows.sort(reverse=query.get("order[ID]") == "DESC")
+        return {"result": [{"ID": row} for row in rows[: int(query.get("limit", "10"))]]}
+
+    traversal = KeysetTraversal(
+        ResultSelector(),
+        IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER),
+        page_size=10,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        execution=AutoKeysetExecution(StableIntegerKeysetContract()),
+    )
+    sources = [
+        ReferenceSource(
+            Request.bare("kappa.list", {}),
+            traversal,
+            Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), parent),), parent),
+        )
+        for parent in (1, 2)
+    ]
+    async with client_for(BatchPortal(answer)) as api:
+        stream = api.iter_reference_source_outcomes(sources, dispatch=BatchDispatch())
+        async with stream:
+            _events = [event async for event in stream]
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.COMPLETED
+    assert commands
+    assert all(commands)
 
 
 def _grant(pool: int, free: int) -> int | None:

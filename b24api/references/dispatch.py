@@ -181,6 +181,8 @@ class _ProducerState:
     pending_continuations: set[str] = field(default_factory=set)
     # Pages whose rows and dispatch are committed but which have not reached the queue yet: a
     # producer that leaves ``runnable`` right after starting their tasks still has them on the way.
+    # ``reserving`` holds those that must still reserve their logical page, ``in_transit`` the rest.
+    reserving: Counter[str] = field(default_factory=Counter)
     in_transit: Counter[str] = field(default_factory=Counter)
     next_key: str | None = None
     next_index: int | None = None
@@ -197,11 +199,11 @@ class _ProducerState:
             if not waiter.done():
                 waiter.set_result(None)
 
-    def depart(self, key: str) -> _Transit:
+    def depart(self, key: str, *, page_reserved: bool) -> _Transit:
         """Count one page on its way to the queue until ``fetch`` queues it or its task ends."""
-        self.in_transit[key] += 1
+        (self.in_transit if page_reserved else self.reserving)[key] += 1
         self.touch()
-        return _Transit(self, key)
+        return _Transit(self, key, page_reserved=page_reserved)
 
     def changed(self, seen: int) -> asyncio.Future[None]:
         """Return a future resolved after the observed revision changes."""
@@ -219,23 +221,37 @@ class _Transit:
 
     state: _ProducerState
     key: str
+    page_reserved: bool
     arrived: bool = False
 
     def carried_by(self, task: asyncio.Task[_DispatchedPage]) -> None:
         """End the transit when ``task`` ends, also if it is cancelled before it first runs."""
         task.add_done_callback(self.arrive)
 
+    def reserved(self) -> None:
+        """Record that the page holds its logical page reservation; it no longer depends on the budget."""
+        if self.arrived or self.page_reserved:
+            return
+        self.page_reserved = True
+        _count_down(self.state.reserving, self.key)
+        self.state.in_transit[self.key] += 1
+        self.state.touch()
+
     def arrive(self, _task: object = None) -> None:
         """Count the page down once: it reached the queue, or its task ended without queuing it."""
         if self.arrived:
             return
         self.arrived = True
-        remaining = self.state.in_transit[self.key] - 1
-        if remaining > 0:
-            self.state.in_transit[self.key] = remaining
-        else:
-            del self.state.in_transit[self.key]
+        _count_down(self.state.in_transit if self.page_reserved else self.state.reserving, self.key)
         self.state.touch()
+
+
+def _count_down(counter: Counter[str], key: str) -> None:
+    remaining = counter[key] - 1
+    if remaining > 0:
+        counter[key] = remaining
+    else:
+        del counter[key]
 
 
 @dataclass(frozen=True, slots=True)
@@ -617,6 +633,8 @@ class _BatchPageDispatcher:
         if self._closed:
             raise RuntimeError("batch page dispatcher is closed")
         reservation = None if page_reserved else await self.context.reserve_page(reference=reference_id)
+        if transit is not None:
+            transit.reserved()
         future: asyncio.Future[_DispatchedPage] = asyncio.get_running_loop().create_future()
         admitted: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -850,8 +868,13 @@ class _BatchPageDispatcher:
             for key in state.admitting
             if self._pending_continuations_can_progress and (self._active_sends > 0 or self._settling_waves > 0)
         )
-        # A page on its way to the queue arrives without any consumer progress, under either order.
-        in_transit = sum(count for key, count in state.in_transit.items() if key in state.indexes)
+        # A page on its way to the queue arrives without any consumer progress, under either order;
+        # one that must still reserve its logical page arrives only if the page budget admits it.
+        in_transit = sum(count for key, count in state.in_transit.items() if key in state.indexes) + sum(
+            count
+            for key, count in state.reserving.items()
+            if key in state.indexes and self.context.can_reserve_page(reference=key)
+        )
         return admitted + admitting + continuations + pending_pull + settling_admission + in_transit
 
     def _count_batch_request(self) -> None:

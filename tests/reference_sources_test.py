@@ -44,9 +44,8 @@ from b24api.contracts import (
 )
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError, CapabilityError, InputSourceError, ReferenceFailed
-from b24api.references import dispatch as dispatch_module
 from b24api.transport import TransportCapabilities, WireResponse
-from tests.scripting import BatchPortal, Envelope, Query
+from tests.scripting import BatchPortal, Envelope, Query, VirtualClock
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -186,8 +185,9 @@ _EVENT_TIMEOUT = 5.0
 @pytest.mark.asyncio
 async def test_a28_late_sources_activate_before_the_counted_source_finishes() -> None:
     # Ordered by events, not by wall time: the late sources arrive once the counted head is
-    # answered and the first tail page is in flight, and that batch is held until they have queued
-    # their first pages behind it, so the next batch finds both sources' pages waiting.
+    # answered and the first tail batch is in flight, and that batch is held until they have queued
+    # their first pages behind it. Their next pages then leave with tail pages the counted source
+    # still has to send, so a batch carries both sources while the counted one is unfinished.
     tail_started = asyncio.Event()
     late_yielded = asyncio.Event()
 
@@ -226,24 +226,6 @@ async def test_a28_late_sources_activate_before_the_counted_source_finishes() ->
     assert report.state is TerminalState.COMPLETED
 
 
-class _TurnClock:
-    """Coalescing clock in loop turns: a wait ends by an event within ``turns`` turns, else its timer fires."""
-
-    def __init__(self, turns: int) -> None:
-        self.now = 0.0
-        self.turns = turns
-
-    def time(self) -> float:
-        return self.now
-
-    async def wait(self, futures: tuple[asyncio.Future[object], ...], seconds: float) -> None:
-        for _turn in range(self.turns):
-            if any(future.done() for future in futures):
-                return
-            await asyncio.sleep(0)
-        self.now += seconds
-
-
 @pytest.mark.parametrize("turns", [3, 64, 1000])
 @pytest.mark.asyncio
 async def test_a28_late_pages_wait_for_a_counted_tail_on_its_way_to_the_queue(
@@ -254,9 +236,7 @@ async def test_a28_late_pages_wait_for_a_counted_tail_on_its_way_to_the_queue(
     The counted source stops being runnable as soon as its tail window is full, one or two loop turns
     before those tail pages reach the queue; while they are on the way they still count as potential.
     """
-    clock = _TurnClock(turns)
-    monkeypatch.setattr(dispatch_module, "_loop_time", clock.time)
-    monkeypatch.setattr(dispatch_module, "_wait_first", clock.wait)
+    VirtualClock(turns).install(monkeypatch)
     head_sent = asyncio.Event()
     late_yielded = asyncio.Event()
 

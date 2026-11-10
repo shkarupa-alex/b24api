@@ -149,7 +149,7 @@ class SharedWaveEngine:
         """Start one task per command, each counted in transit until its command reaches the queue."""
         tasks: list[asyncio.Task[_DispatchedPage]] = []
         for index, request in enumerate(requests):
-            transit = self._state.depart(self._run.producer_key)
+            transit = self._state.depart(self._run.producer_key, page_reserved=True)
             task = asyncio.create_task(self._fetch(index, request, options, errors, transit))
             transit.carried_by(task)
             tasks.append(task)

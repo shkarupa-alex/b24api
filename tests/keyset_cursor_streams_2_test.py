@@ -59,12 +59,11 @@ from b24api.contracts.request import RouteKind
 from b24api.contracts.response import Response, ResultCollectionShape
 from b24api.errors import PageAdaptationError, PageAdaptationViolation
 from b24api.execution import Executor, WireResponse
-from b24api.references import dispatch as dispatch_module
 from b24api.references.dispatch import _BatchPageDispatcher, _ProducerState, _RowBuffer
 from b24api.traversal.keyset_fast_plan import LaneBounds, LaneKind, LaneSpec, LaneState, LaneStatus
 from b24api.traversal.keyset_page_validation import LaneCommandPlan, ReceiptRejection, validate_lane_receipt
 from b24api.traversal.values import _page_fingerprint, _response_items
-from tests.scripting import ResponderTransport, client_for
+from tests.scripting import ResponderTransport, VirtualClock, client_for
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Mapping
@@ -833,25 +832,6 @@ async def test_sender_capacity_is_released_before_downstream_acknowledgement(
     assert len([event async for event in stream]) == 3
 
 
-class _VirtualClock:
-    """Deterministic coalescing clock: a wait ends by an event within bounded loop turns or by its timer."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-        self.timer_firings = 0
-
-    def time(self) -> float:
-        return self.now
-
-    async def wait(self, futures: tuple[asyncio.Future[object], ...], seconds: float) -> None:
-        for _turn in range(_EVENT_TURNS):
-            if any(future.done() for future in futures):
-                return
-            await asyncio.sleep(0)
-        self.now += seconds
-        self.timer_firings += 1
-
-
 class _TimedCursorBatchTransport(CursorBatchTransport):
     def __init__(self, rows: Mapping[str, tuple[int, ...]], clock: Callable[[], float]) -> None:
         super().__init__(rows)
@@ -915,9 +895,7 @@ async def test_slow_consumer_coalescing_is_bounded_per_wave_on_a_virtual_clock(
         observations.append((commands, delay))
 
     monkeypatch.setattr(_BatchPageDispatcher, "_observe_wave", observe_wave)
-    clock = _VirtualClock()
-    monkeypatch.setattr(dispatch_module, "_loop_time", clock.time)
-    monkeypatch.setattr(dispatch_module, "_wait_first", clock.wait)
+    clock = VirtualClock(_EVENT_TURNS).install(monkeypatch)
     coalesce_wait = 0.005
 
     _baseline_events, _baseline_transport, _baseline_report, baseline_waves, _ = await _coalescing_run(

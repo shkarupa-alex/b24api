@@ -141,4 +141,5 @@ published rows alone are thawed. Reference cursor drivers share a capacity-aware
 absolute per-wave coalescing deadline defaults to 20 ms and is skipped when no eligible producer can
 add a command. A command whose task has started but has not reached the queue yet, such as a counted
 tail page or a fast keyset wave command, counts as one about to arrive, under either delivery order,
-until it is queued or its task ends: its producer has already left the runnable set.
+until it is queued or its task ends, since its producer may already have left the runnable set; one
+that must still reserve its logical page counts only while the page budget admits it.

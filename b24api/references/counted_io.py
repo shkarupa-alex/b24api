@@ -240,7 +240,7 @@ class ReferenceTailStream:
                 slot = _TailSlot(ordinal, run.completion.reserve(), host.take_page_sequence())
                 self._slots[ordinal] = slot
                 slot.reservation = await host.buffer.reserve(run.work.index, run.program.page_cap)
-                transit = state.depart(key)
+                transit = state.depart(key, page_reserved=False)
                 slot.task = asyncio.create_task(self._fetch(slot, item.request, transit))
                 transit.carried_by(slot.task)
                 self._changed.set()
