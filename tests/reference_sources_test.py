@@ -325,6 +325,32 @@ async def test_a28_a_tail_window_filling_the_row_pool_refills_from_the_rows_its_
     assert clock.timer_firings == 0
 
 
+@pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
+@pytest.mark.asyncio
+async def test_a28_a_tail_whose_consumer_waits_for_the_chunk_is_not_waited_for(
+    monkeypatch: pytest.MonkeyPatch, order: DeliveryOrder
+) -> None:
+    """A page in hand behind a full window whose consumer awaits a page of the chunk itself is no refill.
+
+    A two-page window: while both pages wait in a chunk, the consumer waits for them and frees no
+    slot, so the chunk leaves at once instead of waiting out its deadline.
+    """
+    clock = VirtualClock().install(monkeypatch)
+    portal = BatchPortal(_answer)
+    async with _client(portal) as api:
+        events, report = await _collect(
+            api,
+            [_gamma()],
+            dispatch=BatchDispatch(batch_size=10, output_order=order),
+            policy=ExecutionPolicy(max_buffered_rows=100),
+        )
+
+    assert report.state is TerminalState.COMPLETED
+    assert _rows(events, 0) == list(range(1001))
+    assert [len(wave) for wave in portal.methods] == [1] + [2] * 10
+    assert clock.timer_firings == 0
+
+
 @pytest.mark.asyncio
 async def test_a28_a_slow_tail_consumer_bounds_each_refill_wait_by_the_deadline(
     monkeypatch: pytest.MonkeyPatch,

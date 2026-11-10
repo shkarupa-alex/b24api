@@ -426,9 +426,14 @@ class ReferenceScheduler:
     async def _drive(self, run: _ReferenceRun, pages: AsyncGenerator[_Page]) -> None:
         """Deliver the driver's pages, then the binding's terminal event."""
         driver, program = run.driver, run.program
-        async for page in pages:
-            if not await self._deliver_page(run, page):
-                break
+        try:
+            async for page in pages:
+                if not await self._deliver_page(run, page):
+                    break
+        finally:
+            # Cleanup comes before the terminal event: a stopped binding must not keep advertising
+            # pages to the dispatcher while that event waits for room in the output queue.
+            await pages.aclose()
         if run.reservation is not None:
             await self.buffer.abort(run.reservation)
             run.reservation = None

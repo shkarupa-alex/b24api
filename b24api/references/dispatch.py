@@ -179,9 +179,10 @@ class _ProducerState:
     caps: dict[str, int] = field(default_factory=dict)
     admitting: set[str] = field(default_factory=set)
     pending_continuations: set[str] = field(default_factory=set)
-    # Windowed producers (a counted tail) whose next page waits only for their consumer. Unlike a
-    # pending continuation, their pages already in a chunk do not exclude them. Each maps to the rows
-    # its consumer returns to the pool before that page reserves its own, if any.
+    # Windowed producers (a counted tail) holding their next page while it waits for nothing the
+    # dispatcher must send first: its consumer freeing a window slot, or its own row reservation.
+    # Unlike a pending continuation, their pages already in a chunk do not exclude them. Each maps
+    # to the reservation its consumer returns to the pool before that page reserves its own, if any.
     pending_refills: dict[str, _Reservation | None] = field(default_factory=dict)
     # Pages whose rows and dispatch are committed but which have not reached the queue yet: a
     # producer that leaves ``runnable`` right after starting their tasks still has them on the way.

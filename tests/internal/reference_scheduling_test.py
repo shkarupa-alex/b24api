@@ -242,6 +242,13 @@ async def test_a_refill_counts_the_rows_its_consumer_returns_first() -> None:
     assert potential({"r0"}) == 0
     state.pending_refills["r0"] = held
     assert potential({"r0"}) == 1
+    page = await context.reserve_page(reference="r0")
+    assert potential({"r0"}) == 1
+    pages = [await context.reserve_page(reference="r0") for _ in range(99)]
+    # The page budget is spent: the refill could not reserve its logical page.
+    assert potential({"r0"}) == 0
+    for reservation in (page, *pages):
+        context.release_page(reservation)
     await buffer.abort(held)
     await buffer.close()
 
