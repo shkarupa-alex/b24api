@@ -453,6 +453,7 @@ class ReferenceScheduler:
         self.producer_state.runnable.discard(run.producer_key)
         self.producer_state.admitting.discard(run.producer_key)
         self.producer_state.pending_continuations.discard(run.producer_key)
+        self.producer_state.pending_refills.discard(run.producer_key)
         self.producer_state.indexes.pop(run.producer_key, None)
         self.producer_state.caps.pop(run.producer_key, None)
         self.producer_state.touch()

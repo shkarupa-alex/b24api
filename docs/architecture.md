@@ -142,4 +142,8 @@ absolute per-wave coalescing deadline defaults to 20 ms and is skipped when no e
 add a command. A command whose task has started but has not reached the queue yet, such as a counted
 tail page or a fast keyset wave command, counts as one about to arrive, under either delivery order,
 until it is queued or its task ends, since its producer may already have left the runnable set; one
-that must still reserve its logical page counts only while the page budget admits it.
+that must still reserve its logical page counts only while the page budget admits it. A counted tail
+whose next page waits only for its consumer to move past a receipt it holds is a pending refill: its
+consumer frees window slots one by one, and those pages coalesce. Unlike a pending continuation, its
+own pages already in the batch do not exclude it, and under `INPUT` delivery only the frontier's
+refill is waited for, as only the frontier's consumer progresses on its own.

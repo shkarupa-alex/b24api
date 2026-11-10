@@ -268,6 +268,62 @@ async def test_a28_late_pages_wait_for_a_counted_tail_on_its_way_to_the_queue(
     assert portal.methods[1].count("beta.list") == 3  # noqa: PLR2004
 
 
+# The counted fixture's tail is 20 pages: one window of 10, then 10 pages its consumer frees one by one.
+_TAIL_WAVES = {
+    (DeliveryOrder.READY, 1): [1, 10, 10],
+    (DeliveryOrder.INPUT, 1): [1, 10, 10],
+    (DeliveryOrder.READY, 3): [3, 10, 10, 10, 10, 10, 10],
+    # Under INPUT a later binding's head waits behind the frontier; every tail still leaves in full batches.
+    (DeliveryOrder.INPUT, 3): [1, 1, 1, 10, 10, 10, 10, 10, 10],
+}
+
+
+@pytest.mark.parametrize(("order", "sources"), list(_TAIL_WAVES))
+@pytest.mark.asyncio
+async def test_a28_a_draining_consumer_refills_the_counted_tail_in_full_batches(
+    monkeypatch: pytest.MonkeyPatch, order: DeliveryOrder, sources: int
+) -> None:
+    """Pages freed one per consumed receipt coalesce instead of leaving one per batch.
+
+    The tail's next page waits only for its consumer to move past a receipt it holds, so the
+    dispatcher waits for it, as for an ordinary binding awaiting its consumer, with no timer firing.
+    """
+    clock = VirtualClock().install(monkeypatch)
+    portal = BatchPortal(_answer)
+    async with _client(portal) as api:
+        events, report = await _collect(
+            api,
+            [_gamma(parent) for parent in range(1, sources + 1)],
+            dispatch=BatchDispatch(batch_size=10, output_order=order),
+        )
+
+    assert report.state is TerminalState.COMPLETED
+    assert all(_rows(events, index) == list(range(1001)) for index in range(sources))
+    assert [len(wave) for wave in portal.methods] == _TAIL_WAVES[order, sources]
+    assert clock.timer_firings == 0
+
+
+@pytest.mark.asyncio
+async def test_a28_a_slow_tail_consumer_bounds_each_refill_wait_by_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consumer slower than the coalescing deadline costs at most one deadline per batch, never a stall."""
+    clock = VirtualClock(turns=3).install(monkeypatch)
+    portal = BatchPortal(_answer)
+    events: list[ReferenceOutcome[int]] = []
+    async with _client(portal) as api:
+        stream = api.iter_reference_source_outcomes([_gamma()], dispatch=BatchDispatch(batch_size=10))
+        async with stream:
+            async for event in stream:
+                events.append(event)
+                for _turn in range(10):
+                    await asyncio.sleep(0)
+
+    assert _report(stream).state is TerminalState.COMPLETED
+    assert _rows(events, 0) == list(range(1001))
+    assert 0 < clock.timer_firings <= len(portal.methods)
+
+
 # --- A28-MATRIX ---------------------------------------------------------------------------------
 
 

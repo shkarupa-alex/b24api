@@ -188,6 +188,38 @@ async def test_a_page_on_its_way_to_the_queue_is_potential_until_it_arrives() ->
     await buffer.close()
 
 
+@pytest.mark.parametrize("ready", [True, False])
+@pytest.mark.asyncio
+async def test_a_pending_refill_is_potential_whatever_the_chunk_carries(*, ready: bool) -> None:
+    """A windowed producer's refill counts while its own pages wait in the chunk.
+
+    Under INPUT delivery only the frontier's consumer progresses on its own, so only its refill counts.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy(max_pages=100, max_pages_per_reference=100))
+    await context.start()
+    state = _ProducerState(set(), {"r0": 0, "r1": 1})
+    buffer = _RowBuffer(10, context, producer_state=state, ordered=not ready)
+    dispatcher = _BatchPageDispatcher(
+        executor,
+        context,
+        KernelBatchDispatch(batch_size=2, coalesce_wait=1),
+        producer_state=state,
+        buffer=buffer,
+        page_cap=1,
+        pending_continuations_can_progress=ready,
+    )
+    potential = dispatcher._potential  # noqa: SLF001 - the assembler's coalescing read
+    state.pending_refills.add("r1")
+    assert potential({"r1"}) == int(ready)
+    state.pending_refills.add("r0")
+    assert potential({"r0", "r1"}) == 1 + int(ready)
+    state.pending_continuations.add("r0")
+    state.pending_refills.clear()
+    assert potential({"r0"}) == 0
+    await buffer.close()
+
+
 @pytest.mark.asyncio
 async def test_every_fast_keyset_wave_command_is_counted_in_transit_until_it_is_queued(
     monkeypatch: pytest.MonkeyPatch,

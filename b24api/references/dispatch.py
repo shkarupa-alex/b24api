@@ -179,6 +179,9 @@ class _ProducerState:
     caps: dict[str, int] = field(default_factory=dict)
     admitting: set[str] = field(default_factory=set)
     pending_continuations: set[str] = field(default_factory=set)
+    # Windowed producers (a counted tail) whose next page waits only for their consumer to free a
+    # window slot. Unlike a pending continuation, their pages already in a chunk do not exclude them.
+    pending_refills: set[str] = field(default_factory=set)
     # Pages whose rows and dispatch are committed but which have not reached the queue yet: a
     # producer that leaves ``runnable`` right after starting their tasks still has them on the way.
     # ``reserving`` holds those that must still reserve their logical page, ``in_transit`` the rest.
@@ -868,6 +871,14 @@ class _BatchPageDispatcher:
             for key in state.admitting
             if self._pending_continuations_can_progress and (self._active_sends > 0 or self._settling_waves > 0)
         )
+        # Under INPUT delivery only the frontier's consumer progresses whatever the chunk carries.
+        refills = sum(
+            (self._pending_continuations_can_progress or state.indexes[key] == buffer.head_index)
+            and self.context.can_reserve_page(reference=key)
+            and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
+            for key in state.pending_refills
+            if key in state.indexes
+        )
         # A page on its way to the queue arrives without any consumer progress, under either order;
         # one that must still reserve its logical page arrives only if the page budget admits it.
         in_transit = sum(count for key, count in state.in_transit.items() if key in state.indexes) + sum(
@@ -875,7 +886,7 @@ class _BatchPageDispatcher:
             for key, count in state.reserving.items()
             if key in state.indexes and self.context.can_reserve_page(reference=key)
         )
-        return admitted + admitting + continuations + pending_pull + settling_admission + in_transit
+        return admitted + admitting + continuations + refills + pending_pull + settling_admission + in_transit
 
     def _count_batch_request(self) -> None:
         """Count one physical batch envelope the chunk sends in its first round."""
