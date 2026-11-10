@@ -355,7 +355,9 @@ def _settle_tail_cleanup(cleanup: CleanupResult, primary_error: BaseException | 
         raise cleanup.cancellation
     elif preserve_primary:
         pending_cancellation = cleanup.cancellation
-    rearm_cancellation(pending_cancellation)
+    # Only a kept primary failure defers a cancellation; a closing or cancelled stream already carries it.
+    if preserve_primary:
+        rearm_cancellation(pending_cancellation)
 
 
 __all__ = ["CountedBatchStrategy", "empty_source_head_eligible"]

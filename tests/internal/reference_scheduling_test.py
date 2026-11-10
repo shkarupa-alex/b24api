@@ -33,6 +33,8 @@ from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError
 from b24api.execution import Executor
+from b24api.execution.context import CleanupResult
+from b24api.references.counted_io import ReferenceTailStream
 from b24api.references.dispatch import (
     _BatchPageDispatcher,
     _failed_settlement,
@@ -41,15 +43,25 @@ from b24api.references.dispatch import (
     _RowBuffer,
 )
 from b24api.references.scheduler import ReferenceScheduler
+from b24api.traversal.counted_batch import _settle_tail_cleanup
 from b24api.traversal.plans import KernelBatchDispatch, ReferenceOutputOrder
 from tests.scripting import BatchPortal, client_for
 
 if TYPE_CHECKING:
-    from b24api.references.dispatch import _DispatchedPage, _Transit
+    from b24api.references.dispatch import _DispatchedPage, _FailureEvent, _Transit
     from b24api.references.program import FastKeysetProgram
     from b24api.references.run import _ReferenceRun
     from b24api.traversal.identity import _Page
     from tests.scripting import Envelope, Query
+
+
+def _counted_answer(_method: str, query: Query) -> Envelope:
+    """Serve the 1001-row counted fixture in pages of 50."""
+    offset = int(query.get("start", "0"))
+    envelope: Envelope = {"result": [{"ID": row} for row in range(offset, min(offset + 50, 1001))], "total": 1001}
+    if offset + 50 < 1001:  # noqa: PLR2004 - the counted fixture's size
+        envelope["next"] = offset + 50
+    return envelope
 
 
 def _dispatcher_page(key: str) -> _PendingBatch:
@@ -401,6 +413,59 @@ async def test_a_failed_counted_binding_closes_its_tail_before_its_terminal_even
             _events = [event async for event in stream]
     assert stream.report is not None
     assert observed == [(False, set())]
+
+
+@pytest.mark.asyncio
+async def test_a_tail_cleanup_failure_never_replaces_the_failure_that_ended_its_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The binding fails with its delivery error; the tail's cleanup failure is raised only after it."""
+    deliver = ReferenceScheduler._deliver_page  # noqa: SLF001 - the delivery seam the failure enters
+    delivered = 0
+    errors: list[BaseException] = []
+
+    async def failing(self: ReferenceScheduler, run: _ReferenceRun, page: _Page) -> bool:
+        nonlocal delivered
+        delivered += 1
+        if delivered == 2:  # noqa: PLR2004 - the first tail page, after the head
+            raise RuntimeError("delivery failed")
+        return await deliver(self, run, page)
+
+    async def failing_cleanup(_tail: ReferenceTailStream) -> None:
+        raise ValueError("tail cleanup failed")
+
+    failure_event = ReferenceScheduler._failure_event  # noqa: SLF001 - observed when it is built
+
+    def observing(self: ReferenceScheduler, run: _ReferenceRun, error: BaseException) -> _FailureEvent:
+        errors.append(error)
+        return failure_event(self, run, error)
+
+    monkeypatch.setattr(ReferenceScheduler, "_deliver_page", failing)
+    monkeypatch.setattr(ReferenceTailStream, "aclose", failing_cleanup)
+    monkeypatch.setattr(ReferenceScheduler, "_failure_event", observing)
+    binding = Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), 1),), 1)
+    source = ReferenceSource(Request.bare("gamma.list", {}), CountedTraversal(), binding)
+    async with client_for(BatchPortal(_counted_answer)) as api:
+        stream = api.iter_reference_source_outcomes([source], dispatch=BatchDispatch(batch_size=10))
+        with pytest.raises(ValueError, match="tail cleanup failed"):
+            async with stream:
+                _events = [event async for event in stream]
+    # The binding failed with its own error; the cleanup failure still ends the operation afterwards.
+    assert [(type(error), str(error)) for error in errors] == [(RuntimeError, "delivery failed")]
+
+
+@pytest.mark.asyncio
+async def test_closing_a_tail_inside_a_cancelled_task_does_not_arm_another_cancellation() -> None:
+    """A stream closed while its task is cancelled already carries that cancellation."""
+    task = asyncio.current_task()
+    assert task is not None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(0)
+    assert task.cancelling() == 1
+    _settle_tail_cleanup(CleanupResult(None, None), GeneratorExit())
+    await asyncio.sleep(0)  # no cancellation was re-armed
+    task.uncancel()
 
 
 def _grant(pool: int, free: int) -> int | None:

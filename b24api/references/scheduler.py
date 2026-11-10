@@ -403,6 +403,8 @@ class ReferenceScheduler:
             self._fast_active.discard(work.index)
             if run.reservation is not None:
                 await self.buffer.abort(run.reservation)
+        if run.deferred_cleanup_error is not None:
+            raise run.deferred_cleanup_error
 
     def _driven_pages(self, run: _ReferenceRun) -> AsyncGenerator[_Page]:
         """Build the binding's pagination driver and return its page stream."""
@@ -426,14 +428,18 @@ class ReferenceScheduler:
     async def _drive(self, run: _ReferenceRun, pages: AsyncGenerator[_Page]) -> None:
         """Deliver the driver's pages, then the binding's terminal event."""
         driver, program = run.driver, run.program
+        primary_error: BaseException | None = None
         try:
             async for page in pages:
                 if not await self._deliver_page(run, page):
                     break
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
             # Cleanup comes before the terminal event: a stopped binding must not keep advertising
             # pages to the dispatcher while that event waits for room in the output queue.
-            await pages.aclose()
+            run.deferred_cleanup_error = await _close_pages(pages, primary_error)
         if run.reservation is not None:
             await self.buffer.abort(run.reservation)
             run.reservation = None
@@ -888,3 +894,18 @@ class ReferenceScheduler:
         """Record one delivered reference item."""
         stored = self._delivery_uniqueness.pop(id(item), None)
         return stored is not None and stored[0] is item and stored[1]
+
+
+async def _close_pages(pages: AsyncGenerator[_Page], primary_error: BaseException | None) -> BaseException | None:
+    """Close a binding's page stream; return a cleanup failure that the failure ending it outranks.
+
+    The binding then fails with its own error, and the cleanup failure is raised once that failure
+    is emitted and the binding is retired, as it was when the stream was closed only after that.
+    """
+    try:
+        await pages.aclose()
+    except Exception as cleanup_error:
+        if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
+            raise
+        return cleanup_error
+    return None
