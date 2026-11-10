@@ -465,6 +465,9 @@ async def test_closing_a_tail_inside_a_cancelled_task_does_not_arm_another_cance
     assert task.cancelling() == 1
     _settle_tail_cleanup(CleanupResult(None, None), GeneratorExit())
     await asyncio.sleep(0)  # no cancellation was re-armed
+    with pytest.raises(ValueError, match="cleanup"):
+        _settle_tail_cleanup(CleanupResult(None, ValueError("cleanup")), GeneratorExit())
+    await asyncio.sleep(0)  # nor when the cleanup itself failed
     task.uncancel()
 
 
