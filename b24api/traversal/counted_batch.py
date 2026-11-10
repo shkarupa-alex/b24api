@@ -11,6 +11,7 @@ keeps today's rejection.
 
 from __future__ import annotations
 import asyncio
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -140,8 +141,10 @@ class CountedBatchStrategy:
                 await io.rows.release_held()
                 return
             if sequential is not None and verdict is not None:
-                async for page in self._sequential(ctx, io, _SequentialSeed(sequential, head, head_items, verdict)):
-                    yield page
+                seed = _SequentialSeed(sequential, head, head_items, verdict)
+                async with aclosing(self._sequential(ctx, io, seed)) as continuation:
+                    async for page in continuation:
+                        yield page
                 return
             batch_size = await io.tail_batch_size(
                 ctx,
@@ -155,8 +158,10 @@ class CountedBatchStrategy:
             yield _Page(tuple(head_items), head, (1,) * len(head_items), not closes)
             await io.rows.release_held()
             if not closes:
-                async for page in self._tail(ctx, io, batch_size):
-                    yield page
+                # Closing these pages closes the tail at once, not when the suspended generator is collected.
+                async with aclosing(self._tail(ctx, io, batch_size)) as tail:
+                    async for page in tail:
+                        yield page
                 if ctx.validated_rows != self._total:
                     raise CapabilityError("parallel counted traversal did not emit its exact total")
             ctx.terminal_reason = io.completed_reason
@@ -255,8 +260,9 @@ class CountedBatchStrategy:
         if seed.items:
             yield _Page(tuple(seed.items), seed.head, (1,) * len(seed.items), not seed.verdict.terminal)
         await io.rows.release_held()
-        async for page in ctx.continue_sequential(seed.strategy, identities):
-            yield page
+        async with aclosing(ctx.continue_sequential(seed.strategy, identities)) as continuation:
+            async for page in continuation:
+                yield page
 
     def _tail_requests(self, ctx: StrategyContext) -> Iterator[_BatchInput]:
         recorder = ctx.completion_recorder

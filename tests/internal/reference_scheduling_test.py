@@ -28,7 +28,7 @@ from b24api import (
     StableIntegerKeysetContract,
     TerminalState,
 )
-from b24api.contracts import Binding, ParameterUpdate, ReferenceSource
+from b24api.contracts import Binding, DeliveryOrder, ParameterUpdate, ReferenceSource
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError
@@ -47,6 +47,8 @@ from tests.scripting import BatchPortal, client_for
 if TYPE_CHECKING:
     from b24api.references.dispatch import _DispatchedPage, _Transit
     from b24api.references.program import FastKeysetProgram
+    from b24api.references.run import _ReferenceRun
+    from b24api.traversal.identity import _Page
     from tests.scripting import Envelope, Query
 
 
@@ -350,6 +352,55 @@ async def test_every_counted_tail_page_reaches_fetch_in_transit_and_leaves_it_re
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED
     assert pages == [(True, True)] * 3  # offsets 50, 100 and 150
+
+
+@pytest.mark.parametrize("ready", [True, False])
+@pytest.mark.asyncio
+async def test_a_failed_counted_binding_closes_its_tail_before_its_terminal_event(
+    monkeypatch: pytest.MonkeyPatch, *, ready: bool
+) -> None:
+    """The tail is settled and stops advertising a refill before the binding's failure is emitted."""
+    deliver = ReferenceScheduler._deliver_page  # noqa: SLF001 - the delivery seam the failure enters
+    delivered = 0
+    observed: list[tuple[bool, set[int]]] = []
+
+    async def failing(self: ReferenceScheduler, run: _ReferenceRun, page: _Page) -> bool:
+        nonlocal delivered
+        delivered += 1
+        if delivered == 2:  # noqa: PLR2004 - the first tail page, after the head
+            raise RuntimeError("delivery failed")
+        return await deliver(self, run, page)
+
+    failure_event = ReferenceScheduler._failure_event  # noqa: SLF001 - observed when it is built
+
+    def observing(self: ReferenceScheduler, run: _ReferenceRun, error: BaseException) -> object:
+        observed.append(
+            (
+                run.producer_key in self.producer_state.pending_refills,
+                set(run.completion._reserved),  # noqa: SLF001 - pages the binding has not settled
+            )
+        )
+        return failure_event(self, run, error)
+
+    monkeypatch.setattr(ReferenceScheduler, "_deliver_page", failing)
+    monkeypatch.setattr(ReferenceScheduler, "_failure_event", observing)
+
+    def answer(_method: str, query: Query) -> Envelope:
+        offset = int(query.get("start", "0"))
+        envelope: Envelope = {"result": [{"ID": row} for row in range(offset, min(offset + 50, 1001))], "total": 1001}
+        if offset + 50 < 1001:  # noqa: PLR2004 - the counted fixture's size
+            envelope["next"] = offset + 50
+        return envelope
+
+    binding = Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), 1),), 1)
+    source = ReferenceSource(Request.bare("gamma.list", {}), CountedTraversal(), binding)
+    order = DeliveryOrder.READY if ready else DeliveryOrder.INPUT
+    async with client_for(BatchPortal(answer), policy=ExecutionPolicy(max_buffered_rows=100)) as api:
+        stream = api.iter_reference_source_outcomes([source], dispatch=BatchDispatch(batch_size=10, output_order=order))
+        async with stream:
+            _events = [event async for event in stream]
+    assert stream.report is not None
+    assert observed == [(False, set())]
 
 
 def _grant(pool: int, free: int) -> int | None:

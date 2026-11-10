@@ -330,10 +330,11 @@ async def test_a28_a_tail_window_filling_the_row_pool_refills_from_the_rows_its_
 async def test_a28_a_tail_whose_consumer_waits_for_the_chunk_is_not_waited_for(
     monkeypatch: pytest.MonkeyPatch, order: DeliveryOrder
 ) -> None:
-    """A page in hand behind a full window whose consumer awaits a page of the chunk itself is no refill.
+    """A two-page window filling the row pool: refills pair up, and no chunk waits out its deadline.
 
-    A two-page window: while both pages wait in a chunk, the consumer waits for them and frees no
-    slot, so the chunk leaves at once instead of waiting out its deadline.
+    While both window pages wait in a chunk, the consumer waits for them and frees no slot, so that
+    chunk leaves at once; each later refill reserves the rows its held receipt returns. With a single
+    binding the row gate alone already keeps the first case from waiting, so this pins the outcome.
     """
     clock = VirtualClock().install(monkeypatch)
     portal = BatchPortal(_answer)
