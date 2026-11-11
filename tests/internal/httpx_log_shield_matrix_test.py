@@ -404,7 +404,7 @@ def test_foreign_record_with_an_exception_but_no_secret_keeps_every_field_object
                     logger.error("foreign %s", foreign_url, exc_info=exc_info)
                     logger.info("plain foreign %s", foreign_url)
                 else:
-                    with HTTPX_LOG_SHIELD.request(owned_url) as ownership:
+                    with HTTPX_LOG_SHIELD.request(credentials=(_OWNED,)) as ownership:
                         ownership.claim(httpx.Request("POST", owned_url))
                         _foreign_client_log(logger, foreign_url, exc_info)
             failed, plain = (record for record in handler.records if record.msg != 'HTTP Request: %s %s "%s %d %s"')

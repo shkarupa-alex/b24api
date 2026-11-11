@@ -2,9 +2,8 @@
 """Opt-in live transport isolated from the distributable ``b24api`` package."""
 
 from __future__ import annotations
+import contextlib
 import os
-import secrets
-import uuid
 import weakref
 import zlib
 from dataclasses import dataclass
@@ -14,15 +13,16 @@ from urllib.parse import urljoin
 
 import httpx
 
+from b24api._webhook import TokenVault, Webhook, parse_webhook
 from b24api.transport.decoding import (
     BOUNDED_ACCEPT_ENCODING,
     _BoundedDecoder,
     _DecodedBodyTooLargeError,
     _DecodeRefusedError,
 )
-from b24api.transport.logging_shield import HTTPX_LOG_SHIELD, webhook_credentials
+from b24api.transport.logging_shield import HTTPX_LOG_SHIELD
 
-from .contracts import ContractError, PortalIdentity, parse_fingerprint_key, portal_identity, strict_json_loads
+from .contracts import ContractError, PortalIdentity, parse_fingerprint_key, strict_json_loads, webhook_identity
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -47,30 +47,14 @@ class LiveCorrectnessError(RuntimeError):
     """A live response contradicts the reviewed disposable-entity contract."""
 
 
-def _webhook_vault() -> tuple[Callable[[str], str], Callable[[str], str], Callable[[str], None]]:
-    entries: dict[str, tuple[bytes, bytes]] = {}
-
-    def store(webhook_url: str) -> str:
-        handle = uuid.uuid4().hex
-        plaintext = webhook_url.encode()
-        key = secrets.token_bytes(len(plaintext))
-        entries[handle] = (bytes(left ^ right for left, right in zip(plaintext, key, strict=True)), key)
-        return handle
-
-    def fetch(handle: str) -> str:
-        try:
-            ciphertext, key = entries[handle]
-        except KeyError as error:
-            raise LiveUnavailableError("live credential is unavailable") from error
-        return bytes(left ^ right for left, right in zip(ciphertext, key, strict=True)).decode()
-
-    def drop(handle: str) -> None:
-        entries.pop(handle, None)
-
-    return store, fetch, drop
+_TOKENS = TokenVault()
 
 
-_store_webhook, _webhook_for, _drop_webhook = _webhook_vault()
+def _token_for(handle: str) -> str:
+    token = _TOKENS.fetch(handle)
+    if token is None:
+        raise LiveUnavailableError("live credential is unavailable")
+    return token
 
 
 class LiveApiError(LiveCorrectnessError):
@@ -177,17 +161,15 @@ class LivePortal:
         webhook_url = os.environ.get("BITRIX24_API_WEBHOOK_URL")
         if webhook_url is None:
             raise ContractError("BITRIX24_API_WEBHOOK_URL is required for --live")
-        identity: PortalIdentity | None = None
-        normalized_webhook: str | None = None
-        invalid_configuration = False
-        try:
-            identity = portal_identity(webhook_url, role=role, fingerprint_key=encoded_key)
-            normalized_webhook = webhook_url.rstrip("/") + "/"
-        except (ContractError, TypeError, ValueError):
-            invalid_configuration = True
-        encoded_key = None
+        # The one webhook parse HttpxTransport and Settings use; its ``repr`` leaves the token out.
+        webhook = parse_webhook(webhook_url)
         webhook_url = None
-        if invalid_configuration:
+        identity: PortalIdentity | None = None
+        if isinstance(webhook, Webhook):
+            with contextlib.suppress(ContractError, TypeError, ValueError):
+                identity = webhook_identity(webhook, role=role, fingerprint_key=encoded_key)
+        encoded_key = None
+        if identity is None or not isinstance(webhook, Webhook):
             raise ContractError("live credential configuration is invalid")
         resolved_client: httpx.Client | None = None
         client_initialization_failed = False
@@ -196,19 +178,19 @@ class LivePortal:
         except Exception:  # noqa: BLE001 - sanitize environment/proxy constructor failures
             client_initialization_failed = True
         if client_initialization_failed:
-            normalized_webhook = None
             raise LiveUnavailableError("live HTTP client configuration is invalid")
-        self.identity = cast("PortalIdentity", identity)
-        self._webhook_handle = _store_webhook(cast("str", normalized_webhook))
-        self._webhook_finalizer = weakref.finalize(self, _drop_webhook, self._webhook_handle)
+        self.identity = identity
+        # Only the token is a secret: the vault holds it, and the rest of the webhook is a plain attribute.
+        self._webhook_handle = _TOKENS.store(webhook.token)
+        self._address = webhook.address
+        self._webhook_finalizer = weakref.finalize(self, _TOKENS.drop, self._webhook_handle)
         self._client = cast("httpx.Client", resolved_client)
         self.attempts = 0
         # Registered only once the client exists, so a failed initialization leaves no registration behind.
         HTTPX_LOG_SHIELD.register_transport(
-            credentials=webhook_credentials(cast("str", normalized_webhook)),
+            credentials=(webhook.token,),
             client=self._client,
         )
-        normalized_webhook = None
         self._shield_finalizer = weakref.finalize(self, HTTPX_LOG_SHIELD.release_transport)
 
     def close(self) -> None:
@@ -243,20 +225,19 @@ class LivePortal:
         bounded_failure: str | None = None
         response: httpx.Response | None = None
         request: httpx.Request | None = None
-        url = ""
         HTTPX_LOG_SHIELD.admit_send(self._client)
         try:
-            url = urljoin(_webhook_for(self._webhook_handle), method)
-            request = self._client.build_request(
-                "POST",
-                url,
-                json=parameters or {},
-                headers={"accept-encoding": BOUNDED_ACCEPT_ENCODING},
-            )
+            webhook = Webhook(self._address, _token_for(self._webhook_handle))
             # The same shield as HttpxTransport: HTTPX logs the full method URL at INFO, and attribution by
             # the sync client's ``_send_handling_auth`` root tells this request's records from foreign ones.
-            with HTTPX_LOG_SHIELD.request(url) as ownership:
-                url = ""
+            # The request is built inside it, and no local of this frame holds the method URL.
+            with HTTPX_LOG_SHIELD.request(credentials=(webhook.token,)) as ownership:
+                request = self._client.build_request(
+                    "POST",
+                    urljoin(webhook.url, method),
+                    json=parameters or {},
+                    headers={"accept-encoding": BOUNDED_ACCEPT_ENCODING},
+                )
                 ownership.claim(request)
                 response = self._client.send(request, stream=True)
                 request = None
@@ -272,7 +253,6 @@ class LivePortal:
             decoding_failed = True
         except httpx.HTTPError:
             transport_failed = True
-        url = ""
         request = None
         response = None
         if status_code is not None and not HTTP_STATUS_MINIMUM <= status_code <= HTTP_STATUS_MAXIMUM:

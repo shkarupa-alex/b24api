@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import zlib
 from dataclasses import dataclass
-from typing import Self
+from typing import Self, cast
 
 import httpx
 
@@ -173,7 +173,7 @@ class BodyReadOutcome:
 
 
 async def read_bounded_body(response: httpx.Response, maximum: int) -> BodyReadOutcome:
-    """Decode raw bytes under the ceiling without propagating credential-bearing HTTPX exceptions."""
+    """Decode raw bytes under the ceiling; HTTPX request errors and decoding failures become an outcome."""
     body = bytearray()
     try:
         # A refused coding fails here, before any body byte is read.
@@ -183,9 +183,7 @@ async def read_bounded_body(response: httpx.Response, maximum: int) -> BodyReadO
             # allocation happened inside that transport, so only the ceiling remains to enforce.
             body.extend(_BoundedDecoder(_IDENTITY, limit=maximum).feed(response.content))
         else:
-            # Raw transfer bytes only: ``aiter_bytes`` would inflate a whole chunk before its size is known.
-            async for chunk in response.aiter_raw():
-                body.extend(decoder.feed(chunk))
+            await _read_raw(response, decoder, body)
             body.extend(decoder.finish())
     except _DecodedBodyTooLargeError:
         return BodyReadOutcome(too_large=True)
@@ -205,3 +203,16 @@ async def read_bounded_body(response: httpx.Response, maximum: int) -> BodyReadO
     except httpx.RequestError:
         return BodyReadOutcome(transport_failure="HTTP client failed while reading the response body")
     return BodyReadOutcome(body=bytes(body))
+
+
+async def _read_raw(response: httpx.Response, decoder: _BoundedDecoder, body: bytearray) -> None:
+    """Feed every raw transfer chunk to the decoder; ``aiter_bytes`` would inflate a chunk before its size is known.
+
+    The stream is read directly, not through ``aiter_raw()``, which also closes it after the last chunk:
+    the transport's own release is then the only close, and its failure cannot void a complete body.
+    """
+    if response.is_closed:
+        raise httpx.StreamClosed  # a hook closed the response unread; ``aiter_raw()`` refuses it alike
+    # ``AsyncClient`` wraps every response stream in an asynchronous one before any hook sees it.
+    async for chunk in cast("httpx.AsyncByteStream", response.stream):
+        body.extend(decoder.feed(chunk))

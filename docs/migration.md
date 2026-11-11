@@ -1,5 +1,110 @@
 # Migration guide
 
+## Transport hygiene: webhook URLs, unsendable requests, error chains
+
+- **One rule for webhook URLs, in `Settings` and `HttpxTransport` alike.** Both parse a webhook with
+  the same function and accept exactly the classic base `http[s]://<host>[:<port>]/rest/<user>/<token>/`,
+  read as HTTPX reads it to send and storable as pydantic's `HttpUrl`:
+  - leading and trailing spaces and control characters are dropped, as URL parsers drop them; one
+    inside the URL is refused. `Settings` also takes UTF-8 bytes, as pydantic did; `HttpxTransport` and
+    `Bitrix24.from_webhook()` take only a string;
+  - the scheme is `http` or `https`, and there is no user name or password: the token in the path is
+    the webhook's only credential, and HTTPX never sent userinfo as Basic auth but logged it. An empty
+    one (`https://@portal/...`, `https://:@portal/...`) is no userinfo and is dropped;
+  - the host, as written, is labels of ASCII letters, digits, `_` and `-` (container service names
+    such as `bitrix_web` included) or of non-ASCII letters, IDNA-encoded (`faß.de` is `xn--fa-hia.de`),
+    a dotted-quad IPv4 address, or an IPv6 address without a zone index, and the port, if any, is ASCII digits for 1-65535. A host HTTPX cannot address
+    is refused: one whose first label is punycode IDNA 2008 cannot decode (`xn--ls8h.la`; HTTPX decodes
+    only a host that starts with `xn--`, so `portal.xn--ls8h.la` is accepted and works), and one
+    pydantic's `HttpUrl` refuses (`xn---p1ai.example`, `portal.xn--p1.ai`);
+  - the path is `/rest/<user>/<token>/`, with a numeric user and a token of letters, digits, `_` and
+    `-`, the trailing slash optional, and no query or fragment, not even an empty `?` or `#`. A
+    percent-encoded character anywhere in the path (`/%72est/`, `/rest%2F1/`, `/rest/%2E/`) is refused
+    rather than decoded; literal `.` and `..` segments are resolved, as HTTPX and URL parsers resolve
+    them;
+  - the whole base is at most 2083 characters, the longest URL pydantic's `HttpUrl` stores.
+
+  `Settings` refuses with a `ValidationError` whose error type is `webhook_url` (not a valid http or
+  https URL, including one too long), `webhook_url_userinfo`, `webhook_url_host` (a host HTTPX cannot
+  address or pydantic refuses) or `webhook_url_shape` (not the classic base); `HttpxTransport(...)`
+  raises `ValueError` with the very message of the `Settings` error, where it raised `httpx.InvalidURL`
+  or an `idna` error before. Neither quotes the URL, nor keeps it in the frame locals of its traceback,
+  and neither does `Bitrix24.from_webhook()`. A host or port of none of the accepted forms is
+  `webhook_url`, not `webhook_url_host`. What changes:
+  - `Settings` accepted any URL pydantic's `HttpUrl` accepts, so a URL that is not a classic base
+    (`https://portal/`, `.../rest/1/token/extra/`) failed only when `Bitrix24` built its transport,
+    and a host HTTPX cannot address failed on every call. Both now fail in `Settings`. A `Settings`
+    that only names the host of an injected transport needs a classic URL too.
+  - Forms URL parsers repair are refused rather than repaired: IPv4 addresses that are not a dotted
+    quad (`1.2.3`, `01.2.3.4`, `0x7f.0.0.1`, `2130706433`), an IPv6 zone index, a full stop other than
+    `.` (`portal。example`), full-width hosts (`ｐｏｒｔａｌ.example`), a port that is empty, signed or
+    not in ASCII digits (`:`, `:+443`, `:٨٠٨٠`), port 0, a scheme without `//`
+    (`https:portal.example/...`), backslashes in place of slashes, and an empty query or fragment.
+  - A doubled slash in the path (`https://portal//rest/1/<token>/`, `.../rest/1/<token>//`) was
+    accepted and sent as written; it is not the classic base and is refused now.
+  - `HttpxTransport` accepted `ws:` and `wss:` URLs, ports outside 1-65535, any path segments and
+    hosts `Settings` refused; it refuses them now.
+  - `Settings.webhook_url` stores the canonical base the transport sends: the scheme and host lower
+    case, the host IDNA-encoded and an IPv6 address in pydantic's hexadecimal form (`::ffff:1.2.3.4`
+    is `::ffff:102:304`), the default port (under any scheme case: `HTTPS://portal:443/...`) and an
+    empty user name or password dropped, `.` and `..` segments resolved, and the trailing slash added.
+    The canonical base parses back to itself.
+  - `HttpxTransport.host` and `Bitrix24.host` are the host the rule yields: `xn--fa-hia.de`, where the
+    transport reported the decoded `faß.de` and so failed `Bitrix24`'s injected-host check, and an
+    IPv6 address without brackets (`::1`, where `Bitrix24.host` was `[::1]` and the transport's host
+    never matched it). An injected transport may still report its IPv6 host with brackets.
+  - The secret registered for redaction and with the HTTPX log shield is the token of the parsed
+    webhook, the one that is sent. It was a segment matched in the raw string, which registered `1`
+    for `/rest/./1/<token>/` and failed, quoting the URL in its frame locals, for `/%72est/1/<token>/`.
+- **Method names are dot-separated names.** `Request` accepted a method with an empty segment (`..`,
+  `.`, `.profile`, `profile.`, `crm..item`); `..` addressed the portal above the webhook token, and the
+  failure surfaced only at dispatch. Such a method now raises `ValueError` when the `Request` is built.
+- **Header values follow RFC 9110.** `RequestHeaders` accepted any string. A value outside the RFC 9110
+  field-value grammar now raises `ValueError` when the headers are built, before anything is sent:
+  only visible ASCII characters, with spaces or tabs between them and none around them. Leading or
+  trailing whitespace used to be stripped and sent over HTTP/2, which HTTPX negotiates by default, and
+  refused by h11 during the send over HTTP/1.1; both are now refused before dispatch. Control
+  characters, some of which (`\x01`, DEL) were sent as they were, are refused too, and so are the
+  grammar's obsolete non-ASCII characters: HTTPX encodes header values as ASCII and failed on them
+  inside the send. A value over 8192 characters is refused with a message about its length.
+- **A request that could not be built is not ambiguous.** When HTTPX could not build the request, the
+  failure was reported as possibly sent: an `UNSAFE` or `UNKNOWN` request raised
+  `AmbiguousExecutionError`. Nothing was sent, so it is now a non-retryable `TransportError` with
+  phase `not_dispatched` (`possible_acceptance` is `False`) for every replay safety.
+- **No HTTPX exception on the chain.** An exception raised inside an injected `httpx.AsyncClient`
+  (an event hook's `raise_for_status()`, an auth flow, a custom transport or response stream) reached
+  the caller as the `__cause__` of a `TransportError`, carrying the request and its webhook URL.
+  `HttpxTransport` now raises a `TransportError` without `__cause__` or `__context__`. Its message names
+  the exception's class and, when the exception carried a received response, its status, which is
+  also `error.http_status`; never a URL or header. Code that read `error.__cause__` to get the hook's
+  exception must keep what it needs in the hook itself. Retries follow one rule in every stage, as
+  before: HTTPX's request errors (connection, read, write, protocol) are retried by the phase they may
+  follow, and any other exception except a builtin `TimeoutError` (below) is not retried, since it
+  would be raised again; it counts as possibly sent once the request was built.
+- **Two failures inside the client are reported differently.** A `B24ApiError` raised inside the
+  injected client, by a hook for example, was re-raised as is, with a traceback through the HTTPX
+  frames that hold the request. It now arrives as the non-retryable `TransportError` above, naming its
+  class, so its own retry and ambiguity classification no longer applies. A builtin `TimeoutError`
+  raised there keeps the executor's deadline classification, as before, but arrives as a fresh
+  `TimeoutError` without arguments under the executor's `TransportError`.
+- **A fully read response survives a failing release.** HTTPX released a response stream itself after
+  its last chunk. A failure there voided a complete response: an HTTPX transport error (`ReadError`,
+  `CloseError`) was a body read failure, retried for `SAFE` requests; any other exception was a
+  non-retryable `TransportError`; both raised `AmbiguousExecutionError` for `UNSAFE` and `UNKNOWN`
+  requests. The transport now reads
+  the stream directly and releases it itself once the outcome is decided, dropping a failure of the
+  release: a complete response is returned, and a voided one keeps its own error.
+- **What is guaranteed.** The webhook token appears in no rendering of an error that `HttpxTransport`
+  raises itself, converts from an `Exception` raised inside the HTTP client, or raises while it is
+  constructed: not in `str` or `repr` of the error, its chain, notes or arguments, not in a formatted
+  traceback, not in the `repr` of the frame locals that `capture_locals` or an error tracker shows,
+  and not in log records at any level. What is not converted passes through unchanged: an exception
+  that is not an `Exception` (`KeyboardInterrupt`, `SystemExit`) raised by a hook, whose traceback
+  runs through the HTTPX frames that hold the request, and the arguments a canceller gives a
+  cancellation. One limitation remains: over HTTP/2,
+  HTTPX's HPACK header table keeps the request path with the token. That is connection state of
+  HTTPX, reachable only by walking the client's internal objects, not by rendering an error.
+
 ## Unknown outcomes follow what was sent
 
 Public signatures are unchanged. Whether a sent command may have run is now one fact, recorded by the

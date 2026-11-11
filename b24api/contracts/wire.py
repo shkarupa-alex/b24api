@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 _HEADER_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$")
+# RFC 9110 field-value, checked before dispatch: visible ASCII with inner spaces and tabs, nothing around it.
+# The grammar's obsolete non-ASCII obs-text is refused too, since HTTPX encodes header values as ASCII.
+_HEADER_VALUE = re.compile(r"(?:[\x21-\x7e](?:[\t\x20-\x7e]*[\x21-\x7e])?)?")
 _FORBIDDEN_HEADERS = frozenset(
     {
         "authorization",
@@ -71,8 +74,10 @@ def _validate_headers(items: tuple[tuple[str, str], ...]) -> tuple[tuple[str, st
         lowered = name.casefold()
         if not _HEADER_TOKEN.fullmatch(name) or any(character in name for character in "\r\n\0"):
             raise ValueError("request header name is invalid")
-        if len(value) > _HEADER_VALUE_MAXIMUM or any(character in value for character in "\r\n\0"):
-            raise ValueError("request header value is invalid")
+        if len(value) > _HEADER_VALUE_MAXIMUM:
+            raise ValueError(f"request header value cannot be longer than {_HEADER_VALUE_MAXIMUM} characters")
+        if not _HEADER_VALUE.fullmatch(value):
+            raise ValueError("request header value must be visible ASCII, with spaces or tabs only between characters")
         if lowered in seen:
             raise ValueError("duplicate request header name")
         if lowered in _FORBIDDEN_HEADERS or any(lowered.startswith(prefix) for prefix in _FORBIDDEN_PREFIXES):

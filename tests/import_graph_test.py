@@ -35,6 +35,7 @@ _ROOT_FILE_LAYERS = {
     "encoding.py": "leaf",
     "migration.py": "leaf",
     "settings.py": "leaf",
+    "_webhook.py": "leaf",
     "redaction.py": "redaction",
     "_diagnostics.py": "redaction",
     "errors.py": "errors",

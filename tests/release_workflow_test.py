@@ -453,9 +453,11 @@ def test_httpx_latest_is_non_blocking_evidence_on_the_latest_httpx() -> None:
     assert jobs["httpx-latest"]["continue-on-error"] is True
     assert "httpx-latest" not in jobs["gate"]["needs"]
     assert 'uv pip install --upgrade "httpx[http2]"' in runs
-    # The §3.8 shield, its hpack matrix (A20) and the LivePortal shield (A1) all run on the latest stack.
+    # The §3.8 shield, its hpack matrix (A20), the transport hygiene matrix (which leans on HTTPX
+    # behaviour: reading ``Response.stream`` directly, and which hosts ``URL.host`` can decode) and the
+    # LivePortal shield (A1) all run on the latest stack.
     assert (
-        "uv run --no-sync pytest tests/httpx_logging_shield_test.py"
+        "uv run --no-sync pytest tests/httpx_logging_shield_test.py tests/httpx_transport_hygiene_test.py"
         " tests/internal/httpx_log_shield_matrix_test.py tools/b24api_evidence/harness/live_test.py"
     ) in runs
     assert not any(job.get("continue-on-error") for name, job in jobs.items() if name != "httpx-latest")

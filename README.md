@@ -13,7 +13,12 @@ export BITRIX24_API_WEBHOOK_URL='https://portal.example/rest/.../'
 ```
 
 Keep the webhook out of source, logs and command arguments. Reuse one client for a related unit of
-work so its HTTP/2 connection pool and rate state are reused.
+work so its HTTP/2 connection pool and rate state are reused. The URL has the form
+`https://<portal>/rest/<user>/<token>/`, with a numeric user and a token of letters, digits, `_` and
+`-`; `http`, upper-case letters, an explicit port, a missing trailing slash, `.` and `..` segments and
+surrounding whitespace are accepted and normalized. Any other form is refused, one with a user name or
+password, a query, a fragment or a percent-encoded path included, since the token is its only credential
+and is registered for redaction as it is sent.
 
 ## Quickstart
 
@@ -98,7 +103,20 @@ A failure that proves the request did not run is retried whatever its safety: a 
 before dispatch, or a refusal listed in `AmbiguityPolicy`, which by default is an unstructured 423, 425
 or 429 (`refusal_http_statuses`) or a `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT` /
 REST 3.0 `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` refusal (`refusal_api_codes`). A code or
-status added only to `RetryPolicy` is retried for `SAFE` work alone.
+status added only to `RetryPolicy` is retried for `SAFE` work alone. A request that HTTPX could not
+build was never sent: it fails at once with a `TransportError` of phase `not_dispatched`, never as
+ambiguous. An exception from an injected client's event hook, auth flow, transport or response
+stream may follow dispatch. An HTTPX request error (`httpx.RequestError`, such as a connection or read
+error) follows the same phase rule as one from the network. A builtin `TimeoutError` counts as the
+attempt's deadline passing after possible dispatch: `SAFE` work is retried, `UNSAFE` and `UNKNOWN`
+work raises `AmbiguousExecutionError`. Any other `Exception` is not retried and counts as possibly
+sent, with the same consequence for `UNSAFE` and `UNKNOWN` work; the failure itself is a
+`TransportError` that names the exception's class and any HTTP status the client received
+(`error.http_status`), without the exception, which would carry the webhook URL, on its chain. A
+cancellation is re-raised with the same arguments, without the HTTPX frames it was raised in, and an
+exception that is not an `Exception` (`KeyboardInterrupt`) passes through unchanged. A response the
+transport refuses itself is reported as `ProtocolError` (a status outside 100-599) or
+`ResponseTooLargeError` rather than `TransportError`.
 A physical batch applies these rules to each command: after a failure, only the commands that
 may run again are sent again, in a smaller batch, and an `UNSAFE` command of a batch that may have run
 arrives as unknown. Replay rounds spend the same attempt and retry-time budget as the sends before

@@ -146,9 +146,9 @@ jobs:
           uv sync --locked
           uv pip install --upgrade "httpx[http2]" httpcore h2 hpack
           uv pip list | grep -Ei '^(httpx|httpcore|h2|hpack) ' | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Run the logging-shield and hpack matrices
+      - name: Run the logging-shield, hpack and transport-hygiene matrices
         run: >-
-          uv run --no-sync pytest tests/httpx_logging_shield_test.py
+          uv run --no-sync pytest tests/httpx_logging_shield_test.py tests/httpx_transport_hygiene_test.py
           tests/internal/httpx_log_shield_matrix_test.py tools/b24api_evidence/harness/live_test.py
 
   gate:

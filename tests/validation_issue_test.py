@@ -123,7 +123,7 @@ async def test_a19_fieldless_item_via_unsafe_direct_call_sends_once(status_code:
         (ScriptedExchange(request, WireResponse(status_code, (("content-type", "application/json"),), body)),),
     )
 
-    async with Bitrix24(Settings(webhook_url="https://fixture.invalid/"), transport=transport) as api:
+    async with Bitrix24(Settings(webhook_url="https://fixture.invalid/rest/1/test/"), transport=transport) as api:
         with pytest.raises(ApiResponseError) as raised:
             await api.call(request)
 
@@ -145,7 +145,7 @@ async def test_a19_present_null_field_via_unsafe_direct_call_is_protocol_error()
     }
     transport = ScriptedTransport((ScriptedExchange.json(request, payload),))
 
-    async with Bitrix24(Settings(webhook_url="https://fixture.invalid/"), transport=transport) as api:
+    async with Bitrix24(Settings(webhook_url="https://fixture.invalid/rest/1/test/"), transport=transport) as api:
         with pytest.raises(ProtocolError) as raised:
             await api.call(request)
 

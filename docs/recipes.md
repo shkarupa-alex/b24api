@@ -635,7 +635,9 @@ write_file(download.body, media_type=download.content_type)
 ```
 
 Form and scoped-header requests require an advertising wire transport and are rejected from physical
-Bitrix batches before dispatch. `call_bytes()` is selected before dispatch and returns every
+Bitrix batches before dispatch. A header value must follow the RFC 9110 field-value grammar in visible ASCII,
+with spaces or tabs only between characters; anything else raises `ValueError` when `RequestHeaders`
+is built, before dispatch. `call_bytes()` is selected before dispatch and returns every
 successful body byte-for-byte; it never acts as a JSON-decoding fallback.
 
 ## Development qualification for counted traversal

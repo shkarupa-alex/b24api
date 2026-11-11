@@ -9,6 +9,7 @@ import weakref
 from typing import TYPE_CHECKING, Self, cast
 
 from b24api._client_traversal import _TraversalFacade
+from b24api._webhook import Webhook, WebhookRefusal, parse_webhook
 from b24api.batch.facade import batch_outcome_stream, batch_stream
 from b24api.batch.logical import command_source as logical_command_source
 from b24api.contracts.dispatch import BatchDispatch, DirectDispatch, DispatchSpec
@@ -25,7 +26,7 @@ from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import KeysetSpec
 from b24api.execution import Executor, HttpxTransport, Transport, await_cleanup_resistant, rearm_cancellation
 from b24api.execution.cleanup import OwnedStream, close_owned_resources
-from b24api.redaction import Redactor, webhook_secrets
+from b24api.redaction import Redactor, secret_values
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
 from b24api.references.fanout import command_source as fanout_command_source
@@ -59,7 +60,8 @@ _DEFAULT_KEYSET = KeysetSpec()
 
 
 def _normalized_host(host: str) -> str:
-    return host.strip().rstrip(".").casefold()
+    """Compare hosts as named: a custom transport may report an IPv6 address in brackets, as in a URL."""
+    return host.strip().removeprefix("[").removesuffix("]").rstrip(".").casefold()
 
 
 class Bitrix24(_TraversalFacade):
@@ -82,11 +84,14 @@ class Bitrix24(_TraversalFacade):
             raise TypeError("settings must be a Settings value")
         if policy is not None and not isinstance(policy, ExecutionPolicy):
             raise TypeError("policy must be an ExecutionPolicy")
-        host = resolved.webhook_url.host
-        if host is None:
-            raise ValueError("webhook URL must contain a host")
+        # The parse Settings validated with; it refuses only a Settings built without validation.
+        match parse_webhook(str(resolved.webhook_url)):
+            case WebhookRefusal() as refusal:
+                raise ValueError(refusal.value)
+            case Webhook() as webhook:
+                host = webhook.host
         if transport is None:
-            selected_transport: Transport = HttpxTransport(str(resolved.webhook_url))
+            selected_transport: Transport = HttpxTransport(webhook.url)
             owned_transport: HttpxTransport | None = cast("HttpxTransport", selected_transport)
         else:
             if _normalized_host(transport.host) != _normalized_host(host):
@@ -96,7 +101,7 @@ class Bitrix24(_TraversalFacade):
         self._transport = selected_transport
         self._owned_transport = owned_transport
         # The configured webhook credential is an exact secret for every error this client renders.
-        codec = ProtocolCodec(redactor=Redactor(known_secrets=webhook_secrets(str(resolved.webhook_url))))
+        codec = ProtocolCodec(redactor=Redactor(known_secrets=secret_values((webhook.token,))))
         self._executor = Executor(selected_transport, codec=codec)
         self._owned_coordinator = self._executor.coordinator
         self._default_policy = policy or ExecutionPolicy.from_settings(resolved)
@@ -118,12 +123,18 @@ class Bitrix24(_TraversalFacade):
 
         The URL is validated by ``Settings``; ``http_timeout=None`` keeps the ``Settings`` default.
         """
-        if not isinstance(url, str):
-            raise TypeError("webhook url must be a string")
-        settings = (
-            Settings(webhook_url=url) if http_timeout is None else Settings(webhook_url=url, http_timeout=http_timeout)
-        )
-        return cls(settings, policy=policy)
+        try:
+            if not isinstance(url, str):
+                raise TypeError("webhook url must be a string")
+            settings = (
+                Settings(webhook_url=url)
+                if http_timeout is None
+                else Settings(webhook_url=url, http_timeout=http_timeout)
+            )
+            return cls(settings, policy=policy)
+        finally:
+            # A construction error's traceback keeps this frame's locals; none of them may be the webhook.
+            url = ""
 
     @classmethod
     def _from_executor(
