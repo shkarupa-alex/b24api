@@ -1,5 +1,21 @@
 # Migration guide
 
+## Keyset traversal
+
+- **A caller order is refused.** A sequential keyset, flat or in references, accepted an `order`
+  with another field beside the identity, for example `{"order": {"PRIO": "DESC"}}`. The traversal
+  added its identity key after it, the server ordered by the caller's field first, and the cursor
+  skipped rows while the report still claimed exact identity coverage. Such a request now fails
+  with `CapabilityError` before any request is sent. A sequential keyset still accepts an order by
+  the identity key alone; fast and automatic keyset refuse any caller order, as before.
+- **Anchor rows are adapted.** A partitioned keyset, including the one `AutoKeysetExecution` picks
+  for a large selection, published each lane's retained upper anchor row without passing it through
+  the `page_adapter`. The anchor probe page is now adapted like every other page, so an adapter that
+  raises on it fails the traversal instead of letting the row through unadapted. An adapter is
+  therefore also invoked on the anchor probe pages of `AutoKeysetExecution` and
+  `PartitionedKeysetExecution`, including when the automatic plan ends up sequential, and may be
+  called more often than before.
+
 ## Page-level response fields
 
 - **`PageBoundary.result`.** A `page_stop` callback now receives the page's immutable server result

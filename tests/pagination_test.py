@@ -55,7 +55,7 @@ from b24api.traversal.plans import (
     SingleResponsePlan,
 )
 from tests.ledger_hold import LedgerHold
-from tests.scripting import Blocker, ResponderTransport, attached_report
+from tests.scripting import Blocker, ResponderTransport, attached_report, replies
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
@@ -974,6 +974,36 @@ async def test_latent_keyset_filter_collision_refuses_before_io() -> None:
     with pytest.raises(CapabilityError, match="conflict"):
         await anext(stream)
     assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_a_caller_order_beside_the_identity_refuses_a_keyset_before_io() -> None:
+    """Ordering by another field first would let the cursor skip rows behind an exact-coverage report."""
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list", {"order": {"PRIO": "DESC"}}, route=RouteKind.BARE),
+        plan=_keyset_plan(),
+        identity=_identity(),
+    )
+
+    with pytest.raises(CapabilityError, match="caller order conflicts"):
+        await anext(stream)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_a_caller_order_by_the_identity_alone_keeps_a_keyset_running() -> None:
+    transport = ResponderTransport(replies({"result": [{"ID": 1}]}, {"result": []}))
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list", {"order": {"id": "ASC"}}, route=RouteKind.BARE),
+        plan=_keyset_plan(),
+        identity=_identity(),
+    )
+
+    assert await _collect(stream) == [{"ID": 1}]
+    assert [request.copy_parameters()["order"] for request in transport.requests] == [{"id": "ASC"}] * 2
 
 
 @pytest.mark.asyncio

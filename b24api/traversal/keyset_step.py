@@ -14,6 +14,7 @@ from b24api.contracts.policy import (
 )
 from b24api.errors import CapabilityError, PaginationError
 from b24api.traversal.identity import _child_path, _request_with_controls
+from b24api.traversal.keyset_eligibility import _path_lookup
 from b24api.traversal.plans import KeysetPlan, KeysetTerminalRule
 from b24api.traversal.values import IdentityValue, _compare_identities
 
@@ -43,6 +44,27 @@ def sequential_keyset_plan(keyset: KeysetSpec, page_size: int) -> KeysetPlan:
         duplicate_policy=DuplicatePolicy.ERROR,
         total_semantics=TotalSemantics.IGNORE,
     )
+
+
+def reject_caller_order(request: Request, plan: KeysetPlan, identity: IdentitySpec) -> None:
+    """Refuse a caller order beside the identity: the cursor only continues rows ordered by the identity.
+
+    The traversal writes the identity's order key into the order container; another key ahead of it
+    would make the server order by that field first, so the cursor would skip rows while the report
+    still claimed exact identity coverage.
+    """
+    if plan.split_order is not None or plan.order_path is None:
+        return
+    positional_arguments = request.positional
+    positional = positional_arguments is not None
+    parameters = positional_arguments.to_wire_slots() if positional_arguments is not None else request.copy_parameters()
+    exists, order = _path_lookup(parameters, plan.order_path, case_sensitive=positional)
+    if not exists:
+        return
+    if not isinstance(order, dict):
+        raise CapabilityError("keyset order path must contain an object")
+    if any(str(key).casefold() != identity.order_key.casefold() for key in order):
+        raise CapabilityError("caller order conflicts with keyset traversal, which orders by the identity alone")
 
 
 def validate_bounded_keyset(request: Request, plan: KeysetPlan, identity: IdentitySpec) -> None:
