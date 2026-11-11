@@ -21,6 +21,7 @@ from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, 
 from b24api.contracts.response import Response, inject_controls
 from b24api.contracts.violation import MAX_RETAINED_VIOLATIONS, retain_violations
 from b24api.errors import BudgetExceededError
+from b24api.execution import ExecutionContext, RateCoordinator
 from b24api.execution.snapshot import KernelReport
 from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem, ReferenceRequest
 
@@ -168,7 +169,8 @@ def test_default_row_buffer_holds_one_complete_portal_batch() -> None:
     assert ExecutionPolicy().max_buffered_rows == 50 * 50
 
 
-def test_budget_counters_count_attempts_pages_references_and_buffers_before_scheduling() -> None:
+@pytest.mark.asyncio
+async def test_budget_ledger_counts_attempts_pages_references_and_buffers_before_scheduling() -> None:
     policy = ExecutionPolicy(
         max_requests=TEST_LIMIT,
         max_pages=TEST_LIMIT,
@@ -178,30 +180,42 @@ def test_budget_counters_count_attempts_pages_references_and_buffers_before_sche
         max_retry_elapsed_per_request=5,
         max_buffered_rows=TEST_LIMIT,
     )
-    counters = BudgetCounters().reserve_attempt(
-        policy,
-        attempts_for_request=0,
-        retry_elapsed=0,
-        total_elapsed=0,
-    )
-    counters = counters.reserve_attempt(policy, attempts_for_request=1, retry_elapsed=1, total_elapsed=1)
-    assert counters.physical_requests == TEST_LIMIT
-    with pytest.raises(BudgetExceededError):
-        counters.reserve_attempt(policy, attempts_for_request=0, retry_elapsed=0, total_elapsed=0)
+    now = [0.0]
+    context = ExecutionContext(policy, RateCoordinator(), clock=lambda: now[0])
+    await context.start()
+    await context.reserve_attempt(attempts_for_request=0, retry_started=0)
+    now[0] = 1
+    await context.reserve_attempt(attempts_for_request=1, retry_started=0)
+    assert (await context.snapshot()).counters.physical_requests == TEST_LIMIT
+    with pytest.raises(BudgetExceededError, match="physical request budget"):
+        await context.reserve_attempt(attempts_for_request=0, retry_started=1)
 
-    pages = BudgetCounters().reserve_page(policy, reference="A")
-    with pytest.raises(BudgetExceededError):
-        pages.reserve_page(policy, reference="A")
-    pages = pages.reserve_page(policy, reference="B")
-    assert pages.logical_pages == TEST_LIMIT
-    with pytest.raises(BudgetExceededError):
-        pages.reserve_page(policy, reference="C")
+    context.commit_page(await context.reserve_page(reference="A"))
+    with pytest.raises(BudgetExceededError, match="per-reference page budget"):
+        await context.reserve_page(reference="A")
+    context.commit_page(await context.reserve_page(reference="B"))
+    counters = (await context.snapshot()).counters
+    assert counters.logical_pages == TEST_LIMIT
+    assert counters.pages_per_reference == (("A", 1), ("B", 1))
+    with pytest.raises(BudgetExceededError, match="logical page budget"):
+        await context.reserve_page(reference="C")
 
-    buffered = BudgetCounters().with_buffered_rows(policy, TEST_LIMIT).with_buffered_rows(policy, 1)
-    assert buffered.buffered_rows == 1
-    assert buffered.buffered_rows_high_water == TEST_LIMIT
-    with pytest.raises(BudgetExceededError):
-        buffered.with_buffered_rows(policy, 3)
+    await context.set_buffered_rows(TEST_LIMIT)
+    await context.adjust_buffered_rows(-1)
+    counters = (await context.snapshot()).counters
+    assert counters.buffered_rows == 1
+    assert counters.buffered_rows_high_water == TEST_LIMIT
+    with pytest.raises(BudgetExceededError, match="buffered row budget"):
+        await context.set_buffered_rows(3)
+
+
+def test_budget_counters_snapshot_is_validated_and_sorted() -> None:
+    counters = BudgetCounters(logical_pages=2, pages_per_reference=(("B", 1), ("A", 1)))
+    assert counters.pages_per_reference == (("A", 1), ("B", 1))
+    with pytest.raises(ValueError, match="cannot be negative"):
+        BudgetCounters(pages_per_reference=(("A", -1),))
+    with pytest.raises(ValueError, match="high-water mark"):
+        BudgetCounters(buffered_rows=1)
 
 
 def test_report_is_frozen_and_completion_rejects_blocking_violation() -> None:

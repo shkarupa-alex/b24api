@@ -54,6 +54,10 @@ outcome.
 - Logical sources are consumed incrementally; physical Bitrix batches contain at most 50 commands.
 - Response bytes, buffered rows and commands, retained unordered identity keys, request/page
   budgets, concurrency and elapsed time are bounded by `ExecutionPolicy`.
+- Budgets are charged to one operation-local ledger of plain counters updated in place, so a
+  reservation, its settlement and a row-buffer change cost the same however many bindings the
+  operation has read. Per-binding page counts are kept only while a binding is open; the validated,
+  immutable counters are built only for a snapshot or the terminal report.
 - The default response ceiling is enforced while streaming, before JSON decoding.
 - Exact sequential, counted, and multi-reference traversal shares one operation-wide
   `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted
