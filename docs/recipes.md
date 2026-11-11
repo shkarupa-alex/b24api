@@ -309,10 +309,12 @@ Any other update is refused locally before that binding sends anything: `iter_re
 reports it as `ReferenceNotExecuted(LOCAL_VALIDATION_FAILED)` with its correlation while the other
 bindings continue, and fail-fast `iter_references()` raises `ReferenceFailed`. Order, `start`, limit
 and split-order controls stay exclusive as before. The base request keeps its own rules: a
-non-mapping `filter`, or a base key equal to the managed cursor key (such as `>ID`), is refused with
-`CapabilityError` before any binding is read, while other identity constraints such as `<=id` remain
-allowed. `traversal_control_paths()` still lists the containers a traversal writes, including the
-whole filter; it names those containers and does not decide which binding updates compose.
+non-mapping `filter`, a base key equal to the managed cursor key (such as `>ID`), or a base `order`
+with any key other than the identity's order key (automatic, range and partitioned keyset refuse any
+base `order`), is refused with `CapabilityError` before any binding is read, while other identity
+constraints such as `<=id` remain allowed. `traversal_control_paths()` still lists the containers a
+traversal writes, including the whole filter; it names those containers and does not decide which
+binding updates compose.
 The same filter updates apply to automatic, range and partitioned keyset references, which need
 `BatchDispatch`; a `KeysetSpec.boundary` remains unavailable in references, and the recipe does not
 promise that every REST method treats arbitrary constant filters the same way.

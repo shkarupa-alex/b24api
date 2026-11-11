@@ -19,6 +19,40 @@
   `IncompleteTraversalError`. It now propagates unchanged with a `FAILED` report, as from
   `iter_list()`; ordinary exceptions are wrapped as before.
 
+## Keyset traversal
+
+- **A caller order is refused.** A sequential keyset, flat or in references, accepted an `order`
+  with another field beside the identity, for example `{"order": {"PRIO": "DESC"}}`. The traversal
+  added its identity key after it, the server ordered by the caller's field first, and the cursor
+  skipped rows while the report still claimed exact identity coverage. Such a request now fails
+  with `CapabilityError` before any request is sent. A sequential keyset still accepts an order by
+  the identity key alone; fast and automatic keyset refuse any caller order, as before.
+- **Anchor rows are adapted.** A partitioned keyset, including the one `AutoKeysetExecution` picks
+  for a large selection, published each lane's retained upper anchor row without passing it through
+  the `page_adapter`. The anchor probe page is now adapted like every other page, so an adapter that
+  raises on it fails the traversal instead of letting the row through unadapted. An adapter is
+  therefore also invoked on the anchor probe pages of `AutoKeysetExecution` and
+  `PartitionedKeysetExecution`, including when the automatic plan ends up sequential, and may be
+  called more often than before.
+
+## Cancellation is delivered once
+
+- **Your cleanup after a cancelled read runs.** A stream, batch or reference operation cancelled
+  while it waited raised the `CancelledError` and then armed it again, so the first `await` in the
+  caller's own `finally` or `except asyncio.CancelledError:` block was interrupted. On Python 3.12 the
+  first `await` after a handled `asyncio.timeout(...)` around a stream raised `CancelledError` too.
+  A cancellation is now replayed only when stream cleanup absorbed it while another failure was
+  raised in its place. On Python 3.12 that replay still survives a handled `asyncio.timeout(...)`
+  around the stream when its cleanup fails, because `uncancel()` there does not disarm it; Python
+  3.13 drops it.
+- **Requests work in the cleanup of a cancelled task.** `call()` and the other request methods,
+  started after the task received its cancellation and kept running (without `uncancel()`), raised
+  `CancelledError` before sending, and a response that arrived after the task's first cancellation
+  was dropped. They are now sent and return their result, so a compensating write or an unlock in
+  cleanup takes effect. A cancellation requested while such a request runs still stops it, even
+  when a transport suppresses it and returns a response or reports a failure: the request is not
+  retried, and a batch sends no further envelope.
+
 ## Page-level response fields
 
 - **`PageBoundary.result`.** A `page_stop` callback now receives the page's immutable server result

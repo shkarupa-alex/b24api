@@ -7,7 +7,7 @@ import asyncio
 import dataclasses
 import json
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs
 
 import pytest
@@ -48,6 +48,7 @@ from b24api.contracts import (
     TotalHintMode,
     TraceClass,
 )
+from b24api.contracts.page import AdaptedPage, PageView
 from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.contracts.report import OperationReport, PageDispatch
 from b24api.contracts.request import RouteKind
@@ -901,6 +902,33 @@ async def test_boundary_overlap_releases_duplicate_row_capacity_immediately() ->
     assert scheduler.counters.boundary_overlap_rows == 3
     assert scheduler.transactions.buffer_balance == 7
     await source.aclose()
+
+
+@pytest.mark.asyncio
+async def test_automatic_partitioned_keyset_adapts_the_anchor_rows_its_lanes_publish() -> None:
+    """A partition lane publishes its retained upper anchor row as a fence; that row is adapted too."""
+
+    class Tag:
+        def adapt(self, page: PageView, /) -> AdaptedPage:
+            return AdaptedPage([{**dict(cast("dict[str, object]", row)), "adapted": True} for row in page.items])
+
+    stream = _client(KeysetTransport(tuple(range(1, 5001)))).iter_list_keyset(
+        Request("item.list", route=RouteKind.BARE),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=50,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        page_adapter=Tag(),
+    )
+    rows = [cast("dict[str, object]", row) async for row in stream]
+
+    report = stream.report
+    assert report is not None
+    assert report.keyset_execution is not None
+    assert report.keyset_execution.selected_kind is KeysetExecutionKind.PARTITIONED
+    assert report.state is TerminalState.COMPLETED
+    assert [row["id"] for row in rows] == list(range(1, 5001))
+    assert [row["id"] for row in rows if "adapted" not in row] == []
 
 
 @pytest.mark.asyncio

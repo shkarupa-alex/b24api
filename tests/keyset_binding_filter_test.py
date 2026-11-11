@@ -371,6 +371,22 @@ async def test_base_cursor_collision_and_non_mapping_filter_fail_before_bindings
     assert portal.physical == 0
 
 
+@pytest.mark.asyncio
+async def test_a_base_order_beside_the_identity_fails_before_bindings() -> None:
+    """Every binding would order by the caller's field first and skip rows, so the base is refused."""
+    portal = _ProductRows()
+    async with _client(portal) as client:
+        with pytest.raises(CapabilityError, match="caller order conflicts"):
+            client.iter_reference_outcomes(
+                _request({"order": {"PRICE": "DESC"}}),
+                _refused_bindings(),
+                traversal=_traversal(),
+                dispatch=DirectDispatch(concurrency=1),
+            )
+
+    assert portal.physical == 0
+
+
 def test_positional_request_binding_remains_a_local_refusal() -> None:
     layout = PositionalLayout(
         "productrow.positional.keyset.v1",
