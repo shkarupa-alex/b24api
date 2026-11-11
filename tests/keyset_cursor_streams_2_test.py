@@ -694,7 +694,8 @@ def test_frozen_selection_and_fingerprint_preserve_legacy_json_semantics() -> No
     assert adapted.items[0]["nested"] == ("before",)  # type: ignore[index]
 
 
-def test_fast_keyset_lane_applies_adapter_only_to_publishable_phases() -> None:
+def test_fast_keyset_lane_applies_adapter_to_every_phase() -> None:
+    """The anchor probe is adapted as well: its row can be published as a partition lane's fence."""
     request = Request("item.list", route=RouteKind.BARE)
     response = Response([{"id": 1}])
     outcome = BatchSuccess(0, "body:0", request, response.result, response=response)
@@ -723,11 +724,11 @@ def test_fast_keyset_lane_applies_adapter_only_to_publishable_phases() -> None:
             page_adapter=RaisingAdapter(),
         )
 
-    assert not isinstance(validate(KeysetPhase.ANCHOR_PROBE), ReceiptRejection)
-    rejected = validate(KeysetPhase.BODY)
-    assert isinstance(rejected, ReceiptRejection)
-    assert isinstance(rejected.error, PageAdaptationError)
-    assert rejected.violation.code == "page_adaptation"
+    for phase in KeysetPhase:
+        rejected = validate(phase)
+        assert isinstance(rejected, ReceiptRejection), phase
+        assert isinstance(rejected.error, PageAdaptationError)
+        assert rejected.violation.code == "page_adaptation"
 
 
 @pytest.mark.asyncio
