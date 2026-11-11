@@ -457,3 +457,66 @@ def test_page_validated_carries_no_identity_digest() -> None:
         PageValidated(  # type: ignore[call-arg]
             operation_id="run", sequence=0, binding_id=0, page_id=0, identity_digest="abc", row_count=1
         )
+
+
+@pytest.mark.parametrize("closure", [BindingClosure.FAILURE, BindingClosure.UNKNOWN])
+def test_a_negative_closure_releases_a_delivered_page_the_consumer_never_accepted(
+    closure: BindingClosure,
+) -> None:
+    gate = CompletionGate("run")
+    sequence = _page(gate, acknowledged=False)
+    gate.emit(BindingTerminal(operation_id="run", sequence=sequence, binding_id=0, closure=closure))
+    gate.emit(StreamTerminal(operation_id="run", sequence=sequence + 1, closure=StreamClosure.EARLY_CLOSE))
+    gate.emit(CleanupOutcome(operation_id="run", sequence=sequence + 2, state=CleanupState.SUCCESS))
+
+    decision = gate.decision()
+    assert decision.violations == ()
+    assert decision.state is TerminalState.EARLY_CLOSED
+    assert (decision.pages_scheduled, decision.pages_acknowledged, decision.bindings_terminal) == (1, 0, 1)
+
+
+def test_a_failure_closure_never_releases_a_page_whose_dispatch_outcome_is_unobserved() -> None:
+    gate = CompletionGate("run")
+    gate.emit(BindingAdmitted(operation_id="run", sequence=0, binding_id=0))
+    gate.emit(PageScheduled(operation_id="run", sequence=1, binding_id=0, page_id=0))
+    _close(gate, 2, BindingClosure.FAILURE)
+
+    decision = gate.decision()
+    assert decision.state is TerminalState.INCOMPLETE
+    assert {violation.code for violation in decision.violations} == {"completion_invalid_binding_terminal"}
+
+
+@pytest.mark.parametrize("closure", [BindingClosure.CALLER_STOP, BindingClosure.BOUNDARY_SEEN])
+def test_a_success_closure_still_requires_every_page_acknowledged(closure: BindingClosure) -> None:
+    # A caller stop is a successful bounded prefix: an unacknowledged page under it stays a violation.
+    gate = CompletionGate("run")
+    _close(gate, _page(gate, acknowledged=False), closure)
+
+    decision = gate.decision()
+    assert decision.state is TerminalState.INCOMPLETE
+    assert {violation.code for violation in decision.violations} == {"completion_invalid_binding_terminal"}
+
+
+def test_publish_failure_closes_a_gate_its_failed_finalizer_left_open() -> None:
+    gate = CompletionGate("run")
+    _page(gate, acknowledged=False)
+    facts = CompletionReportFacts(
+        source=KernelReport(state=KernelState.FAILED, terminal_reason="finalizer failed"),
+        operation="iter_list_counted",
+        assurance=None,
+        admitted=0,
+        emitted=0,
+        successes=0,
+        failures=0,
+        not_executed=0,
+        unknown=0,
+        buffered_commands_high_water=0,
+        active_references_high_water=0,
+        forced_state=TerminalState.FAILED,
+    )
+
+    report = gate.publish_failure(facts, CleanupState.FAILURE)
+
+    assert report.state is TerminalState.FAILED
+    assert not [violation.code for violation in report.violations if violation.code.startswith("completion_")]
+    assert gate.publish_failure(facts, CleanupState.SUCCESS) is report

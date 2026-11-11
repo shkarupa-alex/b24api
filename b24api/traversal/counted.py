@@ -134,7 +134,7 @@ class CountedItemStream:
             primary = error
             await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
             raise
-        except BaseException as error:
+        except Exception as error:
             primary = error
             snapshot = await self._context.snapshot()
             if isinstance(error, CapabilityError) and snapshot.counters.physical_requests == 0:
@@ -155,6 +155,12 @@ class CountedItemStream:
                 replay_disposition=replay_disposition,
             )
             raise incomplete from cause
+        except BaseException as error:
+            # A BaseException that is not an Exception is no traversal failure to wrap: it leaves as raised.
+            primary = error
+            await self._finalize(KernelState.FAILED, type(error).__name__)
+            _attach_report(error, self.report)
+            raise
         finally:
             self._closed = True
             if primary is not None and self.report.state is KernelState.NOT_STARTED:
