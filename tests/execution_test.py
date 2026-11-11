@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import contextlib
 import gc
 import weakref
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 
 import b24api
 from b24api import execution as execution_module
+from b24api.contracts import Command
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.errors import (
@@ -40,12 +42,12 @@ from b24api.execution.rate import (
     RatePolicyCapacityError,
 )
 from b24api.transport import httpx as httpx_transport_module
-from tests.scripting import ResponderTransport, replies
+from tests.scripting import Blocker, ResponderTransport, client_for, replies
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Awaitable, Iterable
 
-    from tests.scripting import ClientFactory
+    from tests.scripting import ClientFactory, Responder
 
 EXPECTED_RETRIED_CALLS = 2
 HTTP_OK = 200
@@ -154,6 +156,225 @@ async def test_failing_owned_cleanup_returns_the_concurrent_external_cancellatio
     await asyncio.create_task(worker())
 
     assert observed == [("external-caller",), ("external-caller",)]
+
+
+_LIST = Request.bare("entity.list", replay_safety=ReplaySafety.SAFE)
+_UNLOCK = Request.bare("entity.unlock")
+
+
+@pytest.mark.asyncio
+async def test_rearm_without_an_absorbed_cancellation_replays_nothing() -> None:
+    """A cancellation the task already received is not delivered again when cleanup absorbed none."""
+
+    async def worker() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        rearm_cancellation(None)
+        await asyncio.sleep(0)  # a replay would be delivered here
+        current.uncancel()
+
+    await asyncio.create_task(worker())
+
+
+@pytest.mark.asyncio
+async def test_one_cancellation_of_a_reading_task_lets_its_finally_await() -> None:
+    """The stream raises the cancellation once; the reader's own cleanup awaits undisturbed."""
+    blocker = Blocker()
+    steps: list[str] = []
+    async with client_for(ResponderTransport(blocker)) as api:
+
+        async def reader() -> None:
+            try:
+                async for _row in api.iter_list(_LIST):
+                    pass
+            finally:
+                steps.append("finally")
+                await asyncio.sleep(0)
+                steps.append("finally awaited")
+
+        task = asyncio.create_task(reader())
+        await blocker.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert steps == ["finally", "finally awaited"]
+
+
+@pytest.mark.asyncio
+async def test_a_handled_timeout_around_a_stream_leaves_no_cancellation_behind() -> None:
+    """The timeout's cancellation ends the read; once the caller handles the timeout nothing is pending."""
+    blocker = Blocker()
+    async with client_for(ResponderTransport(blocker)) as api:
+
+        async def reader() -> str:
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(0.01):
+                    async for _row in api.iter_list(_LIST):
+                        pass
+            await asyncio.sleep(0)
+            return "resumed"
+
+        assert await asyncio.create_task(reader()) == "resumed"
+
+
+@pytest.mark.asyncio
+async def test_a_call_in_the_cleanup_of_a_cancelled_task_is_sent() -> None:
+    """A compensating call after the task handled its cancellation runs; the cancellation is not raised again."""
+    transport = ResponderTransport(replies({"result": True}))
+    async with client_for(transport) as api:
+
+        async def worker() -> object:
+            current = asyncio.current_task()
+            assert current is not None
+            current.cancel()
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                return await api.call(_UNLOCK)
+            return None
+
+        assert await asyncio.create_task(worker()) is True
+
+    assert [request.method for request in transport.requests] == ["entity.unlock"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancellation_requested_during_a_cleanup_call_still_stops_it() -> None:
+    """A later cancellation still voids the cleanup call's response, even when the transport suppressed it."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def suppressing(_request: Request) -> object:
+        started.set()
+        while not release.is_set():
+            with contextlib.suppress(asyncio.CancelledError):
+                await release.wait()
+        return {"result": True}
+
+    transport = ResponderTransport(suppressing)
+    async with client_for(transport) as api:
+
+        async def worker() -> object:
+            current = asyncio.current_task()
+            assert current is not None
+            current.cancel()
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                return await api.call(_LIST)
+            return None
+
+        task = asyncio.create_task(worker())
+        async with asyncio.timeout(1):  # the cleanup call reaches the transport
+            await started.wait()
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert len(transport.requests) == 1
+
+
+def _swallowing_first_send(failure: TransportError, started: asyncio.Event) -> Responder:
+    """Answer the first send by swallowing the caller's cancellation and reporting ``failure`` instead."""
+
+    async def respond(request: Request) -> object:
+        if not started.is_set():
+            started.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.Future[None]()
+            return failure
+        commands = request.copy_parameters().get("cmd")
+        if isinstance(commands, dict):
+            return {"result": {"result": dict.fromkeys(commands, 1), "result_error": []}}
+        return {"result": 1}
+
+    return respond
+
+
+async def _cancel_once_started(started: asyncio.Event, work: Awaitable[object]) -> None:
+    task = asyncio.ensure_future(work)
+    async with asyncio.timeout(1):
+        await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_a_cancellation_a_transport_turns_into_a_failure_is_not_retried() -> None:
+    """The failure proves nothing ran and would be retried, but the request was cancelled meanwhile."""
+    started = asyncio.Event()
+    failure = TransportError("connect failed", phase=FailurePhase.CONNECTION_ESTABLISHED)
+    transport = ResponderTransport(_swallowing_first_send(failure, started))
+    async with client_for(transport) as api:
+        await _cancel_once_started(started, api.call(_LIST))
+
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_cancellation_a_transport_turns_into_a_failure_ends_the_batch() -> None:
+    """The next chunk is never sent once the first chunk's transport swallowed the cancellation."""
+    started = asyncio.Event()
+    transport = ResponderTransport(
+        _swallowing_first_send(TransportError("lost", phase=FailurePhase.DISPATCH_STARTED), started)
+    )
+    commands = [Command(Request.bare("entity.add", {"id": index}), index) for index in range(4)]
+    async with client_for(transport) as api:
+
+        async def drain() -> None:
+            async for _outcome in api.batch_outcomes(commands, batch_size=2):
+                pass
+
+        await _cancel_once_started(started, drain())
+
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stream_cleanup_failure_still_delivers_the_reader_cancellation() -> None:
+    """The cleanup failure is raised from the cancelled read; the cancellation lands at the next await."""
+
+    class CloseFailedError(Exception):
+        pass
+
+    class Source:
+        def __aiter__(self) -> Source:
+            return self
+
+        async def __anext__(self) -> Command[int]:
+            return Command(_LIST, 1)
+
+        async def aclose(self) -> None:
+            raise CloseFailedError
+
+    blocker = Blocker()
+    steps: list[str] = []
+    async with client_for(ResponderTransport(blocker)) as api:
+
+        async def reader() -> None:
+            with contextlib.suppress(CloseFailedError):
+                async for _outcome in api.batch_outcomes(Source(), batch_size=2):
+                    pass
+            steps.append("cleanup failure raised")
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                steps.append("cancellation delivered")
+                raise
+
+        task = asyncio.create_task(reader())
+        await blocker.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert steps == ["cleanup failure raised", "cancellation delivered"]
 
 
 @pytest.mark.asyncio
