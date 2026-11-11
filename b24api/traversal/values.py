@@ -4,27 +4,35 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import re
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
 from b24api.contracts.json import FrozenJson, FrozenMapping, _json_type_name
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.request import (
+    IdentityComponent,
     ResultSelector,
     _MappingValuesResultSelector,
     _TolerantMappingValuesResultSelector,
 )
 from b24api.contracts.response import ResultCollectionShape, result_snapshot
-from b24api.errors import CapabilityError, PaginationError, ResultShapeError
+from b24api.errors import CapabilityError, IdentityContractError, PaginationError, ResultShapeError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from b24api.contracts.request import IdentitySpec
+    from b24api.contracts.request_summary import RequestSummary
     from b24api.contracts.response import Response
     from b24api.traversal.plans import ItemCursorPlan
 
 type IdentityValue = str | int | tuple[str | int, ...]
 _MISSING = object()
+# The exact rendering of ``str(int)``: ASCII digits, no leading zero, an optional minus on a non-zero value.
+# Anything ``int()`` would also accept ("012", " 12", "1_2", "+12", non-ASCII digits) would let two wire
+# values collapse into one identity.
+_CANONICAL_DECIMAL = re.compile(r"0|-?[1-9][0-9]*")
 
 
 def _mapping_values(response: Response, selector: ResultSelector) -> tuple[FrozenJson, ...]:
@@ -129,20 +137,6 @@ def _page_fingerprint_policy(items: tuple[FrozenJson, ...], plan: object) -> tup
     return _page_fingerprint(items), track
 
 
-def _extract_path(value: FrozenJson, path: tuple[str | int, ...]) -> FrozenJson:
-    current = value
-    for part in path:
-        if isinstance(part, int):
-            if not isinstance(current, tuple) or part >= len(current):
-                raise PaginationError(f"identity path is missing: {path!r}")
-            current = current[part]
-        else:
-            if not isinstance(current, Mapping) or part not in current:
-                raise PaginationError(f"identity path is missing: {path!r}")
-            current = current[part]
-    return current
-
-
 def _coerce_identity(value: FrozenJson, coercion: IdentityCoercion) -> IdentityValue:
     if coercion is IdentityCoercion.EXACT_STRING:
         if not isinstance(value, str):
@@ -154,10 +148,49 @@ def _coerce_identity(value: FrozenJson, coercion: IdentityCoercion) -> IdentityV
         return value
     if isinstance(value, bool) or not isinstance(value, str | int):
         raise PaginationError("identity must be a decimal string or integer")
+    if isinstance(value, int):
+        return value
+    if _CANONICAL_DECIMAL.fullmatch(value) is None:
+        raise PaginationError("identity is not a canonical decimal integer")
     try:
         return int(value)
-    except ValueError as error:
-        raise PaginationError("identity is not a decimal integer") from error
+    except ValueError as error:  # beyond the interpreter's integer string conversion limit
+        raise PaginationError("identity is not a canonical decimal integer") from error
+
+
+def _row_identity(
+    item: FrozenJson,
+    component: IdentitySpec | IdentityComponent,
+    *,
+    row_offset: int,
+    request_summary: RequestSummary | None,
+    component_index: int | None = None,
+) -> IdentityValue:
+    """Read one row's identity, or one composite component, or raise ``IdentityContractError``.
+
+    Every traversal reads row identities through here, so a row breaking its declared identity fails
+    with the same typed, value-free error on every path; ``row_offset`` is the caller's position of
+    the row, and ``component_index`` names the component of a composite identity.
+    """
+    path, coercion = component.item_path, component.coercion
+    raw = _extract_optional_path(item, path)
+    cause: PaginationError | None = None
+    if raw is not _MISSING:
+        try:
+            return _coerce_identity(cast("FrozenJson", raw), coercion)
+        except PaginationError as error:
+            cause = error
+    raise IdentityContractError(
+        path=path,
+        coercion=coercion,
+        observed_type="missing" if raw is _MISSING else _json_type_name(raw),
+        row_offset=row_offset,
+        request_summary=request_summary,
+        component_index=component_index,
+        component_label=(
+            component.label if component_index is not None and isinstance(component, IdentityComponent) else None
+        ),
+    ) from cause
 
 
 def _validate_order(values: Sequence[IdentityValue], direction: str | None) -> None:
@@ -182,11 +215,15 @@ def _compare_identities(left: IdentityValue, right: IdentityValue) -> int:
 
 
 def _cursor_values(items: Sequence[FrozenJson], plan: ItemCursorPlan) -> list[IdentityValue]:
-    raw_values = [_extract_optional_path(item, plan.cursor_item_path) for item in items]
-    exhausted = [value is _MISSING or value is None for value in raw_values]
-    if any(exhausted):
-        raise PaginationError(f"cursor path is missing: {plan.cursor_item_path!r}")
-    return [_coerce_cursor(cast("FrozenJson", value), plan.cursor_coercion) for value in raw_values]
+    return [_cursor_value(item, plan.cursor_item_path, plan.cursor_coercion) for item in items]
+
+
+def _cursor_value(item: FrozenJson, path: tuple[str | int, ...], coercion: IdentityCoercion) -> IdentityValue:
+    """Read one row's cursor, or raise the cursor's ``PaginationError``; a null cursor counts as missing."""
+    raw = _extract_optional_path(item, path)
+    if raw is _MISSING or raw is None:
+        raise PaginationError(f"cursor path is missing: {path!r}")
+    return _coerce_cursor(cast("FrozenJson", raw), coercion)
 
 
 def _extract_optional_path(value: FrozenJson, path: tuple[str | int, ...]) -> FrozenJson | object:

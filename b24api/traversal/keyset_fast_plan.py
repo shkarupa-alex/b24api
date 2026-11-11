@@ -72,6 +72,8 @@ class LaneState:
     witness: ClosureWitness | None
     rounds: int
     reserved_rows: int
+    # Rows of this lane's validated pages so far: the lane offset of the next page's first row.
+    received_rows: int = 0
 
 
 @dataclass(slots=True)

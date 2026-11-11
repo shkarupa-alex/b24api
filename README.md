@@ -314,6 +314,26 @@ async with stream:
 Without `identity`, successful exhaustion is reported as `MECHANICS_ONLY`: pagination completed,
 but the client cannot prove that the portal did not duplicate or substitute rows.
 
+A page identical to an earlier page fails the traversal: rows alone cannot tell such a page from a
+portal that ignored `start` and returned the same page again, and a changed `next` or `total` cannot
+either, because an endpoint that ignores `start` can still compute them from it. A narrow `select`
+whose rows repeat by content, such as `{"select": ["STAGE_ID"]}`, therefore needs a unique field in
+the rows: add `ID` to the `select` and declare it as `identity`.
+
+A row whose identity is missing or does not match its coercion raises `IdentityContractError`, a
+`PaginationError`, as the cause of `IncompleteTraversalError` on every traversal; it names the path,
+the coercion, the observed JSON type and the row offset, never the value. The offset counts rows of
+the traversal; a fast keyset counts them within the lane that read the page. Identities and cursors
+are read before a `page_adapter` runs, so an adapter never sees a row that breaks them.
+`DECIMAL_STRING_INTEGER` accepts an integer or the canonical decimal string of one: ASCII digits
+without a leading zero, with a minus only before a non-zero value (`"0"`, `"12"`, `"-7"`). `"012"`,
+`" 12"`, `"1_2"` and `"+12"` are refused, so two different wire values never become one identity.
+
+`OffsetContinuation.SERVER_NEXT` requires `TotalTermination.EXACT_QUALIFIED`. It never continues
+without `next`, and the last Bitrix page carries rows but no `next`, so only an exact total can close
+it; `OffsetSpec` refuses the combination without the total with `ValueError`. Without a qualified
+total use the default `SERVER_NEXT_OR_OBSERVED_COUNT`, which confirms the end with an empty page.
+
 An endpoint that honors `start` only at a fixed server window and signals its end only with a
 shorter page (no usable `total`, no `next`) can declare that stop rule with
 `OffsetSpec(short_page_termination=ShortPageTermination.DECLARED_TERMINAL)`; its successful
@@ -482,6 +502,12 @@ previous boundary. `continuation=ResponseFlagTerminal(ResultSelector(("hasNextPa
 traversal on a `False` flag, even on a non-empty page, instead of requesting an empty confirmation
 page; a missing or non-boolean flag fails closed. An explicit global ascending or descending
 `ConsistencyPolicy` order contradicting a reversed page order is refused before any request.
+
+The cursor and the row identity are independent. Without `identity` the cursor value is the identity.
+An `identity` on another field, or on the cursor field with another coercion, only has to be unique:
+the cursor alone carries the order, so the identity's values may come in any order unless the
+consistency policy declares an order. An explicit `ConsistencyPolicy(order_semantics=...)` then
+applies to that identity, independently of the cursor's direction, and a page breaking it fails.
 
 ### Response-driven continuation
 

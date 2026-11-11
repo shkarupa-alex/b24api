@@ -35,7 +35,7 @@ from b24api.traversal.facade_support import _collection_selector
 from b24api.traversal.identity import _child_path, _request_with_controls
 from b24api.traversal.keyset_capability import canary_commands
 from b24api.traversal.keyset_eligibility import _reject_owned_controls
-from b24api.traversal.values import _coerce_identity, _extract_path, _response_items, _validate_order
+from b24api.traversal.values import _response_items, _row_identity, _validate_order
 
 if TYPE_CHECKING:
     from b24api.contracts.policy import ExecutionPolicy
@@ -268,7 +268,13 @@ class _Verifier:
         if enforce_cap and self.keyset.limit_path is not None and len(rows) > self.page_size:
             raise PaginationError("keyset verifier response exceeded its declared page cap")
         values = tuple(
-            _coerce_identity(_extract_path(row, self.identity.item_path), self.identity.coercion) for row in rows
+            _row_identity(
+                row,
+                self.identity,
+                row_offset=index,
+                request_summary=self.request.summary,
+            )
+            for index, row in enumerate(rows)
         )
         if any(not isinstance(value, int) for value in values):
             raise CapabilityError("keyset verifier requires integer-coercible identity values")

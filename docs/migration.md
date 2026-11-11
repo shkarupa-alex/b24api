@@ -6,6 +6,53 @@
   `1`, or with unbuffered output `0` (help) or `2` (a parser error).
 - **Any other failed write exits `4`**, `--help` to a full disk included, which exited `0` or `120`.
 
+## Traversal contract checks
+
+- **`SERVER_NEXT` needs an exact total.** `OffsetSpec(continuation=OffsetContinuation.SERVER_NEXT)`
+  without `total_termination=TotalTermination.EXACT_QUALIFIED` now raises `ValueError` at
+  construction. Such a traversal never continued without `next`, and with the total disabled only an
+  empty page could close it: an empty first page, or one a `next` had led to. Bitrix omits `next` on
+  its last page, which still holds rows, so every non-empty source failed with `PaginationError` on
+  that page. Add `EXACT_QUALIFIED` when the
+  filtered `total` is exact, or use the default `SERVER_NEXT_OR_OBSERVED_COUNT`.
+- **A row breaking its identity raises `IdentityContractError` on every traversal.** A missing
+  identity, or one of the wrong type, failed the traversal with a plain `PaginationError` (for example
+  "identity path is missing") before the typed check could run, and the page was recorded as
+  `range_contradiction`. Sequential, counted, keyset (sequential and fast: range, partitioned and
+  automatic), cursor, continuation, window and reference traversals now all raise
+  `IdentityContractError` with the path, coercion, observed type and row offset; the failure category
+  and the page trace both say `identity_contract`. It is a subclass of `PaginationError`, so
+  `except PaginationError` still catches it. The row offset counts rows of the traversal, except in
+  a fast keyset, where it counts rows of the lane that read the page: of its range window, partition
+  lane, boundary page or finishing sweep. In a cursor traversal without its own `identity`, a row
+  whose cursor is missing or malformed now fails with this error too, since the cursor is its
+  identity. Tokens are still read before the `page_adapter` runs, so an adapter never sees a page
+  with a row breaking its identity or cursor; that page now raises the typed error. An adapter that
+  removes or changes a valid identity or cursor value still fails with `PageAdaptationError`.
+- **`DECIMAL_STRING_INTEGER` accepts only canonical decimal strings.** Strings were converted with
+  `int()`, so `"012"`, `" 12"`, `"1_2"`, `"+12"` and non-ASCII digits all became `12`. Only ASCII
+  digits without a leading zero are accepted now, with a minus before a non-zero value (`"0"`, `"12"`,
+  `"-7"`); integers are accepted as before. A refused identity raises `IdentityContractError`. A
+  refused cursor value raises `IdentityContractError` too when the cursor is the identity (no other
+  `identity=` is declared), and the cursor's `PaginationError` ("cursor value does not satisfy
+  cursor_coercion") beside a separate identity. A caller's start cursor is checked the same way: a
+  `Binding(start_cursor=...)` of `iter_cursors()` with a non-canonical string fails that binding
+  before it is sent, and a cursor control already in the request of an exclusive-range cursor
+  (`CursorDomain.EXCLUSIVE_POSITIVE_INTEGER`) is refused with `CapabilityError` before any request.
+- **A cursor identity on another field is no longer ordered.** `iter_list_cursor()` and
+  `iter_cursors()` checked the order of `identity=` values as if they were the cursor, so an identity
+  on another field (or on the cursor field with another coercion) failed with "page identities are
+  not strictly ascending". The cursor carries the order; such an identity now only has to be unique,
+  unless the consistency policy declares an order. An identity equal to the cursor keeps the cursor's
+  order check. An explicit `ConsistencyPolicy(order_semantics=OrderSemantics.ASCENDING)` (or
+  `DESCENDING`) now applies to such an identity on its own: beside a cursor of the opposite direction
+  it used to be refused with `CapabilityError` before any request, and it is now admitted and fails
+  the traversal with `PaginationError` as soon as the identity's values break that order.
+- **A repeated page still fails without identity.** `iter_list()` without `identity` fails when a
+  page equals an earlier one, for example under a narrow `select` whose rows repeat. That stays: such
+  a page cannot be told apart from a portal that ignored `start`. The error message now says so; add a
+  unique field such as `ID` to the `select` and declare it as `identity`.
+
 ## Budget accounting scales with the bindings
 
 - **Long reference streams no longer slow down as they go.** Every page and row of

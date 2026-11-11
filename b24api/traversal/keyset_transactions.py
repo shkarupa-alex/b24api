@@ -12,7 +12,6 @@ from b24api.errors import (
     B24ApiError,
     BudgetExceededError,
     IncompleteTraversalError,
-    PageAdaptationError,
     PaginationError,
 )
 from b24api.traversal import keyset_step
@@ -185,9 +184,7 @@ def _validate_wave(
         selected_rows += receipt.selected_rows
         rejections.append(receipt)
         host.violations.append(receipt.violation)
-        page_outcome, rejection_code = classify_rejection(outcome)
-        if isinstance(receipt.error, PageAdaptationError):
-            rejection_code = PageRejectionCode.PAGE_ADAPTATION
+        page_outcome, rejection_code = classify_rejection(outcome, receipt)
         host.record_page(
             plan,
             index=index,
@@ -296,6 +293,7 @@ async def execute_body_wave(host: KeysetTransactionHost) -> None:
     for lane in candidates_lanes[: len(plans)]:
         receipt = by_ordinal[lane.spec.ordinal]
         lane.rounds += 1
+        lane.received_rows += len(receipt.rows)
         host.transactions.lane_rows[lane.spec.ordinal].extend(receipt.rows)
         host.transactions.lane_identities[lane.spec.ordinal].extend(receipt.identities)
         host.transactions.lane_commands[lane.spec.ordinal].append((receipt.command_id, len(receipt.rows)))
@@ -368,7 +366,12 @@ async def execute_finish_page(
     if host.transactions.finish_cursor is None:
         host.transactions.terminal = True
         return
-    finish_lane = host.transactions.finish_lane = _finish_lane(host.transactions.finish_cursor, finish_plan)
+    previous = host.transactions.finish_lane
+    finish_lane = host.transactions.finish_lane = _finish_lane(
+        host.transactions.finish_cursor,
+        finish_plan,
+        received_rows=0 if previous is None else previous.received_rows,
+    )
     plan = build_lane_plan(host, finish_lane, phase=KeysetPhase.FINISH, request=request)
     dispatch = host.engine.page_dispatch
     reservation = await host.context.reserve_page()
@@ -392,6 +395,7 @@ async def execute_finish_page(
         )
         if isinstance(receipt, ReceiptRejection):
             _reject_finish_receipt(host, plan, outcome, receipt, dispatch)
+        finish_lane.received_rows += len(receipt.rows)
         response = outcome.response if isinstance(outcome, BatchSuccess) else None
         host.completion_recorder.validated(plan.command_id)
         terminal = keyset_step.keyset_page_terminal(finish_plan, len(receipt.rows))
@@ -462,11 +466,12 @@ def _require_closure_witness(receipt: LaneReceipt) -> None:
         raise RuntimeError("terminal fast finish page lacked a closure witness")
 
 
-def _finish_lane(cursor: int, finish_plan: KeysetPlan) -> LaneState:
-    """Open the single sequential finish lane that continues from the fast phase's cursor."""
+def _finish_lane(cursor: int, finish_plan: KeysetPlan, *, received_rows: int) -> LaneState:
+    """Open the finish lane's next page: it continues from the cursor, its row count from the last page."""
     descending = finish_plan.direction != "asc"
     bounds = LaneBounds(None if descending else cursor, cursor if descending else None)
-    return LaneState(LaneSpec(0, LaneKind.FINISH, bounds, descending, None), cursor, LaneStatus.OPEN, None, 0, 0)
+    spec = LaneSpec(0, LaneKind.FINISH, bounds, descending, None)
+    return LaneState(spec, cursor, LaneStatus.OPEN, None, 0, 0, received_rows)
 
 
 def _reject_finish_receipt(
@@ -479,9 +484,7 @@ def _reject_finish_receipt(
     """Record a rejected finish page as a rejected wave command is recorded, discard its rows, and raise."""
     host.violations.append(receipt.violation)
     host.admission.record_raw(receipt.selected_rows, discarded=True)
-    page_outcome, rejection_code = classify_rejection(outcome)
-    if isinstance(receipt.error, PageAdaptationError):
-        rejection_code = PageRejectionCode.PAGE_ADAPTATION
+    page_outcome, rejection_code = classify_rejection(outcome, receipt)
     host.record_page(
         plan,
         index=None,
