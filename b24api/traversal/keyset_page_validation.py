@@ -148,15 +148,15 @@ def validate_lane_receipt(  # noqa: PLR0913
     rows: tuple[FrozenJson, ...] = ()
     try:
         rows = _response_items(outcome.response, selector or ResultSelector.root())
-        if plan.phase is not KeysetPhase.ANCHOR_PROBE:
-            rows = adapt_page(
-                outcome.response,
-                rows,
-                adapter=page_adapter,
-                identities=((identity.item_path, identity.coercion),),
-                request_summary=plan.request.summary,
-                page_offset=lane.rounds,
-            )
+        # Every phase, the anchor probe too: a partition lane publishes its retained anchor row as a fence.
+        rows = adapt_page(
+            outcome.response,
+            rows,
+            adapter=page_adapter,
+            identities=((identity.item_path, identity.coercion),),
+            request_summary=plan.request.summary,
+            page_offset=lane.rounds,
+        )
         if len(rows) > effective_page_cap or len(rows) > plan.reserved_rows:
             raise PaginationError("response exceeded the declared keyset page cap")
         if plan.expects_single_row and len(rows) > 1:

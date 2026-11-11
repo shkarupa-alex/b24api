@@ -39,11 +39,32 @@ class PageReservation:
     reference: str | None
 
 
+@dataclass(slots=True)
+class _ReferencePages:
+    """The page ledger of one reference binding: committed pages, reservations in flight, and closure.
+
+    An entry exists only while it carries state: it is created by the binding's first reservation and
+    dropped once nothing is in flight and either nothing was committed or the binding has closed. A
+    closed binding reserves no further pages, so its committed count is no longer needed.
+    """
+
+    committed: int = 0
+    pending: int = 0
+    closed: bool = False
+
+    @property
+    def settled(self) -> bool:
+        """Return whether the entry can be dropped without losing a count any ceiling still needs."""
+        return self.pending == 0 and (self.closed or self.committed == 0)
+
+
 class ExecutionContext:
     """Mutable operation-scoped budget ledger with immutable snapshots.
 
-    Every state change is synchronous code between awaits, so the event loop serializes it and no
-    lock is needed; a mutator must never await in the middle of an update.
+    The ledger is plain counters and one entry per open reference binding, so every reservation,
+    settlement and admission check is O(1); the validated ``BudgetCounters`` value is built only by
+    ``snapshot()``. Every state change is synchronous code between awaits, so the event loop
+    serializes it and no lock is needed; a mutator must never await in the middle of an update.
     """
 
     def __init__(
@@ -58,7 +79,11 @@ class ExecutionContext:
         self.coordinator = coordinator
         self._clock = clock
         self._start: float | None = None
-        self._counters = BudgetCounters()
+        self._physical_requests = 0
+        self._logical_pages = 0
+        self._buffered_rows = 0
+        self._buffered_rows_high_water = 0
+        self._reference_pages: dict[str, _ReferencePages] = {}
         self._retries = 0
         self._cooldown_seconds = 0.0
         self._ambiguous_physical_attempts = 0
@@ -87,12 +112,17 @@ class ExecutionContext:
 
     async def reserve_attempt(self, *, attempts_for_request: int, retry_started: float) -> None:
         """Reserve the attempt budget."""
-        self._counters = self._counters.reserve_attempt(
-            self.policy,
-            attempts_for_request=attempts_for_request,
-            retry_elapsed=max(0.0, self._clock() - retry_started),
-            total_elapsed=self.elapsed,
-        )
+        retry_elapsed = max(0.0, self._clock() - retry_started)
+        total_elapsed = self.elapsed
+        if self._physical_requests >= self.policy.max_requests:
+            raise BudgetExceededError("physical request budget exhausted")
+        if attempts_for_request >= self.policy.max_attempts_per_request:
+            raise BudgetExceededError("per-request attempt budget exhausted")
+        if retry_elapsed >= self.policy.max_retry_elapsed_per_request:
+            raise BudgetExceededError("per-request retry time budget exhausted")
+        if total_elapsed >= self.policy.max_elapsed:
+            raise BudgetExceededError("operation elapsed budget exhausted")
+        self._physical_requests += 1
 
     async def record_retry(self) -> None:
         """Record the retry."""
@@ -117,17 +147,13 @@ class ExecutionContext:
         try:
             async with asyncio.timeout(self.policy.max_elapsed - self.elapsed):
                 while True:
-                    if self._counters.logical_pages >= self.policy.max_pages:
-                        raise BudgetExceededError("logical page budget exhausted")
-                    committed = (
-                        dict(self._counters.pages_per_reference).get(reference, 0) if reference is not None else 0
-                    )
-                    if reference is not None and committed >= self.policy.max_pages_per_reference:
-                        raise BudgetExceededError("per-reference page budget exhausted")
+                    self._check_page_budget(reference)
                     if self.can_reserve_page(reference=reference):
                         reservation = PageReservation(self._page_sequence, reference)
                         self._page_sequence += 1
                         self._page_reservations[reservation] = None
+                        if reference is not None:
+                            self._reference_pages.setdefault(reference, _ReferencePages()).pending += 1
                         return reservation
                     self._page_changed.clear()
                     await self._page_changed.wait()
@@ -136,15 +162,12 @@ class ExecutionContext:
 
     def can_reserve_page(self, *, reference: str | None = None) -> bool:
         """Return whether one page reservation can be admitted immediately."""
-        if self._counters.logical_pages >= self.policy.max_pages:
+        if self._logical_pages + len(self._page_reservations) >= self.policy.max_pages:
             return False
-        committed = dict(self._counters.pages_per_reference).get(reference, 0) if reference is not None else 0
-        pending_for_reference = sum(item.reference == reference for item in self._page_reservations)
-        global_available = self._counters.logical_pages + len(self._page_reservations) < self.policy.max_pages
-        reference_available = (
-            reference is None or committed + pending_for_reference < self.policy.max_pages_per_reference
-        )
-        return global_available and reference_available
+        if reference is None:
+            return True
+        entry = self._reference_pages.get(reference)
+        return entry is None or entry.committed + entry.pending < self.policy.max_pages_per_reference
 
     async def reserve_pages(self, count: int) -> tuple[PageReservation, ...]:
         """Atomically reserve a fixed operation-local page wave or fail immediately."""
@@ -152,7 +175,7 @@ class ExecutionContext:
             raise ValueError("page reservation count must be a positive integer")
         if self.policy.max_elapsed - self.elapsed <= 0:
             raise BudgetExceededError("page reservation exceeded operation time budget")
-        used = self._counters.logical_pages + len(self._page_reservations)
+        used = self._logical_pages + len(self._page_reservations)
         if used + count > self.policy.max_pages:
             raise BudgetExceededError("logical page budget cannot fit the requested wave")
         reservations = tuple(PageReservation(self._page_sequence + offset, None) for offset in range(count))
@@ -164,8 +187,14 @@ class ExecutionContext:
         """Atomically charge one decoded response with no cancellation point."""
         if reservation not in self._page_reservations:
             raise RuntimeError("page reservation is not active")
-        self._counters = self._counters.reserve_page(self.policy, reference=reservation.reference)
+        self._check_page_budget(reservation.reference)
         self._page_reservations.pop(reservation)
+        self._logical_pages += 1
+        if reservation.reference is not None:
+            entry = self._reference_pages[reservation.reference]
+            entry.pending -= 1
+            entry.committed += 1
+            self._drop_settled(reservation.reference, entry)
         self._page_changed.set()
 
     def release_page(self, reservation: PageReservation) -> None:
@@ -173,18 +202,52 @@ class ExecutionContext:
         if reservation not in self._page_reservations:
             return
         self._page_reservations.pop(reservation)
+        if reservation.reference is not None:
+            entry = self._reference_pages[reservation.reference]
+            entry.pending -= 1
+            self._drop_settled(reservation.reference, entry)
         self._page_changed.set()
+
+    def close_reference(self, reference: str) -> None:
+        """Forget a closed binding's committed pages; it must reserve no further page under ``reference``.
+
+        A reservation still in flight keeps the entry until it is committed or released, so both
+        ceilings stay exact while the ledger holds state only for open bindings.
+        """
+        entry = self._reference_pages.get(reference)
+        if entry is not None:
+            entry.closed = True
+            self._drop_settled(reference, entry)
+
+    def _check_page_budget(self, reference: str | None) -> None:
+        """Refuse a page once the operation or the reference has committed its whole page budget."""
+        if self._logical_pages >= self.policy.max_pages:
+            raise BudgetExceededError("logical page budget exhausted")
+        entry = None if reference is None else self._reference_pages.get(reference)
+        if entry is not None and entry.committed >= self.policy.max_pages_per_reference:
+            raise BudgetExceededError("per-reference page budget exhausted")
+
+    def _drop_settled(self, reference: str, entry: _ReferencePages) -> None:
+        if entry.settled:
+            del self._reference_pages[reference]
 
     async def set_buffered_rows(self, rows: int) -> None:
         """Record retained decoded rows and enforce the global buffer ceiling."""
-        self._counters = self._counters.with_buffered_rows(self.policy, rows)
+        self._hold_buffered_rows(rows)
 
     async def adjust_buffered_rows(self, delta: int) -> None:
         """Atomically account concurrent scheduler buffers by a signed delta."""
         if not isinstance(delta, int) or isinstance(delta, bool):
             raise TypeError("buffer delta must be an integer")
-        target = self._counters.buffered_rows + delta
-        self._counters = self._counters.with_buffered_rows(self.policy, target)
+        self._hold_buffered_rows(self._buffered_rows + delta)
+
+    def _hold_buffered_rows(self, rows: int) -> None:
+        if rows < 0:
+            raise ValueError("buffered row count cannot be negative")
+        if rows > self.policy.max_buffered_rows:
+            raise BudgetExceededError("buffered row budget exhausted")
+        self._buffered_rows = rows
+        self._buffered_rows_high_water = max(rows, self._buffered_rows_high_water)
 
     def ensure_identity_capacity(self, additional: int) -> None:
         """Reject a page that would exceed the operation-wide identity budget."""
@@ -214,7 +277,17 @@ class ExecutionContext:
     async def snapshot(self) -> ExecutionSnapshot:
         """Return the current immutable snapshot."""
         return ExecutionSnapshot(
-            counters=self._counters,
+            counters=BudgetCounters(
+                physical_requests=self._physical_requests,
+                logical_pages=self._logical_pages,
+                pages_per_reference=tuple(
+                    (reference, entry.committed)
+                    for reference, entry in self._reference_pages.items()
+                    if entry.committed
+                ),
+                buffered_rows=self._buffered_rows,
+                buffered_rows_high_water=self._buffered_rows_high_water,
+            ),
             retries=self._retries,
             cooldown_seconds=self._cooldown_seconds,
             elapsed=self.elapsed,

@@ -41,6 +41,9 @@ if TYPE_CHECKING:
 
 _MAX_ID_LENGTH = 128
 _MAX_VIOLATIONS = 128
+# Negative closures, which claim none of the binding's rows: a page already settled there is released.
+# A caller stop is a successful bounded prefix, so its pages must still be acknowledged.
+_RELEASING_CLOSURES = frozenset({BindingClosure.FAILURE, BindingClosure.UNKNOWN})
 
 
 class _Stage(IntEnum):
@@ -205,6 +208,7 @@ class CompletionGate:
         self._terminal = 0
         self._scheduled = 0
         self._acknowledged = 0
+        self._released = 0
         self._negative_pages = 0
         self._negative_bindings = 0
         self._unknown = 0
@@ -339,7 +343,11 @@ class CompletionGate:
 
     def _close_binding(self, event: BindingTerminal) -> str | None:
         binding = self._bindings.get(event.binding_id)
-        if binding is None or binding.open_pages or not isinstance(event.closure, BindingClosure):
+        if binding is None or not isinstance(event.closure, BindingClosure):
+            return "completion_invalid_binding_terminal"
+        if binding.open_pages and event.closure in _RELEASING_CLOSURES:
+            self._release_settled_pages(event.binding_id)
+        if binding.open_pages:
             return "completion_invalid_binding_terminal"
         violation = _binding_closure_violation(binding, event)
         if violation is not None:
@@ -375,6 +383,19 @@ class CompletionGate:
         self._empty_source = event.empty_source
         return None
 
+    def _release_settled_pages(self, binding_id: int) -> None:
+        """Release the binding's pages whose command outcome is known but that the consumer never accepted.
+
+        A stream closed or failed while it delivered a page leaves that page settled and unacknowledged:
+        the binding's failed or unknown closure already claims none of its rows. A page whose dispatch
+        outcome was not observed stays open, so its producer must still settle it, as unknown when it
+        cannot tell.
+        """
+        settled = [key for key, page in self._pages.items() if key[0] == binding_id and page.stage > _Stage.SCHEDULED]
+        for key in settled:
+            self._released += 1
+            self._retire_page(*key)
+
     def _retire_page(self, binding_id: int, page_id: int) -> None:
         del self._pages[binding_id, page_id]
         self._bindings[binding_id].open_pages -= 1
@@ -387,7 +408,7 @@ class CompletionGate:
             self._violations
             or self._bindings
             or self._pages
-            or self._scheduled != self._acknowledged + self._negative_pages
+            or self._scheduled != self._acknowledged + self._negative_pages + self._released
             or (self._stream is StreamClosure.NATURAL and self._admitted == 0 and not self._empty_source)
             or self._cleanup is CleanupState.FAILURE,
         )
@@ -555,10 +576,15 @@ class CompletionGate:
         self._published = report
         return report
 
-    def publish_failure(self, facts: CompletionReportFacts) -> OperationReport:
-        """Publish one minimal FAILED report when a finalizer raised; an earlier publication stands."""
+    def publish_failure(self, facts: CompletionReportFacts, cleanup: CleanupState) -> OperationReport:
+        """Publish one minimal FAILED report when a finalizer raised; an earlier publication stands.
+
+        The failed finalizer may not have recorded terminal or cleanup evidence, so the gate is closed here
+        with the actual ``cleanup`` outcome before the report is built.
+        """
         if self._published is not None:
             return self._published
+        self.close_after_failure(cleanup)
         self._report_facts = facts
         return self.finish()
 

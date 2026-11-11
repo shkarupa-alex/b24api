@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from b24api.contracts.error_base import BudgetExceededError
 from b24api.contracts.json import _is_plain_int
 from b24api.contracts.v3_codes import REFUSAL_V3_ERROR_CODES, TRANSIENT_V3_ERROR_CODES
 
@@ -330,7 +329,12 @@ class ExecutionPolicy:
 
 @dataclass(frozen=True, slots=True)
 class BudgetCounters:
-    """Immutable counters implementing pre-scheduling budget semantics."""
+    """Immutable, validated snapshot of an operation's budget counters.
+
+    The execution context keeps the live counters in a mutable ledger and builds this value only
+    when a snapshot or report asks for one. ``pages_per_reference`` holds the committed logical
+    pages of every reference binding that is still open; a closed binding's count is dropped.
+    """
 
     physical_requests: int = 0
     logical_pages: int = 0
@@ -353,64 +357,3 @@ class BudgetCounters:
             raise ValueError("budget counters cannot be negative")
         if self.buffered_rows > self.buffered_rows_high_water:
             raise ValueError("current buffer cannot exceed its high-water mark")
-
-    def reserve_attempt(
-        self,
-        policy: ExecutionPolicy,
-        *,
-        attempts_for_request: int,
-        retry_elapsed: float,
-        total_elapsed: float,
-    ) -> BudgetCounters:
-        """Reserve the attempt budget."""
-        if self.physical_requests >= policy.max_requests:
-            _raise_budget("physical request budget exhausted")
-        if attempts_for_request >= policy.max_attempts_per_request:
-            _raise_budget("per-request attempt budget exhausted")
-        if retry_elapsed >= policy.max_retry_elapsed_per_request:
-            _raise_budget("per-request retry time budget exhausted")
-        if total_elapsed >= policy.max_elapsed:
-            _raise_budget("operation elapsed budget exhausted")
-        return BudgetCounters(
-            physical_requests=self.physical_requests + 1,
-            logical_pages=self.logical_pages,
-            pages_per_reference=self.pages_per_reference,
-            buffered_rows=self.buffered_rows,
-            buffered_rows_high_water=self.buffered_rows_high_water,
-        )
-
-    def reserve_page(self, policy: ExecutionPolicy, *, reference: str | None = None) -> BudgetCounters:
-        """Reserve the page budget."""
-        if self.logical_pages >= policy.max_pages:
-            _raise_budget("logical page budget exhausted")
-        per_reference = dict(self.pages_per_reference)
-        if reference is not None:
-            current = per_reference.get(reference, 0)
-            if current >= policy.max_pages_per_reference:
-                _raise_budget("per-reference page budget exhausted")
-            per_reference[reference] = current + 1
-        return BudgetCounters(
-            physical_requests=self.physical_requests,
-            logical_pages=self.logical_pages + 1,
-            pages_per_reference=tuple(sorted(per_reference.items())),
-            buffered_rows=self.buffered_rows,
-            buffered_rows_high_water=self.buffered_rows_high_water,
-        )
-
-    def with_buffered_rows(self, policy: ExecutionPolicy, rows: int) -> BudgetCounters:
-        """Return counters with buffered rows."""
-        if rows < 0:
-            raise ValueError("buffered row count cannot be negative")
-        if rows > policy.max_buffered_rows:
-            _raise_budget("buffered row budget exhausted")
-        return BudgetCounters(
-            physical_requests=self.physical_requests,
-            logical_pages=self.logical_pages,
-            pages_per_reference=self.pages_per_reference,
-            buffered_rows=rows,
-            buffered_rows_high_water=max(rows, self.buffered_rows_high_water),
-        )
-
-
-def _raise_budget(message: str) -> None:
-    raise BudgetExceededError(message)

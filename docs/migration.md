@@ -1,5 +1,54 @@
 # Migration guide
 
+## Budget accounting scales with the bindings
+
+- **Long reference streams no longer slow down as they go.** Every page and row of
+  `iter_references()`, `iter_reference_sources()` and `fan_out()` copied, sorted and validated the page count of
+  every binding read so far, so CPU time grew with the square of the bindings: over an in-memory
+  transport, 10,000 one-page bindings took about 74 s of CPU, against 8 s now. The operation's
+  budget counters are now updated in place, and a binding's page count is dropped once the binding
+  ends. Budgets, failures, events and reports are unchanged.
+- **`BudgetCounters` is only a snapshot.** The value in `b24api.contracts.policy`, which is not
+  exported, lost its `reserve_attempt`, `reserve_page` and `with_buffered_rows` methods; budget
+  checks live in the operation's execution context. Its `pages_per_reference` in an execution
+  snapshot lists only bindings that still hold pages: open bindings with a committed page, and a
+  closed binding until its page in flight settles.
+
+## Early close and completion evidence
+
+- **A counted early exit publishes its report.** Leaving `iter_list_counted()` with `break`, or
+  `collect(limit=...)`, while a tail page was being delivered raised `RuntimeError: completion gate
+  requires stream terminal and cleanup outcome` and left `stream.report` empty. The stream now
+  closes as `EARLY_CLOSED` with its report.
+- **No false protocol violation on an early close.** A stream closed, or failed in a `page_stop`
+  callback, while it delivered a page reported the blocking violation
+  `completion_invalid_binding_terminal`. A binding that ends as failed or unknown now releases a page
+  that was settled but never acknowledged, so that violation only reports a real protocol error, such
+  as a page whose dispatch outcome was never settled or a caller stop over an unacknowledged page. A
+  reference whose `page_stop` callback fails therefore ends its operation as
+  `COMPLETED_WITH_FAILURES` with a `ReferenceFailure`, like any other failed binding, instead of
+  `INCOMPLETE`.
+- **A `BaseException` leaves a counted traversal as raised.** A `BaseException` that is not an
+  `Exception`, such as an application's own shutdown signal, was wrapped in
+  `IncompleteTraversalError`. It now propagates unchanged with a `FAILED` report, as from
+  `iter_list()`; ordinary exceptions are wrapped as before.
+
+## Keyset traversal
+
+- **A caller order is refused.** A sequential keyset, flat or in references, accepted an `order`
+  with another field beside the identity, for example `{"order": {"PRIO": "DESC"}}`. The traversal
+  added its identity key after it, the server ordered by the caller's field first, and the cursor
+  skipped rows while the report still claimed exact identity coverage. Such a request now fails
+  with `CapabilityError` before any request is sent. A sequential keyset still accepts an order by
+  the identity key alone; fast and automatic keyset refuse any caller order, as before.
+- **Anchor rows are adapted.** A partitioned keyset, including the one `AutoKeysetExecution` picks
+  for a large selection, published each lane's retained upper anchor row without passing it through
+  the `page_adapter`. The anchor probe page is now adapted like every other page, so an adapter that
+  raises on it fails the traversal instead of letting the row through unadapted. An adapter is
+  therefore also invoked on the anchor probe pages of `AutoKeysetExecution` and
+  `PartitionedKeysetExecution`, including when the automatic plan ends up sequential, and may be
+  called more often than before.
+
 ## Cancellation is delivered once
 
 - **Your cleanup after a cancelled read runs.** A stream, batch or reference operation cancelled

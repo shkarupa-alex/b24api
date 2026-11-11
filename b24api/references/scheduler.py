@@ -397,12 +397,14 @@ class ReferenceScheduler:
         except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
             await output.put(self._failure_event(run, error))
         finally:
-            if pages is not None:
-                await pages.aclose()
-            self._retire_producer(run)
-            self._fast_active.discard(work.index)
-            if run.reservation is not None:
-                await self.buffer.abort(run.reservation)
+            try:
+                if pages is not None:
+                    await pages.aclose()
+            finally:
+                self._retire_producer(run)
+                self._fast_active.discard(work.index)
+                if run.reservation is not None:
+                    await self.buffer.abort(run.reservation)
         if run.deferred_cleanup_error is not None:
             raise run.deferred_cleanup_error
 
@@ -458,9 +460,10 @@ class ReferenceScheduler:
         )
 
     def _retire_producer(self, run: _ReferenceRun) -> None:
-        """Release the run's dispatcher waits and remove it from the advisory producer state."""
+        """Release the run's dispatcher waits, remove it from the advisory producer state and close its page ledger."""
         run.admit_page()
         run.settle_page()
+        self.context.close_reference(run.producer_key)
         self.producer_state.runnable.discard(run.producer_key)
         self.producer_state.admitting.discard(run.producer_key)
         self.producer_state.pending_continuations.discard(run.producer_key)

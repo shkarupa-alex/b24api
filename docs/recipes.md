@@ -130,8 +130,8 @@ later windows are empty. Do not use `exhausted` alone as the basis for deleting 
 were absent from the export. A `page_stop` callback runs on every delivered page, the closing short
 page included, so the application can durably commit its last rows. `CallerStop` on a continuing
 full page is reported as a bounded prefix; on the closing short page it is ignored and the closure
-stays `DECLARED_SHORT_PAGE`. A callback exception or invalid result on any page fails the traversal,
-leaves that page unacknowledged and never reports it as exhausted.
+stays `DECLARED_SHORT_PAGE`. A callback exception or invalid result on any page fails the traversal
+(in references, that binding), leaves that page unacknowledged and never reports it as exhausted.
 
 The same `BOOKING_OFFSET` works in references:
 `SequentialTraversal(selector=ResultSelector(("booking",)), page_size=BOOKING_PAGE, offset=BOOKING_OFFSET)`.
@@ -309,10 +309,12 @@ Any other update is refused locally before that binding sends anything: `iter_re
 reports it as `ReferenceNotExecuted(LOCAL_VALIDATION_FAILED)` with its correlation while the other
 bindings continue, and fail-fast `iter_references()` raises `ReferenceFailed`. Order, `start`, limit
 and split-order controls stay exclusive as before. The base request keeps its own rules: a
-non-mapping `filter`, or a base key equal to the managed cursor key (such as `>ID`), is refused with
-`CapabilityError` before any binding is read, while other identity constraints such as `<=id` remain
-allowed. `traversal_control_paths()` still lists the containers a traversal writes, including the
-whole filter; it names those containers and does not decide which binding updates compose.
+non-mapping `filter`, a base key equal to the managed cursor key (such as `>ID`), or a base `order`
+with any key other than the identity's order key (automatic, range and partitioned keyset refuse any
+base `order`), is refused with `CapabilityError` before any binding is read, while other identity
+constraints such as `<=id` remain allowed. `traversal_control_paths()` still lists the containers a
+traversal writes, including the whole filter; it names those containers and does not decide which
+binding updates compose.
 The same filter updates apply to automatic, range and partitioned keyset references, which need
 `BatchDispatch`; a `KeysetSpec.boundary` remains unavailable in references, and the recipe does not
 promise that every REST method treats arbitrary constant filters the same way.
@@ -432,8 +434,8 @@ stream = client.iter_list_window(request, traversal=window, page_stop=popup)
 ```
 
 `thaw_json` returns a plain mutable copy of a frozen value. The callback is the page's durable
-acknowledgement: an exception or an invalid decision fails the traversal and leaves that page
-unacknowledged, and a rejected or failed response never reaches it.
+acknowledgement: an exception or an invalid decision fails the traversal (in references, that
+binding) and leaves that page unacknowledged, and a rejected or failed response never reaches it.
 
 A continuation traversal offers every page its rule evaluates the same way, empty pages between two
 control vectors and its closing page included. Other traversals offer only pages that deliver rows,

@@ -90,7 +90,11 @@ class CompletionRecorder:
 
     def settled(self, outcome: CommandSettlement) -> None:
         """Record dispatch success or a terminal negative command outcome."""
-        page_id = self._require_page()
+        self._settle(self._require_page(), outcome)
+        if outcome is not CommandSettlement.SUCCESS:
+            self._current = None
+
+    def _settle(self, page_id: int, outcome: CommandSettlement) -> None:
         self.gate.emit(
             PageCommandOutcome(
                 operation_id=self.gate.operation_id,
@@ -100,9 +104,7 @@ class CompletionRecorder:
                 outcome=outcome,
             )
         )
-        if outcome is not CommandSettlement.SUCCESS:
-            self._unknown = self._unknown or outcome is CommandSettlement.UNKNOWN
-            self._current = None
+        self._unknown = self._unknown or outcome is CommandSettlement.UNKNOWN
 
     def validated(self, row_count: int) -> None:
         """Record the validated row count of the current page without retaining values."""
@@ -264,10 +266,14 @@ class CountedCompletionRecorder(CompletionRecorder):
         return page_id
 
     def settle_unobserved(self) -> None:
-        """Retire scheduled tail pages whose dispatch outcome was not observed."""
-        for page_id in tuple(sorted(self._reserved - {self._current})):
-            self.activate(page_id)
-            self.settled(CommandSettlement.UNKNOWN)
+        """Retire scheduled tail pages whose dispatch outcome was not observed.
+
+        The page being delivered, if any, stays active: its outcome is known, and the binding's terminal
+        releases it when the stream ends before the consumer accepted it.
+        """
+        for page_id in sorted(self._reserved - {self._current}):
+            self._settle(page_id, CommandSettlement.UNKNOWN)
+            self._reserved.discard(page_id)
 
     def activate(self, page_id: int) -> None:
         """Select one returned logical page for settlement and validation."""
