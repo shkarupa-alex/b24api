@@ -117,3 +117,23 @@ def test_counted_recorder_retires_unexecuted_reserved_pages_before_terminal() ->
     assert decision.state is TerminalState.EARLY_CLOSED
     assert decision.pages_scheduled == RESERVED_PAGE_COUNT
     assert "completion_invalid_binding_terminal" not in {item.code for item in decision.violations}
+
+
+def test_counted_recorder_keeps_the_page_it_delivers_active_while_it_retires_unobserved_pages() -> None:
+    recorder = CountedCompletionRecorder()
+    delivering = recorder.reserve()
+    recorder.reserve()
+    recorder.reserve()
+    recorder.activate(delivering)
+    recorder.settled(CommandSettlement.SUCCESS)
+    recorder.validated(2)
+    recorder.delivered()
+    recorder.settle_unobserved()
+    recorder.terminal(BindingClosure.UNKNOWN, StreamClosure.EARLY_CLOSE)
+    recorder.cleanup(CleanupState.SUCCESS)
+
+    decision = recorder.gate.decision()
+    assert recorder.has_unknown
+    assert decision.violations == ()
+    assert decision.state is TerminalState.EARLY_CLOSED
+    assert (decision.pages_scheduled, decision.pages_acknowledged) == (RESERVED_PAGE_COUNT, 0)

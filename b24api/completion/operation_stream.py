@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, Self
 
 from b24api.completion.gate import CompletionGate, CompletionReportFacts
+from b24api.contracts.completion import CleanupState
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import (
     KeysetSelectionSummary,
@@ -22,6 +23,7 @@ from b24api.execution.lifecycle import (
     LifecycleHooks,
     OperationRunner,
     TerminalCause,
+    cleanup_failed,
     with_cleanup_attempt,
     with_fallback_cleanup,
 )
@@ -206,7 +208,8 @@ class MappedOperationStream[S, T]:
                 Violation(ViolationSeverity.BLOCKING, "report_finalize_failure", "stream report finalization failed"),
             ),
         )
-        self._report = self._gate().publish_failure(facts)
+        cleanup = CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS
+        self._report = self._gate().publish_failure(facts, cleanup)
         self._terminated()
         return self._report
 

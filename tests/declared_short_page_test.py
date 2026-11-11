@@ -858,7 +858,9 @@ async def test_callback_failure_on_the_terminal_short_page_is_never_exhausted(
     assert report is not None
     assert not report.successful
     assert not report.exhausted
-    assert report.state is (TerminalState.FAILED if dispatch is None else TerminalState.INCOMPLETE)
+    # The failed callback fails its binding, not the evidence: the delivered page is released with it.
+    assert report.state is (TerminalState.FAILED if dispatch is None else TerminalState.COMPLETED_WITH_FAILURES)
+    assert not [violation.code for violation in report.violations if violation.code.startswith("completion_")]
     assert not any(isinstance(item, ReferenceComplete) for item in items)
     if dispatch is not None:
         assert any(isinstance(item, ReferenceFailure) for item in items)

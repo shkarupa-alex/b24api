@@ -1,5 +1,24 @@
 # Migration guide
 
+## Early close and completion evidence
+
+- **A counted early exit publishes its report.** Leaving `iter_list_counted()` with `break`, or
+  `collect(limit=...)`, while a tail page was being delivered raised `RuntimeError: completion gate
+  requires stream terminal and cleanup outcome` and left `stream.report` empty. The stream now
+  closes as `EARLY_CLOSED` with its report.
+- **No false protocol violation on an early close.** A stream closed, or failed in a `page_stop`
+  callback, while it delivered a page reported the blocking violation
+  `completion_invalid_binding_terminal`. A binding that ends as failed or unknown now releases a page
+  that was settled but never acknowledged, so that violation only reports a real protocol error, such
+  as a page whose dispatch outcome was never settled or a caller stop over an unacknowledged page. A
+  reference whose `page_stop` callback fails therefore ends its operation as
+  `COMPLETED_WITH_FAILURES` with a `ReferenceFailure`, like any other failed binding, instead of
+  `INCOMPLETE`.
+- **A `BaseException` leaves a counted traversal as raised.** A `BaseException` that is not an
+  `Exception`, such as an application's own shutdown signal, was wrapped in
+  `IncompleteTraversalError`. It now propagates unchanged with a `FAILED` report, as from
+  `iter_list()`; ordinary exceptions are wrapped as before.
+
 ## Page-level response fields
 
 - **`PageBoundary.result`.** A `page_stop` callback now receives the page's immutable server result
