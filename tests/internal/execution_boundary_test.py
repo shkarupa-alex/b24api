@@ -12,7 +12,7 @@ import pytest
 from b24api import BatchFailed, Bitrix24, ReplaySafety, Request, Settings, TerminalState
 from b24api._error_types import FailurePhase
 from b24api.batch.engine import BatchExecutor
-from b24api.batch.outcome import BatchFailure
+from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts import Command, CommandFailure, CommandOutcomeUnknown, CommandSuccess, ReplayDisposition
 from b24api.contracts.policy import AmbiguityPolicy, AmbiguityReason, ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import RouteKind
@@ -769,11 +769,10 @@ async def test_an_unknown_outcome_is_explained_by_the_send_that_may_have_run() -
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replay", ["success", "status"])
 @pytest.mark.parametrize("rounds", [1, 2], ids=["first-round", "replay-round"])
-async def test_a_batch_answered_after_the_time_budget_reports_its_unsafe_command_unknown(
-    replay: str, rounds: int
-) -> None:
-    # Bitrix answered, but the time budget ran out before the answer was classified: an UNSAFE creation in that
-    # batch may have run, whether it was the first batch or a replay after a quota refusal.
+async def test_a_batch_answered_after_the_time_budget_keeps_its_answer(replay: str, rounds: int) -> None:
+    # Bitrix answered, but the time budget ran out before the answer was classified, whether it was the first
+    # batch or a replay after a quota refusal. A success is returned, and a failure meets the ambiguity rules:
+    # an UNSAFE creation answered by a 502 may have run.
     now = [0.0]
     transport = _Script([])
 
@@ -793,13 +792,14 @@ async def test_a_batch_answered_after_the_time_budget_reports_its_unsafe_command
     (outcome,) = await BatchExecutor(executor).execute_requests((request,), context=executor.context(_policy()))
 
     assert len(transport.sent) == rounds
+    if replay == "success":
+        assert isinstance(outcome, BatchSuccess)
+        return
     assert isinstance(outcome, BatchFailure)
     assert isinstance(outcome.error, AmbiguousExecutionError)
-    assert isinstance(outcome.error.__cause__, BudgetExceededError)
+    assert isinstance(outcome.error.__cause__, HTTPGatewayError)
     assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
-    assert outcome.error.reason is (
-        AmbiguityReason.DEADLINE_AFTER_DISPATCH if replay == "success" else AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
-    )
+    assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,7 @@ from b24api.references.dispatch import (
     _DoneEvent,
     _Event,
     _failed_dispatch,
+    _failed_execution,
     _failed_settlement,
     _FailureEvent,
     _KernelFanOutSuccess,
@@ -612,10 +613,10 @@ class ReferenceScheduler:
         except BaseException as error:
             run.completion.settled(_failed_settlement(error))
             await self.abandon_page(run)
-            if isinstance(error, _BatchPageError) or bool(getattr(error, "_b24api_dispatch_started", False)):
+            if _failed_execution(error).dispatched:
                 failed = _failed_dispatch(self.page_dispatch, error)
                 run.driver.set_page_dispatch(dispatch=failed.dispatch, batch_index=failed.batch_index)
-                run.driver.record_unknown_page(
+                run.driver.record_failed_page(
                     dispatch=failed.dispatch,
                     batch_index=failed.batch_index,
                     error=failed.error or error,

@@ -38,6 +38,46 @@ The application still owns facts that a generic REST client cannot infer:
 - endpoint-specific applicability of total, offset, keyset and cursor mechanics;
 - reconciliation of a write whose result is ambiguous after possible dispatch.
 
+Whether a command may have run is one execution fact, recorded on its failure by the code that sent or
+withheld it: the executor for its own sends, the classic and REST v3 batch dialects for the commands of
+an envelope they decode, and the batch page dispatcher of references and list traversal for a page
+cancelled after its wave was sent. A page whose fetch ended before its wave left, cancelled or past its
+admission deadline, is never sent, so it stays proven not run. `b24api.execution.facts` holds the one
+mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
+(`Execution.settlement`), and `b24api.traversal.page_failure` maps it to a failed page's trace: unknown
+only when it may have run, otherwise rejected. Classic and REST v3 batch, `call()`, direct and batch
+fan-out, references and list traversal all use them, and none of them chooses from the exception type,
+which names the cause of a failure and never proves that a command did not run. A sent command is
+unknown unless a listed refusal proves it did not run or a conclusive answer settles it. A conclusive
+answer is a structured Bitrix error, top-level or found in the result by the command's own contract, or
+any status outside 2xx that the ambiguity policy does not hold ambiguous, whatever its body, so a
+malformed error body on such a status is conclusive too. A REST v3 batch envelope is the one exception:
+a top-level structured error on it is an abort, which may come after some of its commands ran, so it
+settles none of them; a command is answered only by its own element or its own isolated send, or proven
+not run by a transport failure that proves the envelope was not accepted or a listed refusal status of
+the envelope. A 2xx answer the client cannot decode settles nothing, whichever part is malformed: the
+envelope, a command's paging metadata or its embedded error.
+
+A command keeps one send lineage across executor retries, classic batch replay rounds and REST v3
+isolation. The commands still pending in a round are always a subset of those of the round before, so
+the lineage of an envelope group is the lineage of each of its pending commands, and an isolated send
+continues it on a per-command copy. The lineage is an explicit state: nothing sent yet, or the latest
+send answered or possibly run (with the failure that left it so), and whether a send before it may have
+run. When a later conclusive answer ends a command after an earlier send may have run (the retried
+envelope, the command's own entry in it, a REST v3 element or an isolated send), the outcome is unknown
+and its reason and cause name that earlier send; the conclusive answer that ended it does not appear in
+the cause chain. `HALTED` means the command was proven not sent and no earlier send of it may have run:
+the server's own halt in a classic fail-fast batch, a later envelope that fail-fast did not send, or a
+window refused before dispatch. A success that arrives after the time budget is returned, not discarded.
+The operation deadline of direct and batch fan-out and references bounds admission only: once a send
+left, the executor's own budgets end it, so a deadline that passes mid-send gives the same evidence on
+every path. The executor ends a send only by cancelling it, so a transport that resists cancellation
+holds the operation for as long as it resists, on every path. A list traversal that fetches a page
+directly raises the page's own failure, as `call()` does, rather than an ambiguity; the page's
+settlement and trace still come from the fact. One settlement does not come from the fact: when
+`iter_list_counted()` stops at a failed page, a page of its batch tail whose outcome it never read
+settles as unknown.
+
 ## Correlation and source failures
 
 `Command.correlation` and `Binding.correlation` are caller-owned objects retained by reference and
@@ -125,7 +165,10 @@ advanced request representations require an advertised `WireTransport` capabilit
 I/O otherwise. No ordinary wire value can name an absolute destination. Native REST 3.0 batch commands travel as
 an internal JSON-array envelope that the transport must advertise; one physical-attempt classifier
 decides, before any retry, whether an envelope failure proves non-execution, attributes per-command
-results, or leaves the envelope unresolved for bounded `SAFE` isolation.
+results, or leaves the envelope unresolved for bounded `SAFE` isolation. Isolation sends each `SAFE`
+command alone and returns its success; a failure stays unknown, because the envelope may have run the
+command, and is explained by that envelope like any other earlier send that may have run, also when
+the budget leaves no isolated send.
 
 Traversal contracts separately declare progression (`server next`, observed width, or fixed step),
 completion (empty confirmation or caller-qualified exact total), collection shape, and identity.

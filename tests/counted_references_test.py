@@ -369,7 +369,7 @@ async def test_a20_provenance_heads_are_batch_pages_with_their_command_index() -
     assert portal.waves == [2]
     heads = {record.reference_index: record for record in report.page_trace if record.offset == 0}
     assert (heads[0].dispatch, heads[0].batch_index, heads[0].outcome) == (PageDispatch.BATCH, 0, PageOutcome.COMMITTED)
-    assert (heads[1].dispatch, heads[1].batch_index, heads[1].outcome) == (PageDispatch.BATCH, 1, PageOutcome.UNKNOWN)
+    assert (heads[1].dispatch, heads[1].batch_index, heads[1].outcome) == (PageDispatch.BATCH, 1, PageOutcome.REJECTED)
     assert [event.correlation for event in events if isinstance(event, ReferenceFailure | ReferenceOutcomeUnknown)] == [
         2
     ]

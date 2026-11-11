@@ -43,6 +43,7 @@ from b24api.contracts import (
     BodyEncoding,
     Command,
     CommandFailure,
+    CommandOutcomeUnknown,
     CommandSuccess,
     CompositeIdentitySpec,
     IdentityComponent,
@@ -1096,8 +1097,9 @@ async def test_batch_isolates_embedded_shape_failure_and_normalizes_terminal_nex
     )
     outcomes = [outcome async for outcome in stream]
 
-    assert isinstance(outcomes[0], CommandFailure)
-    assert isinstance(outcomes[0].error, ProtocolError)
+    # A malformed embedded error proves nothing about what the command did, so it stays unknown.
+    assert isinstance(outcomes[0], CommandOutcomeUnknown)
+    assert isinstance(outcomes[0].error.__cause__, ProtocolError)
     assert outcomes[0].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
     assert isinstance(outcomes[1], CommandSuccess)
     assert outcomes[1].response.next is None

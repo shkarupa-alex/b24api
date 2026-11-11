@@ -16,7 +16,7 @@ from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError
-from b24api.references.dispatch import _BatchPageError, _failed_dispatch, _failed_settlement
+from b24api.references.dispatch import _BatchPageError, _failed_dispatch, _failed_execution, _failed_settlement
 from b24api.traversal.counted_io import HeadAttempt, TailReceipt
 
 if TYPE_CHECKING:
@@ -135,8 +135,7 @@ class SharedCountedWaveIO:
             failed.error or error,
             failed.dispatch,
             failed.batch_index,
-            dispatch_started=isinstance(error, _BatchPageError)
-            or bool(getattr(error, "_b24api_dispatch_started", False)),
+            dispatch_started=_failed_execution(error).dispatched,
             settlement=_failed_settlement(error),
         )
 

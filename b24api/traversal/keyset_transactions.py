@@ -8,12 +8,12 @@ from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
 from b24api.errors import (
-    AmbiguousExecutionError,
     B24ApiError,
     BudgetExceededError,
     IncompleteTraversalError,
     PaginationError,
 )
+from b24api.execution.facts import Execution, execution
 from b24api.traversal import keyset_step
 from b24api.traversal.keyset_capability import (
     anchor_commands,
@@ -223,7 +223,7 @@ def _abort_wave(
     host.admission.record_raw(selected_rows, discarded=True)
     causes = [receipt for receipt in rejections if receipt.error is not None]
     rejection = next(
-        (receipt for receipt in causes if isinstance(receipt.error, AmbiguousExecutionError)),
+        (receipt for receipt in causes if execution(receipt.error) is Execution.POSSIBLY_RUN),
         causes[0] if causes else None,
     )
     if rejection is None:
@@ -232,12 +232,10 @@ def _abort_wave(
 
 
 def _settlement(outcome: BatchOutcome) -> CommandSettlement:
-    """Classify one correlated command: an ambiguous failure may have executed, so it is unknown."""
+    """Settle one correlated command from its execution facts."""
     if isinstance(outcome, BatchSuccess):
         return CommandSettlement.SUCCESS
-    if isinstance(outcome.error, AmbiguousExecutionError):
-        return CommandSettlement.UNKNOWN
-    return CommandSettlement.FAILURE
+    return execution(outcome.error).settlement
 
 
 def _raise_rejection(rejection: ReceiptRejection) -> NoReturn:
@@ -251,7 +249,7 @@ def _raise_rejection(rejection: ReceiptRejection) -> NoReturn:
         raise PaginationError(rejection.detail)
     if (
         isinstance(cause, B24ApiError)
-        and not isinstance(cause, AmbiguousExecutionError)
+        and execution(cause) is not Execution.POSSIBLY_RUN
         and rejection.violation.code == "command_failure"
     ):
         raise IncompleteTraversalError(

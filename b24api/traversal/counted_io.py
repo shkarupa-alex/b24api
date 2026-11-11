@@ -17,6 +17,7 @@ from b24api.batch.stream import _BatchOutcomeStream
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
+from b24api.execution.facts import execution
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -184,7 +185,10 @@ class _FlatTailStream:
     def settle(self, receipt: TailReceipt) -> None:
         if self._recorder is not None:
             self._recorder.activate(receipt.ordinal + 1)
-            self._recorder.settled(CommandSettlement.SUCCESS if receipt.failure is None else CommandSettlement.FAILURE)
+            failure = receipt.failure
+            self._recorder.settled(
+                CommandSettlement.SUCCESS if failure is None else execution(failure.error).settlement
+            )
 
     def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
         del receipt
@@ -241,15 +245,14 @@ class DirectCountedWaveIO:
         )
 
     def head_failure(self, error: BaseException) -> HeadAttempt:
-        """Classify a failed direct head: possibly executed once dispatch started, else not executed."""
-        dispatched = bool(getattr(error, "_b24api_dispatch_started", False))
+        """Classify a failed direct head from its execution facts: possibly run, failed, or never sent."""
         return HeadAttempt(
             None,
             error,
             PageDispatch.DIRECT,
             None,
-            dispatch_started=dispatched,
-            settlement=CommandSettlement.UNKNOWN if dispatched else CommandSettlement.NOT_EXECUTED,
+            dispatch_started=execution(error).dispatched,
+            settlement=execution(error).settlement,
         )
 
     async def tail_batch_size(

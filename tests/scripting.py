@@ -22,7 +22,7 @@ from b24api.references import dispatch as dispatch_module
 from b24api.transport import WireResponse
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 
     import pytest
 
@@ -112,6 +112,12 @@ type ClientFactory = Callable[..., Bitrix24]
 def always(reply: object) -> Responder:
     """Answer every request with the same reply."""
     return lambda _request: reply
+
+
+async def on_loop[T](items: Iterable[T]) -> AsyncIterator[T]:
+    """Yield ``items`` on the event loop; a plain iterable is pulled in a worker thread, whose pace no test sets."""
+    for item in items:
+        yield item
 
 
 class Blocker:

@@ -9,10 +9,12 @@ from typing import TYPE_CHECKING, cast
 from b24api._error_types import ErrorOrigin
 from b24api.batch.correlation import (
     _BatchNotExecutedError,
+    _by_facts,
     _Command,
     _command_failure,
     _command_success,
     _shared_failure,
+    _withheld,
 )
 from b24api.batch.outcome import (
     BatchCommandEvidence,
@@ -23,7 +25,6 @@ from b24api.batch.outcome import (
 from b24api.batch.v3 import _V3Resolution
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.policy import (
-    AmbiguityReason,
     ReplayDisposition,
 )
 from b24api.contracts.request import ReplaySafety, Request, diagnostic_context
@@ -32,15 +33,11 @@ from b24api.contracts.response import Response
 from b24api.encoding import encode_php_query
 from b24api.errors import (
     AmbiguousExecutionError,
-    ApiResponseError,
     B24ApiError,
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
-    HTTPGatewayError,
     ProtocolError,
-    ResponseTooLargeError,
-    TransportError,
 )
 from b24api.execution import (
     ExecutionContext,
@@ -53,9 +50,12 @@ from b24api.execution.executor import (
     _refused_before_running,
     _RequestAttempts,
 )
+from b24api.execution.facts import Execution, execution
 
 if TYPE_CHECKING:
+    from b24api.contracts.evidence import ResponseEvidence
     from b24api.contracts.json import JsonValue
+    from b24api.contracts.policy import ExecutionPolicy
 
 _MISSING = object()
 _UNSUPPORTED_COMMAND = "physical batch supports BARE JSON requests without scoped headers; use direct dispatch"
@@ -103,6 +103,9 @@ class _BatchEnvelope:
     errors: Mapping[str, object]
     totals: Mapping[str, object]
     continuations: Mapping[str, object]
+    evidence: ResponseEvidence
+    # Keys that are both a result and an error: the answer contradicts itself and attributes nothing.
+    contradictory: frozenset[str] = frozenset()
 
 
 class BatchExecutor:
@@ -138,29 +141,38 @@ class BatchExecutor:
         rounds, envelope retries and isolation requests are not counted.
         """
         eligible, rejected = self._partition_capabilities(commands)
+        settled: Mapping[int, BatchOutcome] = {}
         if halt and rejected:
             first_rejected = next(command.index for command in commands if command.index in rejected)
-            return tuple(
-                rejected[command.index]
+            message = "physical batch command was not executed after fail-fast capability rejection"
+            rejected = {
+                command.index: rejected[command.index]
                 if command.index == first_rejected
-                else _command_failure(
-                    command,
-                    _BatchNotExecutedError(
-                        "physical batch command was not executed after fail-fast capability rejection",
-                        request_summary=command.request.summary,
-                    ),
-                    evidence=BatchCommandEvidence(command.index, command.stable_key),
-                )
+                else _shared_failure(command, _withheld(message, command))
                 for command in commands
-            )
-        if not eligible:
-            return tuple(rejected[command.index] for command in commands)
-        options = _RoundOptions(halt, advisory_totals, strict_envelope, strict_json_members)
+            }
+        elif eligible:
+            options = _RoundOptions(halt, advisory_totals, strict_envelope, strict_json_members)
+            settled = await self._execute_groups(eligible, context=context, options=options, on_envelope=on_envelope)
+        # Every outcome of the chunk leaves the engine through the one mapping from execution facts.
+        return tuple(_by_facts(outcome) for outcome in _merge_outcomes(commands, tuple(settled.values()), rejected))
+
+    async def _execute_groups(
+        self,
+        eligible: tuple[_Command, ...],
+        *,
+        context: ExecutionContext,
+        options: _RoundOptions,
+        on_envelope: Callable[[], None] | None,
+    ) -> dict[int, BatchOutcome]:
         settled: dict[int, BatchOutcome] = {}
         for group in _envelope_groups(eligible):
-            if halt and any(not isinstance(outcome, BatchSuccess) for outcome in settled.values()):
+            if options.halt and any(not isinstance(outcome, BatchSuccess) for outcome in settled.values()):
                 # Fail-fast: a later envelope of the accepted chunk is not sent after a failed one.
-                settled.update((command.index, _halted_failure(command)) for command in group)
+                message = "physical batch command was not executed after a fail-fast envelope failure"
+                settled.update(
+                    (command.index, _shared_failure(command, _withheld(message, command))) for command in group
+                )
                 continue
             if on_envelope is not None:
                 on_envelope()
@@ -169,7 +181,7 @@ class BatchExecutor:
             else:
                 outcomes = await self._execute_bare(group, context=context, options=options)
             settled.update((outcome.command_index, outcome) for outcome in outcomes)
-        return _merge_outcomes(commands, tuple(settled.values()), rejected)
+        return settled
 
     async def _execute_bare(
         self,
@@ -180,15 +192,14 @@ class BatchExecutor:
     ) -> tuple[BatchOutcome, ...]:
         """Run one classic batch envelope and its replay rounds."""
         settled: dict[int, BatchOutcome] = {}
-        # Every command of a replay round was sent in each round before it, so one count bounds them all.
+        # Every command of a replay round was sent in each round before it, so one count, one retry clock and
+        # one execution lineage serve them all.
         pending, rounds, attempts = eligible, 0, _RequestAttempts()
         while pending:
             sent = await self._dispatch_round(pending, context=context, options=options, attempts=attempts)
-            # A replay the budget stops before it runs leaves each command the outcome it last received.
+            # A replay the budget stopped leaves each command the outcome it last received.
             settled.update(
-                (outcome.command_index, outcome)
-                for outcome in sent.outcomes
-                if not (rounds and isinstance(outcome, BatchFailure) and isinstance(outcome.error, BudgetExceededError))
+                (outcome.command_index, outcome) for outcome in sent.outcomes if not (rounds and _stopped(outcome))
             )
             rounds += 1
             # Only the commands that may run again are sent again, in a smaller physical batch; the rest keep
@@ -214,7 +225,10 @@ class BatchExecutor:
         they did not run (owner decision, 2026-09-25). A fail-fast batch is never split.
         """
         request = _batch_request(commands, halt=options.halt)
-        attempts.new_round()
+        spent = attempts.used
+        # A failure of the executor carries the facts it recorded; one of the engine's own is recorded here.
+        failure: B24ApiError | None = None
+        owned = False
         try:
             response = await self.executor.execute(
                 request,
@@ -224,45 +238,33 @@ class BatchExecutor:
                 _admission_methods=frozenset(command.request.method for command in commands),
                 _attempts=attempts,
             )
-            envelope = _decode_batch_envelope(
-                response.result,
-                expected_keys=frozenset(command.stable_key for command in commands),
-                strict=options.strict_envelope,
-            )
         except asyncio.CancelledError:
             raise
         except B24ApiError as error:
-            if options.strict_envelope and isinstance(error, ProtocolError) and error.request_summary is None:
-                scoped_error = ProtocolError(
-                    str(error),
-                    origin=error.origin,
-                    description=error.description,
-                    request_summary=request.summary,
-                    evidence=error.evidence,
-                    retryable=error.retryable,
+            failure = error
+        else:
+            try:
+                envelope = _decode_batch_envelope(
+                    response.result,
+                    expected_keys=frozenset(command.stable_key for command in commands),
+                    strict=options.strict_envelope,
+                    evidence=response.evidence,
                 )
-                scoped_error.__cause__ = error
-                error = scoped_error
+            except B24ApiError as error:
+                failure, owned = error, True
+        if failure is not None:
+            scoped = _scoped(failure, request, strict=options.strict_envelope)
+            if (owned or scoped is not failure) and attempts.used > spent:
+                attempts.record(scoped, context.policy)
             # The SAFE commands are sent again after any failure a SAFE request would retry, whether or not the
             # batch may have run and whatever its other commands are.
-            replay = () if options.halt or not _safe_replay_allowed(error, context) else commands
+            replay = () if options.halt or not _safe_replay_allowed(scoped, context) else commands
             safe = tuple(command for command in replay if command.request.replay_safety is ReplaySafety.SAFE)
-            if not _possibly_executed(error, attempts):
-                return _Round(tuple(_shared_failure(command, error) for command in commands), safe)
-            return _Round(
-                tuple(_unknown_failure(command, error, attempts.unproven_failure) for command in commands), safe
-            )
+            return _Round(tuple(_shared_failure(command, scoped) for command in commands), safe)
 
-        outcomes = tuple(
-            self._decode_command(
-                command,
-                envelope,
-                response,
-                context=context,
-                advisory_totals=options.advisory_totals,
-            )
-            for command in commands
-        )
+        outcomes = self._decode_commands(commands, envelope, context=context, options=options, attempts=attempts)
+        # Each command's entry answered this send; a command sent again carries only what earlier sends left open.
+        attempts.classified(None, may_have_run=False)
         method_cooldown = 0.0
         for command, outcome in zip(commands, outcomes, strict=True):
             if (
@@ -323,15 +325,45 @@ class BatchExecutor:
             )
         return tuple(eligible), rejected
 
+    def _decode_commands(
+        self,
+        commands: tuple[_Command, ...],
+        envelope: _BatchEnvelope,
+        *,
+        context: ExecutionContext,
+        options: _RoundOptions,
+        attempts: _RequestAttempts,
+    ) -> tuple[BatchOutcome, ...]:
+        """Decode every command's entry in submission order, tracking the server's own halt.
+
+        Under ``halt`` Bitrix stops the envelope at the first command it answers with an error, so only a
+        command after such an entry and without one of its own is proven not executed by this send. Each
+        command's failure records what this send and the earlier ones left open about it.
+        """
+        outcomes: list[BatchOutcome] = []
+        halted = False
+        for command in commands:
+            key = command.stable_key
+            outcome = _unattributed(command, envelope, halted=halted, attempts=attempts, policy=context.policy)
+            if outcome is None:
+                outcome = self._decode_command(
+                    command, envelope, context=context, advisory_totals=options.advisory_totals
+                )
+                if isinstance(outcome, BatchFailure) and isinstance(outcome.error, BaseException):
+                    attempts.record(outcome.error, context.policy)
+            outcomes.append(outcome)
+            halted = halted or (options.halt and key in envelope.errors and key not in envelope.contradictory)
+        return tuple(outcomes)
+
     def _decode_command(
         self,
         command: _Command,
         envelope: _BatchEnvelope,
-        response: Response,
         *,
         context: ExecutionContext,
         advisory_totals: bool = False,
     ) -> BatchOutcome:
+        """Decode the one entry, an error or a result, that answers a command."""
         evidence = BatchCommandEvidence(command.index, command.stable_key)
         if command.stable_key in envelope.errors:
             command_error = self._command_error(
@@ -351,13 +383,6 @@ class BatchExecutor:
                 evidence=command_evidence,
                 refused=_refused_before_running(command_error, context.policy),
             )
-        if command.stable_key not in envelope.results:
-            missing_error = ProtocolError(
-                "Batch result map is missing a submitted command",
-                origin=ErrorOrigin.PROTOCOL,
-                request_summary=command.request.summary,
-            )
-            return _command_failure(command, missing_error, evidence=evidence)
         try:
             command_response = Response(
                 envelope.results[command.stable_key],
@@ -368,12 +393,12 @@ class BatchExecutor:
                     malformed_as_none=advisory_totals,
                 ),
                 next=_optional_batch_integer(envelope.continuations, command.stable_key, field="next"),
-                evidence=response.evidence,
+                evidence=envelope.evidence,
             )
             _raise_embedded_result_error(
                 command.request,
                 command_response.result,
-                http_status=response.evidence.http_status or 200,
+                http_status=envelope.evidence.http_status or 200,
                 retry_codes=context.policy.retry.transient_api_codes,
                 batch=True,
                 redactor=self.executor.codec.redactor,
@@ -389,16 +414,16 @@ class BatchExecutor:
                 command, error, evidence=command_evidence, refused=_refused_before_running(error, context.policy)
             )
         except ProtocolError as error:
-            return _command_failure(command, error, evidence=evidence)
+            return _shared_failure(command, error)
         except (TypeError, ValueError) as error:
             protocol_error = ProtocolError(
                 "Batch command metadata is malformed",
                 origin=ErrorOrigin.PROTOCOL,
                 request_summary=command.request.summary,
-                evidence=response.evidence,
+                evidence=envelope.evidence,
             )
             protocol_error.__cause__ = error
-            return _command_failure(command, protocol_error, evidence=evidence)
+            return _shared_failure(command, protocol_error)
         return _command_success(command, command_response, evidence)
 
     async def execute_requests(  # noqa: PLR0913 - mirrors execute_chunk's round options
@@ -501,6 +526,7 @@ def _decode_batch_envelope(
     *,
     expected_keys: frozenset[str],
     strict: bool = False,
+    evidence: ResponseEvidence,
 ) -> _BatchEnvelope:
     if not isinstance(raw, dict):
         raise ProtocolError("Batch result envelope must be an object", origin=ErrorOrigin.PROTOCOL)
@@ -512,7 +538,8 @@ def _decode_batch_envelope(
     continuations = _decode_optional_php_map(raw, field="result_next")
     result_keys = frozenset(results)
     error_keys = frozenset(errors)
-    if strict and (result_keys & error_keys or not (result_keys | error_keys).issubset(expected_keys)):
+    contradictory = result_keys & error_keys
+    if strict and (contradictory or not (result_keys | error_keys).issubset(expected_keys)):
         raise ProtocolError(
             "Batch result correlation keys are duplicated or unknown",
             origin=ErrorOrigin.PROTOCOL,
@@ -526,6 +553,8 @@ def _decode_batch_envelope(
         errors=errors,
         totals=totals,
         continuations=continuations,
+        evidence=evidence,
+        contradictory=contradictory,
     )
 
 
@@ -636,76 +665,72 @@ def _is_safe(command: _Command) -> bool:
     return command.request.replay_safety is ReplaySafety.SAFE
 
 
-def _halted_failure(command: _Command) -> BatchFailure:
-    return _shared_failure(
-        command,
-        _BatchNotExecutedError(
-            "physical batch command was not executed after a fail-fast envelope failure",
+def _unattributed(
+    command: _Command,
+    envelope: _BatchEnvelope,
+    *,
+    halted: bool,
+    attempts: _RequestAttempts,
+    policy: ExecutionPolicy,
+) -> BatchOutcome | None:
+    """Return the outcome of a command no single entry answers, or ``None`` when one does.
+
+    The server's own halt proves that this send did not run a command it left without an entry. Any other
+    command without one entry, missing or both a result and an error, was dispatched and may have run.
+    """
+    key = command.stable_key
+    if key in envelope.contradictory:
+        message = "Batch command is both a result and an error"
+    elif key in envelope.results or key in envelope.errors:
+        return None
+    elif halted:
+        halt = _BatchNotExecutedError(
+            "physical batch command was not executed after the server halted the batch",
             request_summary=command.request.summary,
-        ),
+        )
+        attempts.withhold(halt)
+        return _shared_failure(command, halt)
+    else:
+        message = "Batch result map is missing a submitted command"
+    error = ProtocolError(
+        message, origin=ErrorOrigin.PROTOCOL, request_summary=command.request.summary, evidence=envelope.evidence
+    )
+    attempts.record(error, policy)
+    return _shared_failure(command, error)
+
+
+def _stopped(outcome: BatchOutcome) -> bool:
+    """Return whether the budget stopped a replay of the command without leaving it possibly run.
+
+    Such a round proves nothing new about the command, so the outcome its last answered round gave it stands.
+    """
+    return (
+        isinstance(outcome, BatchFailure)
+        and isinstance(outcome.error, BudgetExceededError)
+        and execution(outcome.error) is not Execution.POSSIBLY_RUN
     )
 
 
-def _possibly_executed(error: B24ApiError, attempts: _RequestAttempts) -> bool:
-    """Return whether a failed physical batch may have executed its admitted commands."""
-    # A send of this round that no failure proved refused may have run, whatever ended the round.
-    if attempts.earlier_unproven:
-        return True
-    if isinstance(error, BudgetExceededError):
-        return attempts.last_unproven
-    if isinstance(error, TransportError):
-        return error.possible_acceptance
-    return isinstance(error, AmbiguousExecutionError | ResponseTooLargeError)
+def _scoped(error: B24ApiError, request: Request, *, strict: bool) -> B24ApiError:
+    """Return a strict envelope's protocol failure scoped to the physical batch request it answered."""
+    if not (strict and isinstance(error, ProtocolError) and error.request_summary is None):
+        return error
+    scoped = ProtocolError(
+        str(error),
+        origin=error.origin,
+        description=error.description,
+        request_summary=request.summary,
+        evidence=error.evidence,
+        retryable=error.retryable,
+    )
+    scoped.__cause__ = error
+    return scoped
 
 
 def _safe_replay_allowed(error: B24ApiError, context: ExecutionContext) -> bool:
     """Return whether the failure that made a batch's outcome unknown would let a SAFE request retry."""
     cause = error.__cause__ if isinstance(error, AmbiguousExecutionError) else error
     return isinstance(cause, B24ApiError) and _is_retryable(cause, safety=ReplaySafety.SAFE, policy=context.policy)
-
-
-def _unknown_failure(command: _Command, error: B24ApiError, unproven: B24ApiError | None = None) -> BatchFailure:
-    """Give one admitted command its own possible-execution outcome, kept unless a SAFE replay replaces it.
-
-    The reason and cause name the latest failure of a send that may have run; without one (an answer that came
-    after the budget, for example), the failure that ended the round.
-    """
-    source = error
-    if isinstance(error, BudgetExceededError) and isinstance(error.__cause__, B24ApiError):
-        source = error.__cause__
-    source = unproven or source
-    if isinstance(source, AmbiguousExecutionError):
-        reason = source.reason
-    elif isinstance(source, ResponseTooLargeError):
-        reason = AmbiguityReason.RESPONSE_LIMIT_AFTER_DISPATCH
-    elif isinstance(source, BudgetExceededError) or isinstance(source.__cause__, TimeoutError):
-        reason = AmbiguityReason.DEADLINE_AFTER_DISPATCH
-    elif isinstance(source, HTTPGatewayError | ApiResponseError):
-        reason = AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
-    else:
-        reason = AmbiguityReason.CONNECTION_LOST_AFTER_DISPATCH
-    ambiguous = AmbiguousExecutionError(
-        "Physical batch may have executed this command; automatic replay is forbidden",
-        reason=reason,
-        declared_unsafe=command.request.replay_safety is ReplaySafety.UNSAFE,
-        request_summary=command.request.summary,
-        evidence=source.evidence,
-    )
-    # Keep the original failure as the cause instead of the executor's batch-scoped ambiguity wrapper.
-    original = error.__cause__ if isinstance(error, AmbiguousExecutionError) else None
-    terminal = original if isinstance(original, BaseException) else error
-    # The chain must reach the send that may have run, even when a later failure ended the round.
-    ambiguous.__cause__ = terminal if unproven is None or _caused_by(terminal, unproven) else unproven
-    return _shared_failure(command, ambiguous)
-
-
-def _caused_by(error: BaseException, cause: BaseException) -> bool:
-    current: BaseException | None = error
-    while current is not None:
-        if current is cause:
-            return True
-        current = current.__cause__
-    return False
 
 
 def _raise_source_error(error: Exception) -> None:
