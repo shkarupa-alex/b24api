@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+from contextlib import aclosing
 from typing import TYPE_CHECKING, Self
 
 from b24api.completion.recorder import CountedCompletionRecorder
@@ -112,18 +113,17 @@ class CountedItemStream:
     async def _run(self) -> AsyncGenerator[JsonValue]:
         primary: BaseException | None = None
         try:
-            async for page in self._driver.counted_batch_pages(
-                batch_size=self._batch_size,
-                page_size=self._page_size,
-            ):
-                self._evidence.append(page.response.evidence)
-                for item, is_unique in zip(page.items, self._driver.last_page_unique_mask, strict=True):
-                    self._emitted += 1
-                    self._unique += int(is_unique)
-                    yield thaw_json(item)
-                if page.items:
-                    self._completion.delivered()
-                    self._completion.acknowledged()
+            pages = self._driver.counted_batch_pages(batch_size=self._batch_size, page_size=self._page_size)
+            async with aclosing(pages):
+                async for page in pages:
+                    self._evidence.append(page.response.evidence)
+                    for item, is_unique in zip(page.items, self._driver.last_page_unique_mask, strict=True):
+                        self._emitted += 1
+                        self._unique += int(is_unique)
+                        yield thaw_json(item)
+                    if page.items:
+                        self._completion.delivered()
+                        self._completion.acknowledged()
             await self._finalize(KernelState.COMPLETED, "counted traversal completed exactly")
         except asyncio.CancelledError as error:
             primary = error

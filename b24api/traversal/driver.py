@@ -198,15 +198,17 @@ class PaginationDriver:
         try:
             strategy = _strategy(self.plan)
             pages = strategy.pages(self) if isinstance(strategy, PagedStrategy) else self._sequential(strategy)
-            async for page in pages:
-                yield page
+            async with contextlib.aclosing(pages):
+                async for page in pages:
+                    yield page
         finally:
             self.close_external_validation()
 
     async def _sequential(self, strategy: SequentialPageStrategy) -> AsyncGenerator[_Page]:
         """Own each page transaction: fetch, select, judge, validate, record the rejection or yield."""
-        async for page in self._sequential_from(strategy, strategy.first_request(self)):
-            yield page
+        async with contextlib.aclosing(self._sequential_from(strategy, strategy.first_request(self))) as pages:
+            async for page in pages:
+                yield page
 
     async def continue_sequential(
         self,
@@ -218,8 +220,9 @@ class PaginationDriver:
         if isinstance(step, PageStop):
             self.terminal_reason = step.reason
             return
-        async for page in self._sequential_from(strategy, step):
-            yield page
+        async with contextlib.aclosing(self._sequential_from(strategy, step)) as pages:
+            async for page in pages:
+                yield page
 
     async def _sequential_from(self, strategy: SequentialPageStrategy, request: Request) -> AsyncGenerator[_Page]:
         while True:

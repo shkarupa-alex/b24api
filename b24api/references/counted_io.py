@@ -190,6 +190,10 @@ class ReferenceTailStream:
     the shared dispatcher, at most ``window`` pages ahead of the consumer. Receipts are yielded in
     offset order; ``aclose`` settles every page the binding will not commit exactly once: never sent
     as not executed, sent without an observed outcome as unknown, settled but unconsumed as aborted.
+
+    While the submitter holds its next page and only the consumer's progress stands between it and
+    the queue, the tail is a pending refill of the dispatcher: the window slots a draining consumer
+    frees one by one then fill one batch instead of one batch each.
     """
 
     report: KernelReport | None = None
@@ -211,6 +215,14 @@ class ReferenceTailStream:
         self._changed = asyncio.Event()
         self._submitter: asyncio.Task[None] | None = None
         self._closed = False
+        # The submitter holds its next page until the page departs for the queue.
+        self._in_hand = False
+        # That page has its window slot.
+        self._slot_taken = False
+        # The consumer freed a window slot the submitter has not taken yet.
+        self._slot_freed = False
+        # The consumer holds a yielded receipt; moving past it frees a window slot.
+        self._holding = False
 
     async def __aiter__(self) -> AsyncIterator[TailReceipt]:
         """Yield each planned page's receipt in offset order."""
@@ -222,8 +234,30 @@ class ReferenceTailStream:
             if slot is None:
                 return
             ordinal += 1
-            yield await self._receipt(slot)
+            receipt = await self._receipt(slot)
+            self._holding = True
+            self._publish_refill()
+            yield receipt
+            self._holding = False
+            self._slot_freed = True
             self._window.release()
+            self._publish_refill()
+
+    def _publish_refill(self) -> None:
+        """Report whether the page in hand waits for nothing but the consumer.
+
+        It has its slot, a slot is free for it, or the consumer holds a receipt whose release frees
+        one. While the consumer itself waits for an in-flight page, the tail adds nothing on its own.
+        """
+        state, key = self._host.producer_state, self._run.producer_key
+        if self._in_hand and (self._slot_taken or self._slot_freed):
+            state.pending_refills[key] = None
+        elif self._in_hand and self._holding:
+            # The held receipt's rows come back to the pool before the page reserves its own.
+            state.pending_refills[key] = self._run.reservation
+        else:
+            state.pending_refills.pop(key, None)
+        state.touch()
 
     async def _submit(self) -> None:
         """Plan, reserve and dispatch tail pages ahead of the consumer, bounded by the window."""
@@ -231,22 +265,27 @@ class ReferenceTailStream:
         state, key = host.producer_state, run.producer_key
         try:
             for ordinal, item in enumerate(self._requests):
+                self._in_hand = True
                 if self._window.locked():
                     state.runnable.discard(key)
-                    state.touch()
+                self._publish_refill()
                 await self._window.acquire()
+                self._slot_taken, self._slot_freed = True, False
                 state.runnable.add(key)
-                state.touch()
+                self._publish_refill()
                 slot = _TailSlot(ordinal, run.completion.reserve(), host.take_page_sequence())
                 self._slots[ordinal] = slot
                 slot.reservation = await host.buffer.reserve(run.work.index, run.program.page_cap)
                 transit = state.depart(key, page_reserved=False)
                 slot.task = asyncio.create_task(self._fetch(slot, item.request, transit))
                 transit.carried_by(slot.task)
+                self._in_hand = self._slot_taken = False
+                self._publish_refill()
                 self._changed.set()
         finally:
+            self._in_hand = self._slot_taken = False
             state.runnable.discard(key)
-            state.touch()
+            self._publish_refill()
             self._changed.set()
 
     async def _fetch(self, slot: _TailSlot, request: Request, transit: _Transit) -> _DispatchedPage:

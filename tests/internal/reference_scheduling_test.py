@@ -28,11 +28,13 @@ from b24api import (
     StableIntegerKeysetContract,
     TerminalState,
 )
-from b24api.contracts import Binding, ParameterUpdate, ReferenceSource
+from b24api.contracts import Binding, DeliveryOrder, ParameterUpdate, ReferenceSource
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError
 from b24api.execution import Executor
+from b24api.execution.context import CleanupResult
+from b24api.references.counted_io import ReferenceTailStream
 from b24api.references.dispatch import (
     _BatchPageDispatcher,
     _failed_settlement,
@@ -41,13 +43,25 @@ from b24api.references.dispatch import (
     _RowBuffer,
 )
 from b24api.references.scheduler import ReferenceScheduler
+from b24api.traversal.counted_batch import _settle_tail_cleanup
 from b24api.traversal.plans import KernelBatchDispatch, ReferenceOutputOrder
 from tests.scripting import BatchPortal, client_for
 
 if TYPE_CHECKING:
-    from b24api.references.dispatch import _DispatchedPage, _Transit
+    from b24api.references.dispatch import _DispatchedPage, _FailureEvent, _Transit
     from b24api.references.program import FastKeysetProgram
+    from b24api.references.run import _ReferenceRun
+    from b24api.traversal.identity import _Page
     from tests.scripting import Envelope, Query
+
+
+def _counted_answer(_method: str, query: Query) -> Envelope:
+    """Serve the 1001-row counted fixture in pages of 50."""
+    offset = int(query.get("start", "0"))
+    envelope: Envelope = {"result": [{"ID": row} for row in range(offset, min(offset + 50, 1001))], "total": 1001}
+    if offset + 50 < 1001:  # noqa: PLR2004 - the counted fixture's size
+        envelope["next"] = offset + 50
+    return envelope
 
 
 def _dispatcher_page(key: str) -> _PendingBatch:
@@ -188,6 +202,71 @@ async def test_a_page_on_its_way_to_the_queue_is_potential_until_it_arrives() ->
     await buffer.close()
 
 
+@pytest.mark.parametrize("ready", [True, False])
+@pytest.mark.asyncio
+async def test_a_pending_refill_is_potential_whatever_the_chunk_carries(*, ready: bool) -> None:
+    """A windowed producer's refill counts while its own pages wait in the chunk.
+
+    Under INPUT delivery only the frontier's consumer progresses on its own, so only its refill counts.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy(max_pages=100, max_pages_per_reference=100))
+    await context.start()
+    state = _ProducerState(set(), {"r0": 0, "r1": 1})
+    buffer = _RowBuffer(10, context, producer_state=state, ordered=not ready)
+    dispatcher = _BatchPageDispatcher(
+        executor,
+        context,
+        KernelBatchDispatch(batch_size=2, coalesce_wait=1),
+        producer_state=state,
+        buffer=buffer,
+        page_cap=1,
+        pending_continuations_can_progress=ready,
+    )
+    potential = dispatcher._potential  # noqa: SLF001 - the assembler's coalescing read
+    state.pending_refills["r1"] = None
+    assert potential({"r1"}) == int(ready)
+    state.pending_refills["r0"] = None
+    assert potential({"r0", "r1"}) == 1 + int(ready)
+    state.pending_continuations.add("r0")
+    state.pending_refills.clear()
+    assert potential({"r0"}) == 0
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_refill_counts_the_rows_its_consumer_returns_first() -> None:
+    """A refill waiting on a held receipt reserves from the rows that receipt returns, not only free ones."""
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy(max_pages=100, max_pages_per_reference=100))
+    await context.start()
+    state = _ProducerState(set(), {"r0": 0})
+    buffer = _RowBuffer(2, context, producer_state=state)
+    dispatcher = _BatchPageDispatcher(
+        executor,
+        context,
+        KernelBatchDispatch(batch_size=2, coalesce_wait=1),
+        producer_state=state,
+        buffer=buffer,
+        page_cap=2,
+    )
+    potential = dispatcher._potential  # noqa: SLF001 - the assembler's coalescing read
+    held = await buffer.reserve(0, 2)
+    state.pending_refills["r0"] = None
+    assert potential({"r0"}) == 0
+    state.pending_refills["r0"] = held
+    assert potential({"r0"}) == 1
+    page = await context.reserve_page(reference="r0")
+    assert potential({"r0"}) == 1
+    pages = [await context.reserve_page(reference="r0") for _ in range(99)]
+    # The page budget is spent: the refill could not reserve its logical page.
+    assert potential({"r0"}) == 0
+    for reservation in (page, *pages):
+        context.release_page(reservation)
+    await buffer.abort(held)
+    await buffer.close()
+
+
 @pytest.mark.asyncio
 async def test_every_fast_keyset_wave_command_is_counted_in_transit_until_it_is_queued(
     monkeypatch: pytest.MonkeyPatch,
@@ -285,6 +364,111 @@ async def test_every_counted_tail_page_reaches_fetch_in_transit_and_leaves_it_re
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED
     assert pages == [(True, True)] * 3  # offsets 50, 100 and 150
+
+
+@pytest.mark.parametrize("ready", [True, False])
+@pytest.mark.asyncio
+async def test_a_failed_counted_binding_closes_its_tail_before_its_terminal_event(
+    monkeypatch: pytest.MonkeyPatch, *, ready: bool
+) -> None:
+    """The tail is settled and stops advertising a refill before the binding's failure is emitted."""
+    deliver = ReferenceScheduler._deliver_page  # noqa: SLF001 - the delivery seam the failure enters
+    delivered = 0
+    observed: list[tuple[bool, set[int]]] = []
+
+    async def failing(self: ReferenceScheduler, run: _ReferenceRun, page: _Page) -> bool:
+        nonlocal delivered
+        delivered += 1
+        if delivered == 2:  # noqa: PLR2004 - the first tail page, after the head
+            raise RuntimeError("delivery failed")
+        return await deliver(self, run, page)
+
+    failure_event = ReferenceScheduler._failure_event  # noqa: SLF001 - observed when it is built
+
+    def observing(self: ReferenceScheduler, run: _ReferenceRun, error: BaseException) -> object:
+        observed.append(
+            (
+                run.producer_key in self.producer_state.pending_refills,
+                set(run.completion._reserved),  # noqa: SLF001 - pages the binding has not settled
+            )
+        )
+        return failure_event(self, run, error)
+
+    monkeypatch.setattr(ReferenceScheduler, "_deliver_page", failing)
+    monkeypatch.setattr(ReferenceScheduler, "_failure_event", observing)
+
+    def answer(_method: str, query: Query) -> Envelope:
+        offset = int(query.get("start", "0"))
+        envelope: Envelope = {"result": [{"ID": row} for row in range(offset, min(offset + 50, 1001))], "total": 1001}
+        if offset + 50 < 1001:  # noqa: PLR2004 - the counted fixture's size
+            envelope["next"] = offset + 50
+        return envelope
+
+    binding = Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), 1),), 1)
+    source = ReferenceSource(Request.bare("gamma.list", {}), CountedTraversal(), binding)
+    order = DeliveryOrder.READY if ready else DeliveryOrder.INPUT
+    async with client_for(BatchPortal(answer), policy=ExecutionPolicy(max_buffered_rows=100)) as api:
+        stream = api.iter_reference_source_outcomes([source], dispatch=BatchDispatch(batch_size=10, output_order=order))
+        async with stream:
+            _events = [event async for event in stream]
+    assert stream.report is not None
+    assert observed == [(False, set())]
+
+
+@pytest.mark.asyncio
+async def test_a_tail_cleanup_failure_never_replaces_the_failure_that_ended_its_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The binding fails with its delivery error; the tail's cleanup failure is raised only after it."""
+    deliver = ReferenceScheduler._deliver_page  # noqa: SLF001 - the delivery seam the failure enters
+    delivered = 0
+    errors: list[BaseException] = []
+
+    async def failing(self: ReferenceScheduler, run: _ReferenceRun, page: _Page) -> bool:
+        nonlocal delivered
+        delivered += 1
+        if delivered == 2:  # noqa: PLR2004 - the first tail page, after the head
+            raise RuntimeError("delivery failed")
+        return await deliver(self, run, page)
+
+    async def failing_cleanup(_tail: ReferenceTailStream) -> None:
+        raise ValueError("tail cleanup failed")
+
+    failure_event = ReferenceScheduler._failure_event  # noqa: SLF001 - observed when it is built
+
+    def observing(self: ReferenceScheduler, run: _ReferenceRun, error: BaseException) -> _FailureEvent:
+        errors.append(error)
+        return failure_event(self, run, error)
+
+    monkeypatch.setattr(ReferenceScheduler, "_deliver_page", failing)
+    monkeypatch.setattr(ReferenceTailStream, "aclose", failing_cleanup)
+    monkeypatch.setattr(ReferenceScheduler, "_failure_event", observing)
+    binding = Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), 1),), 1)
+    source = ReferenceSource(Request.bare("gamma.list", {}), CountedTraversal(), binding)
+    async with client_for(BatchPortal(_counted_answer)) as api:
+        stream = api.iter_reference_source_outcomes([source], dispatch=BatchDispatch(batch_size=10))
+        with pytest.raises(ValueError, match="tail cleanup failed"):
+            async with stream:
+                _events = [event async for event in stream]
+    # The binding failed with its own error; the cleanup failure still ends the operation afterwards.
+    assert [(type(error), str(error)) for error in errors] == [(RuntimeError, "delivery failed")]
+
+
+@pytest.mark.asyncio
+async def test_closing_a_tail_inside_a_cancelled_task_does_not_arm_another_cancellation() -> None:
+    """A stream closed while its task is cancelled already carries that cancellation."""
+    task = asyncio.current_task()
+    assert task is not None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(0)
+    assert task.cancelling() == 1
+    _settle_tail_cleanup(CleanupResult(None, None), GeneratorExit())
+    await asyncio.sleep(0)  # no cancellation was re-armed
+    with pytest.raises(ValueError, match="cleanup"):
+        _settle_tail_cleanup(CleanupResult(None, ValueError("cleanup")), GeneratorExit())
+    await asyncio.sleep(0)  # nor when the cleanup itself failed
+    task.uncancel()
 
 
 def _grant(pool: int, free: int) -> int | None:
