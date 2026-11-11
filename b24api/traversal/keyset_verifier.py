@@ -528,6 +528,8 @@ async def verify_keyset_capability(  # noqa: PLR0913
         raise ValueError("page_size must be a positive integer")
     if request.encoding is not BodyEncoding.JSON or request.headers.items:
         raise CapabilityError("keyset verifier supports JSON requests without scoped headers")
+    if request.has_empty_container:
+        raise CapabilityError("keyset verifier sends classic batch probes, which cannot carry an empty array or object")
     if identity.coercion not in {IdentityCoercion.EXACT_INTEGER, IdentityCoercion.DECIMAL_STRING_INTEGER}:
         raise CapabilityError("keyset verifier requires integer identity coercion")
     _reject_owned_controls(request, identity, keyset)

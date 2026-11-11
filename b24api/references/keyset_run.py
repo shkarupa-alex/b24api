@@ -22,7 +22,7 @@ from b24api.errors import PaginationError
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _DoneEvent, _failed_settlement, _FailureEvent, _PageEvent
 from b24api.references.wave_engine import SharedWaveEngine, WaveHost
-from b24api.traversal.keyset_eligibility import validate_fast_keyset
+from b24api.traversal.keyset_eligibility import reject_unencodable_fast_request, validate_fast_keyset
 from b24api.traversal.keyset_observation import FastTraceRecorder
 from b24api.traversal.keyset_runtime import KeysetRuntime
 
@@ -80,6 +80,7 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
             execution=fast.execution,
             policy=host.context.policy,
         )
+        reject_unencodable_fast_request(request)
         lease = await host.lease_rows(run, fast)
         view = BindingBudgetView.over(host.context, RowLease.of(lease))
         runtime = KeysetRuntime(

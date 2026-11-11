@@ -67,6 +67,31 @@
   when a transport suppresses it and returns a response or reports a failure: the request is not
   retried, and a batch sends no further envelope.
 
+## Request encoding
+
+- **Enum members send their value everywhere.** A `str`, `int` or `float` subclass in request
+  parameters, such as a member of `class Stage(str, Enum)` or an `IntEnum`, is now stored as its
+  plain value, keys included. A direct JSON call already sent `"NEW"`, but a classic batch command
+  rendered the member through its own `__str__` and sent `Stage.NEW`, so a counted traversal sent its
+  head and its tail with different filters. `Request` equality and hashing now also treat a member
+  and its value alike.
+- **Classic batch refuses an empty array or object.** PHP bracket encoding names leaves only, so
+  `{"fields": {"UF_MULTI": []}}` reached the server as no field at all, and an update meant to clear
+  a field succeeded without clearing it. Each command a classic batch would send is now checked before
+  any request:
+  - `batch_outcomes()`, `fan_out_outcomes()` and batched references fail that command or binding
+    locally with `CapabilityError` (a `CommandFailure` or a `ReferenceFailure`), and the others still
+    run; a binding that replaces an empty placeholder of its template is sent as usual.
+  - Fail-fast `batch()` sends nothing for a window that holds such a command and raises `BatchFailed`.
+  - `iter_list_counted()` (its tail is batched), fast and automatic keyset traversal and
+    `verify_keyset_capability()` refuse such a base request before their first request. A common case
+    is an empty `filter: {}`: omit it, or use `iter_list()` or `SequentialKeysetExecution`.
+  - A `FORM_URLENCODED` request with an empty container is refused when it is built.
+
+  Native REST v3 batch and every direct JSON request still send empty containers. `None` is still
+  omitted from bracket encoding, so `{"UF_MULTI": [None]}` also sends no field there. The new
+  read-only `Request.has_empty_container` tells whether a request holds such a value.
+
 ## Page-level response fields
 
 - **`PageBoundary.result`.** A `page_stop` callback now receives the page's immutable server result

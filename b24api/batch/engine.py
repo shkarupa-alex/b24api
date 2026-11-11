@@ -59,6 +59,9 @@ if TYPE_CHECKING:
 
 _MISSING = object()
 _UNSUPPORTED_COMMAND = "physical batch supports BARE JSON requests without scoped headers; use direct dispatch"
+_UNSUPPORTED_EMPTY_CONTAINER = (
+    "classic batch cannot carry an empty array or object, which PHP bracket encoding drops; use direct dispatch"
+)
 _UNSUPPORTED_V3_TRANSPORT = "transport does not support native REST v3 batch envelopes; use direct dispatch"
 
 
@@ -287,11 +290,9 @@ class BatchExecutor:
 
     def _batch_route(self, request: Request) -> RouteKind | None:
         """Return the envelope dialect a request can travel in, or ``None`` when no envelope represents it."""
-        if request.encoding.value != "json" or request.positional is not None or request.headers.items:
-            return None
-        if request.route is RouteKind.BARE and not request.method.endswith(".json"):
+        if _classic_representable(request) and not request.has_empty_container:
             return RouteKind.BARE
-        if request.route is RouteKind.API_V3 and self.executor.supports_v3_batch:
+        if _v3_representable(request) and self.executor.supports_v3_batch:
             return RouteKind.API_V3
         return None
 
@@ -306,8 +307,14 @@ class BatchExecutor:
             if self._batch_route(command.request) is not None:
                 eligible.append(command)
                 continue
-            # A v3 command is refused before any reservation when the transport cannot send the array body.
-            message = _UNSUPPORTED_V3_TRANSPORT if _v3_representable(command.request) else _UNSUPPORTED_COMMAND
+            # A command is refused before any reservation when no envelope the transport sends represents it.
+            message = (
+                _UNSUPPORTED_V3_TRANSPORT
+                if _v3_representable(command.request)
+                else _UNSUPPORTED_EMPTY_CONTAINER
+                if _classic_representable(command.request)
+                else _UNSUPPORTED_COMMAND
+            )
             error = CapabilityError(message, request_summary=command.request.summary)
             rejected[command.index] = _command_failure(
                 command,
@@ -577,6 +584,17 @@ def _merge_outcomes(
     by_index = {outcome.command_index: outcome for outcome in executed}
     by_index.update(rejected)
     return tuple(by_index[command.index] for command in commands)
+
+
+def _classic_representable(request: Request) -> bool:
+    """Return whether a request has a classic batch command form, whatever values its parameters hold."""
+    return (
+        request.route is RouteKind.BARE
+        and not request.method.endswith(".json")
+        and request.encoding.value == "json"
+        and request.positional is None
+        and not request.headers.items
+    )
 
 
 def _v3_representable(request: Request) -> bool:
