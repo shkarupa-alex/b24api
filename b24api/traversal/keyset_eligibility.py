@@ -97,6 +97,19 @@ def _reject_owned_controls(request: Request, identity: IdentitySpec, keyset: Key
             raise CapabilityError("caller traversal control conflicts with fast keyset traversal")
 
 
+def reject_unencodable_fast_request(request: Request) -> None:
+    """Refuse a request that fast keyset would send in classic batch without one of its values.
+
+    A reference template is not sent as it stands, so this applies to the flat request and to each
+    bound reference request, never to the template.
+    """
+    if request.has_empty_container:
+        raise CapabilityError(
+            "fast keyset traversal sends classic batch commands, which cannot carry an empty array or object; "
+            "use SequentialKeysetExecution"
+        )
+
+
 def _effective_cap(
     execution: RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
     keyset: KeysetSpec,
@@ -197,4 +210,4 @@ def validate_fast_keyset(  # noqa: C901, PLR0912, PLR0913
     return effective_cap
 
 
-__all__ = ["validate_fast_keyset"]
+__all__ = ["reject_unencodable_fast_request", "validate_fast_keyset"]

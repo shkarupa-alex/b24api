@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import TypedDict, cast
 
 from b24api._diagnostics import DiagnosticContext
-from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, thaw_json
+from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, _has_empty_container, thaw_json
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.positional import PositionalArguments
 from b24api.contracts.request_summary import RequestSummary, RouteKind
@@ -219,6 +219,7 @@ class Request:
     result_error: ResultErrorSpec | None
     _parameters: FrozenMapping = field(repr=False)
     _positional: PositionalArguments | None = field(repr=False)
+    _empty_container: bool | None = field(repr=False, compare=False)
 
     def __init__(  # noqa: C901, PLR0913 - canonical request boundary validates each declared contract
         self,
@@ -262,6 +263,9 @@ class Request:
         object.__setattr__(self, "result_error", result_error)
         object.__setattr__(self, "_parameters", frozen)
         object.__setattr__(self, "_positional", positional)
+        object.__setattr__(self, "_empty_container", None)
+        if encoding is BodyEncoding.FORM_URLENCODED and self.has_empty_container:
+            raise ValueError("form-encoded parameters cannot carry an empty array or object; use JSON encoding")
 
     @classmethod
     def bare(  # noqa: PLR0913 - mirrors the canonical constructor's arguments except route
@@ -304,6 +308,18 @@ class Request:
     def positional(self) -> PositionalArguments | None:
         """Return immutable positional arguments, if this request uses them."""
         return self._positional
+
+    @property
+    def has_empty_container(self) -> bool:
+        """Return whether a nested empty array or object would vanish from PHP bracket encoding.
+
+        Bracket syntax, used by form bodies and classic batch commands, names leaves only, so
+        ``{"fields": {"UF_MULTI": []}}`` encodes exactly as ``{}``. Positional requests have no
+        named parameters and answer ``False``.
+        """
+        if self._empty_container is None:
+            object.__setattr__(self, "_empty_container", _has_empty_container(self._parameters))
+        return cast("bool", self._empty_container)
 
     @property
     def parameters(self) -> Mapping[str, JsonValue]:

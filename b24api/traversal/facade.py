@@ -42,7 +42,7 @@ from b24api.traversal.facade_support import (
     _direction,
     declared_traversal_plan,
 )
-from b24api.traversal.keyset_eligibility import validate_fast_keyset
+from b24api.traversal.keyset_eligibility import reject_unencodable_fast_request, validate_fast_keyset
 from b24api.traversal.keyset_engine import FlatWaveEngine
 from b24api.traversal.keyset_fast_stream import KeysetFastStream
 from b24api.traversal.keyset_observation import FastTraceRecorder
@@ -191,6 +191,7 @@ def keyset_stream(  # noqa: PLR0913
             execution=execution,
             policy=policy,
         )
+        reject_unencodable_fast_request(canonical)
         context = executor.context(policy)
         trace = FastTraceRecorder(policy.page_trace_limit)
         runtime = KeysetRuntime(
@@ -273,6 +274,12 @@ def counted_stream(  # noqa: PLR0913
         or canonical.positional is not None
     ):
         raise CapabilityError("counted traversal supports JSON requests without scoped headers")
+    if canonical.has_empty_container:
+        # The head goes direct and the tail in classic batch: both must send the same request.
+        raise CapabilityError(
+            "counted traversal sends its tail in classic batch, which cannot carry an empty array or object; "
+            "use iter_list"
+        )
     executor.preflight_request(canonical)
     plan = CountedOffsetPlan(
         offset_path=offset.parameter_path,

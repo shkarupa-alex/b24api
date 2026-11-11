@@ -3,6 +3,7 @@
 from __future__ import annotations
 import math
 from collections.abc import Iterator, Mapping, Sequence
+from typing import cast
 
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
@@ -67,7 +68,28 @@ def _frozen_json_key(value: FrozenJson) -> object:  # noqa: PLR0911 - closed JSO
     return value._comparison_key()  # noqa: SLF001 - closed recursive value implementation
 
 
-def _freeze_json(  # noqa: C901 - closed JSON scalar/container variants
+def _plain_scalar(value: JsonScalar) -> JsonScalar:
+    """Return a JSON scalar as its exact built-in type.
+
+    A subclass, such as a ``(str, Enum)`` member, is stored as its plain value, so every encoding sends
+    the same JSON: a PHP query would otherwise render it through its own ``__str__``.
+    """
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("JSON numbers must be finite")
+        return value
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value if type(value) is int else int.__int__(value)
+    if isinstance(value, str):
+        return value if type(value) is str else str.__str__(value)
+    if not math.isfinite(value):
+        raise ValueError("JSON numbers must be finite")
+    return value if type(value) is float else float.__float__(value)
+
+
+def _freeze_json(
     value: object,
     *,
     active: set[int] | None = None,
@@ -76,12 +98,11 @@ def _freeze_json(  # noqa: C901 - closed JSON scalar/container variants
     if depth > _MAX_JSON_DEPTH:
         raise ValueError("JSON nesting exceeds the supported depth")
     active = active if active is not None else set()
-    if value is None or isinstance(value, bool | int | str):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("JSON numbers must be finite")
-        return value
+    kind = type(value)
+    if value is None or kind is str or kind is int or kind is bool:
+        return cast("JsonScalar", value)
+    if isinstance(value, bool | int | str | float):
+        return _plain_scalar(value)
     if isinstance(value, Mapping):
         identity = id(value)
         if identity in active:
@@ -92,7 +113,9 @@ def _freeze_json(  # noqa: C901 - closed JSON scalar/container variants
             for key, item in value.items():
                 if not isinstance(key, str):
                     raise TypeError("JSON object keys must be strings")
-                frozen[key] = _freeze_json(item, active=active, depth=depth + 1)
+                frozen[key if type(key) is str else str.__str__(key)] = _freeze_json(
+                    item, active=active, depth=depth + 1
+                )
             return FrozenMapping(frozen)
         finally:
             active.remove(identity)
@@ -106,6 +129,18 @@ def _freeze_json(  # noqa: C901 - closed JSON scalar/container variants
         finally:
             active.remove(identity)
     raise TypeError(f"unsupported JSON value type: {type(value).__name__}")
+
+
+def _has_empty_container(value: FrozenJson) -> bool:
+    """Return whether a frozen value holds an empty array or object below its own top level."""
+    pending: list[FrozenJson] = list(value.values()) if isinstance(value, FrozenMapping) else [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, FrozenMapping | tuple):
+            if not item:
+                return True
+            pending.extend(item.values() if isinstance(item, FrozenMapping) else item)
+    return False
 
 
 def thaw_json(value: FrozenJson) -> JsonValue:
