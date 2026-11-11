@@ -38,11 +38,7 @@ from b24api.errors import (
     TransportError,
 )
 from b24api.execution.boundary import send_transport, send_wire_envelope
-from b24api.execution.context import (
-    ExecutionContext,
-    _checkpoint_pending_cancellation,
-    _raise_for_pending_cancellation,
-)
+from b24api.execution.context import CancellationMark, ExecutionContext, mark_cancellation
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
@@ -311,7 +307,7 @@ class Executor:
         """Run the attempt loop and return one conclusive raw response; ``shared`` counts every dispatch."""
         self.preflight_request(request)
         wire_request = WireRequest(request) if self._wire_transport is not None else None
-        await _checkpoint_pending_cancellation()
+        cancellation = await mark_cancellation()
         await context.start()
         retry_started, attempts = shared.begin(self._clock)
         last_error: B24ApiError | None = None
@@ -333,25 +329,13 @@ class Executor:
                         raise BudgetExceededError("execution time budget exhausted before dispatch")
                     await context.reserve_attempt(attempts_for_request=attempts, retry_started=retry_started)
                     shared.dispatched()
-                    try:
-                        async with asyncio.timeout(remaining):
-                            wire = await send_transport(
-                                self.transport,
-                                self._wire_transport,
-                                request,
-                                wire_request=wire_request,
-                                attempt_timeout=remaining,
-                                max_response_bytes=context.policy.max_response_bytes,
-                            )
-                    except TimeoutError as error:
-                        raise TransportError(
-                            "Transport attempt exceeded its elapsed budget",
-                            phase=FailurePhase.DISPATCH_STARTED,
-                            request_summary=request.summary,
-                        ) from error
+                    wire = await self._send_attempt(request, wire_request, context=context, remaining=remaining)
             except asyncio.CancelledError:
                 raise
             except B24ApiError as error:
+                # A transport that turned a cancellation into a failure is neither retried nor reported by it.
+                if cancellation.requested():
+                    raise asyncio.CancelledError from error
                 await self._prepare_retry(
                     request,
                     error,
@@ -366,7 +350,7 @@ class Executor:
 
             response_error, parsed = self._classify_response(request, wire, context=context, mode=mode)
             if response_error is None:
-                _raise_for_pending_cancellation()
+                cancellation.raise_if_requested()
                 if context.remaining_time(retry_started=retry_started) <= 0:
                     raise BudgetExceededError("transport completed after execution time budget")
                 return wire, parsed
@@ -382,7 +366,7 @@ class Executor:
                     throttle_delay, reason=_throttle_reason(response_error)
                 )
                 await context.record_cooldown(merged)
-            _raise_for_pending_cancellation()
+            cancellation.raise_if_requested()
             shared.settle(response_error, context.policy)
             if context.remaining_time(retry_started=retry_started) <= 0:
                 raise BudgetExceededError("transport completed after execution time budget") from response_error
@@ -398,6 +382,32 @@ class Executor:
             )
             last_error = response_error
             attempts += 1
+
+    async def _send_attempt(
+        self,
+        request: Request,
+        wire_request: WireRequest | None,
+        *,
+        context: ExecutionContext,
+        remaining: float,
+    ) -> WireResponse:
+        """Send one admitted, counted attempt within what is left of the retry window."""
+        try:
+            async with asyncio.timeout(remaining):
+                return await send_transport(
+                    self.transport,
+                    self._wire_transport,
+                    request,
+                    wire_request=wire_request,
+                    attempt_timeout=remaining,
+                    max_response_bytes=context.policy.max_response_bytes,
+                )
+        except TimeoutError as error:
+            raise TransportError(
+                "Transport attempt exceeded its elapsed budget",
+                phase=FailurePhase.DISPATCH_STARTED,
+                request_summary=request.summary,
+            ) from error
 
     async def _execute_physical_batch_attempt(
         self,
@@ -417,7 +427,7 @@ class Executor:
             self.preflight_wire(envelope)
         except CapabilityError as error:
             return _local_attempt_failure(error)
-        await _checkpoint_pending_cancellation()
+        cancellation = await mark_cancellation()
         await context.start()
         retry_started, spent = attempts.begin(self._clock)
         try:
@@ -428,10 +438,16 @@ class Executor:
             return _dispatched_attempt("cancelled", error=error)
         except B24ApiError as error:
             if attempts.used == spent:
+                cancellation.raise_if_requested()
                 return _local_attempt_failure(error)
+            if cancellation.requested():
+                # The transport turned a cancellation into this failure: the envelope ends cancelled.
+                return _dispatched_attempt("cancelled", error=asyncio.CancelledError())
             proven = isinstance(error, TransportError) and not error.possible_acceptance
             return _dispatched_attempt("error", error=error, proven_not_accepted=proven)
-        return await self._classify_envelope(envelope, wire, context=context, retry_started=retry_started)
+        return await self._classify_envelope(
+            envelope, wire, context=context, retry_started=retry_started, cancellation=cancellation
+        )
 
     async def _send_envelope(
         self,
@@ -485,6 +501,7 @@ class Executor:
         *,
         context: ExecutionContext,
         retry_started: float,
+        cancellation: CancellationMark,
     ) -> PhysicalAttemptOutcome:
         """Classify one envelope response with the shared primitives, observing any host throttle hint."""
         summary = envelope.summary
@@ -495,7 +512,7 @@ class Executor:
         if response_error is not None and throttle_delay is not None:
             merged = await context.coordinator.observe_throttle(throttle_delay, reason=_throttle_reason(response_error))
             await context.record_cooldown(merged)
-        if _cancellation_pending():
+        if cancellation.requested():
             return _dispatched_attempt("cancelled", wire=wire, error=asyncio.CancelledError())
         if response_error is None and context.remaining_time(retry_started=retry_started) <= 0:
             response_error = BudgetExceededError("transport completed after execution time budget")
@@ -674,11 +691,6 @@ def _dispatched_attempt(
     return PhysicalAttemptOutcome(
         kind, wire, response, error, dispatch_started=True, transport_proves_not_accepted=proven_not_accepted
     )
-
-
-def _cancellation_pending() -> bool:
-    task = asyncio.current_task()
-    return task is not None and bool(task.cancelling())
 
 
 def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: ExecutionPolicy) -> bool:

@@ -16,6 +16,24 @@
   `PartitionedKeysetExecution`, including when the automatic plan ends up sequential, and may be
   called more often than before.
 
+## Cancellation is delivered once
+
+- **Your cleanup after a cancelled read runs.** A stream, batch or reference operation cancelled
+  while it waited raised the `CancelledError` and then armed it again, so the first `await` in the
+  caller's own `finally` or `except asyncio.CancelledError:` block was interrupted. On Python 3.12 the
+  first `await` after a handled `asyncio.timeout(...)` around a stream raised `CancelledError` too.
+  A cancellation is now replayed only when stream cleanup absorbed it while another failure was
+  raised in its place. On Python 3.12 that replay still survives a handled `asyncio.timeout(...)`
+  around the stream when its cleanup fails, because `uncancel()` there does not disarm it; Python
+  3.13 drops it.
+- **Requests work in the cleanup of a cancelled task.** `call()` and the other request methods,
+  started after the task received its cancellation and kept running (without `uncancel()`), raised
+  `CancelledError` before sending, and a response that arrived after the task's first cancellation
+  was dropped. They are now sent and return their result, so a compensating write or an unlock in
+  cleanup takes effect. A cancellation requested while such a request runs still stops it, even
+  when a transport suppresses it and returns a response or reports a failure: the request is not
+  retried, and a batch sends no further envelope.
+
 ## Page-level response fields
 
 - **`PageBoundary.result`.** A `page_stop` callback now receives the page's immutable server result

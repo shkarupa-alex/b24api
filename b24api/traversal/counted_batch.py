@@ -346,8 +346,8 @@ def _settle_tail_cleanup(cleanup: CleanupResult, primary_error: BaseException | 
     if cleanup.error is not None:
         if not preserve_primary:
             # The cleanup failure replaces a cancellation, which it must not lose; a closing stream has none.
-            if cleanup.cancellation is not None or isinstance(primary_error, asyncio.CancelledError):
-                rearm_cancellation(cleanup.cancellation)
+            replaced = primary_error if isinstance(primary_error, asyncio.CancelledError) else None
+            rearm_cancellation(cleanup.cancellation or replaced)
             raise cleanup.error
         if isinstance(cleanup.error, asyncio.CancelledError):
             pending_cancellation = cleanup.error
