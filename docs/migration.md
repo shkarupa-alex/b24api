@@ -1,5 +1,19 @@
 # Migration guide
 
+## Budget accounting scales with the bindings
+
+- **Long reference streams no longer slow down as they go.** Every page and row of
+  `iter_references()`, `iter_reference_sources()` and `fan_out()` copied, sorted and validated the page count of
+  every binding read so far, so CPU time grew with the square of the bindings: over an in-memory
+  transport, 10,000 one-page bindings took about 74 s of CPU, against 8 s now. The operation's
+  budget counters are now updated in place, and a binding's page count is dropped once the binding
+  ends. Budgets, failures, events and reports are unchanged.
+- **`BudgetCounters` is only a snapshot.** The value in `b24api.contracts.policy`, which is not
+  exported, lost its `reserve_attempt`, `reserve_page` and `with_buffered_rows` methods; budget
+  checks live in the operation's execution context. Its `pages_per_reference` in an execution
+  snapshot lists only bindings that still hold pages: open bindings with a committed page, and a
+  closed binding until its page in flight settles.
+
 ## Early close and completion evidence
 
 - **A counted early exit publishes its report.** Leaving `iter_list_counted()` with `break`, or
