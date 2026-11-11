@@ -758,7 +758,12 @@ list strategies use closed JSON `version: 1` contracts. The entire contract is v
 client construction. Run `b24api --help` and `b24api list --help` for the compact option surface.
 
 Exit codes are `0` success, `2` usage/contract error, `3` unavailable configuration, `4`
-remote/protocol/correctness/incomplete failure, `5` broken output consumer and `130` cancellation.
+remote/protocol/correctness/incomplete failure, `5` broken output consumer, `6` keyset bounds
+unsupported and `7` keyset verification inconclusive (both from `verify-keyset`), and `130`
+cancellation.
+`5` takes priority whenever a write to stdout or stderr finds its reader gone, including a run whose
+data was delivered but whose diagnostic hit a closed stderr. Any other failed write, such as to a full
+disk, exits `4`.
 
 ## Correctness boundaries
 
