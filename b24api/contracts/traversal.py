@@ -249,6 +249,16 @@ class OffsetSpec:
                 raise ValueError("fixed-step offset requires a positive integer step")
         elif self.step is not None:
             raise ValueError("step is valid only for fixed-step continuation")
+        if (
+            self.continuation is OffsetContinuation.SERVER_NEXT
+            and self.total_termination is not TotalTermination.EXACT_QUALIFIED
+        ):
+            # SERVER_NEXT refuses a non-empty page without ``next``, and an empty page may close it only
+            # after a ``next`` led there. Bitrix omits ``next`` on its last, non-empty page, so only an
+            # exact qualified total can close the traversal.
+            raise ValueError(
+                "server-next continuation requires TotalTermination.EXACT_QUALIFIED: the last page omits next",
+            )
 
 
 _COUNTED_OFFSET = OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED)

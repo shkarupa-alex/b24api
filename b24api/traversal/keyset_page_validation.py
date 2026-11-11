@@ -16,13 +16,14 @@ from b24api.errors import (
     AmbiguousExecutionError,
     B24ApiError,
     CapabilityError,
+    IdentityContractError,
     PageAdaptationError,
     PaginationError,
     ProtocolError,
 )
 from b24api.traversal.keyset_geometry import closure_witness
-from b24api.traversal.page_adaptation import adapt_page
-from b24api.traversal.values import _coerce_identity, _extract_path, _response_items, _validate_order
+from b24api.traversal.page_adaptation import PageTokens, adapt_page
+from b24api.traversal.values import _response_items, _row_identity, _validate_order
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -106,18 +107,20 @@ def select_rows(*, outcome: BatchSuccess, selector: ResultSelector) -> tuple[Fro
     return tuple(_response_items(outcome.response, selector))
 
 
-def classify_rejection(outcome: BatchOutcome) -> tuple[PageOutcome, PageRejectionCode]:
-    """Classify one correlated failure without inspecting unsafe values."""
+def classify_rejection(outcome: BatchOutcome, receipt: ReceiptRejection) -> tuple[PageOutcome, PageRejectionCode]:
+    """Classify one rejected receipt without inspecting unsafe values: its own contract failure first."""
+    if isinstance(receipt.error, PageAdaptationError):
+        return PageOutcome.REJECTED, PageRejectionCode.PAGE_ADAPTATION
+    if isinstance(receipt.error, IdentityContractError):
+        return PageOutcome.REJECTED, PageRejectionCode.IDENTITY_CONTRACT
     if not isinstance(outcome, BatchFailure):
         return PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION
     error = outcome.error
     if isinstance(error, AmbiguousExecutionError):
         return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION
-    if isinstance(error, ProtocolError):
-        summary = error.request_summary
-        if summary is not None and summary.method == "batch":
-            return PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE
-        return PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE
+    summary = error.request_summary if isinstance(error, ProtocolError) else None
+    if summary is not None and summary.method == "batch":
+        return PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE
     return PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE
 
 
@@ -153,7 +156,8 @@ def validate_lane_receipt(  # noqa: PLR0913
             outcome.response,
             rows,
             adapter=page_adapter,
-            identities=((identity.item_path, identity.coercion),),
+            tokens=PageTokens((identity,)),
+            row_offset=lane.received_rows,
             request_summary=plan.request.summary,
             page_offset=lane.rounds,
         )
@@ -161,7 +165,15 @@ def validate_lane_receipt(  # noqa: PLR0913
             raise PaginationError("response exceeded the declared keyset page cap")
         if plan.expects_single_row and len(rows) > 1:
             raise PaginationError("anchor probe returned more than one row")
-        coerced = tuple(_coerce_identity(_extract_path(row, identity.item_path), identity.coercion) for row in rows)
+        coerced = tuple(
+            _row_identity(
+                row,
+                identity,
+                row_offset=lane.received_rows + index,
+                request_summary=plan.request.summary,
+            )
+            for index, row in enumerate(rows)
+        )
         if any(not isinstance(value, int) for value in coerced):
             raise PaginationError("fast keyset identity must coerce to an integer")
         identities = tuple(value for value in coerced if isinstance(value, int))
@@ -199,6 +211,8 @@ def validate_lane_receipt(  # noqa: PLR0913
         )
     except PageAdaptationError as error:
         return _rejection(plan, str(error), code="page_adaptation", selected_rows=len(rows), error=error)
+    except IdentityContractError as error:
+        return _rejection(plan, str(error), code="identity_contract", selected_rows=len(rows), error=error)
     except (CapabilityError, PaginationError) as error:
         return _rejection(plan, str(error), code="range_contradiction", selected_rows=len(rows), error=error)
 

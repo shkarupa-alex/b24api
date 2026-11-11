@@ -52,7 +52,13 @@ from b24api.contracts.page import AdaptedPage, PageView
 from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSemantics
 from b24api.contracts.report import OperationReport, PageDispatch
 from b24api.contracts.request import RouteKind
-from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError, ResultShapeError
+from b24api.errors import (
+    CapabilityError,
+    IdentityContractError,
+    IncompleteTraversalError,
+    PaginationError,
+    ResultShapeError,
+)
 from b24api.execution import WireResponse
 from b24api.traversal import keyset_page_validation, keyset_plan
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
@@ -266,6 +272,19 @@ class AsymmetricBoundaryTransport(KeysetTransport):
         bounded = isinstance(filters, dict) and any(key in filters for key in (">ID", "<ID"))
         descending = isinstance(order, dict) and order.get("id") == "DESC"
         return rows[:1] if not bounded and not descending else rows
+
+
+class BrokenIdentityTransport(KeysetTransport):
+    """Serve one identity as a non-canonical decimal string wherever it is selected."""
+
+    def __init__(self, identities: tuple[int, ...], *, broken: int) -> None:
+        super().__init__(identities)
+        self.broken = broken
+
+    def _rows(self, parameters: dict[str, JsonValue]) -> list[dict[str, int]]:
+        rows = super()._rows(parameters)
+        broken = cast("dict[str, int]", {"id": f"0{self.broken}"})
+        return [broken if row["id"] == self.broken else row for row in rows]
 
 
 class NthBatchMissingResultTransport(KeysetTransport):
@@ -1123,6 +1142,87 @@ async def test_fast_wave_preserves_typed_result_shape_failure() -> None:
 
     with pytest.raises(ResultShapeError):
         await anext(stream)
+
+
+@pytest.mark.parametrize(
+    ("execution", "selected", "broken", "lane_offset"),
+    [
+        # Range window (9, 14) holds 10..13: the broken row is the fourth of its lane's first page.
+        (RangeKeysetExecution(StableIntegerKeysetContract(), window_width=5), 20, 13, 3),
+        # Partition lane (21, 36): 22..26, then 27..31, so 30 is the lane's ninth row.
+        (PartitionedKeysetExecution(StableIntegerKeysetContract(), target_lanes=2), 40, 30, 8),
+        # Auto picks the sequential finish after the head 1..5: 6..10, then 11..15, so 12 is its seventh row.
+        (AutoKeysetExecution(StableIntegerKeysetContract()), 18, 12, 6),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fast_lane_row_breaking_its_identity_raises_identity_contract_error(
+    execution: RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
+    selected: int,
+    broken: int,
+    lane_offset: int,
+) -> None:
+    stream = _stream(BrokenIdentityTransport(tuple(range(1, selected + 1)), broken=broken), execution)
+
+    with pytest.raises(IncompleteTraversalError, match="identity_contract") as captured:
+        _ = [row async for row in stream]
+
+    cause = captured.value.__cause__
+    assert isinstance(cause, IdentityContractError)
+    assert isinstance(cause, PaginationError)
+    assert (cause.path, cause.coercion, cause.observed_type) == (("id",), IdentityCoercion.EXACT_INTEGER, "string")
+    assert cause.row_offset == lane_offset
+    assert stream.report is not None
+    rejected = [record for record in stream.report.page_trace if record.outcome is PageOutcome.REJECTED]
+    assert rejected[0].rejection_code is PageRejectionCode.IDENTITY_CONTRACT
+
+
+class _SeenIdentities:
+    """Record every identity value the adapter is shown."""
+
+    def __init__(self) -> None:
+        self.seen: list[object] = []
+
+    def adapt(self, page: PageView, /) -> AdaptedPage:
+        self.seen.extend(cast("dict[str, object]", item).get("id") for item in page.items)
+        return AdaptedPage(page.items)
+
+
+@pytest.mark.asyncio
+async def test_fast_lane_adapter_never_sees_a_row_breaking_its_identity() -> None:
+    adapter = _SeenIdentities()
+    stream = _client(BrokenIdentityTransport(tuple(range(1, 21)), broken=13)).iter_list_keyset(
+        Request("item.list", parameters={"filter": {"STATUS": "open"}}, route=RouteKind.BARE),
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=PAGE_SIZE,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+        execution=RangeKeysetExecution(StableIntegerKeysetContract(), window_width=5),
+        page_adapter=adapter,
+    )
+
+    with pytest.raises(IncompleteTraversalError, match="identity_contract") as captured:
+        _ = [row async for row in stream]
+
+    assert isinstance(captured.value.__cause__, IdentityContractError)
+    assert captured.value.__cause__.row_offset == 3
+    assert adapter.seen
+    assert all(isinstance(value, int) for value in adapter.seen)
+
+
+@pytest.mark.asyncio
+async def test_fast_boundary_row_breaking_its_identity_raises_identity_contract_error() -> None:
+    stream = _stream(
+        BrokenIdentityTransport(tuple(range(1, 21)), broken=2),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    with pytest.raises(IncompleteTraversalError, match="identity_contract") as captured:
+        await anext(stream)
+
+    cause = captured.value.__cause__
+    assert isinstance(cause, IdentityContractError)
+    assert cause.row_offset == 1
 
 
 @pytest.mark.asyncio

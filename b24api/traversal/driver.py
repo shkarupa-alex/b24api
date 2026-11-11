@@ -6,13 +6,11 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 from b24api.contracts.completion import EMPTY_SOURCE_WITNESS, CommandSettlement, EmptySourceWitness
-from b24api.contracts.json import FrozenJson, _json_type_name
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import (
     ConfirmationPolicy,
     DuplicatePolicy,
     ExecutionPolicy,
-    IdentityCoercion,
     IdentityRequirement,
     OrderSemantics,
     SnapshotRequirement,
@@ -64,7 +62,7 @@ from b24api.traversal.identity import (
 )
 from b24api.traversal.inclusive_window import InclusiveWindowStrategy
 from b24api.traversal.keyset import KeysetStrategy
-from b24api.traversal.page_adaptation import _SourcePageState, adapt_page
+from b24api.traversal.page_adaptation import PageTokens, _SourcePageState, adapt_page
 from b24api.traversal.plans import (
     ContinuationPlan,
     CountedOffsetPlan,
@@ -81,12 +79,11 @@ from b24api.traversal.sequential import CountedStrategy, OffsetStrategy, SingleR
 from b24api.traversal.strategy_context import PagedStrategy, PageStop, SequentialPageStrategy
 from b24api.traversal.values import (
     IdentityValue,
-    _coerce_identity,
     _compare_identities,
-    _extract_path,
     _mapping_shape_degraded,
     _page_fingerprint_policy,
     _response_items,
+    _row_identity,
     _validate_order,
 )
 
@@ -95,7 +92,7 @@ if TYPE_CHECKING:
 
     from b24api.completion.recorder import CompletionSink
     from b24api.contracts.identity_store import IdentityStore
-    from b24api.contracts.json import JsonValue
+    from b24api.contracts.json import FrozenJson, JsonValue
     from b24api.contracts.response import Response
     from b24api.execution import ExecutionContext, Executor
     from b24api.execution.snapshot import KernelReport
@@ -370,22 +367,19 @@ class PaginationDriver:
             response,
             source,
             adapter=self.page_adapter,
-            identities=self._adaptation_specs(),
+            tokens=self._page_tokens(),
+            row_offset=self.validated_rows,
             request_summary=self.request.summary,
             page_offset=self.page_trace_count,
         )
 
-    def _adaptation_specs(self) -> tuple[tuple[tuple[str | int, ...], IdentityCoercion], ...]:
-        specs: list[tuple[tuple[str | int, ...], IdentityCoercion]] = []
+    def _page_tokens(self) -> PageTokens:
+        cursor = (
+            (self.plan.cursor_item_path, self.plan.cursor_coercion) if isinstance(self.plan, ItemCursorPlan) else None
+        )
         if isinstance(self.identity, CompositeIdentitySpec):
-            specs.extend((component.item_path, component.coercion) for component in self.identity.components)
-        elif isinstance(self.identity, IdentitySpec):
-            specs.append((self.identity.item_path, self.identity.coercion))
-        if isinstance(self.plan, ItemCursorPlan):
-            cursor_spec = (self.plan.cursor_item_path, self.plan.cursor_coercion)
-            if cursor_spec not in specs:
-                specs.append(cursor_spec)
-        return tuple(specs)
+            return PageTokens(self.identity.components, composite=True, cursor=cursor)
+        return PageTokens(() if self.identity is None else (self.identity,), cursor=cursor)
 
     def close_external_validation(self) -> None:
         """Release the canonical identity store retained by external page validation."""
@@ -576,7 +570,10 @@ class PaginationDriver:
         fingerprint, track_fingerprint = _page_fingerprint_policy(items, self.plan)
         if fingerprint in self._fingerprints and track_fingerprint:
             raise _PageRejectionError(
-                "repeated page fingerprint detected",
+                # Without a unique identity in the rows, a page equal to an earlier one is indistinguishable
+                # from a server that ignored the page control, so content-equal pages fail closed.
+                "repeated page fingerprint detected: a page equal to an earlier one cannot be told apart from an "
+                "ignored page control; rows that repeat by content need a unique identity",
                 PageRejectionCode.REPEATED_FINGERPRINT,
             )
         accepted_count = len(items) if qualified_count is None else qualified_count
@@ -755,27 +752,19 @@ class PaginationDriver:
             components = (IdentityComponent(self.identity.item_path, self.identity.coercion),)
         identities: list[IdentityValue] = []
         for index, item in enumerate(items):
-            row_offset = self.validated_rows + index
-            values: list[str | int] = []
-            for component_index, component in enumerate(components):
-                path = component.item_path
-                coercion = component.coercion
-                try:
-                    raw = _extract_path(item, path)
-                    values.append(cast("str | int", _coerce_identity(raw, coercion)))
-                except PaginationError as error:
-                    observed_type = "missing"
-                    with contextlib.suppress(PaginationError):
-                        observed_type = _json_type_name(_extract_path(item, path))
-                    raise IdentityContractError(
-                        path=path,
-                        coercion=coercion,
-                        observed_type=observed_type,
-                        row_offset=row_offset,
+            values = [
+                cast(
+                    "str | int",
+                    _row_identity(
+                        item,
+                        component,
+                        row_offset=self.validated_rows + index,
                         request_summary=self.request.summary,
                         component_index=(component_index if composite else None),
-                        component_label=(component.label if composite else None),
-                    ) from error
+                    ),
+                )
+                for component_index, component in enumerate(components)
+            ]
             identities.append(tuple(values) if composite else values[0])
         return identities
 
