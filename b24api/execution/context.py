@@ -392,24 +392,53 @@ async def await_cleanup_resistant(awaitable: Awaitable[None]) -> CleanupResult:
 
 
 def rearm_cancellation(cancellation: asyncio.CancelledError | None) -> None:
-    """Replay a cancellation after a primary failure has crossed its atomic cleanup."""
+    """Replay a cancellation that atomic cleanup absorbed, after a failure that is not one replaced it.
+
+    ``None`` means cleanup absorbed no cancellation, so nothing is replayed: a cancellation that is
+    itself leaving as the exception, or one the caller already handled, is never delivered twice.
+    """
     task = asyncio.current_task()
-    if task is None or not task.cancelling():
+    if cancellation is None or task is None or not task.cancelling():
         return
     task.uncancel()
-    message = cancellation.args[0] if cancellation is not None and cancellation.args else None
-    task.cancel(message)
+    task.cancel(cancellation.args[0] if cancellation.args else None)
 
 
-def _raise_for_pending_cancellation() -> None:
+@dataclass(frozen=True, slots=True)
+class CancellationMark:
+    """The current task's cancellation count when an operation began.
+
+    A cancellation requested after the mark is pending even when a foreign awaitable suppressed it;
+    one the caller had already received before the operation began, as in its own cleanup, is not.
+    """
+
+    count: int
+
+    @classmethod
+    def now(cls) -> CancellationMark:
+        """Mark the current task's count as it stands, without a checkpoint.
+
+        For a reader whose next await is itself the checkpoint, such as a pull; an operation that sends
+        requests marks with ``mark_cancellation()``, which delivers a replayed cancellation first.
+        """
+        task = asyncio.current_task()
+        return cls(task.cancelling() if task is not None else 0)
+
+    def requested(self) -> bool:
+        """Return whether the task was cancelled after the mark."""
+        task = asyncio.current_task()
+        return task is not None and task.cancelling() > self.count
+
+    def raise_if_requested(self) -> None:
+        """Raise a cancellation requested after the mark that no await delivered."""
+        if self.requested():
+            raise asyncio.CancelledError
+
+
+async def mark_cancellation() -> CancellationMark:
+    """Deliver a replayed cancellation at this checkpoint, then mark the count the operation starts from."""
     task = asyncio.current_task()
     if task is not None and task.cancelling():
-        raise asyncio.CancelledError
-
-
-async def _checkpoint_pending_cancellation() -> None:
-    task = asyncio.current_task()
-    if task is None or not task.cancelling():
-        return
-    await asyncio.sleep(0)
-    _raise_for_pending_cancellation()
+        # A replayed cancellation is armed, not yet delivered; a handled one only leaves the count raised.
+        await asyncio.sleep(0)
+    return CancellationMark.now()

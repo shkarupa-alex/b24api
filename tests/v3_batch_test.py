@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import contextlib
 import inspect
 import json
 import time
@@ -31,8 +32,10 @@ from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
+    FailurePhase,
     ProtocolError,
     ResultShapeError,
+    TransportError,
 )
 from b24api.execution import Executor, RateCoordinator
 from b24api.testing import ScriptedCall, ScriptedExchange, ScriptedTransport, ScriptedV3Command
@@ -701,8 +704,12 @@ async def test_a21_presponse_size_overflow_after_dispatch_is_unknown_without_res
 
 
 @pytest.mark.asyncio
-async def test_a21_presponse_cancellation_before_response_propagates_without_resend() -> None:
-    """A21-PRESPONSE: cancellation after dispatch and before the Response replays nothing and propagates."""
+@pytest.mark.parametrize("swallowed", [False, True], ids=["propagated", "swallowed-into-failure"])
+async def test_a21_presponse_cancellation_before_response_propagates_without_resend(*, swallowed: bool) -> None:
+    """A21-PRESPONSE: cancellation after dispatch and before the Response replays nothing and propagates.
+
+    A transport that swallows the cancellation and reports a failure proving nothing ran ends the same way.
+    """
     started = asyncio.Event()
     sends = 0
 
@@ -713,9 +720,15 @@ async def test_a21_presponse_cancellation_before_response_propagates_without_res
             del request, attempt_timeout, max_response_bytes
             nonlocal sends
             sends += 1
+            if sends > 1:
+                raise AssertionError("a cancelled envelope was sent again")
             started.set()
-            await asyncio.Future[None]()
-            raise AssertionError("unreachable")
+            if not swallowed:
+                await asyncio.Future[None]()
+                raise AssertionError("unreachable")
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.Future[None]()
+            raise TransportError("connect failed", phase=FailurePhase.CONNECTION_ESTABLISHED)
 
     engine = BatchExecutor(Executor(_Blocking(())))
     context = engine.executor.context(_policy())

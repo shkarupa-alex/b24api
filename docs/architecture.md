@@ -62,6 +62,12 @@ outcome.
   `max_pages`); a reported duplicate withdraws identity assurance.
 - Streams publish one immutable terminal report after cleanup. Early close and cancellation never
   claim completion.
+- A cancellation is delivered once. Owned cleanup finishes under cancellation protection and
+  replays a cancellation it absorbed only when another failure leaves in its place. A request treats
+  as pending only a cancellation requested after it began, so a call made in the cleanup of a
+  cancelled task is sent, while a later cancellation still ends it, even when a foreign transport
+  suppressed it into a response or a failure. An isolated pull that absorbs its reader's
+  cancellation by failing in cleanup hands the cancellation back to the reader's next await.
 - The client owns its default transport and active streams; injected transports remain caller-owned.
 
 ## Reference scheduling

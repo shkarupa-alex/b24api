@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, NoReturn, Self, cast
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.stream import PartialResult
-from b24api.execution.context import await_cleanup_resistant, rearm_cancellation
+from b24api.execution.context import CancellationMark, await_cleanup_resistant, rearm_cancellation
 from b24api.execution.failure import EARLY_CLOSE_REASON, attach_report, report_reason, with_cleanup_failure
 from b24api.execution.snapshot import KernelReport
 
@@ -216,6 +216,7 @@ class OperationRunner[T, R]:
         if self._phase is _Phase.PULLING:
             raise RuntimeError("concurrent stream pull")
         self._phase = _Phase.PULLING
+        reader = CancellationMark.now()
         try:
             if self._isolated:
                 self._pull = asyncio.ensure_future(_pull_next(self._body))
@@ -238,7 +239,11 @@ class OperationRunner[T, R]:
                 if isinstance(error, asyncio.CancelledError)
                 else TerminalCause.FAILED
             )
-            await self._terminate(cause, None if cause is TerminalCause.EXHAUSTED else error)
+            # A pull task that ends in its own failure absorbs the reader's cancellation it was handed.
+            absorbed = None
+            if reader.requested() and not isinstance(error, asyncio.CancelledError):
+                absorbed = asyncio.CancelledError()
+            await self._terminate(cause, None if cause is TerminalCause.EXHAUSTED else error, pending=absorbed)
             raise
         self._pull = None
         if self._phase is _Phase.PULLING:
