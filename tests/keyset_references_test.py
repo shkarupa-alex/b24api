@@ -51,7 +51,7 @@ from b24api.contracts import (
 )
 from b24api.contracts.page_stop import ContinuePage
 from b24api.contracts.request import RouteKind
-from b24api.errors import CapabilityError
+from b24api.errors import CapabilityError, IdentityContractError
 from b24api.execution import ExecutionContext
 from b24api.references import wave_engine
 from b24api.references.budget_view import BindingBudgetView, RowLease
@@ -72,6 +72,7 @@ if TYPE_CHECKING:
 PAGE = 10
 LANES = 4
 _CONTRACT = StableIntegerKeysetContract()
+_BROKEN_ID = 77
 
 type Execution = RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution
 
@@ -338,6 +339,32 @@ async def test_a_server_ignoring_bounds_fails_its_binding_closed_while_neighbour
     assert liar.partial_rows == len(delivered) < len(DISTRIBUTIONS["dense"])
     assert report.state is TerminalState.COMPLETED_WITH_FAILURES
     assert leases.outstanding == 0
+
+
+@pytest.mark.parametrize("execution", [_range(), _partitioned(), _auto()], ids=["range", "partitioned", "auto"])
+@pytest.mark.asyncio
+async def test_a_row_breaking_its_identity_fails_its_binding_with_identity_contract_error(execution: Execution) -> None:
+    def answer(method: str, query: Query) -> Envelope:
+        del method
+        rows = _rows(DISTRIBUTIONS["dense"], query)
+        if query.get("filter[=parent]") == "broken":
+            return {"result": [{"id": f"0{row['id']}"} if row["id"] == _BROKEN_ID else row for row in rows]}
+        return {"result": rows}
+
+    async with client_for(BatchPortal(answer)) as client:
+        outcomes, _ = await _drain(
+            client.iter_reference_outcomes(
+                _base(), [_parent("honest"), _parent("broken")], traversal=_traversal(execution)
+            )
+        )
+
+    terminal = {outcome.correlation: outcome for outcome in outcomes if not isinstance(outcome, ReferenceItem)}
+    assert isinstance(terminal["honest"], ReferenceComplete)
+    broken = terminal["broken"]
+    assert isinstance(broken, ReferenceFailure)
+    cause = broken.error.__cause__
+    assert isinstance(cause, IdentityContractError)
+    assert (cause.path, cause.observed_type) == (("id",), "string")
 
 
 @pytest.mark.asyncio

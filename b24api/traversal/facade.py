@@ -38,8 +38,7 @@ from b24api.traversal.counted import CountedItemStream
 from b24api.traversal.facade_support import (
     _checked_identity_store,
     _collection_selector,
-    _cursor_page_contract,
-    _direction,
+    cursor_traversal_plan,
     declared_traversal_plan,
 )
 from b24api.traversal.keyset_eligibility import reject_unencodable_fast_request, validate_fast_keyset
@@ -52,7 +51,6 @@ from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
-    CursorTerminalRule,
     ItemCursorPlan,
     KeysetPlan,
     OffsetSequentialPlan,
@@ -337,31 +335,7 @@ def cursor_stream(  # noqa: PLR0913
     audit_violations: tuple[Violation, ...] = (),
 ) -> OperationStream[JsonValue]:
     """Compose strict dependent cursor traversal with empty confirmation."""
-    cursor_identity = identity or IdentitySpec(
-        item_path=cursor.item_path,
-        filter_key="cursor",
-        order_key="cursor",
-        coercion=cursor.coercion,
-    )
-    direction = _direction(cursor.direction)
-    page_order, order_semantics = _cursor_page_contract(cursor)
-    plan = ItemCursorPlan(
-        cursor_request_path=cursor.parameter_path,
-        cursor_item_path=cursor.item_path,
-        cursor_coercion=cursor.coercion,
-        direction=direction,
-        cursor_take=cursor.take,
-        limit_path=cursor.limit_path,
-        requested_page_size=page_size if cursor.limit_path is not None else None,
-        terminal=CursorTerminalRule.EMPTY_CONFIRMATION,
-        allow_create_controls=cursor.allow_create_controls,
-        domain=cursor.domain,
-        identity_requirement=IdentityRequirement.REQUIRED,
-        order_semantics=order_semantics,
-        duplicate_policy=DuplicatePolicy.ERROR,
-        page_order=page_order,
-        response_terminal=cursor.continuation,
-    )
+    plan, cursor_identity = cursor_traversal_plan(cursor, identity, page_size=page_size)
     return _plan_stream(
         executor,
         request,

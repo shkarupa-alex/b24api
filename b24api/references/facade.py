@@ -29,7 +29,6 @@ from b24api.contracts.reference import (
 )
 from b24api.contracts.report import KeysetSelectionSummary, TraversalAssurance
 from b24api.contracts.request import (
-    IdentitySpec,
     Request,
     RequestLike,
     ResultSelector,
@@ -66,14 +65,12 @@ from b24api.references.outcome import KernelReferenceFailure, KernelReferenceIte
 from b24api.references.program import FastKeysetProgram
 from b24api.references.stream import iter_references as _iter_references
 from b24api.traversal.driver import PaginationDriver
-from b24api.traversal.facade_support import _collection_selector, _cursor_page_contract, declared_traversal_plan
+from b24api.traversal.facade_support import _collection_selector, cursor_traversal_plan, declared_traversal_plan
 from b24api.traversal.keyset_eligibility import _effective_cap, validate_fast_keyset
 from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
-    CursorTerminalRule,
-    ItemCursorPlan,
     KeysetPlan,
     KeysetTerminalRule,
     ListPlan,
@@ -244,37 +241,7 @@ def preflight_fast_keyset(
 
 
 def _cursor_kernel_plan(traversal: CursorTraversal) -> tuple[ListPlan, TraversalIdentity | None]:
-    cursor_mechanics = traversal.cursor
-    direction = _direction(cursor_mechanics.direction)
-    page_order, order_semantics = _cursor_page_contract(cursor_mechanics)
-    identity = traversal.identity
-    if identity is None:
-        identity = IdentitySpec(
-            item_path=cursor_mechanics.item_path,
-            filter_key="cursor",
-            order_key="cursor",
-            coercion=cursor_mechanics.coercion,
-        )
-    return (
-        ItemCursorPlan(
-            cursor_request_path=cursor_mechanics.parameter_path,
-            cursor_item_path=cursor_mechanics.item_path,
-            cursor_coercion=cursor_mechanics.coercion,
-            direction=direction,
-            cursor_take=cursor_mechanics.take,
-            limit_path=cursor_mechanics.limit_path,
-            requested_page_size=traversal.page_size if cursor_mechanics.limit_path is not None else None,
-            terminal=CursorTerminalRule.EMPTY_CONFIRMATION,
-            allow_create_controls=cursor_mechanics.allow_create_controls,
-            domain=cursor_mechanics.domain,
-            identity_requirement=IdentityRequirement.REQUIRED,
-            order_semantics=order_semantics,
-            duplicate_policy=DuplicatePolicy.ERROR,
-            page_order=page_order,
-            response_terminal=cursor_mechanics.continuation,
-        ),
-        identity,
-    )
+    return cursor_traversal_plan(traversal.cursor, traversal.identity, page_size=traversal.page_size)
 
 
 def _reference_page_cap(traversal: TraversalSpec) -> int:
