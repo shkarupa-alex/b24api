@@ -9,6 +9,7 @@ to every raised exception and replays a cancellation that cleanup had to defer.
 from __future__ import annotations
 import asyncio
 import inspect
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, NoReturn, Self, cast
@@ -42,6 +43,9 @@ class CleanupAttempt:
 
     error: BaseException | None = None
     cancellation: asyncio.CancelledError | None = None
+    # False when a deadline stopped the wait: cleanup goes on in the background and the body never
+    # recorded its terminal, so the family reports from what it holds instead of the body's report.
+    finished: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +61,9 @@ class LifecycleHooks[R]:
     attach: Callable[[BaseException, R], None] = attach_report
     # Maps a FAILED primary to the exception the caller receives (for example ``BatchFailed``).
     propagate: Callable[[BaseException, R], BaseException] | None = None
+    # Seconds the operation's elapsed budget has left; bounds how long a close and its cleanup defer a
+    # caller's cancellation. ``None`` defers it until cleanup ends, for a runner driven by an outer one.
+    cleanup_budget: Callable[[], float] | None = None
 
 
 def kernel_terminal(cause: TerminalCause, reason: str | None) -> tuple[KernelState, str]:
@@ -138,8 +145,16 @@ class _Phase(Enum):
     CLOSED = "closed"
 
 
-async def _pull_next[T](body: AsyncIterator[T]) -> T:
-    return await anext(body)
+# The work tokens of the runners whose isolated pull or cleanup owns the current task. Each runs in its
+# own task, and every task started while it runs copies its context, so the marker reaches all work done
+# on its behalf: a family's workers and the caller code they run (a page-stop callback, a source, a
+# transport). A token, not the runner, so a task that outlives the stream never keeps it alive.
+_WORK_OWNERS: ContextVar[tuple[object, ...]] = ContextVar("b24api_work_owners", default=())
+
+_SELF_CLOSE = (
+    "a stream cannot be closed from inside its own pull or cleanup (a page_stop callback, a command, "
+    "binding or reference source, a transport, or a task one of them started): the close would wait for itself"
+)
 
 
 async def _settle(pull: asyncio.Future[object]) -> None:
@@ -151,20 +166,32 @@ class OperationRunner[T, R]:
     """Single-use async iterator that owns one body's termination and publishes one report.
 
     ``isolated_pulls`` runs each read in a child task so ``aclose()`` from another task can cancel
-    only that read; a kernel runner driven by one outer runner reads inline instead.
+    only that read; a kernel runner driven by one outer runner reads inline instead. ``works_between_reads``
+    declares a body whose own tasks keep running caller code while no read is in progress.
     """
 
-    def __init__(self, body: AsyncIterator[T], hooks: LifecycleHooks[R], *, isolated_pulls: bool = True) -> None:
+    def __init__(
+        self,
+        body: AsyncIterator[T],
+        hooks: LifecycleHooks[R],
+        *,
+        isolated_pulls: bool = True,
+        works_between_reads: bool = False,
+    ) -> None:
         """Initialize without starting the body."""
         self._body = body
         self._hooks = hooks
         self._isolated = isolated_pulls
+        self._works_between_reads = works_between_reads
         self._phase = _Phase.NEW
         self._pull: asyncio.Future[T] | None = None
         self._published = asyncio.Event()
         self._report: R | None = None
         self._primary: BaseException | None = None
         self._finalize_error: BaseException | None = None
+        self._work_token = object()
+        # The one cleanup, kept even when a deadline stopped waiting for it, so it lives until it ends.
+        self._cleanup_task: asyncio.Future[None] | None = None
 
     @property
     def report(self) -> R | None:
@@ -180,6 +207,21 @@ class OperationRunner[T, R]:
     def terminated(self) -> bool:
         """Whether the report has been published."""
         return self._phase is _Phase.CLOSED
+
+    @property
+    def inside_own_work(self) -> bool:
+        """Whether a close requested from the current task could wait for that task itself.
+
+        The task carries this runner's marker when it is the runner's pull or cleanup or was started
+        while one ran. A close waits for such work while the pull or cleanup task is running, and for a
+        body that works between reads as long as it is open; otherwise it waits for none.
+        """
+        if not any(token is self._work_token for token in _WORK_OWNERS.get()):
+            return False
+        running = self._pull if self._phase is _Phase.PULLING else self._cleanup_task
+        if running is not None and not running.done():
+            return True
+        return self._phase is _Phase.NEW and self._works_between_reads
 
     def __aiter__(self) -> Self:
         """Return this single-use iterator."""
@@ -215,11 +257,13 @@ class OperationRunner[T, R]:
             raise StopAsyncIteration
         if self._phase is _Phase.PULLING:
             raise RuntimeError("concurrent stream pull")
+        # Taken before any state changes, so a failing budget hook cannot leave the read half-started.
+        deadline = self._cleanup_deadline()
         self._phase = _Phase.PULLING
         reader = CancellationMark.now()
         try:
             if self._isolated:
-                self._pull = asyncio.ensure_future(_pull_next(self._body))
+                self._pull = asyncio.ensure_future(self._pull_next())
                 item = await self._pull
             else:
                 item = await anext(self._body)
@@ -243,7 +287,12 @@ class OperationRunner[T, R]:
             absorbed = None
             if reader.requested() and not isinstance(error, asyncio.CancelledError):
                 absorbed = asyncio.CancelledError()
-            await self._terminate(cause, None if cause is TerminalCause.EXHAUSTED else error, pending=absorbed)
+            await self._terminate(
+                cause,
+                None if cause is TerminalCause.EXHAUSTED else error,
+                pending=absorbed,
+                deadline=deadline,
+            )
             raise
         self._pull = None
         if self._phase is _Phase.PULLING:
@@ -251,21 +300,26 @@ class OperationRunner[T, R]:
         return item
 
     async def aclose(self) -> None:
-        """Close idempotently; an active read is cancelled and awaited before one termination."""
+        """Close idempotently; an active read is cancelled and awaited before one termination.
+
+        A close requested from inside this runner's own work is refused rather than left waiting for itself.
+        """
         if self._phase is _Phase.CLOSED:
             return
+        if self.inside_own_work:
+            raise RuntimeError(_SELF_CLOSE)
         if self._phase is _Phase.CLOSING:
             await self._published.wait()
             return
         pull = self._pull
         if self._phase is _Phase.PULLING and pull is None:
             raise RuntimeError("an inline stream read cannot be closed from another task")
+        # Taken before the phase changes, so a failing budget hook cannot wedge the stream in CLOSING.
+        deadline = self._cleanup_deadline()
         self._phase = _Phase.CLOSING
-        pending: asyncio.CancelledError | None = None
         if pull is not None and not pull.done():
             pull.cancel()
-            pending = (await await_cleanup_resistant(_settle(cast("asyncio.Future[object]", pull)))).cancellation
-        await self._terminate(TerminalCause.EARLY_CLOSED, None, pending=pending)
+        await self._terminate(TerminalCause.EARLY_CLOSED, None, read=pull, deadline=deadline)
 
     async def first(self) -> PartialResult[tuple[T, ...]]:
         """Consume zero or one item, then close without an extra proof read."""
@@ -293,7 +347,24 @@ class OperationRunner[T, R]:
             await self.aclose()
         return PartialResult(values, cast("OperationReport", self._report))
 
-    async def _clean_up(self) -> None:
+    def _cleanup_deadline(self) -> float | None:
+        budget = self._hooks.cleanup_budget
+        return None if budget is None else asyncio.get_running_loop().time() + max(0.0, budget())
+
+    def _mark_own_work(self) -> None:
+        # Called first in the pull or cleanup task, whose context is its own copy, so it needs no reset.
+        _WORK_OWNERS.set((*_WORK_OWNERS.get(), self._work_token))
+
+    async def _pull_next(self) -> T:
+        self._mark_own_work()
+        return await anext(self._body)
+
+    async def _clean_up(self, read: asyncio.Future[T] | None) -> None:
+        # Cleanup runs caller code too (a source's ``finally``, a transport), which must not close this runner.
+        self._mark_own_work()
+        if read is not None:
+            # A cancelled read ends before the body closes under it, even after a deadline stopped the wait.
+            await _settle(cast("asyncio.Future[object]", read))
         try:
             close = getattr(self._body, "aclose", None)
             if close is not None:
@@ -333,15 +404,28 @@ class OperationRunner[T, R]:
         primary: BaseException | None,
         *,
         pending: asyncio.CancelledError | None = None,
+        read: asyncio.Future[T] | None = None,
+        deadline: float | None = None,
     ) -> None:
+        """Settle a cancelled ``read``, clean up, publish once and raise by the §3.1 rows.
+
+        A caller's cancellation, pending or arriving during cleanup, is deferred only until ``deadline``;
+        cleanup still running then finishes in the background and is reported as failed.
+        """
         self._primary = primary
-        cleanup = await await_cleanup_resistant(self._clean_up())
-        attempt = CleanupAttempt(cleanup.error, cleanup.cancellation or pending)
+        cancelled = pending is not None or isinstance(primary, asyncio.CancelledError)
+        self._cleanup_task = asyncio.ensure_future(self._clean_up(read))
+        cleanup = await await_cleanup_resistant(self._cleanup_task, deadline=deadline, cancelled=cancelled)
+        attempt = CleanupAttempt(cleanup.error, cleanup.cancellation or pending, finished=cleanup.unfinished is None)
         reason = report_reason(primary) if cause is TerminalCause.FAILED and primary is not None else None
         report, finalize_failed = await self._publish(cause, reason, attempt)
         if cause is TerminalCause.FAILED and primary is not None:
             self._raise_failed(primary, report, attempt, finalize_failed=finalize_failed)
         if finalize_failed and self._finalize_error is not None and primary is None:
+            if attempt.error is not None:
+                self._finalize_error.add_note(f"stream cleanup also failed ({type(attempt.error).__name__})")
+            # The finalization failure leaves in place of a cancellation cleanup absorbed, so it is replayed.
+            rearm_cancellation(attempt.cancellation)
             raise self._finalize_error
         self._raise_terminal(cause, primary, report, attempt)
 

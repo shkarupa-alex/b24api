@@ -405,7 +405,7 @@ class AsyncIteratorController[T]:
         (await self._source.aclose()).raise_failure()
 
 
-def _observe_background_cleanup(task: asyncio.Task[None]) -> None:
+def _observe_background_cleanup(task: asyncio.Future[None]) -> None:
     """Retrieve late exceptions while preserving them for any later await."""
     if not task.cancelled():
         task.exception()
@@ -435,6 +435,8 @@ class CleanupResult:
 
     cancellation: asyncio.CancelledError | None
     error: BaseException | None
+    # Cleanup a deadline stopped waiting for, still running; its owner must keep a reference to it.
+    unfinished: asyncio.Future[None] | None = field(default=None, kw_only=True)
 
     def raise_failure(self) -> None:
         """Raise the deferred cancellation first, then the cleanup failure."""
@@ -444,15 +446,35 @@ class CleanupResult:
             raise self.error
 
 
-async def await_cleanup_resistant(awaitable: Awaitable[None]) -> CleanupResult:
-    """Finish owned cleanup without losing a concurrent caller cancellation."""
+async def await_cleanup_resistant(
+    awaitable: Awaitable[None],
+    *,
+    deadline: float | None = None,
+    cancelled: bool = False,
+) -> CleanupResult:
+    """Finish owned cleanup without losing a concurrent caller cancellation.
+
+    ``deadline`` (event-loop time) bounds how long a cancellation is deferred, one that arrives here
+    or one the caller already holds (``cancelled``): cleanup still running at the deadline is left
+    to finish in the background, returned as ``unfinished`` with a ``BudgetExceededError``. Without a
+    cancellation, or without a deadline, cleanup is awaited to its end.
+    """
     task: asyncio.Future[None] = asyncio.ensure_future(awaitable)
     cancellation: asyncio.CancelledError | None = None
+    loop = asyncio.get_running_loop()
     while not task.done():
+        timeout = None
+        if deadline is not None and (cancelled or cancellation is not None):
+            timeout = max(0.0, deadline - loop.time())
         try:
-            await asyncio.wait((task,), return_when=asyncio.ALL_COMPLETED)
+            await asyncio.wait((task,), timeout=timeout)
         except asyncio.CancelledError as error:
             cancellation = error
+            continue
+        if not task.done():
+            task.add_done_callback(_observe_background_cleanup)
+            overrun = BudgetExceededError("cleanup exceeded the operation time budget")
+            return CleanupResult(cancellation, overrun, unfinished=task)
     try:
         await task
     except asyncio.CancelledError as error:
