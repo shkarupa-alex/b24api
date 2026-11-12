@@ -2,22 +2,22 @@
 
 ## `INPUT` delivery reads reference pages ahead
 
-- **Physical batches fill up under `DeliveryOrder.INPUT`.** A reference binding of
-  `iter_references()`, `iter_reference_outcomes()` and their sequential, cursor and counted variants,
-  and each command of `fan_out()` and `fan_out_outcomes()`, waited for the consumer to leave its page
-  before it fetched the next. Under `INPUT` delivery only the binding being delivered moved, so with
-  `BatchDispatch` its pages left almost one per physical batch: 300 parents of two pages took 552
-  (counted) to 852 (sequential) requests and 30 to 46 s on a 50 ms wire, against 34 to 90 requests
-  and 2.5 to 7 s under `READY`. A binding now reads its pages ahead into its own queue while the row
-  pool has room, and the dispatcher waits for the rows the consumer frees on its own, so the same
-  traversal takes 55 (sequential) and 33 (counted) requests and 2 to 4 s. Batches still fill less than
-  under `READY`, whose consumer takes pages as they come: in our deterministic model a sequential
-  traversal sends 1 to 4.7 times `READY`'s requests with the default pool, the more pages per binding
-  the more, and 1 to 2 times with a pool of 10 000 rows; a counted traversal sends at most twice as
-  many, and mostly fewer. Unless a budget stops the operation or the stream closes early (see below),
-  the items, their order and the outcomes are unchanged; the number of physical requests, their grouping and the order the
-  portal receives the commands change. `READY` delivery is unchanged, and so is a fast or automatic
-  keyset binding, which hands over one row group at a time within its row lease.
+- **Physical batches fill up under `DeliveryOrder.INPUT`.** A reference binding of `iter_references()`,
+  `iter_reference_outcomes()` and their sequential, cursor and counted variants, and each command of
+  `fan_out()` and `fan_out_outcomes()`, waited for the consumer to leave its page before it fetched the
+  next. Under `INPUT` delivery only the binding being delivered moved, so with `BatchDispatch` its pages
+  left almost one per physical batch: 300 parents of two pages took 552 (counted) to 852 (sequential)
+  requests and 30 to 46 s on a 50 ms wire, against 34 to 90 requests and 2.5 to 7 s under `READY`. A
+  binding now reads its pages ahead into its own queue while the row pool has room, and the dispatcher
+  waits for the rows the consumer frees on its own, so the same traversal takes 55 (sequential) and 33
+  (counted) requests and 2 to 4 s. Batches still fill less than under `READY`, whose consumer takes
+  pages as they come: in our deterministic model a sequential traversal sends 1 to 4.7 times `READY`'s
+  requests with the default pool, the more pages per binding the more, and 1 to 2 times with a pool of
+  10 000 rows; a counted traversal sends at most twice as many, and mostly fewer. Unless a budget stops
+  the operation or the stream closes early (see below), the items, their order and the outcomes are
+  unchanged; the number of physical requests, their grouping and the order the portal receives the
+  commands change. `READY` delivery is unchanged, and so is a fast or automatic keyset binding, which
+  hands over one row group at a time within its row lease.
 - **`DirectDispatch` fetches ahead concurrently too.** Under `INPUT` delivery the bindings behind
   the one being delivered now send their pages while it is consumed, up to the dispatch concurrency,
   instead of standing still. A stream closed early has spent requests and pages on the pages read
@@ -67,12 +67,15 @@ a binding waits for rows, have changed.
   default `DirectDispatch`. A list result longer than its share was a `CommandFailure` with a plain
   `BudgetExceededError`, the failure of a command never sent. It now carries `ResultTooLargeError`, since
   the command ran and was answered.
-- **Waiting for rows ends with `max_elapsed`.** A reference binding or a `fan_out()` command waiting for
-  rows still held by results the consumer had not taken waited until the consumer read on, however
-  long after `max_elapsed`, and its send was then refused at its admission. The wait now ends with the
-  operation's elapsed budget, while the consumer still holds the rows: the command or binding fails
-  unsent with `BudgetExceededError` ("row buffer wait exceeded operation time budget"), and the
-  operation ends as the time budget ends it.
+- **Waiting for row capacity ends with `max_elapsed`.** A page of a reference binding or a `fan_out()`
+  command waiting for row capacity still held by results the consumer had not taken waited until the
+  consumer read on, however long after `max_elapsed`, and its send was then refused at its admission.
+  That wait now ends with the operation's elapsed budget, while the consumer still holds the rows: the
+  command or binding fails with its waiting page unsent, with `BudgetExceededError` ("row buffer wait
+  exceeded operation time budget"), and the operation ends as the time budget ends it. Unchanged: a
+  binding waiting for the consumer to take a page already handed to it (under `READY` delivery, or with
+  a `page_stop`) waits without a bound, as long as the consumer takes; see the time-budget note under
+  [Retry timing](#retry-timing).
 
 ## Batch budgets and held methods
 
@@ -94,9 +97,9 @@ send meets a method pause, have changed.
   completes. A send that the spent budget will refuse is now refused before it queues for a permit, so
   it no longer waits out a cooldown first. Code that read such a stream to its end with `async for`
   must now catch `BudgetExceededError`, or give the operation enough `max_requests`.
-- **One held method no longer holds back or fails a whole `batch()` or `batch_outcomes()` chunk.** A
-  batch envelope is admitted under every method it carries, so after an `OPERATION_TIME_LIMIT` (120 s
-  by default) on one method, the first send of every later chunk that carried that method waited two
+- **Breaking: one held method no longer holds back or fails a whole `batch_outcomes()` chunk.** A batch
+  envelope is admitted under every method it carries, so after an `OPERATION_TIME_LIMIT` (120 s by
+  default) on one method, the first send of every later chunk that carried that method waited two
   minutes with all its other commands, or, when the operation had less time left than the pause, failed
   all of them with `BudgetExceededError`. The first send now weighs each command against its own
   method's pause, as a replay round already did: by how much longer its method is held than the portal
@@ -104,18 +107,22 @@ send meets a method pause, have changed.
   (`max_retry_elapsed_per_request`) or what the operation has left after the portal's pause, whichever
   is shorter. When some commands of a chunk can wait that long and others cannot, each command that
   cannot is not sent and ends at once with `BudgetExceededError` ("coordinator hold exceeds execution
-  time budget"), never sent and not eligible for replay, and the others are sent after the longest
-  pause among them. When every command of a chunk can wait, or none can, leaving some out would let no
-  other command go, so nothing is left out: as for a lone `call()`, the chunk waits for its pauses within
-  `max_elapsed` (and `batch_outcomes()` reads no further while it waits), or fails at once when a pause
-  outlasts what the operation has left. A fail-fast `batch()` is never split either, since the failure of
-  the command left out would fail the batch: its chunk is treated the same way, so it waits for the
-  pause, as before, or fails at once when the pause outlasts what the operation has left. Unchanged in that last case: every later chunk of
-  the held method fails the same way, so a source of only that method is still read, chunk by chunk,
-  until `max_elapsed` ends the operation. This holds for classic and REST 3.0 envelopes alike. To let such commands wait for a long pause again,
-  raise the retry window above it: `http_timeout` sets it only under the client's default policy
-  (`ExecutionPolicy.from_settings`); with an explicit `policy=`, raise its
-  `max_retry_elapsed_per_request`. The pause must also fit in what is left of `max_elapsed`.
+  time budget"), never sent and not eligible for replay, and the others are sent after the longest pause
+  among them. This is what breaks: a command whose own method is held longer than it may wait (by
+  default, longer than the 30 s retry window), in a chunk whose other commands may go, used to wait with
+  them and succeed when the operation had the time, and now fails unsent with `BudgetExceededError`.
+  When every command of a chunk can wait, or none can, leaving some out would let no other command go,
+  so nothing is left out: as for a lone `call()`, the chunk waits for its pauses within `max_elapsed`
+  (and `batch_outcomes()` reads no further while it waits), or fails at once when a pause outlasts what
+  the operation has left. A fail-fast `batch()` is never split either, since the failure of the command
+  left out would fail the batch: its chunk is treated the same way, so it waits for the pause, as
+  before, or fails at once when the pause outlasts what the operation has left. Unchanged in that last
+  case: every later chunk of the held method fails the same way, so a source of only that method is
+  still read, chunk by chunk, until `max_elapsed` ends the operation. This holds for classic and REST
+  3.0 envelopes alike. To let such commands wait for a long pause again, raise the retry window above
+  it: `http_timeout` sets it only under the client's default policy (`ExecutionPolicy.from_settings`);
+  with an explicit `policy=`, raise its `max_retry_elapsed_per_request`. The pause must also fit in what
+  is left of `max_elapsed`.
 - **Unchanged: traversals and dispatched commands wait for a held method.** The pages of a list or
   reference traversal and the commands that `fan_out()` and `fan_out_outcomes()` gather into a
   `BatchDispatch` wave are never left out for their method's pause: a wave waits for it within
@@ -130,17 +137,25 @@ send meets a method pause, have changed.
   `b24api.errors`) for a call still waiting for a permit when the client closed, and `TransportError`
   "transport is closed" or "HTTP client is closed" for a send after its transport or injected HTTPX
   client closed. Each now raises `b24api.errors.ClientClosedError`. It is a `TransportError` of phase
-  `not_dispatched` and `retryable=False`: nothing left the process, so an `UNSAFE` request is proven
-  not run, and it is never retried. It also derives from `RuntimeError`, so `except RuntimeError` and
-  `except TransportError` handlers keep catching what they caught, while `except B24ApiError` now
-  catches a closed client too. `b24api.execution.CoordinatorClosedError` is removed: catch
-  `ClientClosedError`.
+  `not_dispatched` and `retryable=False`: the attempt it stopped never left the process, and it is never
+  retried. The phase covers that attempt alone. A `SAFE` request waiting for the permit of a retry may
+  have run on an earlier attempt; an `UNSAFE` or `UNKNOWN` one is retried only after a failure that
+  proved it did not run (a transport failure before dispatch, or a refusal listed in `AmbiguityPolicy`),
+  so it stays proven not run. It also derives from `RuntimeError`, so
+  `except RuntimeError` and `except TransportError` handlers keep catching what they caught, while
+  `except B24ApiError` now catches a closed client too. `b24api.execution.CoordinatorClosedError` is
+  removed: catch `ClientClosedError`.
 - **Every error survives `pickle` and `copy`.** An error whose constructor needs more than its
   message (`ApiResponseError`, `BatchCommandError`, `AmbiguousExecutionError`, `ContinuationError`,
   `BatchFailed`, a bare `B24ApiError` and the others like them) failed
   `pickle.loads(pickle.dumps(error))`, `copy.copy()` and `copy.deepcopy()` with `TypeError`, since
-  `Exception` rebuilds an error by calling its class with the message alone. Every class of `b24api.errors` now rebuilds without its constructor and keeps
-  its message, attributes and notes, so an error can cross a process pool or a task queue.
+  `Exception` rebuilds an error by calling its class with the message alone. Every class of
+  `b24api.errors` now rebuilds without its constructor and keeps its message, attributes and notes, so
+  an error can cross a process pool or a task queue. The exception is an error holding a caller's
+  correlation: `BatchFailed` and `ReferenceFailed` keep their outcomes with their correlations, so
+  `pickle` fails on them when the correlation cannot be pickled, and `copy.deepcopy()` when it cannot be
+  deep-copied, as on the correlation itself (`TypeError` for a lock, for example), while `copy.copy()`
+  still works.
 - **`Settings.http_timeout` must be finite.** `http_timeout=float("inf")` passed `Settings`, and
   `Bitrix24()` then failed with `ValueError` after it had already opened its HTTPX transport. It is
   now a `ValidationError` of `Settings` (and of `Bitrix24.from_webhook()`), as `nan` already was. The
@@ -151,10 +166,16 @@ send meets a method pause, have changed.
   `ExecutionPolicy(max_direct_concurrency=40)` still ran 10 at a time. The limit is now
   `Settings.max_concurrent_requests` (environment `BITRIX24_API_MAX_CONCURRENT_REQUESTS`, or
   `Bitrix24.from_webhook(..., max_concurrent_requests=...)`), 10 by default as before. It bounds all
-  the client's calls, streams and retries together; an operation's own limits
-  (`max_direct_concurrency`, `DirectDispatch.concurrency`, `BatchDispatch.concurrency`) only narrow it,
-  so the effective concurrency is the smallest of them. Raise it only as far as the portal's rate
-  limits allow.
+  the client's calls, streams and retries together, and an operation's own limits only narrow it, per
+  dispatch: a `DirectDispatch` sends at most the smallest of its `concurrency`,
+  `max_direct_concurrency`, `max_active_references` and the client limit at once; a `BatchDispatch`
+  keeps at most the smallest of its `concurrency`, `max_active_references` and the client limit of
+  physical batches in flight, and `max_direct_concurrency` does not limit it. The isolation of a REST
+  3.0 envelope of `SAFE` commands that may have run sends its unresolved commands one by one, all at
+  once, bounded only by the client limit. In `fan_out()` and `fan_out_outcomes()`,
+  `BatchDispatch(batch_size=1)` sends one batch at a time whatever its `concurrency`, since each
+  command's share of `max_buffered_rows` is sized for one batch; use `DirectDispatch` to send single
+  commands concurrently. Raise the client limit only as far as the portal's rate limits allow.
 - **A synchronous source keeps one context.** A synchronous iterator given to `batch()`,
   `fan_out()` or a reference traversal is pulled in a worker thread, and each pull ran in a fresh copy
   of the context, so a generator that set a `ContextVar` before a `yield` no longer saw it when it
@@ -162,7 +183,6 @@ send meets a method pause, have changed.
   close, in one `contextvars.Context`, copied from the caller when the call that receives the source
   is made: the generator sees what it set across its `yield`s, as in a plain `for` loop. What it sets
   stays in that context and never reaches the caller's.
-
 
 ## Retry timing
 
@@ -192,41 +212,44 @@ Public signatures are unchanged; when a retry waits and when it is sent have cha
   with whatever window the wait left, so a 0.95-second `Retry-After` in a 1-second window sent it with
   0.05 seconds, and a send cut that way was reported unknown. Such a retry is now sent only while the
   window left after its wait is at least as long as the wait, measured as the time it actually waited
-  when that was longer than planned. Otherwise the request ends with
-  `BudgetExceededError`, whose cause is the refusal, and its outcome stays proven not run: at once,
-  without waiting, when the planned wait already does not fit, or after the wait, before the send,
-  when the wait overran its plan (a late wake or a long permit queue). With the default 30-second
-  window, a `Retry-After` of 15 seconds or more ends an `UNSAFE` or `UNKNOWN` request without a retry
-  even when its first send took no time; each second the request has already spent lowers that
-  bound by half a second. To let it wait longer, raise the retry window: `http_timeout` under the
-  client's default policy, `max_retry_elapsed_per_request` with an explicit `policy=`. A `SAFE` retry is still sent
-  with any window left: it may succeed, and repeating it is harmless.
+  when that was longer than planned. Otherwise the request ends with `BudgetExceededError`, whose cause
+  is the refusal, and its outcome stays proven not run: at once, without waiting, when the planned wait
+  already does not fit, or after the wait, before the send, when the wait overran its plan (a late wake
+  or a long permit queue). With the default 30-second window, a `Retry-After` of 15 seconds or more ends
+  an `UNSAFE` or `UNKNOWN` request without a retry even when its first send took no time; each second
+  the request has already spent lowers that bound by half a second. To let it wait longer, raise the
+  retry window: `http_timeout` under the client's default policy, `max_retry_elapsed_per_request` with
+  an explicit `policy=`. A `SAFE` retry is still sent with any window left: it may succeed, and
+  repeating it is harmless.
 - **The `SAFE` commands of a classic batch keep their replay.** The same rule applies to the replay
   rounds of a classic batch, whether its commands' own entries were refused or the whole batch was
   refused (a 429, or a quota error for the batch). When the window is too short for its `UNSAFE` or
-  `UNKNOWN` commands, the round still sends its `SAFE` commands: after the same wait when the plan
-  shows it, or at once, with the window left, when the send itself is refused after a wait that
-  overran (the wait is not repeated; a pause the client still holds on their methods is). The other
-  commands are not sent again. One whose own entry answered it keeps that answer, a
-  `BatchCommandError` with its refusal; when the whole batch was refused, each ends with
-  `BudgetExceededError` whose cause is that refusal, proven not run and not eligible for replay. Each
-  command is weighed against its own method's pause too, as the client knows it when the round is
-  planned (a method paused by `OPERATION_TIME_LIMIT`, for example), so such a pause does not take the
-  replay away from the other commands: a command whose own pause outlasts the window is not sent
-  again, and a round waits only as long as its `UNSAFE` and `UNKNOWN` commands can afford (less than
-  half the window); a `SAFE` command whose method is held longer than that waits for a later round,
-  after its pause. A pause that appears during a round's wait is met when the round asks for its
-  permit, and stops the whole round when it outlasts the window. Each round spends one attempt of
-  the batch, so `max_attempts_per_request` bounds how often a command waits for a later round: one
-  still waiting when the last attempt is spent is not sent again, and keeps its own refusal or ends
-  with `BudgetExceededError` ("per-request attempt budget exhausted") caused by the batch refusal it
+  `UNKNOWN` commands, the round still sends its `SAFE` commands: after the same wait when the plan shows
+  it, or at once, with the window left, when the send itself is refused after a wait that overran (the
+  wait is not repeated; a pause the client still holds on their methods is). The other commands are not
+  sent again. One whose own entry answered it keeps that answer, a `BatchCommandError` with its refusal;
+  when the whole batch was refused, each ends with `BudgetExceededError` whose cause is that refusal,
+  proven not run and not eligible for replay. Each command is weighed against its own method's pause
+  too, as the client knows it when the round is planned (a method paused by `OPERATION_TIME_LIMIT`, for
+  example), so such a pause does not take the replay away from the other commands: a command whose own
+  pause outlasts the window is not sent again, and a round waits only as long as its `UNSAFE` and
+  `UNKNOWN` commands can afford (less than half the window); a `SAFE` command whose method is held
+  longer than that waits for a later round, after its pause. A pause that appears during a round's wait
+  is met when the round asks for its permit, and stops the whole round when it outlasts the window. Only
+  a round that is sent spends an attempt of the batch: a round stopped before its send (at its permit or
+  at its admission) spends none, and a command carried to a later round spends none of its own, the
+  round's send of the others spending the batch's attempt. Every round that carries a command plans to
+  send another, so `max_attempts_per_request` bounds how often a command waits for a later round: one
+  still waiting when the last attempt is spent is not sent again, and keeps its own refusal or ends with
+  `BudgetExceededError` ("per-request attempt budget exhausted") caused by the batch refusal it
   followed. A command the budget stops before its round is sent ends with that stop caused by the
-  failure it followed, never by the failure of a round it skipped, and it is reported possibly run
-  only when a send it was in may have run. A fail-fast batch is never split: it is sent again whole
-  or not at all, after the longest pause of its commands. A REST 3.0 batch keeps `SAFE` and other commands in separate envelopes, so
-  each envelope is admitted or refused whole; one that was refused as a whole and whose replay the
-  budget then stops (the window, or a pause or a full queue at its permit) now ends the same way, with
-  `BudgetExceededError` whose cause is the refusal, where it used to keep the refusal itself.
+  failure it followed, never by the failure of a round it skipped, and it is reported possibly run only
+  when a send it was in may have run. A fail-fast batch is never split: it is sent again whole or not at
+  all, after the longest pause of its commands. A REST 3.0 batch keeps `SAFE` and other commands in
+  separate envelopes, so each envelope is admitted or refused whole; one that was refused as a whole and
+  whose replay the budget then stops (the window, or a pause or a full queue at its permit) now ends the
+  same way, with `BudgetExceededError` whose cause is the refusal, where it used to keep the refusal
+  itself.
 - **408 and 504 are retried, 507 is not.** `RetryPolicy.transient_http_statuses` now defaults to
   408, 423, 425, 429, 500, 502, 503 and 504. An unstructured 408 or 504 is retried for `SAFE`
   requests and stays ambiguous for `UNSAFE` and `UNKNOWN` ones, which are never sent again after it.
@@ -254,6 +277,22 @@ settings = Settings(webhook_url="https://example.bitrix24.com/rest/1/token/")
 bounded = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_elapsed=settings.http_timeout)
 ```
 
+**What `max_elapsed` bounds.** It bounds the operation at its scheduling points: when a request, a page
+or a source item is admitted, while a send waits for its permit (a pause included), while a page waits
+for row capacity and while a source, synchronous or asynchronous, is pulled. A send in flight is cut at
+what is left of the operation or of its retry window, whichever is shorter. It does not bound the time
+the application spends while it holds control: in a `page_stop` callback, or as a consumer that is slow
+between pulls of a stream, a binding waiting for the consumer to take its page included. Nothing
+interrupts the application when the budget runs out meanwhile; the next scheduling point ends the
+operation, even when all that is left is to read the end of the source. The report is then `incomplete`,
+with `BudgetExceededError` as its terminal reason and a `budget_exhausted` violation. The stream raises
+a plain `BudgetExceededError`, except that a fail-fast stream whose stop failed a command or a binding
+raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report carries that reason); a stop at a
+source pull, the end-of-source check or the cleanup fails none. So it depends on where the budget
+stopped the stream, not on the operation: handle both, or read the report. A send cut in flight is another case: its command may have
+run, so it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end on that ambiguity
+instead.
+
 ## Compressed bodies are decoded whole
 
 - **A compressed body cut short is a body read failure.** A `gzip` or `deflate` body (zlib-wrapped
@@ -273,12 +312,16 @@ bounded = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_elaps
   that still carries `Content-Encoding: gzip`) stays an empty body, as HTTPX reads it. Bytes after the
   end of a complete zlib or raw `deflate` stream are still dropped.
 - **Not checked: a body read inside an injected HTTPX client.** When the client's transport returns a
-  response it has already read (`httpx.Response(content=...)` in a `MockTransport`), or a response
-  event hook reads the body (`await response.aread()`), HTTPX has decoded it: without checking the end
-  of a compressed stream, and keeping only the first gzip member. The raw bytes are not reachable
-  through HTTPX's public API, so `HttpxTransport` accepts such a body as HTTPX decoded it, within the
-  byte ceiling. A transport that returns the raw bytes unread (`httpx.Response(..., stream=...)`, as
-  HTTPX's own transports do) and hooks that leave the body unread get every check above.
+  response it has already read (`httpx.Response(content=...)` in a `MockTransport`), a response event
+  hook reads the body (`await response.aread()`), or the client's `httpx.Auth` declares
+  `requires_response_body = True` (HTTPX then reads every response for it), HTTPX has decoded the body:
+  without checking the end of a compressed stream, and keeping only the first gzip member.
+  `HttpxTransport` accepts such a body as HTTPX decoded it, within the byte ceiling. The raw bytes may
+  still sit behind the client's stream wrapper, but HTTPX's public API cannot tell an in-memory body
+  read that way from a network stream already released to the connection pool, which cannot be read
+  again, so the transport does not try. A transport that returns the raw bytes unread
+  (`httpx.Response(..., stream=...)`, as HTTPX's own transports do), with hooks and auth that leave the
+  body unread, gets every check above.
 
 ## Transport hygiene: webhook URLs, unsendable requests, error chains
 
@@ -377,14 +420,20 @@ bounded = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_elaps
 - **What is guaranteed.** The webhook token appears in no rendering of an error that `HttpxTransport`
   raises itself, converts from an `Exception` raised inside the HTTP client, or raises while it is
   constructed: not in `str` or `repr` of the error, its chain, notes or arguments, not in a formatted
-  traceback, not in the `repr` of the frame locals that `capture_locals` or an error tracker shows,
-  and not in log records at any level. What is not converted passes through unchanged: an exception
-  that is not an `Exception` (`KeyboardInterrupt`, `SystemExit`) raised by a hook, whose traceback
-  runs through the HTTPX frames that hold the request, and the arguments a canceller gives a
-  cancellation. One limitation remains: over HTTP/2,
-  HTTPX's HPACK header table keeps the request path with the token. That is connection state of
-  HTTPX, reachable only by walking the client's internal objects, not by rendering an error.
-
+  traceback, not in the `repr` of the frame locals that `capture_locals` or an error tracker shows.
+  In logs, the guarantee covers a record of such an error (the library writes no log records of its
+  own), the records of the `httpx` logger, and the `hpack.hpack` and `hpack.table` records, which are
+  dropped while a library HTTPX client is open (an HTTP/2 send is refused with `CapabilityError` before
+  I/O when that filter was removed; see item 14 under
+  [Upgrading from 2.3 to 3.0](#upgrading-from-23-to-30)). Records of other loggers are not filtered:
+  `httpcore` DEBUG records carry the response headers, so a `Location` header that holds the token
+  puts it in a record; see the HTTPX logging note in
+  [Migrating to the issues architecture (2.3)](#migrating-to-the-issues-architecture-23). What is not
+  converted passes through unchanged: an exception that is not an `Exception` (`KeyboardInterrupt`,
+  `SystemExit`) raised by a hook, whose traceback runs through the HTTPX frames that hold the request,
+  and the arguments a canceller gives a cancellation. One limitation remains: over HTTP/2, HTTPX's
+  HPACK header table keeps the request path with the token. That is connection state of HTTPX,
+  reachable only by walking the client's internal objects, not by rendering an error.
 
 ## Unknown outcomes follow what was sent
 
@@ -665,6 +714,15 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   omitted from bracket encoding, so `{"UF_MULTI": [None]}` also sends no field there. The new
   read-only `Request.has_empty_container` tells whether a request holds such a value.
 
+  **Warning: `None` in a classic batch is a no-op, not "clear this field".** A direct JSON call sends
+  `None` as `null` (`{"fields": {"TITLE": null}}`); what the method does with `null` is its own. The
+  bracket encoding of a classic batch command, and of a `FORM_URLENCODED` request, drops every `None`
+  instead, with nothing in its place and no error: `{"fields": {"TITLE": None}}` sends no `TITLE`, so
+  the update leaves the field as it was; a mapping left holding only `None` values is not sent at all;
+  and `{"fields": {"UF_MULTI": [None, 5]}}` sends only `fields[UF_MULTI][1]=5`, the later items keeping
+  their index. `Request.has_empty_container` does not flag a `None`. To clear a field in a batch, send
+  the value the method itself expects for clearing it, never `None`.
+
 ## Page-level response fields
 
 - **`PageBoundary.result`.** A `page_stop` callback now receives the page's immutable server result
@@ -931,7 +989,9 @@ sent, with a non-retryable `TransportError` whose phase records whether the owne
 already been answered: a substitute would make it undecidable which records carry the webhook.
 Direct use of a caller-owned client after the transport closes is outside that shield. An
 application enabling the separate `httpcore` DEBUG logger needs its own logging policy and test;
-this guarantee covers the emitting `httpx` INFO logger.
+this guarantee covers the emitting `httpx` INFO logger. `httpcore` DEBUG records are not filtered:
+they include the response headers, so a redirect whose `Location` header carries the webhook token
+writes the token into a record.
 The supported HTTPX range is `>=0.28.1,<0.29`, with `h2>=4.3.0,<4.5` and `hpack>=4.1.0,<4.3` as
 direct requirements, because the shield filters the `hpack` logger names verified on those lines. An
 environment pinned below them must upgrade; raising any of these upper bounds requires rerunning the

@@ -12,21 +12,35 @@ uv sync --frozen
 export BITRIX24_API_WEBHOOK_URL='https://portal.example/rest/.../'
 ```
 
-Keep the webhook out of source, logs and command arguments. Reuse one client for a related unit of
-work so its HTTP/2 connection pool and rate state are reused. The URL has the form
+Keep the webhook out of source, logs and command arguments. Reuse one client for a related unit of work
+so its HTTP/2 connection pool and rate state are reused. The URL has the form
 `https://<portal>/rest/<user>/<token>/`, with a numeric user and a token of letters, digits, `_` and
-`-`; `http`, upper-case letters, an explicit port, a missing trailing slash, `.` and `..` segments and
-surrounding whitespace are accepted and normalized. Any other form is refused, one with a user name or
-password, a query, a fragment or a percent-encoded path included, since the token is its only credential
-and is registered for redaction as it is sent.
+`-`. `http` is accepted. Letter case is normalized only in the scheme and host, which are lowered: the
+path keeps its case, so the token is sent as written and `/REST/` is refused. A default port is dropped
+and any other kept, `.` and `..` segments are resolved, a missing trailing slash is added, and leading
+and trailing control characters U+0000–U+001F and spaces are dropped. A host of non-ASCII letters
+is IDNA-encoded, an empty userinfo (`https://@portal/...`, `https://:@portal/...`) is dropped, and a
+host with a trailing dot is accepted as written; see
+[the webhook URL rule](https://github.com/shkarupa-alex/b24api/blob/master/docs/migration.md#transport-hygiene-webhook-urls-unsendable-requests-error-chains)
+for all of it. Any other form is refused, one with a user name or password, a query, a fragment, a
+percent-encoded path, or a surrounding DEL (U+007F) or non-ASCII space (a no-break space, for example)
+included, since the token is its only credential and is registered for redaction as it is sent.
 
 `Settings` reads two limits as well. `BITRIX24_API_HTTP_TIMEOUT` is each request's retry window in
 seconds (30 by default, finite). `BITRIX24_API_MAX_CONCURRENT_REQUESTS` is how many requests one client
-keeps in flight at once, all its calls, streams and retries together (10 by default). An operation's
-own limits, `ExecutionPolicy.max_direct_concurrency` and the `concurrency` of `DirectDispatch` or
-`BatchDispatch`, only narrow it: the effective concurrency is the smallest of them, so
-`DirectDispatch(concurrency=40)` alone still runs 10 requests at a time. Raise the client limit only as
-far as the portal's rate limits allow. `Bitrix24.from_webhook()` takes both limits as arguments:
+keeps in flight at once, all its calls, streams and retries together (10 by default). An operation's own
+limits only narrow it, and which of them apply depends on the dispatch. A `DirectDispatch` sends at most
+the smallest of its `concurrency`, `ExecutionPolicy.max_direct_concurrency`,
+`ExecutionPolicy.max_active_references` and the client limit at once, so
+`DirectDispatch(concurrency=40)` alone still runs 10 requests at a time. A `BatchDispatch` bounds
+physical batches, not requests: it keeps at most the smallest of its `concurrency`,
+`max_active_references` and the client limit in flight, and `max_direct_concurrency` does not limit it.
+When a REST 3.0 envelope of `SAFE` commands may have run without an answer, its unresolved commands are
+sent again one by one, all at once, bounded only by the client limit. `fan_out()` and
+`fan_out_outcomes()` size each command's share of `max_buffered_rows` for one batch, so
+`BatchDispatch(batch_size=1)` gives a command the whole row pool and sends one batch at a time whatever
+its `concurrency`; use `DirectDispatch` to send single commands concurrently. Raise the client limit
+only as far as the portal's rate limits allow. `Bitrix24.from_webhook()` takes both limits as arguments:
 
 <!-- tested: tests/settings_test.py::test_effective_concurrency_is_the_smallest_of_the_client_and_operation_limits -->
 ```python
@@ -73,10 +87,13 @@ users = await client.call(Request.bare("user.get", {"ID": 1}))
 
 The client owns the transport it creates. An injected transport remains caller-owned. `aclose()` is
 idempotent and closes active streams before the owned transport. A closed client raises
-`ClientClosedError` (from `b24api.errors`) for every call or stream started after `aclose()` and for
-the calls still waiting for a permit when it closed: a `TransportError` of phase `not_dispatched`, so
-nothing was sent and it is never retried, and a `RuntimeError` as well. To prove that no row is missing or
-repeated, give the traversal an identity (see [Choosing a list operation](#choosing-a-list-operation)).
+`ClientClosedError` (from `b24api.errors`) for every call awaited and every stream created after
+`aclose()` (the method that creates the stream raises it), and for the calls still waiting for a permit
+when it closed. It is a `TransportError` of phase `not_dispatched`, so the attempt it stopped was not
+sent, and it is never retried. It is a `RuntimeError` as well. The phase covers only that attempt: a
+`SAFE` request that waited for the permit of a retry may already have run on an earlier attempt. To
+prove that no row is missing or repeated, give the traversal an identity (see
+[Choosing a list operation](#choosing-a-list-operation)).
 
 ## Direct calls
 
@@ -202,8 +219,12 @@ default `SAFE` requests are also retried after an unstructured 408, 500, 502, 50
 ### Error codes
 
 Every error of `b24api.errors` survives `pickle` and `copy` with its message and attributes, so it can
-cross a process pool or a task queue. A structured refusal raises `ApiResponseError`. Its message, `wire_code`, `normalized_code`, `code`
-(lower case) and `to_safe_dict()` name the server's code, so failures can be told apart:
+cross a process pool or a task queue. The exception is an error that holds a caller's correlation:
+`BatchFailed` and `ReferenceFailed` keep their outcomes, each with its correlation, so `pickle` fails on
+them when the correlation cannot be pickled, and `copy.deepcopy()` when it cannot be deep-copied, with
+the error the correlation raises (`TypeError` for a lock, for example); `copy.copy()` still works. A structured refusal raises `ApiResponseError`. Its
+message, `wire_code`, `normalized_code`, `code` (lower case) and `to_safe_dict()` name the server's
+code, so failures can be told apart:
 
 ```text
 API error [BITRIX_REST_V3_EXCEPTION_ACCESSDENIEDEXCEPTION]: Access denied
@@ -844,9 +865,29 @@ holds rather than what it sends. `batch()` and `batch_outcomes()` share the budg
 results in input order, one row per outcome and a success's other rows while they fit; `fan_out()` and
 `fan_out_outcomes()` give each command an equal share (50 rows under the default `BatchDispatch`, 250
 under `DirectDispatch`). A result that does not fit is dropped: its command ends as a `CommandFailure`
-with `ResultTooLargeError`, a `BudgetExceededError` that says the command ran and was answered, so it
-is never replayed, and every other command keeps its own outcome. Waiting for rows a consumer has not
-taken yet is bounded by `max_elapsed`.
+with `ResultTooLargeError`, a `BudgetExceededError` that says the command ran and was answered, so it is
+never replayed, and every other command keeps its own outcome. A page's wait for row capacity, while the
+consumer has not yet taken the rows other pages hold, is bounded by `max_elapsed`: when it runs out, the
+binding or `fan_out()` command fails with its waiting page unsent, with `BudgetExceededError` ("row
+buffer wait exceeded operation time budget"). A binding's wait for the consumer to take a page already
+handed to it (under `READY` delivery, or with a `page_stop`) is not bounded: it lasts as long as the
+consumer takes.
+
+`max_elapsed` is checked at the operation's scheduling points: when a request, a page or a source item
+is admitted, while a send waits for its permit (a pause included), while a page waits for row capacity
+and while a source, synchronous or asynchronous, is pulled. A send in flight is cut at what is left of
+the operation or of its retry window, whichever is shorter. It does not bound the time the application
+spends while it holds control: in a `page_stop` callback, or as a consumer that is slow between pulls
+of the stream. Nothing interrupts the application when the budget runs out meanwhile; the next
+scheduling point ends the operation, even when all that is left is to read the end of the source. The
+report is then `incomplete`, with `BudgetExceededError` as its terminal reason and a `budget_exhausted`
+violation. The stream raises a plain `BudgetExceededError`, except that a fail-fast stream whose stop
+failed a command or a binding raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report
+carries that reason); a stop at a source pull, the end-of-source check or the cleanup fails none. So it
+depends on where the budget stopped the stream, not on the operation: handle both, or read the
+report. A send cut in flight is another case:
+its command may have run, so it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end
+on that ambiguity instead.
 
 Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
 observed identities per operation in memory (100,000 by default). All active reference bindings
