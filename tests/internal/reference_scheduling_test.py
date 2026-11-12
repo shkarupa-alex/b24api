@@ -50,7 +50,7 @@ from b24api.references.dispatch import (
 from b24api.references.scheduler import ReferenceScheduler
 from b24api.traversal.counted_batch import _settle_tail_cleanup
 from b24api.traversal.plans import KernelBatchDispatch, ReferenceOutputOrder
-from tests.scripting import BatchPortal, Blocker, ResponderTransport, VirtualClock, client_for
+from tests.scripting import BatchPortal, Blocker, ResponderTransport, VirtualClock, client_for, on_loop
 
 if TYPE_CHECKING:
     from b24api.contracts import TraversalSpec
@@ -525,7 +525,10 @@ async def test_a_binding_stops_counting_as_a_producer_before_it_publishes_its_te
         for parent in (0, 1, 2)
     ]
     async with client_for(BatchPortal(answer)) as api:
-        stream = api.iter_reference_source_outcomes(sources, dispatch=BatchDispatch(batch_size=10, output_order=order))
+        # Fed on the event loop: a pull in a worker thread could outlast a virtual wait and fire its timer.
+        stream = api.iter_reference_source_outcomes(
+            on_loop(sources), dispatch=BatchDispatch(batch_size=10, output_order=order)
+        )
         async with stream:
             _events = [event async for event in stream]
 
