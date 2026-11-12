@@ -71,10 +71,10 @@ a binding waits for rows, have changed.
   command waiting for row capacity still held by results the consumer had not taken waited until the
   consumer read on, however long after `max_elapsed`, and its send was then refused at its admission.
   That wait now ends with the operation's elapsed budget, while the consumer still holds the rows: the
-  command or binding fails unsent with `BudgetExceededError` ("row buffer wait exceeded operation time
-  budget"), and the operation ends as the time budget ends it. Unchanged: a binding waiting for the
-  consumer to take a page already handed to it (under `READY` delivery, or with a `page_stop`) waits
-  without a bound, as long as the consumer takes; see the time-budget note under
+  command or binding fails with its waiting page unsent, with `BudgetExceededError` ("row buffer wait
+  exceeded operation time budget"), and the operation ends as the time budget ends it. Unchanged: a
+  binding waiting for the consumer to take a page already handed to it (under `READY` delivery, or with
+  a `page_stop`) waits without a bound, as long as the consumer takes; see the time-budget note under
   [Retry timing](#retry-timing).
 
 ## Batch budgets and held methods
@@ -276,17 +276,21 @@ settings = Settings(webhook_url="https://example.bitrix24.com/rest/1/token/")
 bounded = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_elapsed=settings.http_timeout)
 ```
 
-`max_elapsed` bounds the operation at its scheduling points: when a request, a page or a source item is
-admitted, while a send waits for its permit (a pause included), while a page waits for row capacity and
-while a source, synchronous or asynchronous, is pulled. A send in flight is cut at what is left of the
-operation or of its retry window, whichever is shorter. It does not bound the time the application
-spends while it holds control: in a `page_stop` callback, or as a consumer that is slow between pulls of
-a stream, a binding waiting for the consumer to take its page included. Nothing interrupts the
-application when the budget runs out meanwhile; the next scheduling point ends the operation, even when
-all that is left is to read the end of the source. The report is then `incomplete`, with
-`BudgetExceededError` as its terminal reason and a `budget_exhausted` violation. The stream raises
-`BudgetExceededError`, except `fan_out()`, which raises `BatchFailed`, and `iter_references()`,
-`iter_cursors()` and `iter_reference_sources()`, which raise `ReferenceFailed`.
+**What `max_elapsed` bounds.** It bounds the operation at its scheduling points: when a request, a page
+or a source item is admitted, while a send waits for its permit (a pause included), while a page waits
+for row capacity and while a source, synchronous or asynchronous, is pulled. A send in flight is cut at
+what is left of the operation or of its retry window, whichever is shorter. It does not bound the time
+the application spends while it holds control: in a `page_stop` callback, or as a consumer that is slow
+between pulls of a stream, a binding waiting for the consumer to take its page included. Nothing
+interrupts the application when the budget runs out meanwhile; the next scheduling point ends the
+operation, even when all that is left is to read the end of the source. The report is then `incomplete`,
+with `BudgetExceededError` as its terminal reason and a `budget_exhausted` violation. What the stream
+raises depends on where the budget stopped it, not on the operation: a plain `BudgetExceededError` when
+it stopped a source pull, the end-of-source check or the cleanup, and the fail-fast wrapper
+(`BatchFailed` or `ReferenceFailed`, whose report carries that reason) when it failed a command or a
+binding. Handle both, or read the report. A send cut in flight is another case: its command may have
+run, so it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end on that ambiguity
+instead.
 
 ## Compressed bodies are decoded whole
 
