@@ -63,6 +63,31 @@ class TransportError(B24ApiError):
         return {**super().to_safe_dict(), "phase": self.phase.value, "possible_acceptance": self.possible_acceptance}
 
 
+class ClientClosedError(TransportError, RuntimeError):
+    """The client, its rate limiter or its transport was closed before this request was sent.
+
+    A transport lifecycle failure of phase ``not_dispatched``: nothing left the process, so even an
+    ``UNSAFE`` request is proven not run, and it is never retried. It is also a ``RuntimeError``, the type
+    a closed client raised before, so existing ``except RuntimeError`` handlers keep catching it.
+    """
+
+    def __init__(
+        self,
+        message: str = "client is closed",
+        *,
+        request_summary: RequestSummary | None = None,
+        redactor: Redactor = DEFAULT_REDACTOR,
+    ) -> None:
+        """Refuse before dispatch, without a retry."""
+        super().__init__(
+            message,
+            phase=FailurePhase.NOT_DISPATCHED,
+            request_summary=request_summary,
+            retryable=False,
+            redactor=redactor,
+        )
+
+
 class HTTPGatewayError(B24ApiError):
     """Non-structured HTTP or gateway failure."""
 
@@ -534,6 +559,7 @@ __all__ = (
     "BatchFailed",
     "BudgetExceededError",
     "CapabilityError",
+    "ClientClosedError",
     "ContinuationError",
     "ContinuationReason",
     "EnvelopeContractError",

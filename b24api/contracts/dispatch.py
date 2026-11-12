@@ -24,7 +24,12 @@ def _positive_plain_integer(value: object, name: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class DirectDispatch:
-    """Bounded independent direct requests."""
+    """Bounded independent direct requests.
+
+    ``concurrency`` is a ceiling of this operation alone: the requests in flight are also bounded by the
+    policy (``max_direct_concurrency``, and ``max_active_references`` for references) and by
+    ``Settings.max_concurrent_requests``, which the client's operations share; the smallest applies.
+    """
 
     concurrency: int = 10
     output_order: DeliveryOrder = DeliveryOrder.READY
@@ -38,7 +43,11 @@ class DirectDispatch:
 
 @dataclass(frozen=True, slots=True)
 class BatchDispatch:
-    """Bounded independent physical Bitrix batch requests."""
+    """Bounded independent physical Bitrix batch requests.
+
+    ``concurrency`` is a ceiling of this operation alone; ``Settings.max_concurrent_requests``, which the
+    client's operations share, still bounds the batches in flight.
+    """
 
     batch_size: int = PORTAL_BATCH_CAP
     concurrency: int = 1

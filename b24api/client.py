@@ -24,7 +24,15 @@ from b24api.contracts.request import (
 )
 from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import KeysetSpec
-from b24api.execution import Executor, HttpxTransport, Transport, await_cleanup_resistant, rearm_cancellation
+from b24api.errors import ClientClosedError
+from b24api.execution import (
+    Executor,
+    HttpxTransport,
+    RateCoordinator,
+    Transport,
+    await_cleanup_resistant,
+    rearm_cancellation,
+)
 from b24api.execution.cleanup import OwnedStream, close_owned_resources
 from b24api.redaction import Redactor, secret_values
 from b24api.references.facade import reference_stream
@@ -49,7 +57,6 @@ if TYPE_CHECKING:
     from b24api.contracts.response import BinaryResponse, Response
     from b24api.contracts.stream import OperationStream
     from b24api.contracts.traversal import CursorSpec, TraversalSpec
-    from b24api.execution.rate import RateCoordinator
     from b24api.references.binding import BindingSource
     from b24api.references.sources import ReferenceSources
 
@@ -78,7 +85,7 @@ class Bitrix24(_TraversalFacade):
         transport: Transport | None = None,
         unknown_request_audit: UnknownRequestAudit | None = None,
     ) -> None:
-        """Compose settings, transport ownership and default policy."""
+        """Compose settings, transport ownership, the request concurrency limit and the default policy."""
         resolved = settings if settings is not None else api_settings()
         if not isinstance(resolved, Settings):
             raise TypeError("settings must be a Settings value")
@@ -90,6 +97,11 @@ class Bitrix24(_TraversalFacade):
                 raise ValueError(refusal.value)
             case Webhook() as webhook:
                 host = webhook.host
+        # Every refusal of the configuration comes before the transport, so a refused client opens nothing.
+        default_policy = policy or ExecutionPolicy.from_settings(resolved)
+        coordinator = RateCoordinator(max_concurrency=resolved.max_concurrent_requests)
+        # The configured webhook credential is an exact secret for every error this client renders.
+        codec = ProtocolCodec(redactor=Redactor(known_secrets=secret_values((webhook.token,))))
         if transport is None:
             selected_transport: Transport = HttpxTransport(webhook.url)
             owned_transport: HttpxTransport | None = cast("HttpxTransport", selected_transport)
@@ -100,11 +112,9 @@ class Bitrix24(_TraversalFacade):
             owned_transport = None
         self._transport = selected_transport
         self._owned_transport = owned_transport
-        # The configured webhook credential is an exact secret for every error this client renders.
-        codec = ProtocolCodec(redactor=Redactor(known_secrets=secret_values((webhook.token,))))
-        self._executor = Executor(selected_transport, codec=codec)
-        self._owned_coordinator = self._executor.coordinator
-        self._default_policy = policy or ExecutionPolicy.from_settings(resolved)
+        self._executor = Executor(selected_transport, codec=codec, coordinator=coordinator)
+        self._owned_coordinator = coordinator
+        self._default_policy = default_policy
         self._host = host
         self._closed = False
         self._unknown_request_audit = unknown_request_audit
@@ -117,20 +127,19 @@ class Bitrix24(_TraversalFacade):
         url: str,
         *,
         http_timeout: float | None = None,
+        max_concurrent_requests: int | None = None,
         policy: ExecutionPolicy | None = None,
     ) -> Bitrix24:
         """Build a client that owns its HTTPX transport and rate coordinator for one webhook URL.
 
-        The URL is validated by ``Settings``; ``http_timeout=None`` keeps the ``Settings`` default.
+        The URL and the limits are validated by ``Settings``; a limit left ``None`` keeps its ``Settings``
+        default.
         """
         try:
             if not isinstance(url, str):
                 raise TypeError("webhook url must be a string")
-            settings = (
-                Settings(webhook_url=url)
-                if http_timeout is None
-                else Settings(webhook_url=url, http_timeout=http_timeout)
-            )
+            limits = {"http_timeout": http_timeout, "max_concurrent_requests": max_concurrent_requests}
+            settings = Settings(webhook_url=url, **{name: value for name, value in limits.items() if value is not None})
             return cls(settings, policy=policy)
         finally:
             # A construction error's traceback keeps this frame's locals; none of them may be the webhook.
@@ -462,7 +471,7 @@ class Bitrix24(_TraversalFacade):
 
     def _require_open(self) -> None:
         if self._closed:
-            raise RuntimeError("client is closed")
+            raise ClientClosedError
 
     def _audit_unknown(self, request: Request) -> Violation | None:
         if request.replay_safety is not ReplaySafety.UNKNOWN or self._unknown_request_audit is None:

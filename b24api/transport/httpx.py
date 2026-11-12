@@ -16,6 +16,7 @@ from b24api.contracts.request_summary import RequestSummary, RouteKind
 from b24api.contracts.wire import BodyEncoding, _validate_headers
 from b24api.encoding import encode_php_query
 from b24api.errors import (
+    ClientClosedError,
     ProtocolError,
     ResponseTooLargeError,
     TransportError,
@@ -75,10 +76,9 @@ def _method_url(webhook: Webhook, request: WireRequest) -> str:
     return f"{base}{request.method}{suffix}"
 
 
-def _closed_refusal(*, transport_closed: bool) -> TransportError:
+def _closed_refusal(*, transport_closed: bool) -> ClientClosedError:
     """A closed transport or injected client refuses before any I/O; the request never left the process."""
-    message = "transport is closed" if transport_closed else "HTTP client is closed"
-    return TransportError(message, phase=FailurePhase.NOT_DISPATCHED, retryable=False)
+    return ClientClosedError("transport is closed" if transport_closed else "HTTP client is closed")
 
 
 class HttpxTransport:

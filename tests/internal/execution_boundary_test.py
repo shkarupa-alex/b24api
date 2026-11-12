@@ -23,6 +23,7 @@ from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
+    ClientClosedError,
     EnvelopeContractError,
     HTTPGatewayError,
     ResponseTooLargeError,
@@ -1380,7 +1381,7 @@ async def test_closed_default_transport_refuses_before_dispatch_without_implying
         sends.clear()
         await (transport.aclose() if closed == "transport" else http_client.aclose())
         for safety in (ReplaySafety.UNSAFE, ReplaySafety.SAFE):
-            with pytest.raises(TransportError, match=refusal) as refused:
+            with pytest.raises(ClientClosedError, match=refusal) as refused:
                 await client.call(_request(safety), policy=_policy())
             assert refused.value.phase is FailurePhase.NOT_DISPATCHED
             assert refused.value.retryable is False
@@ -1391,7 +1392,7 @@ async def test_closed_default_transport_refuses_before_dispatch_without_implying
         assert len(outcomes) == 2  # noqa: PLR2004
         for outcome in outcomes:
             assert isinstance(outcome, CommandFailure)
-            assert isinstance(outcome.error, TransportError)
+            assert isinstance(outcome.error, ClientClosedError)
             assert outcome.error.phase is FailurePhase.NOT_DISPATCHED
             assert outcome.error.retryable is False
         assert sends == []

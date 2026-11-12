@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import contextvars
 import threading
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,7 @@ from b24api._sources import EXHAUSTED, OwnedSource
 from b24api.contracts import Command
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.violation import MAX_RETAINED_VIOLATIONS
+from b24api.execution.context import CleanupResult
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -141,3 +143,40 @@ async def test_cancelled_sync_pull_finishes_before_the_iterator_is_closed() -> N
     result = await source.aclose()
     assert result.error is None
     assert trace == ["pulled", "closed"]
+
+
+_TENANT: contextvars.ContextVar[str] = contextvars.ContextVar("tenant", default="caller")
+
+
+def _tenant_scoped(seen: list[tuple[str, str]]) -> Iterator[int]:
+    """Set a context variable around each yield and reset it with its token, as a scoped generator does."""
+    for index in range(3):
+        token = _TENANT.set(f"tenant-{index}")
+        try:
+            yield index
+            seen.append(("resumed", _TENANT.get()))
+        finally:
+            _TENANT.reset(token)
+            seen.append(("reset", _TENANT.get()))
+
+
+@pytest.mark.asyncio
+async def test_sync_source_keeps_one_context_across_its_pulls_and_close() -> None:
+    # Each pull used to run in a fresh copy of the caller's context, so a token set before a yield belonged
+    # to another context when the generator resumed, and resetting it raised ValueError.
+    seen: list[tuple[str, str]] = []
+    drained = OwnedSource.adapt(_tenant_scoped(seen), accept=_identity)
+    assert await _drain(drained) == 3  # noqa: PLR2004
+    assert seen == [
+        (step, value) for index in range(3) for step, value in (("resumed", f"tenant-{index}"), ("reset", "caller"))
+    ]
+    assert await drained.aclose() == CleanupResult(None, None)
+
+    # A close that interrupts the generator runs its cleanup in the same context as its pulls.
+    seen.clear()
+    interrupted = OwnedSource.adapt(_tenant_scoped(seen), accept=_identity)
+    assert await interrupted.next() == 0
+    assert await interrupted.aclose() == CleanupResult(None, None)
+    assert seen == [("reset", "caller")]
+    # The source's context is its own: the caller's context never sees what the generator sets.
+    assert _TENANT.get() == "caller"

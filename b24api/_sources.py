@@ -3,15 +3,20 @@
 Every stream family adapts its caller source here instead of keeping its own sync and async
 iterator wrappers. A synchronous iterator is pulled and closed in a worker thread, and a pull
 that is cancelled still finishes before the cancellation propagates, so the iterator is never
-closed while it runs. ``accept`` maps each raw item to the family's item and raises for a
-foreign one, ``observe`` records a bounded violation per admitted item, and ``failure`` maps a
-pull or admission failure onto the family's carrier. ``aclose`` never raises: it returns the
-cleanup outcome and the lifecycle owner decides what to report.
+closed while it runs. Its pulls and its close all run in one ``contextvars.Context``, copied when
+the source is adapted, as a generator iterated in one place runs: a context variable it sets
+before a ``yield`` is still set, and its token still resettable, when it resumes. They run one at
+a time, so the context is never entered twice at once. ``accept`` maps each raw item to the
+family's item and raises for a foreign one, ``observe`` records a bounded violation per admitted
+item, and ``failure`` maps a pull or admission failure onto the family's carrier. ``aclose``
+never raises: it returns the cleanup outcome and the lifecycle owner decides what to report.
 """
 
 from __future__ import annotations
 import asyncio
 import contextlib
+import contextvars
+import functools
 from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
@@ -81,6 +86,7 @@ class OwnedSource[T](AsyncIterator[T]):
         """Hold an already opened iterator; use :meth:`adapt` to build one."""
         self._iterator = iterator
         self._inline = inline
+        self._context = contextvars.copy_context()
         self._accept = accept
         self._observe = observe
         self._failure = failure
@@ -152,7 +158,7 @@ class OwnedSource[T](AsyncIterator[T]):
                 return EXHAUSTED
         if self._inline:
             return _next_or_exhausted(iterator)
-        return await _finish_in_thread(lambda: _next_or_exhausted(iterator))
+        return await _finish_in_thread(functools.partial(self._context.run, _next_or_exhausted, iterator))
 
     async def aclose(self) -> CleanupResult:
         """Close the caller iterator once; every call returns the same outcome and none raises."""
@@ -166,7 +172,7 @@ class OwnedSource[T](AsyncIterator[T]):
             if isinstance(iterator, AsyncClosable):
                 await iterator.aclose()
         elif isinstance(iterator, SyncClosable):
-            await _finish_in_thread(iterator.close)
+            await _finish_in_thread(functools.partial(self._context.run, iterator.close))
 
 
 __all__ = ["EXHAUSTED", "AsyncClosable", "Exhausted", "OwnedSource", "SyncClosable"]

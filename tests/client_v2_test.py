@@ -53,6 +53,7 @@ from b24api.errors import (
     BatchFailed,
     BudgetExceededError,
     CapabilityError,
+    ClientClosedError,
     FailurePhase,
     IncompleteTraversalError,
     InputSourceError,
@@ -60,7 +61,7 @@ from b24api.errors import (
     TransportError,
 )
 from b24api.settings import Settings
-from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, attached_report, client_for
+from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, attached_report, client_for, reached
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator
@@ -69,6 +70,8 @@ if TYPE_CHECKING:
     from tests.scripting import ClientFactory
 
 HTTP_OK = 200
+# The permits of a client's shared limiter when Settings.max_concurrent_requests keeps its default.
+_DEFAULT_CONCURRENT_REQUESTS = 10
 COUNTED_ROWS = 500
 EXPECTED_COUNTED_REQUESTS = 2
 PAGE_SIZE = 50
@@ -1576,8 +1579,50 @@ async def test_client_closes_active_stream_before_owned_transport_but_not_inject
     assert stream.report.state is TerminalState.EARLY_CLOSED
     assert stream._source.completion_gate.finish() == stream.report  # noqa: SLF001 - gate ownership assertion
     assert not transport.closed
-    with pytest.raises(RuntimeError, match="client is closed"):
+    with pytest.raises(ClientClosedError, match="client is closed"):
         await client.call(Request("test.get", route=RouteKind.BARE))
+
+
+@pytest.mark.asyncio
+async def test_a_closed_client_refuses_queued_and_later_work_with_one_typed_error() -> None:
+    # Calls still queued for a permit when the client closes, and every call or stream after the close, get
+    # ClientClosedError: a public TransportError of phase not_dispatched (even an UNSAFE call is proven not
+    # run, never ambiguous), never retried, and still the RuntimeError a closed client used to raise.
+    release = asyncio.Event()
+    all_admitted = asyncio.Event()
+
+    async def respond(_request: object) -> object:
+        if len(transport.requests) == _DEFAULT_CONCURRENT_REQUESTS:
+            all_admitted.set()
+        await release.wait()
+        return {"result": 1}
+
+    transport = ResponderTransport(respond)
+    client = client_for(transport)
+    request = Request.bare("crm.deal.add", {"fields": {"TITLE": "x"}}, ReplaySafety.UNSAFE)
+    in_flight = [asyncio.create_task(client.call(request)) for _ in range(_DEFAULT_CONCURRENT_REQUESTS)]
+    queued = [asyncio.create_task(client.call(request)) for _ in range(2)]
+    await reached(all_admitted)
+
+    close = asyncio.create_task(client.aclose())
+    await asyncio.wait(queued)
+    release.set()
+    await close
+
+    assert await asyncio.gather(*in_flight) == [1] * _DEFAULT_CONCURRENT_REQUESTS
+    refusals = [task.exception() for task in queued]
+    with pytest.raises(ClientClosedError, match="client is closed") as later:
+        await client.call(request)
+    with pytest.raises(ClientClosedError, match="client is closed") as stream:
+        client.batch([Command(request, 0)])
+    for refusal in (*refusals, later.value, stream.value):
+        assert isinstance(refusal, ClientClosedError)
+        assert isinstance(refusal, TransportError)
+        assert isinstance(refusal, RuntimeError)
+        assert refusal.phase is FailurePhase.NOT_DISPATCHED
+        assert not refusal.possible_acceptance
+        assert not refusal.retryable
+    assert len(transport.requests) == _DEFAULT_CONCURRENT_REQUESTS
 
 
 @pytest.mark.asyncio

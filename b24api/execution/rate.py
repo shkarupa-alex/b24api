@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Self
 
+from b24api.errors import ClientClosedError
+
 type Clock = Callable[[], float]
 type Sleeper = Callable[[float], Awaitable[None]]
 
@@ -31,10 +33,6 @@ class DeadlineBudget:
         """Reject deadlines that cannot be compared to monotonic time."""
         if not math.isfinite(self.deadline):
             raise ValueError("deadline must be finite")
-
-
-class CoordinatorClosedError(RuntimeError):
-    """Admission was rejected because the coordinator was closed."""
 
 
 class RatePolicyCapacityError(RuntimeError):
@@ -161,7 +159,7 @@ class RateCoordinator:
         future: asyncio.Future[None] = loop.create_future()
         waiter = _Waiter(future, methods)
         if self._state is CoordinatorState.CLOSED:
-            raise CoordinatorClosedError("rate coordinator is closed")
+            raise ClientClosedError("rate coordinator is closed")
         self._refresh_cooldown()
         if budget is not None and self._clock() >= budget.deadline:
             raise CoordinatorBudgetError("coordinator admission budget exhausted")
@@ -255,7 +253,7 @@ class RateCoordinator:
                 while queue:
                     future = queue.popleft().future
                     if not future.done():
-                        future.set_exception(CoordinatorClosedError("rate coordinator is closed"))
+                        future.set_exception(ClientClosedError("rate coordinator is closed"))
         if wake_task is not None:
             wake_task.cancel()
             await asyncio.gather(wake_task, return_exceptions=True)
