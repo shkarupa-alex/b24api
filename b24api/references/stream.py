@@ -51,11 +51,16 @@ if TYPE_CHECKING:
     from b24api.contracts.report import KeysetSelectionSummary
     from b24api.contracts.request import ResultSelector, TraversalIdentity
     from b24api.execution import Executor
+    from b24api.execution.context import ExecutionContext
     from b24api.references.program import FastKeysetProgram
 
 
 class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     """Lazy reference stream with one frozen report and deterministic cleanup."""
+
+    # The scheduler's producer, binding and dispatch tasks keep pulling sources, running page-stop
+    # callbacks and sending through the transport while no read is in progress.
+    works_between_reads = True
 
     def __init__(
         self,
@@ -81,6 +86,11 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
         return self
+
+    @property
+    def operation_context(self) -> ExecutionContext:
+        """Return the operation context whose elapsed budget bounds the wrapper's cleanup."""
+        return self._scheduler.context
 
     @property
     def completion_gate(self) -> object:

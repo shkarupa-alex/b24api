@@ -55,6 +55,7 @@ if TYPE_CHECKING:
 
     from b24api.contracts.report import Violation
     from b24api.contracts.request import Request
+    from b24api.execution.context import ExecutionContext
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
 
@@ -138,6 +139,9 @@ def _public_outcomes(outcomes: tuple[KernelSuccess | KernelFailure, ...]) -> tup
 class LogicalBatchKernelStream[C]:
     """Kernel-report stream used by the public v2 lifecycle adapter."""
 
+    # Commands are pulled and sent inside a read; nothing runs between reads.
+    works_between_reads = False
+
     def __init__(
         self,
         executor: Executor,
@@ -171,6 +175,11 @@ class LogicalBatchKernelStream[C]:
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
         return self
+
+    @property
+    def operation_context(self) -> ExecutionContext:
+        """Return the operation context whose elapsed budget bounds the wrapper's cleanup."""
+        return self._context
 
     @property
     def completion_gate(self) -> object:

@@ -111,7 +111,15 @@ outcome.
   as pending only a cancellation requested after it began, so a call made in the cleanup of a
   cancelled task is sent, while a later cancellation still ends it, even when a foreign transport
   suppressed it into a response or a failure. An isolated pull that absorbs its reader's
-  cancellation by failing in cleanup hands the cancellation back to the reader's next await.
+  cancellation by failing in cleanup hands the cancellation back to the reader's next await. A
+  stream's close and cleanup defer a cancellation only while the operation's `max_elapsed` budget
+  lasts; cleanup still running then finishes in the background and the report records it as failed.
+- Caller code a stream's read or cleanup runs (a page-stop callback, an async command, binding or
+  reference source, an injected transport, or a task one of them starts) cannot close that stream
+  or its client while the read or cleanup is in progress, nor at all on a reference-scheduler
+  stream, which runs such code between reads too: the close could wait for the code that requested
+  it, so it raises `RuntimeError` and changes nothing. Stop a binding with `CallerStop`, end the
+  source, or close from the code that iterates.
 - The client owns its default transport and active streams; injected transports remain caller-owned.
 
 ## Reference scheduling

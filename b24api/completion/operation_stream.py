@@ -33,12 +33,21 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from b24api.contracts.stream import PartialResult
+    from b24api.execution.context import ExecutionContext
 
 type Mapper[S, T] = Callable[[S], T | Awaitable[T]]
 
 
 class _ClosableIterator[T](Protocol):
     report: KernelReport
+
+    # Whether the source's own tasks keep running caller code while no read is in progress.
+    works_between_reads: bool
+
+    @property
+    def operation_context(self) -> ExecutionContext:
+        """Return the operation context."""
+        ...
 
     def __aiter__(self) -> Self:
         """Return this iterator."""
@@ -116,13 +125,20 @@ class MappedOperationStream[S, T]:
                 failure_report=self._failure_report,
                 cleanup=self._source.aclose,
                 propagate=self._propagate,
+                cleanup_budget=self._cleanup_budget,
             ),
+            works_between_reads=source.works_between_reads,
         )
 
     @property
     def report(self) -> OperationReport | None:
         """Return the same frozen terminal report after cleanup."""
         return self._report
+
+    @property
+    def inside_own_work(self) -> bool:
+        """Whether the current task runs inside this stream's own pull or cleanup, where a close is refused."""
+        return self._runner.inside_own_work
 
     def __aiter__(self) -> Self:
         """Return this single-use stream."""
@@ -213,6 +229,10 @@ class MappedOperationStream[S, T]:
         self._terminated()
         return self._report
 
+    def _cleanup_budget(self) -> float:
+        context = self._source.operation_context
+        return context.policy.max_elapsed - context.elapsed
+
     def _propagate(self, error: BaseException, report: OperationReport) -> BaseException:
         return self._error_mapper(error, report) if self._error_mapper is not None else error
 
@@ -258,7 +278,11 @@ class MappedOperationStream[S, T]:
 
     def _publish(self, *, forced_state: TerminalState | None = None) -> OperationReport:
         gate = self._gate()
-        if self._source.report.state is KernelState.NOT_STARTED:
+        if self._cleanup is not None and not self._cleanup[1].finished:
+            # Cleanup given up at the deadline: the source never recorded its terminal, so the gate closes
+            # conservatively from the evidence it already holds.
+            gate.close_after_failure(CleanupState.FAILURE)
+        elif self._source.report.state is KernelState.NOT_STARTED:
             gate.abort_unstarted()
         gate.attach_report(self._facts(self._source_report(), forced_state=forced_state))
         self._report = gate.finish()

@@ -97,6 +97,43 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   that wave and its answer discarded. Its wave now leaves without it, and a wave left with no page is
   not sent at all.
 
+## Closing a stream from inside its own pull or cleanup
+
+- **Breaking: caller code a stream runs can no longer close that stream or its client.**
+  `stream.aclose()` or `client.aclose()` now raises `RuntimeError` when it is called from code the
+  stream itself runs: a page-stop `on_page`, an async command source of `batch()` or `fan_out()`,
+  an async binding or reference source (its `finally` included, which the stream's own cleanup
+  runs), an injected transport, or a task one of them started. The refusal changes nothing: the
+  stream keeps reading and the client stays open.
+- **What it fixes.** Such a close cancelled the stream's read or cleanup and then waited for it to
+  end, while that read or cleanup was waiting for the code that asked for the close. The program
+  hung for good, and no cancellation, `asyncio.wait_for` included, could end the wait. A task the
+  caller code started hung the same way only when that code awaited the task.
+- **What is refused, exactly.** A task started from that caller code inherits the stream's context,
+  so its close is refused too while a read or the cleanup of that stream is running, even when
+  nothing awaits the task. A close started with `asyncio.create_task(stream.aclose())` therefore
+  works or is refused depending on when the task runs, and a refused one loses the stop it asked
+  for. Between reads the close is allowed, except for `iter_references()`, `iter_cursors()`,
+  `iter_reference_outcomes()`, `iter_reference_sources()`, `iter_reference_source_outcomes()`,
+  `fan_out()` and `fan_out_outcomes()`, whose scheduler keeps running caller code in its own tasks
+  until the stream ends.
+- **How to stop instead.** Return `CallerStop` from `on_page` to stop a binding, end the source (return
+  from the generator or raise `StopAsyncIteration`), or close from the code that iterates the
+  stream. A task that must close the stream on its own can be started outside the stream's context:
+  `asyncio.create_task(stream.aclose(), context=contextvars.Context())`. Closing another stream
+  from caller code is still allowed.
+- **How the refusal surfaces.** Left unhandled, the `RuntimeError` fails the stream as any failure of
+  that caller code does: each family wraps it as it wraps that code's other failures (for example
+  `ReferenceFailed`, `BatchFailed`, `InputSourceError` or `TransportError`), and the `RuntimeError`
+  stays in the cause chain. Raised in a source's `finally` during the stream's cleanup, it is the
+  cleanup failure: the close raises it and the report records `cleanup_failure`.
+- **A cancelled close or cleanup gives up at the operation deadline.** Stream cleanup deferred a
+  cancellation of its caller until it ended, however long that took. It now defers it only while
+  the operation's `ExecutionPolicy.max_elapsed` lasts; cleanup still running then finishes in the
+  background, the close raises `BudgetExceededError` and the cancellation is delivered at the next
+  await, and the report carries a `cleanup_failure` violation with the terminal reason "stream
+  cleanup failed". Without a cancellation, cleanup is still awaited to its end.
+
 ## CLI exit code for a closed reader
 
 - **A write to a closed stdout or stderr reader exits `5`**, ahead of any other code. It exited `120`,

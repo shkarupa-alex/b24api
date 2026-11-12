@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from b24api.contracts.report import OperationReport, Violation
     from b24api.contracts.request import Request
     from b24api.contracts.stream import OperationStream
+    from b24api.execution.context import ExecutionContext
     from b24api.execution.snapshot import KernelReport
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
@@ -47,6 +48,12 @@ class FanOutKernelStream(Protocol):
 
     report: KernelReport
     active_references_high_water: int
+    works_between_reads: bool
+
+    @property
+    def operation_context(self) -> ExecutionContext:
+        """Return the operation context."""
+        ...
 
     def __aiter__(self) -> Self:
         """Return this iterator."""
