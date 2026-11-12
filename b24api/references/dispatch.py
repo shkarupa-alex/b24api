@@ -3,9 +3,12 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+from bisect import bisect_left, insort
 from collections import Counter, deque
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from enum import Enum
+from itertools import accumulate
 from typing import TYPE_CHECKING, cast
 
 from b24api.batch.engine import BatchExecutor
@@ -59,15 +62,93 @@ class _Work:
     reference: ReferenceRequest
 
 
+class _Hold(Enum):
+    """What rows a reservation holds in the pool."""
+
+    # A page's capacity, reserved before its I/O: its unused rows come back when it is accepted.
+    IN_FLIGHT = "in_flight"
+    # An accepted page's rows, waiting for the consumer, who releases them one by one.
+    QUEUED = "queued"
+    # A fast keyset lease, held from activation to terminal, only ever trimmed and charged by its own
+    # budget view; its binding has not chosen its plan yet, so it may still shrink.
+    LEASE = "lease"
+    # A lease whose binding has chosen its plan: it keeps its size and returns rows only at terminal.
+    SETTLED_LEASE = "settled_lease"
+
+
 @dataclass(slots=True)
 class _Reservation:
     index: int
     amount: int
-    accepted: bool = False
-    # A fast keyset lease: held from activation to terminal, only ever trimmed, charged by its own budget view.
-    lease: bool = False
-    # A lease whose binding has chosen its plan: it keeps its size, so it returns rows only at terminal.
-    settled: bool = False
+    hold: _Hold = _Hold.IN_FLIGHT
+
+
+@dataclass(slots=True, eq=False)
+class _Waiter:
+    """A page waiting for its rows; the pool wakes it by resolving ``woken`` once its rows are free."""
+
+    index: int
+    amount: int
+    woken: asyncio.Future[None]
+
+
+def _waiter_index(waiter: _Waiter) -> int:
+    return waiter.index
+
+
+def _reduce(counter: Counter[int], key: int, amount: int) -> None:
+    """Take ``amount`` off ``counter[key]``, dropping the key at zero."""
+    remaining = counter[key] - amount
+    if remaining > 0:
+        counter[key] = remaining
+    else:
+        del counter[key]
+
+
+@dataclass(frozen=True, slots=True)
+class _Drain:
+    """Where an INPUT consumer gets with no page sent: the frontier it then waits on, and the rows it frees.
+
+    ``head_rows`` are the freed rows the new frontier itself held; ``passed`` counts the bindings the
+    consumer leaves behind, each of which frees an admission slot for the next binding from the source.
+    """
+
+    head: int
+    rows: int = 0
+    head_rows: int = 0
+    passed: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _Rooms:
+    """The producing bindings in binding order and the room each keeps, at one version of the producers.
+
+    A producer's room is the rows of the pages it may still put in flight at once, its next page or a
+    counted tail's window: the rows an ordered pool keeps free for it while it is nearer the frontier
+    than the page reserving.
+    """
+
+    version: int
+    indexes: tuple[int, ...]
+    # The rooms of the producers summed in binding order.
+    cumulative: tuple[int, ...]
+
+    def _before(self, index: int) -> int:
+        position = bisect_left(self.indexes, index)
+        return self.cumulative[position - 1] if position else 0
+
+    def producing(self, index: int) -> bool:
+        """Return whether the binding at ``index`` is a producer."""
+        position = bisect_left(self.indexes, index)
+        return position < len(self.indexes) and self.indexes[position] == index
+
+    def room(self, index: int) -> int:
+        """Return the room of the producer at ``index``, nothing for a binding that adds no page."""
+        return self._before(index + 1) - self._before(index)
+
+    def between(self, head: int, index: int) -> int:
+        """Return the room of the producers after ``head`` and before ``index``."""
+        return max(0, self._before(index) - self._before(head + 1))
 
 
 @dataclass(slots=True)
@@ -80,10 +161,14 @@ class _PageEvent:
     violations: tuple[Violation, ...]
     page_records: tuple[PageRecord, ...]
     reservation: _Reservation | None
-    acknowledged: asyncio.Future[None]
+    # Resolved once the consumer leaves the page, for a binding that waits for that before its next
+    # page; ``None`` when the binding read ahead, and the consumer acknowledges the page itself.
+    acknowledged: asyncio.Future[None] | None
     # A fast keyset row group is held by its binding's lease, not a page reservation: each delivered
     # row is reported to the binding's runtime instead of being released to the shared pool.
     emitted: Callable[[int], None] | None = None
+    # The binding's completion page id of an ordinary or counted page.
+    page_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +288,15 @@ class _ProducerState:
     # Unlike a pending continuation, their pages already in a chunk do not exclude them. Each maps
     # to the reservation its consumer returns to the pool before that page reserves its own, if any.
     pending_refills: dict[str, _Reservation | None] = field(default_factory=dict)
+    # Producers whose last page has reserved its rows (a whole result): they add no page, and an
+    # ordered pool keeps no room for them.
+    reserved_last: set[str] = field(default_factory=set)
+    # Changes whenever a producer's room may change: one is registered, retires, has its pages charged
+    # to a lease, reserves its last page or changes its window. ``indexes``, ``caps`` and ``windows``
+    # change only through those methods.
+    rooms_version: int = 0
+    # Producers that may put more than one page in flight at once (a counted tail), and how many.
+    windows: dict[str, int] = field(default_factory=dict)
     # Pages whose rows and dispatch are committed but which have not reached the queue yet: a
     # producer that leaves ``runnable`` right after starting their tasks still has them on the way.
     # ``reserving`` holds those that must still reserve their logical page, ``in_transit`` the rest.
@@ -210,13 +304,28 @@ class _ProducerState:
     in_transit: Counter[str] = field(default_factory=Counter)
     next_key: str | None = None
     next_index: int | None = None
+    # The bindings pulled from the source so far: every index below it is admitted.
+    admitted: int = 0
+    source_exhausted: bool = False
     source_pull_in_flight: bool = False
     closing: bool = False
     revision: int = 0
+    # Changes with every fact the dispatcher's projection reads; ``revision`` also with the consumer's
+    # progress, which leaves that projection as it was.
+    facts: int = 0
     _waiters: list[asyncio.Future[None]] = field(default_factory=list)
 
     def touch(self) -> None:
         """Synchronously publish a state change to every waiting worker."""
+        self.facts += 1
+        self.progress()
+
+    def progress(self) -> None:
+        """Wake every waiting worker after the consumer's progress, which changes no fact the projection reads.
+
+        An INPUT consumer draining a queued page frees rows the drain projection already counts. A wave
+        still waits for the pages that progress brings; it need not project them again.
+        """
         self.revision += 1
         waiters, self._waiters = self._waiters, []
         for waiter in waiters:
@@ -233,9 +342,52 @@ class _ProducerState:
         self.admitting.discard(key)
         self.pending_continuations.discard(key)
         self.pending_refills.pop(key, None)
+        self.reserved_last.discard(key)
+        self.windows.pop(key, None)
         self.caps.pop(key, None)
+        self.rooms_version += 1
         if registered:
             self.touch()
+
+    def register(self, key: str, index: int, cap: int) -> None:
+        """Count an admitted binding as a runnable producer whose pages reserve ``cap`` rows each."""
+        self.runnable.add(key)
+        self.indexes[key] = index
+        self.caps[key] = cap
+        self.rooms_version += 1
+
+    def charge_to_lease(self, key: str) -> None:
+        """Charge every further page of producer ``key`` to its lease: none reserves pool rows."""
+        self.caps[key] = 0
+        self.rooms_version += 1
+        self.touch()
+
+    def reserve_last(self, key: str) -> None:
+        """Record that producer ``key`` has reserved the rows of its last page."""
+        self.reserved_last.add(key)
+        self.rooms_version += 1
+        self.touch()
+
+    def set_window(self, key: str, pages: int) -> None:
+        """Record that producer ``key`` may put ``pages`` pages in flight at once."""
+        if self.windows.get(key) != pages:
+            self.windows[key] = pages
+            self.rooms_version += 1
+
+    def room(self, key: str) -> int:
+        """Return the rows of the pages producer ``key`` may still put in flight at once."""
+        if key in self.reserved_last:
+            return 0
+        return self.caps.get(key, 0) * self.windows.get(key, 1)
+
+    def rooms(self) -> _Rooms:
+        """Return the producers in binding order with the room each keeps."""
+        ordered = sorted((index, self.room(key)) for key, index in self.indexes.items())
+        return _Rooms(
+            self.rooms_version,
+            tuple(index for index, _room in ordered),
+            tuple(accumulate(room for _index, room in ordered)),
+        )
 
     def depart(self, key: str, *, page_reserved: bool) -> _Transit:
         """Count one page on its way to the queue until ``fetch`` queues it or its task ends."""
@@ -345,7 +497,13 @@ def _failed_dispatch(dispatch: PageDispatch, error: BaseException) -> _FailedDis
 
 
 class _RowBuffer:
-    """Reserve page capacity before I/O and account decoded retained rows exactly."""
+    """Reserve page capacity before I/O and account decoded retained rows exactly.
+
+    The rows each binding holds are counted per binding, and so are the rows of its accepted pages that
+    wait for the consumer, so no check scans the reservations. A page that cannot reserve waits until a
+    change of the pool wakes it; an ordered pool wakes only the waiting pages that fit, nearest the
+    frontier first (``_serve``).
+    """
 
     def __init__(
         self,
@@ -362,13 +520,22 @@ class _RowBuffer:
         self._head_index = 0
         self._head_reserve = head_reserve
         self._closed = False
-        self._condition = asyncio.Condition()
         self._reservations: list[_Reservation] = []
+        # The rows each binding holds, and those of its accepted pages that wait for the consumer.
+        self._held: Counter[int] = Counter()
+        self._queued: Counter[int] = Counter()
+        # Pages waiting for rows, in binding order in an ordered pool, and fast keyset bindings waiting
+        # for a lease.
+        self._waiters: list[_Waiter] = []
+        # The rows the woken pages will take once their tasks resume: no other waiter is woken for them.
+        self._promised = 0
+        self._lease_waiters: list[asyncio.Future[None]] = []
         self._producer_state = producer_state
         # INPUT delivery: rows go to bindings in binding order, so no binding takes rows while an
         # earlier one, which becomes the frontier first, waits for its lease.
         self._ordered = ordered
         self._lease_waiting: set[int] = set()
+        self._rooms: _Rooms | None = None
 
     @property
     def head_index(self) -> int:
@@ -384,20 +551,108 @@ class _RowBuffer:
         """Reserve a page's rows, waiting for the consumer to release them within the operation's elapsed budget."""
         if amount > self.maximum:
             raise BudgetExceededError("one decoded page exceeds the global row buffer")
-        try:
-            async with asyncio.timeout(self.context.policy.max_elapsed - self.context.elapsed), self._condition:
-                await self._condition.wait_for(lambda: self._closed or self.can_reserve(index, amount))
-                if self._closed:
-                    raise asyncio.CancelledError
-                self._available -= amount
-                reservation = _Reservation(index, amount)
-                self._reservations.append(reservation)
-                return reservation
-        except TimeoutError as error:
-            raise BudgetExceededError("row buffer wait exceeded operation time budget") from error
+        if self._closed:
+            raise asyncio.CancelledError
+        if not self._can_reserve(index, amount):
+            try:
+                async with asyncio.timeout(self.context.policy.max_elapsed - self.context.elapsed):
+                    await self._wait_for_rows(index, amount)
+            except TimeoutError as error:
+                raise BudgetExceededError("row buffer wait exceeded operation time budget") from error
+        return self._take(index, amount, _Hold.IN_FLIGHT)
 
-    def _can_reserve(self, index: int, amount: int, returning: int = 0) -> bool:
-        available = self._available + returning
+    async def _wait_for_rows(self, index: int, amount: int) -> None:
+        """Wait until ``amount`` rows fit for binding ``index``; the caller takes them in the same step.
+
+        A page that stops waiting, by cancellation or by the elapsed budget, leaves the queue. If it was
+        woken already, the rows promised to it go back to the others and the next waiting pages that fit
+        are woken; a page never woken blocked no other, as each one's turn depends on the rows alone.
+        """
+        while not self._can_reserve(index, amount):
+            waiter = _Waiter(index, amount, asyncio.get_running_loop().create_future())
+            if self._ordered:
+                insort(self._waiters, waiter, key=_waiter_index)
+            else:
+                self._waiters.append(waiter)
+            try:
+                await waiter.woken
+            except BaseException:
+                if waiter in self._waiters:
+                    self._waiters.remove(waiter)
+                elif waiter.woken.done() and not waiter.woken.cancelled():
+                    # Woken while its task was being cancelled: another page may take its rows.
+                    self._promised -= amount
+                    self._changed()
+                raise
+            self._promised -= amount
+            if self._closed:
+                raise asyncio.CancelledError
+
+    def _take(self, index: int, amount: int, hold: _Hold) -> _Reservation:
+        self._available -= amount
+        self._held[index] += amount
+        reservation = _Reservation(index, amount, hold)
+        self._reservations.append(reservation)
+        return reservation
+
+    def _give_back(self, reservation: _Reservation) -> int:
+        """Return every row ``reservation`` holds to the pool, and the count."""
+        amount = reservation.amount
+        reservation.amount = 0
+        self._available += amount
+        _reduce(self._held, reservation.index, amount)
+        if reservation.hold is _Hold.QUEUED:
+            _reduce(self._queued, reservation.index, amount)
+        self._reservations.remove(reservation)
+        return amount
+
+    def _serve(self) -> None:
+        """Wake the waiting pages that may take their rows now; each checks again once its task resumes.
+
+        An unordered pool wakes every page, in the order they came: each check is a count, and the pages
+        a READY consumer receives depend on which of them takes the rows first. An ordered pool keeps
+        free the room of the producers nearer the frontier, which costs more to check, so it wakes only
+        the pages whose rows are free beyond those the pages already woken will take, in binding order. A
+        page behind the frontier that does not fit ends the pass: a later page keeps free the room of
+        every producer between the frontier and it, that page's room included, which covers that page's
+        rows, so it does not fit either.
+        """
+        position, stop_after = 0, None
+        while position < len(self._waiters):
+            waiter = self._waiters[position]
+            if stop_after is not None and waiter.index > stop_after:
+                return
+            if waiter.woken.done():
+                del self._waiters[position]
+            elif not self._ordered or self._can_reserve(waiter.index, waiter.amount, -self._promised):
+                del self._waiters[position]
+                self._promised += waiter.amount
+                waiter.woken.set_result(None)
+            else:
+                if self._ends_pass(waiter):
+                    stop_after = waiter.index
+                position += 1
+
+    def _ends_pass(self, waiter: _Waiter) -> bool:
+        """Return whether no later page fits while ``waiter``, behind the frontier, does not."""
+        state = self._producer_state
+        if not self._ordered or state is None or self._head_reserve == 0 or waiter.index <= self._head_index:
+            return False
+        return self._rooms_now(state).room(waiter.index) >= waiter.amount
+
+    def _changed(self) -> None:
+        """Grant the waiting pages that now fit and wake the bindings waiting for a lease."""
+        self._serve()
+        waiters, self._lease_waiters = self._lease_waiters, []
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    def _can_reserve(self, index: int, amount: int, returning: int = 0, drain: _Drain | None = None) -> bool:
+        head, drained, head_drained = (
+            (self._head_index, 0, 0) if drain is None else (drain.head, drain.rows, drain.head_rows)
+        )
+        available = self._available + returning + drained
         if available < amount:
             return False
         # A page charged to a fast keyset lease reserves no pool rows: it cannot take the frontier's reserve.
@@ -405,19 +660,61 @@ class _RowBuffer:
             return True
         if self._behind_lease_waiter(index):
             return False
-        if self._head_reserve == 0 or index == self._head_index:
+        if self._head_reserve == 0 or index == head:
             return True
-        # Rows the frontier holds come back to it; only the rest of its reserve must stay free. A
-        # frontier page accepted short returns its unused rows, and those stay the frontier's: if
-        # another binding took them, rows held behind the frontier could never be released.
-        head_held = sum(
-            reservation.amount for reservation in self._reservations if reservation.index == self._head_index
-        )
-        return available - amount >= self._head_reserve - head_held
+        return available - amount >= self._kept_free(index, head, head_drained)
 
-    def can_reserve(self, index: int, amount: int, *, returning: int = 0) -> bool:
-        """Return whether a reservation can be admitted immediately, or once ``returning`` rows come back."""
-        return not self._closed and self._can_reserve(index, amount, returning)
+    def _kept_free(self, index: int, head: int, head_drained: int) -> int:
+        """Return the rows a page at ``index``, behind frontier ``head``, leaves free for the bindings ahead.
+
+        The frontier keeps room for its next page, whichever admitted binding it is. Rows it holds come
+        back to it; only the rest of its reserve must stay free. A frontier page accepted short returns
+        its unused rows, and those stay the frontier's: if another binding took them, rows held behind the
+        frontier could never be released. ``head_drained`` of its rows are counted as already back.
+
+        Under INPUT delivery every producer between the frontier and ``index`` keeps its room as well, the
+        pages it may put in flight at once: bindings read ahead, and the nearer the frontier, the sooner
+        the consumer drains their rows. Without it, the bindings behind would fill the pool with their
+        pages, and each page a binding nearer the frontier then needs would travel alone, once the
+        consumer has drained the frontier.
+        """
+        between = 0
+        if self._ordered and self._producer_state is not None:
+            between = self._rooms_now(self._producer_state).between(head, index)
+        return max(0, self._head_reserve - self._held[head] + head_drained) + between
+
+    def _rooms_now(self, state: _ProducerState) -> _Rooms:
+        """Return the producers' rooms, read again only once a producer's room may have changed."""
+        rooms = self._rooms
+        if rooms is None or rooms.version != state.rooms_version:
+            rooms = self._rooms = state.rooms()
+        return rooms
+
+    def drain(self) -> _Drain | None:
+        """Return where an INPUT consumer gets with no page sent, or ``None`` without ordered delivery.
+
+        Pages read ahead wait in their bindings' queues, not in a wave. The consumer drains the frontier's,
+        passes every admitted binding that adds no page any more, and drains the first one that still adds
+        one, or waits for the source; the rows those pages hold come back to the pool on the way.
+        """
+        state = self._producer_state
+        if not self._ordered or state is None:
+            return None
+        rooms = self._rooms_now(state)
+        head, rows = self._head_index, 0
+        while True:
+            rows += self._queued[head]
+            if rooms.producing(head) or head + 1 >= state.admitted:
+                return _Drain(head, rows, self._queued[head], head - self._head_index)
+            head += 1
+
+    def can_reserve(self, index: int, amount: int, *, returning: int = 0, drain: _Drain | None = None) -> bool:
+        """Return whether a reservation can be admitted immediately, or once rows come back.
+
+        ``returning`` rows come back to the pool; a ``drain`` projects the pool to where the INPUT
+        consumer gets on its own.
+        """
+        return not self._closed and self._can_reserve(index, amount, returning, drain)
 
     def _touch(self) -> None:
         if self._producer_state is not None:
@@ -427,80 +724,78 @@ class _RowBuffer:
         if actual > reservation.amount:
             await self.abort(reservation)
             raise BudgetExceededError("decoded page exceeded its reserved row capacity")
-        async with self._condition:
-            if self._closed:
-                raise asyncio.CancelledError
-            unused = reservation.amount - actual
-            reservation.amount = actual
-            reservation.accepted = True
-            self._available += unused
-            if actual == 0:
-                self._reservations.remove(reservation)
-            self._condition.notify_all()
-            self._touch()
+        if self._closed:
+            raise asyncio.CancelledError
+        unused = reservation.amount - actual
+        reservation.amount = actual
+        reservation.hold = _Hold.QUEUED
+        self._available += unused
+        _reduce(self._held, reservation.index, unused)
+        if actual:
+            self._queued[reservation.index] += actual
+        else:
+            self._reservations.remove(reservation)
+        self._changed()
+        self._touch()
         if actual:
             await self.context.adjust_buffered_rows(actual)
 
     async def release(self, reservation: _Reservation, count: int) -> None:
         if count < 0 or count > reservation.amount:
             raise ValueError("invalid row-buffer release")
-        if not count:
+        if not count or reservation.amount == 0:
             return
-        async with self._condition:
-            if reservation.amount == 0:
-                return
-            reservation.amount -= count
-            self._available += count
-            if reservation.amount == 0:
-                self._reservations.remove(reservation)
-            self._condition.notify_all()
+        reservation.amount -= count
+        self._available += count
+        _reduce(self._held, reservation.index, count)
+        if reservation.hold is _Hold.QUEUED:
+            _reduce(self._queued, reservation.index, count)
+        if reservation.amount == 0:
+            self._reservations.remove(reservation)
+        self._changed()
+        if self._ordered and reservation.hold is _Hold.QUEUED and self._producer_state is not None:
+            # The drain projection counts these rows already, whether queued or free.
+            self._producer_state.progress()
+        else:
             self._touch()
         await self.context.adjust_buffered_rows(-count)
 
     async def abort(self, reservation: _Reservation) -> None:
-        amount = reservation.amount
-        if not amount:
+        if not reservation.amount:
             return
-        async with self._condition:
-            amount = reservation.amount
-            if not amount:
-                return
-            reservation.amount = 0
-            self._available += amount
-            self._reservations.remove(reservation)
-            self._condition.notify_all()
-            self._touch()
-        if reservation.accepted:
+        queued = reservation.hold is _Hold.QUEUED
+        amount = self._give_back(reservation)
+        self._changed()
+        self._touch()
+        if queued:
             await self.context.adjust_buffered_rows(-amount)
 
     async def lease(self, index: int, grant: Callable[[int], int | None]) -> _Reservation:
         """Hold one capacity until terminal, never grown; ``grant`` sizes it from the free rows or asks to wait.
 
-        ``grant`` runs under the pool condition, so the decision and the reservation are atomic. It
+        ``grant`` runs with no await between its decision and the reservation, so the two are atomic. It
         may raise to refuse a lease no releaser can ever satisfy. An ordered pool asks it only once no
         earlier binding waits for a lease. A binding leaving the wait, with a lease or without one,
         wakes the others: whether it still waits decides whether a later binding may take rows.
         """
-        async with self._condition:
-            self._lease_waiting.add(index)
-            try:
-                while True:
-                    if self._closed:
-                        raise asyncio.CancelledError
-                    amount = None if self._behind_lease_waiter(index) else grant(self._available)
-                    if amount is not None:
-                        break
-                    await self._condition.wait()
-                if isinstance(amount, bool) or not 0 < amount <= self._available:
-                    raise RuntimeError("fast keyset lease exceeds the free row pool")
-                self._available -= amount
-                reservation = _Reservation(index, amount, lease=True)
-                self._reservations.append(reservation)
-            finally:
-                self._lease_waiting.discard(index)
-                self._condition.notify_all()
-                self._touch()
-            return reservation
+        self._lease_waiting.add(index)
+        try:
+            while True:
+                if self._closed:
+                    raise asyncio.CancelledError
+                amount = None if self._behind_lease_waiter(index) else grant(self._available)
+                if amount is not None:
+                    break
+                wake: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+                self._lease_waiters.append(wake)
+                await wake
+            if isinstance(amount, bool) or not 0 < amount <= self._available:
+                raise RuntimeError("fast keyset lease exceeds the free row pool")
+            return self._take(index, amount, _Hold.LEASE)
+        finally:
+            self._lease_waiting.discard(index)
+            self._changed()
+            self._touch()
 
     def _behind_lease_waiter(self, index: int) -> bool:
         """Return whether an ordered pool holds rows back from ``index`` for an earlier lease waiter."""
@@ -514,59 +809,62 @@ class _RowBuffer:
         accepted, so the shared row counter holds only what its binding charged; trimming moves free
         pool rows only. A pool closed meanwhile has already reclaimed the lease.
         """
-        if not reservation.lease or amount <= 0:
+        if reservation.hold not in {_Hold.LEASE, _Hold.SETTLED_LEASE} or amount <= 0:
             raise RuntimeError("only a lease settles, and never to nothing")
-        async with self._condition:
-            if self._closed or reservation.amount == 0:
-                return
-            if amount > reservation.amount:
-                raise RuntimeError("a lease cannot grow")
-            self._available += reservation.amount - amount
-            reservation.amount = amount
-            reservation.settled = True
-            self._condition.notify_all()
-            self._touch()
+        if self._closed or reservation.amount == 0:
+            return
+        if amount > reservation.amount:
+            raise RuntimeError("a lease cannot grow")
+        trimmed = reservation.amount - amount
+        self._available += trimmed
+        _reduce(self._held, reservation.index, trimmed)
+        reservation.amount = amount
+        reservation.hold = _Hold.SETTLED_LEASE
+        self._changed()
+        self._touch()
 
     def releasable_elsewhere(self, index: int) -> bool:
         """Return whether another binding may still return capacity without this one's progress.
 
-        An unaccepted page returns its unused rows when it settles, and an unsettled lease may be trimmed
+        A page in flight returns its unused rows when it settles, and an unsettled lease may be trimmed
         once its binding has planned, which needs no delivery.
         """
         return any(
-            reservation.index != index
-            and not reservation.accepted
-            and (not reservation.lease or not reservation.settled)
+            reservation.index != index and reservation.hold in {_Hold.IN_FLIGHT, _Hold.LEASE}
             for reservation in self._reservations
         )
 
     async def poke(self) -> None:
         """Wake capacity waiters after a scheduling fact a lease decision depends on has changed."""
-        async with self._condition:
-            self._condition.notify_all()
+        self._changed()
 
     def raise_head_reserve(self, reserve: int) -> None:
         """Reserve more rows for the INPUT frontier, synchronously: a stricter reserve wakes no waiter."""
         self._head_reserve = max(self._head_reserve, min(reserve, self.maximum))
 
     async def advance_head(self, index: int, reserve: int) -> None:
-        async with self._condition:
-            self._head_index = index
-            self._head_reserve = reserve
-            self._condition.notify_all()
-            self._touch()
+        self._head_index = index
+        self._head_reserve = reserve
+        self._changed()
+        self._touch()
 
     async def close(self) -> None:
-        async with self._condition:
-            if self._closed:
-                return
-            self._closed = True
-            self._available = self.maximum
-            for reservation in self._reservations:
-                reservation.amount = 0
-            self._reservations.clear()
-            self._condition.notify_all()
-            self._touch()
+        if self._closed:
+            return
+        self._closed = True
+        self._available = self.maximum
+        for reservation in self._reservations:
+            reservation.amount = 0
+        self._reservations.clear()
+        self._held.clear()
+        self._queued.clear()
+        waiters, self._waiters = self._waiters, []
+        for waiter in waiters:
+            if not waiter.woken.done():
+                self._promised += waiter.amount
+                waiter.woken.set_result(None)
+        self._changed()
+        self._touch()
         await self.context.set_buffered_rows(0)
 
 
@@ -773,14 +1071,23 @@ class _BatchPageDispatcher:
                     continue
                 deadline = self._time() + self.plan.coalesce_wait
                 coalescing_delay = 0.0
+                projected: tuple[int, int, int] | None = None
                 while len(chunk) < self.plan.batch_size:
                     self._drain_nowait(chunk)
                     if len(chunk) >= self.plan.batch_size:
                         break
                     if self.plan.coalesce_wait <= 0:
                         break
-                    if self._potential({item.reference_id for item in chunk}) == 0:
-                        break
+                    # The pages still to come change only with a fact, the chunk or the queue.
+                    facts = (
+                        self._producer_state.facts if self._producer_state else 0,
+                        len(chunk),
+                        self._pending_count(),
+                    )
+                    if facts != projected:
+                        projected = facts
+                        if self._potential({item.reference_id for item in chunk}) == 0:
+                            break
                     remaining = min(
                         deadline - self._time(),
                         self.context.policy.max_elapsed - self.context.elapsed,
@@ -869,58 +1176,40 @@ class _BatchPageDispatcher:
         state, buffer = self._producer_state, self._buffer
         if state is None or buffer is None or state.closing or self._pending_count() >= self._queue.maxsize:
             return 0
-        admitted = sum(
-            key not in chunk_keys
-            and self.context.can_reserve_page(reference=key)
-            and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
-            for key in state.runnable
-            if key in state.indexes
-        )
-        admitting = sum(
-            key not in chunk_keys
-            and self.context.can_reserve_page(reference=key)
-            and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
-            for key in state.admitting
-            if self._pending_continuations_can_progress and key in state.indexes
-        )
+
+        # The rows the consumer gives back on its own. A READY consumer acknowledges the receipt a
+        # refill waits on, whichever binding it is; an INPUT consumer drains the queues ahead of it.
+        ready = self._pending_continuations_can_progress
+        drain = buffer.drain()
+
+        def fits(key: str, held: _Reservation | None = None) -> bool:
+            """Return whether the producer's next page reserves its page and rows once the consumer gives rows back."""
+            return self.context.can_reserve_page(reference=key) and buffer.can_reserve(
+                state.indexes[key],
+                state.caps.get(key, self._page_cap),
+                returning=held.amount if ready and held is not None else 0,
+                drain=drain,
+            )
+
+        admitted = sum(key not in chunk_keys and fits(key) for key in state.runnable if key in state.indexes)
+        admitting = sum(key not in chunk_keys and fits(key) for key in state.admitting if key in state.indexes)
         continuations = sum(
-            key not in chunk_keys
-            and self.context.can_reserve_page(reference=key)
-            and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
-            for key in state.pending_continuations
-            if self._pending_continuations_can_progress and key in state.indexes
+            key not in chunk_keys and fits(key) for key in state.pending_continuations if ready and key in state.indexes
         )
         pending_pull = int(
-            self._pending_continuations_can_progress
-            and state.next_key is not None
+            state.next_key is not None
             and state.next_index is not None
             and state.next_key not in chunk_keys
             and state.source_pull_in_flight
             and self.context.can_reserve_page(reference=state.next_key)
-            and buffer.can_reserve(state.next_index, self._page_cap),
+            and buffer.can_reserve(state.next_index, self._page_cap, drain=drain),
         )
         settling_admission = sum(
-            key not in chunk_keys
-            and key in state.indexes
-            and not (
-                self.context.can_reserve_page(reference=key)
-                and buffer.can_reserve(state.indexes[key], state.caps.get(key, self._page_cap))
-            )
+            key not in chunk_keys and key in state.indexes and not fits(key)
             for key in state.admitting
-            if self._pending_continuations_can_progress and (self._active_sends > 0 or self._settling_waves > 0)
+            if ready and (self._active_sends > 0 or self._settling_waves > 0)
         )
-        # Under INPUT delivery only the frontier's consumer progresses whatever the chunk carries.
-        refills = sum(
-            (self._pending_continuations_can_progress or state.indexes[key] == buffer.head_index)
-            and self.context.can_reserve_page(reference=key)
-            and buffer.can_reserve(
-                state.indexes[key],
-                state.caps.get(key, self._page_cap),
-                returning=0 if returned is None else returned.amount,
-            )
-            for key, returned in state.pending_refills.items()
-            if key in state.indexes
-        )
+        refills = sum(fits(key, returned) for key, returned in state.pending_refills.items() if key in state.indexes)
         # A page on its way to the queue arrives without any consumer progress, under either order;
         # one that must still reserve its logical page arrives only if the page budget admits it.
         in_transit = sum(count for key, count in state.in_transit.items() if key in state.indexes) + sum(
@@ -928,7 +1217,17 @@ class _BatchPageDispatcher:
             for key, count in state.reserving.items()
             if key in state.indexes and self.context.can_reserve_page(reference=key)
         )
-        return admitted + admitting + continuations + refills + pending_pull + settling_admission + in_transit
+        # Under INPUT each binding the consumer passes frees an admission slot: the next binding from the
+        # source arrives without any page sent.
+        admissions = 0
+        if drain is not None and not state.source_exhausted:
+            first = state.admitted + pending_pull
+            admissions = sum(
+                self.context.can_reserve_page() and buffer.can_reserve(first + offset, self._page_cap, drain=drain)
+                for offset in range(drain.passed)
+            )
+        waiting = admitted + admitting + continuations + refills + pending_pull + settling_admission
+        return waiting + in_transit + admissions
 
     def _count_batch_request(self) -> None:
         """Count one physical batch envelope the chunk sends in its first round."""

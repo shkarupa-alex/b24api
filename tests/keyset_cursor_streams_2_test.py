@@ -805,6 +805,10 @@ async def test_input_order_does_not_wait_for_an_unacknowledgeable_continuation(
     assert clock.timer_firings == 0
 
 
+# Loop turns a send takes to settle once its transport answers at once.
+_SETTLE_TURNS = 50
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("output_order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
 async def test_sender_capacity_is_released_before_downstream_acknowledgement(
@@ -822,11 +826,16 @@ async def test_sender_capacity_is_released_before_downstream_acknowledgement(
 
     first = await anext(stream)
     assert isinstance(first, ReferenceItem)
-    for _ in range(3):
-        await asyncio.sleep(0)
     dispatcher = stream._source._scheduler.dispatcher
     assert isinstance(dispatcher, _BatchPageDispatcher)
-    assert dispatcher._active_sends == 0
+    # Under INPUT delivery the bindings read ahead and send their next pages; every send settles within
+    # a bounded number of loop turns while the consumer still holds the first item.
+    for _ in range(_SETTLE_TURNS):
+        active = dispatcher._active_sends
+        if not active:
+            break
+        await asyncio.sleep(0)
+    assert active == 0
 
     assert len([event async for event in stream]) == 3
 
@@ -905,13 +914,9 @@ async def test_slow_consumer_coalescing_is_bounded_per_wave_on_a_virtual_clock(
     underfilled = [delay for commands, delay in waves if commands < _COALESCE_BATCH]
     assert len(waves) == len(transport.requests)
     assert sum(command_counts) == len(transport.commands) == 4 * _COALESCE_BINDINGS
-    if output_order is DeliveryOrder.READY:
-        assert len(underfilled) < len(waves)
-        assert command_counts[-1] == _COALESCE_BATCH
-    else:
-        assert len(waves) > _COALESCE_BINDINGS
-        assert len(underfilled) == len(waves)
-        assert command_counts[-1] < _COALESCE_BATCH
+    # Under INPUT delivery the bindings behind the frontier read ahead, so their pages fill the waves too.
+    assert len(underfilled) < len(waves)
+    assert command_counts[-1] == _COALESCE_BATCH
     # At most one timer firing per underfilled wave, and no wave waits longer than its window.
     assert clock.timer_firings <= len(underfilled)
     assert all(delay <= coalesce_wait for _commands, delay in waves)
@@ -919,8 +924,10 @@ async def test_slow_consumer_coalescing_is_bounded_per_wave_on_a_virtual_clock(
     assert all(delay == 0 for _commands, delay in baseline_waves)
     assert first_request_latency <= coalesce_wait
     assert report is not None
-    # The row buffer is bounded by the active bindings; the exact peak depends on consumer interleaving.
-    assert 1 <= report.buffered_rows_high_water <= _COALESCE_BINDINGS
+    # Under READY the row buffer is bounded by the active bindings, a page each; under INPUT the bindings
+    # read ahead within the row pool. The exact peak depends on consumer interleaving.
+    held = _COALESCE_BINDINGS if output_order is DeliveryOrder.READY else 3 * _COALESCE_BINDINGS
+    assert 1 <= report.buffered_rows_high_water <= held
     assert report.active_references_high_water == _COALESCE_BINDINGS
 
 

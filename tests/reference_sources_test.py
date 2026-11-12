@@ -331,9 +331,9 @@ _TAIL_WAVES = {
     (DeliveryOrder.READY, 1): [1, 10, 10],
     (DeliveryOrder.INPUT, 1): [1, 10, 10],
     (DeliveryOrder.READY, 3): [3, 10, 10, 10, 10, 10, 10],
-    # Under INPUT a pull in flight is not waited for, so the first head leaves alone; the next head
-    # leaves with the one already pulled. Every tail still leaves in full batches.
-    (DeliveryOrder.INPUT, 3): [1, 2, 10, 10, 10, 10, 10, 10],
+    # Under INPUT the bindings behind the frontier read ahead, so the heads leave together, and the
+    # tails share full batches as under READY.
+    (DeliveryOrder.INPUT, 3): [3, 10, 10, 10, 10, 10, 10],
 }
 
 

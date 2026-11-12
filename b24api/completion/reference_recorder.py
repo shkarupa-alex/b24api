@@ -112,7 +112,7 @@ class ReferenceCompletionRecorder:
 
 
 class ReferenceBindingRecorder:
-    """Correlate sequential pages of one active reference binding."""
+    """Correlate the pages of one active reference binding: one current page, any number in delivery."""
 
     def __init__(self, operation: ReferenceCompletionRecorder, binding_id: int) -> None:
         """Initialize the binding's local page sequence."""
@@ -120,9 +120,11 @@ class ReferenceBindingRecorder:
         self.binding_id = binding_id
         self._next_page = 0
         self._current: int | None = None
-        self._delivered = False
         self._validated_rows: int | None = None
         self._reserved: set[int] = set()
+        # Pages handed to delivery, each mapped to whether the consumer has delivered it yet: the
+        # binding schedules its next page as soon as one is handed over, not once it is acknowledged.
+        self._handed: dict[int, bool] = {}
         self.unknown = False
 
     def _emit(self, event: CompletionEvidence) -> None:
@@ -167,7 +169,6 @@ class ReferenceBindingRecorder:
             raise RuntimeError("reference page activation lacks a reserved page")
         self._reserved.discard(page_id)
         self._current = page_id
-        self._delivered = False
         self._validated_rows = None
 
     def abandon_reserved(self, page_id: int, outcome: CommandSettlement) -> None:
@@ -187,7 +188,6 @@ class ReferenceBindingRecorder:
             raise RuntimeError("previous reference page remains active")
         self._current = self._next_page
         self._next_page += 1
-        self._delivered = False
         self._validated_rows = None
         self._emit(PageScheduled(**self._fields()))
 
@@ -206,26 +206,42 @@ class ReferenceBindingRecorder:
     def complete_omitted_empty(self) -> None:
         """Acknowledge an empty terminal page suppressed by the traversal driver."""
         if self._current is not None and self._validated_rows == 0:
-            self.delivered()
-            self.acknowledged()
+            self.deliver_current()
+
+    def deliver_current(self) -> None:
+        """Hand over, deliver and acknowledge the current page in one step: no consumer stands between."""
+        page_id = self.hand_over()
+        self.delivered(page_id)
+        self.acknowledged(page_id)
 
     def rejected(self, reason: str) -> None:
         """Retire a successful command whose page validation failed."""
         self._emit(PageRejected(**self._fields(), reason=reason))
         self._current = None
 
-    def delivered(self) -> None:
-        """Mark the whole page delivered after its final consumer yield."""
-        self._emit(PageDelivered(**self._fields()))
-        self._delivered = True
-
-    def acknowledged(self) -> None:
-        """Acknowledge only after delivery and optional page-stop commit."""
-        if not self._delivered:
-            return
-        self._emit(PageAcknowledged(**self._fields()))
+    def hand_over(self) -> int:
+        """Hand the current page to delivery and return its id; the binding may schedule its next page."""
+        page_id = self._current
+        if page_id is None:
+            raise RuntimeError("reference page handover lacks a scheduled page")
         self._current = None
-        self._delivered = False
+        self._validated_rows = None
+        self._handed[page_id] = False
+        return page_id
+
+    def delivered(self, page_id: int) -> None:
+        """Mark a handed-over page delivered after its final consumer yield."""
+        if page_id not in self._handed:
+            raise RuntimeError("reference page delivery lacks a handed-over page")
+        self._emit(PageDelivered(**self._fields(page_id)))
+        self._handed[page_id] = True
+
+    def acknowledged(self, page_id: int) -> None:
+        """Acknowledge only after delivery and optional page-stop commit."""
+        if not self._handed.get(page_id, False):
+            return
+        del self._handed[page_id]
+        self._emit(PageAcknowledged(**self._fields(page_id)))
 
 
 class ReferenceFastLedger(FastPageLedger):

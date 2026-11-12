@@ -254,13 +254,18 @@ def flat_query(parameters: Mapping[str, object]) -> Query:
 
 @dataclass
 class BatchPortal:
-    """Serve envelopes from ``answer`` and record each physical request's command count."""
+    """Serve envelopes from ``answer`` and record each physical request's command count.
+
+    ``wire_turns`` is a deterministic wire latency: each physical request yields that many event-loop
+    turns before it is answered, so the consumer and the producers run while it is on the wire.
+    """
 
     answer: Answer
     host: str = HOST
     waves: list[int] = field(default_factory=list)
     methods: list[tuple[str, ...]] = field(default_factory=list)
     queries: list[Query] = field(default_factory=list)
+    wire_turns: int = 0
 
     async def _envelope(self, method: str, query: Query) -> Envelope:
         self.queries.append(query)
@@ -272,6 +277,8 @@ class BatchPortal:
     async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Answer one direct request or one classic physical batch."""
         del attempt_timeout, max_response_bytes
+        for _turn in range(self.wire_turns):
+            await asyncio.sleep(0)
         parameters = request.copy_parameters()
         if request.method != "batch":
             self.waves.append(1)

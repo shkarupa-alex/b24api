@@ -373,8 +373,10 @@ async def test_a_contended_input_frontier_sends_its_own_pages_before_a_later_hea
 
     With 20 buffered rows the frontier's short pages give rows back. The 2.5.2 scheduler let the
     third binding's head take them, sending ``p0@0, p1@0, p2@0, p0@10, p0@20, p0@25, ...``; the
-    frontier reserve now keeps them for the frontier, so ``p2@0`` follows ``p0``'s pages. Events and
-    the report are unchanged; only this physical send order differs.
+    frontier reserve then kept them for the frontier, so ``p2@0`` followed ``p0``'s pages. A binding
+    now reads its pages ahead instead of waiting for the consumer to leave each, so the frontier's
+    pages fill the pool before ``p1@0`` reserves. Events and the report are unchanged; only this
+    physical send order differs.
 
     The bindings come from an async iterable, read on the event loop: a list is pulled in a worker
     thread, so when a later head reaches the queue would depend on thread scheduling.
@@ -393,8 +395,8 @@ async def test_a_contended_input_frontier_sends_its_own_pages_before_a_later_hea
             events = [event async for event in stream]
     sent = [(query["PARENT"], query.get("start", "0")) for query in portal.queries]
     assert sent == [
-        ("p0", "0"), ("p1", "0"), ("p0", "10"), ("p0", "20"), ("p0", "25"), ("p2", "0"), ("p3", "0"),
-        ("p1", "3"), ("p3", "10"), ("p3", "20"), ("p3", "30"), ("p3", "40"), ("p3", "41"),
+        ("p0", "0"), ("p0", "10"), ("p0", "20"), ("p0", "25"), ("p1", "0"), ("p1", "3"), ("p2", "0"),
+        ("p3", "0"), ("p3", "10"), ("p3", "20"), ("p3", "30"), ("p3", "40"), ("p3", "41"),
     ]  # fmt: skip
     completes = {event.correlation: event.row_count for event in events if isinstance(event, ReferenceComplete)}
     assert completes == {"p0": 25, "p1": 3, "p2": 0, "p3": 41}

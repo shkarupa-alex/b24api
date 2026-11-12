@@ -138,11 +138,12 @@ class CountedWaveIO(Protocol):
         self,
         requests: Iterator[_BatchInput],
         *,
+        pages: int,
         batch_size: int,
         policy: ExecutionPolicy,
         context: ExecutionContext,
     ) -> CountedTailStream:
-        """Start the dense tail over lazily planned page requests."""
+        """Start the dense tail over ``pages`` lazily planned page requests."""
         ...
 
 
@@ -282,11 +283,13 @@ class DirectCountedWaveIO:
         self,
         requests: Iterator[_BatchInput],
         *,
+        pages: int,
         batch_size: int,
         policy: ExecutionPolicy,
         context: ExecutionContext,
     ) -> _FlatTailStream:
         """Stream the tail through a private bounded batch outcome stream."""
+        del pages  # the stream reads the requests as it sends them
         outcomes = _BatchOutcomeStream(
             BatchExecutor(self._ctx.executor),
             requests,

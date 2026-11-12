@@ -17,6 +17,7 @@ from b24api.contracts import (
     Command,
     CommandFailure,
     CommandSuccess,
+    DeliveryOrder,
     DirectDispatch,
     ExecutionPolicy,
     ReplayDisposition,
@@ -188,13 +189,14 @@ async def test_a_fan_out_result_longer_than_its_share_of_the_row_budget_reports_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
 async def test_a_command_waiting_for_rows_a_stalled_consumer_holds_ends_with_the_elapsed_budget(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, order: DeliveryOrder
 ) -> None:
     # Each result takes the whole row budget, so the second command waits for the rows of the first, which the
     # consumer holds while it stalls. The wait ends with the operation's elapsed budget, while the consumer still
     # stalls, rather than when the consumer next reads: the second command fails unsent, and the operation ends
-    # with its time budget.
+    # with its time budget. Under INPUT the second command reads ahead of the consumer and waits the same way.
     reserve = _RowBuffer.reserve
     wait_ended = asyncio.Event()
 
@@ -214,7 +216,7 @@ async def test_a_command_waiting_for_rows_a_stalled_consumer_holds_ends_with_the
     policy = ExecutionPolicy(max_elapsed=DEADLINE_BUDGET, max_buffered_rows=2)
     async with client_for(transport, policy=policy) as client:
         started = deadline_started()
-        stream = client.fan_out_outcomes(on_loop(commands), dispatch=DirectDispatch(concurrency=1))
+        stream = client.fan_out_outcomes(on_loop(commands), dispatch=DirectDispatch(concurrency=1, output_order=order))
         first = await anext(stream)
         # The consumer stalls with the first result in hand until the second command's wait has ended.
         await reached(wait_ended, DEADLINE_BUDGET + DEADLINE_SLACK)

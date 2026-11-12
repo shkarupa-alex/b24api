@@ -27,6 +27,7 @@ from b24api.contracts import (
     CallerStop,
     ContinuePage,
     CursorDomain,
+    DeliveryOrder,
     PageBoundary,
     ReferenceComplete,
     ReferenceFailure,
@@ -85,10 +86,16 @@ class StopFirstChat:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("output_order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
 @pytest.mark.parametrize("dispatch_kind", ["direct", "batch"])
 async def test_reference_page_stop_is_per_binding_and_not_source_exhaustion(
-    dispatch_kind: str, scripted_client: ClientFactory
+    dispatch_kind: str, output_order: DeliveryOrder, scripted_client: ClientFactory
 ) -> None:
+    """A page stop sees each page before its binding fetches the next: no binding reads past a stop.
+
+    Under INPUT delivery a binding reads ahead, except one with a page stop: the stopped first chat
+    never fetches a second page.
+    """
     portal = ChatPortal()
     transport = ResponderTransport(portal)
     client = scripted_client(transport)
@@ -107,7 +114,9 @@ async def test_reference_page_stop_is_per_binding_and_not_source_exhaustion(
     )
     stop = StopFirstChat()
     dispatch = (
-        BatchDispatch(batch_size=2, coalesce_wait=0) if dispatch_kind == "batch" else DirectDispatch(concurrency=2)
+        BatchDispatch(batch_size=2, coalesce_wait=0, output_order=output_order)
+        if dispatch_kind == "batch"
+        else DirectDispatch(concurrency=2, output_order=output_order)
     )
     stream = client.iter_cursors(
         Request("messages.get", {"parent": "", "LAST_ID": 100}, route=RouteKind.BARE),
