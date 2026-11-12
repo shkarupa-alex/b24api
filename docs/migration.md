@@ -1,11 +1,50 @@
 # Migration guide
 
+## Results beyond the row budget
+
+One error is new; what happens to a command whose result does not fit `max_buffered_rows`, and how long
+a binding waits for rows, have changed.
+
+- **New: `b24api.errors.ResultTooLargeError`.** A `BudgetExceededError` for a command that ran and was
+  answered, but whose decoded result holds more rows than `ExecutionPolicy.max_buffered_rows` leaves
+  it. The client drops the result, and the command's outcome is a `CommandFailure` carrying this
+  error: unlike a command a budget refused before its send, it ran, and it is never replayed. Its
+  `rows` is how many rows the result decoded to (the length of a list result), its `limit` how many the
+  budget left it. `except BudgetExceededError` still catches it.
+- **Breaking: `batch()` and `batch_outcomes()` keep every outcome of a window whose results outgrow the
+  row budget.** The budget was checked once a physical window had run and been decoded, and a window
+  whose results held more rows than `max_buffered_rows` raised `BudgetExceededError` with no outcome
+  at all, not even those of its commands that fit: with 5 `crm.deal.add` and 25 lists of 120 rows in
+  one window, the deals were created and their ids lost, and the report counted the commands admitted
+  and sent but none settled. Now every command of the window keeps its outcome, in input order. Each
+  outcome holds one row of the budget, and a success holds the rest of its result's rows while they
+  fit what the budget has left, in input order; a success whose result does not fit ends with
+  `ResultTooLargeError` instead (in that example, the last 5 lists). `batch_outcomes()` yields every
+  outcome and goes on with the next window, so the stream completes with failures where it raised;
+  `batch()` yields the successes before the first such failure and raises `BatchFailed`, whose
+  `outcomes` hold the rest, with a `budget_exhausted` violation. Code that caught
+  `BudgetExceededError` from `batch_outcomes()` for this must look for `ResultTooLargeError` in the
+  outcomes instead. To keep such results, raise `max_buffered_rows` or lower `batch_size`, so that
+  fewer results share the budget.
+- **A fan-out result longer than its share of the row budget reports that it ran.** `fan_out()` and
+  `fan_out_outcomes()` reserve each command a share of `max_buffered_rows`: the budget divided among the
+  results a dispatch may hold at once, 50 rows each under the default `BatchDispatch` and 250 under the
+  default `DirectDispatch`. A list result longer than its share was a `CommandFailure` with a plain
+  `BudgetExceededError`, the failure of a command never sent. It now carries `ResultTooLargeError`, since
+  the command ran and was answered.
+- **Waiting for rows ends with `max_elapsed`.** A reference binding or a `fan_out()` command waiting for
+  rows still held by results the consumer had not taken waited until the consumer read on, however
+  long after `max_elapsed`, and its send was then refused at its admission. The wait now ends with the
+  operation's elapsed budget, while the consumer still holds the rows: the command or binding fails
+  unsent with `BudgetExceededError` ("row buffer wait exceeded operation time budget"), and the
+  operation ends as the time budget ends it.
+
 ## Batch budgets and held methods
 
 Public signatures are unchanged; how an operation ends on its request budget, and how a batch's first
 send meets a method pause, have changed.
 
-- **The request budget ends the operation.** Once `max_requests` was spent, `batch_outcomes()`,
+- **Breaking: the request budget ends the operation.** Once `max_requests` was spent, `batch_outcomes()`,
   `fan_out_outcomes()` and the reference traversals (`iter_reference_outcomes()` and the operations
   built on it) went on reading their source: every further command or binding was refused before its
   send, so a source without end was read without end, each yielded as a failure with
@@ -31,11 +70,12 @@ send meets a method pause, have changed.
   is shorter. When some commands of a chunk can wait that long and others cannot, each command that
   cannot is not sent and ends at once with `BudgetExceededError` ("coordinator hold exceeds execution
   time budget"), never sent and not eligible for replay, and the others are sent after the longest
-  pause among them. A fail-fast `batch()` is never split: such a chunk is refused whole, unsent, and
-  the batch fails with `BatchFailed`. When every command of a chunk can wait, or none can, leaving some out
-  would let no other command go, so nothing is left out: as for a lone `call()`, the chunk waits for its
-  pauses within `max_elapsed` (and `batch_outcomes()` reads no further while it waits), or fails at once
-  when a pause outlasts what the operation has left. Unchanged in that last case: every later chunk of
+  pause among them. When every command of a chunk can wait, or none can, leaving some out would let no
+  other command go, so nothing is left out: as for a lone `call()`, the chunk waits for its pauses within
+  `max_elapsed` (and `batch_outcomes()` reads no further while it waits), or fails at once when a pause
+  outlasts what the operation has left. A fail-fast `batch()` is never split either, since the failure of
+  the command left out would fail the batch: its chunk is treated the same way, so it waits for the
+  pause, as before, or fails at once when the pause outlasts what the operation has left. Unchanged in that last case: every later chunk of
   the held method fails the same way, so a source of only that method is still read, chunk by chunk,
   until `max_elapsed` ends the operation. This holds for classic and REST 3.0 envelopes alike. To let such commands wait for a long pause again,
   raise the retry window above it: `http_timeout` sets it only under the client's default policy

@@ -23,6 +23,7 @@ from b24api.execution import (
     rearm_cancellation,
 )
 from b24api.execution.context import REQUEST_BUDGET_EXHAUSTED
+from b24api.execution.facts import dropped_result
 from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
     ReferenceStreamItem,
@@ -673,6 +674,14 @@ class ReferenceScheduler:
             raise RuntimeError("page completed without a buffer reservation")
         if not run.reservation.accepted:
             # A counted head's rows were already charged when it was selected (LeaseCountedRowAccount).
+            if page.retained_rows > run.reservation.amount:
+                # The page was answered: a result larger than the rows reserved for it is dropped, and its command
+                # ran. A fan-out result longer than its share of the row budget ends here.
+                raise dropped_result(
+                    rows=page.retained_rows,
+                    limit=run.reservation.amount,
+                    request_summary=run.work.reference.request.summary,
+                )
             await self.buffer.accept(run.reservation, page.retained_rows)
         # The physical sender owns capacity only until the decoded page is
         # admitted to the bounded row buffer.  Holding that slot until a

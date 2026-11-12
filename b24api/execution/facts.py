@@ -21,6 +21,7 @@ from b24api.errors import (
     HTTPGatewayError,
     ProtocolError,
     ResponseTooLargeError,
+    ResultTooLargeError,
     TransportError,
 )
 
@@ -76,6 +77,16 @@ def record_dispatch(error: BaseException, *, possibly_executed: bool, unproven: 
     """Record that the command of ``error`` was dispatched, whether a send may have run and which one did."""
     execution = Execution.POSSIBLY_RUN if possibly_executed else Execution.ANSWERED
     error.__dict__[_FACTS] = _ExecutionFacts(execution, None if unproven is error else unproven)
+
+
+def dropped_result(*, rows: int, limit: int, request_summary: RequestSummary | None) -> ResultTooLargeError:
+    """Return the failure of a command that ran and was answered, but whose result the row budget drops.
+
+    It is recorded answered: the command's outcome is a failure settled as failed, never one proven not run.
+    """
+    error = ResultTooLargeError(rows=rows, limit=limit, request_summary=request_summary)
+    record_dispatch(error, possibly_executed=False)
+    return error
 
 
 def record_withheld(error: BaseException) -> None:
@@ -214,6 +225,7 @@ __all__ = [
     "ambiguity_reason",
     "ambiguous_status",
     "answered_conclusively",
+    "dropped_result",
     "execution",
     "http_success",
     "possible_execution",

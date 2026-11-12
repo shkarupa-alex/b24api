@@ -31,9 +31,11 @@ from b24api.errors import (
     CapabilityError,
     FailurePhase,
     ProtocolError,
+    ResultTooLargeError,
     TransportError,
 )
 from b24api.execution import Executor, WireResponse
+from b24api.execution.facts import Execution, execution
 from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem, ReferenceRequest
 from b24api.references.stream import iter_references
 from b24api.traversal.plans import (
@@ -626,9 +628,11 @@ async def test_fan_out_list_result_obeys_decoded_row_buffer(dispatch: DispatchPl
         policy=ExecutionPolicy(max_buffered_rows=TWO_REFERENCES),
     )
 
-    with pytest.raises(BudgetExceededError, match="decoded page") as captured:
+    # The command ran and was answered: its result is dropped, never delivered, and its failure says it ran.
+    with pytest.raises(ResultTooLargeError, match="decoded result of 3 rows") as captured:
         await anext(stream)
 
+    assert execution(captured.value) is Execution.ANSWERED
     assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert stream.report.emitted_rows == 0
@@ -675,8 +679,9 @@ async def test_input_order_rejects_oversized_whole_result_behind_blocked_head() 
     assert isinstance(head, KernelReferenceItem)
     assert head.reference_key == "head"
 
-    with pytest.raises(BudgetExceededError, match="decoded page"):
+    with pytest.raises(ResultTooLargeError, match="decoded result of 10 rows") as captured:
         await anext(stream)
+    assert execution(captured.value) is Execution.ANSWERED
     assert stream.report.buffered_rows_high_water == 1
 
 

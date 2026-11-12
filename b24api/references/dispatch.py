@@ -381,16 +381,20 @@ class _RowBuffer:
         return self._head_reserve
 
     async def reserve(self, index: int, amount: int) -> _Reservation:
+        """Reserve a page's rows, waiting for the consumer to release them within the operation's elapsed budget."""
         if amount > self.maximum:
             raise BudgetExceededError("one decoded page exceeds the global row buffer")
-        async with self._condition:
-            await self._condition.wait_for(lambda: self._closed or self.can_reserve(index, amount))
-            if self._closed:
-                raise asyncio.CancelledError
-            self._available -= amount
-            reservation = _Reservation(index, amount)
-            self._reservations.append(reservation)
-            return reservation
+        try:
+            async with asyncio.timeout(self.context.policy.max_elapsed - self.context.elapsed), self._condition:
+                await self._condition.wait_for(lambda: self._closed or self.can_reserve(index, amount))
+                if self._closed:
+                    raise asyncio.CancelledError
+                self._available -= amount
+                reservation = _Reservation(index, amount)
+                self._reservations.append(reservation)
+                return reservation
+        except TimeoutError as error:
+            raise BudgetExceededError("row buffer wait exceeded operation time budget") from error
 
     def _can_reserve(self, index: int, amount: int, returning: int = 0) -> bool:
         available = self._available + returning

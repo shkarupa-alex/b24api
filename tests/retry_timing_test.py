@@ -20,6 +20,7 @@ from b24api import ReplaySafety, Request
 from b24api.batch.correlation import _Command
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchOutcome, BatchSuccess
+from b24api.batch.stream import batch_outcome_stream
 from b24api.contracts import ResultErrorSpec, ResultSelector
 from b24api.contracts.policy import ExecutionPolicy, ReplayDisposition, RetryPolicy
 from b24api.contracts.request import RouteKind
@@ -1264,25 +1265,39 @@ async def test_a_method_held_beyond_the_window_is_split_off_the_first_send_of_a_
 
 
 @pytest.mark.asyncio
-async def test_a_fail_fast_first_send_with_a_method_held_beyond_the_window_is_refused_whole() -> None:
-    # A fail-fast chunk is never split: one command's hold beyond the window refuses the whole chunk unsent, at
-    # once, as it refuses a fail-fast replay round, instead of holding every command for two minutes.
+@pytest.mark.parametrize(
+    ("max_elapsed", "waited"), [(900.0, 120.0), (100.0, None)], ids=["default-budget", "budget-shorter-than-the-hold"]
+)
+async def test_a_fail_fast_first_send_with_a_method_held_beyond_the_window_goes_whole_to_its_permit(
+    max_elapsed: float, waited: float | None
+) -> None:
+    # A fail-fast chunk is never split: leaving the held get out would let nothing go, since its failure fails the
+    # batch. The chunk goes whole to its permit, as a lone call does: the permit waits out the 120-second hold
+    # within the operation's budget and sends every command, or refuses the chunk at once, unsent, when the hold
+    # outlasts what the operation has left.
     time = _Time()
     transport = ResponderTransport(_answers_with_a_time_limit_once("crm.item.get"))
     executor = _executor(transport, time)
     _holds_pass_in_virtual_time(executor, time)
     engine = BatchExecutor(executor)
-    context = executor.context(ExecutionPolicy(max_retry_elapsed_per_request=30.0))
+    context = executor.context(ExecutionPolicy(max_elapsed=max_elapsed, max_retry_elapsed_per_request=30.0))
     first = (_Command(0, "c000000000000", _request(ReplaySafety.SAFE, "crm.item.get"), None),)
     await engine.execute_chunk(first, context=context, halt=True, split_held=True)
 
     outcomes = await engine.execute_chunk(_neighbouring_chunk(), context=context, halt=True, split_held=True)
     await executor.coordinator.close()
 
-    assert len(transport.requests) == 1
-    assert time.now == 0.0
-    for outcome in outcomes:
-        _assert_refused_by_its_hold(outcome)
+    if waited is None:
+        assert len(transport.requests) == 1
+        assert time.now == 0.0
+        for outcome in outcomes:
+            _assert_refused_by_its_hold(outcome)
+        return
+    assert [_sent_methods(request) for request in transport.requests][1:] == [
+        ["crm.item.list", "crm.item.get", "crm.item.add"]
+    ]
+    assert time.now == waited
+    assert all(isinstance(outcome, BatchSuccess) for outcome in outcomes)
 
 
 @pytest.mark.asyncio
@@ -1447,6 +1462,37 @@ async def test_a_user_batch_whose_every_command_is_held_waits_at_its_permit(halt
     assert all(isinstance(outcome, BatchSuccess) for outcome in outcomes)
 
 
+@pytest.mark.asyncio
+async def test_the_private_stream_of_counted_tails_waits_for_a_held_method_instead_of_splitting_it_off() -> None:
+    # The stream that sends counted tails' pages is never split: a page left out for its method's hold would fail
+    # its traversal. Its chunk waits whole at its permit for the get's 120-second hold, beyond the 30-second window,
+    # and every command goes in one envelope once the hold ends.
+    time = _Time()
+    sends: list[tuple[float, list[str]]] = []
+
+    def respond(request: Request) -> object:
+        sends.append((time.now, _sent_methods(request)))
+        keys = request.copy_parameters()["cmd"]
+        assert isinstance(keys, Mapping)
+        return {"result": {"result": {key: {"ok": 1} for key in keys}, "result_error": []}}
+
+    executor = _executor(ResponderTransport(respond), time)
+    _holds_pass_in_virtual_time(executor, time)
+    await executor.coordinator.observe_operation_time_limit(_GET, delay=120.0)
+    stream = batch_outcome_stream(
+        BatchExecutor(executor),
+        [_request(ReplaySafety.SAFE, method) for method in (_LIST, _GET, _ADD)],
+        batch_size=3,
+        policy=ExecutionPolicy(max_retry_elapsed_per_request=30.0),
+    )
+
+    outcomes = [outcome async for outcome in stream]
+    await executor.coordinator.close()
+
+    assert sends == [(120.0, [_LIST, _GET, _ADD])]
+    assert all(isinstance(outcome, BatchSuccess) for outcome in outcomes)
+
+
 def _cannot_wait(hold: float, host: float, policy: ExecutionPolicy) -> bool:
     """Whether a first send may not wait for a command's method hold.
 
@@ -1460,8 +1506,9 @@ def _cannot_wait(hold: float, host: float, policy: ExecutionPolicy) -> bool:
 @pytest.mark.asyncio
 async def test_a_first_send_leaves_out_exactly_the_commands_that_cannot_wait() -> None:
     # Seeded scenarios of host and method holds: a command is refused exactly when it cannot wait and another of
-    # its chunk can (or, fail-fast, the whole chunk then); otherwise the permit admits the chunk or refuses it whole
-    # when its hold outlasts the operation. Nothing is sent before the holds of what it carries end.
+    # its chunk can; otherwise, and always for a fail-fast chunk, which is never split, the permit admits the chunk
+    # or refuses it whole when its hold outlasts the operation. Nothing is sent before the holds of what it carries
+    # end.
     methods = (_LIST, _GET, _ADD)
     for seed in range(300):
         rnd = random.Random(seed)
@@ -1482,11 +1529,11 @@ async def test_a_first_send_leaves_out_exactly_the_commands_that_cannot_wait() -
             halt=halt,
         )
         cannot = {index for index, (method, _) in enumerate(commands) if _cannot_wait(held[method], host, policy)}
-        if len(cannot) in {0, len(commands)}:
+        if halt or len(cannot) in {0, len(commands)}:
             whole_hold = max(max(held[method], host) for method, _ in commands)
             expected = set(range(len(commands))) if whole_hold >= policy.max_elapsed else set()
         else:
-            expected = set(range(len(commands))) if halt else cannot
+            expected = cannot
         refused = {outcome.command_index for outcome in outcomes if isinstance(outcome, BatchFailure)}
         assert refused == expected, f"seed {seed}"
         for at, carried in sends:

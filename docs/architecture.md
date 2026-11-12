@@ -100,6 +100,13 @@ outcome.
   budgets, concurrency and elapsed time are bounded by `ExecutionPolicy`. Concurrency has one more,
   client-wide ceiling: the permits of the client's shared rate coordinator,
   `Settings.max_concurrent_requests`. An operation's limits only narrow it.
+- The row budget bounds what an operation holds, not what it sends: a result's rows are known only
+  after its command ran. A logical batch fits a window's results into `max_buffered_rows` in input
+  order (`_within_row_budget`), and the reference scheduler fits each page into the rows reserved for
+  it before the page is accepted. A result that does not fit is dropped, and its command fails with
+  `ResultTooLargeError`, recorded answered by `b24api.execution.facts.dropped_result`: a failure that
+  ran, never one proven not run. A page's wait for row capacity (`_RowBuffer.reserve`) is bounded by
+  the operation's elapsed budget, as every other dispatch wait is.
 - Budgets are charged to one operation-local ledger of plain counters updated in place, so a
   reservation, its settlement and a row-buffer change cost the same however many bindings the
   operation has read. Per-binding page counts are kept only while a binding is open; the validated,
@@ -129,8 +136,9 @@ outcome.
   the same `_Pause.admits` and `_plan_round`, with no backoff, by how much longer each command's own
   method is held than the host, against the window its send opens or what the operation has left after
   the host hold: when some commands can wait and others cannot, the engine refuses those unsent and
-  sends the rest (a fail-fast envelope is refused whole); otherwise the envelope goes whole to its
-  permit. Traversal pages and dispatcher waves (`BatchExecutor.execute_requests`) are never split.
+  sends the rest; otherwise the envelope goes whole to its permit. A fail-fast envelope, traversal
+  pages and dispatcher waves (`BatchExecutor.execute_requests`) are never split: leaving a command out
+  of them lets no other command go.
 - The request budget ends an operation: `ExecutionContext.admit_request` refuses a send once
   `max_requests` is spent, before its permit and again at its reservation, and records the refusal
   (`requests_refused`), after which no send can be admitted. `AsyncIteratorController.get`, the one

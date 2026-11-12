@@ -934,3 +934,64 @@ async def test_a_fail_fast_operation_its_request_budget_closes_records_only_the_
     assert source.closed
     # The budget's end of the source wakes lease waiters as a read-out source does.
     assert True in woken_ended
+
+
+class _Commands:
+    """Commands of one SAFE method without end, recording every pull."""
+
+    def __init__(self) -> None:
+        self.pulled = 0
+
+    async def commands(self) -> AsyncGenerator[Command[int]]:
+        while True:
+            self.pulled += 1
+            yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), self.pulled)
+
+
+@pytest.mark.asyncio
+async def test_a_producer_waiting_for_a_slot_meets_the_spent_budget_once_it_has_the_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The producer checks the request budget after it acquires a slot, not before.
+
+    Two slots and a budget of one request: the producer reads two commands and waits for a slot before either
+    is sent; the first is sent and the second's send is then refused. Under INPUT delivery the first command's
+    success frees a slot before the stream takes up the refused one, which it does only once the producer has
+    ended. Had the producer checked the budget before its wait, it would go on to read a binding with the spent
+    budget, and fail on it: its error would be left to the cleanup, recorded as a blocking ``cleanup_failure``.
+    """
+    produce = ReferenceScheduler._produce  # noqa: SLF001
+    consume = ReferenceScheduler._consume_event  # noqa: SLF001
+    producer_ended = asyncio.Event()
+
+    async def observed_produce(scheduler: ReferenceScheduler, *args: object) -> None:
+        try:
+            await produce(scheduler, *args)  # type: ignore[arg-type]
+        finally:
+            producer_ended.set()
+
+    async def consume_after_the_producer(scheduler: ReferenceScheduler, event: _Event) -> AsyncGenerator[object]:
+        if isinstance(event, _FailureEvent):
+            await reached(producer_ended)
+        async for item in consume(scheduler, event):
+            yield item
+
+    monkeypatch.setattr(ReferenceScheduler, "_produce", observed_produce)
+    monkeypatch.setattr(ReferenceScheduler, "_consume_event", consume_after_the_producer)
+    source = _Commands()
+    transport = ResponderTransport(_one_row_each)
+    stream = client_for(transport).fan_out(
+        source.commands(),
+        dispatch=DirectDispatch(concurrency=2, output_order=DeliveryOrder.INPUT),
+        policy=ExecutionPolicy(max_requests=1, max_active_references=2),
+    )
+
+    with pytest.raises(BatchFailed):
+        async for _item in stream:
+            pass
+
+    report = stream.report
+    assert report is not None
+    assert [violation.code for violation in report.violations] == ["budget_exhausted"]
+    assert len(transport.requests) == 1
+    assert source.pulled == 2  # noqa: PLR2004 - the sent command and the refused one

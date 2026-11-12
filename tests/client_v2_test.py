@@ -651,6 +651,36 @@ async def test_fan_out_outcomes_ends_when_the_request_budget_refuses_a_send(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dispatch", [DirectDispatch(), BatchDispatch()], ids=["direct", "batch"])
+async def test_a_command_waiting_for_a_slot_is_not_read_once_the_request_budget_refused_a_send(
+    dispatch: DirectDispatch | BatchDispatch,
+) -> None:
+    # One active command at a time and a budget of one request. The scheduler reads the second command while the
+    # first is answered, then waits for its slot; meanwhile the second's send is refused. Once the slot is free,
+    # the spent budget is checked before another command is read, so the source is pulled twice, not three times.
+    source = _BudgetSource(None)
+    transport = ResponderTransport(_answer_direct_or_batch)
+    stream = _client(transport).fan_out_outcomes(
+        source.commands(), dispatch=dispatch, policy=ExecutionPolicy(max_requests=1, max_active_references=1)
+    )
+
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    sent, refused = outcomes
+    assert isinstance(sent, CommandSuccess)
+    assert isinstance(refused, CommandFailure)
+    assert execution(refused.error) is Execution.NOT_SENT
+    assert source.pulled == PARTIAL_WINDOW
+    assert source.closed
+    assert len(transport.requests) == 1
+    assert str(error) == "physical request budget exhausted"
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.INCOMPLETE
+    assert "budget_exhausted" in {violation.code for violation in report.violations}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch", [DirectDispatch(), BatchDispatch()], ids=["direct", "batch"])
 async def test_reference_outcomes_end_when_the_request_budget_refuses_a_send(
     dispatch: DirectDispatch | BatchDispatch,
 ) -> None:
@@ -818,6 +848,53 @@ async def test_batch_outcomes_sends_the_other_methods_of_a_chunk_without_its_hel
     assert execution(refused.error) is Execution.NOT_SENT
     assert len(transport.requests) == PARTIAL_WINDOW
     assert transport.requests[-1].method == "batch"
+
+
+@pytest.mark.asyncio
+async def test_a_fail_fast_batch_waits_for_a_held_method_instead_of_failing_its_other_commands() -> None:
+    # The same chunk under batch(): leaving the held list out would let the get go only for the batch to fail on
+    # the list, so the chunk is not split. It waits at its permit for the list's hold, within max_elapsed, as a
+    # lone call does, instead of failing at once with BatchFailed.
+    transport = _held_portal("test.list")
+    held = Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    free = Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    async with _client(transport) as client:
+        await _hold(client, "test.list")
+        assert await _waits(client.batch([Command(held, 0), Command(free, 1)]))
+
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_spent_request_budget_ends_the_operation_before_a_hold_that_outlasts_it_is_weighed() -> None:
+    # The budget's one request carries the get. The list's method is held two minutes, longer than the minute the
+    # operation has: its chunk is refused by the spent budget, which ends the operation at once, not by the hold,
+    # which would end only that chunk and leave the stream reading and refusing the rest of its source.
+    transport = _held_portal("test.list")
+    get = Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    held = Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    pulled = 0
+
+    async def commands() -> AsyncGenerator[Command[int]]:
+        nonlocal pulled
+        for index, request in enumerate((get, held, held)):
+            pulled += 1
+            yield Command(request, index)
+
+    async with _client(transport) as client:
+        await _hold(client, "test.list")
+        stream = client.batch_outcomes(
+            commands(), batch_size=1, policy=ExecutionPolicy(max_requests=1, max_elapsed=60.0)
+        )
+        outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    assert str(error) == "physical request budget exhausted"
+    sent, refused = outcomes
+    assert isinstance(sent, CommandSuccess)
+    assert isinstance(refused, CommandFailure)
+    assert str(refused.error) == "physical request budget exhausted"
+    assert pulled == PARTIAL_WINDOW
+    assert len(transport.requests) == PARTIAL_WINDOW
 
 
 @pytest.mark.asyncio
