@@ -728,6 +728,15 @@ messages = client.iter_references(
 `Binding` has no valid caller correlation, so it terminates the source with `InputSourceError`
 rather than fabricating a reference outcome. Already accepted bindings retain their real outcomes.
 
+With `DeliveryOrder.INPUT` the bindings are delivered in source order, and each still reads its pages
+ahead while earlier bindings are being consumed, holding their rows within
+`ExecutionPolicy.max_buffered_rows`, so physical batches stay well filled. They fill less than under
+`READY`, whose consumer takes pages as they come: a sequential traversal of many bindings with several
+pages each may send up to four or five times `READY`'s requests with the default pool, and up to twice
+with a larger one; a counted traversal sends at most about twice as many, and often fewer. A binding
+with a `page_stop` fetches its next page only once the consumer has received the page and the callback
+has returned, so its pages travel in small batches.
+
 ### Keyset references
 
 `KeysetTraversal` bindings run sequentially by default (`SequentialKeysetExecution()`), unlike

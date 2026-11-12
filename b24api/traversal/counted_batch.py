@@ -275,6 +275,7 @@ class CountedBatchStrategy:
         """Stream the dense tail and close it, keeping the primary failure over a cleanup failure."""
         tail = io.open_tail(
             self._tail_requests(ctx),
+            pages=len(range(self._stride, self._total, self._stride)),
             batch_size=batch_size,
             policy=ctx.context.policy,
             context=ctx.context,

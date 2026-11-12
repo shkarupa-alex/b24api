@@ -162,13 +162,14 @@ class SharedCountedWaveIO:
         self,
         requests: Iterator[_BatchInput],
         *,
+        pages: int,
         batch_size: int,
         policy: ExecutionPolicy,
         context: ExecutionContext,
     ) -> ReferenceTailStream:
-        """Stream the dense tail through the shared dispatcher with ``batch_size`` pages in flight."""
+        """Stream the dense tail's ``pages`` through the shared dispatcher with ``batch_size`` pages in flight."""
         del policy, context
-        return ReferenceTailStream(self._host, self._run, requests, window=batch_size)
+        return ReferenceTailStream(self._host, self._run, requests, pages=pages, window=batch_size)
 
 
 @dataclass(slots=True, eq=False)
@@ -203,6 +204,7 @@ class ReferenceTailStream:
         run: _ReferenceRun,
         requests: Iterator[_BatchInput],
         *,
+        pages: int,
         window: int,
     ) -> None:
         """Hold the planned requests; nothing is reserved or sent before iteration starts."""
@@ -210,6 +212,9 @@ class ReferenceTailStream:
         self._run = run
         self._requests = requests
         self._window = asyncio.Semaphore(max(1, window))
+        self._width = max(1, window)
+        # The planned pages not handed to the dispatcher yet.
+        self._unsent = pages
         self._slots: dict[int, _TailSlot] = {}
         self._changed = asyncio.Event()
         self._submitter: asyncio.Task[None] | None = None
@@ -258,10 +263,15 @@ class ReferenceTailStream:
             state.pending_refills.pop(key, None)
         state.touch()
 
+    def _publish_window(self) -> None:
+        """Report the pages the tail may still put in flight at once: an ordered pool keeps room for them."""
+        self._host.producer_state.set_window(self._run.producer_key, min(self._width, self._unsent))
+
     async def _submit(self) -> None:
         """Plan, reserve and dispatch tail pages ahead of the consumer, bounded by the window."""
         host, run = self._host, self._run
         state, key = host.producer_state, run.producer_key
+        self._publish_window()
         try:
             for ordinal, item in enumerate(self._requests):
                 self._in_hand = True
@@ -278,11 +288,15 @@ class ReferenceTailStream:
                 transit = state.depart(key, page_reserved=False)
                 slot.task = asyncio.create_task(self._fetch(slot, item.request, transit))
                 transit.carried_by(slot.task)
+                self._unsent -= 1
+                self._publish_window()
                 self._in_hand = self._slot_taken = False
                 self._publish_refill()
                 self._changed.set()
         finally:
             self._in_hand = self._slot_taken = False
+            self._unsent = 0
+            self._publish_window()
             state.runnable.discard(key)
             self._publish_refill()
             self._changed.set()

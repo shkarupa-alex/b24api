@@ -238,8 +238,7 @@ class LogicalBatchKernelStream[C]:
     def _finish_outcome(self, outcome: CommandOutcome[object]) -> None:
         binding = self._completion.binding(outcome.index)
         if isinstance(outcome, CommandSuccess):
-            binding.delivered()
-            binding.acknowledged()
+            binding.deliver_current()
             closure = BindingClosure.SINGLE_RESPONSE
         elif isinstance(outcome, CommandOutcomeUnknown):
             closure = BindingClosure.UNKNOWN

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -35,9 +35,9 @@ from b24api import (
     TerminalState,
 )
 from b24api.batch.engine import BatchExecutor
-from b24api.contracts import Binding, DeliveryOrder, ParameterUpdate, ReferenceSource
+from b24api.contracts import Binding, DeliveryOrder, ParameterUpdate, ReferenceItem, ReferenceSource
 from b24api.contracts.command import Command
-from b24api.contracts.completion import CommandSettlement
+from b24api.contracts.completion import CommandSettlement, PageAcknowledged, PageDelivered
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError
 from b24api.execution import Executor
@@ -233,9 +233,10 @@ async def test_a_page_on_its_way_to_the_queue_is_potential_until_it_arrives() ->
 @pytest.mark.parametrize("ready", [True, False])
 @pytest.mark.asyncio
 async def test_a_pending_refill_is_potential_whatever_the_chunk_carries(*, ready: bool) -> None:
-    """A windowed producer's refill counts while its own pages wait in the chunk.
+    """A windowed producer's refill counts while its own pages wait in the chunk, under either order.
 
-    Under INPUT delivery only the frontier's consumer progresses on its own, so only its refill counts.
+    Under INPUT delivery a binding behind the frontier reads ahead as well: its refill waits on its own
+    tail, not on the frontier's consumer.
     """
     executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
     context = executor.context(ExecutionPolicy(max_pages=100, max_pages_per_reference=100))
@@ -253,13 +254,200 @@ async def test_a_pending_refill_is_potential_whatever_the_chunk_carries(*, ready
     )
     potential = dispatcher._potential  # noqa: SLF001 - the assembler's coalescing read
     state.pending_refills["r1"] = None
-    assert potential({"r1"}) == int(ready)
+    assert potential({"r1"}) == 1
     state.pending_refills["r0"] = None
-    assert potential({"r0", "r1"}) == 1 + int(ready)
+    assert potential({"r0", "r1"}) == len(state.pending_refills)
     state.pending_continuations.add("r0")
     state.pending_refills.clear()
     assert potential({"r0"}) == 0
     await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_an_input_page_behind_the_frontier_leaves_room_for_the_bindings_nearer_it() -> None:
+    """Bindings read ahead under INPUT: a page keeps free the next page of each producer ahead of it.
+
+    The frontier's room, less the rows it holds, and the room of every producer between it and the page
+    stay free; a producer that retires keeps none. The frontier itself is never held back.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    state = _ProducerState(set(), {"r0": 0, "r1": 1, "r3": 3}, caps={"r0": 2, "r1": 2, "r3": 2})
+    buffer = _RowBuffer(10, context, head_reserve=2, producer_state=state, ordered=True)
+    held = await buffer.reserve(2, 5)
+    # Five rows free: the frontier's page and r1's page stay free, so r3's page does not fit.
+    assert not buffer.can_reserve(3, 2)
+    assert buffer.can_reserve(1, 2)
+    assert buffer.can_reserve(0, 5)
+    state.retire("r1")
+    assert buffer.can_reserve(3, 2)
+    await buffer.abort(held)
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_the_input_drain_passes_the_bindings_that_add_no_page() -> None:
+    """The INPUT consumer frees, with no page sent, the queued rows up to the first binding still producing."""
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    state = _ProducerState(set(), {"r2": 2}, caps={"r2": 2}, admitted=3)
+    buffer = _RowBuffer(10, context, head_reserve=2, producer_state=state, ordered=True)
+    reservations = [await buffer.reserve(index, amount) for index, amount in ((0, 3), (1, 2), (2, 2))]
+    for reservation, rows in zip(reservations, (3, 2, 1), strict=True):
+        await buffer.accept(reservation, rows)
+    drain = buffer.drain()
+    assert drain is not None
+    assert (drain.head, drain.rows, drain.head_rows) == (2, 6, 1)
+    # Four rows are free now; ten once the consumer has drained the queued pages.
+    assert not buffer.can_reserve(3, 8)
+    assert buffer.can_reserve(3, 8, drain=drain)
+    # A binding still producing stops the drain: the consumer waits for its next page.
+    state.register("r1", 1, 2)
+    drain = buffer.drain()
+    assert drain is not None
+    assert (drain.head, drain.rows) == (1, 5)
+    assert _RowBuffer(10, context, producer_state=state).drain() is None
+    for reservation in reservations:
+        await buffer.abort(reservation)
+    await buffer.close()
+
+
+def _producers(*indexes: int, cap: int = 2) -> _ProducerState:
+    state = _ProducerState(set(), {})
+    for index in indexes:
+        state.register(f"r{index}", index, cap)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_an_ordered_pool_wakes_the_waiting_pages_nearest_the_frontier_and_no_further() -> None:
+    """Rows coming back go to the waiting page nearest the frontier that fits.
+
+    A page behind it that does not fit ends the pass, since every page after it keeps more room free.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    buffer = _RowBuffer(10, context, head_reserve=2, producer_state=_producers(0, 1, 2, 3), ordered=True)
+    frontier = await buffer.reserve(0, 10)
+    await buffer.accept(frontier, 10)
+    page = 2
+    waiting = {index: asyncio.create_task(buffer.reserve(index, page)) for index in (3, 1, 2)}
+    await asyncio.sleep(0)
+    assert not any(task.done() for task in waiting.values())
+
+    await buffer.release(frontier, 2)
+    granted = await waiting[1]
+    # Two rows free once r1's page took the others: r2 must leave r1's room free as well.
+    await buffer.release(frontier, 2)
+    await asyncio.sleep(0)
+    assert not waiting[2].done()
+    await buffer.release(frontier, 2)
+    assert (await waiting[2]).amount == page
+    await asyncio.sleep(0)
+    assert not waiting[3].done()
+
+    await buffer.close()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting[3]
+    assert granted.amount == 0
+
+
+@pytest.mark.asyncio
+async def test_an_ordered_pool_page_that_waits_out_the_elapsed_budget_leaves_the_queue_and_holds_nothing() -> None:
+    """A page behind the frontier that waits for rows past the operation's elapsed budget ends unsent.
+
+    It leaves the queue and holds no row, so the rows released afterwards go to the page that still waits.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy(max_elapsed=DEADLINE_BUDGET))
+    await context.start()
+    buffer = _RowBuffer(10, context, head_reserve=2, producer_state=_producers(0, 1, 2), ordered=True)
+    frontier = await buffer.reserve(0, 10)
+    await buffer.accept(frontier, 10)
+
+    with pytest.raises(BudgetExceededError, match="row buffer wait exceeded operation time budget"):
+        await buffer.reserve(2, 2)
+
+    assert not buffer._waiters  # noqa: SLF001
+    assert (buffer._available, buffer._reservations) == (0, [frontier])  # noqa: SLF001
+    assert dict(buffer._held) == {0: 10}  # noqa: SLF001
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_an_ordered_pool_page_that_stops_waiting_once_woken_hands_its_rows_to_the_next() -> None:
+    """A woken page whose wait ends before its task takes the rows gives them back to the pages still waiting.
+
+    The elapsed budget ends a wait by cancelling it, as here: the rows promised to the woken page would
+    otherwise be withheld from every later page.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    buffer = _RowBuffer(10, context, head_reserve=2, producer_state=_producers(0, 1), ordered=True)
+    frontier = await buffer.reserve(0, 10)
+    await buffer.accept(frontier, 10)
+    page = 2
+    first = asyncio.create_task(buffer.reserve(1, page))
+    second = asyncio.create_task(buffer.reserve(1, page))
+    await asyncio.sleep(0)
+
+    # The rows are promised to the first page, which stops waiting before its task resumes.
+    await buffer.release(frontier, page)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    async with asyncio.timeout(HANG_BOUND):
+        assert (await second).amount == page
+    assert not buffer._waiters  # noqa: SLF001
+    assert buffer._promised == 0  # noqa: SLF001
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_an_input_tail_keeps_room_for_the_pages_it_puts_in_flight_at_once() -> None:
+    """A counted tail sends up to its window of pages at once: the pages behind it leave room for all of them."""
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    state = _producers(0, 1, 2)
+    buffer = _RowBuffer(10, context, head_reserve=2, producer_state=state, ordered=True)
+    held = await buffer.reserve(0, 2)
+    # Eight rows free: the frontier holds its reserve, r1 keeps room for one page.
+    assert buffer.can_reserve(2, 6)
+    state.set_window("r1", 3)
+    assert not buffer.can_reserve(2, 4)
+    assert buffer.can_reserve(2, 2)
+    # Its last page sent, the tail keeps no room.
+    state.set_window("r1", 0)
+    assert buffer.can_reserve(2, 8)
+    await buffer.abort(held)
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_an_input_consumer_draining_a_queued_page_wakes_the_dispatcher_with_no_fact_changed() -> None:
+    """The drain projection counts a queued page's rows already: the consumer freeing them changes no fact it reads."""
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    for ordered in (True, False):
+        state = _producers(0, 1)
+        buffer = _RowBuffer(10, context, head_reserve=2, producer_state=state, ordered=ordered)
+        page = await buffer.reserve(0, 4)
+        await buffer.accept(page, 4)
+        facts, revision = state.facts, state.revision
+        projected = [buffer.can_reserve(1, rows, drain=buffer.drain()) for rows in (8, 9)]
+        await buffer.release(page, 1)
+        assert state.revision == revision + 1
+        assert state.facts == facts + (not ordered)
+        if ordered:
+            assert projected == [buffer.can_reserve(1, rows, drain=buffer.drain()) for rows in (8, 9)] == [True, False]
+        await buffer.abort(page)
+        await buffer.close()
 
 
 @pytest.mark.asyncio
@@ -995,3 +1183,55 @@ async def test_a_producer_waiting_for_a_slot_meets_the_spent_budget_once_it_has_
     assert [violation.code for violation in report.violations] == ["budget_exhausted"]
     assert len(transport.requests) == 1
     assert source.pulled == 2  # noqa: PLR2004 - the sent command and the refused one
+
+
+@pytest.mark.asyncio
+async def test_an_input_page_read_ahead_is_acknowledged_only_once_its_consumer_has_received_it() -> None:
+    """Reading ahead hands pages over long before the consumer reaches them; only a received page is acknowledged.
+
+    A page is acknowledged after its last row reaches the consumer, never when its binding queues it, so an
+    early close leaves every page read ahead but not received unacknowledged.
+    """
+    page, pages = 5, 3
+
+    def answer(_method: str, query: Query) -> Envelope:
+        parent, offset = int(query["PARENT"]), int(query.get("start", "0"))
+        total = pages * page
+        envelope: Envelope = {"result": [{"ID": parent * 100 + row} for row in range(offset, offset + page)]}
+        if offset + page < total:
+            envelope["next"] = offset + page
+        return envelope
+
+    bindings = on_loop(
+        Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), parent),), parent) for parent in range(3)
+    )
+    async with client_for(BatchPortal(answer, wire_turns=20), policy=ExecutionPolicy(max_buffered_rows=100)) as client:
+        stream = client.iter_reference_outcomes(
+            Request.bare("gamma.list", {}),
+            bindings,
+            traversal=SequentialTraversal(page_size=page),
+            dispatch=BatchDispatch(output_order=DeliveryOrder.INPUT, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
+        )
+        # The stream's completion gate is no public surface: observe the events it records.
+        gate = cast("Any", stream)._source.completion_gate  # noqa: SLF001
+        events: list[object] = []
+        emit = gate.emit
+
+        def observe(event: object) -> None:
+            events.append(event)
+            emit(event)
+
+        gate.emit = observe
+        async with stream:
+            received = 0
+            async for outcome in stream:
+                received += isinstance(outcome, ReferenceItem)
+                if received == page + 1:
+                    break
+        decision = gate.decision()
+
+    delivered = {event.page_id for event in events if isinstance(event, PageDelivered)}
+    acknowledged = [event.page_id for event in events if isinstance(event, PageAcknowledged)]
+    assert decision.pages_scheduled > pages
+    assert len(acknowledged) == decision.pages_acknowledged == 1
+    assert set(acknowledged) <= delivered

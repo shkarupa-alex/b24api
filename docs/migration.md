@@ -1,5 +1,40 @@
 # Migration guide
 
+## `INPUT` delivery reads reference pages ahead
+
+- **Physical batches fill up under `DeliveryOrder.INPUT`.** A reference binding of
+  `iter_references()`, `iter_reference_outcomes()` and their sequential, cursor and counted variants,
+  and each command of `fan_out()` and `fan_out_outcomes()`, waited for the consumer to leave its page
+  before it fetched the next. Under `INPUT` delivery only the binding being delivered moved, so with
+  `BatchDispatch` its pages left almost one per physical batch: 300 parents of two pages took 552
+  (counted) to 852 (sequential) requests and 30 to 46 s on a 50 ms wire, against 34 to 90 requests
+  and 2.5 to 7 s under `READY`. A binding now reads its pages ahead into its own queue while the row
+  pool has room, and the dispatcher waits for the rows the consumer frees on its own, so the same
+  traversal takes 55 (sequential) and 33 (counted) requests and 2 to 4 s. Batches still fill less than
+  under `READY`, whose consumer takes pages as they come: in our deterministic model a sequential
+  traversal sends 1 to 4.7 times `READY`'s requests with the default pool, the more pages per binding
+  the more, and 1 to 2 times with a pool of 10 000 rows; a counted traversal sends at most twice as
+  many, and mostly fewer. Unless a budget stops the operation or the stream closes early (see below),
+  the items, their order and the outcomes are unchanged; the number of physical requests, their grouping and the order the
+  portal receives the commands change. `READY` delivery is unchanged, and so is a fast or automatic
+  keyset binding, which hands over one row group at a time within its row lease.
+- **`DirectDispatch` fetches ahead concurrently too.** Under `INPUT` delivery the bindings behind
+  the one being delivered now send their pages while it is consumed, up to the dispatch concurrency,
+  instead of standing still. A stream closed early has spent requests and pages on the pages read
+  ahead and discarded.
+- **Rows behind the binding being delivered are held until its turn.** They stay within
+  `ExecutionPolicy.max_buffered_rows`; `buffered_rows_high_water` may come closer to it than before.
+  The pool always keeps room for the binding being delivered and for the next pages of the bindings
+  nearest it, so a small `max_buffered_rows` still completes and only reads less ahead.
+- **Budgets are spent ahead of the consumer.** `max_requests`, `max_pages` and `max_elapsed` count
+  the pages read ahead when they are fetched, not when they are delivered, so the binding a budget
+  stops may be an earlier one than before. Closing a stream early discards the pages read ahead for
+  bindings not delivered yet; the report counts their requests and pages.
+- **A page stop still sees each page before its binding goes on.** A binding with a `page_stop`
+  fetches its next page only once the consumer has received the page and the callback has returned,
+  as documented under the page-stop contract below. Such a binding does not read ahead, so under
+  `INPUT` delivery its pages still travel in small batches.
+
 ## Results beyond the row budget
 
 One error is new; what happens to a command whose result does not fit `max_buffered_rows`, and how long
@@ -127,6 +162,7 @@ send meets a method pause, have changed.
   close, in one `contextvars.Context`, copied from the caller when the call that receives the source
   is made: the generator sees what it set across its `yield`s, as in a plain `for` loop. What it sets
   stays in that context and never reaches the caller's.
+
 
 ## Retry timing
 

@@ -55,6 +55,7 @@ from tests.scripting import (
     assert_fired_near_deadline,
     deadline_started,
     on_loop,
+    reached,
 )
 
 if TYPE_CHECKING:
@@ -487,6 +488,7 @@ async def test_a20_sibling_a_counted_head_never_replaces_a_siblings_buffered_row
     balance = [0]
     observed: list[int] = []
     resets: list[int] = []
+    sibling_buffered = asyncio.Event()
     adjust = ExecutionContext.adjust_buffered_rows
     reset = ExecutionContext.set_buffered_rows
 
@@ -494,6 +496,8 @@ async def test_a20_sibling_a_counted_head_never_replaces_a_siblings_buffered_row
         await adjust(self, delta)
         balance[0] += delta
         observed.append(balance[0])
+        if balance[0] == 30 + 2 * WIDTH:
+            sibling_buffered.set()
 
     async def tracked_reset(self: ExecutionContext, rows: int) -> None:
         resets.append(rows)
@@ -517,8 +521,9 @@ async def test_a20_sibling_a_counted_head_never_replaces_a_siblings_buffered_row
         async with stream:
             first = await anext(stream)
             assert isinstance(first, ReferenceItem)
-            await asyncio.sleep(0.05)  # the counted head lands while the sibling's page stays buffered
-            assert balance[0] == 30 + WIDTH
+            # The sibling's head and tail land, read ahead, while the first binding's page stays buffered.
+            await reached(sibling_buffered)
+            assert balance[0] == 30 + 2 * WIDTH
             events = [first, *[event async for event in stream]]
 
     assert sum(isinstance(event, ReferenceItem) for event in events) == 30 + 2 * WIDTH

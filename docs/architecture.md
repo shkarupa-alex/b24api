@@ -184,11 +184,25 @@ the source, one dispatcher coalesces ready pages of every binding into physical 
 commands share decoding options, and one completion gate builds the terminal report after cleanup.
 
 Ordinary and counted bindings reserve rows per page from one shared row pool and release them when
-the consumer acknowledges the rows. Under `INPUT` delivery, rows behind the frontier stay held until
-it advances, so the pool keeps the frontier's next page free: rows the frontier already holds count
-toward that reserve, and the reserve covers the largest page of any admitted binding; a counted
-binding reads its head and its known tail offsets as ordinary pages of that pool and commits them in
-offset order. A fast or automatic keyset binding instead holds one row lease from activation to its
+the consumer acknowledges the rows. Under `INPUT` delivery a binding reads its pages ahead: a
+validated page waits in the binding's own queue, its rows held in the pool, while the binding goes
+on to its next page, so the bindings behind the frontier keep the batches full. Only a binding with a
+page stop waits for the consumer to leave each page, as its callback must see a delivered page. Rows
+behind the frontier stay held until it advances, so the pool keeps the frontier's next page free, or
+the pages its counted tail may still put in flight at once: rows the frontier already holds count
+toward that reserve, and the reserve covers the largest page of any admitted binding. A page of a
+binding behind the frontier also leaves free the next page of every producing binding between the
+frontier and it, as the consumer drains the nearer bindings first; otherwise later bindings would
+fill the pool and each page a nearer binding then needs would travel alone. The frontier is never
+held back by that room, so it always progresses: either its page fits, or it holds rows the
+consumer drains. The pool counts the rows each binding holds, and those of its queued pages, per
+binding, and sums the producers' rooms in binding order, so a check scans no reservation. A page that
+cannot reserve waits in binding order; a change of the pool wakes only the waiting pages that fit,
+nearest the frontier first, and stops at the first page behind the frontier that does not fit, since
+every later page keeps more room free. Under `READY` delivery a change wakes every waiting page, whose
+check is a count. A counted binding reads its head and its known tail offsets as ordinary pages of
+that pool and commits them in offset order. A fast or automatic keyset binding instead holds one row
+lease from activation to its
 terminal event. Its runtime plans and fits every wave against a view of the operation policy that
 differs only in `max_buffered_rows`, equal to the lease; requests, pages, attempts, elapsed time and
 response bytes are charged to the single operation context, and each buffered-row change is applied
@@ -264,5 +278,10 @@ admits it. A counted tail whose next page waits only for its consumer to move pa
 holds is a pending refill: its consumer frees window slots one by one, and those pages coalesce.
 Unlike a pending continuation, its own pages already in the batch do not exclude it, the rows the
 held receipt returns count toward the next page's reservation (a window may hold the whole row
-pool), and under `INPUT` delivery only the frontier's refill is waited for, as only the frontier's
-consumer progresses on its own.
+pool). Under `INPUT` delivery the dispatcher waits for what the consumer frees on its own: it drains
+the queued pages of the frontier and of every binding that adds no page any more, up to the first
+one that still does, and each binding it passes frees an admission slot for the next binding from
+the source. A producer whose next page fits once those rows return counts, under either order, as do
+a binding being admitted, a source pull in flight and every pending refill. The consumer draining a
+queued page changes none of that projection, as the drained rows count already: it wakes a waiting
+wave without the dispatcher projecting again.

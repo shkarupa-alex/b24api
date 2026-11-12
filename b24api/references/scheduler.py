@@ -38,6 +38,7 @@ from b24api.references.dispatch import (
     _failed_execution,
     _failed_settlement,
     _FailureEvent,
+    _Hold,
     _KernelFanOutSuccess,
     _KernelReferenceComplete,
     _PageEvent,
@@ -342,6 +343,7 @@ class ReferenceScheduler:
                 work = _Work(next_index, reference)
                 self.completion.admit(next_index)
                 next_index += 1
+                self.producer_state.admitted = next_index
                 if reference.not_executed_reason is None:
                     self._admit_program(work)
                 # The pulled binding stops counting as a pending pull in the same step it starts counting
@@ -363,6 +365,7 @@ class ReferenceScheduler:
         self._clear_pending_pull()
         admission.slots.release()
         self._source_ended = True
+        self.producer_state.source_exhausted = True
         await self._wake_lease_waiters()
 
     def _raise_if_requests_refused(self) -> None:
@@ -375,7 +378,8 @@ class ReferenceScheduler:
 
     def _start_binding(self, work: _Work, admission: _AdmissionState) -> None:
         """Start an admitted binding's task: its local non-execution, or the run that retires its producer."""
-        queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue(maxsize=1)
+        # Under INPUT a binding's queue holds the pages it read ahead; the row pool bounds them.
+        queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue[_Event]()
         admission.queues[work.index] = queue
         if work.reference.not_executed_reason is not None:
             task = asyncio.create_task(self._emit_local_non_execution(work, queue))
@@ -405,10 +409,7 @@ class ReferenceScheduler:
         self._caps[work.index] = cap
         if self.output_order is ReferenceOutputOrder.INPUT:
             self.buffer.raise_head_reserve(cap)
-        key = _producer_key(work.index)
-        self.producer_state.runnable.add(key)
-        self.producer_state.indexes[key] = work.index
-        self.producer_state.caps[key] = cap
+        self.producer_state.register(_producer_key(work.index), work.index, cap)
 
     def _head_cap(self, index: int) -> int:
         return self._caps.get(index, self.page_cap if self.default_program is not None else 0)
@@ -498,7 +499,8 @@ class ReferenceScheduler:
     async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent) -> None:
         """Publish the binding's terminal event once it has cleaned up; it adds no command any more.
 
-        It stops counting as a producer first, so no wave waits for it while the event waits for room.
+        It stops counting as a producer first, so no wave waits for it while the event waits for room,
+        and the ordered pool stops keeping room for its next page.
         """
         self.producer_state.retire(run.producer_key)
         await run.output.put(event)
@@ -549,9 +551,8 @@ class ReferenceScheduler:
         finally:
             self._fast_waiting -= 1
         # Every page of a leased binding is charged to its lease, none to the free pool rows.
-        self.producer_state.caps[run.producer_key] = 0
+        self.producer_state.charge_to_lease(run.producer_key)
         self.producer_state.runnable.add(run.producer_key)
-        self.producer_state.touch()
         return lease
 
     async def settle_lease(self, lease: _Reservation, rows: int) -> None:
@@ -629,6 +630,9 @@ class ReferenceScheduler:
         run.scheduled_sequences.append(self.take_page_sequence())
         run.completion.scheduled()
         run.reservation = await self.buffer.reserve(run.work.index, run.program.page_cap)
+        if run.program.whole_result:
+            # A whole result is its binding's only page: the ordered pool keeps no room for another.
+            self.producer_state.reserve_last(run.producer_key)
         dispatched = await self.dispatcher.fetch(request, run.producer_key)
         run.page_admission = dispatched.admission
         run.settlement = dispatched.settlement
@@ -668,11 +672,11 @@ class ReferenceScheduler:
         run.completion.settled(CommandSettlement.SUCCESS)
         return dispatched.response
 
-    async def _deliver_page(self, run: _ReferenceRun, page: _Page) -> bool:
-        """Hand one validated page to the consumer; return False when the caller stops the reference."""
+    async def _accept_rows(self, run: _ReferenceRun, page: _Page) -> None:
+        """Charge a validated page's rows to its reservation, before the page is queued for the consumer."""
         if run.reservation is None:
             raise RuntimeError("page completed without a buffer reservation")
-        if not run.reservation.accepted:
+        if run.reservation.hold is _Hold.IN_FLIGHT:
             # A counted head's rows were already charged when it was selected (LeaseCountedRowAccount).
             if page.retained_rows > run.reservation.amount:
                 # The page was answered: a result larger than the rows reserved for it is dropped, and its command
@@ -683,6 +687,16 @@ class ReferenceScheduler:
                     request_summary=run.work.reference.request.summary,
                 )
             await self.buffer.accept(run.reservation, page.retained_rows)
+
+    async def _deliver_page(self, run: _ReferenceRun, page: _Page) -> bool:
+        """Hand one validated page to the consumer; return False when the caller stops the reference.
+
+        Under INPUT delivery a binding reads ahead: its page waits in its queue, its rows held in the
+        row pool, while the binding goes on to its next page, so the bindings behind the frontier
+        fill the waves the frontier's pages travel in. It waits for the consumer only when a page stop
+        must see the page first, and under READY delivery, whose consumer takes pages as they come.
+        """
+        await self._accept_rows(run, page)
         # The physical sender owns capacity only until the decoded page is
         # admitted to the bounded row buffer.  Holding that slot until a
         # READY consumer acknowledges every row would serialize consumer
@@ -690,38 +704,44 @@ class ReferenceScheduler:
         run.admit_page()
         if self.output_order is ReferenceOutputOrder.INPUT:
             run.settle_page()
-        acknowledged = asyncio.get_running_loop().create_future()
+        awaits_consumer = self.output_order is ReferenceOutputOrder.READY or run.program.page_stop is not None
+        acknowledged = asyncio.get_running_loop().create_future() if awaits_consumer else None
         # A dense counted tail reports its own pending pages to the dispatcher (ReferenceTailStream).
-        if page.continuing and not run.tail_active:
+        if acknowledged is not None and page.continuing and not run.tail_active:
             self.producer_state.pending_continuations.add(run.producer_key)
             self.producer_state.touch()
         page_violations = tuple(run.driver.violations[run.violation_offset :])
         run.violation_offset = len(run.driver.violations)
         page_records = self._pending_page_records(run)
+        page_id = run.completion.hand_over()
         await run.output.put(
             _PageEvent(
                 run.work,
                 page.items,
-                page.response,
+                # Only a fan-out consumer takes the response; a page read ahead holds just its rows.
+                page.response if self.emit_response else None,
                 page.item_weights,
                 run.driver.last_page_unique_mask,
                 page_violations,
                 page_records,
                 run.reservation,
                 acknowledged,
+                page_id=page_id,
             ),
         )
         run.trace_offset = run.driver.page_trace_count
-        await acknowledged
-        if self.output_order is ReferenceOutputOrder.READY:
-            run.settle_page()
+        if acknowledged is not None:
+            await acknowledged
+            if self.output_order is ReferenceOutputOrder.READY:
+                run.settle_page()
         self.producer_state.pending_continuations.discard(run.producer_key)
         run.partial_rows += len(page.items)
         run.reservation = None
-        if await self._caller_stopped(run, page, page_records):
-            run.completion.acknowledged()
+        stopped = await self._caller_stopped(run, page, page_records)
+        if acknowledged is not None:
+            run.completion.acknowledged(page_id)
+        if stopped:
             return False
-        run.completion.acknowledged()
         if page.continuing and not run.tail_active:
             self.producer_state.runnable.add(run.producer_key)
             self.producer_state.touch()
@@ -873,7 +893,7 @@ class ReferenceScheduler:
                 yield _KernelFanOutSuccess(event.work.reference, event.response)
                 for weight in event.item_weights:
                     await self.buffer.release(reservation, weight)
-                self.completion.binding(event.work.index).delivered()
+                self._page_delivered(event)
                 return
             for item, weight, is_unique in zip(
                 event.items,
@@ -894,10 +914,19 @@ class ReferenceScheduler:
                 elif reservation is not None:
                     await self.buffer.release(reservation, weight)
             if event.emitted is None:
-                self.completion.binding(event.work.index).delivered()
+                self._page_delivered(event)
         finally:
-            if not event.acknowledged.done():
+            if event.acknowledged is not None and not event.acknowledged.done():
                 event.acknowledged.set_result(None)
+
+    def _page_delivered(self, event: _PageEvent) -> None:
+        """Record a whole page delivered; acknowledge it too unless its binding waits to do so."""
+        if event.page_id is None:
+            raise RuntimeError("reference page lacks its completion page")
+        binding = self.completion.binding(event.work.index)
+        binding.delivered(event.page_id)
+        if event.acknowledged is None:
+            binding.acknowledged(event.page_id)
 
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
         if isinstance(event, _PageEvent):
