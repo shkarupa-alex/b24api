@@ -8,7 +8,7 @@ shows that one source cannot be, so the counterexample is recorded here and pinn
 Coverage matrix (source -> registered as an exact secret before any output? -> other free-text coverage):
 
 - Webhook from ``Settings`` (``Bitrix24(settings)``) -> yes, ``Bitrix24`` builds its codec redactor with
-  ``webhook_secrets(settings.webhook_url)`` -> full-URL pattern, heuristic.
+  the token of the parsed ``settings.webhook_url`` -> full-URL pattern, heuristic.
 - ``Bitrix24.from_webhook`` -> yes, it validates the URL through ``Settings`` and builds the client
   from them, so it inherits the row above -> as above.
 - URL of an injected transport -> only as the ``Settings`` webhook it must match by host; the

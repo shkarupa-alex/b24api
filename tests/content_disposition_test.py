@@ -234,7 +234,9 @@ async def test_a25_call_bytes_via_scripted_transport_reports_status_and_keeps_bo
     policy = ExecutionPolicy(binary_digest=True)
 
     caplog.set_level(logging.DEBUG)
-    async with Bitrix24(Settings(webhook_url="https://fixture.invalid/"), transport=transport, policy=policy) as api:
+    async with Bitrix24(
+        Settings(webhook_url="https://fixture.invalid/rest/1/test/"), transport=transport, policy=policy
+    ) as api:
         response = await api.call_bytes(request)
 
     transport.assert_exhausted()

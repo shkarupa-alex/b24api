@@ -46,7 +46,6 @@ _ENV_SECRET_RE = re.compile(
 )
 _COOKIE_RE = re.compile(r"(?P<prefix>\b(?:Cookie|Set-Cookie)\s*:\s*)[^\r\n]+", re.IGNORECASE)
 _BARE_CREDENTIAL_RE = re.compile(r"\b[A-Za-z0-9_-]{16,}\b")
-_WEBHOOK_CREDENTIAL_RE = re.compile(r"/rest/(?:api/)?[^/\s]+/(?P<token>[^/\s?#]+)/", re.IGNORECASE)
 _HIDDEN_KEY = "[REDACTED#{}]"
 # A shorter exact secret can be a fragment of an ordinary word, so it is replaced only where it stands as a
 # whole token; a longer one is replaced wherever it occurs. Either way a registered secret is never shown.
@@ -93,12 +92,6 @@ def secret_values(values: Collection[str]) -> frozenset[str]:
     if not all(isinstance(value, str) for value in values):
         raise TypeError("known secrets must be strings")
     return frozenset(value for value in values if value)
-
-
-def webhook_secrets(webhook_url: str) -> frozenset[str]:
-    """Return the credential segment of a classic or V3 webhook URL as an exact secret."""
-    match = _WEBHOOK_CREDENTIAL_RE.search(webhook_url)
-    return secret_values((match.group("token"),)) if match is not None else frozenset()
 
 
 def is_secret(value: str, secrets: frozenset[str], *, ignore_case: bool = False) -> bool:

@@ -27,7 +27,6 @@ suppression cannot be guaranteed.
 
 from __future__ import annotations
 import logging
-import re
 import sys
 import threading
 import weakref
@@ -57,19 +56,10 @@ _EMITTING_METHOD = "_send_handling_auth"
 _EMITTING_MODULE = ("httpx", "_client.py")
 _OWNER_EXTENSION = "b24api_log_owner"
 _UNATTRIBUTED = object()
-_CREDENTIAL_PATH = re.compile(r"/rest/(?:api/)?[^/]+/([^/]+)/", re.IGNORECASE)
 _UNREGISTERED_CLIENT = "HTTP/2 send refused: the HTTPX client cannot be weakly registered for hpack log suppression"
 _MISSING_HPACK_FILTER = "HTTP/2 send refused: the hpack log filter was removed from its logger"
 
 type _Client = httpx.AsyncClient | httpx.Client
-
-
-def webhook_credentials(url: str) -> tuple[str, ...]:
-    """Extract the credential segment shared by classic webhook bases and classic and V3 method URLs."""
-    match = _CREDENTIAL_PATH.search(url)
-    if match is None or not match.group(1):
-        raise ValueError("HTTPX log shield requires a credentialed Bitrix method URL")
-    return (match.group(1),)
 
 
 def _emitting_root() -> object:
@@ -104,9 +94,12 @@ class LogOwnership:
 
     __slots__ = ("_request", "credentials")
 
-    def __init__(self, url: str) -> None:
-        """Bind the owned webhook credential segment."""
-        self.credentials = webhook_credentials(url)
+    def __init__(self, credentials: tuple[str, ...]) -> None:
+        """Bind the owned webhook credentials, the token of the webhook the request is sent with."""
+        if not credentials or not all(isinstance(credential, str) and credential for credential in credentials):
+            credentials = ()  # a raising frame renders its locals
+            raise ValueError("HTTPX log shield requires the webhook credential of the owned request")
+        self.credentials = credentials
         self._request: weakref.ref[httpx.Request] | None = None
 
     def claim(self, request: httpx.Request) -> None:
@@ -305,9 +298,12 @@ class HttpxLogShield:
             return bool(self._transports or self._in_flight or len(self._clients))
 
     @contextmanager
-    def request(self, url: str) -> Iterator[LogOwnership]:
+    def request(self, *, credentials: tuple[str, ...]) -> Iterator[LogOwnership]:
         """Protect one dispatch; the caller claims its HTTPX request with the yielded marker."""
-        ownership = LogOwnership(url)
+        ownership = LogOwnership(credentials)
+        # The ownership keeps the credentials; this generator frame, rendered in any traceback through the
+        # dispatch, does not.
+        credentials = ()
         with self._lock:
             if self._transports < 1:
                 raise RuntimeError("HTTPX log shield has no registered transport")

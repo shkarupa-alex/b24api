@@ -197,7 +197,7 @@ def test_live_portal_webhook_vault_is_opaque_and_gc_bounded(monkeypatch: pytest.
 
     assert reference() is None
     with pytest.raises(LiveUnavailableError, match="credential is unavailable"):
-        live_module._webhook_for(handle)  # noqa: SLF001 - lifecycle regression
+        live_module._token_for(handle)  # noqa: SLF001 - lifecycle regression
     client.close()
 
 
@@ -723,3 +723,36 @@ def test_live_portal_holds_its_shield_registration_exactly_for_its_lifetime(
     with pytest.raises(LiveUnavailableError, match="client configuration"):
         LivePortal(role="admin_full")
     assert HTTPX_LOG_SHIELD._transports == initial  # noqa: SLF001 - a failed initialization leaves none
+
+
+def test_live_portal_registers_and_claims_only_the_webhook_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    token = "live" + "-token-" + "xyz"
+    claimed: list[tuple[str, ...]] = []
+    network_client = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        claimed.append(request.extensions["b24api_log_owner"].credentials)
+        return httpx.Response(200, json={"result": {"ID": "7"}})
+
+    def offline_client(**options: float | bool) -> httpx.Client:
+        return network_client(transport=httpx.MockTransport(handler), **options)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(httpx, "Client", offline_client)
+    key = base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
+    monkeypatch.setenv("BITRIX24_EVIDENCE_FINGERPRINT_KEY", key)
+    monkeypatch.setenv("BITRIX24_API_WEBHOOK_URL", "https://example.invalid" + "/rest/7/" + token + "/")
+    with LivePortal(role="admin_full") as portal:
+        registered = HTTPX_LOG_SHIELD.registered_secrets()
+        assert token in registered
+        assert "7" not in registered
+        assert portal.call_envelope("profile")["result"] == {"ID": "7"}
+    assert claimed == [(token,)]
+
+
+def test_live_refused_shield_entry_drops_the_method_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    with _portal(monkeypatch, lambda _request: httpx.Response(200, json={"result": []})) as portal:
+        monkeypatch.setattr(HTTPX_LOG_SHIELD, "_transports", 0)
+        with pytest.raises(RuntimeError, match="no registered transport") as refused:
+            portal.call_envelope("profile")
+        monkeypatch.undo()
+    _assert_live_error_redacted(refused.value, "not-a-secret")

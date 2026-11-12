@@ -1,15 +1,27 @@
 """Environment-backed credential and transport settings."""
 
+import contextlib
 from collections.abc import Generator
+from types import MappingProxyType
 from typing import Any, Self, cast
 
-from pydantic import Field, HttpUrl, TypeAdapter, ValidationError, field_serializer, field_validator
+from pydantic import AnyUrl, Field, HttpUrl, ValidationError, field_serializer, field_validator
 from pydantic.config import ExtraValues
 from pydantic_core import InitErrorDetails, PydanticCustomError
 from pydantic_settings import BaseSettings, SettingsConfigDict, SettingsError
 
-_WEBHOOK_ADAPTER = TypeAdapter(HttpUrl)
+from b24api._webhook import WebhookRefusal, parse_webhook
+
 _REDACTED = "[REDACTED]"
+# The error type of each refusal; its message is the refusal's own, which quotes no part of the URL.
+_WEBHOOK_ERROR_TYPES = MappingProxyType(
+    {
+        WebhookRefusal.INVALID: "webhook_url",
+        WebhookRefusal.USERINFO: "webhook_url_userinfo",
+        WebhookRefusal.HOST: "webhook_url_host",
+        WebhookRefusal.SHAPE: "webhook_url_shape",
+    }
+)
 
 
 def _settings_validation_error(error: ValidationError | None = None) -> ValidationError:
@@ -25,8 +37,8 @@ def _settings_validation_error(error: ValidationError | None = None) -> Validati
         details = []
         for item in error.errors(include_url=False):
             safe_item = dict(item, input=_REDACTED)
-            if item["type"] == "webhook_url":
-                safe_item["type"] = PydanticCustomError("webhook_url", "Webhook URL is invalid")
+            if item["type"] in _WEBHOOK_ERROR_TYPES.values():
+                safe_item["type"] = PydanticCustomError(item["type"], item["msg"])
             details.append(cast("InitErrorDetails", safe_item))
     return ValidationError.from_exception_data("Settings", details)
 
@@ -177,12 +189,23 @@ class Settings(BaseSettings):
 
     @field_validator("webhook_url", mode="before")
     @classmethod
-    def _sanitize_invalid_webhook_input(cls, value: Any) -> HttpUrl | str:  # noqa: ANN401
-        """Keep invalid credential-bearing input out of validation errors."""
-        try:
-            return _WEBHOOK_ADAPTER.validate_python(value)
-        except (TypeError, ValueError, ValidationError):
-            raise PydanticCustomError("webhook_url", "Webhook URL is invalid") from None
+    def _sanitize_invalid_webhook_input(cls, value: Any) -> str:  # noqa: ANN401
+        """Accept exactly what the transport accepts and store its canonical base; keep the input out of errors.
+
+        The returned base is what pydantic then validates as ``HttpUrl``; the shared parse admits only
+        bases it represents.
+        """
+        # A pydantic URL (a copied or re-validated Settings) is read back from its string form; bytes are
+        # read as UTF-8, as pydantic reads them.
+        if isinstance(value, AnyUrl):
+            value = str(value)
+        elif isinstance(value, bytes | bytearray):
+            with contextlib.suppress(UnicodeDecodeError):
+                value = bytes(value).decode()
+        webhook = parse_webhook(value)
+        if isinstance(webhook, WebhookRefusal):
+            raise PydanticCustomError(_WEBHOOK_ERROR_TYPES[webhook], webhook.value)
+        return webhook.url
 
     @field_serializer("webhook_url")
     def _serialize_webhook_url(self, _value: HttpUrl) -> str:

@@ -394,7 +394,7 @@ async def test_transport_webhook_vault_is_opaque_and_gc_bounded() -> None:
 
     assert reference() is None
     with pytest.raises(TransportError, match="credential is unavailable") as refused:
-        httpx_transport_module._webhook_for(handle)  # noqa: SLF001 - lifecycle regression
+        httpx_transport_module._token_for(handle)  # noqa: SLF001 - lifecycle regression
     assert refused.value.phase is FailurePhase.NOT_DISPATCHED
     assert refused.value.retryable is False
     await client.aclose()

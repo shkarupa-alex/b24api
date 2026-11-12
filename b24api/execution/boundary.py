@@ -30,6 +30,9 @@ async def send_transport(  # noqa: PLR0913 - keeps legacy and wire boundaries ex
     transport's ``send``/``send_wire`` has been called, an arbitrary ``Exception`` cannot prove
     that the request never reached the server, so it becomes a non-retryable
     ``TransportError(phase=DISPATCH_STARTED)`` whose ``__cause__`` is the original exception.
+    ``HttpxTransport`` never lets one escape: it classifies every failure of building, sending or
+    reading the request itself and raises a ``TransportError`` (or a fresh ``TimeoutError``) unchained,
+    because HTTPX exceptions carry the webhook URL.
     ``B24ApiError`` values keep the transport's own classification, ``TimeoutError`` keeps the
     executor's deadline classification, and ``BaseException`` values such as cancellation are
     never converted. A returned body larger than ``max_response_bytes`` is rejected before any

@@ -88,3 +88,15 @@ def test_injected_transport_for_another_host_is_refused() -> None:
 
     with pytest.raises(ValueError, match="injected transport host does not match Settings"):
         Bitrix24(Settings(webhook_url=URL), transport=transport)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported", ["::1", "[::1]"])
+async def test_an_ipv6_host_is_compared_without_brackets(reported: str) -> None:
+    url = "https://[0:0::1]" + f"/rest/1/{MARKER}/"
+    async with Bitrix24(Settings(webhook_url=url)) as owned:
+        assert owned.host == "::1"
+    transport = _Transport()
+    transport.host = reported
+    async with Bitrix24(Settings(webhook_url=url), transport=transport) as injected:
+        assert injected.host == "::1"

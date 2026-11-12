@@ -16,7 +16,8 @@ from b24api.contracts.request_summary import RequestSummary, RouteKind
 from b24api.contracts.wire import BodyEncoding, RequestHeaders
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
-_METHOD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+# Dot-separated names: an empty segment (``..``, a leading or trailing dot) would be a URL dot segment.
+_METHOD_RE = re.compile(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*")
 _NO_HEADERS = RequestHeaders()
 type PathPart = str | int
 _COMPONENT_LABEL_MAXIMUM = 80
@@ -234,7 +235,7 @@ class Request:
     ) -> None:
         """Initialize instance state."""
         if not _METHOD_RE.fullmatch(method):
-            raise ValueError("method must contain only letters, digits, dots, and underscores")
+            raise ValueError("method must be dot-separated names of letters, digits, and underscores")
         if method.endswith(".json"):
             raise ValueError("request methods are logical names and cannot include a .json route suffix")
         if not isinstance(route, RouteKind):

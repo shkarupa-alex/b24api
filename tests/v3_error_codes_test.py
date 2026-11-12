@@ -24,7 +24,7 @@ from b24api.contracts.v3_codes import (
 )
 from b24api.errors import ApiResponseError
 from b24api.execution import Executor, WireResponse
-from b24api.redaction import REDACTED, Redactor, webhook_secrets
+from b24api.redaction import REDACTED, Redactor, secret_values
 from b24api.transport.protocol import ProtocolCodec
 from tests.scripting import ResponderTransport, replies
 
@@ -314,7 +314,7 @@ def test_a_request_field_name_in_another_letter_case_is_never_shown(field: str, 
 
 
 def test_registered_and_request_secrets_beat_the_shape() -> None:
-    webhook = webhook_secrets(f"https://portal.invalid/rest/1/{AUTH_VALUE}/")
+    webhook = secret_values((AUTH_VALUE,))
     codec = ProtocolCodec(redactor=Redactor(known_secrets=webhook))
     request = Request("note.list", {"auth": AUTH_VALUE.upper(), "select": ["NOTE_FIELD_NAME"]}, route=RouteKind.API_V3)
 
