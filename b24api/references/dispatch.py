@@ -224,9 +224,9 @@ class _ProducerState:
                 waiter.set_result(None)
 
     def retire(self, key: str) -> None:
-        """Stop counting a producer that adds no further command: it reached its terminal, or its task ended.
+        """Stop counting a producer that adds no further command: it publishes its terminal, or its task ended.
 
-        Only a producer with an index counts, so a mark its own cleanup leaves afterwards never counts.
+        Only a producer with an index counts, so a mark left behind by a retired producer never counts.
         """
         registered = self.indexes.pop(key, None) is not None
         self.runnable.discard(key)

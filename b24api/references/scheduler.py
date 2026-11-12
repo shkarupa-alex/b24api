@@ -408,9 +408,9 @@ class ReferenceScheduler:
             raise
         except _BatchPageError as error:
             failure = self._failure_event(run, cast("BaseException", error.failure.error))
-            await output.put(replace(failure, replay_disposition=error.failure.replay_disposition))
+            await self.publish_terminal(run, replace(failure, replay_disposition=error.failure.replay_disposition))
         except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
-            await output.put(self._failure_event(run, error))
+            await self.publish_terminal(run, self._failure_event(run, error))
         finally:
             try:
                 if pages is not None:
@@ -454,14 +454,14 @@ class ReferenceScheduler:
             primary_error = error
             raise
         finally:
-            # The binding adds no further command once its pages end, however they end: it stops counting
-            # as a producer before its cleanup and its terminal event, so no wave waits for it meanwhile.
-            self.producer_state.retire(run.producer_key)
+            # Cleanup comes before the terminal event: the pages a stopped binding abandons are cancelled
+            # before it stops counting as a producer, so no wave leaves with them meanwhile.
             run.deferred_cleanup_error = await _close_pages(pages, primary_error)
         if run.reservation is not None:
             await self.buffer.abort(run.reservation)
             run.reservation = None
-        await run.output.put(
+        await self.publish_terminal(
+            run,
             _DoneEvent(
                 run.work,
                 run.partial_rows,
@@ -474,6 +474,14 @@ class ReferenceScheduler:
                 keyset_selection=program.keyset_selection,
             ),
         )
+
+    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent) -> None:
+        """Publish the binding's terminal event once it has cleaned up; it adds no command any more.
+
+        It stops counting as a producer first, so no wave waits for it while the event waits for room.
+        """
+        self.producer_state.retire(run.producer_key)
+        await run.output.put(event)
 
     def _retire_producer(self, run: _ReferenceRun) -> None:
         """Release the run's dispatcher waits, remove it from the advisory producer state and close its page ledger."""

@@ -201,13 +201,15 @@ is invoked once at the two canonical row funnels (driver and fast-keyset receipt
 published rows alone are thawed. Reference cursor drivers share a capacity-aware dispatcher whose
 absolute per-wave coalescing deadline defaults to 20 ms and is skipped when no eligible producer can
 add a command. A pulled binding is a producer from the moment it leaves the source, before its task
-first runs, until it reaches its terminal: it stops counting before its cleanup and its terminal
-event. A local non-execution never is one. A command whose task has started but has not reached the queue yet, such as a counted
-tail page or a fast keyset wave command, counts as one about to arrive, under either delivery order,
-until it is queued or its task ends, since its producer may already have left the runnable set; one
-that must still reserve its logical page counts only while the page budget admits it. A counted tail
-whose next page waits only for its consumer to move past a receipt it holds is a pending refill: its
-consumer frees window slots one by one, and those pages coalesce. Unlike a pending continuation, its
-own pages already in the batch do not exclude it, the rows the held receipt returns count toward the
-next page's reservation (a window may hold the whole row pool), and under `INPUT` delivery only the
-frontier's refill is waited for, as only the frontier's consumer progresses on its own.
+first runs, until it publishes its terminal event: it stops counting once its cleanup has cancelled
+the pages it abandons, before that event may wait for room. A binding refused as a local
+non-execution is never a producer. A command whose task has started but has not reached the queue
+yet, such as a counted tail page or a fast keyset wave command, counts as one about to arrive, under
+either delivery order, until it is queued or its task ends, since its producer may already have left
+the runnable set; one that must still reserve its logical page counts only while the page budget
+admits it. A counted tail whose next page waits only for its consumer to move past a receipt it
+holds is a pending refill: its consumer frees window slots one by one, and those pages coalesce.
+Unlike a pending continuation, its own pages already in the batch do not exclude it, the rows the
+held receipt returns count toward the next page's reservation (a window may hold the whole row
+pool), and under `INPUT` delivery only the frontier's refill is waited for, as only the frontier's
+consumer progresses on its own.

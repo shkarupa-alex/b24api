@@ -61,6 +61,10 @@ class FastKeysetHost(WaveHost, Protocol):
         """Fix the planned binding's lease at ``rows``, giving the rest back to the shared pool."""
         ...
 
+    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent) -> None:
+        """Publish the binding's terminal event; it stops counting as a producer first."""
+        ...
+
 
 async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKeysetProgram) -> None:
     """Run one binding to its terminal event; the lease is returned exactly once."""
@@ -107,14 +111,13 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
         await host.settle_lease(lease, view.lease.capacity)
         while rows := await runtime.next_rows():
             await _deliver(host, run, runtime, rows)
-        # At its terminal the binding adds no command: no wave waits for it during its cleanup and terminal event.
-        host.producer_state.retire(run.producer_key)
         closure, witnesses = runtime.completion_closure()
         await runtime.aclose()
         ledger.close(successful=True, reason=KernelState.COMPLETED.value, unsettled=CommandSettlement.NOT_EXECUTED)
         closure = _witnessed(closure, ledger)
         report = runtime.report_fragment()
-        await run.output.put(
+        await host.publish_terminal(
+            run,
             _DoneEvent(
                 run.work,
                 run.partial_rows,
@@ -130,7 +133,6 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
         raise
     except BaseException as error:
         # The scheduler's per-reference boundary turns the error into this binding's terminal event.
-        host.producer_state.retire(run.producer_key)
         if runtime is not None and not runtime.closed:
             await runtime.aclose()
         ledger.close(successful=False, reason=KernelState.FAILED.value, unsettled=_failed_settlement(error))
