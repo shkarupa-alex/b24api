@@ -28,11 +28,15 @@ from b24api.execution.snapshot import KernelReport
 
 if TYPE_CHECKING:
     from b24api.completion.gate import CompletionGate
+    from b24api.execution.context import ExecutionContext
     from b24api.traversal.keyset_runtime import KeysetRuntime
 
 
 class KeysetFastStream:
     """Single-use lifecycle shell around the fast keyset runtime."""
+
+    # Every wave is read inside a read; nothing runs between reads.
+    works_between_reads = False
 
     def __init__(self, runtime: KeysetRuntime) -> None:
         """Initialize without starting planning or I/O."""
@@ -48,6 +52,11 @@ class KeysetFastStream:
     def __aiter__(self) -> Self:
         """Return this single-use async iterator."""
         return self
+
+    @property
+    def operation_context(self) -> ExecutionContext:
+        """Return the operation context whose elapsed budget bounds the wrapper's cleanup."""
+        return self._runtime.context.execution_context
 
     @property
     def completion_gate(self) -> CompletionGate:

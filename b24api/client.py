@@ -24,7 +24,7 @@ from b24api.contracts.request import (
 from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import KeysetSpec
 from b24api.execution import Executor, HttpxTransport, Transport, await_cleanup_resistant, rearm_cancellation
-from b24api.execution.cleanup import CloseableResource, close_owned_resources
+from b24api.execution.cleanup import OwnedStream, close_owned_resources
 from b24api.redaction import Redactor, webhook_secrets
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
@@ -104,7 +104,7 @@ class Bitrix24(_TraversalFacade):
         self._closed = False
         self._unknown_request_audit = unknown_request_audit
         self._close_task: asyncio.Task[None] | None = None
-        self._streams: weakref.WeakSet[CloseableResource] = weakref.WeakSet()
+        self._streams: weakref.WeakSet[OwnedStream] = weakref.WeakSet()
 
     @classmethod
     def from_webhook(
@@ -172,9 +172,15 @@ class Bitrix24(_TraversalFacade):
             raise
 
     async def aclose(self) -> None:
-        """Close active streams, the owned rate coordinator and the owned transport idempotently."""
+        """Close active streams, the owned rate coordinator and the owned transport idempotently.
+
+        A close requested from inside the pull or cleanup of one of this client's streams is refused,
+        leaving the client open, because closing that stream would wait for the code that requested it.
+        """
         if self._close_task is not None and self._close_task.done():
             return
+        if any(stream.inside_own_work for stream in tuple(self._streams)):
+            raise RuntimeError("client cannot be closed from inside the pull or cleanup of one of its streams")
         if self._close_task is None:
             self._closed = True
             self._close_task = asyncio.create_task(
@@ -437,11 +443,11 @@ class Bitrix24(_TraversalFacade):
         )
 
     def _register_stream[T](self, stream: OperationStream[T]) -> OperationStream[T]:
-        self._streams.add(cast("CloseableResource", stream))
+        self._streams.add(cast("OwnedStream", stream))
         return stream
 
     def _discard_stream(self, stream: object) -> None:
-        self._streams.discard(cast("CloseableResource", stream))
+        self._streams.discard(cast("OwnedStream", stream))
 
     def _require_open(self) -> None:
         if self._closed:

@@ -15,6 +15,15 @@ class CloseableResource(Protocol):
         ...
 
 
+class OwnedStream(CloseableResource, Protocol):
+    """A client-registered stream that knows whether the current task runs inside its own work."""
+
+    @property
+    def inside_own_work(self) -> bool:
+        """Whether closing the stream from the current task would wait for that task itself."""
+        ...
+
+
 async def close_owned_resources(
     streams: Iterable[CloseableResource],
     transport: CloseableResource | None,
@@ -44,4 +53,4 @@ async def close_owned_resources(
         raise primary
 
 
-__all__ = ["CloseableResource", "close_owned_resources"]
+__all__ = ["CloseableResource", "OwnedStream", "close_owned_resources"]

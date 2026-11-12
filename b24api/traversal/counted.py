@@ -31,11 +31,15 @@ if TYPE_CHECKING:
     from b24api.contracts.page import PageAdapter
     from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
     from b24api.execution import Executor
+    from b24api.execution.context import ExecutionContext
     from b24api.traversal.plans import CountedOffsetPlan
 
 
 class CountedItemStream:
     """Single-use counted item stream backed by the proven pagination driver."""
+
+    # Every page is read inside a read; nothing runs between reads.
+    works_between_reads = False
 
     def __init__(  # noqa: PLR0913
         self,
@@ -79,6 +83,11 @@ class CountedItemStream:
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
         return self
+
+    @property
+    def operation_context(self) -> ExecutionContext:
+        """Return the operation context whose elapsed budget bounds the wrapper's cleanup."""
+        return self._context
 
     @property
     def completion_gate(self) -> object:
