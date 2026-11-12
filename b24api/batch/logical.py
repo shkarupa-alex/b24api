@@ -288,6 +288,7 @@ class LogicalBatchKernelStream[C]:
                 context=self._context,
                 halt=self._fail_fast,
                 on_envelope=self._count_batch_request,
+                split_held=True,
             )
             buffered_rows = sum(outcome.decoded_rows if isinstance(outcome, KernelSuccess) else 1 for outcome in kernel)
             outcomes = _public_outcomes(kernel)

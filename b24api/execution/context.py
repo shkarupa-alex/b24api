@@ -19,6 +19,9 @@ if TYPE_CHECKING:
     type Clock = Callable[[], float]
 
 
+REQUEST_BUDGET_EXHAUSTED = "physical request budget exhausted"
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionSnapshot:
     """Operation-local attempt, retry, and cooldown counters."""
@@ -80,6 +83,8 @@ class ExecutionContext:
         self._clock = clock
         self._start: float | None = None
         self._physical_requests = 0
+        # Set once the request budget refuses a send: the count never falls, so no later send can be admitted.
+        self._requests_refused = False
         self._logical_pages = 0
         self._buffered_rows = 0
         self._buffered_rows_high_water = 0
@@ -105,6 +110,26 @@ class ExecutionContext:
             return 0.0
         return max(0.0, self._clock() - self._start)
 
+    @property
+    def requests_refused(self) -> bool:
+        """Return whether the request budget has refused a send, which ends the operation: no send can follow.
+
+        Only a refusal sets it: a budget spent exactly by the last send the operation needed ends nothing. Once it
+        is set, the batch streams' source pull (``AsyncIteratorController.get``) refuses further input, and the
+        reference scheduler reads none, ends its source and, once the bindings read are settled, ends the operation.
+        """
+        return self._requests_refused
+
+    def admit_request(self) -> None:
+        """Refuse a send once the request budget is spent, recording the refusal that ends the operation.
+
+        The executor asks before a send queues for its permit, so a spent budget never waits for a cooldown just to
+        refuse, and again when it reserves the attempt.
+        """
+        if self._physical_requests >= self.policy.max_requests:
+            self._requests_refused = True
+            raise BudgetExceededError(REQUEST_BUDGET_EXHAUSTED)
+
     async def start(self) -> None:
         """Start the operation clock exactly once when execution first begins."""
         if self._start is None:
@@ -114,8 +139,7 @@ class ExecutionContext:
         """Reserve the attempt budget."""
         retry_elapsed = max(0.0, self._clock() - retry_started)
         total_elapsed = self.elapsed
-        if self._physical_requests >= self.policy.max_requests:
-            raise BudgetExceededError("physical request budget exhausted")
+        self.admit_request()
         if attempts_for_request >= self.policy.max_attempts_per_request:
             raise BudgetExceededError("per-request attempt budget exhausted")
         if retry_elapsed >= self.policy.max_retry_elapsed_per_request:
@@ -326,11 +350,14 @@ class AsyncIteratorController[T]:
         self._cleanup_task: asyncio.Task[None] | None = None
 
     async def get(self, context: ExecutionContext) -> T:
-        """Pull one item within the operation's remaining budget."""
+        """Pull one item within the operation's budget: its time left, and a request budget that refused nothing."""
         if self._active_pull is not None:
             raise RuntimeError("source pull is already active")
         if self._cleanup_task is not None:
             raise RuntimeError("source cleanup has already started")
+        if context.requests_refused:
+            # No item pulled now could be sent: the operation ends with its request budget, as with its time budget.
+            raise BudgetExceededError(REQUEST_BUDGET_EXHAUSTED)
         remaining = context.policy.max_elapsed - context.elapsed
         if remaining <= 0:
             raise BudgetExceededError(self._input_error)

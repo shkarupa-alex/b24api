@@ -222,6 +222,17 @@ async def on_loop[T](items: Iterable[T]) -> AsyncIterator[T]:
         yield item
 
 
+async def drain_to_failure[T, E: BaseException](stream: AsyncIterator[T], failure: type[E]) -> tuple[list[T], E]:
+    """Drain ``stream`` until it raises ``failure``; return the items it delivered before, and that failure."""
+    items: list[T] = []
+    try:
+        async for item in stream:
+            items.append(item)  # noqa: PERF401 - keep the items delivered before the failure
+    except failure as error:
+        return items, error
+    raise AssertionError(f"the stream ended without {failure.__name__}")
+
+
 def attached_report(error: BaseException) -> object:
     """Return the report an operation attached to its exception, or ``None``."""
     return getattr(error, "report", None)

@@ -1,5 +1,52 @@
 # Migration guide
 
+## Batch budgets and held methods
+
+Public signatures are unchanged; how an operation ends on its request budget, and how a batch's first
+send meets a method pause, have changed.
+
+- **The request budget ends the operation.** Once `max_requests` was spent, `batch_outcomes()`,
+  `fan_out_outcomes()` and the reference traversals (`iter_reference_outcomes()` and the operations
+  built on it) went on reading their source: every further command or binding was refused before its
+  send, so a source without end was read without end, each yielded as a failure with
+  `BudgetExceededError`, and a finite source ended `completed_with_failures` with no violation. Now the
+  first send that `max_requests` refuses ends the operation, as `max_elapsed` ends it. What was
+  already read is still yielded: what was sent keeps its outcome, and a command never sent is a
+  failure with `BudgetExceededError`, never sent and not eligible for replay. Then the stream raises
+  `BudgetExceededError` ("physical request budget exhausted") with the report attached, reads no
+  further input and closes the source, as on any other end. The report is `incomplete` and records a
+  `budget_exhausted` violation. A retry or replay that the budget refuses ends the operation the same
+  way. A budget that the last send the operation needs spends exactly refuses nothing, and the stream
+  completes. A send that the spent budget will refuse is now refused before it queues for a permit, so
+  it no longer waits out a cooldown first. Code that read such a stream to its end with `async for`
+  must now catch `BudgetExceededError`, or give the operation enough `max_requests`.
+- **One held method no longer holds back or fails a whole `batch()` or `batch_outcomes()` chunk.** A
+  batch envelope is admitted under every method it carries, so after an `OPERATION_TIME_LIMIT` (120 s
+  by default) on one method, the first send of every later chunk that carried that method waited two
+  minutes with all its other commands, or, when the operation had less time left than the pause, failed
+  all of them with `BudgetExceededError`. The first send now weighs each command against its own
+  method's pause, as a replay round already did: by how much longer its method is held than the portal
+  as a whole (a `Retry-After` hint holds every command alike), against the retry window
+  (`max_retry_elapsed_per_request`) or what the operation has left after the portal's pause, whichever
+  is shorter. When some commands of a chunk can wait that long and others cannot, each command that
+  cannot is not sent and ends at once with `BudgetExceededError` ("coordinator hold exceeds execution
+  time budget"), never sent and not eligible for replay, and the others are sent after the longest
+  pause among them. A fail-fast `batch()` is never split: such a chunk is refused whole, unsent, and
+  the batch fails with `BatchFailed`. When every command of a chunk can wait, or none can, leaving some out
+  would let no other command go, so nothing is left out: as for a lone `call()`, the chunk waits for its
+  pauses within `max_elapsed` (and `batch_outcomes()` reads no further while it waits), or fails at once
+  when a pause outlasts what the operation has left. Unchanged in that last case: every later chunk of
+  the held method fails the same way, so a source of only that method is still read, chunk by chunk,
+  until `max_elapsed` ends the operation. This holds for classic and REST 3.0 envelopes alike. To let such commands wait for a long pause again,
+  raise the retry window above it: `http_timeout` sets it only under the client's default policy
+  (`ExecutionPolicy.from_settings`); with an explicit `policy=`, raise its
+  `max_retry_elapsed_per_request`. The pause must also fit in what is left of `max_elapsed`.
+- **Unchanged: traversals and dispatched commands wait for a held method.** The pages of a list or
+  reference traversal and the commands that `fan_out()` and `fan_out_outcomes()` gather into a
+  `BatchDispatch` wave are never left out for their method's pause: a wave waits for it within
+  `max_elapsed`, as the same requests sent one by one with `DirectDispatch` do. Failing a reference's
+  page fails the whole reference, which is worse than waiting.
+
 ## Closed clients, copyable errors and the client's request limit
 
 - **Breaking: a closed client raises `ClientClosedError`.** A closed client refused work with three
@@ -75,7 +122,8 @@ Public signatures are unchanged; when a retry waits and when it is sent have cha
   when the wait overran its plan (a late wake or a long permit queue). With the default 30-second
   window, a `Retry-After` of 15 seconds or more ends an `UNSAFE` or `UNKNOWN` request without a retry
   even when its first send took no time; each second the request has already spent lowers that
-  bound by half a second. Raise `http_timeout` to let it wait longer. A `SAFE` retry is still sent
+  bound by half a second. To let it wait longer, raise the retry window: `http_timeout` under the
+  client's default policy, `max_retry_elapsed_per_request` with an explicit `policy=`. A `SAFE` retry is still sent
   with any window left: it may succeed, and repeating it is harmless.
 - **The `SAFE` commands of a classic batch keep their replay.** The same rule applies to the replay
   rounds of a classic batch, whether its commands' own entries were refused or the whole batch was

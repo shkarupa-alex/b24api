@@ -41,7 +41,7 @@ from b24api.errors import (
 from b24api.execution import Executor, RateCoordinator
 from b24api.testing import ScriptedCall, ScriptedExchange, ScriptedTransport, ScriptedV3Command
 from b24api.transport import HttpxTransport, TransportCapabilities, WireRequest, WireResponse
-from tests.scripting import ResponderTransport, client_for
+from tests.scripting import ResponderTransport, client_for, drain_to_failure
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
@@ -95,13 +95,19 @@ async def _run(
     *,
     policy: ExecutionPolicy | None = None,
     batch_size: int | None = None,
+    request_budget_ends: bool = False,
 ) -> tuple[list[CommandOutcome[int]], OperationReport]:
+    """Drain a logical batch; ``request_budget_ends``: the request budget refuses a send and so ends the stream."""
     async with client_for(transport, policy=policy or _policy()) as api:
         stream = api.batch_outcomes(
             [Command(request, index) for index, request in enumerate(requests)], batch_size=batch_size
         )
         async with stream:
-            outcomes = [outcome async for outcome in stream]
+            if request_budget_ends:
+                outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+                assert str(error) == "physical request budget exhausted"
+            else:
+                outcomes = [outcome async for outcome in stream]
     report = stream.report
     assert report is not None
     return outcomes, report
@@ -523,7 +529,7 @@ async def test_a21_mixed_a_group_the_budget_stops_before_its_send_counts_like_a_
     v3 = _v3(2)
     transport = ScriptedTransport((ScriptedExchange.batch((bare,), (_item(1),), total=1),))
 
-    outcomes, report = await _run(transport, [bare, v3], policy=_policy(max_requests=1))
+    outcomes, report = await _run(transport, [bare, v3], policy=_policy(max_requests=1), request_budget_ends=True)
 
     assert isinstance(outcomes[0], CommandSuccess)
     assert isinstance(outcomes[1], CommandFailure)
@@ -971,7 +977,7 @@ async def test_a21_lineage_low_request_budget_leaves_unsent_isolation_unknown() 
         (_poisoned(requests), *(_direct(request, {"result": _item(1)}) for request in requests)),
     )
 
-    outcomes, report = await _run(transport, requests, policy=_policy(max_requests=TWO))
+    outcomes, report = await _run(transport, requests, policy=_policy(max_requests=TWO), request_budget_ends=True)
 
     assert report.physical_requests == TWO
     assert report.batch_isolation_requests == 1

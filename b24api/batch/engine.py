@@ -45,6 +45,7 @@ from b24api.execution import (
     WorkClass,
 )
 from b24api.execution.executor import (
+    _HOLD_REFUSAL,
     _is_retryable,
     _Lineage,
     _raise_embedded_result_error,
@@ -91,6 +92,8 @@ class _RoundOptions:
     advisory_totals: bool
     strict_envelope: bool
     strict_json_members: bool
+    # Whether a command held longer than its envelope's first send may wait is left out (``_split_held``).
+    split_held: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,12 +253,18 @@ class BatchExecutor:
         strict_envelope: bool = False,
         strict_json_members: bool = False,
         on_envelope: Callable[[], None] | None = None,
+        split_held: bool = False,
     ) -> tuple[BatchOutcome, ...]:
         """Execute one admitted chunk: classic BARE and native v3 commands never share an envelope.
 
         ``on_envelope`` is called once as each admitted envelope group starts its first round, the 2.5.2 rule for
         an admitted chunk: the group counts even when the budget then stops its first send. Halted groups, replay
         rounds, envelope retries and isolation requests are not counted.
+
+        ``split_held`` is set for a user's logical batch, whose commands are independent outcomes: a command whose
+        own method is held longer than its envelope's first send may wait is left out so that the others go. Pages
+        of a traversal, and the commands a dispatcher batches, are not split: they wait at the permit, as they would
+        sent one by one.
         """
         eligible, rejected = self._partition_capabilities(commands)
         settled: Mapping[int, BatchOutcome] = {}
@@ -269,7 +278,7 @@ class BatchExecutor:
                 for command in commands
             }
         elif eligible:
-            options = _RoundOptions(halt, advisory_totals, strict_envelope, strict_json_members)
+            options = _RoundOptions(halt, advisory_totals, strict_envelope, strict_json_members, split_held)
             settled = await self._execute_groups(eligible, context=context, options=options, on_envelope=on_envelope)
         # Every outcome of the chunk leaves the engine through the one mapping from execution facts.
         return tuple(_by_facts(outcome) for outcome in _merge_outcomes(commands, tuple(settled.values()), rejected))
@@ -293,12 +302,41 @@ class BatchExecutor:
                 continue
             if on_envelope is not None:
                 on_envelope()
-            if group[0].request.route is RouteKind.API_V3:
-                outcomes = await _V3Resolution(self.executor, context).run(group)
+            sending, refused = (
+                self._split_held(group, context=context, whole=options.halt) if options.split_held else (group, {})
+            )
+            settled.update(refused)
+            if not sending:
+                continue
+            if sending[0].request.route is RouteKind.API_V3:
+                outcomes = await _V3Resolution(self.executor, context).run(sending)
             else:
-                outcomes = await self._execute_bare(group, context=context, options=options)
+                outcomes = await self._execute_bare(sending, context=context, options=options)
             settled.update((outcome.command_index, outcome) for outcome in outcomes)
         return settled
+
+    def _split_held(
+        self, group: tuple[_Command, ...], *, context: ExecutionContext, whole: bool
+    ) -> tuple[tuple[_Command, ...], dict[int, BatchOutcome]]:
+        """Split off the commands whose own method is held longer than their envelope's first send may wait.
+
+        ``Executor.plan_first_send`` decides, so one method's cooldown never holds back or fails the other commands
+        of its envelope. A refused command is never sent: it ends with ``BudgetExceededError``, proven not run. A
+        fail-fast envelope is refused whole or sent whole.
+        """
+        plan = self.executor.plan_first_send(
+            context, methods=tuple(frozenset({command.request.method}) for command in group), whole=whole
+        )
+        if plan is None:
+            return group, {}
+        refused = frozenset(plan.sends(_SendPlan.REFUSE))
+        return (
+            tuple(command for position, command in enumerate(group) if position not in refused),
+            {
+                group[position].index: _shared_failure(group[position], BudgetExceededError(_HOLD_REFUSAL))
+                for position in sorted(refused)
+            },
+        )
 
     async def _execute_bare(
         self,
@@ -334,7 +372,7 @@ class BatchExecutor:
         """Plan the next round from the commands that may run again, wait for it, and return what it sends.
 
         Each command is planned on its own safety and its own method's hold within the round's one plan (see
-        ``_Replay``): the round sends the commands the window admits, leaves a SAFE command whose own wait is
+        ``_RoundPlan``): the round sends the commands the window admits, leaves a SAFE command whose own wait is
         longer for a later round, and stops the others, unless it is fail-fast, which is never split.
         """
         if not candidates:

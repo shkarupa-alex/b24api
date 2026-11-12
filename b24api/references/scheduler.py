@@ -22,6 +22,7 @@ from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
 )
+from b24api.execution.context import REQUEST_BUDGET_EXHAUSTED
 from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
     ReferenceStreamItem,
@@ -190,10 +191,11 @@ class ReferenceScheduler:
         self._source_controller: AsyncIteratorController[ReferenceRequest] | None = None
         self.active_references_high_water = 0
         self._next_page_sequence = 0
-        # Lease decisions read the admitted set, source exhaustion and the fast bindings holding or
-        # awaiting a lease; a change of either wakes lease waiters only while one is waiting.
+        # Lease decisions read the admitted set, whether the source has ended (read out, or closed by the spent
+        # request budget: no binding follows either way) and the fast bindings holding or awaiting a lease; a
+        # change of either wakes lease waiters only while one is waiting.
         self._admission: _AdmissionState | None = None
-        self._source_exhausted = False
+        self._source_ended = False
         self._fast_active: set[int] = set()
         self._fast_waiting = 0
 
@@ -308,10 +310,21 @@ class ReferenceScheduler:
         iterator: AsyncIteratorController[ReferenceRequest],
         admission: _AdmissionState,
     ) -> None:
+        """Read and admit bindings until the source ends: read out, or closed by the spent request budget.
+
+        Once the request budget has refused a send, no binding read could be sent, so the producer reads none and
+        ends the source as a read-out source ends. Its own task ends without error either way, so a fail-fast
+        window's failure stays the operation's only error and its cleanup records nothing. Whether the operation
+        ends with the budget is decided by the consumer from the budget itself (``_raise_if_requests_refused``),
+        not from how the source ended: a source may be read out before the budget refuses a send.
+        """
         next_index = 0
         try:
             while True:
                 await admission.slots.acquire()
+                if self.context.requests_refused:
+                    await self._end_source(admission)
+                    return
                 self.producer_state.next_key = _producer_key(next_index)
                 self.producer_state.next_index = next_index
                 self.producer_state.source_pull_in_flight = True
@@ -319,19 +332,10 @@ class ReferenceScheduler:
                 try:
                     reference = await iterator.get(self.context)
                 except StopAsyncIteration:
-                    self.producer_state.source_pull_in_flight = False
-                    self.producer_state.next_key = None
-                    self.producer_state.next_index = None
-                    self.producer_state.touch()
-                    admission.slots.release()
-                    self._source_exhausted = True
-                    await self._wake_lease_waiters()
+                    await self._end_source(admission)
                     return
                 except BaseException:
-                    self.producer_state.source_pull_in_flight = False
-                    self.producer_state.next_key = None
-                    self.producer_state.next_index = None
-                    self.producer_state.touch()
+                    self._clear_pending_pull()
                     admission.slots.release()
                     raise
                 work = _Work(next_index, reference)
@@ -341,17 +345,32 @@ class ReferenceScheduler:
                     self._admit_program(work)
                 # The pulled binding stops counting as a pending pull in the same step it starts counting
                 # as a producer: no coalescing check sees it as neither.
-                self.producer_state.source_pull_in_flight = False
-                self.producer_state.next_key = None
-                self.producer_state.next_index = None
-                self.producer_state.touch()
+                self._clear_pending_pull()
                 self._start_binding(work, admission)
         finally:
-            self.producer_state.source_pull_in_flight = False
-            self.producer_state.next_key = None
-            self.producer_state.next_index = None
-            self.producer_state.touch()
+            self._clear_pending_pull()
             admission.changed.set()
+
+    def _clear_pending_pull(self) -> None:
+        self.producer_state.source_pull_in_flight = False
+        self.producer_state.next_key = None
+        self.producer_state.next_index = None
+        self.producer_state.touch()
+
+    async def _end_source(self, admission: _AdmissionState) -> None:
+        """End the source: no pull is pending, its slot is free, and lease waiters see that no binding follows."""
+        self._clear_pending_pull()
+        admission.slots.release()
+        self._source_ended = True
+        await self._wake_lease_waiters()
+
+    def _raise_if_requests_refused(self) -> None:
+        """End the operation with its request budget once every binding read is settled, if the budget refused a send.
+
+        The budget's own record decides, whether the source was read out before the refusal or closed by it.
+        """
+        if self.context.requests_refused:
+            raise BudgetExceededError(REQUEST_BUDGET_EXHAUSTED)
 
     def _start_binding(self, work: _Work, admission: _AdmissionState) -> None:
         """Start an admitted binding's task: its local non-execution, or the run that retires its producer."""
@@ -565,8 +584,9 @@ class ReferenceScheduler:
             return None
         admission = self._admission
         others = admission is not None and len(admission.tasks) > 1
-        keep = 0 if frontier or not (others or not self._source_exhausted) else self.buffer.head_reserve
-        sources = len(self._fast_active) + (0 if self._source_exhausted else 1)
+        unread = not self._source_ended
+        keep = 0 if frontier or not (others or unread) else self.buffer.head_reserve
+        sources = len(self._fast_active) + (1 if unread else 0)
         cap = max(fast.floor, (pool - keep) // sources)
         available = free - keep
         # G = clamp(free - R_keep, P, G_cap): a share below the quota Q starts from the floor P, while a
@@ -782,6 +802,7 @@ class ReferenceScheduler:
             admission.slots.release()
             await self._wake_lease_waiters()
         await producer
+        self._raise_if_requests_refused()
 
     async def _input(
         self,
@@ -807,6 +828,7 @@ class ReferenceScheduler:
             next_head = min(admission.tasks) if admission.tasks else head + 1
             await self.buffer.advance_head(next_head, max(self._caps.values(), default=self._head_cap(next_head)))
         await producer
+        self._raise_if_requests_refused()
 
     def _record_event_violations(self, event: _Event) -> None:
         self.violations = list(retain_violations((*self.violations, *event.violations)))
