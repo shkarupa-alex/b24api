@@ -152,9 +152,10 @@ send meets a method pause, have changed.
   `Exception` rebuilds an error by calling its class with the message alone. Every class of
   `b24api.errors` now rebuilds without its constructor and keeps its message, attributes and notes, so
   an error can cross a process pool or a task queue. The exception is an error holding a caller's
-  correlation that cannot be pickled: `BatchFailed` and `ReferenceFailed` keep their outcomes with
-  their correlations, so `pickle` and `copy.deepcopy()` fail on them as on the correlation itself
-  (`TypeError` for a lock, for example), while `copy.copy()` still works.
+  correlation: `BatchFailed` and `ReferenceFailed` keep their outcomes with their correlations, so
+  `pickle` fails on them when the correlation cannot be pickled, and `copy.deepcopy()` when it cannot be
+  deep-copied, as on the correlation itself (`TypeError` for a lock, for example), while `copy.copy()`
+  still works.
 - **`Settings.http_timeout` must be finite.** `http_timeout=float("inf")` passed `Settings`, and
   `Bitrix24()` then failed with `ValueError` after it had already opened its HTTPX transport. It is
   now a `ValidationError` of `Settings` (and of `Bitrix24.from_webhook()`), as `nan` already was. The
@@ -284,11 +285,11 @@ the application spends while it holds control: in a `page_stop` callback, or as 
 between pulls of a stream, a binding waiting for the consumer to take its page included. Nothing
 interrupts the application when the budget runs out meanwhile; the next scheduling point ends the
 operation, even when all that is left is to read the end of the source. The report is then `incomplete`,
-with `BudgetExceededError` as its terminal reason and a `budget_exhausted` violation. What the stream
-raises depends on where the budget stopped it, not on the operation: a plain `BudgetExceededError` when
-it stopped a source pull, the end-of-source check or the cleanup, and the fail-fast wrapper
-(`BatchFailed` or `ReferenceFailed`, whose report carries that reason) when it failed a command or a
-binding. Handle both, or read the report. A send cut in flight is another case: its command may have
+with `BudgetExceededError` as its terminal reason and a `budget_exhausted` violation. The stream raises
+a plain `BudgetExceededError`, except that a fail-fast stream whose stop failed a command or a binding
+raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report carries that reason); a stop at a
+source pull, the end-of-source check or the cleanup fails none. So it depends on where the budget
+stopped the stream, not on the operation: handle both, or read the report. A send cut in flight is another case: its command may have
 run, so it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end on that ambiguity
 instead.
 

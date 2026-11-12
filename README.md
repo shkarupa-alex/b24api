@@ -19,8 +19,8 @@ so its HTTP/2 connection pool and rate state are reused. The URL has the form
 path keeps its case, so the token is sent as written and `/REST/` is refused. A default port is dropped
 and any other kept, `.` and `..` segments are resolved, a missing trailing slash is added, and leading
 and trailing control characters U+0000–U+001F and spaces are dropped. A host of non-ASCII letters
-is IDNA-encoded, an empty user name or password (`https://@portal/...`) is dropped, and a host with a
-trailing dot is accepted as written; see
+is IDNA-encoded, an empty userinfo (`https://@portal/...`, `https://:@portal/...`) is dropped, and a
+host with a trailing dot is accepted as written; see
 [the webhook URL rule](https://github.com/shkarupa-alex/b24api/blob/master/docs/migration.md#transport-hygiene-webhook-urls-unsendable-requests-error-chains)
 for all of it. Any other form is refused, one with a user name or password, a query, a fragment, a
 percent-encoded path, or a surrounding DEL (U+007F) or non-ASCII space (a no-break space, for example)
@@ -219,10 +219,10 @@ default `SAFE` requests are also retried after an unstructured 408, 500, 502, 50
 ### Error codes
 
 Every error of `b24api.errors` survives `pickle` and `copy` with its message and attributes, so it can
-cross a process pool or a task queue. The exception is an error that holds a caller's correlation that
-cannot be pickled: `BatchFailed` and `ReferenceFailed` keep their outcomes, each with its correlation,
-so `pickle` and `copy.deepcopy()` fail on them with the error the correlation raises (`TypeError` for a
-lock, for example); `copy.copy()` still works. A structured refusal raises `ApiResponseError`. Its
+cross a process pool or a task queue. The exception is an error that holds a caller's correlation:
+`BatchFailed` and `ReferenceFailed` keep their outcomes, each with its correlation, so `pickle` fails on
+them when the correlation cannot be pickled, and `copy.deepcopy()` when it cannot be deep-copied, with
+the error the correlation raises (`TypeError` for a lock, for example); `copy.copy()` still works. A structured refusal raises `ApiResponseError`. Its
 message, `wire_code`, `normalized_code`, `code` (lower case) and `to_safe_dict()` name the server's
 code, so failures can be told apart:
 
@@ -881,10 +881,11 @@ spends while it holds control: in a `page_stop` callback, or as a consumer that 
 of the stream. Nothing interrupts the application when the budget runs out meanwhile; the next
 scheduling point ends the operation, even when all that is left is to read the end of the source. The
 report is then `incomplete`, with `BudgetExceededError` as its terminal reason and a `budget_exhausted`
-violation. What the stream raises depends on where the budget stopped it, not on the operation: a
-plain `BudgetExceededError` when it stopped a source pull, the end-of-source check or the cleanup, and
-the fail-fast wrapper (`BatchFailed` or `ReferenceFailed`, whose report carries that reason) when it
-failed a command or a binding. Handle both, or read the report. A send cut in flight is another case:
+violation. The stream raises a plain `BudgetExceededError`, except that a fail-fast stream whose stop
+failed a command or a binding raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report
+carries that reason); a stop at a source pull, the end-of-source check or the cleanup fails none. So it
+depends on where the budget stopped the stream, not on the operation: handle both, or read the
+report. A send cut in flight is another case:
 its command may have run, so it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end
 on that ambiguity instead.
 
