@@ -29,6 +29,7 @@ from b24api.errors import (
     ApiResponseError,
     B24ApiError,
     BatchCommandError,
+    BudgetExceededError,
     HTTPGatewayError,
     ProtocolError,
 )
@@ -39,6 +40,8 @@ from b24api.execution.executor import (
     _raise_embedded_result_error,
     _refused_before_running,
     _RequestAttempts,
+    _retry_refusal,
+    _SendPlan,
 )
 from b24api.transport.base import WireRequest
 
@@ -72,6 +75,8 @@ class _V3Resolution:
         """Send the group's envelopes until every command has its one settled outcome."""
         safe = all(command.request.replay_safety is ReplaySafety.SAFE for command in commands)
         pending = commands
+        # The refusal of the whole envelope that the pending commands are sent again after; ``None`` after any other.
+        refusal: B24ApiError | None = None
         while pending:
             attempt = await self.executor._execute_physical_batch_attempt(  # noqa: SLF001 - batch-owned physical port
                 _envelope(pending),
@@ -79,33 +84,39 @@ class _V3Resolution:
                 attempts=self.attempts,
                 methods=frozenset(command.request.method for command in pending),
             )
-            pending = await self._classify(pending, attempt, safe=safe)
+            pending, refusal = await self._classify(pending, attempt, safe=safe, refusal=refusal)
         return tuple(self.settled[command.index] for command in commands)
 
     async def _classify(
-        self, pending: tuple[_Command, ...], attempt: PhysicalAttemptOutcome, *, safe: bool
-    ) -> tuple[_Command, ...]:
-        """Classify one physical attempt and return the commands that are sent again."""
+        self,
+        pending: tuple[_Command, ...],
+        attempt: PhysicalAttemptOutcome,
+        *,
+        safe: bool,
+        refusal: B24ApiError | None,
+    ) -> tuple[tuple[_Command, ...], B24ApiError | None]:
+        """Classify one physical attempt; return the commands sent again, and the envelope refusal they follow."""
         if attempt.kind == "cancelled":
             # Cancellation after dispatch: nothing is replayed and nothing is guessed; it propagates.
             raise attempt.error if isinstance(attempt.error, BaseException) else asyncio.CancelledError
         if attempt.kind == "response" and attempt.response is not None:
             elements = _complete_array(attempt.response, len(pending))
             if elements is not None:
-                return await self._attributed(pending, elements, attempt.response)
+                return await self._attributed(pending, elements, attempt.response), None
             malformed = ProtocolError(
                 "REST v3 batch result is not a complete array of command responses",
                 evidence=attempt.response.evidence,
             )
-            return await self._unresolved(pending, malformed, safe=safe)
+            return await self._unresolved(pending, malformed, safe=safe), None
         error = attempt.error
         if not isinstance(error, B24ApiError):
             raise TypeError("physical batch attempt failed without a typed error")
         if not attempt.dispatch_started:
-            return self._stop(pending, error)
+            return self._stop(pending, error, refusal=refusal), None
         if attempt.transport_proves_not_accepted or _unstructured_refusal(error, self.context):
-            return await self._not_run(pending, error, safe=safe)
-        return await self._unresolved(pending, error, safe=safe)
+            replay = await self._not_run(pending, error, safe=safe)
+            return replay, error if replay else None
+        return await self._unresolved(pending, error, safe=safe), None
 
     async def _attributed(
         self, pending: tuple[_Command, ...], elements: list[JsonValue], response: Response
@@ -116,15 +127,11 @@ class _V3Resolution:
         )
         # Each element answered this send; a command sent again carries only what earlier sends left open.
         self.attempts.classified(None, may_have_run=False)
-        cooldown = 0.0
         for command, outcome in zip(pending, outcomes, strict=True):
             self.last[command.index] = outcome
             error = outcome.error if isinstance(outcome, BatchFailure) else None
             if isinstance(error, BatchCommandError) and error.normalized_code == _OPERATION_TIME_LIMIT:
-                observed = await self.context.coordinator.observe_api_throttle(
-                    command.request.method, error.normalized_code
-                )
-                cooldown = max(cooldown, observed)
+                await self.context.coordinator.observe_api_throttle(command.request.method, error.normalized_code)
         # A SAFE command is sent again after its own transient error; any other only after a listed refusal.
         replay = tuple(
             command
@@ -135,9 +142,7 @@ class _V3Resolution:
         )
         replayed = {command.index for command in replay}
         self._settle(command for command in pending if command.index not in replayed)
-        if replay and await self.executor.pause_before_replay(
-            self.context, attempts=self.attempts, method_cooldown=cooldown
-        ):
+        if replay and await self._pause(replay) is None:
             return replay
         self._settle(replay)
         return ()
@@ -177,10 +182,16 @@ class _V3Resolution:
         for command in pending:
             self.last[command.index] = _shared_failure(command, error)
         safety = ReplaySafety.SAFE if safe else ReplaySafety.UNKNOWN
-        if _is_retryable(error, safety=safety, policy=self.context.policy) and await self.executor.pause_before_replay(
-            self.context, attempts=self.attempts
-        ):
-            return pending
+        if _is_retryable(error, safety=safety, policy=self.context.policy):
+            stop = await self._pause(pending)
+            if stop is None:
+                return pending
+            # As a lone request and a classic batch end: with the budget that stopped the retry, caused by the refusal.
+            stopped = BudgetExceededError(stop)
+            stopped.__cause__ = error
+            self.attempts.record(stopped, self.context.policy)
+            for command in pending:
+                self.last[command.index] = _shared_failure(command, stopped)
         self._settle(pending)
         return ()
 
@@ -191,7 +202,7 @@ class _V3Resolution:
         self.context.record_ambiguous_physical_attempt()
         self.attempts.classified(error, may_have_run=True)
         self.attempts.record(error, self.context.policy)
-        cooldown = await self._observe_abort_throttle(pending, error)
+        await self._observe_abort_throttle(pending, error)
         for command in pending:
             self.last[command.index] = _shared_failure(command, error)
         if (
@@ -200,7 +211,7 @@ class _V3Resolution:
             and _is_retryable(error, safety=ReplaySafety.SAFE, policy=self.context.policy)
         ):
             self.envelope_retry_used = True
-            if await self.executor.pause_before_replay(self.context, attempts=self.attempts, method_cooldown=cooldown):
+            if await self._pause(pending) is None:
                 return pending
         if safe and self._isolation_allowed():
             for command, outcome in zip(pending, await self._isolate(pending), strict=True):
@@ -208,8 +219,21 @@ class _V3Resolution:
         self._settle(pending)
         return ()
 
-    def _stop(self, pending: tuple[_Command, ...], error: B24ApiError) -> tuple[_Command, ...]:
-        """A round stopped before dispatch leaves each command the outcome it last received."""
+    def _stop(
+        self, pending: tuple[_Command, ...], error: B24ApiError, *, refusal: B24ApiError | None
+    ) -> tuple[_Command, ...]:
+        """A round stopped before dispatch leaves each command the outcome it last received.
+
+        Sent again after a refusal of the whole envelope and stopped by the budget before the send (at the permit,
+        or at the send for too little window after the wait), the commands end as a classic batch's and a lone
+        request's do: with that stop, caused by the refusal.
+        """
+        if refusal is not None and isinstance(error, BudgetExceededError):
+            if error.__cause__ is None:
+                error.__cause__ = refusal
+            self.attempts.record_unsent(error)
+            for command in pending:
+                self.last[command.index] = _shared_failure(command, error)
         for command in pending:
             self.last.setdefault(command.index, _shared_failure(command, error))
         self._settle(pending)
@@ -219,15 +243,25 @@ class _V3Resolution:
         for command in commands:
             self.settled[command.index] = self.last[command.index]
 
-    async def _observe_abort_throttle(self, pending: tuple[_Command, ...], error: B24ApiError) -> float:
+    async def _observe_abort_throttle(self, pending: tuple[_Command, ...], error: B24ApiError) -> None:
         """A top-level throttle code cannot be attributed, so every distinct inner method observes it."""
         if not isinstance(error, ApiResponseError) or error.normalized_code != _OPERATION_TIME_LIMIT:
-            return 0.0
-        cooldown = 0.0
+            return
         for method in sorted({command.request.method for command in pending}):
-            observed = await self.context.coordinator.observe_api_throttle(method, error.normalized_code)
-            cooldown = max(cooldown, observed)
-        return cooldown
+            await self.context.coordinator.observe_api_throttle(method, error.normalized_code)
+
+    async def _pause(self, commands: tuple[_Command, ...]) -> str | None:
+        """Wait before sending ``commands`` again; return why the group's budget forbids another envelope, if it does.
+
+        A group carries one safety class and travels in one envelope, so its replay is admitted or refused whole.
+        """
+        safety = envelope_safety(command.request.replay_safety for command in commands)
+        methods = frozenset(command.request.method for command in commands)
+        plan = self.executor.plan_replay(self.context, attempts=self.attempts, sends=((safety, methods),))
+        if plan is None or plan.plans != (_SendPlan.SEND,):
+            return _retry_refusal(plan)
+        await self.executor.replay_after(self.context, attempts=self.attempts, pause=plan.pause)
+        return None
 
     def _isolation_allowed(self) -> bool:
         """One bounded attribution phase, only within the inherited attempt and retry-time budgets."""

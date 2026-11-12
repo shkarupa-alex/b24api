@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import contextlib
+import datetime
 import email.utils
 import math
 import time
@@ -34,9 +35,13 @@ def _retry_delay(
 
 
 def _retry_after_seconds(wire: WireResponse) -> float | None:
-    """Return the bounded host cooldown hinted by a response; ``Retry-After`` has priority."""
+    """Return the bounded host cooldown hinted by a response; ``Retry-After`` has priority.
+
+    A hint given as a date or an epoch is measured against the response's own ``Date``, the server's clock that
+    set it, so a local clock running ahead cannot shrink it; the local wall clock stands in only without one.
+    """
     headers = wire.header_map
-    wall_now = time.time()
+    wall_now = _server_now(headers.get("date"))
     retry_after = headers.get("retry-after")
     if retry_after:
         return parse_retry_after(retry_after, now=wall_now, cap=_RETRY_AFTER_CAP_SECONDS)
@@ -86,6 +91,26 @@ def parse_rate_limit_reset(raw: str, *, wall_now: float, cap: float) -> float | 
     return min(value, cap)
 
 
+def _server_now(date: str | None) -> float:
+    """Return the epoch time of a response's ``Date`` header, or the local wall clock without a usable one."""
+    parsed = _http_date(date) if date else None
+    return time.time() if parsed is None else parsed
+
+
+def _http_date(raw: str) -> float | None:
+    """Return the epoch time of an HTTP date, or ``None`` for an unusable value.
+
+    RFC 9110 dates are GMT, so a date without a zone (the asctime form or ``-0000``) is read as UTC, never as
+    the local time zone that a naive ``datetime`` would assume.
+    """
+    with contextlib.suppress(TypeError, ValueError, OverflowError):
+        parsed = email.utils.parsedate_to_datetime(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.UTC)
+        return parsed.timestamp()
+    return None
+
+
 def _finite_non_negative(raw: str) -> float | None:
     with contextlib.suppress(ValueError):
         value = float(raw)
@@ -95,10 +120,8 @@ def _finite_non_negative(raw: str) -> float | None:
 
 
 def _http_date_delay(raw: str, *, now: float, cap: float) -> float | None:
-    with contextlib.suppress(TypeError, ValueError, OverflowError):
-        parsed = email.utils.parsedate_to_datetime(raw)
-        return min(max(0.0, parsed.timestamp() - now), cap)
-    return None
+    moment = _http_date(raw)
+    return None if moment is None else min(max(0.0, moment - now), cap)
 
 
 def _throttle_reason(error: B24ApiError) -> str:

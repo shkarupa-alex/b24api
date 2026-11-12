@@ -3,7 +3,7 @@
 from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 from b24api._error_types import ErrorOrigin
@@ -46,11 +46,14 @@ from b24api.execution import (
 )
 from b24api.execution.executor import (
     _is_retryable,
+    _Lineage,
     _raise_embedded_result_error,
     _refused_before_running,
     _RequestAttempts,
+    _retry_refusal,
+    _SendPlan,
+    _Settled,
 )
-from b24api.execution.facts import Execution, execution
 
 if TYPE_CHECKING:
     from b24api.contracts.evidence import ResponseEvidence
@@ -92,9 +95,123 @@ class _RoundOptions:
 
 @dataclass(frozen=True, slots=True)
 class _Round:
+    """What one classic round gave its commands, which of them may run again, and the envelope's own failure.
+
+    ``failure`` is set when the envelope failed as a whole (no entry answered a command); ``None`` when each
+    command's entry answered it. ``send`` is what the round's send alone left open, the same for each command it
+    carried; nothing sent when the round was stopped before its send.
+    """
+
     outcomes: tuple[BatchOutcome, ...]
+    send: _Lineage
     replay: tuple[_Command, ...] = ()
-    method_cooldown: float = 0.0
+    failure: B24ApiError | None = None
+
+    @property
+    def dispatched(self) -> bool:
+        """Return whether the round's envelope was handed to the transport."""
+        return self.send.latest is not _Settled.NOTHING_SENT
+
+    @property
+    def answered_whole(self) -> bool:
+        """Return whether the envelope failed as a whole with an answer that leaves nothing open: a refusal."""
+        return self.failure is not None and self.send.latest is _Settled.ANSWERED
+
+
+@dataclass(frozen=True, slots=True)
+class _Answered:
+    """Its own entry answered the command, with a failure it may be sent again after."""
+
+    outcome: BatchOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class _Follows:
+    """The command's envelope failed as a whole, with a failure it may be sent again after."""
+
+    failure: B24ApiError
+
+
+@dataclass(frozen=True, slots=True)
+class _Waiting:
+    """A command that may run again: what its latest send gave it, and what the sends it was in left open."""
+
+    state: _Answered | _Follows
+    lineage: _Lineage
+
+
+def _state(outcome: BatchOutcome, sent: _Round) -> _Answered | _Follows:
+    """Return what a sent round left a command it may send again: its entry's answer, or its envelope's failure."""
+    return _Answered(outcome) if sent.failure is None else _Follows(sent.failure)
+
+
+@dataclass(slots=True)
+class _Lineup:
+    """Where each command of one classic envelope stands between its rounds.
+
+    ``settled`` holds each command's final outcome; ``waiting`` each command that may run again, in one state:
+    answered by its own entry, an answer a stop leaves it; or following the failure of its envelope as a whole,
+    which the budget that stops it reports as its cause, as a lone request's would be. Each waiting command
+    keeps the lineage of the sends it was in: a SAFE command the last plan left for a later round is
+    ``carried``, misses that round, and is planned again with the next round's commands, so what a round's
+    send left open is added only to the commands that were in it.
+    """
+
+    settled: dict[int, BatchOutcome] = field(default_factory=dict)
+    waiting: dict[int, _Waiting] = field(default_factory=dict)
+    carried: tuple[_Command, ...] = ()
+
+    def after_round(self, sent: _Round, commands: tuple[_Command, ...]) -> tuple[_Command, ...]:
+        """Record what a round gave its commands; return those that may run again, carried ones included.
+
+        A round proves nothing new about a command when it was stopped before its send, or when its envelope was
+        refused as a whole after the command's own entry answered it: the command stays as it was. A budget that
+        stops a round before its send stops each command it holds as ``stop`` does, whichever command's failure
+        asked for that round.
+        """
+        again = {command.index for command in sent.replay}
+        for command, outcome in zip(commands, sent.outcomes, strict=True):
+            before = self.waiting.pop(command.index, None)
+            if before is None:
+                self._after_first(command, outcome, sent, again=command.index in again)
+            elif command.index in again and (
+                not sent.dispatched or (isinstance(before.state, _Answered) and sent.answered_whole)
+            ):
+                self.waiting[command.index] = _Waiting(before.state, before.lineage.after(sent.send))
+            elif command.index in again:
+                self.waiting[command.index] = _Waiting(_state(outcome, sent), before.lineage.after(sent.send))
+            elif not sent.dispatched and isinstance(sent.failure, BudgetExceededError):
+                self._stop(command, before, str(sent.failure))
+            else:
+                self._settle(outcome, before.lineage)
+        candidates, self.carried = (*sent.replay, *self.carried), ()
+        return candidates
+
+    def _after_first(self, command: _Command, outcome: BatchOutcome, sent: _Round, *, again: bool) -> None:
+        """Record what the first round gave a command, which nothing was sent for before."""
+        if again:
+            self.waiting[command.index] = _Waiting(_state(outcome, sent), _Lineage().after(sent.send))
+        else:
+            self._settle(outcome, _Lineage())
+
+    def stop(self, commands: tuple[_Command, ...], refusal: str) -> None:
+        """End the commands the budget keeps from being sent again, for ``refusal``."""
+        for command in commands:
+            self._stop(command, self.waiting.pop(command.index), refusal)
+
+    def _stop(self, command: _Command, waiting: _Waiting, refusal: str) -> None:
+        """End a command the budget keeps from being sent again: its entry's answer, or the budget it caused."""
+        if isinstance(waiting.state, _Answered):
+            self._settle(waiting.state.outcome, waiting.lineage)
+            return
+        error = BudgetExceededError(refusal)
+        error.__cause__ = waiting.state.failure
+        waiting.lineage.record_unsent(error)
+        self._settle(_shared_failure(command, error), waiting.lineage)
+
+    def _settle(self, outcome: BatchOutcome, lineage: _Lineage) -> None:
+        """Make an outcome final, adding what the command's own sends before it left open (``lineage``)."""
+        self.settled[outcome.command_index] = _by_facts(outcome, lineage.left_open())
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,25 +308,55 @@ class BatchExecutor:
         options: _RoundOptions,
     ) -> tuple[BatchOutcome, ...]:
         """Run one classic batch envelope and its replay rounds."""
-        settled: dict[int, BatchOutcome] = {}
-        # Every command of a replay round was sent in each round before it, so one count, one retry clock and
-        # one execution lineage serve them all.
-        pending, rounds, attempts = eligible, 0, _RequestAttempts()
+        # The rounds share one attempt count, one retry window and one wait; each command keeps the lineage of the
+        # rounds it was in (``_Lineup``). The engine alone decides every round after the first, whether the
+        # envelope failed as a whole or its entries answered: the executor sends each round once.
+        attempts = _RequestAttempts(caller_retries=True)
+        lineup = _Lineup()
+        pending = eligible
         while pending:
             sent = await self._dispatch_round(pending, context=context, options=options, attempts=attempts)
-            # A replay the budget stopped leaves each command the outcome it last received.
-            settled.update(
-                (outcome.command_index, outcome) for outcome in sent.outcomes if not (rounds and _stopped(outcome))
-            )
-            rounds += 1
             # Only the commands that may run again are sent again, in a smaller physical batch; the rest keep
-            # the outcome this round gave them, which also stands for a replay the budget does not allow.
-            if not sent.replay or not await self.executor.pause_before_replay(
-                context, attempts=attempts, method_cooldown=sent.method_cooldown
-            ):
-                break
-            pending = sent.replay
-        return tuple(settled.values())
+            # the outcome this round gave them.
+            candidates = lineup.after_round(sent, pending)
+            pending = await self._next_round(candidates, lineup, context=context, attempts=attempts, options=options)
+        return tuple(lineup.settled.values())
+
+    async def _next_round(
+        self,
+        candidates: tuple[_Command, ...],
+        lineup: _Lineup,
+        *,
+        context: ExecutionContext,
+        attempts: _RequestAttempts,
+        options: _RoundOptions,
+    ) -> tuple[_Command, ...]:
+        """Plan the next round from the commands that may run again, wait for it, and return what it sends.
+
+        Each command is planned on its own safety and its own method's hold within the round's one plan (see
+        ``_Replay``): the round sends the commands the window admits, leaves a SAFE command whose own wait is
+        longer for a later round, and stops the others, unless it is fail-fast, which is never split.
+        """
+        if not candidates:
+            return ()
+        plan = self.executor.plan_replay(
+            context,
+            attempts=attempts,
+            sends=tuple((command.request.replay_safety, frozenset({command.request.method})) for command in candidates),
+            whole=options.halt,
+        )
+        if plan is None:
+            lineup.stop(candidates, _retry_refusal(plan))
+            return ()
+        sending, carried, refused = (
+            tuple(candidates[index] for index in plan.sends(each))
+            for each in (_SendPlan.SEND, _SendPlan.CARRY, _SendPlan.REFUSE)
+        )
+        lineup.carried = carried
+        lineup.stop(refused, _retry_refusal(plan))
+        if sending:
+            await self.executor.replay_after(context, attempts=attempts, pause=plan.pause)
+        return sending
 
     async def _dispatch_round(
         self,
@@ -226,7 +373,9 @@ class BatchExecutor:
         """
         request = _batch_request(commands, halt=options.halt)
         spent = attempts.used
-        # A failure of the executor carries the facts it recorded; one of the engine's own is recorded here.
+        attempts.start_round()
+        # A failure of the executor carries the facts it recorded about this round's send; one of the engine's own
+        # is recorded here. What each command's earlier sends left open is its own (``_Lineup``).
         failure: B24ApiError | None = None
         owned = False
         try:
@@ -242,6 +391,9 @@ class BatchExecutor:
             raise
         except B24ApiError as error:
             failure = error
+            if attempts.used == spent and spent:
+                # The budget stopped this round before its send: every command it holds was sent before.
+                attempts.record_unsent(error)
         else:
             try:
                 envelope = _decode_batch_envelope(
@@ -256,26 +408,22 @@ class BatchExecutor:
             scoped = _scoped(failure, request, strict=options.strict_envelope)
             if (owned or scoped is not failure) and attempts.used > spent:
                 attempts.record(scoped, context.policy)
-            # The SAFE commands are sent again after any failure a SAFE request would retry, whether or not the
-            # batch may have run and whatever its other commands are.
-            replay = () if options.halt or not _safe_replay_allowed(scoped, context) else commands
-            safe = tuple(command for command in replay if command.request.replay_safety is ReplaySafety.SAFE)
-            return _Round(tuple(_shared_failure(command, scoped) for command in commands), safe)
+            replay = _envelope_replay(
+                commands, scoped, context, refused_at_send=failure is attempts.refusal, halt=options.halt
+            )
+            shared = tuple(_shared_failure(command, scoped) for command in commands)
+            return _Round(shared, attempts.lineage, replay, scoped)
 
         outcomes = self._decode_commands(commands, envelope, context=context, options=options, attempts=attempts)
         # Each command's entry answered this send; a command sent again carries only what earlier sends left open.
         attempts.classified(None, may_have_run=False)
-        method_cooldown = 0.0
         for command, outcome in zip(commands, outcomes, strict=True):
             if (
                 isinstance(outcome, BatchFailure)
                 and isinstance(outcome.error, BatchCommandError)
                 and outcome.error.normalized_code == "operation_time_limit"
             ):
-                cooldown = await context.coordinator.observe_api_throttle(
-                    command.request.method, outcome.error.normalized_code
-                )
-                method_cooldown = max(method_cooldown, cooldown)
+                await context.coordinator.observe_api_throttle(command.request.method, outcome.error.normalized_code)
         # A SAFE command is sent again after its own transient error; any other only after a listed refusal.
         replay = (
             ()
@@ -288,7 +436,7 @@ class BatchExecutor:
                 and outcome.replay_disposition is ReplayDisposition.ELIGIBLE
             )
         )
-        return _Round(outcomes, replay, method_cooldown)
+        return _Round(outcomes, attempts.lineage, replay)
 
     def _batch_route(self, request: Request) -> RouteKind | None:
         """Return the envelope dialect a request can travel in, or ``None`` when no envelope represents it."""
@@ -665,6 +813,11 @@ def _is_safe(command: _Command) -> bool:
     return command.request.replay_safety is ReplaySafety.SAFE
 
 
+def _safe_only(commands: tuple[_Command, ...]) -> tuple[_Command, ...]:
+    """Return the SAFE commands, which may be sent again whatever the failure or window left proves."""
+    return tuple(command for command in commands if _is_safe(command))
+
+
 def _unattributed(
     command: _Command,
     envelope: _BatchEnvelope,
@@ -699,18 +852,6 @@ def _unattributed(
     return _shared_failure(command, error)
 
 
-def _stopped(outcome: BatchOutcome) -> bool:
-    """Return whether the budget stopped a replay of the command without leaving it possibly run.
-
-    Such a round proves nothing new about the command, so the outcome its last answered round gave it stands.
-    """
-    return (
-        isinstance(outcome, BatchFailure)
-        and isinstance(outcome.error, BudgetExceededError)
-        and execution(outcome.error) is not Execution.POSSIBLY_RUN
-    )
-
-
 def _scoped(error: B24ApiError, request: Request, *, strict: bool) -> B24ApiError:
     """Return a strict envelope's protocol failure scoped to the physical batch request it answered."""
     if not (strict and isinstance(error, ProtocolError) and error.request_summary is None):
@@ -727,10 +868,32 @@ def _scoped(error: B24ApiError, request: Request, *, strict: bool) -> B24ApiErro
     return scoped
 
 
-def _safe_replay_allowed(error: B24ApiError, context: ExecutionContext) -> bool:
-    """Return whether the failure that made a batch's outcome unknown would let a SAFE request retry."""
+def _envelope_replay(
+    commands: tuple[_Command, ...], error: B24ApiError, context: ExecutionContext, *, refused_at_send: bool, halt: bool
+) -> tuple[_Command, ...]:
+    """Return the commands of a failed envelope that may be sent again.
+
+    Each may be when a lone request of its safety would be retried after the failure: a SAFE one after any
+    transient failure, the others only when it proves the envelope did not run. A round refused at its send, for
+    too little window after its wait, carries its SAFE commands on. A fail-fast batch goes again whole or not at all.
+    """
+    replay = (
+        _safe_only(commands)
+        if refused_at_send
+        else tuple(command for command in commands if _replayable(error, command, context))
+    )
+    return () if halt and len(replay) < len(commands) else replay
+
+
+def _replayable(error: B24ApiError, command: _Command, context: ExecutionContext) -> bool:
+    """Return whether a lone request of the command's safety would be retried after its envelope's failure.
+
+    A failure that made the envelope's outcome unknown is judged by the failure that caused it.
+    """
     cause = error.__cause__ if isinstance(error, AmbiguousExecutionError) else error
-    return isinstance(cause, B24ApiError) and _is_retryable(cause, safety=ReplaySafety.SAFE, policy=context.policy)
+    return isinstance(cause, B24ApiError) and _is_retryable(
+        cause, safety=command.request.replay_safety, policy=context.policy
+    )
 
 
 def _raise_source_error(error: Exception) -> None:

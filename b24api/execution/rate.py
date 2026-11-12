@@ -213,6 +213,16 @@ class RateCoordinator:
             return 0.0
         return await self.observe_operation_time_limit(method, delay=delay)
 
+    def admission_delay(self, methods: frozenset[str]) -> float:
+        """Return how long the host cooldown and the cooldowns of ``methods`` still hold a permit for them."""
+        if self._state is CoordinatorState.CLOSED:
+            return 0.0
+        now = self._clock()
+        holds = [self._method_until.get(method, now) for method in methods]
+        if self._state is CoordinatorState.COOLDOWN and self._cooldown_until is not None:
+            holds.append(self._cooldown_until)
+        return max(0.0, max((until - now for until in holds), default=0.0))
+
     def bind_host(self, host: str) -> None:
         """Refuse to share a coordinator between distinct portal hosts."""
         if not isinstance(host, str) or not host:

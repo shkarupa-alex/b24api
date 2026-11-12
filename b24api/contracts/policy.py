@@ -188,9 +188,16 @@ class UnknownRequestCollector:
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
-    """Explicit retry classifications and delay bounds."""
+    """Explicit retry classifications and delay bounds.
 
-    transient_http_statuses: frozenset[int] = frozenset({423, 425, 429, 500, 502, 503, 507})
+    ``transient_http_statuses`` lists the unstructured statuses worth another attempt: the refusals 423, 425 and
+    429, and the timeout or overload of the server or a gateway (408, 500, 502, 503, 504). A status the ambiguity
+    policy holds ambiguous, as 408 and every 5xx are by default, is retried for SAFE work alone, since the request
+    may have run before it; a listed refusal is retried whatever the safety. 507 is not listed: insufficient storage
+    does not pass while a request retries.
+    """
+
+    transient_http_statuses: frozenset[int] = frozenset({408, 423, 425, 429, 500, 502, 503, 504})
     # The classic request and time quotas, and the REST 3.0 load limits; codes compare without letter case.
     transient_api_codes: frozenset[str] = frozenset(
         {"query_limit_exceeded", "operation_time_limit", *TRANSIENT_V3_ERROR_CODES}
@@ -261,7 +268,13 @@ class ConsistencyPolicy:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionPolicy:
-    """Universal execution ceilings; every value is checked before scheduling."""
+    """Universal execution ceilings; every value is checked before scheduling.
+
+    ``max_elapsed`` bounds the whole operation, including each request's wait for its first coordinator permit.
+    ``max_retry_elapsed_per_request`` is each request's retry window: it opens when the first send is granted its
+    permit and bounds every send, retry wait and later permit wait after it. A send has no timeout of its own; it
+    may use what is left of the window.
+    """
 
     max_requests: int = 10_000
     max_pages: int = 10_000

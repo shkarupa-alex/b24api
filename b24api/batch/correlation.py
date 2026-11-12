@@ -9,10 +9,11 @@ from b24api.batch.outcome import BatchCommandEvidence, BatchFailure, BatchOutcom
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ReplaySafety, Request
 from b24api.errors import B24ApiError, ProtocolError, TransportError
-from b24api.execution.facts import ambiguity_of, record_withheld
+from b24api.execution.facts import ambiguity_of, possible_execution, record_withheld
 
 if TYPE_CHECKING:
     from b24api.contracts.response import Response
+    from b24api.execution.executor import _PossiblyRun
 
 
 class _BatchNotExecutedError(ProtocolError):
@@ -61,19 +62,22 @@ def _shared_failure(command: _Command, error: B24ApiError) -> BatchFailure:
     )
 
 
-def _by_facts(outcome: BatchOutcome) -> BatchOutcome:
+def _by_facts(outcome: BatchOutcome, earlier: _PossiblyRun | None = None) -> BatchOutcome:
     """Give a failed command the outcome its execution facts call for; the batch dialects report only this.
 
-    Until a chunk's outcomes leave the engine, a failure keeps its own error and replay disposition, which
-    decide whether it is sent again; a command that may have run then carries the ambiguity that explains it.
+    Until a command's outcome is final, its failure keeps its own error and replay disposition, which decide
+    whether it is sent again; a command that may have run then carries the ambiguity that explains it.
+    ``earlier`` is a send of the command before the one its failure records that may have run: a failure a
+    classic round shares records only that round's send, which a command carried past a round did not share.
     """
     if isinstance(outcome, BatchSuccess) or not isinstance(outcome.error, B24ApiError):
         return outcome
-    ambiguity = ambiguity_of(
-        outcome.error,
-        request_summary=outcome.request.summary,
-        declared_unsafe=outcome.replay_safety is ReplaySafety.UNSAFE,
-    )
+    summary, unsafe = outcome.request.summary, outcome.replay_safety is ReplaySafety.UNSAFE
+    ambiguity = ambiguity_of(outcome.error, request_summary=summary, declared_unsafe=unsafe)
+    if ambiguity is None and earlier is not None:
+        ambiguity = possible_execution(
+            outcome.error, request_summary=summary, declared_unsafe=unsafe, unproven=earlier.failure
+        )
     if ambiguity is None:
         return outcome
     return dataclasses.replace(outcome, error=ambiguity, replay_disposition=ReplayDisposition.NOT_ELIGIBLE)

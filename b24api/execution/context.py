@@ -267,12 +267,12 @@ class ExecutionContext:
             raise RuntimeError("identity evidence accounting is inconsistent")
         self._retained_identity_keys -= count
 
-    def remaining_time(self, *, retry_started: float) -> float:
-        """Return the tighter operation or retry time remaining."""
-        return min(
-            self.policy.max_elapsed - self.elapsed,
-            self.policy.max_retry_elapsed_per_request - max(0.0, self._clock() - retry_started),
-        )
+    def remaining_time(self, *, retry_started: float | None) -> float:
+        """Return the tighter operation or retry time remaining; before its window opens, only the operation's."""
+        operation = self.policy.max_elapsed - self.elapsed
+        if retry_started is None:
+            return operation
+        return min(operation, self.policy.max_retry_elapsed_per_request - max(0.0, self._clock() - retry_started))
 
     async def snapshot(self) -> ExecutionSnapshot:
         """Return the current immutable snapshot."""

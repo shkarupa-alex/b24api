@@ -61,6 +61,7 @@ from b24api.transport.protocol import ProtocolCodec
 
 if TYPE_CHECKING:
     from b24api.contracts.request_summary import RequestSummary
+    from b24api.execution.rate import _Permit
     from b24api.transport.base import Transport, WireResponse
 
 type Clock = Callable[[], float]
@@ -136,6 +137,19 @@ class _Lineage:
             raise RuntimeError("a lineage with nothing sent has no answer to classify")
         return _Lineage(_PossiblyRun(failure) if may_have_run else _Settled.ANSWERED, self.earlier)
 
+    def after(self, send: _Lineage) -> _Lineage:
+        """Return this lineage after one more send that ended as the lineage of that send alone (``send``) says.
+
+        A send that never left (``send`` has nothing sent) changes nothing.
+        """
+        if send.latest is _Settled.NOTHING_SENT:
+            return self
+        return _Lineage(send.latest, self.left_open())
+
+    def left_open(self) -> _PossiblyRun | None:
+        """Return the latest of these sends that may have run, as a send after them sees it; ``None``: none may have."""
+        return self.dispatched().earlier
+
     def explains(self, error: BaseException, policy: ExecutionPolicy) -> bool:
         """Return whether ``error`` leaves the latest send possibly run: it is what left it so, or settles nothing."""
         latest = self.latest
@@ -143,13 +157,145 @@ class _Lineage:
             error is latest.failure or not answered_conclusively(error, policy)
         )
 
+    def record(self, error: BaseException, policy: ExecutionPolicy) -> None:
+        """Record on the failure that ended the command, or answered it, what these sends left open.
+
+        The failure explains itself when it leaves the latest send possibly run; otherwise the latest earlier send
+        that may have run explains the outcome.
+        """
+        explains_itself = self.explains(error, policy)
+        record_dispatch(
+            error,
+            possibly_executed=self.earlier is not None or explains_itself,
+            unproven=None if explains_itself else self.unproven,
+        )
+
+    def record_unsent(self, error: BaseException) -> None:
+        """Record a failure before a further send left: what these sends left open stays open."""
+        record_dispatch(error, possibly_executed=self.left_open() is not None, unproven=self.unproven)
+
+    def withhold(self, error: BaseException) -> None:
+        """Record a command the server halted before: proven not run by the latest send, but not by earlier ones."""
+        if self.earlier is not None:
+            record_dispatch(error, possibly_executed=True, unproven=self.unproven)
+        else:
+            record_withheld(error)
+
+
+@dataclass(frozen=True, slots=True)
+class _Pause:
+    """The planned wait before a retry, against the retry window left when it was planned.
+
+    The wait is the longer of the request's own backoff and how long the coordinator still holds a permit for its
+    methods (a host throttle hint or a method cooldown). The coordinator enforces its hold at admission, so the
+    request sleeps only when its own backoff is longer, and the hold ends within that sleep. ``planned_at`` is
+    when the wait began, so the send after it can measure the wait it actually got (see ``_RequestAttempts.admit``).
+    """
+
+    backoff: float
+    held: float
+    window: float
+    planned_at: float
+
+    @property
+    def delay(self) -> float:
+        """Return how long the retry waits before its send."""
+        return max(self.backoff, self.held)
+
+    def admits(self, safety: ReplaySafety) -> bool:
+        """Return whether a send of ``safety`` may follow the wait.
+
+        The wait must fit the window. A send that may not be repeated must also keep at least as much window after
+        the wait as the wait itself (see ``_RequestAttempts.admit``), strictly: time passes between the plan and
+        the send, so a plan that leaves exactly the wait would be refused at the send after the whole wait. A SAFE
+        send goes with any window left.
+        """
+        if self.delay >= self.window:
+            return False
+        return safety is ReplaySafety.SAFE or 2 * self.delay < self.window
+
+
+class _SendPlan(Enum):
+    """What the next round does with one of its sends."""
+
+    #: Sent after the round's wait.
+    SEND = "send"
+    #: A SAFE send whose own wait outlasts the round's: left out of this round and planned again in the next.
+    CARRY = "carry"
+    #: Not sent again: the window cannot carry its own wait for its safety.
+    REFUSE = "refuse"
+
+
+@dataclass(frozen=True, slots=True)
+class _Replay:
+    """The next round's wait, and what it does with each of its sends.
+
+    Each send is weighed against the round's one backoff and its own methods' hold, and admitted when that wait
+    fits the window for its safety. With an admitted send that may not be repeated, the round waits the longest
+    admitted wait that such a send can still afford (at most half the window), so each of them is sent; a SAFE
+    send whose own wait is longer is carried to a later round instead of taking their replay away. With no such
+    send, the round waits the longest wait among its SAFE sends. A round that carries a send always sends one.
+    """
+
+    pause: _Pause
+    plans: tuple[_SendPlan, ...]
+
+    def __post_init__(self) -> None:
+        """Refuse a round that carries a send but sends none: nothing would spend an attempt on its way."""
+        if _SendPlan.CARRY in self.plans and _SendPlan.SEND not in self.plans:
+            raise ValueError("a replay round that carries a send must send one")
+
+    def sends(self, plan: _SendPlan) -> tuple[int, ...]:
+        """Return the positions of the sends with ``plan``."""
+        return tuple(index for index, own in enumerate(self.plans) if own is plan)
+
+
+def _retry_refusal(replay: _Replay | None) -> str:
+    """Return why the budget refused a retry: no attempt was left (no plan), or the window does not carry it."""
+    return "per-request attempt budget exhausted" if replay is None else "retry delay would exceed elapsed budget"
+
+
+def _plan_round(own: tuple[_Pause, ...], safeties: tuple[ReplaySafety, ...], *, whole: bool) -> _Replay:
+    """Plan a round from each send's own pause (see ``_Replay``)."""
+    first = own[0]
+    if whole:
+        pause = dataclasses.replace(first, held=max(each.held for each in own))
+        plan = _SendPlan.SEND if all(pause.admits(safety) for safety in safeties) else _SendPlan.REFUSE
+        return _Replay(pause, tuple(plan for _ in own))
+    fits = tuple(each.admits(safety) for each, safety in zip(own, safeties, strict=True))
+    unrepeatable = any(fit and safety is not ReplaySafety.SAFE for fit, safety in zip(fits, safeties, strict=True))
+    # With a send that may not be repeated, the round waits only as long as such a send can afford.
+    held = max(
+        (
+            each.held
+            for each, fit in zip(own, fits, strict=True)
+            if fit and (not unrepeatable or each.admits(ReplaySafety.UNSAFE))
+        ),
+        default=0.0,
+    )
+    pause = dataclasses.replace(first, held=held)
+    return _Replay(
+        pause,
+        tuple(
+            _SendPlan.REFUSE if not fit else _SendPlan.SEND if each.delay <= pause.delay else _SendPlan.CARRY
+            for each, fit in zip(own, fits, strict=True)
+        ),
+    )
+
 
 @dataclass(slots=True)
 class _RequestAttempts:
-    """Attempts, retry clock and execution lineage one request shares across its sends.
+    """Attempts, retry window, wait and execution lineage one request shares across its sends.
 
-    A batch's replay rounds and isolated sends share it too: each sends only commands that every earlier send
-    of the batch carried, so what the batch's sends leave open is what each of those commands' sends leave open.
+    The retry window opens when the request's first send is granted its coordinator permit: queueing for that
+    permit is bounded by the operation's elapsed budget alone, and every send, wait and permit after it spends
+    the window. A batch's replay rounds and isolated sends share the attempts, the window and the wait.
+
+    What the sends leave open about whether a command ran is that command's own: it follows only the sends the
+    command was in. A REST v3 group sends every command it still resolves in each envelope, and an isolated send
+    takes a copy, so ``lineage`` is each of those commands' own. A classic batch round may carry a SAFE command
+    past a round, so its engine keeps each command's lineage itself and starts ``lineage`` afresh for each round
+    (``start_round``): there it says what that round's send alone left open.
     """
 
     started: float | None = None
@@ -157,17 +303,50 @@ class _RequestAttempts:
     lineage: _Lineage = _Lineage()
     # The latest failure a send ended with: the one a budget that stops the retry it asked for reports.
     retry_cause: B24ApiError | None = None
+    # Whoever decides each send after a failure: the executor retries within one ``execute`` call, unless the
+    # classic batch engine that shares these attempts decides every replay round itself and sends once per call.
+    caller_retries: bool = False
+    # The wait waited before the next send, which that send consumes; the first send, and a send after a failure
+    # sent at once, has none.
+    pause: _Pause | None = None
+    # The budget that refused this classic batch round's send at its admission, for too little window after its
+    # wait: the engine, which sees only the failure of its round, tells this refusal from any other stop before a
+    # send by it, and plans that round's SAFE commands again. ``start_round`` clears it.
+    refusal: BudgetExceededError | None = None
 
-    def begin(self, clock: Clock) -> tuple[float, int]:
-        """Start the retry clock on the first send and return it with the attempts already spent."""
+    def open_window(self, clock: Clock) -> float:
+        """Open the retry window when the first send is granted its permit, and return when it opened."""
         if self.started is None:
             self.started = clock()
-        return self.started, self.used
+        return self.started
+
+    def admit(self, remaining: float, safety: ReplaySafety, *, now: float) -> None:
+        """Refuse a send the window cannot carry: none is left, or one that may not be repeated gets less than its wait.
+
+        A send that may not be repeated and is cut by the window turns a refusal already proven into an unknown
+        outcome, so it is started only with at least as much window left as it waited since its wait was planned.
+        That is never less than the planned wait once the window left is short: the plan left more than twice
+        the wait, so a window left shorter than the planned wait means a wait longer than half of it, a late wake
+        or a long permit queue. A SAFE send is started with any window left, since it may still succeed and a cut
+        one is replayed harmlessly. The refusal is kept as ``refusal``.
+        """
+        if remaining <= 0:
+            raise BudgetExceededError("execution time budget exhausted before dispatch")
+        pause = self.pause
+        if safety is not ReplaySafety.SAFE and pause is not None and remaining < now - pause.planned_at:
+            self.refusal = BudgetExceededError("retry window left after the wait is shorter than the wait")
+            raise self.refusal
+
+    def start_round(self) -> None:
+        """Start a classic batch round, whose commands keep their own lineages: ``lineage`` and ``refusal`` cover it."""
+        self.lineage = _Lineage()
+        self.refusal = None
 
     def dispatched(self) -> None:
-        """Record a send, which may have run until its failure proves otherwise."""
+        """Record a send, which may have run until its failure proves otherwise; it consumes the wait before it."""
         self.lineage = self.lineage.dispatched()
         self.used += 1
+        self.pause = None
 
     def settle(self, error: B24ApiError, policy: ExecutionPolicy) -> None:
         """Record how the last send failed; a budget that stops a retry reports the failure that asked for it."""
@@ -189,33 +368,16 @@ class _RequestAttempts:
         self.lineage = self.lineage.classified(failure, may_have_run=may_have_run)
 
     def record(self, error: BaseException, policy: ExecutionPolicy) -> None:
-        """Record on the failure that ended the request, or answered one of its commands, what its sends left open.
-
-        The failure explains itself when it leaves the latest send possibly run; otherwise the latest earlier send
-        that may have run explains the outcome.
-        """
-        explains_itself = self.lineage.explains(error, policy)
-        record_dispatch(
-            error,
-            possibly_executed=self.lineage.earlier is not None or explains_itself,
-            unproven=None if explains_itself else self.lineage.unproven,
-        )
+        """Record on the failure that ended the request, or answered one of its commands, what its sends left open."""
+        self.lineage.record(error, policy)
 
     def record_unsent(self, error: BaseException) -> None:
         """Record a failure before a further send left: what the earlier sends left open stays open."""
-        lineage = self.lineage
-        record_dispatch(
-            error,
-            possibly_executed=lineage.earlier is not None or isinstance(lineage.latest, _PossiblyRun),
-            unproven=lineage.unproven,
-        )
+        self.lineage.record_unsent(error)
 
     def withhold(self, error: BaseException) -> None:
         """Record a command the server halted before: proven not run by the last send, but not by earlier ones."""
-        if self.lineage.earlier is not None:
-            record_dispatch(error, possibly_executed=True, unproven=self.lineage.unproven)
-        else:
-            record_withheld(error)
+        self.lineage.withhold(error)
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,24 +559,16 @@ class Executor:
         wire_request = WireRequest(request) if self._wire_transport is not None else None
         cancellation = await mark_cancellation()
         await context.start()
-        retry_started, attempts = shared.begin(self._clock)
-        last_error: B24ApiError | None = None
+        attempts = shared.used
         while True:
-            if (remaining := context.remaining_time(retry_started=retry_started)) <= 0:
-                raise BudgetExceededError("execution time budget exhausted") from last_error
-            scheduled_class = work_class if attempts == 0 else WorkClass.RETRY
-            try:
-                async with asyncio.timeout(remaining):
-                    permit = await context.coordinator.acquire(
-                        scheduled_class, methods=methods, budget=DeadlineBudget(self._clock() + remaining)
-                    )
-            except TimeoutError as error:
-                raise BudgetExceededError("permit wait exhausted execution time budget") from (last_error or error)
+            permit = await self._permit(
+                context, shared, work_class=work_class if attempts == 0 else WorkClass.RETRY, methods=methods
+            )
             try:
                 async with permit:
+                    retry_started = shared.open_window(self._clock)
                     remaining = context.remaining_time(retry_started=retry_started)
-                    if remaining <= 0:
-                        raise BudgetExceededError("execution time budget exhausted before dispatch")
+                    shared.admit(remaining, request.replay_safety, now=self._clock())
                     await context.reserve_attempt(attempts_for_request=attempts, retry_started=retry_started)
                     shared.dispatched()
                     wire = await self._send_attempt(request, wire_request, context=context, remaining=remaining)
@@ -424,15 +578,7 @@ class Executor:
                 # A transport that turned a cancellation into a failure is neither retried nor reported by it.
                 if cancellation.requested():
                     raise asyncio.CancelledError from error
-                await self._prepare_retry(
-                    request,
-                    error,
-                    context=context,
-                    retry_started=retry_started,
-                    attempts=attempts,
-                    shared=shared,
-                )
-                last_error = error
+                await self._prepare_retry(request, error, context=context, shared=shared, methods=methods)
                 attempts += 1
                 continue
 
@@ -442,31 +588,42 @@ class Executor:
                 cancellation.raise_if_requested()
                 return wire, parsed
             code = response_error.normalized_code if isinstance(response_error, ApiResponseError) else None
-            method_cooldown = (
-                await context.coordinator.observe_api_throttle(request.method, code)
-                if code == "operation_time_limit"
-                else 0.0
-            )
-            throttle_delay = _retry_after_seconds(wire)
-            if throttle_delay is not None:
-                merged = await context.coordinator.observe_throttle(
-                    throttle_delay, reason=_throttle_reason(response_error)
-                )
-                await context.record_cooldown(merged)
+            if code == "operation_time_limit":
+                # The methods the coordinator admits: a classic batch envelope's own name is not one of them.
+                for method in sorted(methods):
+                    await context.coordinator.observe_api_throttle(method, code)
+            await self._observe_throttle_hint(wire, response_error, context=context)
             cancellation.raise_if_requested()
             # A late failure meets the ambiguity rules first; the budget stops only a retry it would ask for.
-            await self._prepare_retry(
-                request,
-                response_error,
-                context=context,
-                retry_started=retry_started,
-                attempts=attempts,
-                shared=shared,
-                wire=wire,
-                method_cooldown=method_cooldown,
-            )
-            last_error = response_error
+            await self._prepare_retry(request, response_error, context=context, shared=shared, methods=methods)
             attempts += 1
+
+    async def _permit(
+        self,
+        context: ExecutionContext,
+        attempts: _RequestAttempts,
+        *,
+        work_class: WorkClass,
+        methods: frozenset[str],
+    ) -> _Permit:
+        """Queue for a coordinator permit within the budget left: the operation's until the retry window opens.
+
+        A hold the coordinator already has on ``methods`` (a host throttle hint or a method cooldown) that outlasts
+        the budget fails at once instead of waiting the budget out. Either failure reports the failure of the
+        request's latest send, whichever call or replay round made it.
+        """
+        cause = attempts.retry_cause
+        if (remaining := context.remaining_time(retry_started=attempts.started)) <= 0:
+            raise BudgetExceededError("execution time budget exhausted") from cause
+        if context.coordinator.admission_delay(methods) >= remaining:
+            raise BudgetExceededError("coordinator hold exceeds execution time budget") from cause
+        try:
+            async with asyncio.timeout(remaining):
+                return await context.coordinator.acquire(
+                    work_class, methods=methods, budget=DeadlineBudget(self._clock() + remaining)
+                )
+        except TimeoutError as error:
+            raise BudgetExceededError("permit wait exhausted execution time budget") from (cause or error)
 
     async def _send_attempt(
         self,
@@ -514,7 +671,7 @@ class Executor:
             return _local_attempt_failure(error)
         cancellation = await mark_cancellation()
         await context.start()
-        _started, spent = attempts.begin(self._clock)
+        spent = attempts.used
         try:
             wire = await self._send_envelope(envelope, context=context, attempts=attempts, methods=methods)
         except asyncio.CancelledError as error:
@@ -544,22 +701,14 @@ class Executor:
         wire_transport = self._wire_transport
         if wire_transport is None:  # pragma: no cover - preflight_wire refuses a send-only transport
             raise CapabilityError("send-only transport does not support wire envelopes")
-        retry_started, spent = attempts.begin(self._clock)
-        if (remaining := context.remaining_time(retry_started=retry_started)) <= 0:
-            raise BudgetExceededError("execution time budget exhausted")
-        try:
-            async with asyncio.timeout(remaining):
-                permit = await context.coordinator.acquire(
-                    WorkClass.BATCH if spent == 0 else WorkClass.RETRY,
-                    methods=methods,
-                    budget=DeadlineBudget(self._clock() + remaining),
-                )
-        except TimeoutError as error:
-            raise BudgetExceededError("permit wait exhausted execution time budget") from error
+        spent = attempts.used
+        permit = await self._permit(
+            context, attempts, work_class=WorkClass.BATCH if spent == 0 else WorkClass.RETRY, methods=methods
+        )
         async with permit:
+            retry_started = attempts.open_window(self._clock)
             remaining = context.remaining_time(retry_started=retry_started)
-            if remaining <= 0:
-                raise BudgetExceededError("execution time budget exhausted before dispatch")
+            attempts.admit(remaining, envelope.replay_safety, now=self._clock())
             await context.reserve_attempt(attempts_for_request=spent, retry_started=retry_started)
             attempts.dispatched()
             try:
@@ -590,10 +739,8 @@ class Executor:
         response_error, parsed = self._classify_response(
             None, wire, context=context, mode=_BodyMode.JSON, summary=summary
         )
-        throttle_delay = _retry_after_seconds(wire) if response_error is not None else None
-        if response_error is not None and throttle_delay is not None:
-            merged = await context.coordinator.observe_throttle(throttle_delay, reason=_throttle_reason(response_error))
-            await context.record_cooldown(merged)
+        if response_error is not None:
+            await self._observe_throttle_hint(wire, response_error, context=context)
         if cancellation.requested():
             return _dispatched_attempt("cancelled", wire=wire, error=asyncio.CancelledError())
         if response_error is not None:
@@ -660,37 +807,59 @@ class Executor:
             )
         return response_error, parsed
 
-    async def pause_before_replay(
-        self, context: ExecutionContext, *, attempts: _RequestAttempts, method_cooldown: float = 0.0
-    ) -> bool:
-        """Wait before sending part of a physical batch again; ``False`` when the budget forbids another round.
+    async def _observe_throttle_hint(
+        self, wire: WireResponse, error: B24ApiError, *, context: ExecutionContext
+    ) -> None:
+        """Pause the portal host for the cooldown a failed answer hints, if it hints one."""
+        hint = _retry_after_seconds(wire)
+        if hint is not None:
+            cooldown = await context.coordinator.observe_throttle(hint, reason=_throttle_reason(error))
+            await context.record_cooldown(cooldown)
 
-        The round spends the same attempt and retry-time budget as the sends before it.
+    def plan_replay(
+        self,
+        context: ExecutionContext,
+        *,
+        attempts: _RequestAttempts,
+        sends: tuple[tuple[ReplaySafety, frozenset[str]], ...],
+        whole: bool = False,
+    ) -> _Replay | None:
+        """Plan the wait before the request's next round and what it does with each send; ``None``: no attempt left.
+
+        This plans the executor's own retries and the replay rounds of a physical batch. Each send is a safety and
+        the methods it is admitted under, weighed against the round's one backoff or its own methods' hold when
+        longer (see ``_Replay`` and ``_Pause.admits``). The holds are those the coordinator knows when planning:
+        one on a method of one command does not stop another's replay, but a hold that appears during the wait
+        is met at the permit. A ``whole`` round (a fail-fast batch) waits the longest wait of all its sends and is
+        sent whole or not at all. A backoff already waited for a send that was then refused at its admission is
+        not waited again. A carried send costs no attempt of its own: every round that carries one sends another,
+        which spends the round's attempt, so the attempt budget bounds how often a send is carried; one carried
+        past the round that spends the last attempt meets no plan (``None``) and is stopped by that budget.
         """
         if attempts.started is None or attempts.used >= context.policy.max_attempts_per_request:
-            return False
-        delay = max(
-            _retry_delay(context.policy, retry_number=attempts.used, random_source=self._random), method_cooldown
+            return None
+        backoff = (
+            0.0
+            if attempts.pause is not None
+            else _retry_delay(context.policy, retry_number=attempts.used, random_source=self._random)
         )
-        if delay >= context.remaining_time(retry_started=attempts.started):
-            return False
-        await context.record_retry()
-        # The coordinator holds the next permit until a method cooldown ends, as for a direct retry.
-        if not method_cooldown and delay > 0:
-            await self._sleep(delay)
-        return True
+        window = context.remaining_time(retry_started=attempts.started)
+        now = self._clock()
+        own = tuple(_Pause(backoff, context.coordinator.admission_delay(methods), window, now) for _, methods in sends)
+        return _plan_round(own, tuple(safety for safety, _ in sends), whole=whole)
 
-    async def _prepare_retry(  # noqa: PLR0913
+    async def replay_after(self, context: ExecutionContext, *, attempts: _RequestAttempts, pause: _Pause) -> None:
+        """Wait out a pause ``plan_replay`` planned before the replay round it admits."""
+        await self._wait(context, attempts, pause)
+
+    async def _prepare_retry(
         self,
         request: Request,
         error: B24ApiError,
         *,
         context: ExecutionContext,
-        retry_started: float,
-        attempts: int,
         shared: _RequestAttempts,
-        wire: WireResponse | None = None,
-        method_cooldown: float = 0.0,
+        methods: frozenset[str],
     ) -> None:
         shared.settle(error, context.policy)
         safety = request.replay_safety or ReplaySafety.UNKNOWN
@@ -700,25 +869,26 @@ class Executor:
             raise possible_execution(
                 error, request_summary=request.summary, declared_unsafe=safety is ReplaySafety.UNSAFE, message=message
             ) from error
-        # A physical batch follows the same rule with its combined safety (owner decision, 2026-09-25): SAFE is
-        # replayed within the budget; UNSAFE/UNKNOWN only when the failure proves nothing ran.
+        # SAFE work is retried within the budget; UNSAFE/UNKNOWN only when the failure proves nothing ran (owner
+        # decision, 2026-09-25). A classic batch envelope's caller decides its replay, per command.
         retryable = _is_retryable(error, safety=safety, policy=context.policy)
-        if not retryable:
+        if not retryable or shared.caller_retries:
             raise error
+        replay = self.plan_replay(context, attempts=shared, sends=((safety, methods),))
+        if replay is None or replay.plans != (_SendPlan.SEND,):
+            raise BudgetExceededError(_retry_refusal(replay)) from error
+        await self._wait(context, shared, replay.pause)
 
-        next_attempt = attempts + 1
-        if next_attempt >= context.policy.max_attempts_per_request:
-            raise BudgetExceededError("per-request attempt budget exhausted") from error
-        delay = _retry_delay(context.policy, retry_number=next_attempt, random_source=self._random)
-        throttle_delay = _retry_after_seconds(wire) if wire is not None else None
-        # The coordinator holds the next permit until a method cooldown ends; past the budget it cannot succeed.
-        delay = max(delay, throttle_delay or 0.0, method_cooldown)
-        remaining = context.remaining_time(retry_started=retry_started)
-        if delay >= remaining:
-            raise BudgetExceededError("retry delay would exceed elapsed budget") from error
-        await context.record_retry()
-        if throttle_delay is None and not method_cooldown and delay > 0:
-            await self._sleep(delay)
+    async def _wait(self, context: ExecutionContext, attempts: _RequestAttempts, pause: _Pause) -> None:
+        """Record and wait out a planned pause; the coordinator's hold ends within the backoff when that is longer.
+
+        A wait for a send already waited for, which its admission then refused, is the same retry: counted once.
+        """
+        if attempts.pause is None:
+            await context.record_retry()
+        attempts.pause = pause
+        if pause.backoff > pause.held:
+            await self._sleep(pause.backoff)
 
 
 def _possible_acceptance(error: B24ApiError, policy: ExecutionPolicy) -> str | None:
