@@ -1,5 +1,11 @@
 # Migration guide
 
+## CLI exit code for a closed reader
+
+- **A write to a closed stdout or stderr reader exits `5`**, ahead of any other code. It exited `120`,
+  `1`, or with unbuffered output `0` (help) or `2` (a parser error).
+- **Any other failed write exits `4`**, `--help` to a full disk included, which exited `0` or `120`.
+
 ## Traversal contract checks
 
 - **`SERVER_NEXT` needs an exact total.** `OffsetSpec(continuation=OffsetContinuation.SERVER_NEXT)`

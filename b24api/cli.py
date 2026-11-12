@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import os
 import sys
 from typing import TYPE_CHECKING, NoReturn, TextIO
 
@@ -33,6 +34,8 @@ from b24api.contracts import Response
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from _typeshed import SupportsWrite
 
     from b24api.contracts import OperationReport
 
@@ -104,8 +107,43 @@ def _write_json(stream: TextIO, value: object) -> None:
     stream.flush()
 
 
+def _emit(stream: SupportsWrite[str] | None, text: str) -> None:
+    # Python leaves a standard stream unset when its descriptor was closed at startup; like argparse,
+    # fall back to stderr and drop the message when that is unset too.
+    target = stream or sys.stderr
+    if target is None:
+        return
+    target.write(text)
+    flush = getattr(target, "flush", None)
+    if flush is not None:
+        flush()
+
+
+class _Parser(argparse.ArgumentParser):
+    """Argument parser whose help, usage and error writes reach the caller, failures included.
+
+    ``ArgumentParser`` neither flushes its writes nor lets an ``OSError`` from them escape, so a reader
+    that has gone away would only show up in whatever stayed buffered. Each message is written and
+    flushed here, and a ``BrokenPipeError`` reaches the CLI's output boundary whatever the buffering.
+    """
+
+    def print_usage(self, file: SupportsWrite[str] | None = None) -> None:
+        """Write and flush the usage line (stdout by default)."""
+        _emit(file or sys.stdout, self.format_usage())
+
+    def print_help(self, file: SupportsWrite[str] | None = None) -> None:
+        """Write and flush the help text (stdout by default)."""
+        _emit(file or sys.stdout, self.format_help())
+
+    def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
+        """Write and flush ``message`` to stderr, then exit with ``status``."""
+        if message:
+            _emit(sys.stderr, message)
+        sys.exit(status)
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="b24api", description="Call Bitrix24 methods and stream list rows as JSONL.")
+    parser = _Parser(prog="b24api", description="Call Bitrix24 methods and stream list rows as JSONL.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     call = subparsers.add_parser("call", help="execute one method and print one JSON value")
     call.add_argument("method", help="Bitrix24 REST method name")
@@ -143,6 +181,19 @@ async def _call(args: argparse.Namespace, request: Request, stdout: TextIO) -> N
     _write_json(stdout, _response_json(result) if isinstance(result, Response) else result)
 
 
+def _write_report(stderr: TextIO, report: OperationReport) -> None:
+    if report.assurance is TraversalAssurance.MECHANICS_ONLY:
+        _write_json(
+            stderr,
+            {
+                "kind": "warning",
+                "code": "mechanics_only",
+                "message": "completion proves pagination mechanics, not exact row identity",
+            },
+        )
+    _write_json(stderr, _report_json(report))
+
+
 async def _list(
     request: Request,
     route: ListContractRoute,
@@ -167,16 +218,12 @@ async def _list(
         if primary is not None:
             raise primary
         raise RuntimeError("list stream terminated without a report")
-    if report.assurance is TraversalAssurance.MECHANICS_ONLY:
-        _write_json(
-            stderr,
-            {
-                "kind": "warning",
-                "code": "mechanics_only",
-                "message": "completion proves pagination mechanics, not exact row identity",
-            },
-        )
-    _write_json(stderr, _report_json(report))
+    try:
+        _write_report(stderr, report)
+    except OSError as error:
+        if isinstance(primary, BrokenPipeError):  # a gone stdout reader outranks a failing stderr
+            raise primary from error
+        raise
     if primary is not None:
         raise primary
     if report.state is not TerminalState.COMPLETED:
@@ -196,17 +243,78 @@ async def _verify_keyset(request: Request, route: VerifyKeysetContractRoute, std
     _write_json(stdout, report.to_dict())
 
 
-def main(  # noqa: C901, PLR0911, PLR0912 - stable process-code boundary
+def _discard(stream: TextIO) -> None:
+    """Point a standard stream that cannot be flushed at devnull, so the interpreter's own flush succeeds.
+
+    CPython flushes ``sys.stdout`` and ``sys.stderr`` at shutdown and exits with 120 when bytes a failed
+    write left behind still cannot be delivered. A stream the caller injected is the caller's to close.
+    """
+    if stream is not sys.stdout and stream is not sys.stderr:
+        return
+    try:
+        descriptor = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, descriptor)
+    finally:
+        os.close(devnull)
+
+
+def _settle(code: int, *streams: TextIO | None) -> int:
+    """Deliver what is still buffered and fold an undeliverable stream into the process code."""
+    for stream in streams:
+        # A stream its owner already closed has nothing left to deliver; its writes failed in the run.
+        if stream is None or getattr(stream, "closed", False):
+            continue
+        try:
+            stream.flush()
+        except BrokenPipeError:
+            code = _OUTPUT_CLOSED
+        except OSError:  # e.g. a full disk: a failure, but never a traceback
+            code = code or _CORRECTNESS
+        else:
+            continue
+        _discard(stream)
+    return code
+
+
+def main(
     argv: Sequence[str] | None = None,
     *,
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
-    """Run one CLI operation and return its stable process code."""
+    """Run one CLI operation and return its stable process code.
+
+    A reader of stdout or stderr that has gone away at any write yields the output-closed code, which
+    takes priority over every other outcome; any other failed write yields the generic failure code.
+    """
     input_stream = stdin or sys.stdin
     output_stream = stdout or sys.stdout
     error_stream = stderr or sys.stderr
+    try:
+        code = _run(argv, input_stream, output_stream, error_stream)
+    except BrokenPipeError:
+        code = _OUTPUT_CLOSED
+    except OSError:  # a diagnostic or report that could not be written, e.g. to a full disk
+        code = _CORRECTNESS
+    except ValueError:
+        # Only a write to a stream its owner already closed is a failed write; anything else is a bug.
+        if not any(getattr(stream, "closed", False) for stream in (output_stream, error_stream)):
+            raise
+        code = _CORRECTNESS
+    return _settle(code, output_stream, error_stream)
+
+
+def _run(  # noqa: C901, PLR0911 - stable process-code boundary
+    argv: Sequence[str] | None,
+    input_stream: TextIO,
+    output_stream: TextIO,
+    error_stream: TextIO,
+) -> int:
     try:
         args = _parser().parse_args(argv)
         params = read_json_source(args.params, label="parameters", stdin=input_stream)
@@ -231,12 +339,9 @@ def main(  # noqa: C901, PLR0911, PLR0912 - stable process-code boundary
         _write_json(error_stream, {"kind": "usage_error", "message": str(error)})
         return _USAGE
     except BrokenPipeError:
-        return _OUTPUT_CLOSED
+        raise  # the output boundary in main owns a closed reader, not the generic failure arm below
     except KeysetCapabilityError as error:
-        try:
-            _write_json(output_stream, error.report.to_dict())
-        except BrokenPipeError:
-            return _OUTPUT_CLOSED
+        _write_json(output_stream, error.report.to_dict())
         return _KEYSET_UNSUPPORTED if error.verdict.value == "unsupported" else _KEYSET_INCONCLUSIVE
     except B24ApiError as error:
         _write_json(error_stream, _safe_error(error))
