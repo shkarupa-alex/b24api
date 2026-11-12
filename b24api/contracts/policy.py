@@ -270,12 +270,16 @@ class ConsistencyPolicy:
 class ExecutionPolicy:
     """Universal execution ceilings; every value is checked before scheduling.
 
-    ``max_elapsed`` bounds the whole operation, including each request's wait for its first coordinator permit.
+    ``max_elapsed`` bounds the whole operation, including each request's wait for its first coordinator permit. It
+    is checked at the operation's scheduling points (admission, permits, its own waits), not while the application
+    holds control (a page stop callback, a consumer slow between pulls): the next scheduling point ends the operation.
     ``max_retry_elapsed_per_request`` is each request's retry window: it opens when the first send is granted its
     permit and bounds every send, retry wait and later permit wait after it. A send has no timeout of its own; it
     may use what is left of the window. ``max_direct_concurrency`` only narrows the client's own limit,
     ``Settings.max_concurrent_requests``, which all the client's work shares: a direct dispatch runs at most the
-    smallest of the two and its ``DirectDispatch.concurrency``.
+    smallest of the two, ``max_active_references`` and its ``DirectDispatch.concurrency``. It does not limit a
+    ``BatchDispatch``, whose physical batches in flight are bounded by its ``concurrency``,
+    ``max_active_references`` and the client's limit.
     """
 
     max_requests: int = 10_000

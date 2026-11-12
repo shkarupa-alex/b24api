@@ -64,10 +64,12 @@ class TransportError(B24ApiError):
 
 
 class ClientClosedError(TransportError, RuntimeError):
-    """The client, its rate limiter or its transport was closed before this request was sent.
+    """The client, its rate limiter or its transport was closed before this attempt of the request was sent.
 
-    A transport lifecycle failure of phase ``not_dispatched``: nothing left the process, so even an
-    ``UNSAFE`` request is proven not run, and it is never retried. It is also a ``RuntimeError``, the type
+    A transport lifecycle failure of phase ``not_dispatched``: the attempt it stopped never left the process,
+    and it is never retried. The phase covers that attempt alone: a ``SAFE`` request waiting for the permit
+    of a retry may have run on an earlier attempt. An ``UNSAFE`` or ``UNKNOWN`` request is retried only after
+    a refusal that proved it did not run, so it stays proven not run. It is also a ``RuntimeError``, the type
     a closed client raised before, so existing ``except RuntimeError`` handlers keep catching it.
     """
 

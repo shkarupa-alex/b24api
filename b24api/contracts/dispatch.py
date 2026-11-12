@@ -45,8 +45,9 @@ class DirectDispatch:
 class BatchDispatch:
     """Bounded independent physical Bitrix batch requests.
 
-    ``concurrency`` is a ceiling of this operation alone; ``Settings.max_concurrent_requests``, which the
-    client's operations share, still bounds the batches in flight.
+    ``concurrency`` is a ceiling of this operation alone: the batches in flight are also bounded by the policy's
+    ``max_active_references`` and by ``Settings.max_concurrent_requests``, which the client's operations share;
+    the smallest applies. ``ExecutionPolicy.max_direct_concurrency`` does not limit them.
     """
 
     batch_size: int = PORTAL_BATCH_CAP

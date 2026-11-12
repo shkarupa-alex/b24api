@@ -192,11 +192,11 @@ async def read_bounded_body(response: httpx.Response, maximum: int) -> BodyReadO
         decoder = _BoundedDecoder.for_encoding(response.headers.get("content-encoding"), limit=maximum)
         if response.is_stream_consumed:
             # A body read inside the injected client, by its transport (``httpx.Response(content=...)`` in a
-            # ``MockTransport``) or by a response hook (``await response.aread()``), arrives decoded by HTTPX,
-            # which checks no end of stream and keeps only the first gzip member. Its raw bytes may still sit
-            # behind the client's stream wrapper, but the public API cannot tell an in-memory stream from a
-            # released network one, whose replay would read a connection back in the pool. Only the ceiling
-            # remains to enforce.
+            # ``MockTransport``), by a response hook (``await response.aread()``) or for an ``httpx.Auth`` with
+            # ``requires_response_body``, arrives decoded by HTTPX, which checks no end of stream and keeps only
+            # the first gzip member. Its raw bytes may still sit behind the client's stream wrapper, but the
+            # public API cannot tell an in-memory stream from a released network one, whose replay would read a
+            # connection back in the pool. Only the ceiling remains to enforce.
             body.extend(_BoundedDecoder(_IDENTITY, limit=maximum).feed(response.content))
         else:
             await _read_raw(response, decoder, body)

@@ -101,9 +101,11 @@ def _decode_within_ceiling(response: httpx.Response) -> bytearray:
     decoder = _BoundedDecoder.for_encoding(response.headers.get("content-encoding"), limit=MAX_RESPONSE_BYTES)
     payload = bytearray()
     if response.is_stream_consumed:
-        # An in-memory (mock) response arrives already read and decoded by HTTPX, which checks no end of
-        # stream and keeps only the first gzip member; its raw bytes are not reachable through the public
-        # API, so only the ceiling remains, as in ``read_bounded_body``.
+        # A response already read inside the client (an in-memory mock body, a hook that reads it, or an
+        # ``httpx.Auth`` with ``requires_response_body``) arrives decoded by HTTPX, which checks no end of stream
+        # and keeps only the first gzip member. The public API cannot tell such an in-memory body from a network
+        # stream already released, so its raw bytes are not read again; only the ceiling remains, as in
+        # ``read_bounded_body``.
         payload.extend(_BoundedDecoder.for_encoding(None, limit=MAX_RESPONSE_BYTES).feed(response.content))
         return payload
     for chunk in response.iter_raw():

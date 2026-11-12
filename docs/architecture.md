@@ -106,7 +106,10 @@ outcome.
   it before the page is accepted. A result that does not fit is dropped, and its command fails with
   `ResultTooLargeError`, recorded answered by `b24api.execution.facts.dropped_result`: a failure that
   ran, never one proven not run. A page's wait for row capacity (`_RowBuffer.reserve`) is bounded by
-  the operation's elapsed budget, as every other dispatch wait is.
+  the operation's elapsed budget, as every other dispatch wait is. A binding's wait for the consumer is
+  not: under `READY` delivery, or with a page stop, `_deliver_page` puts the page on the output queue and
+  awaits its acknowledgement without a deadline, since the consumer holds control there. The budget
+  ends the operation at its next scheduling point after the consumer takes the page.
 - Budgets are charged to one operation-local ledger of plain counters updated in place, so a
   reservation, its settlement and a row-buffer change cost the same however many bindings the
   operation has read. Per-binding page counts are kept only while a binding is open; the validated,
@@ -125,10 +128,13 @@ outcome.
   classic batch engine for a classic envelope, which the executor then sends once per call. The
   engine plans each command on its own safety and its own method's hold as known when planning: a
   round waits only as long as its `UNSAFE` and `UNKNOWN` commands can afford, carries a `SAFE` command
-  held longer to a later round (each round spends an attempt, which bounds the carrying: a command
-  still carried when the last attempt is spent ends as the attempt budget stops it), and still sends
-  the others when the window or a held method stops some, unless it is fail-fast, which is sent whole
-  or not at all. A hold that appears during the wait is met at the permit and stops the whole round
+  held longer to a later round (an attempt is spent per send of the envelope, when `_RequestAttempts`
+  records it after the attempt is reserved: a round that is sent spends one, a round stopped before its
+  send, at its permit or its admission, spends none, and a carried command spends none of its own;
+  every round that carries a command plans to send another, so the attempt budget bounds the carrying:
+  a command still carried when the last attempt is spent ends as the attempt budget stops it), and
+  still sends the others when the window or a held method stops some, unless it is fail-fast, which is
+  sent whole or not at all. A hold that appears during the wait is met at the permit and stops the whole round
   when it outlasts the window; a stop before a round's send ends each of its commands with the
   failure that command followed as the cause. The REST 3.0 isolation of an unresolved `SAFE` envelope re-sends its commands one by one at once,
   outside that planner. An envelope's first send is admitted under all its methods, so for a user's

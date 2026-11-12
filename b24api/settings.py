@@ -67,9 +67,11 @@ class Settings(BaseSettings):
     permit and bounds that send and every retry after it. It must be a finite number of seconds.
 
     ``max_concurrent_requests`` is how many requests the client keeps in flight at once, all its calls,
-    streams and retries together: the number of permits of its shared rate limiter. A narrower limit of one
-    operation (``ExecutionPolicy.max_direct_concurrency``, ``DirectDispatch.concurrency``,
-    ``BatchDispatch.concurrency``) still applies, so the effective concurrency is the smallest of them.
+    streams and retries together: the number of permits of its shared rate limiter. An operation's own limits
+    only narrow it, per dispatch: a ``DirectDispatch`` sends at most the smallest of its ``concurrency``,
+    ``ExecutionPolicy.max_direct_concurrency``, ``ExecutionPolicy.max_active_references`` and this limit; a
+    ``BatchDispatch`` keeps at most the smallest of its ``concurrency``, ``max_active_references`` and this
+    limit in flight, and ``max_direct_concurrency`` does not limit it.
     """
 
     webhook_url: HttpUrl = Field(repr=False)
