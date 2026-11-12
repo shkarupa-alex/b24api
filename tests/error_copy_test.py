@@ -54,6 +54,7 @@ from b24api.errors import (
     ReferenceFailed,
     ResponseTooLargeError,
     ResultShapeError,
+    ResultTooLargeError,
     TransportError,
     ValidationIssue,
 )
@@ -149,6 +150,7 @@ _SAMPLES: dict[str, Callable[[], B24ApiError]] = {
         observed_type="dict",
         page_offset=50,
     ),
+    "ResultTooLargeError": lambda: ResultTooLargeError(rows=3, limit=2, request_summary=_SUMMARY),
     "TransportError": lambda: TransportError(
         "reset", phase=FailurePhase.HEADERS_RECEIVED, request_summary=_SUMMARY, retryable=False
     ),

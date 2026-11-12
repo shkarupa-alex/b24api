@@ -79,6 +79,7 @@ def test_public_error_module_export_snapshot_is_static_contract_evidence() -> No
         "ReferenceFailed",
         "ResponseTooLargeError",
         "ResultShapeError",
+        "ResultTooLargeError",
         "TransportError",
         "ValidationIssue",
     )

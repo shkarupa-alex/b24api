@@ -262,9 +262,11 @@ class BatchExecutor:
         rounds, envelope retries and isolation requests are not counted.
 
         ``split_held`` is set for a user's logical batch, whose commands are independent outcomes: a command whose
-        own method is held longer than its envelope's first send may wait is left out so that the others go. Pages
-        of a traversal, and the commands a dispatcher batches, are not split: they wait at the permit, as they would
-        sent one by one.
+        own method is held longer than its envelope's first send may wait is left out so that the others go. A
+        fail-fast (``halt``) chunk is never split: leaving a command out lets no other command go when its failure
+        fails them all, so the envelope goes whole to its permit, which waits within the operation's budget or
+        refuses at once a hold that outlasts it. Pages of a traversal, and the commands a dispatcher batches, are not
+        split either: they wait at the permit, as they would sent one by one.
         """
         eligible, rejected = self._partition_capabilities(commands)
         settled: Mapping[int, BatchOutcome] = {}
@@ -278,7 +280,9 @@ class BatchExecutor:
                 for command in commands
             }
         elif eligible:
-            options = _RoundOptions(halt, advisory_totals, strict_envelope, strict_json_members, split_held)
+            options = _RoundOptions(
+                halt, advisory_totals, strict_envelope, strict_json_members, split_held and not halt
+            )
             settled = await self._execute_groups(eligible, context=context, options=options, on_envelope=on_envelope)
         # Every outcome of the chunk leaves the engine through the one mapping from execution facts.
         return tuple(_by_facts(outcome) for outcome in _merge_outcomes(commands, tuple(settled.values()), rejected))
@@ -302,9 +306,7 @@ class BatchExecutor:
                 continue
             if on_envelope is not None:
                 on_envelope()
-            sending, refused = (
-                self._split_held(group, context=context, whole=options.halt) if options.split_held else (group, {})
-            )
+            sending, refused = self._split_held(group, context=context) if options.split_held else (group, {})
             settled.update(refused)
             if not sending:
                 continue
@@ -316,16 +318,15 @@ class BatchExecutor:
         return settled
 
     def _split_held(
-        self, group: tuple[_Command, ...], *, context: ExecutionContext, whole: bool
+        self, group: tuple[_Command, ...], *, context: ExecutionContext
     ) -> tuple[tuple[_Command, ...], dict[int, BatchOutcome]]:
         """Split off the commands whose own method is held longer than their envelope's first send may wait.
 
         ``Executor.plan_first_send`` decides, so one method's cooldown never holds back or fails the other commands
-        of its envelope. A refused command is never sent: it ends with ``BudgetExceededError``, proven not run. A
-        fail-fast envelope is refused whole or sent whole.
+        of its envelope. A refused command is never sent: it ends with ``BudgetExceededError``, proven not run.
         """
         plan = self.executor.plan_first_send(
-            context, methods=tuple(frozenset({command.request.method}) for command in group), whole=whole
+            context, methods=tuple(frozenset({command.request.method}) for command in group)
         )
         if plan is None:
             return group, {}

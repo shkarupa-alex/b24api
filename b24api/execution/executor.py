@@ -854,9 +854,7 @@ class Executor:
         own = tuple(_Pause(backoff, context.coordinator.admission_delay(methods), window, now) for _, methods in sends)
         return _plan_round(own, tuple(safety for safety, _ in sends), whole=whole)
 
-    def plan_first_send(
-        self, context: ExecutionContext, *, methods: tuple[frozenset[str], ...], whole: bool
-    ) -> _RoundPlan | None:
+    def plan_first_send(self, context: ExecutionContext, *, methods: tuple[frozenset[str], ...]) -> _RoundPlan | None:
         """Plan which commands an envelope's first send leaves out for their own methods' hold; ``None``: none.
 
         An envelope is admitted under every method it carries, so one command's method hold holds back all the others.
@@ -868,7 +866,7 @@ class Executor:
         every command can wait, or none can, the envelope goes whole to its permit, which waits within the operation's
         budget or refuses at once a hold that outlasts it, as for a lone request. Otherwise ``_plan_round`` refuses
         each command that cannot wait, the others being sent once the longest hold among them ends (the coordinator
-        enforces it at the permit), or refuses a ``whole`` (fail-fast) envelope whole, as it refuses a replay round.
+        enforces it at the permit). A fail-fast envelope is never planned here: it goes whole to its permit.
         """
         now = self._clock()
         host = context.coordinator.admission_delay(frozenset())
@@ -877,7 +875,7 @@ class Executor:
         fits = tuple(pause.admits(ReplaySafety.SAFE) for pause in pauses)
         if all(fits) or not any(fits):
             return None
-        return _plan_round(pauses, tuple(ReplaySafety.SAFE for _ in pauses), whole=whole)
+        return _plan_round(pauses, tuple(ReplaySafety.SAFE for _ in pauses), whole=False)
 
     async def replay_after(self, context: ExecutionContext, *, attempts: _RequestAttempts, pause: _Pause) -> None:
         """Wait out a pause ``plan_replay`` planned before the replay round it admits."""

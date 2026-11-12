@@ -193,9 +193,9 @@ stops the whole round at its permit when it outlasts the window. The commands no
 their own refusal, or end with `BudgetExceededError` caused by the batch refusal they followed. The
 first send of a `batch()` or `batch_outcomes()` chunk weighs its commands the same way, by how much
 longer their methods are held than the host: a command that cannot wait that long is not sent and ends
-with `BudgetExceededError`, so that the others go without waiting for it (a fail-fast batch is refused
-whole instead); a chunk whose every command can wait, or none can, waits within `max_elapsed` as a
-lone request does, and so do traversal pages and `fan_out()` waves. By
+with `BudgetExceededError`, so that the others go without waiting for it; a chunk whose every command
+can wait, or none can, and every chunk of a fail-fast `batch()`, which is never split, waits within
+`max_elapsed` as a lone request does, and so do traversal pages and `fan_out()` waves. By
 default `SAFE` requests are also retried after an unstructured 408, 500, 502, 503 or 504
 (`RetryPolicy.transient_http_statuses`).
 
@@ -829,6 +829,15 @@ and publish the same final report where the Python exception type permits it.
 buffered commands and rows, retained unordered identity keys, direct concurrency and active
 references. The default response ceiling is 16 MiB and is enforced while streaming, before JSON
 decoding.
+
+A command's decoded rows are known only once it has run, so `max_buffered_rows` bounds what an operation
+holds rather than what it sends. `batch()` and `batch_outcomes()` share the budget among a window's
+results in input order, one row per outcome and a success's other rows while they fit; `fan_out()` and
+`fan_out_outcomes()` give each command an equal share (50 rows under the default `BatchDispatch`, 250
+under `DirectDispatch`). A result that does not fit is dropped: its command ends as a `CommandFailure`
+with `ResultTooLargeError`, a `BudgetExceededError` that says the command ran and was answered, so it
+is never replayed, and every other command keeps its own outcome. Waiting for rows a consumer has not
+taken yet is bounded by `max_elapsed`.
 
 Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
 observed identities per operation in memory (100,000 by default). All active reference bindings

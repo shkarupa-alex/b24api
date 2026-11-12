@@ -452,6 +452,31 @@ class ResponseTooLargeError(B24ApiError):
     default_origin = ErrorOrigin.PROTOCOL
 
 
+class ResultTooLargeError(BudgetExceededError):
+    """A command ran and was answered, but its decoded result holds more rows than the row budget leaves it.
+
+    The client drops the result rather than hold it past ``ExecutionPolicy.max_buffered_rows``, so the command's
+    outcome is a ``CommandFailure`` carrying this error: it ran, unlike a command a budget refused before its send,
+    and it is never replayed. ``rows`` is how many rows the result decoded to (the length of a list result),
+    ``limit`` how many the budget left it.
+    """
+
+    def __init__(self, *, rows: int, limit: int, request_summary: RequestSummary | None = None) -> None:
+        """Name the result's rows and the rows the budget left it."""
+        self.rows = rows
+        self.limit = limit
+        super().__init__(
+            f"decoded result of {rows} rows exceeds the {limit} the buffered row budget leaves it",
+            request_summary=request_summary,
+        )
+
+    def to_safe_dict(self) -> dict[str, object]:
+        """Return the row counts with the safe fields."""
+        safe = super().to_safe_dict()
+        safe.update({"rows": self.rows, "limit": self.limit})
+        return safe
+
+
 class AmbiguousExecutionError(B24ApiError):
     """A mutation may have executed but no conclusive response was observed."""
 
@@ -577,6 +602,7 @@ __all__ = (
     "ReferenceFailed",
     "ResponseTooLargeError",
     "ResultShapeError",
+    "ResultTooLargeError",
     "TransportError",
     "ValidationIssue",
 )
