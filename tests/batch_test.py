@@ -44,6 +44,7 @@ from tests.scripting import (
     assert_fired_near_deadline,
     attached_report,
     deadline_started,
+    drain_to_failure,
     reached,
 )
 
@@ -162,7 +163,8 @@ async def test_a_chunk_the_budget_stops_before_its_send_still_counts_as_in_2_5_2
         policy=ExecutionPolicy(max_requests=1, max_attempts_per_request=1),
     )
 
-    outcomes = [item async for item in stream]
+    # The refused send ends the operation: the next pull meets the request budget instead of the source.
+    outcomes, _ = await drain_to_failure(stream, BudgetExceededError)
 
     assert isinstance(outcomes[0], BatchSuccess)
     assert isinstance(outcomes[1], BatchFailure)

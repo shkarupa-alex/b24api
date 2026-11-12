@@ -190,7 +190,12 @@ a round waits only as long as its `UNSAFE` and `UNKNOWN` commands can afford, an
 whose method is held longer is sent in a later round; one still waiting when
 `max_attempts_per_request` is spent is not sent again. A pause that appears during a round's wait
 stops the whole round at its permit when it outlasts the window. The commands not sent again keep
-their own refusal, or end with `BudgetExceededError` caused by the batch refusal they followed. By
+their own refusal, or end with `BudgetExceededError` caused by the batch refusal they followed. The
+first send of a `batch()` or `batch_outcomes()` chunk weighs its commands the same way, by how much
+longer their methods are held than the host: a command that cannot wait that long is not sent and ends
+with `BudgetExceededError`, so that the others go without waiting for it (a fail-fast batch is refused
+whole instead); a chunk whose every command can wait, or none can, waits within `max_elapsed` as a
+lone request does, and so do traversal pages and `fan_out()` waves. By
 default `SAFE` requests are also retried after an unstructured 408, 500, 502, 503 or 504
 (`RetryPolicy.transient_http_statuses`).
 
@@ -262,6 +267,11 @@ async with client.batch(commands, batch_size=25) as stream:
 
 `batch()` is fail-fast. `batch_outcomes()` continues where safe and yields one of
 `CommandSuccess`, `CommandFailure`, `CommandNotExecuted` or `CommandOutcomeUnknown` in input order.
+It does not continue past its budgets: once `max_requests` refuses a send, it yields the outcomes of
+the commands it has already read, those never sent as `CommandFailure` with `BudgetExceededError`,
+then raises `BudgetExceededError`, reads no further input and closes the source, as when
+`max_elapsed` runs out. Its report is `incomplete` and records the `budget_exhausted` violation.
+`fan_out_outcomes()` and the reference traversals end the same way.
 
 <!-- tested: tests/client_v2_test.py::test_batch_outcomes_retains_typed_failure_without_halting_later_commands -->
 ```python

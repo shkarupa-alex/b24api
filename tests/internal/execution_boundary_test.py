@@ -31,11 +31,11 @@ from b24api.errors import (
 )
 from b24api.execution import Executor, HttpxTransport, WireResponse
 from b24api.execution import executor as executor_module
-from b24api.execution.executor import _Lineage, _Pause, _Replay, _RequestAttempts, _SendPlan, _Settled
+from b24api.execution.executor import _Lineage, _Pause, _RequestAttempts, _RoundPlan, _SendPlan, _Settled
 from b24api.execution.facts import Execution, execution
 from b24api.transport.base import TransportCapabilities, WireRequest
 from b24api.transport.protocol import ProtocolCodec
-from tests.scripting import ResponderTransport, always
+from tests.scripting import ResponderTransport, always, drain_to_failure
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
@@ -99,6 +99,13 @@ def _request(safety: ReplaySafety, name: str = "sample.get") -> Request:
 
 async def _drain(stream: OperationStream[CommandOutcome[int]]) -> list[CommandOutcome[int]]:
     return [outcome async for outcome in stream]
+
+
+async def _drain_to_request_budget(stream: OperationStream[CommandOutcome[int]]) -> list[CommandOutcome[int]]:
+    """Drain a stream the request budget ends: each admitted command's outcome, then the budget's own failure."""
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+    assert str(error) == "physical request budget exhausted"
+    return outcomes
 
 
 # --- A3 --------------------------------------------------------------------------------------
@@ -662,7 +669,7 @@ async def test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budge
         [Command(_request(ReplaySafety.SAFE, "user.get"), 0)], policy=_policy(max_requests=2)
     )
 
-    (outcome,) = await _drain(stream)
+    (outcome,) = await _drain_to_request_budget(stream)
 
     assert len(transport.sent) == 2  # noqa: PLR2004 - the refused batch and the replay the budget ends
     assert isinstance(outcome, CommandOutcomeUnknown)
@@ -676,7 +683,7 @@ async def test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budge
     # A replay refused with a listed status ran nothing, so the stop after it keeps the refusal.
     refused = _Script([])
     _refused_then(refused, _status(refused, HTTP_TOO_MANY_REQUESTS))
-    (still_refused,) = await _drain(
+    (still_refused,) = await _drain_to_request_budget(
         _client(refused).batch_outcomes(
             [Command(_request(ReplaySafety.UNSAFE, "tasks.task.add"), 0)], policy=_policy(max_requests=2)
         )
@@ -688,7 +695,7 @@ async def test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budge
     # Control: a budget that stops the replay before it is sent leaves the refusal the command received.
     stopped = _Script([])
     _refused_then(stopped, _counting(stopped))
-    (kept,) = await _drain(
+    (kept,) = await _drain_to_request_budget(
         _client(stopped).batch_outcomes(
             [Command(_request(ReplaySafety.UNSAFE, "tasks.task.add"), 0)], policy=_policy(max_requests=1)
         )
@@ -1447,8 +1454,8 @@ async def test_a_replay_round_waits_for_its_unrepeatable_sends_and_carries_a_lon
 def test_a_replay_round_that_carries_a_send_must_send_one() -> None:
     pause = _Pause(backoff=1.0, held=0.0, window=3.0, planned_at=0.0)
     with pytest.raises(ValueError, match="must send one"):
-        _Replay(pause, (_SendPlan.CARRY, _SendPlan.REFUSE))
-    assert _Replay(pause, (_SendPlan.CARRY, _SendPlan.SEND)).sends(_SendPlan.SEND) == (1,)
+        _RoundPlan(pause, (_SendPlan.CARRY, _SendPlan.REFUSE))
+    assert _RoundPlan(pause, (_SendPlan.CARRY, _SendPlan.SEND)).sends(_SendPlan.SEND) == (1,)
 
 
 def test_a_round_refused_at_its_send_leaves_its_commands_following_the_envelope_refusal() -> None:

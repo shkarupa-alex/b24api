@@ -9,6 +9,7 @@ import asyncio
 import email.utils
 import json
 import os
+import random
 from collections.abc import Mapping
 from time import gmtime, strftime, tzset
 from typing import TYPE_CHECKING
@@ -18,7 +19,7 @@ import pytest
 from b24api import ReplaySafety, Request
 from b24api.batch.correlation import _Command
 from b24api.batch.engine import BatchExecutor
-from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.batch.outcome import BatchFailure, BatchOutcome, BatchSuccess
 from b24api.contracts import ResultErrorSpec, ResultSelector
 from b24api.contracts.policy import ExecutionPolicy, ReplayDisposition, RetryPolicy
 from b24api.contracts.request import RouteKind
@@ -1182,3 +1183,332 @@ async def test_a_time_limit_on_a_classic_batch_envelope_pauses_its_methods() -> 
     assert isinstance(outcome, BatchFailure)
     assert isinstance(outcome.error, BudgetExceededError)
     assert isinstance(outcome.error.__cause__, ApiResponseError)
+
+
+def _sent_methods(request: Request) -> list[str]:
+    """Return the methods a classic batch envelope carries, in its command order."""
+    commands = request.copy_parameters()["cmd"]
+    assert isinstance(commands, Mapping)
+    return [str(command).partition("?")[0] for command in commands.values()]
+
+
+def _answers_with_a_time_limit_once(method: str) -> Callable[[Request], object]:
+    """Answer ``method``'s command in the first envelope with OPERATION_TIME_LIMIT, and every other with success."""
+    sent: list[Request] = []
+
+    def respond(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, Mapping)
+        sent.append(request)
+        errors = {
+            key: {"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}
+            for key, command in commands.items()
+            if len(sent) == 1 and str(command).partition("?")[0] == method
+        }
+        result = {key: {"ok": 1} for key in commands if key not in errors}
+        return {"result": {"result": result, "result_error": errors or []}}
+
+    return respond
+
+
+def _assert_refused_by_its_hold(outcome: object) -> None:
+    """The command was never sent: it ends with the hold's refusal, proven not run and never replayed."""
+    assert isinstance(outcome, BatchFailure)
+    assert isinstance(outcome.error, BudgetExceededError)
+    assert str(outcome.error) == "coordinator hold exceeds execution time budget"
+    assert outcome.error.__cause__ is None
+    assert execution(outcome.error) is Execution.NOT_SENT
+    assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+
+
+def _neighbouring_chunk() -> tuple[_Command, ...]:
+    """A chunk after the one whose ``crm.item.get`` hit its time limit: two other methods around that one."""
+    requests = (
+        _request(ReplaySafety.SAFE, "crm.item.list"),
+        _request(ReplaySafety.SAFE, "crm.item.get"),
+        _request(ReplaySafety.UNSAFE, "crm.item.add"),
+    )
+    return tuple(_Command(index, f"c{index:012d}", request, None) for index, request in enumerate(requests, 1))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_elapsed", [900.0, 100.0], ids=["default-budget", "budget-shorter-than-the-hold"])
+async def test_a_method_held_beyond_the_window_is_split_off_the_first_send_of_a_neighbouring_chunk(
+    max_elapsed: float,
+) -> None:
+    # The first chunk's get hits its time limit: its method is held for 120 seconds, beyond the 30-second window.
+    # The next chunk sends its other commands at once; its get is refused unsent. Neither waits for the hold nor
+    # fails the commands of other methods, whether or not the operation's own budget outlasts the hold.
+    time = _Time()
+    transport = ResponderTransport(_answers_with_a_time_limit_once("crm.item.get"))
+    executor = _executor(transport, time)
+    _holds_pass_in_virtual_time(executor, time)
+    engine = BatchExecutor(executor)
+    context = executor.context(ExecutionPolicy(max_elapsed=max_elapsed, max_retry_elapsed_per_request=30.0))
+    first = (_Command(0, "c000000000000", _request(ReplaySafety.SAFE, "crm.item.get"), None),)
+    await engine.execute_chunk(first, context=context, halt=False, split_held=True)
+
+    listed, held, added = await engine.execute_chunk(
+        _neighbouring_chunk(), context=context, halt=False, split_held=True
+    )
+    await executor.coordinator.close()
+
+    assert [_sent_methods(request) for request in transport.requests] == [
+        ["crm.item.get"],
+        ["crm.item.list", "crm.item.add"],
+    ]
+    assert time.now == 0.0
+    assert isinstance(listed, BatchSuccess)
+    assert isinstance(added, BatchSuccess)
+    _assert_refused_by_its_hold(held)
+
+
+@pytest.mark.asyncio
+async def test_a_fail_fast_first_send_with_a_method_held_beyond_the_window_is_refused_whole() -> None:
+    # A fail-fast chunk is never split: one command's hold beyond the window refuses the whole chunk unsent, at
+    # once, as it refuses a fail-fast replay round, instead of holding every command for two minutes.
+    time = _Time()
+    transport = ResponderTransport(_answers_with_a_time_limit_once("crm.item.get"))
+    executor = _executor(transport, time)
+    _holds_pass_in_virtual_time(executor, time)
+    engine = BatchExecutor(executor)
+    context = executor.context(ExecutionPolicy(max_retry_elapsed_per_request=30.0))
+    first = (_Command(0, "c000000000000", _request(ReplaySafety.SAFE, "crm.item.get"), None),)
+    await engine.execute_chunk(first, context=context, halt=True, split_held=True)
+
+    outcomes = await engine.execute_chunk(_neighbouring_chunk(), context=context, halt=True, split_held=True)
+    await executor.coordinator.close()
+
+    assert len(transport.requests) == 1
+    assert time.now == 0.0
+    for outcome in outcomes:
+        _assert_refused_by_its_hold(outcome)
+
+
+@pytest.mark.asyncio
+async def test_a_first_send_weighs_a_method_hold_by_what_it_adds_to_the_host_cooldown() -> None:
+    # The host is held 60 seconds, which every command waits anyway. The list's method is held 70 seconds, 10 more
+    # than that: it is sent with the add once its hold ends. The get's method is held 120 seconds, 60 more than the
+    # host, beyond the 30-second window: it is refused unsent, so the others do not wait for it.
+    time = _Time()
+    answer = {"result": {"result": {"c000000000001": 1, "c000000000003": 3}, "result_error": []}}
+    transport = ResponderTransport(always(answer))
+    sent_at: list[float] = []
+    send = transport.send
+
+    async def record(request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        sent_at.append(time.now)
+        return await send(request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
+
+    transport.send = record  # type: ignore[method-assign]
+    executor = _executor(transport, time)
+    _holds_pass_in_virtual_time(executor, time)
+    coordinator = executor.coordinator
+    await coordinator.observe_throttle(60.0, reason="http_429")
+    await coordinator.observe_operation_time_limit("crm.item.list", delay=70.0)
+    await coordinator.observe_operation_time_limit("crm.item.get", delay=120.0)
+    context = executor.context(ExecutionPolicy(max_retry_elapsed_per_request=30.0))
+
+    listed, held, added = await BatchExecutor(executor).execute_chunk(
+        _neighbouring_chunk(), context=context, halt=False, split_held=True
+    )
+    await coordinator.close()
+
+    assert [_sent_methods(request) for request in transport.requests] == [["crm.item.list", "crm.item.add"]]
+    assert sent_at == [70.0]
+    assert isinstance(listed, BatchSuccess)
+    assert isinstance(added, BatchSuccess)
+    _assert_refused_by_its_hold(held)
+
+
+@pytest.mark.asyncio
+async def test_a_rest_v3_first_send_splits_off_a_method_held_beyond_the_window() -> None:
+    held = Request("x.item.get", {"id": 1}, ReplaySafety.SAFE, route=RouteKind.API_V3, result_error=_ERROR_SPEC)
+    free = Request("x.item.list", {}, ReplaySafety.SAFE, route=RouteKind.API_V3, result_error=_ERROR_SPEC)
+    transport = ScriptedTransport((ScriptedExchange.v3_batch((free,), ({"items": []},)),))
+    time = _Time()
+    executor = _executor(transport, time)
+    _holds_pass_in_virtual_time(executor, time)
+    await executor.coordinator.observe_operation_time_limit("x.item.get")
+    context = executor.context(ExecutionPolicy(max_retry_elapsed_per_request=30.0))
+
+    commands = tuple(_Command(index, f"c{index:012d}", request, None) for index, request in enumerate((held, free)))
+    refused, listed = await BatchExecutor(executor).execute_chunk(
+        commands, context=context, halt=False, split_held=True
+    )
+    await executor.coordinator.close()
+
+    transport.assert_exhausted()
+    assert time.now == 0.0
+    assert isinstance(listed, BatchSuccess)
+    _assert_refused_by_its_hold(refused)
+
+
+async def _first_send(
+    commands: tuple[tuple[str, ReplaySafety], ...],
+    *,
+    host: float,
+    held: Mapping[str, float],
+    policy: ExecutionPolicy,
+    halt: bool = False,
+) -> tuple[list[tuple[float, list[str]]], tuple[BatchOutcome, ...]]:
+    """Send one user batch chunk of ``commands`` (method, safety) while the host and ``held`` methods are held.
+
+    Returns each envelope sent, with when it was sent on the virtual clock and the methods it carried, and the
+    chunk's outcomes. Every command it carries succeeds.
+    """
+    time = _Time()
+    sends: list[tuple[float, list[str]]] = []
+
+    def respond(request: Request) -> object:
+        sends.append((time.now, _sent_methods(request)))
+        keys = request.copy_parameters()["cmd"]
+        assert isinstance(keys, Mapping)
+        return {"result": {"result": {key: {"ok": 1} for key in keys}, "result_error": []}}
+
+    executor = _executor(ResponderTransport(respond), time)
+    _holds_pass_in_virtual_time(executor, time)
+    coordinator = executor.coordinator
+    if host:
+        await coordinator.observe_throttle(host, reason="http_429")
+    for method, delay in held.items():
+        await coordinator.observe_operation_time_limit(method, delay=delay)
+    context = executor.context(policy)
+    await context.start()
+    chunk = tuple(
+        _Command(index, f"c{index:012d}", _request(safety, method), None)
+        for index, (method, safety) in enumerate(commands)
+    )
+    outcomes = await BatchExecutor(executor).execute_chunk(chunk, context=context, halt=halt, split_held=True)
+    await coordinator.close()
+    return sends, outcomes
+
+
+_LIST, _GET, _ADD = "crm.item.list", "crm.item.get", "crm.item.add"
+
+
+@pytest.mark.asyncio
+async def test_a_method_whose_hold_after_the_host_outlasts_the_operation_is_split_off() -> None:
+    # The host is held 50 seconds and the get's method 110, 60 more: within the 120-second window, but the operation
+    # has only 100 seconds, so the get could never be admitted. It is refused, and the list goes once the host lets it.
+    sends, (listed, held) = await _first_send(
+        ((_LIST, ReplaySafety.SAFE), (_GET, ReplaySafety.SAFE)),
+        host=50.0,
+        held={_GET: 110.0},
+        policy=ExecutionPolicy(max_elapsed=100.0, max_retry_elapsed_per_request=120.0),
+    )
+
+    assert sends == [(50.0, [_LIST])]
+    assert isinstance(listed, BatchSuccess)
+    _assert_refused_by_its_hold(held)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hold", "sends"),
+    [(20.0, [(20.0, [_LIST, _ADD])]), (30.0, [(0.0, [_LIST])])],
+    ids=["unsafe-waits-more-than-half-the-window", "a-hold-as-long-as-the-window-is-refused"],
+)
+async def test_a_first_send_waits_for_a_hold_shorter_than_the_window_whatever_its_safety(
+    hold: float, sends: list[tuple[float, list[str]]]
+) -> None:
+    # A first send repeats nothing and its window opens after the hold, so an UNSAFE command waits for any hold
+    # shorter than the 30-second window, more than half of it included; a hold of the whole window is refused.
+    sent, (listed, added) = await _first_send(
+        ((_LIST, ReplaySafety.SAFE), (_ADD, ReplaySafety.UNSAFE)),
+        host=0.0,
+        held={_ADD: hold},
+        policy=ExecutionPolicy(max_retry_elapsed_per_request=30.0),
+    )
+
+    assert sent == sends
+    assert isinstance(listed, BatchSuccess)
+    if hold < 30.0:  # noqa: PLR2004
+        assert isinstance(added, BatchSuccess)
+    else:
+        _assert_refused_by_its_hold(added)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("halt", [False, True], ids=["outcomes", "fail-fast"])
+async def test_a_user_batch_whose_every_command_is_held_waits_at_its_permit(halt: bool) -> None:  # noqa: FBT001
+    # Leaving a command out is worth it only to let others go. Every command here is held 120 seconds, beyond the
+    # 30-second window, so the chunk goes whole to its permit and waits within the operation's budget, as a lone
+    # request does, instead of being refused unsent and pulling the next chunk at once.
+    sends, outcomes = await _first_send(
+        ((_GET, ReplaySafety.SAFE), (_GET, ReplaySafety.SAFE)),
+        host=0.0,
+        held={_GET: 120.0},
+        policy=ExecutionPolicy(max_retry_elapsed_per_request=30.0),
+        halt=halt,
+    )
+
+    assert sends == [(120.0, [_GET, _GET])]
+    assert all(isinstance(outcome, BatchSuccess) for outcome in outcomes)
+
+
+def _cannot_wait(hold: float, host: float, policy: ExecutionPolicy) -> bool:
+    """Whether a first send may not wait for a command's method hold.
+
+    It may not when the hold, beyond the host's, outlasts the window, or with the host's outlasts the operation.
+    """
+    window = min(policy.max_retry_elapsed_per_request, policy.max_elapsed)
+    total = max(hold, host)
+    return total - host >= window or total >= policy.max_elapsed
+
+
+@pytest.mark.asyncio
+async def test_a_first_send_leaves_out_exactly_the_commands_that_cannot_wait() -> None:
+    # Seeded scenarios of host and method holds: a command is refused exactly when it cannot wait and another of
+    # its chunk can (or, fail-fast, the whole chunk then); otherwise the permit admits the chunk or refuses it whole
+    # when its hold outlasts the operation. Nothing is sent before the holds of what it carries end.
+    methods = (_LIST, _GET, _ADD)
+    for seed in range(300):
+        rnd = random.Random(seed)
+        commands = tuple((rnd.choice(methods), rnd.choice(tuple(ReplaySafety))) for _ in range(rnd.randint(1, 6)))
+        host = rnd.choice((0.0, 0.0, 10.0, 50.0, 90.0))
+        held = {method: rnd.choice((0.0, 0.0, 20.0, 35.0, 70.0, 110.0, 130.0)) for method in methods}
+        policy = ExecutionPolicy(
+            max_elapsed=rnd.choice((40.0, 100.0, 900.0)), max_retry_elapsed_per_request=rnd.choice((30.0, 120.0))
+        )
+        halt = rnd.random() < 0.3  # noqa: PLR2004
+        if host >= policy.max_elapsed:
+            continue
+        sends, outcomes = await _first_send(
+            commands,
+            host=host,
+            held={method: delay for method, delay in held.items() if delay},
+            policy=policy,
+            halt=halt,
+        )
+        cannot = {index for index, (method, _) in enumerate(commands) if _cannot_wait(held[method], host, policy)}
+        if len(cannot) in {0, len(commands)}:
+            whole_hold = max(max(held[method], host) for method, _ in commands)
+            expected = set(range(len(commands))) if whole_hold >= policy.max_elapsed else set()
+        else:
+            expected = set(range(len(commands))) if halt else cannot
+        refused = {outcome.command_index for outcome in outcomes if isinstance(outcome, BatchFailure)}
+        assert refused == expected, f"seed {seed}"
+        for at, carried in sends:
+            assert at >= max(max(held[method], host) for method in carried), f"seed {seed}"
+
+
+@pytest.mark.asyncio
+async def test_a_spent_request_budget_refuses_a_send_before_it_queues_for_a_cooldown() -> None:
+    # The budget's one request is spent and the host is then held a minute: the next send is refused at once,
+    # instead of waiting the minute out at its permit only to be refused there.
+    time = _Time()
+    transport = ResponderTransport(always(_OK))
+    executor = _executor(transport, time)
+    _holds_pass_in_virtual_time(executor, time)
+    context = executor.context(ExecutionPolicy(max_requests=1))
+    await executor.execute(_request(ReplaySafety.SAFE, "crm.item.get"), context=context)
+    await executor.coordinator.observe_throttle(60.0, reason="http_429")
+
+    with pytest.raises(BudgetExceededError, match="physical request budget exhausted"):
+        await executor.execute(_request(ReplaySafety.SAFE, "crm.item.get"), context=context)
+    await executor.coordinator.close()
+
+    assert len(transport.requests) == 1
+    assert time.now == 0.0
+    assert context.requests_refused

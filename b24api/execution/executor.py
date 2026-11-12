@@ -69,6 +69,8 @@ type Sleeper = Callable[[float], Awaitable[None]]
 
 _HTTP_STATUS_MINIMUM = 100
 _HTTP_STATUS_MAXIMUM = 599
+# Why a send is refused before it queues: a hold the coordinator already knows of outlasts what it may wait.
+_HOLD_REFUSAL = "coordinator hold exceeds execution time budget"
 
 
 class _BodyMode(Enum):
@@ -227,8 +229,8 @@ class _SendPlan(Enum):
 
 
 @dataclass(frozen=True, slots=True)
-class _Replay:
-    """The next round's wait, and what it does with each of its sends.
+class _RoundPlan:
+    """A round's wait, and what it does with each of its sends: a retry or replay round, or a batch's first send.
 
     Each send is weighed against the round's one backoff and its own methods' hold, and admitted when that wait
     fits the window for its safety. With an admitted send that may not be repeated, the round waits the longest
@@ -243,25 +245,25 @@ class _Replay:
     def __post_init__(self) -> None:
         """Refuse a round that carries a send but sends none: nothing would spend an attempt on its way."""
         if _SendPlan.CARRY in self.plans and _SendPlan.SEND not in self.plans:
-            raise ValueError("a replay round that carries a send must send one")
+            raise ValueError("a round that carries a send must send one")
 
     def sends(self, plan: _SendPlan) -> tuple[int, ...]:
         """Return the positions of the sends with ``plan``."""
         return tuple(index for index, own in enumerate(self.plans) if own is plan)
 
 
-def _retry_refusal(replay: _Replay | None) -> str:
+def _retry_refusal(replay: _RoundPlan | None) -> str:
     """Return why the budget refused a retry: no attempt was left (no plan), or the window does not carry it."""
     return "per-request attempt budget exhausted" if replay is None else "retry delay would exceed elapsed budget"
 
 
-def _plan_round(own: tuple[_Pause, ...], safeties: tuple[ReplaySafety, ...], *, whole: bool) -> _Replay:
-    """Plan a round from each send's own pause (see ``_Replay``)."""
+def _plan_round(own: tuple[_Pause, ...], safeties: tuple[ReplaySafety, ...], *, whole: bool) -> _RoundPlan:
+    """Plan a round from each send's own pause (see ``_RoundPlan``)."""
     first = own[0]
     if whole:
         pause = dataclasses.replace(first, held=max(each.held for each in own))
         plan = _SendPlan.SEND if all(pause.admits(safety) for safety in safeties) else _SendPlan.REFUSE
-        return _Replay(pause, tuple(plan for _ in own))
+        return _RoundPlan(pause, tuple(plan for _ in own))
     fits = tuple(each.admits(safety) for each, safety in zip(own, safeties, strict=True))
     unrepeatable = any(fit and safety is not ReplaySafety.SAFE for fit, safety in zip(fits, safeties, strict=True))
     # With a send that may not be repeated, the round waits only as long as such a send can afford.
@@ -274,7 +276,7 @@ def _plan_round(own: tuple[_Pause, ...], safeties: tuple[ReplaySafety, ...], *, 
         default=0.0,
     )
     pause = dataclasses.replace(first, held=held)
-    return _Replay(
+    return _RoundPlan(
         pause,
         tuple(
             _SendPlan.REFUSE if not fit else _SendPlan.SEND if each.delay <= pause.delay else _SendPlan.CARRY
@@ -608,15 +610,19 @@ class Executor:
     ) -> _Permit:
         """Queue for a coordinator permit within the budget left: the operation's until the retry window opens.
 
-        A hold the coordinator already has on ``methods`` (a host throttle hint or a method cooldown) that outlasts
-        the budget fails at once instead of waiting the budget out. Either failure reports the failure of the
-        request's latest send, whichever call or replay round made it.
+        A spent request budget, and a hold the coordinator already has on ``methods`` (a host throttle hint or a
+        method cooldown) that outlasts the budget, fail at once instead of queueing for nothing or waiting the budget
+        out. Each failure reports the failure of the request's latest send, whichever call or replay round made it.
         """
         cause = attempts.retry_cause
+        try:
+            context.admit_request()
+        except BudgetExceededError as error:
+            raise error from cause
         if (remaining := context.remaining_time(retry_started=attempts.started)) <= 0:
             raise BudgetExceededError("execution time budget exhausted") from cause
         if context.coordinator.admission_delay(methods) >= remaining:
-            raise BudgetExceededError("coordinator hold exceeds execution time budget") from cause
+            raise BudgetExceededError(_HOLD_REFUSAL) from cause
         try:
             async with asyncio.timeout(remaining):
                 return await context.coordinator.acquire(
@@ -823,12 +829,12 @@ class Executor:
         attempts: _RequestAttempts,
         sends: tuple[tuple[ReplaySafety, frozenset[str]], ...],
         whole: bool = False,
-    ) -> _Replay | None:
+    ) -> _RoundPlan | None:
         """Plan the wait before the request's next round and what it does with each send; ``None``: no attempt left.
 
         This plans the executor's own retries and the replay rounds of a physical batch. Each send is a safety and
         the methods it is admitted under, weighed against the round's one backoff or its own methods' hold when
-        longer (see ``_Replay`` and ``_Pause.admits``). The holds are those the coordinator knows when planning:
+        longer (see ``_RoundPlan`` and ``_Pause.admits``). The holds are those the coordinator knows when planning:
         one on a method of one command does not stop another's replay, but a hold that appears during the wait
         is met at the permit. A ``whole`` round (a fail-fast batch) waits the longest wait of all its sends and is
         sent whole or not at all. A backoff already waited for a send that was then refused at its admission is
@@ -847,6 +853,31 @@ class Executor:
         now = self._clock()
         own = tuple(_Pause(backoff, context.coordinator.admission_delay(methods), window, now) for _, methods in sends)
         return _plan_round(own, tuple(safety for safety, _ in sends), whole=whole)
+
+    def plan_first_send(
+        self, context: ExecutionContext, *, methods: tuple[frozenset[str], ...], whole: bool
+    ) -> _RoundPlan | None:
+        """Plan which commands an envelope's first send leaves out for their own methods' hold; ``None``: none.
+
+        An envelope is admitted under every method it carries, so one command's method hold holds back all the others.
+        Each command is weighed as a replay round weighs its send (``_Pause.admits``), with no backoff: by how much
+        longer its own methods are held than the host, which every command waits for alike, against what its send may
+        wait for, the retry window it opens and what the operation has left after the host hold, whichever is shorter.
+        A first send repeats nothing and its window opens at its permit, after the hold, so each is weighed as a send
+        that may be repeated, whatever its safety. Leaving a command out is worth it only to let the others go: when
+        every command can wait, or none can, the envelope goes whole to its permit, which waits within the operation's
+        budget or refuses at once a hold that outlasts it, as for a lone request. Otherwise ``_plan_round`` refuses
+        each command that cannot wait, the others being sent once the longest hold among them ends (the coordinator
+        enforces it at the permit), or refuses a ``whole`` (fail-fast) envelope whole, as it refuses a replay round.
+        """
+        now = self._clock()
+        host = context.coordinator.admission_delay(frozenset())
+        window = min(context.remaining_time(retry_started=now), context.remaining_time(retry_started=None) - host)
+        pauses = tuple(_Pause(0.0, context.coordinator.admission_delay(each) - host, window, now) for each in methods)
+        fits = tuple(pause.admits(ReplaySafety.SAFE) for pause in pauses)
+        if all(fits) or not any(fits):
+            return None
+        return _plan_round(pauses, tuple(ReplaySafety.SAFE for _ in pauses), whole=whole)
 
     async def replay_after(self, context: ExecutionContext, *, attempts: _RequestAttempts, pause: _Pause) -> None:
         """Wait out a pause ``plan_replay`` planned before the replay round it admits."""

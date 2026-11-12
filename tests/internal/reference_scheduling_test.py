@@ -17,13 +17,17 @@ import pytest
 from b24api import (
     AutoKeysetExecution,
     BatchDispatch,
+    BatchFailed,
     CountedTraversal,
+    DirectDispatch,
     ExecutionPolicy,
     IdentityCoercion,
     IdentitySpec,
     KeysetSpec,
     KeysetTraversal,
     ParameterPath,
+    ReferenceFailed,
+    ReplaySafety,
     Request,
     ResultSelector,
     SequentialTraversal,
@@ -32,11 +36,12 @@ from b24api import (
 )
 from b24api.batch.engine import BatchExecutor
 from b24api.contracts import Binding, DeliveryOrder, ParameterUpdate, ReferenceSource
+from b24api.contracts.command import Command
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError
 from b24api.execution import Executor
-from b24api.execution.context import CleanupResult
+from b24api.execution.context import CleanupResult, ExecutionContext
 from b24api.references.counted_io import ReferenceTailStream
 from b24api.references.dispatch import (
     _BatchPageDispatcher,
@@ -64,9 +69,10 @@ from tests.scripting import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from b24api.contracts import TraversalSpec
-    from b24api.execution.context import ExecutionContext
-    from b24api.references.dispatch import _AdmissionState, _DispatchedPage, _Transit, _Work
+    from b24api.references.dispatch import _AdmissionState, _DispatchedPage, _Event, _Transit, _Work
     from b24api.references.program import FastKeysetProgram
     from b24api.references.run import _ReferenceRun
     from b24api.traversal.identity import _Page
@@ -607,7 +613,7 @@ async def test_closing_a_tail_inside_a_cancelled_task_does_not_arm_another_cance
 def _grant(pool: int, free: int) -> int | None:
     """Ask a READY scheduler for a lease of the second of two partitioned bindings (C=10, A=4).
 
-    An ordinary binding is admitted beside them and the source iterator is exhausted, so
+    An ordinary binding is admitted beside them and the source has ended, so
     R_keep = R = 0 under READY, F = 2, P = 34, Q = 44 and G_cap = max(P, pool // 2).
     """
     fast = SimpleNamespace(automatic=False, floor=34, quota=44, effective_page_cap=10)
@@ -616,7 +622,7 @@ def _grant(pool: int, free: int) -> int | None:
         buffer=buffer,
         output_order=ReferenceOutputOrder.READY,
         _admission=SimpleNamespace(tasks={0: None, 1: None, 2: None}),
-        _source_exhausted=True,
+        _source_ended=True,
         _fast_active={0, 1},
     )
     grant = ReferenceScheduler._lease_size  # noqa: SLF001
@@ -808,3 +814,123 @@ async def test_a_send_that_breaks_an_invariant_fails_its_pages_as_possibly_run(m
 
     # The page fails with the send path's own error, and it may have run.
     assert _failed_settlement(caught.value) is CommandSettlement.UNKNOWN
+
+
+class _EndlessReferences:
+    """Commands of one SAFE method without end; the third is read only once ``refused`` is set.
+
+    It records every pull and whether the source was closed.
+    """
+
+    def __init__(self, refused: asyncio.Event) -> None:
+        self.refused = refused
+        self.pulled = 0
+        self.closed = False
+
+    async def commands(self) -> AsyncGenerator[Command[int]]:
+        try:
+            while True:
+                if self.pulled == 2:  # noqa: PLR2004 - the third pull waits for the budget's refusal
+                    await reached(self.refused)
+                self.pulled += 1
+                yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), self.pulled)
+        finally:
+            self.closed = True
+
+    async def bindings(self) -> AsyncGenerator[Binding[int]]:
+        async for command in self.commands():
+            yield Binding(str(command.correlation), (), command.correlation)
+
+
+def _one_row_each(request: Request) -> object:
+    """Answer a direct page, or each command of a classic batch, with one row: every binding yields an item."""
+    commands = request.copy_parameters().get("cmd")
+    if isinstance(commands, dict):
+        return {"result": {"result": {key: [{"ID": 1}] for key in commands}, "result_error": []}}
+    return {"result": [{"ID": 1}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["fan_out", "iter_references"])
+@pytest.mark.parametrize(
+    "dispatch",
+    [DirectDispatch(concurrency=2), BatchDispatch(batch_size=1, concurrency=2)],
+    ids=["direct", "batch"],
+)
+async def test_a_fail_fast_operation_its_request_budget_closes_records_only_the_spent_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    dispatch: DirectDispatch | BatchDispatch,
+) -> None:
+    """A source closed by the request budget ends as input does, not as a failure its cleanup records.
+
+    The order is scripted: the budget allows one request and refuses the second binding's send; the source reads a
+    third binding only after that refusal, so the producer then meets the spent budget; and the stream takes up the
+    refused binding's failure only once the producer has ended. The window's fail-fast failure is therefore raised
+    after the producer ended at the budget, never before: the order in which a producer that failed at the budget
+    left its error to the cleanup, recorded as a blocking ``cleanup_failure``.
+    """
+    admit = ExecutionContext.admit_request
+    produce = ReferenceScheduler._produce  # noqa: SLF001
+    consume = ReferenceScheduler._consume_event  # noqa: SLF001
+    wake = ReferenceScheduler._wake_lease_waiters  # noqa: SLF001
+    refused = asyncio.Event()
+    producer_ended = asyncio.Event()
+    woken_ended: list[bool] = []
+
+    def observed_admit(context: ExecutionContext) -> None:
+        try:
+            admit(context)
+        except BudgetExceededError:
+            refused.set()
+            raise
+
+    async def observed_produce(scheduler: ReferenceScheduler, *args: object) -> None:
+        try:
+            await produce(scheduler, *args)  # type: ignore[arg-type]
+        finally:
+            producer_ended.set()
+
+    async def consume_after_the_producer(scheduler: ReferenceScheduler, event: _Event) -> AsyncGenerator[object]:
+        if isinstance(event, _FailureEvent):
+            await reached(producer_ended)
+        async for item in consume(scheduler, event):
+            yield item
+
+    async def observed_wake(scheduler: ReferenceScheduler) -> None:
+        woken_ended.append(scheduler._source_ended)  # noqa: SLF001
+        await wake(scheduler)
+
+    monkeypatch.setattr(ExecutionContext, "admit_request", observed_admit)
+    monkeypatch.setattr(ReferenceScheduler, "_produce", observed_produce)
+    monkeypatch.setattr(ReferenceScheduler, "_consume_event", consume_after_the_producer)
+    monkeypatch.setattr(ReferenceScheduler, "_wake_lease_waiters", observed_wake)
+    source = _EndlessReferences(refused)
+    transport = ResponderTransport(_one_row_each)
+    client = client_for(transport)
+    policy = ExecutionPolicy(max_requests=1)
+    stream = (
+        client.fan_out(source.commands(), dispatch=dispatch, policy=policy)
+        if operation == "fan_out"
+        else client.iter_references(
+            Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+            source.bindings(),
+            traversal=SequentialTraversal(),
+            dispatch=dispatch,
+            policy=policy,
+        )
+    )
+
+    with pytest.raises((BatchFailed, ReferenceFailed)):
+        async for _item in stream:
+            pass
+
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.INCOMPLETE
+    assert [violation.code for violation in report.violations] == ["budget_exhausted"]
+    assert len(transport.requests) == 1
+    assert source.pulled == 3  # noqa: PLR2004 - the read binding the budget refused, and the one read while it did
+    assert source.closed
+    # The budget's end of the source wakes lease waiters as a read-out source does.
+    assert True in woken_ended

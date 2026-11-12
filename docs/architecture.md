@@ -124,7 +124,25 @@ outcome.
   or not at all. A hold that appears during the wait is met at the permit and stops the whole round
   when it outlasts the window; a stop before a round's send ends each of its commands with the
   failure that command followed as the cause. The REST 3.0 isolation of an unresolved `SAFE` envelope re-sends its commands one by one at once,
-  outside that planner.
+  outside that planner. An envelope's first send is admitted under all its methods, so for a user's
+  logical batch (`batch()`, `batch_outcomes()`) `Executor.plan_first_send` weighs its commands with
+  the same `_Pause.admits` and `_plan_round`, with no backoff, by how much longer each command's own
+  method is held than the host, against the window its send opens or what the operation has left after
+  the host hold: when some commands can wait and others cannot, the engine refuses those unsent and
+  sends the rest (a fail-fast envelope is refused whole); otherwise the envelope goes whole to its
+  permit. Traversal pages and dispatcher waves (`BatchExecutor.execute_requests`) are never split.
+- The request budget ends an operation: `ExecutionContext.admit_request` refuses a send once
+  `max_requests` is spent, before its permit and again at its reservation, and records the refusal
+  (`requests_refused`), after which no send can be admitted. `AsyncIteratorController.get`, the one
+  source pull of the batch streams, then refuses further input, so the operation ends with
+  `BudgetExceededError`, as the time budget ends it at the next pull. The reference scheduler's
+  producer reads no binding once the refusal is recorded and ends the source as a read-out source
+  ends (lease waiters are woken, and the source no longer counts as one that may still bring a
+  binding). Its task ends without error, so a fail-fast window's failure stays the operation's only
+  error and cleanup records nothing. The consumer decides from `requests_refused` itself, not from how
+  the source ended (the producer reads ahead and may read a finite source out before a refusal), and
+  raises `BudgetExceededError` once the bindings already read are settled. A budget the last
+  needed send spends exactly ends nothing.
 - The default response ceiling is enforced while streaming, before JSON decoding.
 - Exact sequential, counted, and multi-reference traversal shares one operation-wide
   `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted

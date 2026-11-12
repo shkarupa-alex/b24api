@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import warnings
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -60,12 +60,22 @@ from b24api.errors import (
     ReferenceFailed,
     TransportError,
 )
+from b24api.execution.facts import Execution, execution
 from b24api.settings import Settings
-from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, attached_report, client_for, reached
+from tests.scripting import (
+    HANG_BOUND,
+    UNREACHABLE_COALESCE_WAIT,
+    ResponderTransport,
+    attached_report,
+    client_for,
+    drain_to_failure,
+    reached,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator
 
+    from b24api.contracts import CommandOutcome, OperationStream
     from b24api.execution import Transport, WireResponse
     from tests.scripting import ClientFactory
 
@@ -92,6 +102,8 @@ LARGE_LOGICAL_BATCH_REQUESTS = 2_000
 BOUNDED_LOOKAHEAD_COMMANDS = 2_000
 CUSTOM_INITIAL_OFFSET = 10
 CUSTOM_NEXT_OFFSET = 12
+BUDGET_CHUNK = 5
+BUDGET_SOURCE_COMMANDS = 20
 
 
 class BlockingCloseTransport(ResponderTransport):
@@ -476,6 +488,356 @@ async def test_batch_outcomes_retains_typed_failure_without_halting_later_comman
     assert decision.pages_scheduled == SMALL_BATCH_COMMANDS
     assert decision.pages_acknowledged == SMALL_BATCH_COMMANDS - 1
     assert gate.finish() == stream.report
+
+
+class _BudgetSource:
+    """Commands of one SAFE method, ``total`` of them or without end, recording every pull and whether it closed."""
+
+    # Far beyond what any budget of these tests sends: pulling this much means the source is pulled for nothing.
+    runaway = 1_000
+
+    def __init__(self, total: int | None) -> None:
+        self.total = total
+        self.pulled = 0
+        self.closed = False
+        # Set once a finite source has been read to its end.
+        self.read_out = asyncio.Event()
+
+    async def commands(self) -> AsyncGenerator[Command[int]]:
+        try:
+            while self.total is None or self.pulled < self.total:
+                if self.pulled >= self.runaway:
+                    raise AssertionError("the source was pulled after the request budget refused a send")
+                self.pulled += 1
+                yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), self.pulled)
+            self.read_out.set()
+        finally:
+            self.closed = True
+
+
+def _echo_batch(request: Request) -> object:
+    commands = request.copy_parameters()["cmd"]
+    assert isinstance(commands, dict)
+    return {"result": {"result": {key: {"ok": 1} for key in commands}, "result_error": []}}
+
+
+def _assert_ended_by_request_budget(stream: OperationStream[CommandOutcome[int]], error: BaseException) -> None:
+    """The stream ended as the time budget ends it: the budget's failure, an incomplete report that records it."""
+    assert str(error) == "physical request budget exhausted"
+    report = stream.report
+    assert report is not None
+    assert attached_report(error) is report
+    assert report.state is TerminalState.INCOMPLETE
+    assert [violation.code for violation in report.violations] == ["budget_exhausted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("total", [None, BUDGET_SOURCE_COMMANDS], ids=["without-end", "finite"])
+async def test_batch_outcomes_ends_when_the_request_budget_refuses_a_send(total: int | None) -> None:
+    # Two requests send the first two chunks; the third chunk, already pulled, is refused before its send. Nothing
+    # more is pulled, the refused commands end as never sent, and the stream ends with the budget.
+    source = _BudgetSource(total)
+    transport = ResponderTransport(_echo_batch)
+    stream = _client(transport).batch_outcomes(
+        source.commands(), batch_size=BUDGET_CHUNK, policy=ExecutionPolicy(max_requests=PARTIAL_WINDOW)
+    )
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    admitted = (PARTIAL_WINDOW + 1) * BUDGET_CHUNK
+    assert len(transport.requests) == PARTIAL_WINDOW
+    assert source.pulled == len(outcomes) == admitted
+    assert source.closed
+    sent, refused = outcomes[: PARTIAL_WINDOW * BUDGET_CHUNK], outcomes[PARTIAL_WINDOW * BUDGET_CHUNK :]
+    assert all(isinstance(outcome, CommandSuccess) for outcome in sent)
+    for outcome in refused:
+        assert isinstance(outcome, CommandFailure)
+        assert isinstance(outcome.error, BudgetExceededError)
+        assert execution(outcome.error) is Execution.NOT_SENT
+        assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+    _assert_ended_by_request_budget(stream, error)
+    report = stream.report
+    assert report is not None
+    assert report.admitted == admitted
+    assert (report.successes, report.failures) == (len(sent), len(refused))
+    assert report.physical_requests == PARTIAL_WINDOW
+
+
+@pytest.mark.asyncio
+async def test_batch_outcomes_ends_when_the_request_budget_stops_a_replay() -> None:
+    # The first chunk's command is refused by quota and may be sent again, but its replay is the request the budget
+    # refuses: the command keeps its own refusal, and the operation ends before the second chunk is pulled.
+    def refused(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {"result": {"result": [], "result_error": {key: {"error": "QUERY_LIMIT_EXCEEDED"} for key in commands}}}
+
+    source = _BudgetSource(PARTIAL_WINDOW)
+    transport = ResponderTransport(refused)
+    stream = _client(transport).batch_outcomes(source.commands(), batch_size=1, policy=ExecutionPolicy(max_requests=1))
+
+    (outcome,), error = await drain_to_failure(stream, BudgetExceededError)
+
+    assert len(transport.requests) == 1
+    assert source.pulled == 1
+    assert source.closed
+    assert isinstance(outcome, CommandFailure)
+    assert isinstance(outcome.error, BatchCommandError)
+    assert outcome.replay_disposition is ReplayDisposition.ELIGIBLE
+    _assert_ended_by_request_budget(stream, error)
+
+    # Control: a budget the operation's last send spends exactly refuses nothing, and the operation completes.
+    exact = _BudgetSource(PARTIAL_WINDOW * BUDGET_CHUNK)
+    fitting = _client(ResponderTransport(_echo_batch)).batch_outcomes(
+        exact.commands(), batch_size=BUDGET_CHUNK, policy=ExecutionPolicy(max_requests=PARTIAL_WINDOW)
+    )
+    assert all([isinstance(each, CommandSuccess) async for each in fitting])
+    assert fitting.report is not None
+    assert fitting.report.state is TerminalState.COMPLETED
+    assert fitting.report.violations == ()
+
+
+def _answer_direct_or_batch(request: Request) -> object:
+    """Answer a direct request with an empty page, and each command of a classic batch with one."""
+    commands = request.copy_parameters().get("cmd")
+    if isinstance(commands, dict):
+        return {"result": {"result": {key: [] for key in commands}, "result_error": []}}
+    return {"result": []}
+
+
+async def _bindings(source: _BudgetSource) -> AsyncGenerator[Binding[int]]:
+    """Bind one reference per command the budget source yields."""
+    async for command in source.commands():
+        yield Binding(str(command.correlation), (), command.correlation)
+
+
+def _assert_reference_stream_ended_by_request_budget(
+    stream: OperationStream[Any], outcomes: list[Any], error: BaseException, transport: ResponderTransport
+) -> None:
+    """Each admitted reference has its outcome, then the request budget ends the stream and its report records it."""
+    report = stream.report
+    assert report is not None
+    assert str(error) == "physical request budget exhausted"
+    assert attached_report(error) is report
+    assert len(transport.requests) == PARTIAL_WINDOW
+    assert report.admitted == len(outcomes)
+    assert report.state is TerminalState.INCOMPLETE
+    assert "budget_exhausted" in {violation.code for violation in report.violations}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("total", [None, BUDGET_SOURCE_COMMANDS * 10], ids=["without-end", "finite"])
+@pytest.mark.parametrize("dispatch", [DirectDispatch(), BatchDispatch()], ids=["direct", "batch"])
+async def test_fan_out_outcomes_ends_when_the_request_budget_refuses_a_send(
+    dispatch: DirectDispatch | BatchDispatch, total: int | None
+) -> None:
+    # Two requests are all the budget allows; the scheduler stops pulling commands once it refuses the third send.
+    source = _BudgetSource(total)
+    transport = ResponderTransport(_answer_direct_or_batch)
+    stream = _client(transport).fan_out_outcomes(
+        source.commands(), dispatch=dispatch, policy=ExecutionPolicy(max_requests=PARTIAL_WINDOW)
+    )
+
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    assert source.pulled == len(outcomes) < (total or _BudgetSource.runaway)
+    assert source.closed
+    refused = [outcome for outcome in outcomes if isinstance(outcome, CommandFailure)]
+    assert refused
+    for outcome in refused:
+        assert isinstance(outcome.error, BudgetExceededError)
+        assert execution(outcome.error) is Execution.NOT_SENT
+    _assert_reference_stream_ended_by_request_budget(stream, outcomes, error, transport)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch", [DirectDispatch(), BatchDispatch()], ids=["direct", "batch"])
+async def test_reference_outcomes_end_when_the_request_budget_refuses_a_send(
+    dispatch: DirectDispatch | BatchDispatch,
+) -> None:
+    source = _BudgetSource(None)
+    transport = ResponderTransport(_answer_direct_or_batch)
+    stream = _client(transport).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        _bindings(source),
+        traversal=SequentialTraversal(),
+        dispatch=dispatch,
+        policy=ExecutionPolicy(max_requests=PARTIAL_WINDOW),
+    )
+
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    assert source.pulled == len(outcomes) < _BudgetSource.runaway
+    assert source.closed
+    assert any(isinstance(outcome, ReferenceFailure) for outcome in outcomes)
+    _assert_reference_stream_ended_by_request_budget(stream, outcomes, error, transport)
+
+
+READ_OUT_SOURCE = 3
+
+
+def _read_ahead(
+    operation: str, dispatch: type[DirectDispatch | BatchDispatch], order: DeliveryOrder, transport: Transport
+) -> tuple[Bitrix24, DirectDispatch | BatchDispatch, ExecutionPolicy]:
+    """Return a client, dispatch and policy that read the whole source ahead of the send the budget refuses.
+
+    The scheduler reads one binding past its active window to see the source end, so the window must exceed the
+    source; under INPUT a whole result's window follows its row share. The sends that follow the first wait for it:
+    one at a time on the client (direct), or on the one wave sender (batch).
+    """
+    if dispatch is DirectDispatch:
+        settings = Settings(webhook_url=f"https://{transport.host}/rest/1/token/", max_concurrent_requests=1)
+        plan: DirectDispatch | BatchDispatch = DirectDispatch(concurrency=READ_OUT_SOURCE, output_order=order)
+        return Bitrix24(settings, transport=transport), plan, ExecutionPolicy(max_requests=PARTIAL_WINDOW)
+    # Two commands a wave: a whole result's share of three rows is one row, so the window holds four bindings.
+    policy = ExecutionPolicy(max_requests=1)
+    if operation == "fan_out_outcomes":
+        policy = ExecutionPolicy(max_requests=1, max_buffered_rows=READ_OUT_SOURCE)
+    plan = BatchDispatch(batch_size=PARTIAL_WINDOW, concurrency=1, output_order=order)
+    return client_for(transport), plan, policy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT], ids=["ready", "input"])
+@pytest.mark.parametrize("dispatch", [DirectDispatch, BatchDispatch], ids=["direct", "batch"])
+@pytest.mark.parametrize("operation", ["fan_out_outcomes", "iter_reference_outcomes"])
+async def test_reference_outcomes_end_with_the_request_budget_even_when_their_source_was_read_out_first(
+    operation: str, dispatch: type[DirectDispatch | BatchDispatch], order: DeliveryOrder
+) -> None:
+    # The scheduler reads ahead of its sends: here the whole source is read before the first answer, so a later
+    # send is refused only after the source ended by itself. The budget's refusal still ends the operation.
+    source = _BudgetSource(READ_OUT_SOURCE)
+
+    async def answer(request: Request) -> object:
+        await reached(source.read_out)
+        return _answer_direct_or_batch(request)
+
+    transport = ResponderTransport(answer)
+    client, plan, policy = _read_ahead(operation, dispatch, order, transport)
+    stream: OperationStream[Any] = (
+        client.fan_out_outcomes(source.commands(), dispatch=plan, policy=policy)
+        if operation == "fan_out_outcomes"
+        else client.iter_reference_outcomes(
+            Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+            _bindings(source),
+            traversal=SequentialTraversal(),
+            dispatch=plan,
+            policy=policy,
+        )
+    )
+
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    assert source.pulled == len(outcomes) == READ_OUT_SOURCE
+    assert source.closed
+    refused = [outcome for outcome in outcomes if isinstance(outcome, CommandFailure | ReferenceFailure)]
+    assert refused
+    for outcome in refused:
+        assert isinstance(outcome.error, BudgetExceededError)
+        assert execution(outcome.error) is Execution.NOT_SENT
+    report = stream.report
+    assert report is not None
+    assert str(error) == "physical request budget exhausted"
+    assert attached_report(error) is report
+    assert report.physical_requests == policy.max_requests
+    assert report.state is TerminalState.INCOMPLETE
+    assert "budget_exhausted" in {violation.code for violation in report.violations}
+
+
+# How long a test watches an operation wait for a method hold of two minutes: a stream that does not wait
+# returns at once, so a busy host can only make this look like waiting when it waits.
+HELD_WAIT = 0.2
+
+
+def _held_portal(method: str) -> ResponderTransport:
+    """Answer the first call to ``method`` with OPERATION_TIME_LIMIT, holding it client-wide, and everything else."""
+
+    def respond(request: Request) -> object:
+        if len(transport.requests) == 1:
+            assert request.method == method
+            return {"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}
+        return _answer_direct_or_batch(request)
+
+    transport = ResponderTransport(respond)
+    return transport
+
+
+async def _hold(client: Bitrix24, method: str) -> None:
+    """Hold ``method`` on the client's coordinator for the default two minutes: the portal limits a call to it."""
+    with pytest.raises(BudgetExceededError):
+        await client.call(Request(method, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
+
+
+async def _waits(stream: OperationStream[Any]) -> bool:
+    """Return whether the stream's first read is still waiting after ``HELD_WAIT``; the stream is closed then."""
+    try:
+        await asyncio.wait_for(anext(stream), timeout=HELD_WAIT)
+    except TimeoutError:
+        return True
+    finally:
+        await stream.aclose()
+    return False
+
+
+@pytest.mark.asyncio
+async def test_batch_outcomes_whose_every_command_is_held_waits_instead_of_draining_its_source() -> None:
+    # Every command's method is held for two minutes, so no command is left out to let another go: the first chunk
+    # waits at its permit, and the source is not pulled past it, where refusing each chunk unsent pulled without end.
+    pulled = 0
+
+    async def updates() -> AsyncGenerator[Command[int]]:
+        nonlocal pulled
+        while True:
+            pulled += 1
+            yield Command(Request.bare("crm.item.update", {"id": pulled}, ReplaySafety.UNSAFE), pulled)
+
+    transport = _held_portal("crm.item.update")
+    async with _client(transport) as client:
+        await _hold(client, "crm.item.update")
+        assert await _waits(client.batch_outcomes(updates()))
+
+    assert len(transport.requests) == 1
+    assert pulled <= PAGE_SIZE
+
+
+@pytest.mark.asyncio
+async def test_batch_outcomes_sends_the_other_methods_of_a_chunk_without_its_held_one() -> None:
+    # The list is held for two minutes, beyond the 30-second window of the client's default policy; the get of the
+    # same chunk goes at once without it, and the list is refused unsent.
+    transport = _held_portal("test.list")
+    held = Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    free = Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    async with _client(transport) as client:
+        await _hold(client, "test.list")
+        stream = client.batch_outcomes([Command(held, 0), Command(free, 1)])
+        async with asyncio.timeout(HANG_BOUND):
+            refused, sent = [outcome async for outcome in stream]
+
+    assert isinstance(sent, CommandSuccess)
+    assert isinstance(refused, CommandFailure)
+    assert isinstance(refused.error, BudgetExceededError)
+    assert execution(refused.error) is Execution.NOT_SENT
+    assert len(transport.requests) == PARTIAL_WINDOW
+    assert transport.requests[-1].method == "batch"
+
+
+@pytest.mark.asyncio
+async def test_traversal_pages_and_dispatched_commands_wait_for_a_held_method_as_sent_one_by_one() -> None:
+    # A reference's pages and the commands a dispatcher batches are never left out for their method's hold: with
+    # the default BatchDispatch they wait at the permit, as with DirectDispatch, instead of failing at once. A
+    # dispatcher's wave that carries the held list with a get waits whole, rather than sending the get without it.
+    held = Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    free = Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    for dispatch in (BatchDispatch(), DirectDispatch()):
+        transport = _held_portal("test.list")
+        async with _client(transport) as client:
+            await _hold(client, "test.list")
+            references = client.iter_reference_outcomes(
+                held, [Binding("held", (), 1)], traversal=SequentialTraversal(), dispatch=dispatch
+            )
+            assert await _waits(references), dispatch
+            wave = [Command(held, 1), Command(free, 2)] if isinstance(dispatch, BatchDispatch) else [Command(held, 1)]
+            assert await _waits(client.fan_out_outcomes(wave, dispatch=dispatch)), dispatch
+        assert len(transport.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -902,7 +1264,7 @@ async def test_homogeneous_reference_chunk_the_budget_stops_still_counts_as_in_2
         policy=ExecutionPolicy(max_requests=1),
     )
 
-    outcomes = [outcome async for outcome in stream]
+    outcomes, _ = await drain_to_failure(stream, BudgetExceededError)
 
     assert isinstance(outcomes[0], ReferenceComplete)
     assert isinstance(outcomes[1], ReferenceFailure)
