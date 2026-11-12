@@ -17,20 +17,26 @@ work so its HTTP/2 connection pool and rate state are reused. The URL has the fo
 `https://<portal>/rest/<user>/<token>/`, with a numeric user and a token of letters, digits, `_` and
 `-`. `http` is accepted. Letter case is normalized only in the scheme and host, which are lowered: the
 path keeps its case, so the token is sent as written and `/REST/` is refused. A default port is dropped
-and any other kept, `.` and `..` segments are resolved, a missing trailing slash is added and
-surrounding whitespace is dropped. Any other form is refused, one with a user name or password, a
-query, a fragment or a percent-encoded path included, since the token is its only credential and is
-registered for redaction as it is sent.
+and any other kept, `.` and `..` segments are resolved, a missing trailing slash is added, and leading
+and trailing ASCII spaces and control characters are dropped. Any other form is refused, one with a
+user name or password, a query, a fragment, a percent-encoded path or a surrounding non-ASCII space (a
+no-break space, for example) included, since the token is its only credential and is registered for
+redaction as it is sent.
 
 `Settings` reads two limits as well. `BITRIX24_API_HTTP_TIMEOUT` is each request's retry window in
 seconds (30 by default, finite). `BITRIX24_API_MAX_CONCURRENT_REQUESTS` is how many requests one client
 keeps in flight at once, all its calls, streams and retries together (10 by default). An operation's
 own limits only narrow it, and which of them apply depends on the dispatch. A `DirectDispatch` sends at
 most the smallest of its `concurrency`, `ExecutionPolicy.max_direct_concurrency`,
-`ExecutionPolicy.max_active_references` and the client limit at once. A `BatchDispatch` keeps at most
-the smallest of its `concurrency`, `max_active_references` and the client limit in flight;
-`max_direct_concurrency` does not limit it. So `DirectDispatch(concurrency=40)` alone still runs 10
-requests at a time. Raise the client limit only as far as the portal's rate limits allow.
+`ExecutionPolicy.max_active_references` and the client limit at once. A `BatchDispatch` bounds physical
+batches, not requests: it keeps at most the smallest of its `concurrency`, `max_active_references` and
+the client limit in flight, and `max_direct_concurrency` does not limit it. When a REST 3.0 envelope of
+`SAFE` commands may have run without an answer, its unresolved commands are sent again one by one, all
+at once, bounded only by the client limit. So `DirectDispatch(concurrency=40)` alone still runs 10
+requests at a time. `fan_out()` and `fan_out_outcomes()` size each command's share of
+`max_buffered_rows` for one batch, so `BatchDispatch(batch_size=1)` gives a command the whole row pool
+and sends one batch at a time whatever its `concurrency`; use `DirectDispatch` to send single commands
+concurrently. Raise the client limit only as far as the portal's rate limits allow.
 `Bitrix24.from_webhook()` takes both limits as arguments:
 
 <!-- tested: tests/settings_test.py::test_effective_concurrency_is_the_smallest_of_the_client_and_operation_limits -->
@@ -866,11 +872,15 @@ takes.
 
 `max_elapsed` is checked at the operation's scheduling points: when a request, a page or a source item
 is admitted, while a send waits for its permit (a pause included), while a page waits for row capacity
-and while an async source is pulled. It does not bound the time the application spends while it holds
-control: in a `page_stop` callback, or as a consumer that is slow between pulls of the stream. Nothing
-interrupts the application when the budget runs out meanwhile; the next scheduling point ends the
-operation with `BudgetExceededError` and an `incomplete` report, even when all that is left is to read
-the end of the source.
+and while a source, synchronous or asynchronous, is pulled. A send in flight is cut at what is left of
+the operation or of its retry window, whichever is shorter. It does not bound the time the application
+spends while it holds control: in a `page_stop` callback, or as a consumer that is slow between pulls
+of the stream. Nothing interrupts the application when the budget runs out meanwhile; the next
+scheduling point ends the operation, even when all that is left is to read the end of the source. The
+report is then `incomplete`, its terminal reason is `BudgetExceededError` and it records the
+`budget_exhausted` violation. The stream raises `BudgetExceededError`, except the fail-fast ones that
+wrap failures: `fan_out()` raises `BatchFailed`, and `iter_references()`, `iter_cursors()` and
+`iter_reference_sources()` raise `ReferenceFailed`.
 
 Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
 observed identities per operation in memory (100,000 by default). All active reference bindings

@@ -139,8 +139,9 @@ send meets a method pause, have changed.
   client closed. Each now raises `b24api.errors.ClientClosedError`. It is a `TransportError` of phase
   `not_dispatched` and `retryable=False`: the attempt it stopped never left the process, and it is never
   retried. The phase covers that attempt alone. A `SAFE` request waiting for the permit of a retry may
-  have run on an earlier attempt; an `UNSAFE` or `UNKNOWN` one is retried only after a refusal that
-  proved it did not run, so it stays proven not run. It also derives from `RuntimeError`, so
+  have run on an earlier attempt; an `UNSAFE` or `UNKNOWN` one is retried only after a failure that
+  proved it did not run (a transport failure before dispatch, or a refusal listed in `AmbiguityPolicy`),
+  so it stays proven not run. It also derives from `RuntimeError`, so
   `except RuntimeError` and `except TransportError` handlers keep catching what they caught, while
   `except B24ApiError` now catches a closed client too. `b24api.execution.CoordinatorClosedError` is
   removed: catch `ClientClosedError`.
@@ -167,9 +168,13 @@ send meets a method pause, have changed.
   the client's calls, streams and retries together, and an operation's own limits only narrow it, per
   dispatch: a `DirectDispatch` sends at most the smallest of its `concurrency`,
   `max_direct_concurrency`, `max_active_references` and the client limit at once; a `BatchDispatch`
-  keeps at most the smallest of its `concurrency`, `max_active_references` and the client limit in
-  flight, and `max_direct_concurrency` does not limit it. Raise the client limit only as far as the
-  portal's rate limits allow.
+  keeps at most the smallest of its `concurrency`, `max_active_references` and the client limit of
+  physical batches in flight, and `max_direct_concurrency` does not limit it. The isolation of a REST
+  3.0 envelope of `SAFE` commands that may have run sends its unresolved commands one by one, all at
+  once, bounded only by the client limit. In `fan_out()` and `fan_out_outcomes()`,
+  `BatchDispatch(batch_size=1)` sends one batch at a time whatever its `concurrency`, since each
+  command's share of `max_buffered_rows` is sized for one batch; use `DirectDispatch` to send single
+  commands concurrently. Raise the client limit only as far as the portal's rate limits allow.
 - **A synchronous source keeps one context.** A synchronous iterator given to `batch()`,
   `fan_out()` or a reference traversal is pulled in a worker thread, and each pull ran in a fresh copy
   of the context, so a generator that set a `ContextVar` before a `yield` no longer saw it when it
@@ -273,11 +278,15 @@ bounded = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_elaps
 
 `max_elapsed` bounds the operation at its scheduling points: when a request, a page or a source item is
 admitted, while a send waits for its permit (a pause included), while a page waits for row capacity and
-while an async source is pulled. It does not bound the time the application spends while it holds
-control: in a `page_stop` callback, or as a consumer that is slow between pulls of a stream, a binding
-waiting for the consumer to take its page included. Nothing interrupts the application when the budget
-runs out meanwhile; the next scheduling point ends the operation with `BudgetExceededError` and an
-`incomplete` report, even when all that is left is to read the end of the source.
+while a source, synchronous or asynchronous, is pulled. A send in flight is cut at what is left of the
+operation or of its retry window, whichever is shorter. It does not bound the time the application
+spends while it holds control: in a `page_stop` callback, or as a consumer that is slow between pulls of
+a stream, a binding waiting for the consumer to take its page included. Nothing interrupts the
+application when the budget runs out meanwhile; the next scheduling point ends the operation, even when
+all that is left is to read the end of the source. The report is then `incomplete`, with
+`BudgetExceededError` as its terminal reason and a `budget_exhausted` violation. The stream raises
+`BudgetExceededError`, except `fan_out()`, which raises `BatchFailed`, and `iter_references()`,
+`iter_cursors()` and `iter_reference_sources()`, which raise `ReferenceFailed`.
 
 ## Compressed bodies are decoded whole
 
@@ -408,9 +417,12 @@ runs out meanwhile; the next scheduling point ends the operation with `BudgetExc
   constructed: not in `str` or `repr` of the error, its chain, notes or arguments, not in a formatted
   traceback, not in the `repr` of the frame locals that `capture_locals` or an error tracker shows.
   In logs, the guarantee covers a record of such an error (the library writes no log records of its
-  own) and the records of the `httpx` logger, and nothing more. The `httpcore` DEBUG records are not
-  filtered: they carry the response headers, so a `Location` header that holds the token puts it in a
-  record; see the HTTPX logging note in
+  own), the records of the `httpx` logger, and the `hpack.hpack` and `hpack.table` records, which are
+  dropped while a library HTTPX client is open (an HTTP/2 send is refused with `CapabilityError` before
+  I/O when that filter was removed; see item 14 under
+  [Upgrading from 2.3 to 3.0](#upgrading-from-23-to-30)). Records of other loggers are not filtered:
+  `httpcore` DEBUG records carry the response headers, so a `Location` header that holds the token
+  puts it in a record; see the HTTPX logging note in
   [Migrating to the issues architecture (2.3)](#migrating-to-the-issues-architecture-23). What is not
   converted passes through unchanged: an exception that is not an `Exception` (`KeyboardInterrupt`,
   `SystemExit`) raised by a hook, whose traceback runs through the HTTPX frames that hold the request,

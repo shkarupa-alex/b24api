@@ -27,7 +27,7 @@ class DirectDispatch:
     """Bounded independent direct requests.
 
     ``concurrency`` is a ceiling of this operation alone: the requests in flight are also bounded by the
-    policy (``max_direct_concurrency``, and ``max_active_references`` for references) and by
+    policy (``max_direct_concurrency`` and ``max_active_references``, for references and fan-out alike) and by
     ``Settings.max_concurrent_requests``, which the client's operations share; the smallest applies.
     """
 
@@ -47,7 +47,9 @@ class BatchDispatch:
 
     ``concurrency`` is a ceiling of this operation alone: the batches in flight are also bounded by the policy's
     ``max_active_references`` and by ``Settings.max_concurrent_requests``, which the client's operations share;
-    the smallest applies. ``ExecutionPolicy.max_direct_concurrency`` does not limit them.
+    the smallest applies. ``ExecutionPolicy.max_direct_concurrency`` does not limit them. The commands a REST 3.0
+    isolation re-sends one by one are not batches: only ``Settings.max_concurrent_requests`` bounds them. A fan-out
+    sizes each command's row share for one batch, so ``batch_size=1`` sends one batch at a time.
     """
 
     batch_size: int = PORTAL_BATCH_CAP

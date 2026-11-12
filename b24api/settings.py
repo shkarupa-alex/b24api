@@ -71,7 +71,9 @@ class Settings(BaseSettings):
     only narrow it, per dispatch: a ``DirectDispatch`` sends at most the smallest of its ``concurrency``,
     ``ExecutionPolicy.max_direct_concurrency``, ``ExecutionPolicy.max_active_references`` and this limit; a
     ``BatchDispatch`` keeps at most the smallest of its ``concurrency``, ``max_active_references`` and this
-    limit in flight, and ``max_direct_concurrency`` does not limit it.
+    limit of physical batches in flight, and ``max_direct_concurrency`` does not limit it. The isolation of a
+    REST 3.0 envelope of SAFE commands that may have run re-sends its unresolved commands one by one at once,
+    bounded only by this limit.
     """
 
     webhook_url: HttpUrl = Field(repr=False)
