@@ -20,6 +20,24 @@ surrounding whitespace are accepted and normalized. Any other form is refused, o
 password, a query, a fragment or a percent-encoded path included, since the token is its only credential
 and is registered for redaction as it is sent.
 
+`Settings` reads two limits as well. `BITRIX24_API_HTTP_TIMEOUT` is each request's retry window in
+seconds (30 by default, finite). `BITRIX24_API_MAX_CONCURRENT_REQUESTS` is how many requests one client
+keeps in flight at once, all its calls, streams and retries together (10 by default). An operation's
+own limits, `ExecutionPolicy.max_direct_concurrency` and the `concurrency` of `DirectDispatch` or
+`BatchDispatch`, only narrow it: the effective concurrency is the smallest of them, so
+`DirectDispatch(concurrency=40)` alone still runs 10 requests at a time. Raise the client limit only as
+far as the portal's rate limits allow. `Bitrix24.from_webhook()` takes both limits as arguments:
+
+<!-- tested: tests/settings_test.py::test_effective_concurrency_is_the_smallest_of_the_client_and_operation_limits -->
+```python
+import os
+
+from b24api import Bitrix24, Request
+
+async with Bitrix24.from_webhook(os.environ["BITRIX24_API_WEBHOOK_URL"], max_concurrent_requests=20) as client:
+    users = await client.call(Request.bare("user.get", {"ID": 1}))
+```
+
 ## Quickstart
 
 <!-- tested: tests/readme_test.py::test_quickstart_runs_exactly_against_a_scripted_portal -->
@@ -54,7 +72,10 @@ users = await client.call(Request.bare("user.get", {"ID": 1}))
 ```
 
 The client owns the transport it creates. An injected transport remains caller-owned. `aclose()` is
-idempotent and closes active streams before the owned transport. To prove that no row is missing or
+idempotent and closes active streams before the owned transport. A closed client raises
+`ClientClosedError` (from `b24api.errors`) for every call or stream started after `aclose()` and for
+the calls still waiting for a permit when it closed: a `TransportError` of phase `not_dispatched`, so
+nothing was sent and it is never retried, and a `RuntimeError` as well. To prove that no row is missing or
 repeated, give the traversal an identity (see [Choosing a list operation](#choosing-a-list-operation)).
 
 ## Direct calls
@@ -175,7 +196,8 @@ default `SAFE` requests are also retried after an unstructured 408, 500, 502, 50
 
 ### Error codes
 
-A structured refusal raises `ApiResponseError`. Its message, `wire_code`, `normalized_code`, `code`
+Every error of `b24api.errors` survives `pickle` and `copy` with its message and attributes, so it can
+cross a process pool or a task queue. A structured refusal raises `ApiResponseError`. Its message, `wire_code`, `normalized_code`, `code`
 (lower case) and `to_safe_dict()` name the server's code, so failures can be told apart:
 
 ```text

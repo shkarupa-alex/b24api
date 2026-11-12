@@ -136,6 +136,29 @@ def test_live_transport_error_drops_credentialed_httpx_cause_and_locals(
     _assert_live_error_redacted(captured.value, sensitive_fragment)
 
 
+@pytest.mark.parametrize("hook_point", ["request", "response"])
+def test_live_non_httpx_client_failure_drops_credentialed_request_text_and_locals(
+    monkeypatch: pytest.MonkeyPatch,
+    hook_point: str,
+) -> None:
+    # An event hook, auth flow or mounted transport may raise any exception, quoting the method URL. Only
+    # HTTPX errors used to be caught: the exception escaped with the token in its text, and the frame's
+    # request local rendered it under capture_locals.
+    sensitive_fragment = "not-a-secret"
+
+    def hook(message: httpx.Request | httpx.Response) -> None:
+        url = message.url if isinstance(message, httpx.Request) else message.request.url
+        raise RuntimeError(f"synthetic hook failure for {url}")
+
+    with _portal(monkeypatch, lambda _request: httpx.Response(200, json={"result": []})) as portal:
+        portal._client.event_hooks[hook_point] = [hook]  # noqa: SLF001 - inject a hook into the owned client
+        with pytest.raises(LiveCorrectnessError, match="live HTTP client raised RuntimeError") as captured:
+            portal.call("scope")
+
+    # The text, the chain and every local of the harness frames are checked, which capture_locals renders.
+    _assert_live_error_redacted(captured.value, sensitive_fragment)
+
+
 @pytest.mark.parametrize("configuration_case", ["fingerprint", "webhook"])
 def test_live_portal_configuration_error_drops_credential_locals(
     monkeypatch: pytest.MonkeyPatch,

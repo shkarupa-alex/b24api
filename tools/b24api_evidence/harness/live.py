@@ -225,15 +225,16 @@ class LivePortal:
         transport_failed = False
         decoding_failed = False
         bounded_failure: str | None = None
+        client_failure: str | None = None
         response: httpx.Response | None = None
         request: httpx.Request | None = None
         HTTPX_LOG_SHIELD.admit_send(self._client)
-        try:
-            webhook = Webhook(self._address, _token_for(self._webhook_handle))
-            # The same shield as HttpxTransport: HTTPX logs the full method URL at INFO, and attribution by
-            # the sync client's ``_send_handling_auth`` root tells this request's records from foreign ones.
-            # The request is built inside it, and no local of this frame holds the method URL.
-            with HTTPX_LOG_SHIELD.request(credentials=(webhook.token,)) as ownership:
+        webhook = Webhook(self._address, _token_for(self._webhook_handle))
+        # The same shield as HttpxTransport: HTTPX logs the full method URL at INFO, and attribution by
+        # the sync client's ``_send_handling_auth`` root tells this request's records from foreign ones.
+        # The request is built inside it, and no local of this frame holds the method URL.
+        with HTTPX_LOG_SHIELD.request(credentials=(webhook.token,)) as ownership:
+            try:
                 request = self._client.build_request(
                     "POST",
                     urljoin(webhook.url, method),
@@ -251,12 +252,19 @@ class LivePortal:
                         bounded_failure = str(error)
                 finally:
                     response.close()
-        except httpx.DecodingError:
-            decoding_failed = True
-        except httpx.HTTPError:
-            transport_failed = True
+            except httpx.DecodingError:
+                decoding_failed = True
+            except httpx.HTTPError:
+                transport_failed = True
+            except Exception as error:  # noqa: BLE001 - classified by its class only, as HttpxTransport does
+                # A hook, auth flow or mounted transport may raise anything. Neither the exception nor its text,
+                # which may quote the method URL, leaves this frame, and the locals holding that URL are
+                # cleared below before the failure is raised.
+                client_failure = type(error).__name__
         request = None
         response = None
+        if client_failure is not None:
+            raise LiveCorrectnessError(f"live HTTP client raised {client_failure} for {method}")
         if status_code is not None and not HTTP_STATUS_MINIMUM <= status_code <= HTTP_STATUS_MAXIMUM:
             payload = None
             raise LiveCorrectnessError(f"live response has an invalid HTTP status for {method}")

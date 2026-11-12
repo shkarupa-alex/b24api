@@ -273,7 +273,9 @@ class ExecutionPolicy:
     ``max_elapsed`` bounds the whole operation, including each request's wait for its first coordinator permit.
     ``max_retry_elapsed_per_request`` is each request's retry window: it opens when the first send is granted its
     permit and bounds every send, retry wait and later permit wait after it. A send has no timeout of its own; it
-    may use what is left of the window.
+    may use what is left of the window. ``max_direct_concurrency`` only narrows the client's own limit,
+    ``Settings.max_concurrent_requests``, which all the client's work shares: a direct dispatch runs at most the
+    smallest of the two and its ``DirectDispatch.concurrency``.
     """
 
     max_requests: int = 10_000

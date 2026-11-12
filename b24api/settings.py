@@ -60,15 +60,21 @@ def _unknown_settings_error(fields: set[str]) -> ValidationError:
 
 
 class Settings(BaseSettings):
-    """Environment-backed webhook credential and request timeout.
+    """Environment-backed webhook credential, request timeout and request concurrency of one client.
 
     ``http_timeout`` is the retry window of each request under the client's default policy
     (``ExecutionPolicy.max_retry_elapsed_per_request``): it opens when the request's first send is granted its
-    permit and bounds that send and every retry after it.
+    permit and bounds that send and every retry after it. It must be a finite number of seconds.
+
+    ``max_concurrent_requests`` is how many requests the client keeps in flight at once, all its calls,
+    streams and retries together: the number of permits of its shared rate limiter. A narrower limit of one
+    operation (``ExecutionPolicy.max_direct_concurrency``, ``DirectDispatch.concurrency``,
+    ``BatchDispatch.concurrency``) still applies, so the effective concurrency is the smallest of them.
     """
 
     webhook_url: HttpUrl = Field(repr=False)
-    http_timeout: float = Field(default=30.0, gt=0)
+    http_timeout: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+    max_concurrent_requests: int = Field(default=10, ge=1)
 
     model_config = SettingsConfigDict(
         env_prefix="bitrix24_api_",
@@ -81,7 +87,7 @@ class Settings(BaseSettings):
         """Validate without retaining credential-bearing framework traceback frames."""
         validation_failure: ValidationError | None = None
         loading_failed = False
-        unknown = set(data) - {"webhook_url", "http_timeout"}
+        unknown = set(data) - set(type(self).model_fields)
         if unknown:
             validation_failure = _unknown_settings_error(unknown)
         else:

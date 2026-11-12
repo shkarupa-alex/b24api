@@ -97,7 +97,9 @@ outcome.
 
 - Logical sources are consumed incrementally; physical Bitrix batches contain at most 50 commands.
 - Response bytes, buffered rows and commands, retained unordered identity keys, request/page
-  budgets, concurrency and elapsed time are bounded by `ExecutionPolicy`.
+  budgets, concurrency and elapsed time are bounded by `ExecutionPolicy`. Concurrency has one more,
+  client-wide ceiling: the permits of the client's shared rate coordinator,
+  `Settings.max_concurrent_requests`. An operation's limits only narrow it.
 - Budgets are charged to one operation-local ledger of plain counters updated in place, so a
   reservation, its settlement and a row-buffer change cost the same however many bindings the
   operation has read. Per-binding page counts are kept only while a binding is open; the validated,

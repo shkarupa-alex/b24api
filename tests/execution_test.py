@@ -20,6 +20,7 @@ from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
     BudgetExceededError,
+    ClientClosedError,
     FailurePhase,
     HTTPGatewayError,
     ProtocolError,
@@ -37,7 +38,6 @@ from b24api.execution import (
 )
 from b24api.execution.rate import (
     CoordinatorBudgetError,
-    CoordinatorClosedError,
     DeadlineBudget,
     RatePolicyCapacityError,
 )
@@ -739,7 +739,7 @@ async def test_method_limit_admission_budget_and_closed_error_are_typed() -> Non
         )
     assert dict((await coordinator.snapshot()).queued)[WorkClass.INTERACTIVE_DIRECT] == 0
     await coordinator.close()
-    with pytest.raises(CoordinatorClosedError):
+    with pytest.raises(ClientClosedError, match="rate coordinator is closed"):
         await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
 
 

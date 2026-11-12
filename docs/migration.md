@@ -1,5 +1,46 @@
 # Migration guide
 
+## Closed clients, copyable errors and the client's request limit
+
+- **Breaking: a closed client raises `ClientClosedError`.** A closed client refused work with three
+  unrelated types: `RuntimeError("client is closed")` for a call or stream started after
+  `aclose()`, `CoordinatorClosedError` (a `RuntimeError` of `b24api.execution`, missing from
+  `b24api.errors`) for a call still waiting for a permit when the client closed, and `TransportError`
+  "transport is closed" or "HTTP client is closed" for a send after its transport or injected HTTPX
+  client closed. Each now raises `b24api.errors.ClientClosedError`. It is a `TransportError` of phase
+  `not_dispatched` and `retryable=False`: nothing left the process, so an `UNSAFE` request is proven
+  not run, and it is never retried. It also derives from `RuntimeError`, so `except RuntimeError` and
+  `except TransportError` handlers keep catching what they caught, while `except B24ApiError` now
+  catches a closed client too. `b24api.execution.CoordinatorClosedError` is removed: catch
+  `ClientClosedError`.
+- **Every error survives `pickle` and `copy`.** An error whose constructor needs more than its
+  message (`ApiResponseError`, `BatchCommandError`, `AmbiguousExecutionError`, `ContinuationError`,
+  `BatchFailed`, a bare `B24ApiError` and the others like them) failed
+  `pickle.loads(pickle.dumps(error))`, `copy.copy()` and `copy.deepcopy()` with `TypeError`, since
+  `Exception` rebuilds an error by calling its class with the message alone. Every class of `b24api.errors` now rebuilds without its constructor and keeps
+  its message, attributes and notes, so an error can cross a process pool or a task queue.
+- **`Settings.http_timeout` must be finite.** `http_timeout=float("inf")` passed `Settings`, and
+  `Bitrix24()` then failed with `ValueError` after it had already opened its HTTPX transport. It is
+  now a `ValidationError` of `Settings` (and of `Bitrix24.from_webhook()`), as `nan` already was. The
+  client also checks the rest of its configuration before it opens a transport, so a refused one
+  opens nothing.
+- **New: `Settings.max_concurrent_requests`.** The client's shared limiter let at most 10 requests be
+  in flight at once, and no setting changed it: `DirectDispatch(concurrency=40)` under
+  `ExecutionPolicy(max_direct_concurrency=40)` still ran 10 at a time. The limit is now
+  `Settings.max_concurrent_requests` (environment `BITRIX24_API_MAX_CONCURRENT_REQUESTS`, or
+  `Bitrix24.from_webhook(..., max_concurrent_requests=...)`), 10 by default as before. It bounds all
+  the client's calls, streams and retries together; an operation's own limits
+  (`max_direct_concurrency`, `DirectDispatch.concurrency`, `BatchDispatch.concurrency`) only narrow it,
+  so the effective concurrency is the smallest of them. Raise it only as far as the portal's rate
+  limits allow.
+- **A synchronous source keeps one context.** A synchronous iterator given to `batch()`,
+  `fan_out()` or a reference traversal is pulled in a worker thread, and each pull ran in a fresh copy
+  of the context, so a generator that set a `ContextVar` before a `yield` no longer saw it when it
+  resumed, and resetting its token raised `ValueError`. Each source now runs every pull, and its
+  close, in one `contextvars.Context`, copied from the caller when the call that receives the source
+  is made: the generator sees what it set across its `yield`s, as in a plain `for` loop. What it sets
+  stays in that context and never reaches the caller's.
+
 ## Retry timing
 
 Public signatures are unchanged; when a retry waits and when it is sent have changed.
