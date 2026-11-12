@@ -149,6 +149,30 @@ one_attempt = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_a
 result = await client.call(request, policy=one_attempt)
 ```
 
+`max_retry_elapsed_per_request` (`Settings.http_timeout`) is each request's retry window. It opens
+when the request's first send gets a permit from the client's shared limiter, so waiting in that
+queue spends only the operation's `max_elapsed` (900 s by default; lower it to bound the queue, at
+the cost of first sends that a long queue leaves only a sliver of it, and a known pause that outlasts
+it fails at once). Every send, retry wait and later permit wait then comes out of the window. There
+is no separate per-attempt timeout: each send may use what is left of the window. A retry waits the
+longer of its own exponential backoff and the server's hint (`Retry-After` or
+`X-Bitrix-RateLimit-Reset`, a date measured against the response's `Date`), so a hint of zero or a
+past date never cancels the backoff. A retry of an `UNSAFE` or `UNKNOWN` request is sent only while
+the window it would have left is at least as long as it waited (as planned, or longer when the wait
+overran). Otherwise the request ends with `BudgetExceededError`, whose cause is the refusal that
+proved the earlier send did not run, instead of a send whose wait took most of the window: under the
+default 30 s window, a `Retry-After` of 15 s or more ends such a request without a retry even when its
+first send took no time. `SAFE` requests are retried with whatever window is left, and so are the
+`SAFE` commands of a classic batch replay round, whether the batch or its commands' entries were
+refused. Each command is weighed against its own method's pause, as known when its round is planned:
+a round waits only as long as its `UNSAFE` and `UNKNOWN` commands can afford, and a `SAFE` command
+whose method is held longer is sent in a later round; one still waiting when
+`max_attempts_per_request` is spent is not sent again. A pause that appears during a round's wait
+stops the whole round at its permit when it outlasts the window. The commands not sent again keep
+their own refusal, or end with `BudgetExceededError` caused by the batch refusal they followed. By
+default `SAFE` requests are also retried after an unstructured 408, 500, 502, 503 or 504
+(`RetryPolicy.transient_http_statuses`).
+
 ### Error codes
 
 A structured refusal raises `ApiResponseError`. Its message, `wire_code`, `normalized_code`, `code`

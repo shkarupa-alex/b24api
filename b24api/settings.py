@@ -60,7 +60,12 @@ def _unknown_settings_error(fields: set[str]) -> ValidationError:
 
 
 class Settings(BaseSettings):
-    """Environment-backed webhook credential and request timeout."""
+    """Environment-backed webhook credential and request timeout.
+
+    ``http_timeout`` is the retry window of each request under the client's default policy
+    (``ExecutionPolicy.max_retry_elapsed_per_request``): it opens when the request's first send is granted its
+    permit and bounds that send and every retry after it.
+    """
 
     webhook_url: HttpUrl = Field(repr=False)
     http_timeout: float = Field(default=30.0, gt=0)

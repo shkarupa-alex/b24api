@@ -11,7 +11,8 @@ import pytest
 
 from b24api import BatchFailed, Bitrix24, ReplaySafety, Request, Settings, TerminalState
 from b24api._error_types import FailurePhase
-from b24api.batch.engine import BatchExecutor
+from b24api.batch.correlation import _Command
+from b24api.batch.engine import BatchExecutor, _Follows, _Lineup, _Round, _Waiting
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts import Command, CommandFailure, CommandOutcomeUnknown, CommandSuccess, ReplayDisposition
 from b24api.contracts.policy import AmbiguityPolicy, AmbiguityReason, ExecutionPolicy, RetryPolicy
@@ -29,8 +30,11 @@ from b24api.errors import (
 )
 from b24api.execution import Executor, HttpxTransport, WireResponse
 from b24api.execution import executor as executor_module
+from b24api.execution.executor import _Lineage, _Pause, _Replay, _RequestAttempts, _SendPlan, _Settled
+from b24api.execution.facts import Execution, execution
 from b24api.transport.base import TransportCapabilities, WireRequest
 from b24api.transport.protocol import ProtocolCodec
+from tests.scripting import ResponderTransport, always
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
@@ -1394,3 +1398,72 @@ async def test_closed_default_transport_refuses_before_dispatch_without_implying
     finally:
         await transport.aclose()
         await http_client.aclose()
+
+
+def test_a_send_consumes_the_wait_before_it() -> None:
+    # A wait that left a send too little window is the next send's own: once sent, it limits no later send.
+    attempts = _RequestAttempts()
+    attempts.pause = _Pause(backoff=1.0, held=0.0, window=3.0, planned_at=0.0)
+    with pytest.raises(BudgetExceededError, match="shorter than the wait") as refused:
+        attempts.admit(0.5, ReplaySafety.UNSAFE, now=1.0)
+    # The refusal belongs to its round alone.
+    assert attempts.refusal is refused.value
+    attempts.start_round()
+    assert attempts.refusal is None
+    attempts.dispatched()
+    attempts.admit(0.5, ReplaySafety.UNSAFE, now=1.0)
+    assert attempts.pause is None
+
+
+@pytest.mark.asyncio
+async def test_a_replay_round_waits_for_its_unrepeatable_sends_and_carries_a_longer_held_safe_one() -> None:
+    # A SAFE command's method is held 20 seconds, which fits a 30-second window for SAFE work; an UNSAFE command's
+    # 1-second backoff fits too. The round waits the UNSAFE send's second and carries the SAFE one to a later
+    # round; fail-fast, it waits the 20 seconds, which the UNSAFE send cannot fit twice, so nothing is sent.
+    executor = Executor(ResponderTransport(always(WireResponse(200, (), b"{}"))), clock=lambda: 0.0)
+    await executor.coordinator.observe_operation_time_limit("crm.item.get", delay=20.0)
+    policy = ExecutionPolicy(max_retry_elapsed_per_request=30.0, retry=RetryPolicy(initial_delay=1.0, jitter=0))
+    context = executor.context(policy)
+    sends = ((ReplaySafety.SAFE, frozenset({"crm.item.get"})), (ReplaySafety.UNSAFE, frozenset({"crm.item.add"})))
+    safe_only = ((ReplaySafety.SAFE, frozenset({"crm.item.get"})), (ReplaySafety.SAFE, frozenset({"crm.item.list"})))
+
+    plan = executor.plan_replay(context, attempts=_RequestAttempts(started=0.0, used=1), sends=sends)
+    whole = executor.plan_replay(context, attempts=_RequestAttempts(started=0.0, used=1), sends=sends, whole=True)
+    safe = executor.plan_replay(context, attempts=_RequestAttempts(started=0.0, used=1), sends=safe_only)
+    await executor.coordinator.close()
+
+    assert plan is not None
+    assert plan.plans == (_SendPlan.CARRY, _SendPlan.SEND)
+    assert plan.pause.delay == 1.0
+    assert whole is not None
+    assert whole.plans == (_SendPlan.REFUSE, _SendPlan.REFUSE)
+    # With no send that may not be repeated, the round waits its longest SAFE wait and carries nothing.
+    assert safe is not None
+    assert safe.plans == (_SendPlan.SEND, _SendPlan.SEND)
+    assert safe.pause.delay == 20.0  # noqa: PLR2004
+
+
+def test_a_replay_round_that_carries_a_send_must_send_one() -> None:
+    pause = _Pause(backoff=1.0, held=0.0, window=3.0, planned_at=0.0)
+    with pytest.raises(ValueError, match="must send one"):
+        _Replay(pause, (_SendPlan.CARRY, _SendPlan.REFUSE))
+    assert _Replay(pause, (_SendPlan.CARRY, _SendPlan.SEND)).sends(_SendPlan.SEND) == (1,)
+
+
+def test_a_round_refused_at_its_send_leaves_its_commands_following_the_envelope_refusal() -> None:
+    # The SAFE command followed a 429 refusal of its envelope; its next round is refused at its send, and its
+    # replay is then stopped: it ends caused by the 429, not by the refusal at the send, which proved nothing.
+    command = _Command(0, "c000000000000", Request("crm.item.get", {}, ReplaySafety.SAFE, route=RouteKind.BARE), None)
+    refusal = HTTPGatewayError("HTTP gateway error 429")
+    lineup = _Lineup(waiting={0: _Waiting(_Follows(refusal), _Lineage(_Settled.ANSWERED))})
+    withheld = BudgetExceededError("retry window left after the wait is shorter than the wait")
+    unsent = _Round((BatchFailure(0, command.stable_key, command.request, withheld),), _Lineage(), (command,), withheld)
+
+    candidates = lineup.after_round(unsent, (command,))
+    lineup.stop(candidates, "per-request attempt budget exhausted")
+
+    (outcome,) = lineup.settled.values()
+    assert isinstance(outcome, BatchFailure)
+    assert isinstance(outcome.error, BudgetExceededError)
+    assert outcome.error.__cause__ is refusal
+    assert execution(outcome.error) is Execution.ANSWERED

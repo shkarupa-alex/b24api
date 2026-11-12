@@ -59,9 +59,13 @@ the envelope. A 2xx answer the client cannot decode settles nothing, whichever p
 envelope, a command's paging metadata or its embedded error.
 
 A command keeps one send lineage across executor retries, classic batch replay rounds and REST v3
-isolation. The commands still pending in a round are always a subset of those of the round before, so
-the lineage of an envelope group is the lineage of each of its pending commands, and an isolated send
-continues it on a per-command copy. The lineage is an explicit state: nothing sent yet, or the latest
+isolation: what the sends it was in left open. The commands a REST v3 envelope group still resolves are
+always a subset of those of its envelope before, so the group's lineage is the lineage of each of its
+pending commands, and an isolated send continues it on a per-command copy. A classic batch round may
+carry a `SAFE` command past a round, so the classic engine keeps each command's lineage and state
+(answered by its own entry, or following its envelope's failure) itself: a failure a round's commands
+share records what that round's send alone left open, and each command adds what its own earlier sends
+left open. The lineage is an explicit state: nothing sent yet, or the latest
 send answered or possibly run (with the failure that left it so), and whether a send before it may have
 run. When a later conclusive answer ends a command after an earlier send may have run (the retried
 envelope, the command's own entry in it, a REST v3 element or an isolated send), the outcome is unknown
@@ -98,6 +102,27 @@ outcome.
   reservation, its settlement and a row-buffer change cost the same however many bindings the
   operation has read. Per-binding page counts are kept only while a binding is open; the validated,
   immutable counters are built only for a snapshot or the terminal report.
+- A request's retry window (`max_retry_elapsed_per_request`) opens when its first send is granted
+  a coordinator permit; queueing before that is bounded by the operation's `max_elapsed`, and a known
+  coordinator hold that outlasts the budget left fails at once. A retry waits the longer of its own
+  backoff and the coordinator's hold on its methods (a host throttle hint or a method cooldown). A
+  retry that may not be repeated is planned only with more than twice its wait left, and starts only
+  with at least as much window left as it actually waited since then (more than the planned wait
+  when the wait overran), so a wait never takes more of the window than the send after it gets; a
+  send that the window still cuts is reported unknown.
+  `Executor.plan_replay` plans the executor's own retries of a direct request and every replay round
+  of a physical batch; each round's caller decides it: the executor for a direct request, the REST
+  3.0 resolution for its envelopes (one safety class each, admitted or refused whole), and the
+  classic batch engine for a classic envelope, which the executor then sends once per call. The
+  engine plans each command on its own safety and its own method's hold as known when planning: a
+  round waits only as long as its `UNSAFE` and `UNKNOWN` commands can afford, carries a `SAFE` command
+  held longer to a later round (each round spends an attempt, which bounds the carrying: a command
+  still carried when the last attempt is spent ends as the attempt budget stops it), and still sends
+  the others when the window or a held method stops some, unless it is fail-fast, which is sent whole
+  or not at all. A hold that appears during the wait is met at the permit and stops the whole round
+  when it outlasts the window; a stop before a round's send ends each of its commands with the
+  failure that command followed as the cause. The REST 3.0 isolation of an unresolved `SAFE` envelope re-sends its commands one by one at once,
+  outside that planner.
 - The default response ceiling is enforced while streaming, before JSON decoding.
 - Exact sequential, counted, and multi-reference traversal shares one operation-wide
   `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted

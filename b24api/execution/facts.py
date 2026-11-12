@@ -156,17 +156,19 @@ def possible_execution(
     request_summary: RequestSummary | None,
     declared_unsafe: bool,
     message: str = _MAY_HAVE_RUN,
+    unproven: B24ApiError | None = None,
 ) -> AmbiguousExecutionError:
     """Return the ambiguity that reports a possibly executed command; one about this same request is kept.
 
     The reason and evidence name the latest send that may have run. The cause keeps the original failure,
     unwrapped from an ambiguity about the physical batch, unless a later conclusive answer ended the command;
-    then it is the failure of that earlier send.
+    then it is the failure of that earlier send. ``unproven`` names that send's failure when the failure's own
+    facts cannot: it is shared with commands that were not in that send.
     """
     if isinstance(error, AmbiguousExecutionError) and error.request_summary == request_summary:
         return error
-    unproven = _recorded_unproven(error)
-    source = _explained_by(error)
+    unproven = unproven or _recorded_unproven(error)
+    source = unproven or _explained_by(error)
     ambiguous = AmbiguousExecutionError(
         message,
         reason=ambiguity_reason(source),

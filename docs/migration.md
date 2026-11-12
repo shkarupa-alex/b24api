@@ -1,5 +1,94 @@
 # Migration guide
 
+## Retry timing
+
+Public signatures are unchanged; when a retry waits and when it is sent have changed.
+
+- **A throttle hint no longer cancels the backoff.** A retry after an answer that carries
+  `Retry-After` or `X-Bitrix-RateLimit-Reset` waited only for that hint, so `Retry-After: 0`, a date
+  in the past or a reset just before now sent every attempt at once. A retry now waits the longer of
+  its exponential backoff and the hint, and the same holds for a method paused by
+  `OPERATION_TIME_LIMIT`. A hint given as a date or an epoch is measured against the response's
+  `Date` header when it has one, not the local clock, so a local clock running ahead no longer
+  shortens it.
+- **Breaking: a call may now wait up to `max_elapsed` for its first permit.** The retry window
+  `max_retry_elapsed_per_request` (`Settings.http_timeout`, 30 s by default, for the client's default
+  policy) used to start before the request queued for a permit of the client's shared limiter. A
+  request that queued behind others was refused without a send, or sent with a sliver of time and
+  reported unknown. The window now opens when the first send gets its permit, so queueing for that
+  permit is bounded only by the operation's `max_elapsed`, 900 s by default, where it used to be
+  bounded by `http_timeout`. Every send, retry wait and later permit wait spends the window, and an
+  attempt still has no timeout of its own: it may use what is left of the window. A pause the client
+  already knows about that outlasts what is left of `max_elapsed` (a `Retry-After` or an
+  `OPERATION_TIME_LIMIT` cooldown on the request's methods) fails at once with
+  `BudgetExceededError` instead of waiting the budget out. To bound the queue more tightly again,
+  lower `max_elapsed` (see the example after this list).
+- **A retry that may not be repeated is not sent into a sliver.** After a refusal proving that an
+  `UNSAFE` or `UNKNOWN` request did not run (a quota error or a 429, for example), the retry was sent
+  with whatever window the wait left, so a 0.95-second `Retry-After` in a 1-second window sent it with
+  0.05 seconds, and a send cut that way was reported unknown. Such a retry is now sent only while the
+  window left after its wait is at least as long as the wait, measured as the time it actually waited
+  when that was longer than planned. Otherwise the request ends with
+  `BudgetExceededError`, whose cause is the refusal, and its outcome stays proven not run: at once,
+  without waiting, when the planned wait already does not fit, or after the wait, before the send,
+  when the wait overran its plan (a late wake or a long permit queue). With the default 30-second
+  window, a `Retry-After` of 15 seconds or more ends an `UNSAFE` or `UNKNOWN` request without a retry
+  even when its first send took no time; each second the request has already spent lowers that
+  bound by half a second. Raise `http_timeout` to let it wait longer. A `SAFE` retry is still sent
+  with any window left: it may succeed, and repeating it is harmless.
+- **The `SAFE` commands of a classic batch keep their replay.** The same rule applies to the replay
+  rounds of a classic batch, whether its commands' own entries were refused or the whole batch was
+  refused (a 429, or a quota error for the batch). When the window is too short for its `UNSAFE` or
+  `UNKNOWN` commands, the round still sends its `SAFE` commands: after the same wait when the plan
+  shows it, or at once, with the window left, when the send itself is refused after a wait that
+  overran (the wait is not repeated; a pause the client still holds on their methods is). The other
+  commands are not sent again. One whose own entry answered it keeps that answer, a
+  `BatchCommandError` with its refusal; when the whole batch was refused, each ends with
+  `BudgetExceededError` whose cause is that refusal, proven not run and not eligible for replay. Each
+  command is weighed against its own method's pause too, as the client knows it when the round is
+  planned (a method paused by `OPERATION_TIME_LIMIT`, for example), so such a pause does not take the
+  replay away from the other commands: a command whose own pause outlasts the window is not sent
+  again, and a round waits only as long as its `UNSAFE` and `UNKNOWN` commands can afford (less than
+  half the window); a `SAFE` command whose method is held longer than that waits for a later round,
+  after its pause. A pause that appears during a round's wait is met when the round asks for its
+  permit, and stops the whole round when it outlasts the window. Each round spends one attempt of
+  the batch, so `max_attempts_per_request` bounds how often a command waits for a later round: one
+  still waiting when the last attempt is spent is not sent again, and keeps its own refusal or ends
+  with `BudgetExceededError` ("per-request attempt budget exhausted") caused by the batch refusal it
+  followed. A command the budget stops before its round is sent ends with that stop caused by the
+  failure it followed, never by the failure of a round it skipped, and it is reported possibly run
+  only when a send it was in may have run. A fail-fast batch is never split: it is sent again whole
+  or not at all, after the longest pause of its commands. A REST 3.0 batch keeps `SAFE` and other commands in separate envelopes, so
+  each envelope is admitted or refused whole; one that was refused as a whole and whose replay the
+  budget then stops (the window, or a pause or a full queue at its permit) now ends the same way, with
+  `BudgetExceededError` whose cause is the refusal, where it used to keep the refusal itself.
+- **408 and 504 are retried, 507 is not.** `RetryPolicy.transient_http_statuses` now defaults to
+  408, 423, 425, 429, 500, 502, 503 and 504. An unstructured 408 or 504 is retried for `SAFE`
+  requests and stays ambiguous for `UNSAFE` and `UNKNOWN` ones, which are never sent again after it.
+  An unstructured 507 (insufficient storage) is now raised at once as `HTTPGatewayError` for a `SAFE`
+  request; for an `UNSAFE` or `UNKNOWN` request it is still `AmbiguousExecutionError`, as every 5xx is.
+  Set `RetryPolicy.transient_http_statuses` in the policy to keep the old set.
+- **A time limit on a whole classic batch pauses its commands' methods.** An `OPERATION_TIME_LIMIT`
+  answered for a classic batch envelope as a whole paused the method name `batch`, which no command
+  is admitted under, so the retry did not wait for it. It now pauses each method of the envelope, as
+  a REST 3.0 batch abort already did. The pause is host-wide: until it ends, every request of the
+  client to one of those methods waits for it, direct calls included.
+
+To restore a short bound on the wait for a permit, lower `max_elapsed` for one call or for the
+client's default policy. For `call()` it bounds the whole call, queue included. A first send gets
+whatever the queue left of `max_elapsed`, so a tight bound brings back the first sends cut to a sliver:
+an `UNSAFE` or `UNKNOWN` one cut that way is reported unknown (`AmbiguousExecutionError`). Keep
+`max_elapsed` well above the longest queue you expect plus one send:
+
+```python
+import dataclasses
+
+from b24api import ExecutionPolicy, Settings
+
+settings = Settings(webhook_url="https://example.bitrix24.com/rest/1/token/")
+bounded = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_elapsed=settings.http_timeout)
+```
+
 ## Compressed bodies are decoded whole
 
 - **A compressed body cut short is a body read failure.** A `gzip` or `deflate` body (zlib-wrapped
@@ -130,6 +219,7 @@
   cancellation. One limitation remains: over HTTP/2,
   HTTPX's HPACK header table keeps the request path with the token. That is connection state of
   HTTPX, reachable only by walking the client's internal objects, not by rendering an error.
+
 
 ## Unknown outcomes follow what was sent
 
