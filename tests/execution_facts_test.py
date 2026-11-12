@@ -53,7 +53,7 @@ from b24api.errors import (
 )
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from b24api.transport import WireRequest, WireResponse
-from tests.scripting import ResponderTransport, client_for, on_loop
+from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, on_loop
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
@@ -429,11 +429,15 @@ async def test_a_replay_round_after_an_answered_retry_stays_explained_by_the_los
 
     safe = [Request.bare("entity.get", {"id": index}, replay_safety=ReplaySafety.SAFE) for index in (1, 2)]
     commands = [Command(safe[0], "refused"), Command(safe[1], "answered")]
+    # Both commands share the first round: they come on the event loop, and the fan-out wave closes by its
+    # size or by the end of input, so neither a worker-thread pull nor the coalescing timer splits it.
     async with client_for(ResponderTransport(respond), policy=ExecutionPolicy(retry=_NO_DELAY)) as client:
         stream = (
-            client.batch_outcomes(commands)
+            client.batch_outcomes(on_loop(commands))
             if mode == "classic batch"
-            else client.fan_out_outcomes(commands, dispatch=BatchDispatch())
+            else client.fan_out_outcomes(
+                on_loop(commands), dispatch=BatchDispatch(coalesce_wait=UNREACHABLE_COALESCE_WAIT)
+            )
         )
         refused, answered = await _drain(stream)
 

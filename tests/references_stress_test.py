@@ -53,10 +53,10 @@ from b24api.contracts import (
 from b24api.errors import BudgetExceededError
 from b24api.execution.context import ExecutionContext
 from b24api.references.dispatch import _RowBuffer
-from tests.scripting import BatchPortal, client_for
+from tests.scripting import BatchPortal, VirtualClock, client_for, on_loop
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import Callable
 
     from b24api.contracts import ReferenceOutcome, TraversalSpec
     from tests.scripting import Envelope, Query
@@ -300,29 +300,30 @@ async def test_a_short_frontier_page_keeps_its_unused_rows_for_the_frontier() ->
 
 
 @pytest.mark.asyncio
-async def test_a_binding_waiting_for_its_lease_never_holds_a_wave_back_to_coalesce() -> None:
+async def test_a_binding_waiting_for_its_lease_never_holds_a_wave_back_to_coalesce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A fast binding parked until a lease frees cannot add a command, so waves do not wait for it.
 
     The first range binding holds the pool's only floor-sized lease and runs hundreds of
-    one-command waves; with a one-second coalescing window, waiting on the parked neighbour would
-    take minutes instead of milliseconds.
+    one-command waves. On a virtual clock every wave whose wait its deadline ended is counted, so a
+    wave held back for the parked neighbour fails the test however fast the host runs; the sources
+    come on the event loop, whose turns are the clock's only pace.
     """
+    clock = VirtualClock().install(monkeypatch)
     sources = [_Source("range", "p0", tuple(range(123, 123 + 113 * 50, 113))), _Source("range", "p1", ())]
     portal = BatchPortal(_portal(sources))
     async with client_for(portal, policy=ExecutionPolicy(max_buffered_rows=40)) as client:
         stream = client.iter_reference_source_outcomes(
-            [_reference(source) for source in sources],
-            dispatch=BatchDispatch(batch_size=25, coalesce_wait=1.0),
+            on_loop([_reference(source) for source in sources]),
+            dispatch=BatchDispatch(batch_size=25),
         )
-
-        async def drain() -> list[ReferenceOutcome[str]]:
-            async with stream:
-                return [event async for event in stream]
-
-        events = await asyncio.wait_for(drain(), timeout=10)
+        async with stream:
+            events = [event async for event in stream]
     completes = {event.correlation: event.row_count for event in events if isinstance(event, ReferenceComplete)}
     assert completes == {"p0": 50, "p1": 0}
     assert len(portal.waves) > 100
+    assert clock.timer_firings == 0
 
 
 @pytest.mark.parametrize("frontier", ["offset", "cursor"])
@@ -378,16 +379,13 @@ async def test_a_contended_input_frontier_sends_its_own_pages_before_a_later_hea
     The bindings come from an async iterable, read on the event loop: a list is pulled in a worker
     thread, so when a later head reaches the queue would depend on thread scheduling.
     """
-
-    async def bindings() -> AsyncIterator[Binding[str]]:
-        for parent in ("p0", "p1", "p2", "p3"):
-            yield Binding(parent, (ParameterUpdate(_PARENT, parent),), parent)
-
     portal = BatchPortal(_offset_answer)
     async with client_for(portal, policy=ExecutionPolicy(max_buffered_rows=20)) as client:
         stream = client.iter_reference_outcomes(
             Request.bare("offset.list", {}, ReplaySafety.SAFE),
-            bindings(),
+            on_loop(
+                Binding(parent, (ParameterUpdate(_PARENT, parent),), parent) for parent in ("p0", "p1", "p2", "p3")
+            ),
             traversal=SequentialTraversal(identity=_identity(), page_size=PAGE),
             dispatch=BatchDispatch(batch_size=2, output_order=DeliveryOrder.INPUT, coalesce_wait=0.0),
         )

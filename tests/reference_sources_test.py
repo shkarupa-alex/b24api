@@ -45,7 +45,18 @@ from b24api.contracts import (
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError, CapabilityError, InputSourceError, ReferenceFailed
 from b24api.transport import TransportCapabilities, WireResponse
-from tests.scripting import BatchPortal, Envelope, Query, VirtualClock, on_loop
+from tests.scripting import (
+    DEADLINE_BUDGET,
+    HANG_BOUND,
+    UNREACHABLE_COALESCE_WAIT,
+    BatchPortal,
+    Envelope,
+    Query,
+    VirtualClock,
+    assert_fired_near_deadline,
+    deadline_started,
+    on_loop,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -59,9 +70,6 @@ ALPHA = CursorTraversal(selector=ResultSelector(), cursor=CURSOR, page_size=2)
 _LIMIT = ParameterPath(("limit",))
 BETA = SequentialTraversal(identity=ID, page_size=10)
 ALPHA_PAGES = {None: [4, 3], 3: [2, 1], 1: []}
-
-
-_HANG_GUARD_SECONDS = 30
 
 
 def _client(portal: BatchPortal) -> Bitrix24:
@@ -142,15 +150,15 @@ def _rows(events: list[ReferenceOutcome[int]], index: int) -> list[object]:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
 async def test_a28_different_templates_share_the_dispatcher_and_keep_separate_state(order: DeliveryOrder) -> None:
-    # An async source is read on the event loop; a list is pulled in a worker thread, whose timing
-    # would decide whether the second source's head reaches the first wave.
-    async def sources() -> AsyncIterator[ReferenceSource[int]]:
-        yield _alpha()
-        yield _beta()
-
     portal = BatchPortal(_answer)
     async with _client(portal) as api:
-        events, report = await _collect(api, sources(), dispatch=BatchDispatch(output_order=order))
+        # On the event loop: a worker-thread pull's timing would decide whether the second source's
+        # head reaches the first wave.
+        events, report = await _collect(
+            api,
+            on_loop((_alpha(), _beta())),
+            dispatch=BatchDispatch(output_order=order, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
+        )
 
     if order is DeliveryOrder.READY:
         # Pages of both methods coalesce into shared physical batches. Under INPUT, as on the homogeneous
@@ -186,7 +194,6 @@ async def test_a28_fail_fast_facade_yields_reference_events() -> None:
 # --- A28-LATE -----------------------------------------------------------------------------------
 
 _ACTIVATION_TURNS = 200
-_EVENT_TIMEOUT = 5.0
 
 
 @pytest.mark.asyncio
@@ -202,7 +209,7 @@ async def test_a28_late_sources_activate_before_the_counted_source_finishes() ->
         tail = method == "gamma.list" and query.get("start", "0") != "0"
         if tail and not tail_started.is_set():
             tail_started.set()
-            async with asyncio.timeout(_EVENT_TIMEOUT):
+            async with asyncio.timeout(HANG_BOUND):
                 await late_yielded.wait()
             # Activating a source is in-loop work only, so loop turns, not time, bound it.
             for _turn in range(_ACTIVATION_TURNS):
@@ -211,7 +218,7 @@ async def test_a28_late_sources_activate_before_the_counted_source_finishes() ->
 
     async def sources() -> AsyncIterator[ReferenceSource[int]]:
         yield _gamma()
-        async with asyncio.timeout(_EVENT_TIMEOUT):
+        async with asyncio.timeout(HANG_BOUND):
             await tail_started.wait()
         for parent in (2, 3, 4):
             yield _beta(parent)
@@ -250,7 +257,7 @@ async def test_a28_late_pages_wait_for_a_counted_tail_on_its_way_to_the_queue(
     async def answer(method: str, query: Query) -> Envelope:
         if method == "gamma.list" and not head_sent.is_set():
             head_sent.set()
-            async with asyncio.timeout(_EVENT_TIMEOUT):
+            async with asyncio.timeout(HANG_BOUND):
                 await late_yielded.wait()
             for _turn in range(_ACTIVATION_TURNS):
                 await asyncio.sleep(0)
@@ -258,7 +265,7 @@ async def test_a28_late_pages_wait_for_a_counted_tail_on_its_way_to_the_queue(
 
     async def sources() -> AsyncIterator[ReferenceSource[int]]:
         yield _gamma()
-        async with asyncio.timeout(_EVENT_TIMEOUT):
+        async with asyncio.timeout(HANG_BOUND):
             await head_sent.wait()
         for parent in (2, 3, 4):
             yield _beta(parent)
@@ -393,7 +400,7 @@ async def test_a28_a_wave_still_leaves_with_the_pages_a_failed_binding_abandoned
         )
         async with stream:
             # A stranded wave would hang the stream; the bound only turns that into a failure.
-            events = await asyncio.wait_for(_drain(stream), timeout=_HANG_GUARD_SECONDS)
+            events = await asyncio.wait_for(_drain(stream), timeout=HANG_BOUND)
 
     terminals = {event.binding_index: type(event) for event in events if not isinstance(event, ReferenceItem)}
     assert terminals == {0: ReferenceFailure, 1: ReferenceComplete, 2: ReferenceComplete}
@@ -769,11 +776,13 @@ async def test_a28_pending_holds_at_most_one_pull_and_closes_the_source_once_at_
     source = _PendingSource()
     portal = BatchPortal(_answer)
     async with _client(portal) as api:
-        stream = api.iter_reference_source_outcomes(source, policy=ExecutionPolicy(max_elapsed=0.2))
+        budget_started = deadline_started()
+        stream = api.iter_reference_source_outcomes(source, policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET))
         events: list[ReferenceOutcome[int]] = []
         with pytest.raises(BudgetExceededError, match="reference input exceeded operation time budget"):
-            async with asyncio.timeout(5), stream:
+            async with asyncio.timeout(HANG_BOUND), stream:
                 events.extend([event async for event in stream])
+        assert_fired_near_deadline(budget_started)
     assert source.max_in_flight == 1
     assert source.closes == 1
     assert _report(stream).state is not TerminalState.COMPLETED
@@ -805,17 +814,23 @@ async def test_ahomo_sources_of_one_template_trace_exactly_like_the_homogeneous_
     method = "alpha.list" if traversal is ALPHA else "seq.list"
     request = Request.bare(method, {}, ReplaySafety.SAFE)
     parents = (1, 2, 3)
+    # Both runs' waves close by size or by the end of input, so the comparison never rides on a timer.
+    dispatch = BatchDispatch(coalesce_wait=UNREACHABLE_COALESCE_WAIT)
 
     homogeneous = BatchPortal(answer)
     async with _client(homogeneous) as api:
-        stream = api.iter_reference_outcomes(request, [_binding(parent) for parent in parents], traversal=traversal)
+        stream = api.iter_reference_outcomes(
+            request, on_loop([_binding(parent) for parent in parents]), traversal=traversal, dispatch=dispatch
+        )
         async with stream:
             expected = [event async for event in stream]
     expected_report = _report(stream)
 
     heterogeneous = BatchPortal(answer)
     async with _client(heterogeneous) as api:
-        events, report = await _collect(api, [ReferenceSource(request, traversal, _binding(p)) for p in parents])
+        events, report = await _collect(
+            api, on_loop([ReferenceSource(request, traversal, _binding(p)) for p in parents]), dispatch=dispatch
+        )
 
     assert events == expected
     assert heterogeneous.waves == homogeneous.waves

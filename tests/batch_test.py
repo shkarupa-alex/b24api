@@ -37,7 +37,15 @@ from b24api.errors import (
 )
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse
 from tests.ledger_hold import LedgerHold
-from tests.scripting import ResponderTransport, attached_report
+from tests.scripting import (
+    DEADLINE_BUDGET,
+    HANG_BOUND,
+    ResponderTransport,
+    assert_fired_near_deadline,
+    attached_report,
+    deadline_started,
+    reached,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator
@@ -48,7 +56,6 @@ EXPECTED_CHUNKS = 4
 MIXED_COMMAND_COUNT = 3
 HTTP_OK = 200
 EXPECTED_TOTAL = 3
-PULL_TEST_TIMEOUT = 0.15
 PARTIAL_COMMAND_COUNT = 2
 NESTED_ROW_COUNT = 2
 
@@ -346,20 +353,23 @@ async def test_blocking_sync_batch_source_close_obeys_cleanup_deadline() -> None
             release_close.wait()
             close_finished.set()
 
+    budget_started = deadline_started()
     stream = batch_outcome_stream(
         BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         BlockingCloseIterator(),
         batch_size=1,
-        policy=ExecutionPolicy(max_elapsed=0.05),
+        policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET),
     )
-    assert isinstance(await anext(stream), BatchSuccess)
-
-    with pytest.raises(BudgetExceededError, match="batch source cleanup") as captured:
-        await asyncio.wait_for(stream.aclose(), timeout=0.2)
-
-    assert attached_report(captured.value) is stream.report
-    release_close.set()
-    assert await asyncio.to_thread(close_finished.wait, 0.2)
+    try:
+        assert isinstance(await anext(stream), BatchSuccess)
+        # close() blocks until released, so only the cleanup deadline can end this close.
+        with pytest.raises(BudgetExceededError, match="batch source cleanup") as captured:
+            await asyncio.wait_for(stream.aclose(), timeout=HANG_BOUND)
+        assert_fired_near_deadline(budget_started)
+        assert attached_report(captured.value) is stream.report
+    finally:
+        release_close.set()
+    assert await asyncio.to_thread(close_finished.wait, HANG_BOUND)
 
 
 @pytest.mark.asyncio
@@ -368,16 +378,18 @@ async def test_async_batch_input_pull_obeys_operation_elapsed_budget() -> None:
         yield Request("profile", route=RouteKind.BARE)
         await asyncio.Future[None]()
 
+    budget_started = deadline_started()
     stream = batch_outcome_stream(
         BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         source(),
         batch_size=1,
-        policy=ExecutionPolicy(max_elapsed=0.03),
+        policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET),
     )
 
     assert isinstance(await anext(stream), BatchSuccess)
     with pytest.raises(BudgetExceededError, match="batch input") as captured:
-        await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
+        await asyncio.wait_for(anext(stream), timeout=HANG_BOUND)
+    assert_fired_near_deadline(budget_started)
 
     assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
@@ -399,21 +411,24 @@ async def test_cancellation_resistant_batch_pull_is_closed_after_late_completion
         finally:
             closed.set()
 
+    budget_started = deadline_started()
     stream = batch_outcome_stream(
         BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         source(),
         batch_size=1,
-        policy=ExecutionPolicy(max_elapsed=0.03),
+        policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET),
     )
 
-    assert isinstance(await anext(stream), BatchSuccess)
-    with pytest.raises(BudgetExceededError) as captured:
-        await asyncio.wait_for(anext(stream), timeout=0.15)
-    assert attached_report(captured.value) is stream.report
-    assert not closed.is_set()
-
-    release.set()
-    await asyncio.wait_for(closed.wait(), timeout=0.2)
+    try:
+        assert isinstance(await anext(stream), BatchSuccess)
+        with pytest.raises(BudgetExceededError) as captured:
+            await asyncio.wait_for(anext(stream), timeout=HANG_BOUND)
+        assert_fired_near_deadline(budget_started)
+        assert attached_report(captured.value) is stream.report
+        assert not closed.is_set()
+    finally:
+        release.set()
+    await reached(closed)
 
 
 @pytest.mark.asyncio
@@ -433,20 +448,23 @@ async def test_late_batch_source_cleanup_error_does_not_reopen_the_published_rep
             closed.set()
             raise RuntimeError("late batch close boom")
 
+    budget_started = deadline_started()
     stream = batch_outcome_stream(
         BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         source(),
         batch_size=1,
-        policy=ExecutionPolicy(max_elapsed=0.03),
+        policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET),
     )
-    assert isinstance(await anext(stream), BatchSuccess)
-    with pytest.raises(BudgetExceededError) as failed:
-        await anext(stream)
-    report = stream.report
-    assert attached_report(failed.value) is report
-
-    release.set()
-    await asyncio.wait_for(closed.wait(), timeout=0.2)
+    try:
+        assert isinstance(await anext(stream), BatchSuccess)
+        with pytest.raises(BudgetExceededError) as failed:
+            await asyncio.wait_for(anext(stream), timeout=HANG_BOUND)
+        assert_fired_near_deadline(budget_started)
+        report = stream.report
+        assert attached_report(failed.value) is report
+    finally:
+        release.set()
+    await reached(closed)
     # The report was published once, after the bounded cleanup; a repeated close changes nothing (§3.1).
     await stream.aclose()
     assert stream.report is report
@@ -475,21 +493,23 @@ async def test_blocking_sync_batch_pull_does_not_block_event_loop_or_deadline() 
         def close(self) -> None:
             closed.set()
 
+    budget_started = deadline_started()
     stream = batch_outcome_stream(
         BatchExecutor(Executor(ResponderTransport(_echo_batch))),
         BlockingPull(),
         batch_size=1,
-        policy=ExecutionPolicy(max_elapsed=0.03),
+        policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET),
     )
 
-    assert isinstance(await anext(stream), BatchSuccess)
-    started = asyncio.get_running_loop().time()
-    with pytest.raises(BudgetExceededError):
-        await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
-    assert asyncio.get_running_loop().time() - started < PULL_TEST_TIMEOUT
-
-    release.set()
-    assert await asyncio.to_thread(closed.wait, 0.2)
+    try:
+        assert isinstance(await anext(stream), BatchSuccess)
+        # The second pull blocks until released, so only the deadline can end this wait.
+        with pytest.raises(BudgetExceededError):
+            await asyncio.wait_for(anext(stream), timeout=HANG_BOUND)
+        assert_fired_near_deadline(budget_started)
+    finally:
+        release.set()
+    assert await asyncio.to_thread(closed.wait, HANG_BOUND)
 
 
 @pytest.mark.asyncio

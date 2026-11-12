@@ -60,7 +60,7 @@ from b24api.errors import (
     TransportError,
 )
 from b24api.settings import Settings
-from tests.scripting import ResponderTransport, attached_report, client_for
+from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, attached_report, client_for
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator
@@ -1134,7 +1134,7 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
             batch_size=FANOUT_BATCH_SIZE,
             concurrency=concurrency,
             output_order=DeliveryOrder.READY,
-            coalesce_wait=1,
+            coalesce_wait=UNREACHABLE_COALESCE_WAIT,
         ),
     )
 

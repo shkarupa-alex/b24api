@@ -91,6 +91,11 @@ OBSERVED_REQUESTS = 2
 REFERENCE_OUTCOMES = 2
 FANOUT_COMMANDS = 3
 DISTINCT_REQUESTS = 2
+# Only a hung child process reaches this: interpreter start and imports on a loaded host stay well inside.
+_CHILD_PROCESS_GUARD = 60
+# The child's own event loop, its 0.02 s close timeout included, ends well inside this on a loaded host;
+# a shutdown that waited for the cancellation-resistant cleanup would not.
+_CHILD_LOOP_BOUND = 2.0
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
@@ -607,8 +612,11 @@ async def test_conformance_runner_preserves_loop_affinity_and_isolates_case_resp
 
 
 def test_cancellation_resistant_cleanup_cannot_block_process_shutdown() -> None:
+    # The child times its own event loop, start to shutdown, so interpreter start and imports on a busy
+    # host do not count; the process timeout only turns a hung shutdown into a failure.
     script = """
 import asyncio
+import time
 from b24api.testing import ConformanceCase, run_transport_conformance
 from b24api.testing import transport as module
 
@@ -632,17 +640,20 @@ async def main():
     )
     assert report.failures[0].detail == "CleanupDeadlineExceeded"
 
+started = time.monotonic()
 asyncio.run(main())
+print(time.monotonic() - started)
 """
     result = subprocess.run(  # noqa: S603 - fixed interpreter and in-repository regression script
         [sys.executable, "-c", script],
         check=False,
         capture_output=True,
         text=True,
-        timeout=1,
+        timeout=_CHILD_PROCESS_GUARD,
     )
 
     assert result.returncode == 0, (result.stdout, result.stderr)
+    assert float(result.stdout) < _CHILD_LOOP_BOUND
 
 
 @pytest.mark.asyncio
