@@ -50,7 +50,18 @@ from b24api.references.dispatch import (
 from b24api.references.scheduler import ReferenceScheduler
 from b24api.traversal.counted_batch import _settle_tail_cleanup
 from b24api.traversal.plans import KernelBatchDispatch, ReferenceOutputOrder
-from tests.scripting import BatchPortal, Blocker, ResponderTransport, VirtualClock, client_for, on_loop
+from tests.scripting import (
+    DEADLINE_BUDGET,
+    HANG_BOUND,
+    UNREACHABLE_COALESCE_WAIT,
+    BatchPortal,
+    Blocker,
+    ResponderTransport,
+    VirtualClock,
+    client_for,
+    on_loop,
+    reached,
+)
 
 if TYPE_CHECKING:
     from b24api.contracts import TraversalSpec
@@ -63,7 +74,6 @@ if TYPE_CHECKING:
 
 
 _COALESCING_TURNS = 1000
-_HANG_GUARD_SECONDS = 30
 
 
 def _counted_answer(_method: str, query: Query) -> Envelope:
@@ -116,7 +126,7 @@ async def _parked_page_dispatcher() -> tuple[_BatchPageDispatcher, BatchPortal, 
     dispatcher = _BatchPageDispatcher(
         executor,
         context,
-        KernelBatchDispatch(batch_size=2, concurrency=1, coalesce_wait=1.0),
+        KernelBatchDispatch(batch_size=2, concurrency=1, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         producer_state=state,
         buffer=buffer,
         page_cap=1,
@@ -124,7 +134,7 @@ async def _parked_page_dispatcher() -> tuple[_BatchPageDispatcher, BatchPortal, 
     )
     dispatcher._queue.put_nowait(first)  # noqa: SLF001
     dispatcher._ensure_workers()  # noqa: SLF001
-    await asyncio.wait_for(asyncio.gather(first.future, leftovers[0].future), timeout=5)
+    await asyncio.wait_for(asyncio.gather(first.future, leftovers[0].future), timeout=HANG_BOUND)
     dispatcher._queue.put_nowait(late)  # noqa: SLF001
     for _ in range(5):
         await asyncio.sleep(0)
@@ -137,7 +147,7 @@ async def test_a_page_the_coalescing_read_took_joins_the_next_round_robin_wave()
     dispatcher, portal, pages, late = await _parked_page_dispatcher()
     _settle(pages[0])
     _settle(pages[1])
-    await asyncio.wait_for(late.future, timeout=5)
+    await asyncio.wait_for(late.future, timeout=HANG_BOUND)
     for page in (*pages[2:], late):
         if page.future.done():
             _settle(page)
@@ -171,7 +181,7 @@ async def test_a_page_on_its_way_to_the_queue_is_potential_until_it_arrives() ->
     dispatcher = _BatchPageDispatcher(
         executor,
         context,
-        KernelBatchDispatch(batch_size=2, coalesce_wait=1),
+        KernelBatchDispatch(batch_size=2, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         producer_state=state,
         buffer=buffer,
         page_cap=1,
@@ -229,7 +239,7 @@ async def test_a_pending_refill_is_potential_whatever_the_chunk_carries(*, ready
     dispatcher = _BatchPageDispatcher(
         executor,
         context,
-        KernelBatchDispatch(batch_size=2, coalesce_wait=1),
+        KernelBatchDispatch(batch_size=2, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         producer_state=state,
         buffer=buffer,
         page_cap=1,
@@ -257,7 +267,7 @@ async def test_a_refill_counts_the_rows_its_consumer_returns_first() -> None:
     dispatcher = _BatchPageDispatcher(
         executor,
         context,
-        KernelBatchDispatch(batch_size=2, coalesce_wait=1),
+        KernelBatchDispatch(batch_size=2, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         producer_state=state,
         buffer=buffer,
         page_cap=2,
@@ -648,7 +658,7 @@ async def test_a_wave_leaves_without_a_page_whose_fetch_was_cancelled_while_it_c
     dispatcher = _BatchPageDispatcher(
         executor,
         context,
-        KernelBatchDispatch(batch_size=3, concurrency=1, coalesce_wait=1.0),
+        KernelBatchDispatch(batch_size=3, concurrency=1, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         producer_state=state,
         buffer=buffer,
         page_cap=1,
@@ -661,7 +671,7 @@ async def test_a_wave_leaves_without_a_page_whose_fetch_was_cancelled_while_it_c
     with contextlib.suppress(asyncio.CancelledError):
         await abandoned
     # A stranded wave would hang the kept page; the bound only turns that into a failure.
-    page = await asyncio.wait_for(kept, timeout=_HANG_GUARD_SECONDS)
+    page = await asyncio.wait_for(kept, timeout=HANG_BOUND)
     assert page.admission is not None
     assert page.settlement is not None
     page.admission.set_result(None)
@@ -678,7 +688,7 @@ async def test_a_page_whose_wave_was_sent_when_the_deadline_passed_settles_unkno
     """The deadline bounds admission: the executor ends a sent wave, and a still-queued page was never sent."""
     blocker = Blocker()
     executor = Executor(ResponderTransport(blocker))
-    context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10, max_elapsed=0.2))
+    context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10, max_elapsed=DEADLINE_BUDGET))
     await context.start()
     state = _ProducerState({"a", "b"}, {"a": 0, "b": 1})
     buffer = _RowBuffer(10, context, producer_state=state)
@@ -691,7 +701,7 @@ async def test_a_page_whose_wave_was_sent_when_the_deadline_passed_settles_unkno
         page_cap=1,
     )
     sent = asyncio.create_task(dispatcher.fetch(Request("item.list", {"PARENT": "a"}, route=RouteKind.BARE), "a"))
-    await asyncio.wait_for(blocker.started.wait(), timeout=5)
+    await reached(blocker.started)
     queued = asyncio.create_task(dispatcher.fetch(Request("item.list", {"PARENT": "b"}, route=RouteKind.BARE), "b"))
     results = await asyncio.gather(sent, queued, return_exceptions=True)
     await dispatcher.aclose()
@@ -738,7 +748,7 @@ async def test_a_page_cancelled_after_its_wave_was_sent_settles_unknown() -> Non
             raise
 
     task = asyncio.create_task(fetch())
-    await asyncio.wait_for(blocker.started.wait(), timeout=_HANG_GUARD_SECONDS)
+    await asyncio.wait_for(blocker.started.wait(), timeout=HANG_BOUND)
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
@@ -757,7 +767,9 @@ async def test_a_wave_left_with_no_page_is_not_sent(monkeypatch: pytest.MonkeyPa
     executor = Executor(portal)
     context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10))
     await context.start()
-    dispatcher, buffer = _three_producer_dispatcher(executor, context, batch_size=3, coalesce_wait=1.0)
+    dispatcher, buffer = _three_producer_dispatcher(
+        executor, context, batch_size=3, coalesce_wait=UNREACHABLE_COALESCE_WAIT
+    )
     abandoned = asyncio.create_task(dispatcher.fetch(_page("b"), "b"))
     for _turn in range(_COALESCING_TURNS // 2):  # the page joins a chunk, which waits for the other producers
         await asyncio.sleep(0)
@@ -766,7 +778,7 @@ async def test_a_wave_left_with_no_page_is_not_sent(monkeypatch: pytest.MonkeyPa
         await abandoned
     for _turn in range(_COALESCING_TURNS * 3):  # the chunk is handed to a send worker, with no live page left
         await asyncio.sleep(0)
-    page = await asyncio.wait_for(dispatcher.fetch(_page("a"), "a"), timeout=_HANG_GUARD_SECONDS)
+    page = await asyncio.wait_for(dispatcher.fetch(_page("a"), "a"), timeout=HANG_BOUND)
     assert page.admission is not None
     assert page.settlement is not None
     page.admission.set_result(None)
@@ -790,7 +802,7 @@ async def test_a_send_that_breaks_an_invariant_fails_its_pages_as_possibly_run(m
     await context.start()
     dispatcher, buffer = _three_producer_dispatcher(executor, context)
     with pytest.raises(ValueError, match="zip") as caught:
-        await asyncio.wait_for(dispatcher.fetch(_page("a"), "a"), timeout=_HANG_GUARD_SECONDS)
+        await asyncio.wait_for(dispatcher.fetch(_page("a"), "a"), timeout=HANG_BOUND)
     await dispatcher.aclose()
     await buffer.close()
 

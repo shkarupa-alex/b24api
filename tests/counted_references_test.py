@@ -44,10 +44,21 @@ from b24api.contracts.completion import BindingClosure
 from b24api.contracts.policy import ConfirmationPolicy, SnapshotRequirement
 from b24api.errors import BudgetExceededError
 from b24api.execution import ExecutionContext
-from tests.scripting import BatchPortal, Envelope, Query
+from tests.scripting import (
+    DEADLINE_BUDGET,
+    HANG_BOUND,
+    UNREACHABLE_COALESCE_WAIT,
+    BatchPortal,
+    Envelope,
+    Query,
+    VirtualClock,
+    assert_fired_near_deadline,
+    deadline_started,
+    on_loop,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     from b24api.contracts import OperationReport, OperationStream, ReferenceOutcome
 
@@ -55,6 +66,10 @@ WIDTH = 50
 ROWS = 1001
 _ABSENT = object()
 _COUNTED = OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED)
+
+
+# Tests that assert exact waves: a wave closes by its size or by the end of input, never by the timer.
+_WAVES = BatchDispatch(coalesce_wait=UNREACHABLE_COALESCE_WAIT)
 
 
 def _client(portal: BatchPortal) -> Bitrix24:
@@ -65,8 +80,10 @@ def _request() -> Request:
     return Request.bare("crm.item.list", {}, ReplaySafety.SAFE)
 
 
-def _bindings(*parents: int) -> list[Binding[int]]:
-    return [Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), parent),), parent) for parent in parents]
+def _bindings(*parents: int) -> AsyncIterator[Binding[int]]:
+    return on_loop(
+        Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), parent),), parent) for parent in parents
+    )
 
 
 def _report(stream: OperationStream[Any]) -> OperationReport:
@@ -103,7 +120,7 @@ async def _outcomes(
             _request(),
             _bindings(*parents),
             traversal=traversal or CountedTraversal(page_size=WIDTH),
-            dispatch=dispatch or BatchDispatch(),
+            dispatch=dispatch or _WAVES,
             policy=policy,
         )
         async with stream:
@@ -131,11 +148,15 @@ def _items(events: list[ReferenceOutcome[int]], parent: int) -> list[object]:
 
 
 @pytest.mark.asyncio
-async def test_a20_two_counted_parents_travel_in_two_http_requests() -> None:
+async def test_a20_two_counted_parents_travel_in_two_http_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    # On a virtual clock each wave closes by its size or by the end of input, after a bounded number of
+    # loop turns, and every wait its deadline ended is counted: the waves hold however the host runs.
+    clock = VirtualClock().install(monkeypatch)
     portal = BatchPortal(_dense(ROWS))
-    events, report = await _outcomes(portal, (1, 2))
+    events, report = await _outcomes(portal, (1, 2), dispatch=BatchDispatch())
 
     assert portal.waves == [2, 40]
+    assert clock.timer_firings == 0
     assert report.physical_requests == len(portal.waves)
     assert report.logical_pages == 42  # noqa: PLR2004 - 2 heads plus 2 x 20 tail pages
     assert sum(isinstance(event, ReferenceItem) for event in events) == 2 * ROWS
@@ -192,9 +213,9 @@ async def test_a11_empty_counted_head_closes_as_source_empty_in_one_http_request
     async with _client(portal) as api:
         traversal = CountedTraversal(page_size=WIDTH)
         stream = (
-            api.iter_reference_outcomes(_request(), _bindings(1, 2), traversal=traversal)
+            api.iter_reference_outcomes(_request(), _bindings(1, 2), traversal=traversal, dispatch=_WAVES)
             if tolerant
-            else api.iter_references(_request(), _bindings(1, 2), traversal=traversal)
+            else api.iter_references(_request(), _bindings(1, 2), traversal=traversal, dispatch=_WAVES)
         )
         async with stream:
             events = [event async for event in stream]
@@ -337,16 +358,18 @@ async def test_a20_provenance_a_sent_head_is_unknown_at_the_deadline_and_a_queue
 
     portal = BatchPortal(answer)
     async with _client(portal) as api:
+        budget_started = deadline_started()
         stream = api.iter_reference_outcomes(
             _request(),
             _bindings(1, 2),
             traversal=CountedTraversal(page_size=WIDTH),
             dispatch=BatchDispatch(batch_size=1, concurrency=1),
-            policy=ExecutionPolicy(max_elapsed=0.2),
+            policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET),
         )
         with pytest.raises(BudgetExceededError):
-            async with asyncio.timeout(5), stream:
+            async with asyncio.timeout(HANG_BOUND), stream:
                 _ = [event async for event in stream]
+        assert_fired_near_deadline(budget_started)
 
     assert portal.waves == [1]
     assert [query["PARENT"] for query in portal.queries] == ["1"]
@@ -517,16 +540,21 @@ async def test_a20_load_an_overloaded_tail_fails_finitely_with_an_honest_partial
 
     portal = BatchPortal(answer)
     policy = ExecutionPolicy(retry=RetryPolicy(initial_delay=0.001, maximum_delay=0.002, jitter=0.0))
+    # The bounds below count full waves: every tail page is known up front, so none waits for the timer.
+    dispatch = BatchDispatch(batch_size=3, coalesce_wait=UNREACHABLE_COALESCE_WAIT)
     async with asyncio.timeout(30):
-        events, report = await _outcomes(portal, (1,), dispatch=BatchDispatch(batch_size=3), policy=policy)
+        events, report = await _outcomes(portal, (1,), dispatch=dispatch, policy=policy)
 
     failures = [event for event in events if isinstance(event, ReferenceFailure | ReferenceOutcomeUnknown)]
     assert len(failures) == 1
     assert failures[0].partial_rows == 2 * WIDTH
     assert not report.exhausted
-    # Bounded backoff retries of the overloaded wave only: no hot loop of resends.
+    # Bounded backoff retries of the overloaded waves only, no hot loop of resends: after the head, the
+    # first tail wave and the next page's wave, which is already on its way when the binding fails. How
+    # often that second wave retries before the failure reaches it is a race with its backoff timer, so
+    # only its bound is fixed.
     attempts = policy.max_attempts_per_request
-    assert report.physical_requests <= 2 + attempts
+    assert report.physical_requests <= 1 + 2 * attempts
     assert len(portal.queries) <= 2 + 3 * attempts
 
 

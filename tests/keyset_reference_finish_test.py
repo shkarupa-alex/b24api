@@ -50,7 +50,7 @@ from b24api.errors import AmbiguousExecutionError, BatchCommandError, Incomplete
 from b24api.execution import ExecutionContext, RateCoordinator
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _RowBuffer
-from tests.scripting import BatchPortal, client_for
+from tests.scripting import UNREACHABLE_COALESCE_WAIT, BatchPortal, client_for, on_loop
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -527,9 +527,9 @@ async def test_a_lost_part_of_a_split_wave_leaves_its_binding_unknown_even_after
         outcomes, report = await _drain(
             client.iter_reference_outcomes(
                 _base(),
-                [_parent(name) for name in data],
+                on_loop(_parent(name) for name in data),
                 traversal=_traversal(RangeKeysetExecution(_CONTRACT)),
-                dispatch=BatchDispatch(batch_size=3),
+                dispatch=BatchDispatch(batch_size=3, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
             )
         )
 

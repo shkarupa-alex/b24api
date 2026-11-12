@@ -114,12 +114,6 @@ def always(reply: object) -> Responder:
     return lambda _request: reply
 
 
-async def on_loop[T](items: Iterable[T]) -> AsyncIterator[T]:
-    """Yield ``items`` on the event loop; a plain iterable is pulled in a worker thread, whose pace no test sets."""
-    for item in items:
-        yield item
-
-
 class Blocker:
     """A responder that never answers: it sets ``started``, waits to be cancelled, then sets ``cancelled``."""
 
@@ -169,6 +163,63 @@ class VirtualClock:
             await asyncio.sleep(0)
         self.now += seconds
         self.timer_firings += 1
+
+
+# Timing: a test's verdict must follow from the order of events it scripts, never from how fast a busy
+# host runs its threads, its event loop or the dispatcher's coalescing timer.
+
+# ``BatchDispatch`` caps ``coalesce_wait`` at one second. A test asserting exact waves that is not about
+# the timer sets this, so a wave closes by its size or because no more input can join it, never by a
+# 20 ms timer that one descheduling of the loop outruns. A test about the timer drives a VirtualClock.
+UNREACHABLE_COALESCE_WAIT = 1.0
+
+# The operation budget of a test whose subject is that deadline firing while a source pull, a source
+# close or a send stays blocked until the test releases it. Wide enough that a worker-thread hop or a
+# stalled loop cannot spend it before the test reaches the blocked step; since that step never ends on
+# its own, a short budget proves nothing this one does not.
+DEADLINE_BUDGET = 0.2
+
+# How late past ``DEADLINE_BUDGET`` the deadline may end the blocked step: room for a loaded host to run
+# the timer, yet well below any fixed cleanup timeout a regression might use in place of the budget.
+DEADLINE_SLACK = 0.3
+
+# Only turns a hang into a failure: how long a test waits for something it caused, an event its fake sets,
+# a deadline it set, or a short stream it drains. Generous, since it costs time only when a test already
+# fails: a stalled or loaded host never reaches it, and it never races a budget. Whether a deadline fired
+# near its budget is checked against ``DEADLINE_SLACK`` instead.
+HANG_BOUND = 30.0
+
+
+def deadline_started() -> float:
+    """Return the loop time a test takes just before it starts an operation on ``DEADLINE_BUDGET``."""
+    return asyncio.get_running_loop().time()
+
+
+def assert_fired_near_deadline(started: float) -> None:
+    """Assert the operation deadline, not some fixed timeout, ended the blocked step begun at ``started``."""
+    elapsed = asyncio.get_running_loop().time() - started
+    if elapsed >= DEADLINE_BUDGET + DEADLINE_SLACK:
+        raise AssertionError(f"the deadline fired {elapsed:.3f} s after the start, not near {DEADLINE_BUDGET} s")
+
+
+async def reached(event: asyncio.Event, bound: float = HANG_BOUND) -> None:
+    """Wait for a test-owned ``event``; fail the test, rather than hang it, if it is not set in ``bound``."""
+    try:
+        async with asyncio.timeout(bound):
+            await event.wait()
+    except TimeoutError:
+        raise AssertionError(f"the test's event was not set within {bound} s") from None
+
+
+async def on_loop[T](items: Iterable[T]) -> AsyncIterator[T]:
+    """Yield ``items`` on the event loop.
+
+    A public family pulls a synchronous source in a worker thread, so when each item reaches the
+    scheduler depends on OS thread scheduling, which no virtual clock sets. A test that asserts exact
+    waves, wave timings or an event order shared by two runs feeds its input through this instead.
+    """
+    for item in items:
+        yield item
 
 
 def attached_report(error: BaseException) -> object:

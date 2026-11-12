@@ -45,7 +45,7 @@ from b24api.contracts import (
 from b24api.encoding import encode_php_query
 from b24api.errors import CapabilityError
 from b24api.references.binding import _bind_request, _BindingLocalValidationError, binding_update_conflict
-from tests.scripting import ResponderTransport, client_for
+from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, on_loop
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -134,7 +134,15 @@ async def _drain[T](stream: OperationStream[T]) -> list[T]:
 # A17.1: every owner keeps its own constants and its own cursor over both dispatch routes.
 
 
-@pytest.mark.parametrize("dispatch", [DirectDispatch(concurrency=2), BatchDispatch(batch_size=2, concurrency=1)])
+# The batch case asserts the owners share a wave: their input comes on the event loop and the wave closes
+# by size or by the end of input, so neither a worker-thread pull nor the coalescing timer decides it.
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        DirectDispatch(concurrency=2),
+        BatchDispatch(batch_size=2, concurrency=1, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
+    ],
+)
 @pytest.mark.asyncio
 async def test_each_owner_binding_keeps_its_constants_and_its_own_cursor(
     dispatch: DirectDispatch | BatchDispatch,
@@ -142,7 +150,7 @@ async def test_each_owner_binding_keeps_its_constants_and_its_own_cursor(
     portal = _ProductRows()
     async with _client(portal) as client:
         stream = client.iter_references(
-            _request(), [_owner("D"), _owner("L")], traversal=_traversal(), dispatch=dispatch
+            _request(), on_loop([_owner("D"), _owner("L")]), traversal=_traversal(), dispatch=dispatch
         )
         outcomes = await _drain(stream)
 

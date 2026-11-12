@@ -8,6 +8,7 @@ import pytest
 import b24api.references.facade as reference_facade
 import b24api.traversal.facade as flat_facade
 from b24api import (
+    BatchDispatch,
     Binding,
     Bitrix24,
     CountedTraversal,
@@ -31,10 +32,10 @@ from b24api.contracts import (
 )
 from b24api.contracts.request import _MappingValuesResultSelector, _TolerantMappingValuesResultSelector
 from b24api.traversal.facade_support import _collection_selector
-from tests.scripting import BatchPortal, Envelope, Query
+from tests.scripting import UNREACHABLE_COALESCE_WAIT, BatchPortal, Envelope, Query, on_loop
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
 
     from b24api.contracts import OperationReport, OperationStream, ReferenceOutcome, TraversalSpec
 
@@ -70,11 +71,17 @@ def _offset_answer(shape: ResultCollectionShape) -> Callable[[str, Query], Envel
     return answer
 
 
-def _bindings() -> list[Binding[str]]:
-    return [
-        Binding("parent", updates=(ParameterUpdate(ParameterPath(("PARENT",)), parent),), correlation=parent)
-        for parent in PAGES
-    ]
+def _bindings() -> AsyncIterator[Binding[str]]:
+    return on_loop(
+        [
+            Binding("parent", updates=(ParameterUpdate(ParameterPath(("PARENT",)), parent),), correlation=parent)
+            for parent in PAGES
+        ]
+    )
+
+
+# The tests assert exact waves: those close by size or by the end of input, never by the timer.
+_WAVES = BatchDispatch(coalesce_wait=UNREACHABLE_COALESCE_WAIT)
 
 
 def _client(portal: BatchPortal) -> Bitrix24:
@@ -86,7 +93,7 @@ def _request() -> Request:
 
 
 async def _collect_references(api: Bitrix24, traversal: TraversalSpec) -> list[ReferenceOutcome[str]]:
-    stream = api.iter_reference_outcomes(_request(), _bindings(), traversal=traversal)
+    stream = api.iter_reference_outcomes(_request(), _bindings(), traversal=traversal, dispatch=_WAVES)
     async with stream:
         events = [event async for event in stream]
     assert _report(stream).successful
@@ -170,6 +177,7 @@ async def test_a26_iter_cursors_passes_the_shape_to_the_shared_cursor_traversal(
             cursor=cursor,
             collection_shape=shape,
             page_size=10,
+            dispatch=_WAVES,
         )
         async with stream:
             events = [event async for event in stream]
