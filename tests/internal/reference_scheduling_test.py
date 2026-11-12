@@ -26,6 +26,7 @@ from b24api import (
     ParameterPath,
     Request,
     ResultSelector,
+    SequentialTraversal,
     StableIntegerKeysetContract,
     TerminalState,
 )
@@ -39,7 +40,9 @@ from b24api.execution.context import CleanupResult
 from b24api.references.counted_io import ReferenceTailStream
 from b24api.references.dispatch import (
     _BatchPageDispatcher,
+    _DoneEvent,
     _failed_settlement,
+    _FailureEvent,
     _PendingBatch,
     _ProducerState,
     _RowBuffer,
@@ -47,15 +50,16 @@ from b24api.references.dispatch import (
 from b24api.references.scheduler import ReferenceScheduler
 from b24api.traversal.counted_batch import _settle_tail_cleanup
 from b24api.traversal.plans import KernelBatchDispatch, ReferenceOutputOrder
-from tests.scripting import BatchPortal, Blocker, ResponderTransport, VirtualClock, client_for
+from tests.scripting import BatchPortal, Blocker, ResponderTransport, VirtualClock, client_for, on_loop
 
 if TYPE_CHECKING:
+    from b24api.contracts import TraversalSpec
     from b24api.execution.context import ExecutionContext
-    from b24api.references.dispatch import _DispatchedPage, _FailureEvent, _Transit
+    from b24api.references.dispatch import _AdmissionState, _DispatchedPage, _Transit, _Work
     from b24api.references.program import FastKeysetProgram
     from b24api.references.run import _ReferenceRun
     from b24api.traversal.identity import _Page
-    from tests.scripting import Envelope, Query
+    from tests.scripting import Answer, Envelope, Query
 
 
 _COALESCING_TURNS = 1000
@@ -421,6 +425,117 @@ async def test_a_failed_counted_binding_closes_its_tail_before_its_terminal_even
             _events = [event async for event in stream]
     assert stream.report is not None
     assert observed == [(False, set())]
+
+
+# A terminal event whose publication waits, as it would for room in its queue, longer than a wave waits for an event.
+_STALLED_PUBLISH_TURNS = 200
+_FAILING_PARENT = 1
+
+
+def _rows_answer(*, counted: bool, fail: bool) -> Answer:
+    """Serve 20 rows per parent in pages of the request's size; the failing parent is refused its second page."""
+
+    def answer(_method: str, query: Query) -> Envelope:
+        offset, size = int(query.get("start", "0")), int(query.get("limit", "2"))
+        if fail and int(query["PARENT"]) == _FAILING_PARENT and offset == size:
+            return {"error": "ACCESS_DENIED", "error_description": "denied"}
+        envelope: Envelope = {"result": [{"ID": row} for row in range(offset, min(offset + size, 20))]}
+        if counted:
+            envelope["total"] = 20
+            if offset + size < 20:  # noqa: PLR2004 - the fixture's size
+                envelope["next"] = offset + size
+        return envelope
+
+    return answer
+
+
+def _keyset_answer(*, fail: bool) -> Answer:
+    """Serve identities 1..60 by keyset; the failing parent is refused its first command."""
+
+    def answer(_method: str, query: Query) -> Envelope:
+        if fail and int(query["PARENT"]) == _FAILING_PARENT:
+            return {"error": "ACCESS_DENIED", "error_description": "denied"}
+        rows = [
+            row
+            for row in range(1, 61)
+            if int(query.get("filter[>ID]", "0")) < row < int(query.get("filter[<ID]", "61"))
+        ]
+        rows.sort(reverse=query.get("order[ID]") == "DESC")
+        return {"result": [{"ID": row} for row in rows[: int(query.get("limit", "10"))]]}
+
+    return answer
+
+
+_INTEGER_ID = IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER)
+_PUBLISHING = {
+    "sequential": (SequentialTraversal(identity=_INTEGER_ID, page_size=2), False),
+    "counted": (CountedTraversal(page_size=2), True),
+    "fast-keyset": (
+        KeysetTraversal(
+            ResultSelector(),
+            _INTEGER_ID,
+            page_size=10,
+            keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
+            execution=AutoKeysetExecution(StableIntegerKeysetContract()),
+        ),
+        None,
+    ),
+}
+
+
+@pytest.mark.parametrize("fail", [True, False], ids=["failure", "success"])
+@pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
+@pytest.mark.parametrize("kind", list(_PUBLISHING))
+@pytest.mark.asyncio
+async def test_a_binding_stops_counting_as_a_producer_before_it_publishes_its_terminal_event(
+    monkeypatch: pytest.MonkeyPatch, kind: str, order: DeliveryOrder, *, fail: bool
+) -> None:
+    """A binding at its terminal adds no command: no wave waits for it while its terminal event is published.
+
+    Each terminal publication is held for longer than a wave waits for an event, as a publication
+    waiting for room in its queue would be: a wave that still counted the publisher would fire its timer.
+    """
+    clock = VirtualClock().install(monkeypatch)
+    states: list[_ProducerState] = []
+    counted_at_publish: list[bool] = []
+    start, put = ReferenceScheduler._start_binding, asyncio.Queue.put  # noqa: SLF001 - the seams observed
+
+    def capturing(self: ReferenceScheduler, work: _Work, admission: _AdmissionState) -> None:
+        states.append(self.producer_state)
+        start(self, work, admission)
+
+    async def stalled(queue: asyncio.Queue[object], item: object) -> None:
+        if isinstance(item, _DoneEvent | _FailureEvent):
+            counted_at_publish.append(f"r{item.work.index}" in states[-1].indexes)
+            for _turn in range(_STALLED_PUBLISH_TURNS):
+                await asyncio.sleep(0)
+        await put(queue, item)
+
+    monkeypatch.setattr(ReferenceScheduler, "_start_binding", capturing)
+    monkeypatch.setattr(asyncio.Queue, "put", stalled)
+    traversal, counted = _PUBLISHING[kind]
+    answer = _keyset_answer(fail=fail) if counted is None else _rows_answer(counted=counted, fail=fail)
+    method = "kappa.list" if counted is None else "gamma.list"
+    sources = [
+        ReferenceSource(
+            Request.bare(method, {}),
+            cast("TraversalSpec", traversal),
+            Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), parent),), parent),
+        )
+        for parent in (0, 1, 2)
+    ]
+    async with client_for(BatchPortal(answer)) as api:
+        # Fed on the event loop: a pull in a worker thread could outlast a virtual wait and fire its timer.
+        stream = api.iter_reference_source_outcomes(
+            on_loop(sources), dispatch=BatchDispatch(batch_size=10, output_order=order)
+        )
+        async with stream:
+            _events = [event async for event in stream]
+
+    assert stream.report is not None
+    assert stream.report.state is (TerminalState.COMPLETED_WITH_FAILURES if fail else TerminalState.COMPLETED)
+    assert counted_at_publish == [False] * 3
+    assert clock.timer_firings == 0
 
 
 @pytest.mark.asyncio

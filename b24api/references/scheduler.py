@@ -89,6 +89,11 @@ type _PageDispatcher = _DirectPageDispatcher | _BatchPageDispatcher
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 
+def _producer_key(index: int) -> str:
+    """Return the dispatcher's producer key of the binding admitted at ``index``."""
+    return f"r{index}"
+
+
 class ReferenceScheduler:
     """Admit bounded reference state and schedule one sequential page per reference."""
 
@@ -307,7 +312,7 @@ class ReferenceScheduler:
         try:
             while True:
                 await admission.slots.acquire()
-                self.producer_state.next_key = f"r{next_index}"
+                self.producer_state.next_key = _producer_key(next_index)
                 self.producer_state.next_index = next_index
                 self.producer_state.source_pull_in_flight = True
                 self.producer_state.touch()
@@ -329,31 +334,38 @@ class ReferenceScheduler:
                     self.producer_state.touch()
                     admission.slots.release()
                     raise
-                self.producer_state.source_pull_in_flight = False
-                self.producer_state.next_key = None
-                self.producer_state.next_index = None
-                self.producer_state.touch()
                 work = _Work(next_index, reference)
                 self.completion.admit(next_index)
                 next_index += 1
                 if reference.not_executed_reason is None:
                     self._admit_program(work)
-                queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue(maxsize=1)
-                admission.queues[work.index] = queue
-                run = (
-                    self._emit_local_non_execution(work, queue)
-                    if reference.not_executed_reason is not None
-                    else self._run_reference(work, queue)
-                )
-                admission.tasks[work.index] = asyncio.create_task(run)
-                self.active_references_high_water = max(self.active_references_high_water, len(admission.tasks))
-                admission.changed.set()
+                # The pulled binding stops counting as a pending pull in the same step it starts counting
+                # as a producer: no coalescing check sees it as neither.
+                self.producer_state.source_pull_in_flight = False
+                self.producer_state.next_key = None
+                self.producer_state.next_index = None
+                self.producer_state.touch()
+                self._start_binding(work, admission)
         finally:
             self.producer_state.source_pull_in_flight = False
             self.producer_state.next_key = None
             self.producer_state.next_index = None
             self.producer_state.touch()
             admission.changed.set()
+
+    def _start_binding(self, work: _Work, admission: _AdmissionState) -> None:
+        """Start an admitted binding's task: its local non-execution, or the run that retires its producer."""
+        queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue(maxsize=1)
+        admission.queues[work.index] = queue
+        if work.reference.not_executed_reason is not None:
+            task = asyncio.create_task(self._emit_local_non_execution(work, queue))
+        else:
+            task = asyncio.create_task(self._run_reference(work, queue))
+            # A task cancelled before it reaches its own retirement leaves its producer to this callback.
+            task.add_done_callback(functools.partial(self._retire_ended_producer, _producer_key(work.index)))
+        admission.tasks[work.index] = task
+        self.active_references_high_water = max(self.active_references_high_water, len(admission.tasks))
+        admission.changed.set()
 
     def _program(self, work: _Work) -> SourceProgram:
         program = work.reference.program or self.default_program
@@ -362,15 +374,21 @@ class ReferenceScheduler:
         return program
 
     def _admit_program(self, work: _Work) -> None:
-        """Record an admitted reference's row cap; under INPUT the frontier reserve covers every admitted cap.
+        """Record an admitted reference's row cap and register it as a producer the dispatcher counts.
 
-        Any admitted binding may become the frontier while rows behind it stay held, so the reserve
-        is the largest admitted cap, not only the current head's.
+        Under INPUT the frontier reserve covers every admitted cap: any admitted binding may become the
+        frontier while rows behind it stay held, so the reserve is the largest admitted cap, not only the
+        current head's. The binding is runnable from the moment it leaves the source, before its task first
+        runs, so a wave never closes short in between; its task retires it.
         """
         cap = self._program(work).page_cap
         self._caps[work.index] = cap
         if self.output_order is ReferenceOutputOrder.INPUT:
             self.buffer.raise_head_reserve(cap)
+        key = _producer_key(work.index)
+        self.producer_state.runnable.add(key)
+        self.producer_state.indexes[key] = work.index
+        self.producer_state.caps[key] = cap
 
     def _head_cap(self, index: int) -> int:
         return self._caps.get(index, self.page_cap if self.default_program is not None else 0)
@@ -378,11 +396,7 @@ class ReferenceScheduler:
     async def _run_reference(self, work: _Work, output: asyncio.Queue[_Event]) -> None:
         """Own one reference transaction from its first page to its terminal event."""
         program = self._program(work)
-        run = _ReferenceRun(work, output, self.completion.binding(work.index), f"r{work.index}", program)
-        self.producer_state.runnable.add(run.producer_key)
-        self.producer_state.indexes[run.producer_key] = work.index
-        self.producer_state.caps[run.producer_key] = program.page_cap
-        self.producer_state.touch()
+        run = _ReferenceRun(work, output, self.completion.binding(work.index), _producer_key(work.index), program)
         await asyncio.sleep(0)
         pages = None if program.fast is not None else self._driven_pages(run)
         try:
@@ -394,9 +408,9 @@ class ReferenceScheduler:
             raise
         except _BatchPageError as error:
             failure = self._failure_event(run, cast("BaseException", error.failure.error))
-            await output.put(replace(failure, replay_disposition=error.failure.replay_disposition))
+            await self.publish_terminal(run, replace(failure, replay_disposition=error.failure.replay_disposition))
         except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
-            await output.put(self._failure_event(run, error))
+            await self.publish_terminal(run, self._failure_event(run, error))
         finally:
             try:
                 if pages is not None:
@@ -440,13 +454,14 @@ class ReferenceScheduler:
             primary_error = error
             raise
         finally:
-            # Cleanup comes before the terminal event: a stopped binding must not keep advertising
-            # pages to the dispatcher while that event waits for room in the output queue.
+            # Cleanup comes before the terminal event: the pages a stopped binding abandons are cancelled
+            # before it stops counting as a producer, so no wave leaves with them meanwhile.
             run.deferred_cleanup_error = await _close_pages(pages, primary_error)
         if run.reservation is not None:
             await self.buffer.abort(run.reservation)
             run.reservation = None
-        await run.output.put(
+        await self.publish_terminal(
+            run,
             _DoneEvent(
                 run.work,
                 run.partial_rows,
@@ -460,18 +475,24 @@ class ReferenceScheduler:
             ),
         )
 
+    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent) -> None:
+        """Publish the binding's terminal event once it has cleaned up; it adds no command any more.
+
+        It stops counting as a producer first, so no wave waits for it while the event waits for room.
+        """
+        self.producer_state.retire(run.producer_key)
+        await run.output.put(event)
+
     def _retire_producer(self, run: _ReferenceRun) -> None:
         """Release the run's dispatcher waits, remove it from the advisory producer state and close its page ledger."""
         run.admit_page()
         run.settle_page()
         self.context.close_reference(run.producer_key)
-        self.producer_state.runnable.discard(run.producer_key)
-        self.producer_state.admitting.discard(run.producer_key)
-        self.producer_state.pending_continuations.discard(run.producer_key)
-        self.producer_state.pending_refills.pop(run.producer_key, None)
-        self.producer_state.indexes.pop(run.producer_key, None)
-        self.producer_state.caps.pop(run.producer_key, None)
-        self.producer_state.touch()
+        self.producer_state.retire(run.producer_key)
+
+    def _retire_ended_producer(self, key: str, _task: asyncio.Task[None]) -> None:
+        """Retire a producer registered at its pull whose task ended without retiring it."""
+        self.producer_state.retire(key)
 
     @property
     def batch_dispatcher(self) -> _BatchPageDispatcher:

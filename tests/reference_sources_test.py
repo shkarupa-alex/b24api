@@ -275,13 +275,58 @@ async def test_a28_late_pages_wait_for_a_counted_tail_on_its_way_to_the_queue(
     assert portal.methods[1].count("beta.list") == 3  # noqa: PLR2004
 
 
+@pytest.mark.asyncio
+async def test_a28_a_binding_just_pulled_from_the_source_keeps_its_wave_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A binding counts as potential from the moment it leaves the source, not only once its task first runs.
+
+    With every activation slot taken, the producer waits for one right after the last pull: the binding
+    is no pending pull any more, and its task has not run yet. The first wave still carries every binding.
+    """
+    clock = VirtualClock().install(monkeypatch)
+    portal = BatchPortal(_answer)
+    async with _client(portal) as api:
+        _events, report = await _collect(
+            api,
+            on_loop([_beta(parent) for parent in (1, 2, 3)]),
+            dispatch=BatchDispatch(batch_size=3),
+            policy=ExecutionPolicy(max_active_references=3),
+        )
+
+    assert report.state is TerminalState.COMPLETED
+    assert portal.waves == [3, 3]
+    assert clock.timer_firings == 0
+
+
+@pytest.mark.asyncio
+async def test_a28_a_binding_refused_at_its_pull_never_holds_a_wave_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A local non-execution is never a producer: the waves of its neighbours leave without waiting for it."""
+    clock = VirtualClock().install(monkeypatch)
+    portal = BatchPortal(_answer)
+    refused = ReferenceSource(
+        Request.bare("beta.list", {}, ReplaySafety.SAFE), BETA, Binding("seeded", (), 5, start_cursor=3)
+    )
+    async with _client(portal) as api:
+        events, report = await _collect(
+            api,
+            on_loop([_beta(1), refused, _beta(3)]),
+            dispatch=BatchDispatch(batch_size=3),
+            policy=ExecutionPolicy(max_active_references=3),
+        )
+
+    assert [event.binding_index for event in events if isinstance(event, ReferenceNotExecuted)] == [1]
+    assert report.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert portal.waves == [2, 2]
+    assert clock.timer_firings == 0
+
+
 # The counted fixture's tail is 20 pages: one window of 10, then 10 pages its consumer frees one by one.
 _TAIL_WAVES = {
     (DeliveryOrder.READY, 1): [1, 10, 10],
     (DeliveryOrder.INPUT, 1): [1, 10, 10],
     (DeliveryOrder.READY, 3): [3, 10, 10, 10, 10, 10, 10],
-    # Under INPUT a later binding's head waits behind the frontier; every tail still leaves in full batches.
-    (DeliveryOrder.INPUT, 3): [1, 1, 1, 10, 10, 10, 10, 10, 10],
+    # Under INPUT a pull in flight is not waited for, so the first head leaves alone; the next head
+    # leaves with the one already pulled. Every tail still leaves in full batches.
+    (DeliveryOrder.INPUT, 3): [1, 2, 10, 10, 10, 10, 10, 10],
 }
 
 

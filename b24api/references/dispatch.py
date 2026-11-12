@@ -223,6 +223,20 @@ class _ProducerState:
             if not waiter.done():
                 waiter.set_result(None)
 
+    def retire(self, key: str) -> None:
+        """Stop counting a producer that adds no further command: it publishes its terminal, or its task ended.
+
+        Only a producer with an index counts, so a mark left behind by a retired producer never counts.
+        """
+        registered = self.indexes.pop(key, None) is not None
+        self.runnable.discard(key)
+        self.admitting.discard(key)
+        self.pending_continuations.discard(key)
+        self.pending_refills.pop(key, None)
+        self.caps.pop(key, None)
+        if registered:
+            self.touch()
+
     def depart(self, key: str, *, page_reserved: bool) -> _Transit:
         """Count one page on its way to the queue until ``fetch`` queues it or its task ends."""
         (self.in_transit if page_reserved else self.reserving)[key] += 1

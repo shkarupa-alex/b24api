@@ -61,6 +61,10 @@ class FastKeysetHost(WaveHost, Protocol):
         """Fix the planned binding's lease at ``rows``, giving the rest back to the shared pool."""
         ...
 
+    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent) -> None:
+        """Publish the binding's terminal event; it stops counting as a producer first."""
+        ...
+
 
 async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKeysetProgram) -> None:
     """Run one binding to its terminal event; the lease is returned exactly once."""
@@ -112,7 +116,8 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
         ledger.close(successful=True, reason=KernelState.COMPLETED.value, unsettled=CommandSettlement.NOT_EXECUTED)
         closure = _witnessed(closure, ledger)
         report = runtime.report_fragment()
-        await run.output.put(
+        await host.publish_terminal(
+            run,
             _DoneEvent(
                 run.work,
                 run.partial_rows,
@@ -185,7 +190,8 @@ async def _deliver(
     await acknowledged
     run.partial_rows += len(rows)
     state.pending_continuations.discard(key)
-    state.runnable.add(key)
+    if continuing:
+        state.runnable.add(key)
     state.touch()
 
 
