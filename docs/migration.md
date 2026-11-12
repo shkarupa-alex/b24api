@@ -1,5 +1,31 @@
 # Migration guide
 
+## Compressed bodies are decoded whole
+
+- **A compressed body cut short is a body read failure.** A `gzip` or `deflate` body (zlib-wrapped
+  or raw) that ends before the end of its compressed stream, its gzip CRC-32 and size or its zlib
+  Adler-32 included, was accepted as the prefix decoded so far, as HTTPX accepts it: `call_bytes()`
+  returned a short body as a success, and `binary_digest` then hashed that prefix. It is now the
+  transport failure every undecodable body already raises, `TransportError` "Transport failed while
+  reading the response body" with phase `body_partially_received`: retried for `SAFE` requests, and
+  `AmbiguousExecutionError` for `UNSAFE` and `UNKNOWN` requests. `gzip.decompress()` and
+  `zlib.decompress()` refuse the same bytes.
+- **Every gzip member is decoded.** A `gzip` body of several members returned only its first member
+  as a success, as HTTPX returns it. Every member is now decoded, under one byte ceiling for them
+  all, as `gzip.decompress()` decodes them. Zero bytes after a member are skipped as padding; any
+  other byte must start a whole member, so bytes after a gzip stream that were dropped before are now
+  the body read failure above, as `gzip.decompress()` refuses them.
+- **Unchanged.** A body without a single byte under a compression coding (an empty `200` or `204`
+  that still carries `Content-Encoding: gzip`) stays an empty body, as HTTPX reads it. Bytes after the
+  end of a complete zlib or raw `deflate` stream are still dropped.
+- **Not checked: a body read inside an injected HTTPX client.** When the client's transport returns a
+  response it has already read (`httpx.Response(content=...)` in a `MockTransport`), or a response
+  event hook reads the body (`await response.aread()`), HTTPX has decoded it: without checking the end
+  of a compressed stream, and keeping only the first gzip member. The raw bytes are not reachable
+  through HTTPX's public API, so `HttpxTransport` accepts such a body as HTTPX decoded it, within the
+  byte ceiling. A transport that returns the raw bytes unread (`httpx.Response(..., stream=...)`, as
+  HTTPX's own transports do) and hooks that leave the body unread get every check above.
+
 ## Transport hygiene: webhook URLs, unsendable requests, error chains
 
 - **One rule for webhook URLs, in `Settings` and `HttpxTransport` alike.** Both parse a webhook with
@@ -548,7 +574,8 @@ details.
      in its body: that exception propagates and the cancellation is raised at the next `await`.
 
 8. **Compressed responses.** Only identity, `gzip` and `deflate` bodies are decoded; `br`, `zstd`,
-   stacked and unknown codings are refused as a transport failure. Library-owned requests send
+   stacked and unknown codings are refused as a transport failure, and so is a compressed body that
+   ends before the end of its stream. Library-owned requests send
    `Accept-Encoding: gzip, deflate`. If you inject an HTTPX client that asks for `br` or `zstd`,
    remove that header.
 9. **Batch replay is decided per command.** A failed physical batch is not retried or abandoned as

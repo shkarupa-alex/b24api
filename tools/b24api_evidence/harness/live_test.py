@@ -622,6 +622,22 @@ def test_live_deflate_fed_one_byte_at_a_time_decodes_once(wbits: int) -> None:
     assert _bounded_response_payload(response, method="scope") == payload
 
 
+def test_live_gzip_cut_before_its_trailer_is_a_decoding_failure() -> None:
+    encoded = gzip.compress(json.dumps({"result": ["x" * 1024]}).encode())
+    response = httpx.Response(200, headers={"content-encoding": "gzip"}, stream=_RawSyncStream(encoded[:-8]))
+
+    with pytest.raises(LiveCorrectnessError, match="decoding failed"):
+        _bounded_response_payload(response, method="scope")
+
+
+def test_live_multi_member_gzip_is_decoded_whole() -> None:
+    payload = json.dumps({"result": ["x" * 1024]}).encode()
+    encoded = gzip.compress(payload[:10]) + gzip.compress(payload[10:])
+    response = httpx.Response(200, headers={"content-encoding": "gzip"}, stream=_RawSyncStream(encoded))
+
+    assert _bounded_response_payload(response, method="scope") == payload
+
+
 @pytest.mark.parametrize("coding", ["br", "zstd", "unknown"])
 def test_live_unbounded_codings_are_refused_as_decoding_failures(coding: str) -> None:
     stream = _RawSyncStream(b"opaque")
