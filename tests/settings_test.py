@@ -16,7 +16,7 @@ from b24api import Bitrix24, DirectDispatch, ExecutionPolicy, ReplaySafety, Requ
 from b24api.contracts import Command
 from b24api.settings import api_settings
 from b24api.transport import WireResponse
-from tests.scripting import HANG_BOUND, ResponderTransport
+from tests.scripting import ResponderTransport, on_loop, reached
 
 _WEBHOOK = "https://bitrix24.com/rest/0/test/"
 _TIMEOUT = 17.5
@@ -203,15 +203,16 @@ _DEFAULT_CONCURRENT_REQUESTS = 10
 _WIDE = 40
 
 
-async def _settled(transport: ResponderTransport) -> int:
-    """Return the sends once their count stops growing; each blocks until released, so all are in flight."""
-    async with asyncio.timeout(HANG_BOUND):
-        seen = -1
-        while seen != len(transport.requests):
-            seen = len(transport.requests)
-            for _ in range(20):
-                await asyncio.sleep(0)
-    return seen
+async def _settled(transport: ResponderTransport, full: asyncio.Event) -> int:
+    """Return the sends in flight once the expected peak is reached and the loop has had room to exceed it.
+
+    Every send blocks until released and the input is fed on the loop, so after ``full`` no further send can
+    start except through a limit that admits more than the peak; the extra turns of the loop give it that room.
+    """
+    await reached(full)
+    for _ in range(50):
+        await asyncio.sleep(0)
+    return len(transport.requests)
 
 
 @pytest.mark.asyncio
@@ -237,8 +238,11 @@ async def test_effective_concurrency_is_the_smallest_of_the_client_and_operation
     # The client's limit used to be a fixed 10 that no setting raised: DirectDispatch(concurrency=40) under
     # max_direct_concurrency=40 still peaked at 10.
     release = asyncio.Event()
+    full = asyncio.Event()
 
     async def respond(_request: Request) -> object:
+        if len(transport.requests) >= peak:
+            full.set()
         await release.wait()
         return {"result": 1}
 
@@ -253,7 +257,7 @@ async def test_effective_concurrency_is_the_smallest_of_the_client_and_operation
 
     async with client:
         stream = client.fan_out_outcomes(
-            commands,
+            on_loop(commands),
             dispatch=DirectDispatch(concurrency=dispatch),
             policy=ExecutionPolicy(max_direct_concurrency=policy),
         )
@@ -263,7 +267,7 @@ async def test_effective_concurrency_is_the_smallest_of_the_client_and_operation
                 return len([outcome async for outcome in stream])
 
         drained = asyncio.create_task(drain())
-        in_flight = await _settled(transport)
+        in_flight = await _settled(transport, full)
         release.set()
         assert await drained == len(commands)
 
