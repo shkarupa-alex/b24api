@@ -75,6 +75,22 @@ harness-produced observations for that portal cell, not general latency promises
   sequential, range, or partitioned execution under the caller-asserted stable integer-keyset
   contract. It pays a planning barrier even when the consumer stops early; pass
   `SequentialKeysetExecution()` explicitly to retain request-by-request traversal.
+- Auto partitioning probes `target_lanes` anchors, or up to twice the batch capacity so a full wave
+  of lanes keeps its rows in `max_buffered_rows`. Finer lanes spend more logical pages, so Auto takes
+  them only while what is left of `max_pages` and `max_requests` covers the `target_lanes` plan's
+  estimate plus the extra pages the estimate assumes (one per extra probe, one or two end pages per
+  extra lane), and the finer plan's own estimate. Two waves of probes bound the gain: 100,000 dense
+  rows at page 50 still take 1,224 requests, against 45 for explicit range traversal. When a group
+  of lanes still outgrows the buffer, the request estimate is optimistic. Auto refuses a range or
+  partitioned plan when its minimum cost (a page per window, probe or lane, never extrapolated rows)
+  exceeds the budget left, and then takes the other fast plan if it fits and pays off (range
+  traversal, also after the anchor probes), or traverses sequentially.
+- Auto's choices rest on estimates extrapolated from the boundary pages. Under a `max_pages` or
+  `max_requests` set close to the need, it can end with `IncompleteTraversalError` on the exhausted
+  budget where a different choice would have fitted (631 of 44,682 tight-budget points, against
+  4,065 that failed before and now finish; no point of the measured grid at the default budgets, which
+  are budgets like any other for a selection whose need comes close to them). For a predictable need
+  under a tight budget, pass `SequentialKeysetExecution()` or `RangeKeysetExecution` explicitly.
 - A returned `total` is advisory only and may raise an auto cost estimate. It never closes a lane or
   strengthens correctness evidence. Normal range/partition reports use caller-asserted bounds
   (`assurance_source=CALLER_ASSERTED_BOUNDS`); explicit verification is a separate operation,

@@ -96,6 +96,7 @@ class AnchorResult:
     empty_probes: int
     raw_rows: int
     discarded_rows: int
+    empty_below: tuple[tuple[int, int], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,13 +208,21 @@ def normalize_anchor_receipts(
     *,
     lo: int,
     upper_exclusive: int,
+    guesses: dict[str, int],
 ) -> AnchorResult:
-    """Normalize probe receipts into retained anchor values and provenance."""
+    """Normalize probe receipts into retained anchor values, provenance and the gaps they reveal.
+
+    A probe returns the first identity above its guess, or nothing below ``upper_exclusive``: no
+    identity lies between the guess and that fence, which ``empty_below`` keeps per fence.
+    """
     anchors: list[int] = []
     rows: dict[int, FrozenJson] = {}
     commands: dict[int, str] = {}
+    empty_below: dict[int, int] = {}
     empty = discarded = 0
     for receipt in receipts:
+        fence = receipt.identities[0] if receipt.rows else upper_exclusive
+        empty_below[fence] = min(empty_below.get(fence, fence), guesses[receipt.command_id])
         if not receipt.rows:
             empty += 1
             continue
@@ -230,6 +239,7 @@ def normalize_anchor_receipts(
         empty,
         sum(len(receipt.rows) for receipt in receipts),
         discarded + len(anchors) - len(normalized),
+        tuple(sorted(empty_below.items())),
     )
 
 

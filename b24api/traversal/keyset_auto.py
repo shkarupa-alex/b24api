@@ -4,12 +4,25 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from b24api.contracts.keyset_execution import (
     KeysetExecutionKind,
     KeysetSelectionReason,
 )
-from b24api.traversal.keyset_geometry import BoundaryFacts, CostEstimate, SelectorInputs, ceil_div, estimates
+from b24api.traversal.keyset_geometry import (
+    BoundaryFacts,
+    CostEstimate,
+    SelectorInputs,
+    ceil_div,
+    estimates,
+    lane_overhead,
+    partition_estimate,
+    sequential_estimate,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 SEQ_FLOOR_REQUESTS = 3
 FAST_GAIN_NUM = 3
@@ -38,6 +51,7 @@ class Preselection:
     sequential_estimate: CostEstimate
     range_estimate: CostEstimate | None
     partition_estimate: CostEstimate | None
+    anchor_probes: int
     interior_span: int = 0
     density_numerator: int = 0
     density_denominator: int = 1
@@ -45,10 +59,15 @@ class Preselection:
 
 @dataclass(frozen=True, slots=True)
 class AnchorFacts:
-    """Normalized occupied-anchor probe observations."""
+    """Normalized occupied-anchor probe observations.
+
+    ``empty_below`` pairs a fence (an anchor, or the tail boundary) with the lowest probe guess that
+    reached it: a probe returns the first identity above its guess, so none lies between the two.
+    """
 
     anchors: tuple[int, ...]
     empty_probes: int
+    empty_below: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +108,7 @@ def preselect(inputs: SelectorInputs) -> Preselection:  # noqa: PLR0911
             sequential,
             range_estimate,
             partition_estimate,
+            partition_estimate.probes,
             span,
             numerator,
             denominator,
@@ -138,48 +158,63 @@ def constrain_anchor_preselection(selection: Preselection, *, anchor_capacity: i
 
 
 def finalize(inputs: SelectorInputs, preselection: Preselection, anchors: AnchorFacts) -> FinalSelection:
-    """Select a final plan after occupied-anchor observations."""
+    """Select a final plan after occupied-anchor observations.
+
+    Probes that found identity ranges empty can make partitioning pay off where the lanes at boundary
+    density did not. That switch from sequential traversal is taken only while the pages left cover
+    the estimate of sequential traversal plus every lane's end pages and the finish page, and the
+    partitioned plan's own estimate. Both extrapolate the boundary density, so a budget sized for
+    sequential traversal can still fail the partitioned plan where the interior is denser than the
+    boundary pages. Likewise the switch spends fewer requests than sequential traversal only by
+    estimate; the requests it really sends follow the rows the lanes hold.
+    """
     if preselection.plan is not Preselected.PROBE_ANCHORS:
         raise ValueError("finalize requires an anchor-probe preselection")
     boundary = inputs.boundary
     if boundary.head_max is None or boundary.tail_min is None:
         raise ValueError("anchor finalization requires non-empty boundary facts")
-    fences = (boundary.head_max, *anchors.anchors, boundary.tail_min)
-    spans = tuple(max(0, right - left - 1) for left, right in itertools.pairwise(fences))
-    lane_count = max(1, len(anchors.anchors) + 1)
-    rows = tuple(ceil_div(span * preselection.density_numerator, preselection.density_denominator) for span in spans)
-    depth = max(1, *(ceil_div(value, inputs.effective_page_cap) for value in rows))
-    part_remaining = ceil_div(lane_count, inputs.batch_capacity) * depth + FINISH_REQUESTS
-    part = CostEstimate(
-        KeysetExecutionKind.PARTITIONED,
-        part_remaining,
-        eligible=True,
-        lane_count=lane_count,
-        depth=depth,
-        groups=ceil_div(lane_count, inputs.batch_capacity),
-    )
-    sequential_requests = preselection.sequential_estimate.requests
-    if FAST_GAIN_DEN * part_remaining <= FAST_GAIN_NUM * sequential_requests:
+    gaps = tuple(itertools.pairwise((boundary.head_max, *anchors.anchors, boundary.tail_min)))
+    empty_below = dict(anchors.empty_below)
+    lane_count = len(anchors.anchors) + 1
+    sequential = preselection.sequential_estimate
+
+    def rows(spans: Iterable[int]) -> tuple[int, ...]:
+        numerator, denominator = preselection.density_numerator, preselection.density_denominator
+        return tuple(ceil_div(span * numerator, denominator) for span in spans)
+
+    def lanes_of(lane_rows: tuple[int, ...]) -> CostEstimate:
+        return inputs.admit(
+            partition_estimate(
+                inputs,
+                lanes=lane_count,
+                lane_rows=max(lane_rows),
+                probes=0,
+                finish_requests=FINISH_REQUESTS,
+            ),
+        )
+
+    def gains(estimate: CostEstimate) -> bool:
+        return estimate.eligible and FAST_GAIN_DEN * estimate.requests <= FAST_GAIN_NUM * sequential.requests
+
+    probed_rows = rows(max(0, max(left, empty_below.get(right, right - 1)) - left) for left, right in gaps)
+    part = lanes_of(probed_rows)
+    # Sequential traversal of the boundary rows, the anchors and the rows the probes left.
+    boundary_rows = preselection.total_rows_estimate - preselection.interior_rows_estimate
+    probed_all_rows = boundary_rows + len(anchors.anchors) + sum(probed_rows)
+    probed_sequential = sequential_estimate(inputs, probed_all_rows, finish_requests=FINISH_REQUESTS)
+    switch_pages = probed_sequential.pages + lane_overhead(inputs, probes=0, lanes=lane_count)[1] + FINISH_REQUESTS
+    at_boundary_density = lanes_of(rows(max(0, right - left - 1) for left, right in gaps))
+    if gains(part) and (gains(at_boundary_density) or inputs.fits(pages=max(switch_pages, part.pages))):
         reason = (
             KeysetSelectionReason.DEGENERATE_SINGLE_LANE
             if not anchors.anchors
             else KeysetSelectionReason.WIDE_SPAN_PARTITIONING
         )
-        return FinalSelection(KeysetExecutionKind.PARTITIONED, reason, lane_count, depth, part)
+        return FinalSelection(KeysetExecutionKind.PARTITIONED, reason, lane_count, part.depth or 1, part)
     range_estimate = preselection.range_estimate
     if range_estimate is not None and range_estimate.eligible:
-        remaining = (range_estimate.groups or 0) * (range_estimate.depth or 1) + FINISH_REQUESTS
-        if FAST_GAIN_DEN * remaining <= FAST_GAIN_NUM * sequential_requests:
-            estimate = CostEstimate(
-                KeysetExecutionKind.RANGE,
-                remaining,
-                eligible=True,
-                window_width=range_estimate.window_width,
-                window_count=range_estimate.window_count,
-                depth=range_estimate.depth,
-                rows_per_window=range_estimate.rows_per_window,
-                groups=range_estimate.groups,
-            )
+        estimate = inputs.admit(range_estimate)
+        if gains(estimate):
             return FinalSelection(
                 KeysetExecutionKind.RANGE,
                 KeysetSelectionReason.POST_PROBE_RANGE_PREFERRED,
@@ -192,7 +227,7 @@ def finalize(inputs: SelectorInputs, preselection: Preselection, anchors: Anchor
         KeysetSelectionReason.POST_PROBE_GAIN_LOST,
         0,
         1,
-        preselection.sequential_estimate,
+        sequential,
     )
 
 
