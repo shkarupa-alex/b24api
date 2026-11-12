@@ -1,5 +1,102 @@
 # Migration guide
 
+## Unknown outcomes follow what was sent
+
+Public signatures are unchanged. Whether a sent command may have run is now one fact, recorded by the
+executor and the batch dialects from the command's sends, and `batch_outcomes()`, `batch()`,
+`fan_out_outcomes()`, `fan_out()` and `iter_reference_outcomes()` derive the outcome from it, whatever
+the exception type. A command that was sent, was not refused, and got no conclusive answer arrives as
+`CommandOutcomeUnknown` (`ReferenceOutcomeUnknown` for a reference): its `AmbiguousExecutionError`
+never lets it be sent again, and its `__cause__` is the original failure. This holds for `SAFE`
+commands too: a direct fan-out command or a direct reference whose sends were lost until the budget ran
+out is unknown, no longer a failure with `BudgetExceededError`. A structured Bitrix error stays a
+conclusive `CommandFailure` or `ReferenceFailure`, unless an earlier send of the same command may have
+run. Then the outcome is unknown, and its reason and cause chain name that earlier send. For example, a
+`SAFE` command whose first send lost its connection and whose retry was refused with `ACCESS_DENIED` is
+now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that reaches the
+`TransportError`, whichever answer refused the retry:
+
+- classic batch: the retried envelope answered 403, or it refused the command in `result_error`;
+- a classic batch replay round: a `SAFE` command of a mixed batch, replayed after its first round was
+  lost and then refused by the replay's envelope or in its `result_error`, is unknown like the
+  `UNSAFE` command of the lost round;
+- REST v3 batch: the retried envelope answered, and its element is the refusal the command's
+  `ResultErrorSpec` finds; or isolation, where a `SAFE` command sent alone after an envelope that may
+  have run (an abort, a malformed or a lost answer) is refused. When the budget leaves no isolated send,
+  the reason and evidence are the envelope's, no longer `DEADLINE_AFTER_DISPATCH`. An isolated success
+  is still returned;
+- direct fan-out, and `iter_reference_outcomes()` with direct or batch dispatch. A batch reference
+  whose lost envelope was answered 403 on retry was already unknown, but with reason
+  `HTTP_STATUS_AFTER_DISPATCH`.
+
+- **A success body that cannot be decoded is unknown.** A 2xx answer to a sent request whose body
+  is not a Bitrix envelope (`{}`, truncated JSON or a non-finite number, for example) was a
+  `CommandFailure` carrying `EnvelopeContractError` or `ProtocolError` in classic batch and
+  direct fan-out, and a `ReferenceFailure` in `iter_reference_outcomes()` with direct or batch
+  dispatch. It is now unknown with reason `HTTP_STATUS_AFTER_DISPATCH` and that error as its cause, as
+  REST v3 batch already reported it. `call()` still raises the `EnvelopeContractError` or
+  `ProtocolError` itself.
+- **A command answer that cannot be decoded is unknown.** Malformed paging metadata of a classic
+  batch command (a `result_total` that is not an integer, for example) and an embedded error that
+  the command's `ResultErrorSpec` finds malformed were a `CommandFailure` with `ProtocolError` in
+  classic batch, REST v3 batch and direct fan-out (with `EnvelopeContractError`, for malformed
+  metadata in direct fan-out). They are now `CommandOutcomeUnknown` with reason
+  `HTTP_STATUS_AFTER_DISPATCH` and that error as its cause on every path.
+- **A classic batch command without exactly one entry is unknown.** A key in both `result` and
+  `result_error` used to be read as its error, so a `QUERY_LIMIT_EXCEEDED` there made an `UNSAFE`
+  command run again. A command missing from both maps was a `CommandFailure` with `ProtocolError`.
+  Neither answer says whether the command ran, so both are now `CommandOutcomeUnknown` and are never
+  sent again.
+- **`HALTED` only where the command was proven not sent or the server halted before it.** A
+  fail-fast `batch()` reports `CommandNotExecuted` with `NotExecutedReason.HALTED` for a command of a
+  later envelope that fail-fast did not send, of a window refused before dispatch, or one that has no
+  entry and comes after a command the server answered in `result_error`. A command the server halted
+  before is unknown instead when an earlier round of the same batch may have run it. A failure found in a
+  returned result by the command's own `ResultErrorSpec` does not halt the server, so a later command
+  whose result came back keeps its own outcome; before, a later `ProtocolError` was reported `HALTED`.
+- **The operation deadline bounds admission, not the send.** The operation deadline of
+  `fan_out_outcomes()` and `iter_reference_outcomes()`, with direct or batch dispatch, ended a send
+  that was already in flight and reported a failure with `BudgetExceededError`. The executor's own
+  budgets now end that send, and the command or reference arrives as unknown with reason
+  `DEADLINE_AFTER_DISPATCH` and a cause chain that reaches the `TransportError` of the cut send, as
+  `batch_outcomes()` reports it; `call()` raises that ambiguity for an `UNSAFE` or `UNKNOWN`
+  request.
+- **`fan_out_outcomes()` keeps the replay disposition.** Its `CommandFailure` and
+  `CommandOutcomeUnknown` carried `NOT_ELIGIBLE` whatever the evidence. They now carry the
+  disposition that `batch_outcomes()` gives the same answer: a quota refusal in a `BatchDispatch`
+  fan-out is `ELIGIBLE`.
+- **An answer that arrives after the time budget is kept.** A success that arrived after the retry
+  or operation time budget was replaced by `BudgetExceededError("transport completed after execution
+  time budget")`: `call()` raised it, and a batch reported the command unknown. The success is now
+  returned. A failure that arrives late meets the usual rules first. For example, a late 502 to an
+  `UNSAFE` request raises `AmbiguousExecutionError`, and a late non-retryable error raises itself. The
+  budget stops only the retry that such a failure would allow.
+- **Fast keyset waves.** A wave whose physical batch answer cannot be decoded records its pages as
+  `PageOutcome.UNKNOWN` with `PageRejectionCode.BATCH_ENVELOPE`, and the traversal raises the
+  `AmbiguousExecutionError`, whose cause is the protocol failure. Before, the pages were `REJECTED`
+  and the traversal raised `IncompleteTraversalError`. A wave command missing from the answer is
+  `UNKNOWN` with `AMBIGUOUS_EXECUTION`.
+- **Settlement agrees with the outcome.** A fan-out, reference or list page whose sends were all refused
+  (for example 429 until the attempt budget ran out), or that the server answered conclusively
+  (`ACCESS_DENIED`, for example), now settles as a failure, not as unknown. A page of a counted
+  traversal's batch tail settles the same way: unknown when its batch may have run, a failure when it
+  was answered conclusively; before, every failed tail page settled as a failure. A `SAFE` batch command
+  whose every send the server answered with its own structured error until the budget ran out is a
+  `CommandFailure`, not unknown. A command that was never sent settles as not executed even when it is
+  reported as a `CommandFailure`: in `batch_outcomes()`, a command refused with `CapabilityError` before
+  dispatch settled as a failure.
+- **A failed page is traced the way it settles.** In the report of a fan-out, a reference or a list
+  traversal, a page whose command failed is `PageOutcome.UNKNOWN` only when it may have run, with
+  `PageRejectionCode.AMBIGUOUS_EXECUTION`, or `BATCH_ENVELOPE` when the answer of its physical batch
+  cannot be decoded. A page refused conclusively (`ACCESS_DENIED`, for example) is `REJECTED` with
+  `COMMAND_FAILURE`, as fast keyset waves record it. Before, every such page was `UNKNOWN`, and its code
+  was `COMMAND_FAILURE` unless the failure was an `AmbiguousExecutionError`, so a page of a sequential
+  or counted traversal that lost its answer was `COMMAND_FAILURE` too.
+- **An abandoned batch page is not sent.** A reference page fetched with `BatchDispatch` whose fetch was
+  cancelled, or whose admission deadline passed, while its wave was being assembled was still sent with
+  that wave and its answer discarded. Its wave now leaves without it, and a wave left with no page is
+  not sent at all.
+
 ## Closing a stream from inside its own pull or cleanup
 
 - **Breaking: caller code a stream runs can no longer close that stream or its client.**

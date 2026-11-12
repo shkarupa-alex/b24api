@@ -17,6 +17,7 @@ from b24api.batch.outcome import (
 )
 from b24api.batch.stream import _BatchOutcomeStream, batch_outcome_stream
 from b24api.contracts.policy import (
+    AmbiguityReason,
     ConsistencyPolicy,
     ExecutionPolicy,
     KernelState,
@@ -26,6 +27,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.errors import (
+    AmbiguousExecutionError,
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
@@ -66,13 +68,22 @@ def _wire_batch(
     omit_result_keys: frozenset[str] = frozenset(),
     empty_results: bool = False,
 ) -> WireResponse:
-    batch_result: dict[str, object] = {
-        "result": [] if empty_results else {key: {"key": key} for key in keys if key not in omit_result_keys},
-    }
+    # Bitrix answers a command with a result or an error entry, never both.
+    failed = frozenset(errors) if isinstance(errors, dict) else frozenset()
+    answered = (key for key in keys if key not in omit_result_keys | failed)
+    batch_result: dict[str, object] = {"result": [] if empty_results else {key: {"key": key} for key in answered}}
     if not omit_error_key:
         batch_result["result_error"] = [] if errors is None else errors
     body = json.dumps({"result": batch_result}).encode()
     return WireResponse(status_code=200, headers=(("content-type", "application/json"),), body=body)
+
+
+def _possibly_executed_cause(outcome: BatchOutcome) -> BaseException | None:
+    """Return the failure behind an outcome reported as possibly executed: an undecodable answer to a sent batch."""
+    assert isinstance(outcome, BatchFailure)
+    assert isinstance(outcome.error, AmbiguousExecutionError)
+    assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+    return outcome.error.__cause__
 
 
 def _echo_batch(request: Request) -> WireResponse:
@@ -313,8 +324,7 @@ async def test_primary_batch_failure_survives_secondary_source_cleanup_failure()
 
     stream = batch_outcome_stream(BatchExecutor(Executor(ResponderTransport(malformed))), source(), batch_size=1)
     outcome = await anext(stream)
-    assert isinstance(outcome, BatchFailure)
-    assert isinstance(outcome.error, ProtocolError)
+    assert isinstance(_possibly_executed_cause(outcome), ProtocolError)
 
     with pytest.raises(RuntimeError, match="batch source close boom"):
         await stream.aclose()
@@ -736,8 +746,7 @@ async def test_php_empty_error_array_is_valid_but_missing_or_nonempty_array_is_m
         [Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)],
     )
     missing_outcome = await anext(missing_stream)
-    assert isinstance(missing_outcome, BatchFailure)
-    assert isinstance(missing_outcome.error, ProtocolError)
+    assert isinstance(_possibly_executed_cause(missing_outcome), ProtocolError)
 
     def malformed(request: Request) -> WireResponse:
         return _wire_batch(_batch_keys(request), errors=[{"error": "bad"}])
@@ -747,8 +756,7 @@ async def test_php_empty_error_array_is_valid_but_missing_or_nonempty_array_is_m
         [Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)],
     )
     malformed_outcome = await anext(malformed_stream)
-    assert isinstance(malformed_outcome, BatchFailure)
-    assert isinstance(malformed_outcome.error, ProtocolError)
+    assert isinstance(_possibly_executed_cause(malformed_outcome), ProtocolError)
 
 
 @pytest.mark.asyncio
@@ -822,8 +830,8 @@ async def test_tolerant_per_command_error_and_missing_result_each_get_one_outcom
     assert command_error.evidence is not None
     assert command_error.evidence.original_code == "denied"
     assert command_error.evidence.normalized_code == "denied"
-    assert isinstance(missing_error, BatchFailure)
-    assert isinstance(missing_error.error, ProtocolError)
+    # Nothing answers for the missing command, which was sent: it may have run.
+    assert isinstance(_possibly_executed_cause(missing_error), ProtocolError)
     assert [outcome.command_index for outcome in outcomes] == [0, 1, 2]
 
 
@@ -862,9 +870,9 @@ async def test_overflowed_batch_result_becomes_totally_correlated_protocol_failu
     outcomes = cast("list[BatchOutcome]", [outcome async for outcome in stream])
 
     assert len(outcomes) == 1
-    assert isinstance(outcomes[0], BatchFailure)
-    assert isinstance(outcomes[0].error, ProtocolError)
-    assert outcomes[0].error.http_status == HTTP_OK
+    cause = _possibly_executed_cause(outcomes[0])
+    assert isinstance(cause, ProtocolError)
+    assert cause.http_status == HTTP_OK
     assert outcomes[0].command_index == 0
     assert stream.report.state is KernelState.COMPLETED
 
@@ -951,7 +959,7 @@ async def test_batch_success_preserves_validated_per_command_pagination_metadata
 
 
 @pytest.mark.asyncio
-async def test_malformed_batch_pagination_metadata_is_correlated_failure() -> None:
+async def test_malformed_batch_pagination_metadata_leaves_its_command_unknown() -> None:
     def malformed_metadata(request: Request) -> WireResponse:
         key = _batch_keys(request)[0]
         body = json.dumps(
@@ -970,8 +978,12 @@ async def test_malformed_batch_pagination_metadata_is_correlated_failure() -> No
         [Request("profile", route=RouteKind.BARE)],
     )
     outcome = await anext(stream)
+    # An answer the client cannot decode proves nothing about what the command did.
     assert isinstance(outcome, BatchFailure)
-    assert isinstance(outcome.error, ProtocolError)
+    assert isinstance(outcome.error, AmbiguousExecutionError)
+    assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    assert isinstance(outcome.error.__cause__, ProtocolError)
+    assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
 
 
 @pytest.mark.asyncio

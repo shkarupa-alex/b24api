@@ -697,13 +697,13 @@ async def test_tolerant_reference_failure_preserves_total_correlation() -> None:
     assert stream.report.state is KernelState.COMPLETED
     assert [violation.code for violation in stream.report.violations] == ["reference_failure"]
     bad_record = next(record for record in stream.report.page_trace if record.reference_index == 0)
-    assert bad_record.outcome is PageOutcome.UNKNOWN
+    assert bad_record.outcome is PageOutcome.REJECTED
     assert bad_record.dispatch is PageDispatch.DIRECT
     assert bad_record.rejection_code is PageRejectionCode.COMMAND_FAILURE
 
 
 @pytest.mark.asyncio
-async def test_tolerant_batch_command_failure_records_unknown_page_provenance() -> None:
+async def test_tolerant_batch_command_failure_records_rejected_page_provenance() -> None:
     def handler(request: Request) -> object:
         commands = request.copy_parameters()["cmd"]
         assert isinstance(commands, dict)
@@ -730,7 +730,7 @@ async def test_tolerant_batch_command_failure_records_unknown_page_provenance() 
     assert isinstance(outcomes[0], KernelReferenceFailure)
     assert len(stream.report.page_trace) == 1
     record = stream.report.page_trace[0]
-    assert record.outcome is PageOutcome.UNKNOWN
+    assert record.outcome is PageOutcome.REJECTED
     assert record.dispatch is PageDispatch.BATCH
     assert record.batch_index == 0
     assert record.reference_index == 0

@@ -627,7 +627,7 @@ async def test_page_trace_limit_bounds_live_driver_evidence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_direct_fetch_failure_records_unknown_scheduled_page() -> None:
+async def test_a_refused_direct_fetch_records_a_rejected_scheduled_page() -> None:
     stream = iter_list(
         Executor(
             ResponderTransport(
@@ -645,7 +645,7 @@ async def test_direct_fetch_failure_records_unknown_scheduled_page() -> None:
     assert attached_report(captured.value) is stream.report
     assert len(stream.report.page_trace) == 1
     record = stream.report.page_trace[0]
-    assert record.outcome is PageOutcome.UNKNOWN
+    assert record.outcome is PageOutcome.REJECTED
     assert record.dispatch is PageDispatch.DIRECT
     assert record.rejection_code is PageRejectionCode.COMMAND_FAILURE
 

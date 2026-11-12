@@ -35,7 +35,6 @@ from b24api.contracts.request import (
 )
 from b24api.contracts.traversal import OffsetContinuation
 from b24api.errors import (
-    AmbiguousExecutionError,
     CapabilityError,
     IdentityContractError,
     PageAdaptationError,
@@ -43,6 +42,7 @@ from b24api.errors import (
     ResultShapeError,
 )
 from b24api.execution import WorkClass
+from b24api.execution.facts import execution
 from b24api.traversal.continuation import ContinuationStrategy
 from b24api.traversal.control_preflight import preflight_controls
 from b24api.traversal.counted_batch import CountedBatchStrategy, empty_source_head_eligible
@@ -63,6 +63,7 @@ from b24api.traversal.identity import (
 from b24api.traversal.inclusive_window import InclusiveWindowStrategy
 from b24api.traversal.keyset import KeysetStrategy
 from b24api.traversal.page_adaptation import PageTokens, _SourcePageState, adapt_page
+from b24api.traversal.page_failure import failed_page
 from b24api.traversal.plans import (
     ContinuationPlan,
     CountedOffsetPlan,
@@ -298,16 +299,12 @@ class PaginationDriver:
                 recorder.settled(CommandSettlement.SUCCESS)
         except BaseException as error:
             if recorder is not None:
-                recorder.settled(
-                    CommandSettlement.UNKNOWN
-                    if bool(getattr(error, "_b24api_dispatch_started", False))
-                    else CommandSettlement.NOT_EXECUTED,
-                )
+                recorder.settled(execution(error).settlement)
             if reservation is not None:
                 self.context.release_page(reservation)
-            if bool(getattr(error, "_b24api_dispatch_started", False)):
+            if execution(error).dispatched:
                 self.set_page_dispatch(dispatch=PageDispatch.DIRECT)
-                self.record_unknown_page(
+                self.record_failed_page(
                     dispatch=PageDispatch.DIRECT,
                     batch_index=None,
                     error=error,
@@ -680,19 +677,15 @@ class PaginationDriver:
         self._page_dispatch = dispatch
         self._page_batch_index = batch_index
 
-    def record_unknown_page(
+    def record_failed_page(
         self,
         *,
         dispatch: PageDispatch,
         batch_index: int | None,
         error: BaseException,
     ) -> None:
-        """Record a scheduled page whose rows could not be decoded."""
-        code = (
-            PageRejectionCode.AMBIGUOUS_EXECUTION
-            if isinstance(error, AmbiguousExecutionError)
-            else PageRejectionCode.COMMAND_FAILURE
-        )
+        """Record a dispatched page whose command failed, traced from its execution facts as it settles."""
+        outcome, code = failed_page(error)
         self._append_page_record(
             PageRecord(
                 sequence=0,
@@ -703,7 +696,7 @@ class PaginationDriver:
                 rows_admitted=0,
                 reported_total=None,
                 reported_next=None,
-                outcome=PageOutcome.UNKNOWN,
+                outcome=outcome,
                 rejection_code=code,
             ),
         )

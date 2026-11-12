@@ -72,8 +72,8 @@ class StrategyContext(Protocol):
         """Attach physical dispatch provenance without changing the logical cursor."""
         ...
 
-    def record_unknown_page(self, *, dispatch: PageDispatch, batch_index: int | None, error: BaseException) -> None:
-        """Record a scheduled page whose rows could not be decoded."""
+    def record_failed_page(self, *, dispatch: PageDispatch, batch_index: int | None, error: BaseException) -> None:
+        """Record a dispatched page whose command failed, traced from its execution facts."""
         ...
 
     def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:

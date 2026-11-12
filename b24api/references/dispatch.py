@@ -10,15 +10,15 @@ from typing import TYPE_CHECKING, cast
 
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchSuccess
-from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.report import PageDispatch
-from b24api.errors import AmbiguousExecutionError, ApiResponseError, BudgetExceededError, CapabilityError
+from b24api.errors import B24ApiError, BudgetExceededError, CapabilityError
 from b24api.execution import (
     ExecutionContext,
     Executor,
     WorkClass,
 )
+from b24api.execution.facts import Execution, execution, record_dispatch
 from b24api.references.outcome import (
     KernelReferenceFailure,
     KernelReferenceItem,
@@ -26,12 +26,14 @@ from b24api.references.outcome import (
 )
 
 if TYPE_CHECKING:
+    from b24api.batch.outcome import BatchOutcome
     from b24api.contracts.command import NotExecutedReason
-    from b24api.contracts.completion import BindingClosure
+    from b24api.contracts.completion import BindingClosure, CommandSettlement
     from b24api.contracts.json import FrozenJson, JsonValue
     from b24api.contracts.report import KeysetExecutionReport, KeysetSelectionSummary, PageRecord, Violation
     from b24api.contracts.request import Request
     from b24api.contracts.response import Response
+    from b24api.execution.context import PageReservation
     from b24api.traversal.plans import (
         KernelBatchDispatch,
         KernelDirectDispatch,
@@ -168,6 +170,23 @@ class _PendingBatch:
     settled: asyncio.Future[None]
     dispatch_started: bool = False
     options: _DecodeOptions = _PLAIN_DECODING
+    # The operation deadline of the page's admission; the send of its wave lifts it.
+    admission: asyncio.Timeout | None = None
+
+    def mark_sent(self) -> bool:
+        """Hand the page to its wave's send, lifting its admission deadline; ``False`` when it was abandoned.
+
+        A page whose fetch has ended (every way out of the fetch completes or cancels its future) or whose deadline
+        has expired is abandoned: no one waits for it, so it is not sent and stays proven not executed. The check
+        and the hand-over happen in one step of the event loop, so the fetch cannot end in between.
+        """
+        admission = self.admission
+        if self.future.done() or (admission is not None and admission.expired()):
+            return False
+        if admission is not None:
+            admission.reschedule(None)
+        self.dispatch_started = True
+        return True
 
 
 @dataclass(slots=True)
@@ -284,15 +303,14 @@ class _BatchPageError(Exception):
         super().__init__("batch page command failed")
 
 
+def _failed_execution(error: BaseException) -> Execution:
+    """Return what the facts say about a page whose dispatch raised, a batch page's from its command outcome."""
+    return execution(error.failure.error if isinstance(error, _BatchPageError) else error)
+
+
 def _failed_settlement(error: BaseException) -> CommandSettlement:
-    """Classify a page whose dispatch raised: ambiguous, failed, possibly sent, or never sent."""
-    if isinstance(error, _BatchPageError) and isinstance(error.failure.error, AmbiguousExecutionError):
-        return CommandSettlement.UNKNOWN
-    if isinstance(error, _BatchPageError | ApiResponseError):
-        return CommandSettlement.FAILURE
-    if bool(getattr(error, "_b24api_dispatch_started", False)):
-        return CommandSettlement.UNKNOWN
-    return CommandSettlement.NOT_EXECUTED
+    """Settle a page whose dispatch raised from its execution facts: possibly run, failed, or never sent."""
+    return _failed_execution(error).settlement
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,20 +576,24 @@ class _DirectPageDispatcher:
             self.context.release_page(reservation)
             raise BudgetExceededError("operation elapsed budget exhausted before direct admission")
         try:
+            # The deadline bounds admission only: once sent, the executor's own budgets end the request and
+            # record whether it may have run, which a deadline raised around the send would discard.
             async with asyncio.timeout(remaining):
-                async with self._semaphore:
-                    response = await self.executor.execute(
-                        request,
-                        context=self.context,
-                        work_class=WorkClass.TRAVERSAL_DIRECT,
-                    )
-                    self.context.commit_page(reservation)
+                await self._semaphore.acquire()
         except TimeoutError as error:
             self.context.release_page(reservation)
             raise BudgetExceededError("direct scheduler admission exceeded operation time budget") from error
         except BaseException:
             self.context.release_page(reservation)
             raise
+        try:
+            response = await self.executor.execute(request, context=self.context, work_class=WorkClass.TRAVERSAL_DIRECT)
+            self.context.commit_page(reservation)
+        except BaseException:
+            self.context.release_page(reservation)
+            raise
+        finally:
+            self._semaphore.release()
         return _DispatchedPage(response, PageDispatch.DIRECT)
 
     async def aclose(self) -> None:
@@ -623,7 +645,7 @@ class _BatchPageDispatcher:
         self.batch_requests = 0
         self.batch_commands = 0
 
-    async def fetch(  # noqa: C901, PLR0912, PLR0915
+    async def fetch(  # noqa: C901
         self,
         request: Request,
         reference_id: str,
@@ -651,60 +673,55 @@ class _BatchPageDispatcher:
                 self.context.release_page(reservation)
             raise BudgetExceededError("operation elapsed budget exhausted before batch admission")
         try:
-            async with asyncio.timeout(remaining):
-                await self._queue.put(pending)
-                if transit is not None:
-                    transit.arrive()
-                if self._producer_state is not None:
-                    self._producer_state.admitting.discard(reference_id)
-                self._ensure_workers()
-                if self._producer_state is not None:
-                    self._producer_state.touch()
+            # The deadline bounds admission only: once the wave is sent, the executor's own budgets end it and
+            # record whether it may have run, as they do for every other send.
+            async with asyncio.timeout(remaining) as admission:
+                pending.admission = admission
+                await self._queue_page(pending, transit)
                 response = await future
-                if reservation is not None:
-                    self.context.commit_page(reservation)
-                if self._producer_state is not None:
-                    self._producer_state.touch()
-                return response
         except asyncio.CancelledError as error:
             future.cancel()
-            if not admitted.done():
-                admitted.set_result(None)
-            if not settled.done():
-                settled.set_result(None)
-            if reservation is not None:
-                self.context.release_page(reservation)
-            if self._producer_state is not None:
-                self._producer_state.touch()
+            self._abandon(pending, reservation)
             if pending.dispatch_started:
                 # A page cancelled after its wave was sent may have executed; settlement must say so.
-                error.__dict__["_b24api_dispatch_started"] = True
+                record_dispatch(error, possibly_executed=True)
             raise
         except TimeoutError as error:
+            # A page whose wave was sent no longer has a deadline: this one was never sent.
             future.cancel()
-            if not admitted.done():
-                admitted.set_result(None)
-            if not settled.done():
-                settled.set_result(None)
-            if reservation is not None:
-                self.context.release_page(reservation)
-            if self._producer_state is not None:
-                self._producer_state.touch()
-            exceeded = BudgetExceededError("batch scheduler admission exceeded operation time budget")
-            if pending.dispatch_started:
-                # The deadline passed while the page's wave was being sent: it may have executed.
-                exceeded.__dict__["_b24api_dispatch_started"] = True
-            raise exceeded from error
+            self._abandon(pending, reservation)
+            raise BudgetExceededError("batch scheduler admission exceeded operation time budget") from error
         except BaseException:
-            if not admitted.done():
-                admitted.set_result(None)
-            if not settled.done():
-                settled.set_result(None)
-            if reservation is not None:
-                self.context.release_page(reservation)
-            if self._producer_state is not None:
-                self._producer_state.touch()
+            future.cancel()
+            self._abandon(pending, reservation)
             raise
+        if reservation is not None:
+            self.context.commit_page(reservation)
+        if self._producer_state is not None:
+            self._producer_state.touch()
+        return response
+
+    async def _queue_page(self, pending: _PendingBatch, transit: _Transit | None) -> None:
+        """Queue a page for the next wave; it has arrived, and its producer is no longer admitting it."""
+        await self._queue.put(pending)
+        if transit is not None:
+            transit.arrive()
+        if self._producer_state is not None:
+            self._producer_state.admitting.discard(pending.reference_id)
+        self._ensure_workers()
+        if self._producer_state is not None:
+            self._producer_state.touch()
+
+    def _abandon(self, pending: _PendingBatch, reservation: PageReservation | None) -> None:
+        """Release what a page that will not be returned holds: its wave barriers and its page reservation."""
+        if not pending.admitted.done():
+            pending.admitted.set_result(None)
+        if not pending.settled.done():
+            pending.settled.set_result(None)
+        if reservation is not None:
+            self.context.release_page(reservation)
+        if self._producer_state is not None:
+            self._producer_state.touch()
 
     def _ensure_workers(self) -> None:
         if self._assembler is not None:
@@ -912,15 +929,22 @@ class _BatchPageDispatcher:
                 strict_json_members=options.strict_json_members,
                 on_envelope=self._count_batch_request,
             )
+            self._correlate(chunk, outcomes)
         except asyncio.CancelledError:
             for item in chunk:
                 item.future.cancel()
             raise
         except Exception as error:  # noqa: BLE001 - total chunk correlation boundary
+            if not isinstance(error, B24ApiError):
+                # A failure the engine did not classify may come after the wave left: a sent page no longer has a
+                # deadline to end its wait, so it fails with this error as possibly run.
+                record_dispatch(error, possibly_executed=True)
             for item in chunk:
                 if not item.future.done():
                     item.future.set_exception(error)
-            return
+
+    @staticmethod
+    def _correlate(chunk: list[_PendingBatch], outcomes: tuple[BatchOutcome, ...]) -> None:
         for item, outcome in zip(chunk, outcomes, strict=True):
             if item.future.done():
                 continue
@@ -956,15 +980,16 @@ class _BatchPageDispatcher:
             self._active_sends += 1
             if self._producer_state is not None:
                 self._producer_state.touch()
-            for item in chunk:
-                item.dispatch_started = True
             try:
-                await self._send(chunk)
-                self._settling_waves += 1
-                settlement_worker = asyncio.create_task(self._wait_for_settlement(chunk))
-                self._settlement_workers.add(settlement_worker)
-                settlement_worker.add_done_callback(self._settlement_workers.discard)
-                await asyncio.gather(*(item.admitted for item in chunk))
+                # Only pages whose fetch still waits are sent; an abandoned one was never sent and settles so.
+                live = [item for item in chunk if item.mark_sent()]
+                if live:
+                    await self._send(live)
+                    self._settling_waves += 1
+                    settlement_worker = asyncio.create_task(self._wait_for_settlement(live))
+                    self._settlement_workers.add(settlement_worker)
+                    settlement_worker.add_done_callback(self._settlement_workers.discard)
+                    await asyncio.gather(*(item.admitted for item in live))
             finally:
                 self._active_sends -= 1
                 if self._producer_state is not None:

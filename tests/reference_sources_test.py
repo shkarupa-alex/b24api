@@ -45,10 +45,10 @@ from b24api.contracts import (
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError, CapabilityError, InputSourceError, ReferenceFailed
 from b24api.transport import TransportCapabilities, WireResponse
-from tests.scripting import BatchPortal, Envelope, Query, VirtualClock
+from tests.scripting import BatchPortal, Envelope, Query, VirtualClock, on_loop
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterable
+    from collections.abc import AsyncIterator, Callable
 
     from b24api.contracts import OperationReport, OperationStream, ReferenceOutcome, TraversalSpec
     from b24api.transport import WireRequest
@@ -59,6 +59,9 @@ ALPHA = CursorTraversal(selector=ResultSelector(), cursor=CURSOR, page_size=2)
 _LIMIT = ParameterPath(("limit",))
 BETA = SequentialTraversal(identity=ID, page_size=10)
 ALPHA_PAGES = {None: [4, 3], 3: [2, 1], 1: []}
+
+
+_HANG_GUARD_SECONDS = 30
 
 
 def _client(portal: BatchPortal) -> Bitrix24:
@@ -121,10 +124,8 @@ async def _collect(
     return events, _report(stream)
 
 
-async def _on_loop(sources: Iterable[ReferenceSource[int]]) -> AsyncIterator[ReferenceSource[int]]:
-    """Yield ``sources`` on the event loop; a list is pulled in a worker thread, whose pace no virtual clock sets."""
-    for source in sources:
-        yield source
+async def _drain(stream: OperationStream[ReferenceOutcome[int]]) -> list[ReferenceOutcome[int]]:
+    return [event async for event in stream]
 
 
 def _rows(events: list[ReferenceOutcome[int]], index: int) -> list[object]:
@@ -299,7 +300,7 @@ async def test_a28_a_draining_consumer_refills_the_counted_tail_in_full_batches(
     async with _client(portal) as api:
         events, report = await _collect(
             api,
-            _on_loop([_gamma(parent) for parent in range(1, sources + 1)]),
+            on_loop([_gamma(parent) for parent in range(1, sources + 1)]),
             dispatch=BatchDispatch(batch_size=10, output_order=order),
         )
 
@@ -307,6 +308,51 @@ async def test_a28_a_draining_consumer_refills_the_counted_tail_in_full_batches(
     assert all(_rows(events, index) == list(range(1001)) for index in range(sources))
     assert [len(wave) for wave in portal.methods] == _TAIL_WAVES[order, sources]
     assert clock.timer_firings == 0
+
+
+_DELTA_ROWS = 120
+_DELTA_PAGE = 2
+_DELTA_REFUSED_PAGE = 10
+
+
+def _delta(_method: str, query: Query) -> Envelope:
+    """Answer 120 rows per parent in pages of 2; parent 1 is refused its tenth tail page."""
+    parent, offset = int(query["PARENT"]), int(query.get("start", "0"))
+    if parent == 1 and offset == _DELTA_REFUSED_PAGE * _DELTA_PAGE:
+        return {"error": "ACCESS_DENIED", "error_description": "denied"}
+    envelope: Envelope = {
+        "result": [{"ID": row} for row in range(offset, min(offset + _DELTA_PAGE, _DELTA_ROWS))],
+        "total": _DELTA_ROWS,
+    }
+    if offset + _DELTA_PAGE < _DELTA_ROWS:
+        envelope["next"] = offset + _DELTA_PAGE
+    return envelope
+
+
+@pytest.mark.asyncio
+async def test_a28_a_wave_still_leaves_with_the_pages_a_failed_binding_abandoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A binding refused mid-tail abandons its queued pages while their wave coalesces with other bindings' pages.
+
+    The wave still leaves, without the abandoned pages' ended deadlines, and every other binding completes.
+    """
+    VirtualClock().install(monkeypatch)
+    portal = BatchPortal(_delta)
+    async with _client(portal) as api:
+        stream = api.iter_reference_outcomes(
+            Request.bare("delta.list", {}, ReplaySafety.SAFE),
+            on_loop([_binding(parent) for parent in (1, 2, 3)]),
+            traversal=CountedTraversal(page_size=_DELTA_PAGE),
+            dispatch=BatchDispatch(concurrency=3),
+        )
+        async with stream:
+            # A stranded wave would hang the stream; the bound only turns that into a failure.
+            events = await asyncio.wait_for(_drain(stream), timeout=_HANG_GUARD_SECONDS)
+
+    terminals = {event.binding_index: type(event) for event in events if not isinstance(event, ReferenceItem)}
+    assert terminals == {0: ReferenceFailure, 1: ReferenceComplete, 2: ReferenceComplete}
+    assert _rows(events, 1) == _rows(events, 2) == list(range(_DELTA_ROWS))
 
 
 @pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
@@ -320,7 +366,7 @@ async def test_a28_a_tail_window_filling_the_row_pool_refills_from_the_rows_its_
     async with _client(portal) as api:
         events, report = await _collect(
             api,
-            _on_loop([_gamma()]),
+            on_loop([_gamma()]),
             dispatch=BatchDispatch(batch_size=50, output_order=order),
             policy=ExecutionPolicy(max_buffered_rows=500),
         )
@@ -347,7 +393,7 @@ async def test_a28_a_tail_whose_consumer_waits_for_the_chunk_is_not_waited_for(
     async with _client(portal) as api:
         events, report = await _collect(
             api,
-            _on_loop([_gamma()]),
+            on_loop([_gamma()]),
             dispatch=BatchDispatch(batch_size=10, output_order=order),
             policy=ExecutionPolicy(max_buffered_rows=100),
         )
@@ -367,7 +413,7 @@ async def test_a28_a_slow_tail_consumer_bounds_each_refill_wait_by_the_deadline(
     portal = BatchPortal(_answer)
     events: list[ReferenceOutcome[int]] = []
     async with _client(portal) as api:
-        stream = api.iter_reference_source_outcomes(_on_loop([_gamma()]), dispatch=BatchDispatch(batch_size=10))
+        stream = api.iter_reference_source_outcomes(on_loop([_gamma()]), dispatch=BatchDispatch(batch_size=10))
         async with stream:
             async for event in stream:
                 events.append(event)

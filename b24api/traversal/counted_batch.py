@@ -188,7 +188,7 @@ class CountedBatchStrategy:
             if failed.dispatch_started:
                 report_error = failed.error if failed.error is not None else error
                 ctx.set_page_dispatch(dispatch=failed.dispatch, batch_index=failed.batch_index)
-                ctx.record_unknown_page(dispatch=failed.dispatch, batch_index=failed.batch_index, error=report_error)
+                ctx.record_failed_page(dispatch=failed.dispatch, batch_index=failed.batch_index, error=report_error)
             raise
         if recorder is not None:
             recorder.settled(attempt.settlement)
@@ -311,7 +311,7 @@ class CountedBatchStrategy:
             recorded = (
                 error if isinstance(error, BaseException) else CapabilityError("parallel counted batch command failed")
             )
-            ctx.record_unknown_page(dispatch=PageDispatch.BATCH, batch_index=receipt.batch_index, error=recorded)
+            ctx.record_failed_page(dispatch=PageDispatch.BATCH, batch_index=receipt.batch_index, error=recorded)
             raise tail.failure(receipt, failure)
         response, total, stride = receipt.response, self._total, self._stride
         if response is None:

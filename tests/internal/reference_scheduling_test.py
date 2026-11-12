@@ -8,6 +8,7 @@ the queue counts as coalescing potential until it arrives, and a fast keyset lea
 
 from __future__ import annotations
 import asyncio
+import contextlib
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
@@ -28,6 +29,7 @@ from b24api import (
     StableIntegerKeysetContract,
     TerminalState,
 )
+from b24api.batch.engine import BatchExecutor
 from b24api.contracts import Binding, DeliveryOrder, ParameterUpdate, ReferenceSource
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.request import RouteKind
@@ -45,14 +47,19 @@ from b24api.references.dispatch import (
 from b24api.references.scheduler import ReferenceScheduler
 from b24api.traversal.counted_batch import _settle_tail_cleanup
 from b24api.traversal.plans import KernelBatchDispatch, ReferenceOutputOrder
-from tests.scripting import BatchPortal, client_for
+from tests.scripting import BatchPortal, Blocker, ResponderTransport, VirtualClock, client_for
 
 if TYPE_CHECKING:
+    from b24api.execution.context import ExecutionContext
     from b24api.references.dispatch import _DispatchedPage, _FailureEvent, _Transit
     from b24api.references.program import FastKeysetProgram
     from b24api.references.run import _ReferenceRun
     from b24api.traversal.identity import _Page
     from tests.scripting import Envelope, Query
+
+
+_COALESCING_TURNS = 1000
+_HANG_GUARD_SECONDS = 30
 
 
 def _counted_answer(_method: str, query: Query) -> Envelope:
@@ -67,7 +74,8 @@ def _counted_answer(_method: str, query: Query) -> Envelope:
 def _dispatcher_page(key: str) -> _PendingBatch:
     loop = asyncio.get_running_loop()
     request = Request("item.list", {"PARENT": key}, route=RouteKind.BARE)
-    return _PendingBatch(request, key, loop.create_future(), loop.create_future(), loop.create_future())
+    futures = (loop.create_future(), loop.create_future(), loop.create_future())
+    return _PendingBatch(request, key, *futures)
 
 
 def _settle(page: _PendingBatch) -> None:
@@ -511,10 +519,50 @@ def test_a_fast_lease_is_the_free_rows_clamped_between_the_floor_and_the_share(
 
 
 @pytest.mark.asyncio
-async def test_a_page_whose_wave_was_sent_when_the_deadline_passed_settles_unknown() -> None:
-    """A deadline after the send began proves nothing about execution; a still-queued page was never sent."""
+async def test_a_wave_leaves_without_a_page_whose_fetch_was_cancelled_while_it_coalesced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page abandoned in a coalescing chunk is never sent: its wave carries only the live page and frees its slot."""
+    VirtualClock(turns=_COALESCING_TURNS).install(monkeypatch)
     portal = BatchPortal(lambda _method, _query: {"result": []})
     executor = Executor(portal)
+    context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10))
+    await context.start()
+    state = _ProducerState({"a", "b", "c"}, {"a": 0, "b": 1, "c": 2})
+    buffer = _RowBuffer(10, context, producer_state=state)
+    dispatcher = _BatchPageDispatcher(
+        executor,
+        context,
+        KernelBatchDispatch(batch_size=3, concurrency=1, coalesce_wait=1.0),
+        producer_state=state,
+        buffer=buffer,
+        page_cap=1,
+    )
+    kept = asyncio.create_task(dispatcher.fetch(Request("item.list", {"PARENT": "a"}, route=RouteKind.BARE), "a"))
+    abandoned = asyncio.create_task(dispatcher.fetch(Request("item.list", {"PARENT": "b"}, route=RouteKind.BARE), "b"))
+    for _turn in range(_COALESCING_TURNS // 2):  # both pages join the chunk, which waits for the third producer
+        await asyncio.sleep(0)
+    abandoned.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await abandoned
+    # A stranded wave would hang the kept page; the bound only turns that into a failure.
+    page = await asyncio.wait_for(kept, timeout=_HANG_GUARD_SECONDS)
+    assert page.admission is not None
+    assert page.settlement is not None
+    page.admission.set_result(None)
+    page.settlement.set_result(None)
+    await dispatcher.aclose()
+    await buffer.close()
+
+    # Only the kept page left: the abandoned one was never sent.
+    assert portal.waves == [1]
+
+
+@pytest.mark.asyncio
+async def test_a_page_whose_wave_was_sent_when_the_deadline_passed_settles_unknown() -> None:
+    """The deadline bounds admission: the executor ends a sent wave, and a still-queued page was never sent."""
+    blocker = Blocker()
+    executor = Executor(ResponderTransport(blocker))
     context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10, max_elapsed=0.2))
     await context.start()
     state = _ProducerState({"a", "b"}, {"a": 0, "b": 1})
@@ -527,23 +575,109 @@ async def test_a_page_whose_wave_was_sent_when_the_deadline_passed_settles_unkno
         buffer=buffer,
         page_cap=1,
     )
-    sending = asyncio.Event()
-
-    async def in_flight(*_args: object, **_kwargs: object) -> tuple[object, ...]:
-        sending.set()
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")
-
-    dispatcher._executor.execute_requests = in_flight  # type: ignore[method-assign, assignment]  # noqa: SLF001
     sent = asyncio.create_task(dispatcher.fetch(Request("item.list", {"PARENT": "a"}, route=RouteKind.BARE), "a"))
-    await asyncio.wait_for(sending.wait(), timeout=5)
+    await asyncio.wait_for(blocker.started.wait(), timeout=5)
     queued = asyncio.create_task(dispatcher.fetch(Request("item.list", {"PARENT": "b"}, route=RouteKind.BARE), "b"))
     results = await asyncio.gather(sent, queued, return_exceptions=True)
     await dispatcher.aclose()
     await buffer.close()
 
-    assert all(isinstance(result, BudgetExceededError) for result in results)
+    # The sent page fails with the executor's own evidence; only the queued one is stopped at admission.
+    assert not isinstance(results[0], BudgetExceededError)
+    assert isinstance(results[1], BudgetExceededError)
+    assert "admission" in str(results[1])
     assert [_failed_settlement(cast("BaseException", result)) for result in results] == [
         CommandSettlement.UNKNOWN,
         CommandSettlement.NOT_EXECUTED,
     ]
+
+
+def _three_producer_dispatcher(
+    executor: Executor, context: ExecutionContext, *, batch_size: int = 1, coalesce_wait: float = 0.0
+) -> tuple[_BatchPageDispatcher, _RowBuffer]:
+    """A dispatcher of producers ``a``, ``b`` and ``c`` with one send slot."""
+    state = _ProducerState({"a", "b", "c"}, {"a": 0, "b": 1, "c": 2})
+    buffer = _RowBuffer(10, context, producer_state=state)
+    shape = KernelBatchDispatch(batch_size=batch_size, concurrency=1, coalesce_wait=coalesce_wait)
+    return _BatchPageDispatcher(executor, context, shape, producer_state=state, buffer=buffer, page_cap=1), buffer
+
+
+def _page(parent: str) -> Request:
+    return Request("item.list", {"PARENT": parent}, route=RouteKind.BARE)
+
+
+@pytest.mark.asyncio
+async def test_a_page_cancelled_after_its_wave_was_sent_settles_unknown() -> None:
+    blocker = Blocker()
+    executor = Executor(ResponderTransport(blocker))
+    context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10))
+    await context.start()
+    dispatcher, buffer = _three_producer_dispatcher(executor, context)
+    cancelled: list[asyncio.CancelledError] = []
+
+    async def fetch() -> None:
+        try:
+            await dispatcher.fetch(_page("a"), "a")
+        except asyncio.CancelledError as error:
+            cancelled.append(error)
+            raise
+
+    task = asyncio.create_task(fetch())
+    await asyncio.wait_for(blocker.started.wait(), timeout=_HANG_GUARD_SECONDS)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    await dispatcher.aclose()
+    await buffer.close()
+
+    # The wave left with the page, so the page may have run.
+    (error,) = cancelled
+    assert _failed_settlement(error) is CommandSettlement.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_a_wave_left_with_no_page_is_not_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    VirtualClock(turns=_COALESCING_TURNS).install(monkeypatch)
+    portal = BatchPortal(lambda _method, _query: {"result": []})
+    executor = Executor(portal)
+    context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10))
+    await context.start()
+    dispatcher, buffer = _three_producer_dispatcher(executor, context, batch_size=3, coalesce_wait=1.0)
+    abandoned = asyncio.create_task(dispatcher.fetch(_page("b"), "b"))
+    for _turn in range(_COALESCING_TURNS // 2):  # the page joins a chunk, which waits for the other producers
+        await asyncio.sleep(0)
+    abandoned.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await abandoned
+    for _turn in range(_COALESCING_TURNS * 3):  # the chunk is handed to a send worker, with no live page left
+        await asyncio.sleep(0)
+    page = await asyncio.wait_for(dispatcher.fetch(_page("a"), "a"), timeout=_HANG_GUARD_SECONDS)
+    assert page.admission is not None
+    assert page.settlement is not None
+    page.admission.set_result(None)
+    page.settlement.set_result(None)
+    await dispatcher.aclose()
+    await buffer.close()
+
+    assert portal.waves == [1]
+
+
+@pytest.mark.asyncio
+async def test_a_send_that_breaks_an_invariant_fails_its_pages_as_possibly_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sent page no longer has an admission deadline: a failure of the send path must still end its wait."""
+
+    async def no_outcomes(_engine: BatchExecutor, _requests: tuple[Request, ...], **_options: object) -> tuple[()]:
+        return ()
+
+    monkeypatch.setattr(BatchExecutor, "execute_requests", no_outcomes)
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10))
+    await context.start()
+    dispatcher, buffer = _three_producer_dispatcher(executor, context)
+    with pytest.raises(ValueError, match="zip") as caught:
+        await asyncio.wait_for(dispatcher.fetch(_page("a"), "a"), timeout=_HANG_GUARD_SECONDS)
+    await dispatcher.aclose()
+    await buffer.close()
+
+    # The page fails with the send path's own error, and it may have run.
+    assert _failed_settlement(caught.value) is CommandSettlement.UNKNOWN

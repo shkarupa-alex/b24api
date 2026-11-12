@@ -5,7 +5,6 @@ from collections.abc import AsyncGenerator, AsyncIterable, Iterable
 from typing import TYPE_CHECKING, Self, cast
 
 from b24api._sources import OwnedSource
-from b24api.batch.correlation import _BatchNotExecutedError
 from b24api.batch.engine import BatchExecutor, _BatchInput, _BatchItem
 from b24api.batch.outcome import BatchFailure as KernelFailure
 from b24api.batch.outcome import BatchSuccess as KernelSuccess
@@ -28,12 +27,9 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     SnapshotState,
 )
-from b24api.contracts.request_summary import RouteKind
+from b24api.contracts.request import ReplaySafety
 from b24api.errors import (
-    AmbiguousExecutionError,
     B24ApiError,
-    BatchCommandError,
-    EnvelopeContractError,
     InputSourceError,
     ProtocolError,
 )
@@ -41,6 +37,7 @@ from b24api.execution import (
     AsyncIteratorController,
     Executor,
 )
+from b24api.execution.facts import Execution, ambiguity_of, execution
 from b24api.execution.lifecycle import (
     CleanupAttempt,
     LifecycleHooks,
@@ -103,13 +100,8 @@ class _BatchWindowError(Exception):
         super().__init__("logical batch physical window failed")
 
 
-def _public_outcomes(
-    outcomes: tuple[KernelSuccess | KernelFailure, ...],
-    *,
-    halt: bool,
-) -> tuple[CommandOutcome[object], ...]:
+def _public_outcomes(outcomes: tuple[KernelSuccess | KernelFailure, ...]) -> tuple[CommandOutcome[object], ...]:
     converted: list[CommandOutcome[object]] = []
-    halted = False
     for outcome in outcomes:
         if isinstance(outcome, KernelSuccess):
             response = outcome.response
@@ -120,57 +112,26 @@ def _public_outcomes(
             )
             continue
         error = outcome.error
-        if isinstance(error, _BatchNotExecutedError):
-            converted.append(
-                CommandNotExecuted(
-                    outcome.command_index,
-                    outcome.correlation,
-                    outcome.request.summary,
-                    NotExecutedReason.HALTED,
-                ),
-            )
-            continue
-        # A malformed 2xx envelope may follow execution, so it is never reported as halted; a classic halt
-        # stops the envelope, while a complete v3 array proves every one of its commands ran.
-        if (
-            halt
-            and halted
-            and outcome.request.route is RouteKind.BARE
-            and isinstance(error, ProtocolError)
-            and not isinstance(error, EnvelopeContractError)
-        ):
-            converted.append(
-                CommandNotExecuted(
-                    outcome.command_index,
-                    outcome.correlation,
-                    outcome.request.summary,
-                    NotExecutedReason.HALTED,
-                ),
-            )
-            continue
-        if isinstance(error, BatchCommandError):
-            halted = halt
         if not isinstance(error, B24ApiError):
             error = ProtocolError("batch command failed without a typed safe error")
-        if isinstance(error, AmbiguousExecutionError):
+        # The variant follows the execution facts; only the physical decoder proves a command withheld.
+        summary = outcome.request.summary
+        ambiguity = ambiguity_of(
+            error, request_summary=summary, declared_unsafe=outcome.replay_safety is ReplaySafety.UNSAFE
+        )
+        if execution(error) is Execution.WITHHELD:
+            converted.append(
+                CommandNotExecuted(outcome.command_index, outcome.correlation, summary, NotExecutedReason.HALTED)
+            )
+        elif ambiguity is not None:
             converted.append(
                 CommandOutcomeUnknown(
-                    outcome.command_index,
-                    outcome.correlation,
-                    outcome.request.summary,
-                    error,
-                    outcome.replay_disposition,
-                ),
+                    outcome.command_index, outcome.correlation, summary, ambiguity, outcome.replay_disposition
+                )
             )
         else:
             converted.append(
-                CommandFailure(
-                    outcome.command_index,
-                    outcome.correlation,
-                    outcome.request.summary,
-                    error,
-                    outcome.replay_disposition,
-                ),
+                CommandFailure(outcome.command_index, outcome.correlation, summary, error, outcome.replay_disposition)
             )
     return tuple(converted)
 
@@ -235,12 +196,10 @@ class LogicalBatchKernelStream[C]:
         if isinstance(outcome, CommandSuccess):
             binding.settled(CommandSettlement.SUCCESS)
             binding.validated(1)
-        elif isinstance(outcome, CommandOutcomeUnknown):
-            binding.settled(CommandSettlement.UNKNOWN)
         elif isinstance(outcome, CommandNotExecuted):
             binding.settled(CommandSettlement.NOT_EXECUTED)
         else:
-            binding.settled(CommandSettlement.FAILURE)
+            binding.settled(execution(outcome.error).settlement)
 
     def _finish_outcome(self, outcome: CommandOutcome[object]) -> None:
         binding = self._completion.binding(outcome.index)
@@ -331,7 +290,7 @@ class LogicalBatchKernelStream[C]:
                 on_envelope=self._count_batch_request,
             )
             buffered_rows = sum(outcome.decoded_rows if isinstance(outcome, KernelSuccess) else 1 for outcome in kernel)
-            outcomes = _public_outcomes(kernel, halt=self._fail_fast)
+            outcomes = _public_outcomes(kernel)
             await self._context.set_buffered_rows(buffered_rows)
             if self._fail_fast and any(not isinstance(outcome, CommandSuccess) for outcome in outcomes):
                 failed_at = next(

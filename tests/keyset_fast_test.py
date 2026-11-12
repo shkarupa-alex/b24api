@@ -53,10 +53,13 @@ from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSe
 from b24api.contracts.report import OperationReport, PageDispatch
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
+    AmbiguousExecutionError,
     CapabilityError,
+    EnvelopeContractError,
     IdentityContractError,
     IncompleteTraversalError,
     PaginationError,
+    ProtocolError,
     ResultShapeError,
 )
 from b24api.execution import WireResponse
@@ -1080,55 +1083,60 @@ async def test_empty_auto_selection_completes_in_boundary_wave() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["extra", "duplicate"])
-async def test_fast_wave_invalid_correlation_rejects_every_observation_as_batch_envelope(fault: str) -> None:
+async def test_fast_wave_invalid_correlation_leaves_every_observation_unknown_as_batch_envelope(fault: str) -> None:
+    # An answer that cannot be attributed to its commands proves nothing about them: they may have run.
     stream = _stream(
         MalformedBatchEnvelopeTransport(tuple(range(1, 21)), fault=fault),
         RangeKeysetExecution(StableIntegerKeysetContract()),
     )
 
-    with pytest.raises(IncompleteTraversalError):
+    with pytest.raises(AmbiguousExecutionError) as captured:
         _ = [item async for item in stream]
 
+    assert isinstance(captured.value.__cause__, ProtocolError)
     assert stream.report is not None
     assert len(stream.report.page_trace) == 2
     assert {(record.outcome, record.rejection_code) for record in stream.report.page_trace} == {
-        (PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE),
+        (PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE),
     }
 
 
 @pytest.mark.asyncio
-async def test_fast_wave_success_status_without_an_envelope_rejects_every_observation_as_batch_envelope() -> None:
-    # EnvelopeContractError is a ProtocolError since 3.0, so a 2xx physical batch without the Bitrix
-    # envelope is a batch-envelope rejection (2.3 recorded COMMAND_FAILURE); the migration guide says so.
+async def test_fast_wave_success_status_without_an_envelope_leaves_every_observation_unknown() -> None:
+    # EnvelopeContractError is a ProtocolError since 3.0, so a 2xx physical batch without the Bitrix envelope
+    # is recorded as BATCH_ENVELOPE (2.3 recorded COMMAND_FAILURE); the sent wave may have run, so its pages
+    # are unknown. The migration guide says so.
     stream = _stream(
         MalformedBatchEnvelopeTransport(tuple(range(1, 21)), fault="no_envelope"),
         RangeKeysetExecution(StableIntegerKeysetContract()),
     )
 
-    with pytest.raises(IncompleteTraversalError):
+    with pytest.raises(AmbiguousExecutionError) as captured:
         _ = [item async for item in stream]
 
+    assert isinstance(captured.value.__cause__, EnvelopeContractError)
     assert stream.report is not None
     assert stream.report.page_trace
     assert {(record.outcome, record.rejection_code) for record in stream.report.page_trace} == {
-        (PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE),
+        (PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE),
     }
 
 
 @pytest.mark.asyncio
-async def test_fast_wave_missing_correlation_rejects_command_and_aborts_decoded_sibling() -> None:
+async def test_fast_wave_missing_correlation_leaves_command_unknown_and_aborts_decoded_sibling() -> None:
+    # Nothing answers for the sent command without an entry, so it may have run.
     stream = _stream(
         MalformedBatchEnvelopeTransport(tuple(range(1, 21)), fault="missing"),
         RangeKeysetExecution(StableIntegerKeysetContract()),
     )
 
-    with pytest.raises(IncompleteTraversalError):
+    with pytest.raises(AmbiguousExecutionError):
         _ = [item async for item in stream]
 
     assert stream.report is not None
     assert len(stream.report.page_trace) == 2
     assert {(record.outcome, record.rejection_code) for record in stream.report.page_trace} == {
-        (PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE),
+        (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION),
         (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED),
     }
 
@@ -1860,7 +1868,7 @@ async def test_separate_anchor_failure_discards_previously_validated_boundaries(
         PartitionedKeysetExecution(StableIntegerKeysetContract(), batch_size=5, target_lanes=3),
     )
 
-    with pytest.raises(IncompleteTraversalError):
+    with pytest.raises(AmbiguousExecutionError):
         await anext(stream)
     assert stream.report.keyset_execution is not None
     selected = sum(record.rows_selected for record in stream.report.page_trace)
@@ -1874,7 +1882,7 @@ async def test_later_anchor_wave_failure_accounts_for_prior_compacted_rows() -> 
         PartitionedKeysetExecution(StableIntegerKeysetContract(), batch_size=2, target_lanes=5),
     )
 
-    with pytest.raises(IncompleteTraversalError):
+    with pytest.raises(AmbiguousExecutionError):
         await anext(stream)
     assert stream.report.keyset_execution is not None
     assert stream._source._runtime.counters.raw_rows == 13

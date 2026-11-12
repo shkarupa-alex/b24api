@@ -13,16 +13,15 @@ from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.report import PageOutcome, PageRejectionCode, Violation, ViolationSeverity
 from b24api.contracts.request import ResultSelector
 from b24api.errors import (
-    AmbiguousExecutionError,
     B24ApiError,
     CapabilityError,
     IdentityContractError,
     PageAdaptationError,
     PaginationError,
-    ProtocolError,
 )
 from b24api.traversal.keyset_geometry import closure_witness
 from b24api.traversal.page_adaptation import PageTokens, adapt_page
+from b24api.traversal.page_failure import failed_page
 from b24api.traversal.values import _response_items, _row_identity, _validate_order
 
 if TYPE_CHECKING:
@@ -115,13 +114,7 @@ def classify_rejection(outcome: BatchOutcome, receipt: ReceiptRejection) -> tupl
         return PageOutcome.REJECTED, PageRejectionCode.IDENTITY_CONTRACT
     if not isinstance(outcome, BatchFailure):
         return PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION
-    error = outcome.error
-    if isinstance(error, AmbiguousExecutionError):
-        return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION
-    summary = error.request_summary if isinstance(error, ProtocolError) else None
-    if summary is not None and summary.method == "batch":
-        return PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE
-    return PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE
+    return failed_page(outcome.error)
 
 
 def validate_lane_receipt(  # noqa: PLR0913

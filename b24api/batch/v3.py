@@ -13,27 +13,27 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from b24api.batch.correlation import _Command, _command_failure, _command_success, _shared_failure
+from b24api.batch.correlation import (
+    _Command,
+    _command_failure,
+    _command_success,
+    _shared_failure,
+)
 from b24api.batch.outcome import BatchCommandEvidence, BatchFailure
 from b24api.contracts.json import FrozenMapping, _freeze_json
-from b24api.contracts.policy import AmbiguityReason, ReplayDisposition
+from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ReplaySafety
 from b24api.contracts.response import Response
 from b24api.contracts.wire_body import V3BatchBody, V3BatchCommand, envelope_safety
 from b24api.errors import (
-    AmbiguousExecutionError,
     ApiResponseError,
     B24ApiError,
     BatchCommandError,
-    BudgetExceededError,
     HTTPGatewayError,
     ProtocolError,
-    ResponseTooLargeError,
-    TransportError,
 )
 from b24api.execution import WorkClass
 from b24api.execution.executor import (
-    _is_embedded_result_error,
     _is_retryable,
     _proves_not_run,
     _raise_embedded_result_error,
@@ -60,9 +60,9 @@ class _V3Resolution:
 
     executor: Executor
     context: ExecutionContext
+    # The group's attempt lineage, which also records whether an envelope that carried the still pending
+    # commands may have run them.
     attempts: _RequestAttempts = field(default_factory=_RequestAttempts)
-    # Whether an envelope that carried the still pending commands may have run them.
-    possibly_executed: bool = False
     envelope_retry_used: bool = False
     settled: dict[int, BatchOutcome] = field(default_factory=dict)
     # The outcome each command last received, kept when a later round is stopped before it is sent.
@@ -114,6 +114,8 @@ class _V3Resolution:
         outcomes = tuple(
             self._decode(command, element, response) for command, element in zip(pending, elements, strict=True)
         )
+        # Each element answered this send; a command sent again carries only what earlier sends left open.
+        self.attempts.classified(None, may_have_run=False)
         cooldown = 0.0
         for command, outcome in zip(pending, outcomes, strict=True):
             self.last[command.index] = outcome
@@ -141,6 +143,7 @@ class _V3Resolution:
         return ()
 
     def _decode(self, command: _Command, element: JsonValue, response: Response) -> BatchOutcome:
+        """Decode one element; its failure records what this send and the earlier ones left open about it."""
         evidence = BatchCommandEvidence(command.index, command.stable_key)
         policy = self.context.policy
         command_response = Response(element, evidence=response.evidence)
@@ -160,15 +163,19 @@ class _V3Resolution:
                 original_code=error.original_code,
                 normalized_code=error.normalized_code,
             )
+            self.attempts.record(error, policy)
             return _command_failure(command, error, evidence=coded, refused=_refused_before_running(error, policy))
         except ProtocolError as error:
-            return _command_failure(command, error, evidence=evidence)
+            self.attempts.record(error, policy)
+            return _shared_failure(command, error)
         return _command_success(command, command_response, evidence)
 
     async def _not_run(self, pending: tuple[_Command, ...], error: B24ApiError, *, safe: bool) -> tuple[_Command, ...]:
         """Proven nonexecution of the envelope: the ordinary bounded retry, whatever the safety class."""
+        self.attempts.classified(error, may_have_run=False)
+        self.attempts.record(error, self.context.policy)
         for command in pending:
-            self.last[command.index] = self._failure_after(command, error)
+            self.last[command.index] = _shared_failure(command, error)
         safety = ReplaySafety.SAFE if safe else ReplaySafety.UNKNOWN
         if _is_retryable(error, safety=safety, policy=self.context.policy) and await self.executor.pause_before_replay(
             self.context, attempts=self.attempts
@@ -182,10 +189,11 @@ class _V3Resolution:
     ) -> tuple[_Command, ...]:
         """Possible execution without attributable outcomes: an abort, a malformed result or a lost answer."""
         self.context.record_ambiguous_physical_attempt()
-        self.possibly_executed = True
+        self.attempts.classified(error, may_have_run=True)
+        self.attempts.record(error, self.context.policy)
         cooldown = await self._observe_abort_throttle(pending, error)
         for command in pending:
-            self.last[command.index] = _unknown(command, error)
+            self.last[command.index] = _shared_failure(command, error)
         if (
             safe
             and not self.envelope_retry_used
@@ -203,13 +211,9 @@ class _V3Resolution:
     def _stop(self, pending: tuple[_Command, ...], error: B24ApiError) -> tuple[_Command, ...]:
         """A round stopped before dispatch leaves each command the outcome it last received."""
         for command in pending:
-            self.last.setdefault(command.index, self._failure_after(command, error))
+            self.last.setdefault(command.index, _shared_failure(command, error))
         self._settle(pending)
         return ()
-
-    def _failure_after(self, command: _Command, error: B24ApiError) -> BatchOutcome:
-        """A failure proven not to have run this time; an earlier possible execution keeps it unknown."""
-        return _unknown(command, error) if self.possibly_executed else _shared_failure(command, error)
 
     def _settle(self, commands: Iterable[_Command]) -> None:
         for command in commands:
@@ -259,24 +263,26 @@ class _V3Resolution:
                 _attempts=lineage,
             )
         except B24ApiError as error:
-            return self._isolated_failure(command, error)
+            if lineage.used == spent:
+                # The executor records facts for its own sends; the envelope already sent this command.
+                lineage.record_unsent(error)
+            return _isolated_failure(command, error)
         finally:
             self.context.record_batch_isolation_requests(lineage.used - spent)
         return _command_success(command, response, BatchCommandEvidence(command.index, command.stable_key))
 
-    def _isolated_failure(self, command: _Command, error: B24ApiError) -> BatchOutcome:
-        """An individual answer attributes the failure; anything less leaves the command unknown."""
-        if isinstance(error, ApiResponseError):
-            evidence = BatchCommandEvidence(
-                command.index,
-                command.stable_key,
-                original_code=error.original_code,
-                normalized_code=error.normalized_code,
-            )
-            return _command_failure(command, error, evidence=evidence)
-        if _is_embedded_result_error(error) or _conclusive_gateway_error(error, self.context):
-            return _shared_failure(command, error)
-        return _unknown(command, error)
+
+def _isolated_failure(command: _Command, error: B24ApiError) -> BatchOutcome:
+    """An individual answer names its code; whether the command may have run is in the execution facts."""
+    if isinstance(error, ApiResponseError):
+        evidence = BatchCommandEvidence(
+            command.index,
+            command.stable_key,
+            original_code=error.original_code,
+            normalized_code=error.normalized_code,
+        )
+        return _command_failure(command, error, evidence=evidence)
+    return _shared_failure(command, error)
 
 
 def _envelope(commands: tuple[_Command, ...]) -> WireRequest:
@@ -303,41 +309,7 @@ def _complete_array(response: Response, expected: int) -> list[JsonValue] | None
 
 def _unstructured_refusal(error: B24ApiError, context: ExecutionContext) -> bool:
     """A listed unstructured refusal status proves the envelope was not accepted; a structured error never does."""
-    return (
-        isinstance(error, HTTPGatewayError)
-        and not isinstance(error, ApiResponseError | ProtocolError)
-        and _proves_not_run(error, context.policy)
-    )
-
-
-def _conclusive_gateway_error(error: B24ApiError, context: ExecutionContext) -> bool:
-    return (
-        isinstance(error, HTTPGatewayError)
-        and not isinstance(error, ProtocolError)
-        and error.http_status is not None
-        and error.http_status not in context.policy.ambiguity.ambiguous_unstructured_statuses
-    )
-
-
-def _unknown(command: _Command, error: B24ApiError) -> BatchFailure:
-    """Give one command a possible-execution outcome; it is never replayed automatically."""
-    if isinstance(error, ResponseTooLargeError):
-        reason = AmbiguityReason.RESPONSE_LIMIT_AFTER_DISPATCH
-    elif isinstance(error, BudgetExceededError) or isinstance(error.__cause__, TimeoutError):
-        reason = AmbiguityReason.DEADLINE_AFTER_DISPATCH
-    elif isinstance(error, TransportError):
-        reason = AmbiguityReason.CONNECTION_LOST_AFTER_DISPATCH
-    else:
-        reason = AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
-    ambiguous = AmbiguousExecutionError(
-        "REST v3 batch may have executed this command; automatic replay is forbidden",
-        reason=reason,
-        declared_unsafe=command.request.replay_safety is ReplaySafety.UNSAFE,
-        request_summary=command.request.summary,
-        evidence=error.evidence,
-    )
-    ambiguous.__cause__ = error
-    return _shared_failure(command, ambiguous)
+    return isinstance(error, HTTPGatewayError) and _proves_not_run(error, context.policy)
 
 
 __all__: list[str] = []

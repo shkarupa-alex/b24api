@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Literal
 from b24api._error_types import FailurePhase
 from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.json import _json_type_name
-from b24api.contracts.policy import AmbiguityReason, ExecutionPolicy
+from b24api.contracts.policy import ExecutionPolicy
 from b24api.contracts.request import ReplaySafety, Request, ResultErrorShape, diagnostic_context
 from b24api.contracts.response import (
     BinaryEvidence,
@@ -25,7 +25,6 @@ from b24api.contracts.response import (
     ResponseTime,
 )
 from b24api.errors import (
-    AmbiguousExecutionError,
     ApiResponseError,
     B24ApiError,
     BatchCommandError,
@@ -39,6 +38,14 @@ from b24api.errors import (
 )
 from b24api.execution.boundary import send_transport, send_wire_envelope
 from b24api.execution.context import CancellationMark, ExecutionContext, mark_cancellation
+from b24api.execution.facts import (
+    ambiguous_status,
+    answered_conclusively,
+    http_success,
+    possible_execution,
+    record_dispatch,
+    record_withheld,
+)
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
@@ -79,18 +86,77 @@ class _ParsedBody:
     failure: ValueError | None
 
 
+class _Settled(Enum):
+    """A latest send that leaves nothing open about whether the command ran."""
+
+    #: Nothing was sent yet.
+    NOTHING_SENT = "nothing_sent"
+    #: Answered conclusively, or proven refused.
+    ANSWERED = "answered"
+
+
+@dataclass(frozen=True, slots=True)
+class _PossiblyRun:
+    """A send that may have run; ``failure`` explains it once its answer was classified as proving nothing."""
+
+    failure: B24ApiError | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Lineage:
+    """What a command's sends leave open about whether it ran: the latest send, and whether one before it may have.
+
+    A send may have run from its dispatch until its answer is classified; a send before the latest that may have
+    run stays so, because no later answer proves anything about it.
+    """
+
+    latest: _Settled | _PossiblyRun = _Settled.NOTHING_SENT
+    earlier: _PossiblyRun | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse an earlier send before any send."""
+        if self.latest is _Settled.NOTHING_SENT and self.earlier is not None:
+            raise ValueError("a lineage with nothing sent has no earlier send")
+
+    @property
+    def unproven(self) -> B24ApiError | None:
+        """Return the failure of the latest send that may have run and whose failure is known."""
+        if isinstance(self.latest, _PossiblyRun) and self.latest.failure is not None:
+            return self.latest.failure
+        return None if self.earlier is None else self.earlier.failure
+
+    def dispatched(self) -> _Lineage:
+        """Return the lineage after one more send, which may have run until its answer is classified."""
+        earlier = _PossiblyRun(self.unproven) if isinstance(self.latest, _PossiblyRun) else self.earlier
+        return _Lineage(_PossiblyRun(), earlier)
+
+    def classified(self, failure: B24ApiError | None, *, may_have_run: bool) -> _Lineage:
+        """Return the lineage once the latest send's answer proved nothing (``failure`` explains it) or settled it."""
+        if self.latest is _Settled.NOTHING_SENT:
+            raise RuntimeError("a lineage with nothing sent has no answer to classify")
+        return _Lineage(_PossiblyRun(failure) if may_have_run else _Settled.ANSWERED, self.earlier)
+
+    def explains(self, error: BaseException, policy: ExecutionPolicy) -> bool:
+        """Return whether ``error`` leaves the latest send possibly run: it is what left it so, or settles nothing."""
+        latest = self.latest
+        return isinstance(latest, _PossiblyRun) and (
+            error is latest.failure or not answered_conclusively(error, policy)
+        )
+
+
 @dataclass(slots=True)
 class _RequestAttempts:
-    """Attempts and retry clock one request shares across its sends, including a batch's replay rounds."""
+    """Attempts, retry clock and execution lineage one request shares across its sends.
+
+    A batch's replay rounds and isolated sends share it too: each sends only commands that every earlier send
+    of the batch carried, so what the batch's sends leave open is what each of those commands' sends leave open.
+    """
 
     started: float | None = None
     used: int = 0
-    # Whether a send of the current batch round may have run: one before its last send, and the last one.
-    earlier_unproven: bool = False
-    last_unproven: bool = False
-    last_failure: B24ApiError | None = None
-    # The latest failure of the round that does not prove its send did not run: what an unknown outcome is about.
-    unproven_failure: B24ApiError | None = None
+    lineage: _Lineage = _Lineage()
+    # The latest failure a send ended with: the one a budget that stops the retry it asked for reports.
+    retry_cause: B24ApiError | None = None
 
     def begin(self, clock: Clock) -> tuple[float, int]:
         """Start the retry clock on the first send and return it with the attempts already spent."""
@@ -100,26 +166,56 @@ class _RequestAttempts:
 
     def dispatched(self) -> None:
         """Record a send, which may have run until its failure proves otherwise."""
-        self.earlier_unproven = self.earlier_unproven or self.last_unproven
-        self.last_unproven = True
+        self.lineage = self.lineage.dispatched()
         self.used += 1
 
     def settle(self, error: B24ApiError, policy: ExecutionPolicy) -> None:
         """Record how the last send failed; a budget that stops a retry reports the failure that asked for it."""
         if isinstance(error, BudgetExceededError):
             if error.__cause__ is None:
-                error.__cause__ = self.last_failure
+                error.__cause__ = self.retry_cause
             return
-        self.last_failure = error
-        if _proves_not_run(error, policy):
-            self.last_unproven = False
-        else:
-            self.unproven_failure = error
+        settled = _proves_not_run(error, policy) or answered_conclusively(error, policy)
+        self.classified(error, may_have_run=not settled)
 
-    def new_round(self) -> None:
-        """Forget which sends of the previous batch round may have run and how they failed."""
-        self.earlier_unproven = self.last_unproven = False
-        self.last_failure = self.unproven_failure = None
+    def classified(self, failure: B24ApiError | None, *, may_have_run: bool) -> None:
+        """Record how the last send ended: possibly run (``failure`` explains it), or answered or refused.
+
+        A batch dialect reads its own envelopes: an abort, a malformed or a lost answer leaves the envelope
+        possibly run, and an answer attributed to each command, or a proven refusal, settles it.
+        """
+        if failure is not None:
+            self.retry_cause = failure
+        self.lineage = self.lineage.classified(failure, may_have_run=may_have_run)
+
+    def record(self, error: BaseException, policy: ExecutionPolicy) -> None:
+        """Record on the failure that ended the request, or answered one of its commands, what its sends left open.
+
+        The failure explains itself when it leaves the latest send possibly run; otherwise the latest earlier send
+        that may have run explains the outcome.
+        """
+        explains_itself = self.lineage.explains(error, policy)
+        record_dispatch(
+            error,
+            possibly_executed=self.lineage.earlier is not None or explains_itself,
+            unproven=None if explains_itself else self.lineage.unproven,
+        )
+
+    def record_unsent(self, error: BaseException) -> None:
+        """Record a failure before a further send left: what the earlier sends left open stays open."""
+        lineage = self.lineage
+        record_dispatch(
+            error,
+            possibly_executed=lineage.earlier is not None or isinstance(lineage.latest, _PossiblyRun),
+            unproven=lineage.unproven,
+        )
+
+    def withhold(self, error: BaseException) -> None:
+        """Record a command the server halted before: proven not run by the last send, but not by earlier ones."""
+        if self.lineage.earlier is not None:
+            record_dispatch(error, possibly_executed=True, unproven=self.lineage.unproven)
+        else:
+            record_withheld(error)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,15 +251,7 @@ class _DecodedJsonObject(dict[str, object]):
         self.duplicate_names = tuple(duplicates)
 
 
-_HTTP_SUCCESS_MINIMUM = 200
-_HTTP_SUCCESS_MAXIMUM = 299
-_HTTP_REDIRECTION_MINIMUM = 300
 _HTTP_CLIENT_ERROR_MINIMUM = 400
-
-
-def _mark_dispatch_started(error: BaseException) -> None:
-    """Attach private request-local proof that an attempt crossed dispatch admission."""
-    error.__dict__["_b24api_dispatch_started"] = True
 
 
 class Executor:
@@ -242,7 +330,7 @@ class Executor:
             )
         except BaseException as error:
             if attempts.used > spent:
-                _mark_dispatch_started(error)
+                attempts.record(error, context.policy)
             raise
         try:
             response = _decode_success(wire, parsed, request_summary=request.summary)
@@ -254,7 +342,7 @@ class Executor:
                 redactor=self.codec.redactor,
             )
         except BaseException as error:
-            _mark_dispatch_started(error)
+            attempts.record(error, context.policy)
             raise
         return response
 
@@ -284,7 +372,7 @@ class Executor:
             )
         except BaseException as error:
             if attempts.used:
-                _mark_dispatch_started(error)
+                attempts.record(error, context.policy)
             raise
         content_type = wire.content_type
         digest = hashlib.sha256(wire.body).hexdigest() if context.policy.binary_digest else None
@@ -294,7 +382,7 @@ class Executor:
         )
         return BinaryResponse(wire.body, content_type=content_type, evidence=evidence, filename=filename)
 
-    async def _execute_wire_attempts(  # noqa: C901, PLR0913, PLR0915
+    async def _execute_wire_attempts(  # noqa: PLR0913
         self,
         request: Request,
         *,
@@ -350,9 +438,8 @@ class Executor:
 
             response_error, parsed = self._classify_response(request, wire, context=context, mode=mode)
             if response_error is None:
+                # An answer that arrives after the budget is still the answer: it is returned, never discarded.
                 cancellation.raise_if_requested()
-                if context.remaining_time(retry_started=retry_started) <= 0:
-                    raise BudgetExceededError("transport completed after execution time budget")
                 return wire, parsed
             code = response_error.normalized_code if isinstance(response_error, ApiResponseError) else None
             method_cooldown = (
@@ -367,9 +454,7 @@ class Executor:
                 )
                 await context.record_cooldown(merged)
             cancellation.raise_if_requested()
-            shared.settle(response_error, context.policy)
-            if context.remaining_time(retry_started=retry_started) <= 0:
-                raise BudgetExceededError("transport completed after execution time budget") from response_error
+            # A late failure meets the ambiguity rules first; the budget stops only a retry it would ask for.
             await self._prepare_retry(
                 request,
                 response_error,
@@ -429,7 +514,7 @@ class Executor:
             return _local_attempt_failure(error)
         cancellation = await mark_cancellation()
         await context.start()
-        retry_started, spent = attempts.begin(self._clock)
+        _started, spent = attempts.begin(self._clock)
         try:
             wire = await self._send_envelope(envelope, context=context, attempts=attempts, methods=methods)
         except asyncio.CancelledError as error:
@@ -445,9 +530,7 @@ class Executor:
                 return _dispatched_attempt("cancelled", error=asyncio.CancelledError())
             proven = isinstance(error, TransportError) and not error.possible_acceptance
             return _dispatched_attempt("error", error=error, proven_not_accepted=proven)
-        return await self._classify_envelope(
-            envelope, wire, context=context, retry_started=retry_started, cancellation=cancellation
-        )
+        return await self._classify_envelope(envelope, wire, context=context, cancellation=cancellation)
 
     async def _send_envelope(
         self,
@@ -500,7 +583,6 @@ class Executor:
         wire: WireResponse,
         *,
         context: ExecutionContext,
-        retry_started: float,
         cancellation: CancellationMark,
     ) -> PhysicalAttemptOutcome:
         """Classify one envelope response with the shared primitives, observing any host throttle hint."""
@@ -514,8 +596,6 @@ class Executor:
             await context.record_cooldown(merged)
         if cancellation.requested():
             return _dispatched_attempt("cancelled", wire=wire, error=asyncio.CancelledError())
-        if response_error is None and context.remaining_time(retry_started=retry_started) <= 0:
-            response_error = BudgetExceededError("transport completed after execution time budget")
         if response_error is not None:
             return _dispatched_attempt("error", wire=wire, error=response_error)
         try:
@@ -538,7 +618,7 @@ class Executor:
         An envelope with no canonical ``Request`` form passes ``request=None`` and its own ``summary``.
         """
         request_summary = request.summary if request is not None else summary
-        success = _HTTP_SUCCESS_MINIMUM <= wire.status_code <= _HTTP_SUCCESS_MAXIMUM
+        success = http_success(wire.status_code)
         if success and mode is _BodyMode.BINARY:
             return None, None
         parsed = None
@@ -558,9 +638,7 @@ class Executor:
         content_type = (wire.content_type or "").split(";", 1)[0].strip().casefold()
         if mode is _BodyMode.BINARY and content_type != "application/json" and not content_type.endswith("+json"):
             body = None
-        if wire.status_code < _HTTP_SUCCESS_MINIMUM or (
-            _HTTP_REDIRECTION_MINIMUM <= wire.status_code < _HTTP_CLIENT_ERROR_MINIMUM
-        ):
+        if not success and wire.status_code < _HTTP_CLIENT_ERROR_MINIMUM:  # an informational or redirect status
             return HTTPGatewayError(
                 f"HTTP gateway error {wire.status_code}",
                 request_summary=request_summary,
@@ -616,41 +694,11 @@ class Executor:
     ) -> None:
         shared.settle(error, context.policy)
         safety = request.replay_safety or ReplaySafety.UNKNOWN
-        if isinstance(error, ResponseTooLargeError) and safety is not ReplaySafety.SAFE:
-            raise AmbiguousExecutionError(
-                "Request may have executed before its oversized response was rejected",
-                reason=AmbiguityReason.RESPONSE_LIMIT_AFTER_DISPATCH,
-                declared_unsafe=safety is ReplaySafety.UNSAFE,
-                request_summary=request.summary,
-                evidence=error.evidence,
-            ) from error
-        if isinstance(error, TransportError) and error.possible_acceptance and safety is not ReplaySafety.SAFE:
-            reason = (
-                AmbiguityReason.DEADLINE_AFTER_DISPATCH
-                if isinstance(error.__cause__, TimeoutError)
-                else AmbiguityReason.CONNECTION_LOST_AFTER_DISPATCH
-            )
-            raise AmbiguousExecutionError(
-                "Request may have executed; automatic replay is forbidden",
-                reason=reason,
-                declared_unsafe=safety is ReplaySafety.UNSAFE,
-                request_summary=request.summary,
-                evidence=error.evidence,
-            ) from error
-        if (
-            isinstance(error, HTTPGatewayError)
-            and not isinstance(error, EnvelopeContractError)
-            and error.http_status is not None
-            and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
-            and error.http_status in context.policy.ambiguity.ambiguous_unstructured_statuses
-            and safety is not ReplaySafety.SAFE
-        ):
-            raise AmbiguousExecutionError(
-                "Request may have executed before the unstructured HTTP failure",
-                reason=AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH,
-                declared_unsafe=safety is ReplaySafety.UNSAFE,
-                request_summary=request.summary,
-                evidence=error.evidence,
+        # A send that may have run is never repeated for work that is not SAFE: the request ends unknown.
+        message = _possible_acceptance(error, context.policy)
+        if safety is not ReplaySafety.SAFE and message is not None:
+            raise possible_execution(
+                error, request_summary=request.summary, declared_unsafe=safety is ReplaySafety.UNSAFE, message=message
             ) from error
         # A physical batch follows the same rule with its combined safety (owner decision, 2026-09-25): SAFE is
         # replayed within the budget; UNSAFE/UNKNOWN only when the failure proves nothing ran.
@@ -671,6 +719,21 @@ class Executor:
         await context.record_retry()
         if throttle_delay is None and not method_cooldown and delay > 0:
             await self._sleep(delay)
+
+
+def _possible_acceptance(error: B24ApiError, policy: ExecutionPolicy) -> str | None:
+    """Say how a failed send may have been accepted: an oversized or lost answer, or an ambiguous status."""
+    if isinstance(error, ResponseTooLargeError):
+        return "Request may have executed before its oversized response was rejected"
+    if isinstance(error, TransportError):
+        return "Request may have executed; automatic replay is forbidden" if error.possible_acceptance else None
+    if (
+        isinstance(error, HTTPGatewayError)
+        and not isinstance(error, EnvelopeContractError)
+        and ambiguous_status(error.http_status, policy)
+    ):
+        return "Request may have executed before the unstructured HTTP failure"
+    return None
 
 
 def _local_attempt_failure(error: B24ApiError) -> PhysicalAttemptOutcome:
@@ -702,7 +765,7 @@ def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: Execution
             isinstance(error, HTTPGatewayError)
             and not isinstance(error, EnvelopeContractError)
             and error.http_status is not None
-            and not _HTTP_SUCCESS_MINIMUM <= error.http_status <= _HTTP_SUCCESS_MAXIMUM
+            and not http_success(error.http_status)
             and error.http_status in policy.retry.transient_http_statuses
         )
     return transient and (safety is ReplaySafety.SAFE or _proves_not_run(error, policy))
@@ -753,13 +816,7 @@ def _result_protocol_error(
     error = ProtocolError(message, request_summary=request.summary)
     error.observed_type = _json_type_name(observed)  # type: ignore[attr-defined]
     error.path = path  # type: ignore[attr-defined]
-    error.__dict__["_b24api_embedded_result"] = True
     return error
-
-
-def _is_embedded_result_error(error: BaseException) -> bool:
-    """Return whether a protocol error is a request-local embedded-result shape failure, not an envelope one."""
-    return isinstance(error, ProtocolError) and error.__dict__.get("_b24api_embedded_result") is True
 
 
 def _raise_embedded_result_error(  # noqa: C901, PLR0912, PLR0913

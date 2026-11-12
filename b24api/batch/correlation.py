@@ -1,20 +1,25 @@
 """Correlated per-command outcomes shared by the classic and the native v3 batch dialects."""
 
 from __future__ import annotations
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from b24api.batch.outcome import BatchCommandEvidence, BatchFailure, BatchSuccess
+from b24api.batch.outcome import BatchCommandEvidence, BatchFailure, BatchOutcome, BatchSuccess
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ReplaySafety, Request
 from b24api.errors import B24ApiError, ProtocolError, TransportError
+from b24api.execution.facts import ambiguity_of, record_withheld
 
 if TYPE_CHECKING:
     from b24api.contracts.response import Response
 
 
 class _BatchNotExecutedError(ProtocolError):
-    """Internal correlated marker for a fail-fast window stopped before dispatch."""
+    """Internal correlated marker of a command the server halted before or fail-fast stopped.
+
+    Its execution facts, not its type, say whether the command was proven not to run.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +59,31 @@ def _shared_failure(command: _Command, error: B24ApiError) -> BatchFailure:
         error,
         evidence=BatchCommandEvidence(command.index, command.stable_key),
     )
+
+
+def _by_facts(outcome: BatchOutcome) -> BatchOutcome:
+    """Give a failed command the outcome its execution facts call for; the batch dialects report only this.
+
+    Until a chunk's outcomes leave the engine, a failure keeps its own error and replay disposition, which
+    decide whether it is sent again; a command that may have run then carries the ambiguity that explains it.
+    """
+    if isinstance(outcome, BatchSuccess) or not isinstance(outcome.error, B24ApiError):
+        return outcome
+    ambiguity = ambiguity_of(
+        outcome.error,
+        request_summary=outcome.request.summary,
+        declared_unsafe=outcome.replay_safety is ReplaySafety.UNSAFE,
+    )
+    if ambiguity is None:
+        return outcome
+    return dataclasses.replace(outcome, error=ambiguity, replay_disposition=ReplayDisposition.NOT_ELIGIBLE)
+
+
+def _withheld(message: str, command: _Command) -> _BatchNotExecutedError:
+    """Mark a command fail-fast stopped before its envelope was sent: it was proven not to run."""
+    error = _BatchNotExecutedError(message, request_summary=command.request.summary)
+    record_withheld(error)
+    return error
 
 
 def _command_success(command: _Command, response: Response, evidence: BatchCommandEvidence) -> BatchSuccess:

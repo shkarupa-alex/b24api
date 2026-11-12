@@ -15,6 +15,7 @@ from b24api import BatchFailed, ExecutionPolicy, ReplaySafety, Request, RetryPol
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts import (
+    AmbiguityReason,
     Command,
     CommandFailure,
     CommandNotExecuted,
@@ -382,9 +383,10 @@ async def test_a21_embedded_safe_errors_are_attributed_by_index_without_resendin
     # The embedded API error keeps the classic batch type and its code.
     assert type(outcomes[1].error) is BatchCommandError
     assert outcomes[1].error.normalized_code == "item_locked"
-    assert isinstance(outcomes[2], CommandFailure)
-    assert type(outcomes[2].error) is ProtocolError
-    assert not isinstance(outcomes[2].error, ResultShapeError)
+    # A malformed embedded error proves nothing about what the command did, so it stays unknown.
+    assert isinstance(outcomes[2], CommandOutcomeUnknown)
+    assert type(outcomes[2].error.__cause__) is ProtocolError
+    assert not isinstance(outcomes[2].error.__cause__, ResultShapeError)
     assert report.physical_requests == 1
     assert report.ambiguous_physical_attempts == 0
     assert report.batch_isolation_requests == 0
@@ -896,26 +898,34 @@ def _poisoned(requests: tuple[Request, ...]) -> ScriptedExchange:
 
 
 @pytest.mark.asyncio
-async def test_a21_poison2_safe_abort_isolates_each_command_and_attributes_the_poisoned_one() -> None:
-    """A21-POISON2: 3 SAFE, the middle one permanently failing, one abort: S/F/S in 1+3 sends."""
+async def test_a21_poison2_safe_abort_isolates_each_command_and_leaves_the_poisoned_one_unknown() -> None:
+    """A21-POISON2: 3 SAFE, the middle one permanently failing, one abort: S/U/S in 1+3 sends.
+
+    The aborted envelope may have run the poisoned command, so its isolated refusal answers only the isolated
+    send: the command is unknown, explained by the envelope's abort.
+    """
     requests = (_v3(1), _v3(2), _v3(3))
     transport = ScriptedTransport(
         (
             _poisoned(requests),
             _direct(requests[0], {"result": _item(1)}),
-            _direct(requests[1], _abort("SYNTHETIC_NOT_FOUND"), status=400),
+            _direct(requests[1], _abort("ACCESS_DENIED"), status=400),
             _direct(requests[2], {"result": _item(3)}),
         ),
     )
 
     outcomes, report = await _run(transport, requests)
 
-    assert [type(outcome) for outcome in outcomes] == [CommandSuccess, CommandFailure, CommandSuccess]
-    assert isinstance(outcomes[1], CommandFailure)
-    assert isinstance(outcomes[1].error, ApiResponseError)
+    assert [type(outcome) for outcome in outcomes] == [CommandSuccess, CommandOutcomeUnknown, CommandSuccess]
+    assert isinstance(outcomes[1], CommandOutcomeUnknown)
+    ambiguity = outcomes[1].error
+    assert isinstance(ambiguity, AmbiguousExecutionError)
+    assert ambiguity.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    assert isinstance(ambiguity.__cause__, ApiResponseError)
+    assert ambiguity.__cause__.original_code == "SYNTHETIC_NOT_FOUND"
     assert [outcome.result for outcome in outcomes if isinstance(outcome, CommandSuccess)] == [_item(1), _item(3)]
     assert report.physical_requests == 1 + THREE
-    assert report.unknown == 0
+    assert report.unknown == 1
     assert report.ambiguous_physical_attempts == 1
     assert report.batch_isolation_requests == THREE
     # Isolated requests are ordinary API_V3 calls; they are never packed into a batch again.
@@ -968,6 +978,13 @@ async def test_a21_lineage_low_request_budget_leaves_unsent_isolation_unknown() 
     assert sum(isinstance(outcome, CommandSuccess) for outcome in outcomes) == 1
     assert sum(isinstance(outcome, CommandOutcomeUnknown) for outcome in outcomes) == TWO
     assert report.not_executed == 0
+    for outcome in outcomes:
+        if isinstance(outcome, CommandOutcomeUnknown):
+            # The unsent isolation leaves open only what the aborted envelope did: its reason and evidence.
+            assert isinstance(outcome.error, AmbiguousExecutionError)
+            assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+            assert outcome.error.evidence is not None
+            assert outcome.error.evidence.http_status == BAD_REQUEST
 
 
 @pytest.mark.asyncio

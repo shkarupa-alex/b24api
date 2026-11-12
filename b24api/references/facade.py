@@ -29,6 +29,7 @@ from b24api.contracts.reference import (
 )
 from b24api.contracts.report import KeysetSelectionSummary, TraversalAssurance
 from b24api.contracts.request import (
+    ReplaySafety,
     Request,
     RequestLike,
     ResultSelector,
@@ -46,7 +47,6 @@ from b24api.contracts.traversal import (
     TraversalSpec,
 )
 from b24api.errors import (
-    AmbiguousExecutionError,
     B24ApiError,
     CapabilityError,
     IncompleteTraversalError,
@@ -54,6 +54,7 @@ from b24api.errors import (
     PaginationError,
     ReferenceFailed,
 )
+from b24api.execution.facts import ambiguity_of
 from b24api.references.binding import BindingSource, _BindingContext, _BindingSourceError, binding_source
 from b24api.references.compatibility import source_incompatibility
 from b24api.references.dispatch import (
@@ -290,6 +291,20 @@ class _ReferenceEventMapper:
         if event.not_executed_reason is not None:
             return ReferenceNotExecuted(context.index, context.correlation, event.not_executed_reason)
         error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("reference failed")
+        # The variant follows the execution facts of the page that failed, as for a fan-out command.
+        ambiguity = ambiguity_of(
+            error,
+            request_summary=error.request_summary or event.request.summary,
+            declared_unsafe=event.replay_safety is ReplaySafety.UNSAFE,
+        )
+        if ambiguity is not None:
+            return ReferenceOutcomeUnknown(
+                context.index,
+                context.correlation,
+                ambiguity,
+                event.partial_rows,
+                event.replay_disposition,
+            )
         application_failure = isinstance(error, PageAdaptationError) and event.partial_rows == 0
         if isinstance(error, PaginationError) or (
             isinstance(error, CapabilityError) and event.page_state > 0 and not application_failure
@@ -302,14 +317,6 @@ class _ReferenceEventMapper:
                 replay_disposition=event.replay_disposition,
             )
             error.__cause__ = incomplete_cause
-        if isinstance(error, AmbiguousExecutionError):
-            return ReferenceOutcomeUnknown(
-                context.index,
-                context.correlation,
-                error,
-                event.partial_rows,
-                event.replay_disposition,
-            )
         return ReferenceFailure(
             context.index,
             context.correlation,
