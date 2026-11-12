@@ -107,6 +107,8 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
         await host.settle_lease(lease, view.lease.capacity)
         while rows := await runtime.next_rows():
             await _deliver(host, run, runtime, rows)
+        # At its terminal the binding adds no command: no wave waits for it during its cleanup and terminal event.
+        host.producer_state.retire(run.producer_key)
         closure, witnesses = runtime.completion_closure()
         await runtime.aclose()
         ledger.close(successful=True, reason=KernelState.COMPLETED.value, unsettled=CommandSettlement.NOT_EXECUTED)
@@ -128,6 +130,7 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
         raise
     except BaseException as error:
         # The scheduler's per-reference boundary turns the error into this binding's terminal event.
+        host.producer_state.retire(run.producer_key)
         if runtime is not None and not runtime.closed:
             await runtime.aclose()
         ledger.close(successful=False, reason=KernelState.FAILED.value, unsettled=_failed_settlement(error))
@@ -185,7 +188,8 @@ async def _deliver(
     await acknowledged
     run.partial_rows += len(rows)
     state.pending_continuations.discard(key)
-    state.runnable.add(key)
+    if continuing:
+        state.runnable.add(key)
     state.touch()
 
 

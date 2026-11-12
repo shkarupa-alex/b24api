@@ -200,7 +200,9 @@ Selection and validation operate on the response's existing frozen tree. A synch
 is invoked once at the two canonical row funnels (driver and fast-keyset receipt) before commit;
 published rows alone are thawed. Reference cursor drivers share a capacity-aware dispatcher whose
 absolute per-wave coalescing deadline defaults to 20 ms and is skipped when no eligible producer can
-add a command. A command whose task has started but has not reached the queue yet, such as a counted
+add a command. A pulled binding is a producer from the moment it leaves the source, before its task
+first runs, until it reaches its terminal: it stops counting before its cleanup and its terminal
+event. A local non-execution never is one. A command whose task has started but has not reached the queue yet, such as a counted
 tail page or a fast keyset wave command, counts as one about to arrive, under either delivery order,
 until it is queued or its task ends, since its producer may already have left the runnable set; one
 that must still reserve its logical page counts only while the page budget admits it. A counted tail
