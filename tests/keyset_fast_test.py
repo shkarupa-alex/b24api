@@ -54,6 +54,7 @@ from b24api.contracts.report import OperationReport, PageDispatch
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
+    BudgetExceededError,
     CapabilityError,
     EnvelopeContractError,
     IdentityContractError,
@@ -66,7 +67,7 @@ from b24api.execution import WireResponse
 from b24api.traversal import keyset_page_validation, keyset_plan
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
-from b24api.traversal.keyset_geometry import anchor_guesses, estimates
+from b24api.traversal.keyset_geometry import anchor_guesses, anchor_probe_count, estimates, partition_estimate
 from b24api.traversal.keyset_observation import FastTraceRecorder, PageObservation
 from tests.scripting import client_for
 
@@ -339,8 +340,9 @@ def _stream(
     *,
     direction: str = "ascending",
     writable_limit: bool = True,
+    policy: ExecutionPolicy | None = None,
 ):
-    return _client(transport).iter_list_keyset(
+    return _client(transport, policy=policy).iter_list_keyset(
         Request("item.list", parameters={"filter": {"STATUS": "open"}}, route=RouteKind.BARE),
         selector=ResultSelector.root(),
         identity=_identity(),
@@ -388,6 +390,7 @@ def test_zero_canary_partition_planning_always_has_a_positive_exact_wave_count(
         BoundaryFacts(5, 5, 1, 5, 996, 1000, False, False),
         effective_page_cap=5,
         batch_capacity=capacity,
+        available_rows=10_000,
         target_lanes=target_lanes,
         max_range_waves=20,
         range_window_width=None,
@@ -503,7 +506,7 @@ def test_frozen_selector_decision_table(
     capacity: int,
     expected: tuple[object, ...],
 ) -> None:
-    inputs = SelectorInputs(boundary, 50, capacity, 20, 2, None, completion, None)
+    inputs = SelectorInputs(boundary, 50, capacity, 50 * capacity, 20, 2, None, completion, None)
     selection = preselect(inputs)
     estimate = selection.range_estimate
     assert estimate is not None
@@ -524,47 +527,47 @@ def test_frozen_selector_decision_table(
     expected_details = {
         (BoundaryFacts(0, 0, None, None, None, None, False, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
             (0, 2, 0, 0, True),
-            (3, 1, 1, 1, 1),
+            (4, 21, 2, 1, 1),
         ),
         (BoundaryFacts(42, 42, 1, 42, 1, 42, True, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
             (1, 2, 0, 0, True),
-            (3, 1, 1, 1, 1),
+            (4, 21, 2, 1, 1),
         ),
         (BoundaryFacts(50, 50, 3, 300, 4400, 4600, False, False), KeysetPageCompletion.SHORT_PAGE_EXHAUSTS, 50): (
             (50, 1, 1, 0, True),
-            (3, 17, 1, 1, 1),
+            (3, 21, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 3, 300, 4400, 4600, False, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
             (10, 2, 2, 0, False),
-            (3, 17, 1, 1, 1),
+            (4, 21, 2, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 71, 120, False, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
             (20, 2, 1, 0, True),
-            (3, 1, 1, 1, 1),
+            (4, 21, 2, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 151, 200, False, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
             (49, 2, 1, 0, True),
-            (3, 2, 1, 1, 1),
+            (4, 21, 2, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 151, 200, False, False), KeysetPageCompletion.SHORT_PAGE_EXHAUSTS, 50): (
             (49, 1, 1, 0, True),
-            (3, 2, 1, 1, 1),
+            (3, 21, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 301, 350, False, False), KeysetPageCompletion.SHORT_PAGE_EXHAUSTS, 50): (
             (49, 1, 1, 0, True),
-            (3, 5, 1, 1, 1),
+            (3, 21, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 301, 350, False, False), KeysetPageCompletion.EMPTY_CONFIRMATION, 50): (
             (49, 2, 1, 0, True),
-            (3, 5, 1, 1, 1),
+            (4, 21, 2, 1, 1),
         ),
         (BoundaryFacts(50, 50, 1, 50, 510000, 1000000, False, False), KeysetPageCompletion.SHORT_PAGE_EXHAUSTS, 50): (
             (50, 1, 1, 0, True),
-            (3, 3, 1, 1, 1),
+            (3, 21, 1, 1, 1),
         ),
         (BoundaryFacts(50, 50, 3, 300, 4400, 4600, False, False), KeysetPageCompletion.SHORT_PAGE_EXHAUSTS, 1): (
             (50, 1, 17, 0, False),
-            (38, 17, 1, 17, 20),
+            (42, 21, 1, 21, 20),
         ),
     }
     expected_range, expected_partition = expected_details[(boundary, completion, capacity)]
@@ -892,11 +895,12 @@ async def test_adjacent_boundaries_select_prefix_assured_boundary_only() -> None
 
 def test_post_probe_range_preferred_transition_is_pinned() -> None:
     inputs = SelectorInputs(
-        BoundaryFacts(50, 50, 1, 50, 551, 600, False, False),
+        BoundaryFacts(50, 50, 1, 50, 5_051, 5_100, False, False),
         50,
-        10,
+        30,
+        100_000,
         20,
-        5,
+        10,
         None,
         KeysetPageCompletion.EMPTY_CONFIRMATION,
         None,
@@ -908,6 +912,570 @@ def test_post_probe_range_preferred_transition_is_pinned() -> None:
     assert selection.plan is Preselected.PROBE_ANCHORS
     assert final.kind is KeysetExecutionKind.RANGE
     assert final.reason is KeysetSelectionReason.POST_PROBE_RANGE_PREFERRED
+    assert (final.estimate.requests, final.estimate.pages) == (9, 207)  # 4 groups of 103 windows, 2 pages deep
+    # 103 windows and the finish page no longer fit once the probes spent the budget.
+    assert finalize(replace(inputs, remaining_pages=104), selection, AnchorFacts((), 20)) == final
+    short = finalize(replace(inputs, remaining_pages=103), selection, AnchorFacts((), 20))
+    assert short.reason is KeysetSelectionReason.POST_PROBE_GAIN_LOST
+
+
+def _two_eras(rows: int) -> tuple[int, ...]:
+    """Two dense halves of ``rows`` identities that a single jump separates."""
+    half = rows // 2
+    return (*range(1, half + 1), *range(half + 100_000, half + 100_000 + half))
+
+
+def _head_dense(rows: int) -> tuple[int, ...]:
+    """Dense boundary pages around an interior that holds every twentieth identity."""
+    interior = range(41, 41 + 20 * (rows - 40), 20)
+    return (*range(1, 21), *interior, *range(interior[-1] + 1, interior[-1] + 21))
+
+
+@pytest.mark.parametrize(
+    ("page_cap", "available_rows", "capacity", "tail_min", "expected"),
+    [
+        (50, 100_000, 48, 20_001, 20),  # target lanes fit a wave of the buffer
+        (50, 30_000, 48, 20_001, 32),  # finer lanes, one wave of probes
+        (50, 2_400, 48, 20_001, 96),  # two waves of probes bound the count
+        (50, 2_400, 48, 4_001, 79),  # a wave of 47-row lanes fits, but a lane never holds less than a page
+        (50, 500, 10, 20_001, 20),  # the ceiling never drops below target lanes
+        (2, 30, 15, 20_001, 28),  # the buffer retains 28 anchors beside one page
+        (5, 2_400, 48, 4_006, 84),  # 96 retained anchors leave 47 lanes 48 rows each beside a page
+    ],
+)
+def test_auto_probes_anchors_until_a_wave_of_lanes_fits_the_buffer(
+    page_cap: int,
+    available_rows: int,
+    capacity: int,
+    tail_min: int,
+    expected: int,
+) -> None:
+    inputs = SelectorInputs(
+        BoundaryFacts(page_cap, page_cap, 1, page_cap, tail_min, tail_min - 1 + page_cap, False, False),
+        page_cap,
+        capacity,
+        available_rows,
+        20,
+        2,
+        None,
+        KeysetPageCompletion.EMPTY_CONFIRMATION,
+        None,
+    )
+    selection = preselect(inputs)
+    partition = selection.partition_estimate
+    assert partition is not None
+    assert anchor_probe_count(inputs, selection.interior_rows_estimate, finish_requests=1) == expected
+    assert (selection.anchor_probes, partition.probes) == (expected, expected)
+    assert partition.planning_waves == -(-expected // capacity)
+
+
+@pytest.mark.parametrize(
+    ("anchors", "empty_below", "kind", "requests"),
+    [
+        ((400, 1_600), (), KeysetExecutionKind.SEQUENTIAL, 41),  # deepest lane 1,199 rows
+        ((400, 1_600), ((1_600, 1_000),), KeysetExecutionKind.PARTITIONED, 15),  # a probe saw 1,000..1,600 empty
+        ((1_000, 1_100), (), KeysetExecutionKind.PARTITIONED, 21),  # 949 rows below the first anchor: 18 full pages
+    ],
+)
+def test_post_probe_estimate_follows_the_deepest_lane_the_probes_left(
+    anchors: tuple[int, ...],
+    empty_below: tuple[tuple[int, int], ...],
+    kind: KeysetExecutionKind,
+    requests: int,
+) -> None:
+    inputs = SelectorInputs(
+        BoundaryFacts(50, 50, 1, 50, 2_001, 2_050, False, False),
+        50,
+        10,
+        1_000,
+        20,
+        2,
+        None,
+        KeysetPageCompletion.EMPTY_CONFIRMATION,
+        None,
+    )
+    selection = preselect(inputs)
+
+    final = finalize(inputs, selection, AnchorFacts(anchors, 0, empty_below))
+
+    assert selection.plan is Preselected.PROBE_ANCHORS
+    assert (final.kind, final.estimate.requests) == (kind, requests)
+
+
+@pytest.mark.parametrize(
+    ("tail_min", "capacity", "budget", "plan"),
+    [
+        (551, 10, (None, 11), Preselected.SEQUENTIAL),  # 11 windows and the finish page cannot fit
+        (551, 10, (None, 12), Preselected.RANGE),
+        (551, 10, (2, None), Preselected.SEQUENTIAL),  # two waves of windows and the finish
+        (551, 10, (3, None), Preselected.RANGE),
+        (5_051, 30, (None, 21), Preselected.SEQUENTIAL),  # 20 probes, a lane and the finish page cannot fit
+        (5_051, 30, (None, 22), Preselected.PROBE_ANCHORS),
+        (5_051, 30, (2, None), Preselected.SEQUENTIAL),  # a probe wave, a lane, the finish
+        (5_051, 30, (3, None), Preselected.PROBE_ANCHORS),
+    ],
+)
+def test_auto_refuses_only_fast_plans_whose_certain_cost_exceeds_the_budget(
+    tail_min: int,
+    capacity: int,
+    budget: tuple[int | None, int | None],
+    plan: Preselected,
+) -> None:
+    inputs = SelectorInputs(
+        BoundaryFacts(50, 50, 1, 50, tail_min, tail_min + 49, False, False),
+        50,
+        capacity,
+        100_000,
+        20,
+        10,
+        None,
+        KeysetPageCompletion.EMPTY_CONFIRMATION,
+        None,
+    )
+    free = preselect(inputs)
+    estimate = free.range_estimate if plan is Preselected.RANGE else free.partition_estimate
+    assert estimate is not None
+    assert estimate.pages > 22  # the estimate plays no part
+
+    assert preselect(replace(inputs, remaining_requests=budget[0], remaining_pages=budget[1])).plan is plan
+
+
+@pytest.mark.parametrize(
+    ("budget", "kind"),
+    [
+        ((None, 4), KeysetExecutionKind.PARTITIONED),  # 3 lanes and the finish page
+        ((None, 3), KeysetExecutionKind.SEQUENTIAL),
+        ((2, None), KeysetExecutionKind.PARTITIONED),  # a wave of lanes and the finish
+        ((1, None), KeysetExecutionKind.SEQUENTIAL),
+    ],
+)
+def test_post_probe_partitioning_needs_a_page_for_every_lane_it_found(
+    budget: tuple[int | None, int | None],
+    kind: KeysetExecutionKind,
+) -> None:
+    inputs = SelectorInputs(
+        BoundaryFacts(50, 50, 1, 50, 2_001, 2_050, False, False),
+        50,
+        10,
+        1_000,
+        20,
+        2,
+        None,
+        KeysetPageCompletion.EMPTY_CONFIRMATION,
+        None,
+    )
+    final = finalize(
+        replace(inputs, remaining_requests=budget[0], remaining_pages=budget[1]),
+        preselect(inputs),
+        AnchorFacts((1_000, 1_100), 0),
+    )
+
+    assert final.kind is kind
+
+
+@pytest.mark.parametrize(
+    ("anchors", "empty_below", "budget", "kind"),
+    [
+        # 3 lanes as deep as the 600 rows left between the anchors: 12 full and 2 end pages each, and
+        # the finish. Sequential traversal of what the probes left, with the lane ends, takes only 37.
+        ((400, 1_600), ((1_600, 1_000),), (None, 43), KeysetExecutionKind.PARTITIONED),
+        ((400, 1_600), ((1_600, 1_000),), (None, 42), KeysetExecutionKind.SEQUENTIAL),
+        # Sequential traversal of the 1,199 rows the probes left, the 2 anchors and the tail page takes
+        # 26 pages and the finish; the 3 lanes add 2 end pages each, the partitioned plan its finish.
+        # Its own estimate, 3 lanes of 425 rows, is 31.
+        ((475, 1_650), ((1_650, 900),), (None, 34), KeysetExecutionKind.PARTITIONED),
+        ((475, 1_650), ((1_650, 900),), (None, 33), KeysetExecutionKind.SEQUENTIAL),
+        ((400, 1_600), ((1_600, 1_000),), (2, None), KeysetExecutionKind.PARTITIONED),  # a lane wave, the finish
+        ((400, 1_600), ((1_600, 1_000),), (1, None), KeysetExecutionKind.SEQUENTIAL),
+    ],
+)
+def test_post_probe_switch_to_partitioning_needs_the_pages_of_sequential_traversal_and_of_its_own_plan(
+    anchors: tuple[int, ...],
+    empty_below: tuple[tuple[int, int], ...],
+    budget: tuple[int | None, int | None],
+    kind: KeysetExecutionKind,
+) -> None:
+    inputs = SelectorInputs(
+        BoundaryFacts(50, 50, 1, 50, 2_001, 2_050, False, False),
+        50,
+        10,
+        1_000,
+        20,
+        2,
+        None,
+        KeysetPageCompletion.EMPTY_CONFIRMATION,
+        None,
+    )
+    selection = preselect(inputs)
+    # At boundary density the rows between the anchors take too many waves; the probe that saw the
+    # range below the second anchor empty is what makes partitioning pay off.
+    blind = finalize(inputs, selection, AnchorFacts(anchors, 0))
+    assert blind.kind is KeysetExecutionKind.SEQUENTIAL
+
+    final = finalize(
+        replace(inputs, remaining_requests=budget[0], remaining_pages=budget[1]),
+        selection,
+        AnchorFacts(anchors, 0, empty_below),
+    )
+
+    assert final.kind is kind
+
+
+def _sparse_edged_eras(step: int, rows: int, gap: int) -> tuple[int, ...]:
+    """Two dense eras of ``rows`` identities ``gap`` apart, between boundary pages of every ``step``-th."""
+    head = range(1, PAGE_SIZE * step + 1, step)
+    first = range(head[-1] + 1, head[-1] + 1 + rows)
+    second = range(first[-1] + gap, first[-1] + gap + rows)
+    tail = range(second[-1] + step, second[-1] + step + PAGE_SIZE * step, step)
+    return (*head, *first, *second, *tail)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("identities", "max_pages"),
+    [
+        (_sparse_edged_eras(10, 500, 100_000), 224),
+        (_sparse_edged_eras(10, 300, 50_000), 144),
+        (_sparse_edged_eras(4, 400, 20_000), 184),
+    ],
+)
+async def test_auto_keeps_sequential_traversal_the_budget_fits_when_the_boundary_pages_undercount_the_interior(
+    identities: tuple[int, ...],
+    max_pages: int,
+) -> None:
+    # The sparse boundary pages put the eras at a tenth or a quarter of their rows: sequential
+    # traversal of what the probes left looks cheap, but the deepest lane's estimate does not fit.
+    transport = KeysetTransport(identities)
+    stream = _stream(
+        transport,
+        AutoKeysetExecution(StableIntegerKeysetContract()),
+        policy=ExecutionPolicy(max_buffered_rows=250, max_pages=max_pages),
+    )
+
+    assert [cast("dict[str, int]", row)["id"] async for row in stream] == list(identities)
+    report = stream.report
+    assert report is not None
+    keyset = report.keyset_execution
+    assert keyset is not None
+    assert (keyset.selected_kind, keyset.final_selection_reason, keyset.anchor_probe_commands) == (
+        KeysetExecutionKind.SEQUENTIAL,
+        KeysetSelectionReason.POST_PROBE_GAIN_LOST,
+        20,
+    )
+    assert report.logical_pages == max_pages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_pages", "kind", "requests"),
+    [
+        # The probes left 3,064 pages: the partitioned plan's own estimate, 3 lanes as deep as the
+        # 5,098 rows the boundary density puts below the second anchor (1,019 full and 2 end pages
+        # each) and the finish. It takes 423 pages in all; sequential traversal takes 422.
+        (3_086, KeysetExecutionKind.PARTITIONED, 355),
+        (3_085, KeysetExecutionKind.SEQUENTIAL, 402),
+    ],
+)
+async def test_auto_switches_to_partitioning_after_the_probes_only_while_the_budget_covers_its_estimate(
+    max_pages: int,
+    kind: KeysetExecutionKind,
+    requests: int,
+) -> None:
+    identities = _two_eras(2_000)
+    transport = KeysetTransport(identities)
+    stream = _stream(
+        transport,
+        AutoKeysetExecution(StableIntegerKeysetContract()),
+        policy=ExecutionPolicy(max_buffered_rows=250, max_pages=max_pages),
+    )
+
+    assert [cast("dict[str, int]", row)["id"] async for row in stream] == list(identities)
+    report = stream.report
+    assert report is not None
+    keyset = report.keyset_execution
+    assert keyset is not None
+    assert (keyset.selected_kind, keyset.anchor_probe_commands, len(transport.requests)) == (kind, 20, requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_pages", "probes", "requests"),
+    [
+        # Two boundary pages leave 690: the 20-lane plan's 462 and the 228 more pages of finer lanes.
+        (692, 96, 41),
+        (691, 20, 227),
+    ],
+)
+async def test_auto_cuts_lanes_finer_at_the_exact_page_budget_edge(max_pages: int, probes: int, requests: int) -> None:
+    transport = KeysetTransport(tuple(range(1, 2_001)))
+    stream = _stream(
+        transport,
+        AutoKeysetExecution(StableIntegerKeysetContract()),
+        policy=ExecutionPolicy(max_buffered_rows=250, max_pages=max_pages),
+    )
+
+    assert len([row async for row in stream]) == 2_000
+    report = stream.report
+    assert report is not None
+    keyset = report.keyset_execution
+    assert keyset is not None
+    assert (keyset.anchor_probe_commands, len(transport.requests)) == (probes, requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_requests", "probes"),
+    [
+        # The boundary request leaves 28: the 20-lane plan's 23 and 5 more of finer lanes. Neither plan
+        # finishes in so few, but the boundary request already spent counts against the budget.
+        (29, 96),
+        (28, 20),
+    ],
+)
+async def test_auto_cuts_lanes_finer_at_the_exact_request_budget_edge(max_requests: int, probes: int) -> None:
+    stream = _stream(
+        KeysetTransport(tuple(range(1, 2_001))),
+        AutoKeysetExecution(StableIntegerKeysetContract()),
+        policy=ExecutionPolicy(max_buffered_rows=250, max_requests=max_requests),
+    )
+
+    with pytest.raises(IncompleteTraversalError, match="command_failure") as captured:
+        _ = [row async for row in stream]
+    assert isinstance(captured.value.__cause__, BudgetExceededError)
+    report = stream.report
+    assert report is not None
+    keyset = report.keyset_execution
+    assert keyset is not None
+    assert keyset.anchor_probe_commands == probes
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected"),
+    [
+        ((None, None), 96),
+        # 20 probes and 21 lanes of 19 full pages, 2 end pages each, and the finish: 462 pages, then
+        # 76 more probes and 76 more lanes of 2 end pages each.
+        ((None, 690), 96),
+        ((None, 689), 20),
+        # A probe wave, a group of 19 full and 2 end waves, the finish: 23 requests, then a probe
+        # wave and 2 more groups of 2 end waves each.
+        ((28, None), 96),
+        ((27, None), 20),
+    ],
+)
+def test_auto_cuts_lanes_finer_only_while_the_budget_covers_the_target_lanes_plan_and_their_overhead(
+    budget: tuple[int | None, int | None],
+    expected: int,
+) -> None:
+    inputs = SelectorInputs(
+        BoundaryFacts(50, 50, 1, 50, 20_001, 20_050, False, False),
+        50,
+        48,
+        2_400,
+        20,
+        2,
+        None,
+        KeysetPageCompletion.EMPTY_CONFIRMATION,
+        None,
+        remaining_requests=budget[0],
+        remaining_pages=budget[1],
+    )
+    selection = preselect(inputs)
+    coarse = partition_estimate(inputs, lanes=21, lane_rows=950, probes=20, finish_requests=1)
+
+    assert (selection.interior_rows_estimate, coarse.requests, coarse.pages) == (19_950, 23, 462)
+    assert selection.anchor_probes == expected
+    assert anchor_probe_count(inputs, selection.interior_rows_estimate, finish_requests=1) == expected
+
+
+@pytest.mark.parametrize(("descending", "requests"), [(False, 79), (True, 80)])
+def test_sequential_estimate_leaves_out_the_boundary_page_already_admitted(
+    *,
+    descending: bool,
+    requests: int,
+) -> None:
+    inputs = SelectorInputs(
+        BoundaryFacts(50, 5, 1, 50, 4_001, 4_006, False, False),
+        50,
+        48,
+        2_400,
+        20,
+        2,
+        None,
+        KeysetPageCompletion.EMPTY_CONFIRMATION,
+        None,
+        descending=descending,
+    )
+    selection = preselect(inputs)
+
+    # 3,935 rows: ascending traversal admitted the 50-row head page, descending the 5-row tail page.
+    assert (selection.total_rows_estimate, selection.sequential_estimate.requests) == (3_935, requests)
+
+
+@pytest.mark.parametrize(("remaining_pages", "expected"), [(582, 96), (581, 20)])
+def test_auto_cuts_lanes_finer_only_while_the_finer_plan_estimate_fits_too(remaining_pages: int, expected: int) -> None:
+    inputs = SelectorInputs(
+        BoundaryFacts(50, 50, 1, 50, 19_951, 20_000, False, False),
+        50,
+        48,
+        2_400,
+        20,
+        2,
+        None,
+        KeysetPageCompletion.SHORT_PAGE_EXHAUSTS,
+        None,
+        remaining_pages=remaining_pages,
+    )
+    selection = preselect(inputs)
+    # 21 lanes of 948 rows round down to 18 full pages, 97 lanes of 206 rows to 4: the 20-lane plan's
+    # 420 pages and 76 more probes and lane ends come to 572, the 96-anchor plan's own estimate to 582.
+    coarse = partition_estimate(inputs, lanes=21, lane_rows=948, probes=20, finish_requests=1)
+    finer = partition_estimate(inputs, lanes=97, lane_rows=206, probes=96, finish_requests=1)
+
+    assert (selection.interior_rows_estimate, coarse.pages, finer.pages) == (19_900, 420, 582)
+    assert selection.anchor_probes == expected
+
+
+@pytest.mark.parametrize(("remaining_requests", "expected"), [(15, 44), (14, 20)])
+def test_auto_cuts_lanes_finer_only_while_the_finer_plan_request_estimate_fits_too(
+    remaining_requests: int,
+    expected: int,
+) -> None:
+    inputs = SelectorInputs(
+        BoundaryFacts(50, 50, 1, 50, 8_001, 8_050, False, False),
+        50,
+        22,
+        300,
+        20,
+        2,
+        None,
+        KeysetPageCompletion.SHORT_PAGE_EXHAUSTS,
+        None,
+        remaining_requests=remaining_requests,
+    )
+    selection = preselect(inputs)
+    # One group of 21 lanes, 7 full and 1 end page deep, after a probe wave: 10 requests, and a probe
+    # wave and two groups of lane ends more come to 13. The 45 lanes of 177 rows fill three groups
+    # 3 full pages deep, so the finer plan's own estimate is 15.
+    coarse = partition_estimate(inputs, lanes=21, lane_rows=379, probes=20, finish_requests=1)
+    finer = partition_estimate(inputs, lanes=45, lane_rows=177, probes=44, finish_requests=1)
+
+    assert (selection.interior_rows_estimate, coarse.requests, finer.requests) == (7_950, 10, 15)
+    assert selection.anchor_probes == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("identities", "kind", "probes", "ceiling"),
+    [
+        (tuple(range(1, 2_001)), KeysetExecutionKind.PARTITIONED, 96, 60),  # D20, 227 requests with 20 big lanes
+        (_head_dense(800), KeysetExecutionKind.PARTITIONED, 96, 40),  # 54 with 20 lanes
+        (_two_eras(2_000), KeysetExecutionKind.PARTITIONED, 20, 360),  # 402 sequentially after 20 probes
+    ],
+)
+async def test_auto_plans_a_selection_larger_than_the_buffer_in_lanes_a_wave_holds(
+    identities: tuple[int, ...],
+    kind: KeysetExecutionKind,
+    probes: int,
+    ceiling: int,
+) -> None:
+    transport = KeysetTransport(identities)
+    stream = _stream(
+        transport,
+        AutoKeysetExecution(StableIntegerKeysetContract()),
+        policy=ExecutionPolicy(max_buffered_rows=250),
+    )
+
+    assert [cast("dict[str, int]", row)["id"] async for row in stream] == list(identities)
+    report = stream.report
+    assert report is not None
+    keyset = report.keyset_execution
+    assert keyset is not None
+    assert (keyset.selected_kind, keyset.anchor_probe_commands) == (kind, probes)
+    assert len(transport.requests) <= ceiling
+
+
+@pytest.mark.asyncio
+async def test_auto_partition_estimate_holds_while_a_wave_of_lanes_fits_the_buffer() -> None:
+    transport = KeysetTransport(tuple(range(1, 2_001)))
+    stream = _stream(
+        transport,
+        AutoKeysetExecution(StableIntegerKeysetContract()),
+        policy=ExecutionPolicy(max_buffered_rows=2_500),
+    )
+
+    assert len([row async for row in stream]) == 2_000
+    report = stream.report
+    assert report is not None
+    keyset = report.keyset_execution
+    assert keyset is not None
+    assert keyset.selected_kind is KeysetExecutionKind.PARTITIONED
+    assert keyset.selected_requests_estimate == 12  # the lanes after the boundary page and the probe wave
+    assert len(transport.requests) == 13
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("identities", "max_pages"),
+    [
+        (_head_dense(800), 300),  # estimated at thousands of pages; 20 lanes take 209, finer ones 393
+        (tuple(range(1, 2_001)), 485),  # 20 lanes take 424 pages, finer ones 484; the gate asks 692
+    ],
+)
+async def test_auto_keeps_target_lanes_when_finer_lanes_would_not_fit_the_page_budget(
+    identities: tuple[int, ...],
+    max_pages: int,
+) -> None:
+    transport = KeysetTransport(identities)
+    stream = _stream(
+        transport,
+        AutoKeysetExecution(StableIntegerKeysetContract()),
+        policy=ExecutionPolicy(max_buffered_rows=250, max_pages=max_pages),
+    )
+
+    assert [cast("dict[str, int]", row)["id"] async for row in stream] == list(identities)
+    report = stream.report
+    assert report is not None
+    keyset = report.keyset_execution
+    assert keyset is not None
+    assert (keyset.selected_kind, keyset.anchor_probe_commands) == (KeysetExecutionKind.PARTITIONED, 20)
+
+
+@pytest.mark.asyncio
+async def test_auto_rechecks_the_certain_cost_after_the_probes_spent_pages() -> None:
+    stream = _stream(
+        KeysetTransport(tuple(range(1, 2_001))),
+        AutoKeysetExecution(StableIntegerKeysetContract()),
+        policy=ExecutionPolicy(max_buffered_rows=250, max_pages=32),
+    )
+
+    with pytest.raises(IncompleteTraversalError, match="budget_exhausted"):
+        _ = [row async for row in stream]
+    report = stream.report
+    assert report is not None
+    keyset = report.keyset_execution
+    assert keyset is not None
+    assert keyset.anchor_probe_commands == 20  # 20 probes, a lane and the finish fit 30 pages
+    assert keyset.final_selection_reason is KeysetSelectionReason.POST_PROBE_GAIN_LOST  # 21 lanes do not fit 10
+
+
+@pytest.mark.asyncio
+async def test_auto_leaves_out_the_identity_range_empty_anchor_probes_saw() -> None:
+    identities = (*range(1, 2_001), *range(1_000_000, 1_000_005))
+    stream = _stream(
+        KeysetTransport(identities),
+        AutoKeysetExecution(StableIntegerKeysetContract()),
+        policy=ExecutionPolicy(max_buffered_rows=250, max_pages=500_000, max_requests=500_000),
+    )
+
+    assert [cast("dict[str, int]", row)["id"] async for row in stream] == list(identities)
+    report = stream.report
+    assert report is not None
+    keyset = report.keyset_execution
+    assert keyset is not None
+    assert keyset.empty_anchor_probes == 95
+    assert keyset.selected_kind is KeysetExecutionKind.PARTITIONED
+    assert keyset.selected_requests_estimate == 2_086
 
 
 @pytest.mark.asyncio

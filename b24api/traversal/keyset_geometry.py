@@ -56,12 +56,30 @@ class SelectorInputs:
     boundary: BoundaryFacts
     effective_page_cap: int
     batch_capacity: int
+    available_rows: int
     target_lanes: int
     max_range_waves: int
     range_window_width: int | None
     completion: KeysetPageCompletion
     advisory_total: int | None
     descending: bool = False
+    remaining_requests: int | None = None
+    remaining_pages: int | None = None
+
+    def fits(self, *, requests: int = 0, pages: int = 0) -> bool:
+        """Return whether ``requests`` and ``pages`` fit what is left of the operation budget."""
+        return (self.remaining_requests is None or requests <= self.remaining_requests) and (
+            self.remaining_pages is None or pages <= self.remaining_pages
+        )
+
+    def admit(self, estimate: CostEstimate) -> CostEstimate:
+        """Keep a fast plan eligible only if its minimum cost fits the operation budget left.
+
+        The minimum cost (``min_requests``, ``min_pages``) never extrapolates the interior density, so
+        an over-counted interior does not rule a plan out; a plan is refused only when it must fail.
+        """
+        fits = self.fits(requests=estimate.min_requests, pages=estimate.min_pages)
+        return replace(estimate, eligible=estimate.eligible and fits)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,11 +96,83 @@ class CostEstimate:
     rows_per_window: int | None = None
     groups: int | None = None
     planning_waves: int | None = None
+    pages: int = 0
+    # What the plan must spend whatever the interior holds; the budget check uses only these.
+    min_requests: int = 0
+    min_pages: int = 0
+    # Anchor probes still to send, counted in the estimate.
+    probes: int = 0
+
+
+ANCHOR_PROBE_WAVES = 2
 
 
 def ceil_div(numerator: int, denominator: int) -> int:
     """Return integer ceiling division."""
     return (numerator + denominator - 1) // denominator
+
+
+def lane_end_pages(completion: KeysetPageCompletion) -> int:
+    """Return the pages the estimates assume a lane spends past its full pages.
+
+    The page the lane ends on, assumed not full, and an empty confirmation page where the completion
+    may need one to close a lane. A lane whose last page reaches its upper fence closes without the
+    confirmation, so the assumption usually over-counts dense lanes.
+    """
+    return 1 + int(completion is KeysetPageCompletion.EMPTY_CONFIRMATION)
+
+
+def lane_overhead(inputs: SelectorInputs, *, probes: int, lanes: int) -> tuple[int, int]:
+    """Return the requests and logical pages the estimates add to the full pages of the rows.
+
+    Every probe is a page, ``batch_capacity`` probes a wave; every lane is assumed to spend its end
+    pages, every group of ``batch_capacity`` lanes as many waves.
+    """
+    end, capacity = lane_end_pages(inputs.completion), inputs.batch_capacity
+    return (
+        ceil_div(probes, capacity) + ceil_div(lanes, capacity) * end,
+        probes + lanes * end,
+    )
+
+
+def anchor_probe_count(inputs: SelectorInputs, interior_rows: int, *, finish_requests: int) -> int:
+    """Return how many anchors automatic partitioning probes.
+
+    ``target_lanes``, or more when lanes that many would hold more rows than a full wave of lanes can
+    keep in the row buffer beside the retained anchors: up to ``ANCHOR_PROBE_WAVES`` waves of probes
+    and as many anchors as the buffer retains beside one page. Every extra probe and every extra lane
+    spends pages the ``target_lanes`` plan does not, so the finer lanes are kept only while what is
+    left of the operation budget covers the ``target_lanes`` plan's estimate plus that difference, and
+    the finer plan's own estimate, which rounds its lanes' rows to pages on its own.
+    """
+    cap, capacity, target = inputs.effective_page_cap, inputs.batch_capacity, inputs.target_lanes
+    if capacity < 1:
+        return target  # no wave fits, so no plan partitions
+    ceiling = max(target, min(capacity * ANCHOR_PROBE_WAVES, inputs.available_rows - cap))
+    lane_room = (inputs.available_rows - ceiling - cap) // max(1, capacity - 1)
+    probes = min(ceiling, max(target, ceil_div(interior_rows, max(cap, lane_room))))
+    if probes == target:
+        return target
+    coarse = _partition_plan(inputs, interior_rows, probes=target, finish_requests=finish_requests)
+    finer = _partition_plan(inputs, interior_rows, probes=probes, finish_requests=finish_requests)
+    finer_requests, finer_pages = lane_overhead(inputs, probes=probes, lanes=probes + 1)
+    coarse_requests, coarse_pages = lane_overhead(inputs, probes=target, lanes=target + 1)
+    fits = inputs.fits(
+        requests=max(finer.requests, coarse.requests + finer_requests - coarse_requests),
+        pages=max(finer.pages, coarse.pages + finer_pages - coarse_pages),
+    )
+    return probes if fits else target
+
+
+def _partition_plan(inputs: SelectorInputs, interior_rows: int, *, probes: int, finish_requests: int) -> CostEstimate:
+    lanes = probes + 1
+    return partition_estimate(
+        inputs,
+        lanes=lanes,
+        lane_rows=ceil_div(interior_rows, lanes),
+        probes=probes,
+        finish_requests=finish_requests,
+    )
 
 
 def selected_range_geometry(
@@ -134,12 +224,7 @@ def estimates(
     """Compute every frozen candidate formula from integer observations."""
     span, numerator, denominator, interior_rows, all_rows = _geometry(inputs)
     cap, capacity = inputs.effective_page_cap, inputs.batch_capacity
-    admitted_head_rows = inputs.boundary.tail_rows if inputs.descending else inputs.boundary.head_rows
-    sequential = CostEstimate(
-        KeysetExecutionKind.SEQUENTIAL,
-        max(1, ceil_div(max(0, all_rows - admitted_head_rows), cap)) + finish_requests,
-        eligible=True,
-    )
+    sequential = sequential_estimate(inputs, all_rows, finish_requests=finish_requests)
     if capacity < 1:
         unavailable = CostEstimate(KeysetExecutionKind.RANGE, 0, eligible=False)
         partition = CostEstimate(KeysetExecutionKind.PARTITIONED, 0, eligible=False)
@@ -154,35 +239,76 @@ def estimates(
     )
     windows = (span + width - 2) // (width - 1) if span else 0
     rows_per_window = ceil_div((width - 1) * numerator, denominator)
-    range_depth = max(1, ceil_div(rows_per_window, cap)) + int(
-        inputs.completion is KeysetPageCompletion.EMPTY_CONFIRMATION,
-    )
+    # A window fills the pages before the one holding its last row, then spends a lane's end pages.
+    range_depth = (max(1, rows_per_window) - 1) // cap + lane_end_pages(inputs.completion)
     groups = ceil_div(windows, capacity) if windows else 0
-    range_estimate = CostEstimate(
-        KeysetExecutionKind.RANGE,
-        groups * range_depth + finish_requests,
-        groups * range_depth <= inputs.max_range_waves,
-        width,
-        windows,
-        None,
-        range_depth,
-        rows_per_window,
-        groups,
-        0,
+    range_estimate = inputs.admit(
+        CostEstimate(
+            KeysetExecutionKind.RANGE,
+            groups * range_depth + finish_requests,
+            groups * range_depth <= inputs.max_range_waves,
+            width,
+            windows,
+            None,
+            range_depth,
+            rows_per_window,
+            groups,
+            0,
+            pages=windows * range_depth + finish_requests,
+            # Every window is read at least once, at most ``batch_capacity`` windows a wave.
+            min_requests=groups + finish_requests,
+            min_pages=windows + finish_requests,
+        ),
     )
-    lanes = min(inputs.target_lanes, max(1, ceil_div(interior_rows, cap)))
-    partition_depth = max(1, ceil_div(interior_rows, lanes * cap))
-    planning_waves = max(1, ceil_div(inputs.target_lanes, capacity))
-    partition = CostEstimate(
+    probes = anchor_probe_count(inputs, interior_rows, finish_requests=finish_requests)
+    partition = inputs.admit(_partition_plan(inputs, interior_rows, probes=probes, finish_requests=finish_requests))
+    return sequential, range_estimate, partition, (span, numerator, denominator, interior_rows, all_rows)
+
+
+def sequential_estimate(inputs: SelectorInputs, all_rows: int, *, finish_requests: int) -> CostEstimate:
+    """Estimate sequential traversal of ``all_rows`` rows past the boundary page already admitted."""
+    admitted_head_rows = inputs.boundary.tail_rows if inputs.descending else inputs.boundary.head_rows
+    requests = max(1, ceil_div(max(0, all_rows - admitted_head_rows), inputs.effective_page_cap)) + finish_requests
+    return CostEstimate(KeysetExecutionKind.SEQUENTIAL, requests, eligible=True, pages=requests)
+
+
+def partition_estimate(
+    inputs: SelectorInputs,
+    *,
+    lanes: int,
+    lane_rows: int,
+    probes: int,
+    finish_requests: int,
+) -> CostEstimate:
+    """Estimate ``probes`` anchor probes still to send, then ``lanes`` lanes of up to ``lane_rows`` rows.
+
+    Every wave advances up to ``batch_capacity`` lanes by one page, so each group of that many lanes
+    takes as many waves as its deepest lane has pages: its full pages and its end pages. That holds
+    while a group of lanes keeps its rows in the row buffer; behind a smaller buffer, later lanes wait
+    for the earlier ones to close and the selection takes more waves than estimated.
+
+    The minimum cost is every probe, and one page for each lane: all ``lanes`` once the anchors are
+    known (no probe left), only one while they come from probes still to send.
+    """
+    cap, capacity = inputs.effective_page_cap, inputs.batch_capacity
+    overhead_requests, overhead_pages = lane_overhead(inputs, probes=probes, lanes=lanes)
+    full_pages = lane_rows // cap
+    groups = ceil_div(lanes, capacity)
+    known_lanes = 1 if probes else lanes
+    planning_waves = ceil_div(probes, capacity)
+    return CostEstimate(
         KeysetExecutionKind.PARTITIONED,
-        planning_waves + ceil_div(lanes, capacity) * partition_depth + finish_requests,
+        overhead_requests + groups * full_pages + finish_requests,
         eligible=True,
         lane_count=lanes,
-        depth=partition_depth,
-        groups=ceil_div(lanes, capacity),
+        depth=full_pages + lane_end_pages(inputs.completion),
+        groups=groups,
         planning_waves=planning_waves,
+        pages=overhead_pages + lanes * full_pages + finish_requests,
+        min_requests=planning_waves + ceil_div(known_lanes, capacity) + finish_requests,
+        min_pages=probes + known_lanes + finish_requests,
+        probes=probes,
     )
-    return sequential, range_estimate, partition, (span, numerator, denominator, interior_rows, all_rows)
 
 
 def range_window_width(  # noqa: PLR0913
@@ -296,18 +422,24 @@ def partition_lane_specs(
 
 
 __all__ = [
+    "ANCHOR_PROBE_WAVES",
     "BoundaryDensity",
     "BoundaryFacts",
     "CostEstimate",
     "SelectorInputs",
     "anchor_guesses",
+    "anchor_probe_count",
     "boundary_density",
     "ceil_div",
     "closure_witness",
     "descending_closure_witness",
     "estimates",
+    "lane_end_pages",
+    "lane_overhead",
     "normalize_anchors",
+    "partition_estimate",
     "partition_lane_specs",
     "range_window_width",
     "selected_range_geometry",
+    "sequential_estimate",
 ]

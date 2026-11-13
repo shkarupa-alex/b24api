@@ -259,24 +259,29 @@ class KeysetPlanner:
         if not isinstance(execution, AutoKeysetExecution):
             raise TypeError("automatic selection requires auto execution")
         facts = self.facts
-        inputs = SelectorInputs(
-            analysis.facts,
-            self.effective_page_cap,
-            host.batch_capacity,
-            execution.target_lanes,
-            execution.max_range_waves,
-            execution.range_window_width,
-            self.completion,
-            facts.total_hint.observed if facts.total_hint.plausible else None,
-            self.keyset.direction == "descending",
+        inputs = await self._budget_left(
+            host,
+            SelectorInputs(
+                analysis.facts,
+                self.effective_page_cap,
+                host.batch_capacity,
+                available_rows,
+                execution.target_lanes,
+                execution.max_range_waves,
+                execution.range_window_width,
+                self.completion,
+                facts.total_hint.observed if facts.total_hint.plausible else None,
+                self.keyset.direction == "descending",
+            ),
         )
+        initial = preselect(inputs)
         preselection = constrain_anchor_preselection(
-            preselect(inputs),
+            initial,
             anchor_capacity=anchor_capable_batch_capacity(
                 current=host.batch_capacity,
                 available_rows=available_rows,
                 page_cap=self.effective_page_cap,
-                target_lanes=execution.target_lanes,
+                target_lanes=initial.anchor_probes,
             ),
         )
         facts.preselection, facts.reason = preselection, preselection.reason
@@ -295,8 +300,8 @@ class KeysetPlanner:
         elif preselection.plan is Preselected.RANGE:
             selected = KeysetExecutionKind.RANGE
         else:
-            anchors = await self._partition_planning(host, asc, desc, execution.target_lanes)
-            facts.final = finalize(inputs, preselection, AnchorFacts(tuple(anchors), facts.empty_anchor_probes))
+            probed = await self._partition_planning(host, asc, desc, preselection.anchor_probes)
+            facts.final = finalize(await self._budget_left(host, inputs), preselection, probed)
             selected = facts.final.kind
             if selected is not KeysetExecutionKind.PARTITIONED:
                 host.admission.record_discarded(facts.anchor_count)
@@ -315,6 +320,17 @@ class KeysetPlanner:
         facts.target_lanes = execution.target_lanes
         return selected
 
+    @staticmethod
+    async def _budget_left(host: KeysetTransactionHost, inputs: SelectorInputs) -> SelectorInputs:
+        """Return the selector inputs with the requests and logical pages the operation budget leaves."""
+        counters = (await host.context.snapshot()).counters
+        policy = host.context.policy
+        return replace(
+            inputs,
+            remaining_requests=policy.max_requests - counters.physical_requests,
+            remaining_pages=policy.max_pages - counters.logical_pages,
+        )
+
     async def _select_explicit(
         self,
         host: KeysetTransactionHost,
@@ -326,9 +342,11 @@ class KeysetPlanner:
             self.facts.reason = KeysetSelectionReason.EXPLICIT_RANGE
             return KeysetExecutionKind.RANGE
         if isinstance(self.execution, PartitionedKeysetExecution):
-            anchors = await self._partition_planning(host, asc, desc, self.execution.target_lanes)
+            probed = await self._partition_planning(host, asc, desc, self.execution.target_lanes)
             self.facts.reason = (
-                KeysetSelectionReason.EXPLICIT_PARTITIONED if anchors else KeysetSelectionReason.DEGENERATE_SINGLE_LANE
+                KeysetSelectionReason.EXPLICIT_PARTITIONED
+                if probed.anchors
+                else KeysetSelectionReason.DEGENERATE_SINGLE_LANE
             )
             self.facts.target_lanes = self.execution.target_lanes
             return KeysetExecutionKind.PARTITIONED
@@ -353,10 +371,11 @@ class KeysetPlanner:
         asc: LaneReceipt,
         desc: LaneReceipt,
         target: int,
-    ) -> tuple[int, ...]:
+    ) -> AnchorFacts:
         precharged = 0
         try:
             anchors = build_anchor_plans(host, asc, desc, target)
+            guesses = {plan.command_id: self._probe_guess(host, plan) for plan in anchors}
             self.facts.anchor_probe_commands = len(anchors)
             anchor_receipts = await self._anchor_waves(host, anchors) if anchors else ()
             precharged = sum(bool(receipt.rows) for receipt in anchor_receipts)
@@ -369,7 +388,10 @@ class KeysetPlanner:
             )
             raise
         result = normalize_anchor_receipts(
-            anchor_receipts, lo=max(asc.identities), upper_exclusive=min(desc.identities)
+            anchor_receipts,
+            lo=max(asc.identities),
+            upper_exclusive=min(desc.identities),
+            guesses=guesses,
         )
         host.transactions.anchor_rows = result.rows
         host.transactions.anchor_commands = result.commands
@@ -378,7 +400,14 @@ class KeysetPlanner:
         host.admission.record_raw(result.raw_rows - precharged)
         host.admission.record_discarded(result.discarded_rows)
         await host.adjust_buffer(self.facts.anchor_count - precharged)
-        return result.anchors
+        return AnchorFacts(result.anchors, result.empty_probes, result.empty_below)
+
+    @staticmethod
+    def _probe_guess(host: KeysetTransactionHost, plan: LaneCommandPlan) -> int:
+        lower = host.transactions.planning_bounds[plan.command_id].lower_exclusive
+        if lower is None:
+            raise RuntimeError("anchor probe lost its guess")
+        return lower
 
     async def _anchor_waves(
         self,

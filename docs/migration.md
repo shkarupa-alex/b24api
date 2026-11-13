@@ -1,5 +1,91 @@
 # Migration guide
 
+## Auto keyset partitioning under a small row buffer
+
+- **Auto sizes partition lanes to the row buffer.** `AutoKeysetExecution` probed `target_lanes`
+  anchors (20 by default) whatever `ExecutionPolicy.max_buffered_rows` allowed. Rows of a lane behind
+  the first open one stay buffered until the lanes before it close, so when the selection outgrew the
+  buffer, its twenty lanes filled the buffer and then advanced one at a time: 20,000 dense rows with
+  page 50 and the default 2,500 buffered rows took 227 requests against an estimate of 21. Auto now
+  probes more anchors when lanes `target_lanes` many would hold more rows than a full wave of lanes
+  can keep in the buffer left after the boundary pages and the retained anchors: up to two waves of
+  probes (twice the batch capacity), and no more anchors than the buffer retains beside one page. The
+  same selection takes 62 requests. The report's `anchor_probe_commands` shows how many anchors were
+  probed; `target_lanes` still reports the configured value.
+- **Finer lanes spend more logical pages, so the budget decides.** Every extra probe is a page, and
+  extra lanes split the same rows over more pages that are not full; the selection above reads 580
+  logical pages with 96 anchors against 424 with 20. Auto cuts lanes finer only while what is left of
+  `max_pages` and `max_requests` covers the estimate of the `target_lanes` plan plus the extra cost
+  the estimate assumes: one page per extra probe and, per extra lane, an end page it does not fill
+  plus, under `EMPTY_CONFIRMATION`, an empty confirmation page; one request per extra wave of probes
+  and one, or two under `EMPTY_CONFIRMATION`, per extra batch-capacity group of lanes. It must also
+  cover the finer plan's own estimate, which can be a few pages higher because each lane's rows round
+  to pages separately. Above, that is 441 plus 228 pages, and 679 for the finer plan, after the two
+  boundary pages, so `max_pages` of 681 or more; with less, Auto probes `target_lanes` anchors and
+  plans as before. The assumed extra cost is often generous: dense lanes close on their last row
+  without a confirmation page, so above the 96 anchors cost 156 more pages, not 228, and a
+  `max_pages` from 580 to 680 gets the 20-lane plan's 227 requests although the finer lanes would
+  have finished in 62.
+- **The gain is bounded.** At most two waves of probes are sent, so the larger the selection, the
+  less of the buffer problem finer lanes solve: 50,000 and 100,000 dense rows (page 50, 2,500
+  buffered rows) take 300 and 1,224 requests, against 790 and 1,790 before and against 24 and 45 for
+  an explicit `RangeKeysetExecution`. With `batch_size=10` two waves of probes are no more than the
+  20 target lanes, so the 20,000-row selection still takes 183 requests.
+- **Estimates count every lane's end pages.** A partition estimate gives each lane its full pages
+  plus its end pages (the page it ends on and, under `EMPTY_CONFIRMATION`, the confirmation page), and
+  counts the probes plus one lanes before probing, so `selected_requests_estimate` for a partitioned
+  plan can be a wave or so higher than before. It assumes every wave advances a batch-capacity group
+  of lanes by one page. Behind a row buffer that cannot hold such a group's rows, later lanes wait for
+  the earlier ones to close, and the estimate is optimistic: the selection above is estimated at 19
+  requests and takes 62. After probing, the estimate follows the deepest lane and leaves out identity
+  ranges a probe found empty: those between a probe's starting point and the anchor it returned, or
+  the tail boundary when it returned nothing.
+- **Empty ranges the probes find can switch Auto to partitioning.** When lanes at the boundary
+  density would not pay off but lanes without those empty ranges do, Auto partitions only while what
+  is left of `max_pages` covers the estimate of sequential traversal of the rows the probes could not
+  rule out plus every lane's end pages and the finish page, and the partitioned plan's own estimate,
+  which counts every lane as deep as the deepest; otherwise it traverses sequentially
+  (`post_probe_gain_lost`) as before. Two dense eras of 10,000 rows a million identities apart, page
+  50, now take 355 requests instead of 402.
+- **Auto refuses fast plans whose minimum cost exceeds the operation budget.** Auto did not consult
+  `max_requests` or `max_pages` when choosing. It now refuses range or partitioned execution when
+  the plan's minimum cost (what it spends whatever the interior holds) exceeds what is left of
+  either, checked before choosing and again after the anchor probes, and takes the other fast plan
+  if it fits and pays off (range traversal, also after the probes), or traverses sequentially
+  (`insufficient_predicted_gain`, or `post_probe_gain_lost` after probing). The minimum cost does not extrapolate the interior:
+  - range: one page per window plus the finish page, and one wave per batch capacity of windows plus
+    the finish request;
+  - partitioning, before probing: one page per probe, one lane page and the finish page, and the
+    probe waves, one lane wave and the finish request;
+  - partitioning, after probing: one page per lane and the finish page, and one wave per batch
+    capacity of lanes plus the finish request.
+
+  Explicit `RangeKeysetExecution` and `PartitionedKeysetExecution` are unchanged.
+- **Small sparse-edged selections may traverse sequentially.** Counting every lane's end pages makes
+  the partition estimate higher, so where sparse boundary pages also make the sequential estimate
+  too low, Auto now traverses sequentially: 2,000 rows with sparse edges, page 50 and
+  `EMPTY_CONFIRMATION` take 41 requests where they took 14 to 23 with 20 lanes.
+- **Under a tight budget, Auto can fail where the previous release fitted.** Auto chooses its plan,
+  the number of lanes and the switch after the probes from estimates extrapolated from the density
+  of the boundary pages. None of these choices is guaranteed to fit what is left of a `max_pages` or
+  `max_requests` set close to the need, and a choice that differs from the previous release's can
+  fail where that one fitted:
+  - the interior is denser than the boundary pages, so a plan needs more pages than estimated;
+  - finer lanes cost more than the extra cost the estimate assumes for them, by up to about 12 pages
+    or 17 requests;
+  - the switch to partitioning after the probes reads more pages than sequential traversal would
+    have.
+
+  Such a run ends on the exhausted budget as any traversal does (`iter_list_keyset()` raises
+  `IncompleteTraversalError`); rows already yielded are a correct prefix and the buffer and budget
+  bounds hold. Over 44,682 tight-budget points this happened at 631, while 4,065 points that failed
+  before now finish, and no point of the measured grid fails at the default budgets. The default
+  `max_pages` and `max_requests` are budgets like any other, though: a selection whose need comes close
+  to them can fail the same way (495,000 rows at page 50 with a sparse first and last 200 identities
+  take 9,927 pages in the previous release's 20 lanes and run out of the 10,000 in finer lanes). To get
+  a predictable page and request need under a tight budget, pass an explicit strategy:
+  `SequentialKeysetExecution()` or `RangeKeysetExecution`.
+
 ## `INPUT` delivery reads reference pages ahead
 
 - **Physical batches fill up under `DeliveryOrder.INPUT`.** A reference binding of `iter_references()`,
