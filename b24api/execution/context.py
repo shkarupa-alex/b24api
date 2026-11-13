@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 from b24api.contracts.policy import BudgetCounters, ExecutionPolicy
-from b24api.errors import (
-    BudgetExceededError,
-)
+from b24api.errors import BudgetExceededError, CleanupOverrunError
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     from b24api.execution.rate import RateCoordinator
 
@@ -20,6 +19,16 @@ if TYPE_CHECKING:
 
 
 REQUEST_BUDGET_EXHAUSTED = "physical request budget exhausted"
+# A request's own retry window closed before the operation's deadline: that request alone is refused, whatever the
+# work it was refused (``ExecutionContext.time_left``), and the operation goes on.
+RETRY_WINDOW_EXHAUSTED = "per-request retry time budget exhausted"
+
+# The least time a cleanup step may wait for what it closes: a caller source's close, or the workers and tasks the
+# operation cancelled. Cleanup runs when the operation ends, which is often because ``max_elapsed`` ran out, so the
+# time left is then zero; a close that ends at once still needs a few loop turns, and a synchronous source's close a
+# worker-thread hop. The grace lets such a close finish, so the budget's end is never reported as a cleanup failure,
+# while a close that really blocks overruns the budget by at most this much per step.
+CLEANUP_GRACE_SECONDS = 0.1
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +94,9 @@ class ExecutionContext:
         self._physical_requests = 0
         # Set once the request budget refuses a send: the count never falls, so no later send can be admitted.
         self._requests_refused = False
+        # The first refusal of work by the request budget or the operation's deadline (a send, a page, an admission
+        # or a pull), which ends the operation: neither budget comes back, so no later work can be admitted either.
+        self._refusal: str | None = None
         self._logical_pages = 0
         self._buffered_rows = 0
         self._buffered_rows_high_water = 0
@@ -112,13 +124,83 @@ class ExecutionContext:
 
     @property
     def requests_refused(self) -> bool:
-        """Return whether the request budget has refused a send, which ends the operation: no send can follow.
+        """Return whether the request budget has refused a send: no send can follow.
 
-        Only a refusal sets it: a budget spent exactly by the last send the operation needed ends nothing. Once it
-        is set, the batch streams' source pull (``AsyncIteratorController.get``) refuses further input, and the
-        reference scheduler reads none, ends its source and, once the bindings read are settled, ends the operation.
+        Once it is set, the batch streams' source pull (``AsyncIteratorController.get``) refuses further input.
         """
         return self._requests_refused
+
+    @property
+    def refusal(self) -> str | None:
+        """Return the first refusal of work by the operation's budget, which ends the operation, or ``None``.
+
+        It is the refusal's message: the request budget's (``REQUEST_BUDGET_EXHAUSTED``), or the deadline's, which
+        names what the deadline refused. Only a refusal sets it: a budget spent exactly by the last send the
+        operation needed, or a deadline that passes while the application holds control once nothing is left to
+        admit, ends nothing. The reference scheduler reads its source ahead of the sends, so it may have read the
+        source out before the refusal: once it is set, every later pull is refused, which ends its source, and once
+        the bindings read are settled, the scheduler ends the operation with it.
+        """
+        return self._refusal
+
+    def time_left(self, refusal: str, *, retry_started: float | None = None) -> float:
+        """Return the time left: the operation's, or a request's retry window from ``retry_started`` if shorter.
+
+        With none left, raise the refusal. When the operation's deadline closed it, the refusal names the work
+        ``refusal`` names, and is recorded (``refusal``) and ends the operation; when the request's own retry window
+        closed first, it is ``RETRY_WINDOW_EXHAUSTED``, refuses that request alone and records nothing. With
+        ``deadline``, the one way to ask for the time left, so time refuses work only here; ``coalescing_time_left``
+        alone reads it without refusing, for a wait that ends in a send, never in a refusal.
+        """
+        left = self._time_left(retry_started)
+        if left > 0:
+            return left
+        raise self._refuse(refusal, retry_started)
+
+    def coalescing_time_left(self) -> float:
+        """Return the operation's time left, which may be none, without refusing anything.
+
+        The one reader of the time left that does not refuse, for the batch dispatcher's coalescing wait: when the
+        time runs out it stops waiting for more commands and sends the chunk it holds, which the send's own permit
+        then admits or refuses (``time_left``).
+        """
+        return self._time_left(None)
+
+    @contextlib.asynccontextmanager
+    async def deadline(self, refusal: str, *, retry_started: float | None = None) -> AsyncIterator[asyncio.Timeout]:
+        """Run the block within the time left (``time_left``), refusing as ``time_left`` refuses.
+
+        The refusal is raised before the block when no time is left, and in place of the ``TimeoutError`` that
+        ends the block when the time runs out while it waits: its own, or that of a wait the block handed the same
+        deadline to (a rate coordinator's admission budget). The block is given its timeout, which a block whose
+        wait ends in work the deadline must not cut (a sent batch wave) lifts with ``reschedule(None)``.
+        """
+        left = self.time_left(refusal, retry_started=retry_started)
+        try:
+            async with asyncio.timeout(left) as timeout:
+                yield timeout
+        except TimeoutError as error:
+            raise self._refuse(refusal, retry_started) from error
+
+    def raise_if_refused(self) -> None:
+        """Raise the operation's recorded refusal (``refusal``) again, if there is one."""
+        if self._refusal is not None:
+            raise BudgetExceededError(self._refusal)
+
+    def _refuse(self, refusal: str, retry_started: float | None) -> BudgetExceededError:
+        start = self._start
+        if (
+            retry_started is not None
+            and start is not None
+            and retry_started + self.policy.max_retry_elapsed_per_request < start + self.policy.max_elapsed
+        ):
+            return BudgetExceededError(RETRY_WINDOW_EXHAUSTED)
+        self._record_refusal(refusal)
+        return BudgetExceededError(refusal)
+
+    def _record_refusal(self, message: str) -> None:
+        if self._refusal is None:
+            self._refusal = message
 
     def admit_request(self) -> None:
         """Refuse a send once the request budget is spent, recording the refusal that ends the operation.
@@ -128,6 +210,7 @@ class ExecutionContext:
         """
         if self._physical_requests >= self.policy.max_requests:
             self._requests_refused = True
+            self._record_refusal(REQUEST_BUDGET_EXHAUSTED)
             raise BudgetExceededError(REQUEST_BUDGET_EXHAUSTED)
 
     async def start(self) -> None:
@@ -135,17 +218,11 @@ class ExecutionContext:
         if self._start is None:
             self._start = self._clock()
 
-    async def reserve_attempt(self, *, attempts_for_request: int, retry_started: float) -> None:
-        """Reserve the attempt budget."""
-        retry_elapsed = max(0.0, self._clock() - retry_started)
-        total_elapsed = self.elapsed
+    async def reserve_attempt(self, *, attempts_for_request: int) -> None:
+        """Reserve the attempt budget; the send's dispatch check just before it (``time_left``) is its time check."""
         self.admit_request()
         if attempts_for_request >= self.policy.max_attempts_per_request:
             raise BudgetExceededError("per-request attempt budget exhausted")
-        if retry_elapsed >= self.policy.max_retry_elapsed_per_request:
-            raise BudgetExceededError("per-request retry time budget exhausted")
-        if total_elapsed >= self.policy.max_elapsed:
-            raise BudgetExceededError("operation elapsed budget exhausted")
         self._physical_requests += 1
 
     async def record_retry(self) -> None:
@@ -168,21 +245,18 @@ class ExecutionContext:
 
     async def reserve_page(self, *, reference: str | None = None) -> PageReservation:
         """Reserve page capacity before I/O without charging the response counter."""
-        try:
-            async with asyncio.timeout(self.policy.max_elapsed - self.elapsed):
-                while True:
-                    self._check_page_budget(reference)
-                    if self.can_reserve_page(reference=reference):
-                        reservation = PageReservation(self._page_sequence, reference)
-                        self._page_sequence += 1
-                        self._page_reservations[reservation] = None
-                        if reference is not None:
-                            self._reference_pages.setdefault(reference, _ReferencePages()).pending += 1
-                        return reservation
-                    self._page_changed.clear()
-                    await self._page_changed.wait()
-        except TimeoutError as error:
-            raise BudgetExceededError("page reservation exceeded operation time budget") from error
+        while True:
+            self._check_page_budget(reference)
+            if self.can_reserve_page(reference=reference):
+                reservation = PageReservation(self._page_sequence, reference)
+                self._page_sequence += 1
+                self._page_reservations[reservation] = None
+                if reference is not None:
+                    self._reference_pages.setdefault(reference, _ReferencePages()).pending += 1
+                return reservation
+            self._page_changed.clear()
+            async with self.deadline("page reservation exceeded operation time budget"):
+                await self._page_changed.wait()
 
     def can_reserve_page(self, *, reference: str | None = None) -> bool:
         """Return whether one page reservation can be admitted immediately."""
@@ -197,8 +271,7 @@ class ExecutionContext:
         """Atomically reserve a fixed operation-local page wave or fail immediately."""
         if not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise ValueError("page reservation count must be a positive integer")
-        if self.policy.max_elapsed - self.elapsed <= 0:
-            raise BudgetExceededError("page reservation exceeded operation time budget")
+        self.time_left("page reservation exceeded operation time budget")
         used = self._logical_pages + len(self._page_reservations)
         if used + count > self.policy.max_pages:
             raise BudgetExceededError("logical page budget cannot fit the requested wave")
@@ -291,7 +364,11 @@ class ExecutionContext:
             raise RuntimeError("identity evidence accounting is inconsistent")
         self._retained_identity_keys -= count
 
-    def remaining_time(self, *, retry_started: float | None) -> float:
+    def cleanup_window(self) -> float:
+        """Return how long a cleanup step starting now may wait: the time left, but at least the cleanup grace."""
+        return max(self.policy.max_elapsed - self.elapsed, CLEANUP_GRACE_SECONDS)
+
+    def _time_left(self, retry_started: float | None) -> float:
         """Return the tighter operation or retry time remaining; before its window opens, only the operation's."""
         operation = self.policy.max_elapsed - self.elapsed
         if retry_started is None:
@@ -358,29 +435,29 @@ class AsyncIteratorController[T]:
         if context.requests_refused:
             # No item pulled now could be sent: the operation ends with its request budget, as with its time budget.
             raise BudgetExceededError(REQUEST_BUDGET_EXHAUSTED)
-        remaining = context.policy.max_elapsed - context.elapsed
-        if remaining <= 0:
-            raise BudgetExceededError(self._input_error)
-        pull = asyncio.create_task(anext(self._source))
-        self._active_pull = pull
+        pull: asyncio.Task[T] | None = None
         try:
-            done, _ = await asyncio.wait((pull,), timeout=remaining)
+            async with context.deadline(self._input_error):
+                pull = asyncio.create_task(anext(self._source))
+                self._active_pull = pull
+                await asyncio.wait((pull,))
         except BaseException:
-            if not pull.done():
-                pull.cancel()
-            self._retain_close_after(pull)
+            if pull is not None:
+                if not pull.done():
+                    pull.cancel()
+                self._retain_close_after(pull)
             raise
-        if done:
-            try:
-                return await pull
-            finally:
-                self._active_pull = None
-        pull.cancel()
-        self._retain_close_after(pull)
-        raise BudgetExceededError(self._input_error)
+        try:
+            return await pull
+        finally:
+            self._active_pull = None
 
-    async def aclose(self, *, remaining: float) -> None:
-        """Close the source within the supplied remaining duration."""
+    async def aclose(self, context: ExecutionContext) -> None:
+        """Close the source, waiting for it within the operation's cleanup window.
+
+        A close still running when the window ends goes on in the background, retained here, and the
+        wait raises the cleanup error.
+        """
         if self._cleanup_task is None:
             active = self._active_pull
             if active is None:
@@ -391,15 +468,11 @@ class AsyncIteratorController[T]:
         cleanup = self._cleanup_task
         if cleanup is None:
             return
-        await asyncio.sleep(0)
-        if cleanup.done():
-            await cleanup
-            return
-        done, _ = await asyncio.wait((cleanup,), timeout=max(0.0, remaining))
+        done, _ = await asyncio.wait((cleanup,), timeout=context.cleanup_window())
         if done:
             await cleanup
             return
-        raise BudgetExceededError(self._cleanup_error)
+        raise CleanupOverrunError(self._cleanup_error)
 
     def _retain_close_after(self, pull: asyncio.Task[T]) -> None:
         if self._cleanup_task is None:
@@ -500,7 +573,7 @@ async def await_cleanup_resistant(
             continue
         if not task.done():
             task.add_done_callback(_observe_background_cleanup)
-            overrun = BudgetExceededError("cleanup exceeded the operation time budget")
+            overrun = CleanupOverrunError("cleanup exceeded the operation time budget")
             return CleanupResult(cancellation, overrun, unfinished=task)
     try:
         await task

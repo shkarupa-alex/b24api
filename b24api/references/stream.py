@@ -16,6 +16,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.report import Violation, ViolationSeverity, retain_page_trace
 from b24api.contracts.violation import retain_violations
+from b24api.execution.context import AsyncIteratorController
 from b24api.execution.lifecycle import (
     CleanupAttempt,
     LifecycleHooks,
@@ -72,6 +73,12 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         """Initialize instance state."""
         self._scheduler = scheduler
         self._source = own_reference_source(source)
+        # Owns the source from the start, so even a close before the first pull is bounded by the cleanup window.
+        self._controller = AsyncIteratorController(
+            self._source,
+            input_error="reference input exceeded operation time budget",
+            cleanup_error="reference source cleanup exceeded operation time budget",
+        )
         self._outcomes: AsyncGenerator[ReferenceStreamItem] | None = None
         self._emitted = 0
         self._unique_emitted = 0
@@ -124,7 +131,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         await self._runner.aclose()
 
     async def _run(self) -> AsyncGenerator[ReferenceStreamItem]:
-        outcomes = self._outcomes = self._scheduler.outcomes(self._source)
+        outcomes = self._outcomes = self._scheduler.outcomes(self._controller)
         async for outcome in outcomes:
             if isinstance(outcome, KernelReferenceItem):
                 self._emitted += 1
@@ -138,9 +145,8 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         if self._outcomes is not None:
             await self._outcomes.aclose()
             return
-        # Closed before the first pull: the scheduler never took the source this stream opened, so the
-        # stream closes it itself. OwnedSource.aclose is idempotent for a family that closes it too.
-        (await self._source.aclose()).raise_failure()
+        # Closed before the first pull: the scheduler never took the source, so the stream closes it itself.
+        await self._controller.aclose(self._scheduler.context)
 
     async def _finalize(self, cause: TerminalCause, failure: str | None, attempt: CleanupAttempt) -> KernelReport:
         if self._outcomes is None:

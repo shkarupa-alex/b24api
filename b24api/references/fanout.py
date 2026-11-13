@@ -77,9 +77,10 @@ class _CommandContext:
 class _CommandSourceError(Exception):
     """Carry a failed fan-out input source; reports name the public failure it maps to (``report_cause``)."""
 
-    def __init__(self) -> None:
+    def __init__(self, source_error: BaseException) -> None:
         super().__init__("fan-out input source failed")
         self.report_cause = InputSourceError("Fan-out input source failed")
+        self.report_cause.__cause__ = source_error
 
 
 def _reference(command: object, index: int) -> ReferenceRequest:
@@ -102,7 +103,7 @@ def command_source[C](
         source,
         accept=_reference,
         observe=observe,
-        failure=lambda _error: _CommandSourceError(),
+        failure=_CommandSourceError,
     )
 
 

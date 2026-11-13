@@ -2,11 +2,15 @@
 
 Every stream family adapts its caller source here instead of keeping its own sync and async
 iterator wrappers. A synchronous iterator is pulled and closed in a worker thread, and a pull
-that is cancelled still finishes before the cancellation propagates, so the iterator is never
-closed while it runs. Its pulls and its close all run in one ``contextvars.Context``, copied when
-the source is adapted, as a generator iterated in one place runs: a context variable it sets
-before a ``yield`` is still set, and its token still resettable, when it resumes. They run one at
-a time, so the context is never entered twice at once. ``accept`` maps each raw item to the
+that is cancelled still finishes before the cancellation propagates. Its pulls and its close all
+run in one ``contextvars.Context``, copied when the source is adapted, as a generator iterated in
+one place runs: a context variable it sets before a ``yield`` is still set, and its token still
+resettable, when it resumes. They run one at a time, serialized by a lock taken in the worker
+thread: a close that the operation's end starts while an abandoned pull still runs (its deadline
+passed, or the loop cancelled every task as it shut down) waits there for that pull to return, so
+the iterator is never closed while it runs and the context is never entered twice at once. The
+wait is bounded on the event loop by the operation's cleanup window; past it the close finishes in
+the background. ``accept`` maps each raw item to the
 family's item and raises for a foreign one, ``observe`` records a bounded violation per admitted
 item, and ``failure`` maps a pull or admission failure onto the family's carrier. ``aclose``
 never raises: it returns the cleanup outcome and the lifecycle owner decides what to report.
@@ -17,6 +21,7 @@ import asyncio
 import contextlib
 import contextvars
 import functools
+import threading
 from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
@@ -87,6 +92,8 @@ class OwnedSource[T](AsyncIterator[T]):
         self._iterator = iterator
         self._inline = inline
         self._context = contextvars.copy_context()
+        # Held by the worker thread running a pull or the close in ``_context``: one call at a time.
+        self._context_lock = threading.Lock()
         self._accept = accept
         self._observe = observe
         self._failure = failure
@@ -158,7 +165,7 @@ class OwnedSource[T](AsyncIterator[T]):
                 return EXHAUSTED
         if self._inline:
             return _next_or_exhausted(iterator)
-        return await _finish_in_thread(functools.partial(self._context.run, _next_or_exhausted, iterator))
+        return await _finish_in_thread(functools.partial(self._run_in_context, _next_or_exhausted, iterator))
 
     async def aclose(self) -> CleanupResult:
         """Close the caller iterator once; every call returns the same outcome and none raises."""
@@ -172,7 +179,12 @@ class OwnedSource[T](AsyncIterator[T]):
             if isinstance(iterator, AsyncClosable):
                 await iterator.aclose()
         elif isinstance(iterator, SyncClosable):
-            await _finish_in_thread(functools.partial(self._context.run, iterator.close))
+            await _finish_in_thread(functools.partial(self._run_in_context, iterator.close))
+
+    def _run_in_context[R](self, call: Callable[..., R], *args: object) -> R:
+        """Run ``call`` in the source's context in a worker thread, after any call still running there returns."""
+        with self._context_lock:
+            return self._context.run(call, *args)
 
 
 __all__ = ["EXHAUSTED", "AsyncClosable", "Exhausted", "OwnedSource", "SyncClosable"]

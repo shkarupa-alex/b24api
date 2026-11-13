@@ -5,7 +5,7 @@ from collections.abc import AsyncGenerator, AsyncIterable, Iterable
 from typing import TYPE_CHECKING, Self, cast
 
 from b24api._sources import OwnedSource
-from b24api.batch.engine import BatchExecutor, _batch_outcome_row_weight, _BatchInput, _BatchItem
+from b24api.batch.engine import BatchExecutor, _batch_outcome_row_weight, _BatchInput, _BatchItem, _Chunk
 from b24api.batch.outcome import BatchFailure as KernelFailure
 from b24api.batch.outcome import BatchSuccess as KernelSuccess
 from b24api.batch.stream import _next_chunk
@@ -192,8 +192,13 @@ class LogicalBatchKernelStream[C]:
         self._fail_fast = fail_fast
         self._context = executor.context(policy)
         self._completion = ReferenceCompletionRecorder()
-        self._controller: AsyncIteratorController[_BatchItem] | None = None
-        self._source_taken = False
+        # Owns the source from the start, so even a close before the first pull is bounded by the cleanup window;
+        # ``None`` once the one close attempt has been made.
+        self._controller: AsyncIteratorController[_BatchItem] | None = AsyncIteratorController(
+            self._source,
+            input_error="batch input exceeded operation time budget",
+            cleanup_error="batch source cleanup exceeded operation time budget",
+        )
         self._runner = OperationRunner(
             self._run(),
             LifecycleHooks(finalize=self._finalize, failure_report=self._failure_report, cleanup=self._cleanup),
@@ -260,30 +265,12 @@ class LogicalBatchKernelStream[C]:
 
     async def _run(self) -> AsyncGenerator[CommandOutcome[object]]:  # noqa: C901
         await self._context.start()
-        controller: AsyncIteratorController[_BatchItem] = AsyncIteratorController(
-            self._source,
-            input_error="batch input exceeded operation time budget",
-            cleanup_error="batch source cleanup exceeded operation time budget",
-        )
-        self._controller = controller
-        self._source_taken = True
+        controller = self._controller
+        if controller is None:
+            raise RuntimeError("logical batch source is already closed")
         next_index = 0
         while True:
-            try:
-                chunk = await _next_chunk(
-                    controller,
-                    min(
-                        self._batch_size,
-                        self._context.policy.max_buffered_commands,
-                        self._context.policy.max_buffered_rows,
-                    ),
-                    start_index=next_index,
-                    context=self._context,
-                )
-            except B24ApiError:
-                raise
-            except Exception as error:
-                raise InputSourceError("Logical batch input source failed") from error
+            chunk = await self._read_chunk(controller, next_index)
             if not chunk.commands:
                 break
             next_index += len(chunk.commands)
@@ -342,17 +329,32 @@ class LogicalBatchKernelStream[C]:
                 yield batch_outcome
                 self._finish_outcome(batch_outcome)
             await self._context.set_buffered_rows(0)
+            if chunk.refusal is not None:
+                raise chunk.refusal
+
+    async def _read_chunk(self, controller: AsyncIteratorController[_BatchItem], start_index: int) -> _Chunk:
+        """Read the next chunk; a source that fails before its first command fails the stream."""
+        try:
+            return await _next_chunk(
+                controller,
+                min(
+                    self._batch_size,
+                    self._context.policy.max_buffered_commands,
+                    self._context.policy.max_buffered_rows,
+                ),
+                start_index=start_index,
+                context=self._context,
+            )
+        except B24ApiError:
+            raise
+        except Exception as error:
+            raise InputSourceError("Logical batch input source failed") from error
 
     async def _close_controller(self) -> None:
         # One close attempt: a failed close is recorded once and never retried by a later aclose().
         controller, self._controller = self._controller, None
-        if controller is None:
-            if not self._source_taken:
-                # No controller took the source this stream opened (closed before the first pull, or the
-                # context failed to start), so the stream closes it itself. OwnedSource.aclose is idempotent.
-                (await self._source.aclose()).raise_failure()
-            return
-        await controller.aclose(remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed))
+        if controller is not None:
+            await controller.aclose(self._context)
 
     async def _cleanup(self) -> None:
         await self._context.set_buffered_rows(0)

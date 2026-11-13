@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qsl, urlsplit
@@ -183,6 +184,10 @@ DEADLINE_BUDGET = 0.2
 # the timer, yet well below any fixed cleanup timeout a regression might use in place of the budget.
 DEADLINE_SLACK = 0.3
 
+# How long past the deadline cleanup may wait for what still blocks: the documented grace of 0.1 s, pinned
+# here rather than read from ``CLEANUP_GRACE_SECONDS``, so a longer grace fails the tests that bound it.
+CLEANUP_GRACE = 0.1
+
 # Only turns a hang into a failure: how long a test waits for something it caused, an event its fake sets,
 # a deadline it set, or a short stream it drains. Generous, since it costs time only when a test already
 # fails: a stalled or loaded host never reaches it, and it never races a budget. Whether a deadline fired
@@ -198,7 +203,7 @@ def deadline_started() -> float:
 def assert_fired_near_deadline(started: float) -> None:
     """Assert the operation deadline, not some fixed timeout, ended the blocked step begun at ``started``."""
     elapsed = asyncio.get_running_loop().time() - started
-    if elapsed >= DEADLINE_BUDGET + DEADLINE_SLACK:
+    if elapsed >= DEADLINE_BUDGET + CLEANUP_GRACE + DEADLINE_SLACK:
         raise AssertionError(f"the deadline fired {elapsed:.3f} s after the start, not near {DEADLINE_BUDGET} s")
 
 
@@ -209,6 +214,37 @@ async def reached(event: asyncio.Event, bound: float = HANG_BOUND) -> None:
             await event.wait()
     except TimeoutError:
         raise AssertionError(f"the test's event was not set within {bound} s") from None
+
+
+class WorkerStarts(ThreadPoolExecutor):
+    """Worker threads for a loop's default executor that set an event as each submitted call starts.
+
+    A synchronous source is pulled and closed in worker threads; installed with
+    ``loop.set_default_executor``, this lets a test wait until a given call is running instead of
+    guessing how long a thread takes to start.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start with no call submitted."""
+        super().__init__(max_workers=4)
+        self._loop = loop
+        self._submitted = 0
+        self._started: dict[int, asyncio.Event] = {}
+
+    def started(self, call: int) -> asyncio.Event:
+        """Return the event set once the ``call``-th submitted call (from zero) starts running."""
+        return self._started.setdefault(call, asyncio.Event())
+
+    def submit[R](self, fn: Callable[..., R], /, *args: object, **kwargs: object) -> Future[R]:
+        """Submit ``fn`` and set its event once its worker thread starts running it."""
+        started = self.started(self._submitted)
+        self._submitted += 1
+
+        def run() -> R:
+            self._loop.call_soon_threadsafe(started.set)
+            return fn(*args, **kwargs)
+
+        return super().submit(run)
 
 
 async def on_loop[T](items: Iterable[T]) -> AsyncIterator[T]:

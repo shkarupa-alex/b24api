@@ -187,6 +187,32 @@ async def test_reference_bindings_share_one_operation_identity_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_raw_source_raising_its_own_budget_error_fails_the_stream() -> None:
+    # A raw source's own BudgetExceededError (a nested operation's, say) is not this operation's budget refusing a
+    # pull: nothing was refused here, so it fails the stream as any source failure does, not as a read-out source.
+    def source() -> Iterator[ReferenceRequest]:
+        yield _reference("a")
+        raise BudgetExceededError("nested operation budget")
+
+    stream = iter_references(
+        Executor(ResponderTransport(lambda _request: {"result": [{"ID": 1}]})),
+        source(),
+        plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
+        dispatch=KernelDirectDispatch(concurrency=1),
+        identity=_identity(),
+        tolerant=True,
+        policy=ExecutionPolicy(max_active_references=1, max_buffered_rows=1),
+    )
+
+    with pytest.raises(BudgetExceededError, match="nested operation budget"):
+        async for _outcome in stream:
+            pass
+
+    assert stream.report.state is KernelState.FAILED
+
+
+@pytest.mark.asyncio
 async def test_reference_failure_violations_are_bounded_without_losing_outcomes() -> None:
     transport = ResponderTransport(
         lambda _request: {"error": "ACCESS_DENIED", "error_description": "denied"},
@@ -1440,7 +1466,8 @@ async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_
     try:
         await reached(started)
         task.cancel()
-        with pytest.raises(BudgetExceededError, match="reference task cleanup") as captured:
+        # The caller's cancellation leaves, not the cleanup that overran its window: that is recorded behind it.
+        with pytest.raises(asyncio.CancelledError):
             await task
         # The cleanup gave up at the operation deadline, long before the safety release could end the send.
         assert_fired_near_deadline(budget_started)
@@ -1448,7 +1475,9 @@ async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_
         release.set()
         safety.cancel()
     frozen_report = stream.report
-    assert attached_report(captured.value) is frozen_report
+    assert frozen_report.state is KernelState.CANCELLED
+    assert [violation.code for violation in frozen_report.violations] == ["cleanup_failure"]
+    assert "CleanupOverrunError" in frozen_report.violations[0].message
     assert frozen_report.logical_pages == 0
 
     await reached(returned)
@@ -1549,10 +1578,11 @@ async def test_closed_batch_worker_exits_after_transport_temporarily_resists_can
     try:
         await reached(started)
         task.cancel()
-        with pytest.raises(BudgetExceededError) as captured:
+        with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=HANG_BOUND)
         assert_fired_near_deadline(budget_started)
-        assert attached_report(captured.value) is stream.report
+        assert stream.report.state is KernelState.CANCELLED
+        assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
 
         dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
         worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001

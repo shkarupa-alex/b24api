@@ -9,6 +9,7 @@ from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, qualified_clo
 from b24api.contracts.completion import BindingClosure
 from b24api.contracts.dispatch import PORTAL_PAGE_ROWS
 from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
+from b24api.execution.failure import report_reason
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     DispatchPlan,
@@ -73,7 +74,7 @@ def _record_cleanup_failure(violations: list[Violation], error: BaseException) -
         Violation(
             severity=ViolationSeverity.BLOCKING,
             code="cleanup_failure",
-            message=f"reference cleanup also failed ({type(error).__name__})",
+            message=f"reference cleanup also failed ({report_reason(error)})",
         )
     )
 
@@ -117,8 +118,7 @@ async def _wait_for_cleanup_tasks(
     active = set(tasks)
     if not active:
         return set(), []
-    await asyncio.sleep(0)
-    done, pending = await asyncio.wait(active, timeout=max(0.0, remaining))
+    done, pending = await asyncio.wait(active, timeout=remaining)
     errors = [error for task in done if not task.cancelled() and (error := task.exception()) is not None]
     for task in pending:
         task.cancel()

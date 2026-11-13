@@ -34,6 +34,7 @@ from b24api.errors import (
     BudgetExceededError,
     CapabilityError,
     FailurePhase,
+    HTTPGatewayError,
     ProtocolError,
     ResultShapeError,
     TransportError,
@@ -1022,6 +1023,62 @@ async def test_a21_lineage_expired_retry_time_forbids_isolation() -> None:
     assert snapshot.counters.physical_requests == 1
     assert snapshot.batch_isolation_requests == 0
     assert snapshot.ambiguous_physical_attempts == 1
+
+
+class _AnswersAt(ScriptedTransport):
+    """Answer each send as the virtual clock moves on by ``step`` seconds."""
+
+    def __init__(self, exchanges: tuple[ScriptedExchange, ...], now: list[float], step: float) -> None:
+        super().__init__(exchanges)
+        self.now = now
+        self.step = step
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        self.now[0] += self.step
+        return await super().send_wire(request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("abort", "refusal"),
+    [
+        # A SAFE abort that may have run: no attribution phase is left once the deadline has passed.
+        ("poisoned", "execution time budget exhausted before isolating the batch's commands"),
+        # A quota abort, which may have run: its one envelope retry is refused too.
+        ("quota", "execution time budget exhausted before the retry"),
+        # A refusal of the envelope, proven not run: its replay is refused, and each command ends with that refusal.
+        ("refused", "execution time budget exhausted before the retry"),
+    ],
+)
+async def test_a21_lineage_an_abort_answered_past_the_deadline_ends_the_operation(abort: str, refusal: str) -> None:
+    """The deadline passes as the envelope's abort is answered: what would follow is refused by time, recorded."""
+    now = [1000.0]
+    requests = (_v3(1), _v3(2))
+    if abort == "poisoned":
+        exchange = _poisoned(requests)
+    elif abort == "quota":
+        exchange = ScriptedExchange.v3_batch(requests, payload={"error": "QUERY_LIMIT_EXCEEDED"}, status=503)
+    else:
+        fixture = ScriptedExchange.v3_batch(requests, (_item(1), _item(2)))
+        exchange = ScriptedExchange(fixture.request, WireResponse(429, (), b""), v3_wire=fixture.v3_wire)
+    transport = _AnswersAt((exchange,), now, 30.0)
+    executor = Executor(transport, clock=lambda: now[0])
+    context = executor.context(_policy(max_elapsed=20.0, max_retry_elapsed_per_request=1000.0))
+
+    outcomes = await BatchExecutor(executor).execute_requests(requests, context=context)
+
+    assert all(isinstance(outcome, BatchFailure) for outcome in outcomes)
+    snapshot = await context.snapshot()
+    assert snapshot.counters.physical_requests == 1
+    assert snapshot.batch_isolation_requests == 0
+    assert context.refusal == refusal
+    if abort == "refused":
+        for outcome in outcomes:
+            assert isinstance(outcome, BatchFailure)
+            assert isinstance(outcome.error, BudgetExceededError)
+            assert str(outcome.error) == refusal
+            assert isinstance(outcome.error.__cause__, HTTPGatewayError)
+    transport.assert_exhausted()
 
 
 @pytest.mark.asyncio

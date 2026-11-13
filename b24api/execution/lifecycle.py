@@ -17,8 +17,15 @@ from typing import TYPE_CHECKING, NoReturn, Self, cast
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.stream import PartialResult
+from b24api.errors import CleanupOverrunError
 from b24api.execution.context import CancellationMark, await_cleanup_resistant, rearm_cancellation
-from b24api.execution.failure import EARLY_CLOSE_REASON, attach_report, report_reason, with_cleanup_failure
+from b24api.execution.failure import (
+    EARLY_CLOSE_REASON,
+    attach_report,
+    public_cause,
+    report_reason,
+    with_cleanup_failure,
+)
 from b24api.execution.snapshot import KernelReport
 
 if TYPE_CHECKING:
@@ -26,6 +33,15 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from b24api.contracts.report import OperationReport
+
+
+def _carried_cause(public: BaseException, error: BaseException) -> BaseException | None:
+    """Return what ``public``, raised for ``error``, chains from: what a private carrier carries, never the carrier.
+
+    The carried failure itself, when it is what is raised, keeps its own cause (the source's exception, say).
+    """
+    cause = public_cause(error)
+    return public.__cause__ if public is cause else cause
 
 
 class TerminalCause(StrEnum):
@@ -61,8 +77,9 @@ class LifecycleHooks[R]:
     attach: Callable[[BaseException, R], None] = attach_report
     # Maps a FAILED primary to the exception the caller receives (for example ``BatchFailed``).
     propagate: Callable[[BaseException, R], BaseException] | None = None
-    # Seconds the operation's elapsed budget has left; bounds how long a close and its cleanup defer a
-    # caller's cancellation. ``None`` defers it until cleanup ends, for a runner driven by an outer one.
+    # Seconds the operation's cleanup window has left (``ExecutionContext.cleanup_window``); bounds how long a
+    # close and its cleanup defer a caller's cancellation. ``None`` defers it until cleanup ends, for a runner
+    # driven by an outer one.
     cleanup_budget: Callable[[], float] | None = None
 
 
@@ -88,8 +105,11 @@ def with_cleanup_attempt(
 
     Without a primary failure a cleanup failure turns the report FAILED ("stream cleanup failed"); a
     cancellation during that cleanup is raised but not recorded. Behind a FAILED primary both the
-    cleanup failure and a cleanup cancellation are secondary violations.
+    cleanup failure and a cleanup cancellation are secondary violations, as is a cleanup that overran
+    its window behind a caller's cancellation (``cancellation_outranks``).
     """
+    if cancellation_outranks(cause, attempt):
+        return with_cleanup_failure(report, cast("BaseException", attempt.error), terminal=False, subject=subject)
     if cause is not TerminalCause.FAILED:
         if attempt.error is None:
             return report
@@ -98,6 +118,15 @@ def with_cleanup_attempt(
         if failure is not None:
             report = with_cleanup_failure(report, failure, terminal=False, subject=subject)
     return report
+
+
+def cancellation_outranks(cause: TerminalCause, attempt: CleanupAttempt) -> bool:
+    """Whether a caller's cancellation, not the cleanup failure, ends the stream: the cleanup overran its window.
+
+    The window ended the wait the cancellation was deferred by, so the overrun is that bound, not a failure of
+    what was closed: the cancellation is raised and the stream is cancelled, the overrun a secondary violation.
+    """
+    return cause is TerminalCause.CANCELLED and isinstance(attempt.error, CleanupOverrunError)
 
 
 def cleanup_failed(cause: TerminalCause, attempt: CleanupAttempt) -> bool:
@@ -249,7 +278,7 @@ class OperationRunner[T, R]:
         except Exception as close_error:
             if exc is None:
                 raise
-            exc.add_note(f"stream cleanup also failed ({type(close_error).__name__})")
+            exc.add_note(f"stream cleanup also failed ({report_reason(close_error)})")
 
     async def __anext__(self) -> T:
         """Read one item; the read that ends the body publishes the report and raises by §3.1."""
@@ -272,9 +301,10 @@ class OperationRunner[T, R]:
             if self._phase is _Phase.CLOSING:
                 # A concurrent aclose() owns termination; this read reports the published report.
                 await self._published.wait()
-                if self._report is not None:
-                    self._hooks.attach(error, self._report)
-                raise
+                closed = self._closed_read_error(error)
+                if closed is error:
+                    raise
+                raise closed from _carried_cause(closed, error)
             self._phase = _Phase.CLOSING
             cause = (
                 TerminalCause.EXHAUSTED
@@ -298,6 +328,28 @@ class OperationRunner[T, R]:
         if self._phase is _Phase.PULLING:
             self._phase = _Phase.NEW
         return item
+
+    def _closed_read_error(self, error: BaseException) -> BaseException:
+        """Return what a read a concurrent close ended raises: its own end, a failure mapped as the stream's are."""
+        report = self._report
+        if report is None:
+            return error
+        return self._public_error(error, report)
+
+    def _public_error(self, error: BaseException, report: R) -> BaseException:
+        """Return the failure the caller sees for ``error``, which is not the stream's primary, with the report.
+
+        A failure that does not end the stream itself (a read a concurrent close ended, or its cleanup's) leaves
+        through ``propagate`` as one that ends it does, so a private carrier (a source's failure) never reaches the
+        caller.
+        """
+        self._hooks.attach(error, report)
+        propagate = self._hooks.propagate
+        if propagate is None or not isinstance(error, Exception) or isinstance(error, StopAsyncIteration):
+            return error
+        propagated = propagate(error, report)
+        self._hooks.attach(propagated, report)
+        return propagated
 
     async def aclose(self) -> None:
         """Close idempotently; an active read is cancelled and awaited before one termination.
@@ -423,7 +475,7 @@ class OperationRunner[T, R]:
             self._raise_failed(primary, report, attempt, finalize_failed=finalize_failed)
         if finalize_failed and self._finalize_error is not None and primary is None:
             if attempt.error is not None:
-                self._finalize_error.add_note(f"stream cleanup also failed ({type(attempt.error).__name__})")
+                self._finalize_error.add_note(f"stream cleanup also failed ({report_reason(attempt.error)})")
             # The finalization failure leaves in place of a cancellation cleanup absorbed, so it is replayed.
             rearm_cancellation(attempt.cancellation)
             raise self._finalize_error
@@ -439,7 +491,7 @@ class OperationRunner[T, R]:
     ) -> NoReturn:
         """Raise a FAILED primary; cleanup and finalization failures only annotate it."""
         if attempt.error is not None:
-            primary.add_note(f"stream cleanup also failed ({type(attempt.error).__name__})")
+            primary.add_note(f"stream cleanup also failed ({report_reason(attempt.error)})")
         if finalize_failed and self._finalize_error is not None:
             primary.add_note(f"stream report finalization failed ({type(self._finalize_error).__name__})")
         propagated = self._hooks.propagate(primary, report) if self._hooks.propagate is not None else primary
@@ -448,7 +500,7 @@ class OperationRunner[T, R]:
         rearm_cancellation(attempt.cancellation)
         if propagated is primary:
             raise primary
-        raise propagated from primary
+        raise propagated from _carried_cause(propagated, primary)
 
     def _raise_terminal(
         self,
@@ -459,8 +511,8 @@ class OperationRunner[T, R]:
     ) -> None:
         """Raise by the exhausted, early-close and cancelled rows; an early close returns quietly."""
         raised: BaseException | None = None
-        if attempt.error is not None:
-            raised = attempt.error
+        if attempt.error is not None and not cancellation_outranks(cause, attempt):
+            raised = self._public_error(attempt.error, report)
             primary_cancellation = primary if isinstance(primary, asyncio.CancelledError) else None
             rearm_cancellation(attempt.cancellation or primary_cancellation)
         elif attempt.cancellation is not None:
@@ -472,8 +524,10 @@ class OperationRunner[T, R]:
                 raise StopAsyncIteration
             return
         self._hooks.attach(raised, report)
-        if attempt.error is None and attempt.cancellation is not None and primary is not None:
-            raise raised from primary
+        if primary is not None and attempt.cancellation is not None and raised is attempt.cancellation:
+            raise attempt.cancellation from primary
+        if attempt.error is not None and raised is not attempt.error and raised is not attempt.cancellation:
+            raise raised from _carried_cause(raised, attempt.error)
         raise raised
 
 
@@ -482,6 +536,7 @@ __all__ = [
     "LifecycleHooks",
     "OperationRunner",
     "TerminalCause",
+    "cancellation_outranks",
     "cleanup_failed",
     "failed_kernel_report",
     "kernel_terminal",

@@ -900,11 +900,32 @@ scheduling point ends the operation, even when all that is left is to read the e
 report is then `incomplete`, with `BudgetExceededError` as its terminal reason and a `budget_exhausted`
 violation. The stream raises a plain `BudgetExceededError`, except that a fail-fast stream whose stop
 failed a command or a binding raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report
-carries that reason); a stop at a source pull, the end-of-source check or the cleanup fails none. So it
-depends on where the budget stopped the stream, not on the operation: handle both, or read the
-report. A send cut in flight is another case:
+carries that reason). A stop at a source pull or at the end-of-source check fails none by itself, but
+`batch()` and `batch_outcomes()` still send the commands they read into the window before it, which the
+budget refuses in turn (each a `CommandFailure` with `BudgetExceededError`), so `batch()` then raises
+`BatchFailed`. So it depends on where the budget stopped the stream, not on the operation: handle both,
+or read the report. Cleanup never ends a stream with the budget. A send cut in flight is another case:
 its command may have run, so it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end
 on that ambiguity instead.
+
+Cleanup runs once the operation has ended, often because `max_elapsed` ran out, so it is not cut at
+the budget: each of its steps (closing the source, stopping the operation's own tasks) waits for what
+is left of `max_elapsed`, but at least 0.1 s. A source whose close ends at once (a list, a generator,
+an async generator whose `aclose()` returns) closes within that grace, and the report records the
+budget's end alone. A close that blocks longer goes on in the background: the report adds a
+`cleanup_failure` violation, and the stream still raises the error that ended it. When nothing else
+ended it, the close raises `b24api.errors.CleanupOverrunError`, a `BudgetExceededError` that refused
+no work, and the report is the one a close that raised any other error gets, with no
+`budget_exhausted`: after `break` or an early `aclose()`, `early_closed` with the terminal reason
+"stream cleanup failed"; on a stream read to its end, `failed`. Either way its `cleanup_failure`
+violation names `CleanupOverrunError`. A cancellation is
+that error only when it came first: a consumer cancelled before the budget or a failure ended the
+stream receives its `CancelledError`, with a `cancelled` report, even when the close then overruns.
+One cancelled after them, while the cleanup waits, receives the budget's error (or the failure), with
+an `incomplete` (or `failed`) report, and the cancellation is delivered at its next `await`. A stream
+closed before its first pull closes its source the same way. A synchronous source is pulled and closed in worker threads, in
+one `contextvars.Context`; a pull the deadline cut while it still runs is waited for before the close
+runs in that context, so a pull that outlasts the grace leaves its close to the background the same way.
 
 Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
 observed identities per operation in memory (100,000 by default). All active reference bindings
