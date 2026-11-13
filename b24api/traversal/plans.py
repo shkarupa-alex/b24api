@@ -414,6 +414,11 @@ class KernelBatchDispatch:
             raise ValueError("coalesce_wait must be between 0 and 1 second")
         object.__setattr__(self, "coalesce_wait", float(self.coalesce_wait))
 
+    @property
+    def results_in_flight(self) -> int:
+        """Return the command results this dispatch may have in flight at once: a full batch per sender."""
+        return self.batch_size * self.concurrency
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class KernelDirectDispatch:
@@ -428,6 +433,11 @@ class KernelDirectDispatch:
             raise ValueError("direct concurrency must be positive")
         if not isinstance(self.output_order, ReferenceOutputOrder):
             raise TypeError("output_order must be a ReferenceOutputOrder")
+
+    @property
+    def results_in_flight(self) -> int:
+        """Return the command results this dispatch may have in flight at once: one per request."""
+        return self.concurrency
 
 
 type ListPlan = (

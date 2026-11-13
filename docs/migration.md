@@ -153,6 +153,38 @@ a binding waits for rows, have changed.
   default `DirectDispatch`. A list result longer than its share was a `CommandFailure` with a plain
   `BudgetExceededError`, the failure of a command never sent. It now carries `ResultTooLargeError`, since
   the command ran and was answered.
+- **A fan-out's row share follows its concurrency.** A command's share was `max_buffered_rows` divided
+  by `batch_size` alone, sized for one batch in flight, so the row budget, not the dispatch, decided how
+  many batches were sent at once: `BatchDispatch(batch_size=1, concurrency=8)` gave one command the whole
+  budget and sent one batch at a time (200 commands took 200 sequential requests), and
+  `BatchDispatch(batch_size=5, concurrency=4)` fit five commands in all, in batches of about one. The
+  budget is now divided among the results the dispatch may have in flight at once: `batch_size` times
+  the smallest of its `concurrency`, `max_active_references` and `Settings.max_concurrent_requests` for
+  a `BatchDispatch`, the smallest of its `concurrency`, `max_direct_concurrency`,
+  `max_active_references` and the client limit for a `DirectDispatch`, at most `max_active_references`
+  either way. A `BatchDispatch` share never drops below a full 50-row portal page while the budget holds
+  one per command of a batch: no more commands are counted than the budget has pages (50 of the default
+  2,500 rows), and the row budget holds back the commands beyond them, which coalesce into fewer,
+  fuller batches. Below that budget the share is the old one-batch share. A `DirectDispatch` share
+  has no such floor: its requests do not coalesce, so a floor would only cut its requests in flight;
+  it keeps the old rule, now bounded by the client limit too. Shares of the default 2,500 rows:
+
+  | Dispatch | Before | Now | In flight at once now |
+  | --- | --- | --- | --- |
+  | `BatchDispatch()` | 50 | 50 | 1 batch of 50 |
+  | `DirectDispatch()` | 250 | 250 | 10 requests |
+  | `BatchDispatch(batch_size=1, concurrency=8)` | 2,500 | 312 | 8 batches of 1 (was 1) |
+  | `BatchDispatch(batch_size=5, concurrency=4)` | 500 | 125 | 4 batches of 5 (was 5 commands) |
+  | `BatchDispatch(batch_size=20, concurrency=4)` | 125 | 50 | 50 commands (was 20) |
+  | `BatchDispatch(concurrency=2)` or `(concurrency=4)` | 50 | 50 | 50 commands |
+
+  A `BatchDispatch` with `concurrency` above 1 and a small `batch_size` now gives each command less,
+  since more results share the budget, and a result longer than that now ends with
+  `ResultTooLargeError`. In exchange the batches are really in flight together. A batch dispatch wider
+  than the budget's page count keeps a full page per command, so ordinary 50-row pages still fit, and
+  has at most as many commands in flight as the budget has pages. A client limit below the dispatch's `concurrency` now counts too and
+  gives each command more: under `max_concurrent_requests=2` the default `DirectDispatch` share is 1,250
+  rows (was 250). To keep a longer result, raise `max_buffered_rows` or lower `concurrency`.
 - **Waiting for row capacity ends with `max_elapsed`.** A page of a reference binding or a `fan_out()`
   command waiting for row capacity still held by results the consumer had not taken waited until the
   consumer read on, however long after `max_elapsed`, and its send was then refused at its admission.
@@ -258,10 +290,10 @@ send meets a method pause, have changed.
   keeps at most the smallest of its `concurrency`, `max_active_references` and the client limit of
   physical batches in flight, and `max_direct_concurrency` does not limit it. The isolation of a REST
   3.0 envelope of `SAFE` commands that may have run sends its unresolved commands one by one, all at
-  once, bounded only by the client limit. In `fan_out()` and `fan_out_outcomes()`,
-  `BatchDispatch(batch_size=1)` sends one batch at a time whatever its `concurrency`, since each
-  command's share of `max_buffered_rows` is sized for one batch; use `DirectDispatch` to send single
-  commands concurrently. Raise the client limit only as far as the portal's rate limits allow.
+  once, bounded only by the client limit. In `fan_out()` and `fan_out_outcomes()`, a `BatchDispatch`
+  keeps as many batches in flight as these limits allow, whatever its `batch_size`: see "A fan-out's
+  row share follows its concurrency" under "Results beyond the row budget". Raise the client limit
+  only as far as the portal's rate limits allow.
 - **A synchronous source keeps one context.** A synchronous iterator given to `batch()`,
   `fan_out()` or a reference traversal is pulled in a worker thread, and each pull ran in a fresh copy
   of the context, so a generator that set a `ContextVar` before a `yield` no longer saw it when it

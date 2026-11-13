@@ -37,10 +37,25 @@ physical batches, not requests: it keeps at most the smallest of its `concurrenc
 `max_active_references` and the client limit in flight, and `max_direct_concurrency` does not limit it.
 When a REST 3.0 envelope of `SAFE` commands may have run without an answer, its unresolved commands are
 sent again one by one, all at once, bounded only by the client limit. `fan_out()` and
-`fan_out_outcomes()` size each command's share of `max_buffered_rows` for one batch, so
-`BatchDispatch(batch_size=1)` gives a command the whole row pool and sends one batch at a time whatever
-its `concurrency`; use `DirectDispatch` to send single commands concurrently. Raise the client limit
-only as far as the portal's rate limits allow. `Bitrix24.from_webhook()` takes both limits as arguments:
+`fan_out_outcomes()` divide `max_buffered_rows` among the results they may have in flight at once: the
+requests of a `DirectDispatch`, or `batch_size` commands per physical batch of a `BatchDispatch`, at most
+`max_active_references`. That share is the longest result a command may return, and a longer one ends
+with `ResultTooLargeError`. A `BatchDispatch` share never drops below a full 50-row portal page while
+the budget holds one per command of a batch: fewer commands are counted, and the row budget holds back
+the commands beyond them, which coalesce into fewer, fuller batches. Of the default 2,500 rows that
+gives:
+
+| Dispatch | Share (rows) | In flight at once |
+| --- | --- | --- |
+| `DirectDispatch()` | 250 | 10 requests |
+| `BatchDispatch()` | 50 | 1 batch of 50 |
+| `BatchDispatch(batch_size=1, concurrency=8)` | 312 | 8 batches of 1 |
+| `BatchDispatch(batch_size=5, concurrency=4)` | 125 | 4 batches of 5 |
+| `BatchDispatch(concurrency=2)`, `BatchDispatch(batch_size=20, concurrency=4)` | 50 | 50 commands |
+
+Raise `max_buffered_rows` or narrow the dispatch for longer results. Raise the client limit only as far
+as the portal's rate limits allow. `Bitrix24.from_webhook()` takes both limits
+as arguments:
 
 <!-- tested: tests/settings_test.py::test_effective_concurrency_is_the_smallest_of_the_client_and_operation_limits -->
 ```python
@@ -863,8 +878,10 @@ decoding.
 A command's decoded rows are known only once it has run, so `max_buffered_rows` bounds what an operation
 holds rather than what it sends. `batch()` and `batch_outcomes()` share the budget among a window's
 results in input order, one row per outcome and a success's other rows while they fit; `fan_out()` and
-`fan_out_outcomes()` give each command an equal share (50 rows under the default `BatchDispatch`, 250
-under `DirectDispatch`). A result that does not fit is dropped: its command ends as a `CommandFailure`
+`fan_out_outcomes()` give each command an equal share among the results their dispatch may have in
+flight at once, under a `BatchDispatch` never below a 50-row page while the budget holds one per
+command of a batch (50 rows under the default `BatchDispatch`, 250 under the default `DirectDispatch`,
+see the table above). A result that does not fit is dropped: its command ends as a `CommandFailure`
 with `ResultTooLargeError`, a `BudgetExceededError` that says the command ran and was answered, so it is
 never replayed, and every other command keeps its own outcome. A page's wait for row capacity, while the
 consumer has not yet taken the rows other pages hold, is bounded by `max_elapsed`: when it runs out, the
