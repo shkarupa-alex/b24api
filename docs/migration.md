@@ -1,5 +1,96 @@
 # Migration guide
 
+## The end of `max_elapsed` is not a cleanup failure
+
+- **Cleanup gets a grace past the budget.** Every stream but `iter_list()` waited for its source's
+  close only for what was left of `max_elapsed`, which is nothing when the budget's end is what ends
+  the operation. So nearly every operation the budget ended also reported a blocking
+  `cleanup_failure` ("reference source cleanup exceeded operation time budget"), even for a list or
+  a plain generator, and `fan_out_outcomes()`, `iter_reference_outcomes()` and
+  `iter_reference_source_outcomes()` raised that cleanup error instead of the budget's. Each cleanup
+  step now waits for what is left of the budget, but at least 0.1 s: a close that ends at once is no
+  longer a failure, and the report records `budget_exhausted` alone. A close that blocks longer still
+  goes on in the background and is recorded as a `cleanup_failure`, but never replaces the error that
+  ended the stream. A cancelled close or cleanup likewise defers the cancellation for at least the
+  grace.
+- **A retry the deadline refuses ends the operation too.** A retry, a batch replay round or a batch's
+  isolation phase planned when no time was left was refused as that request alone ("retry delay would
+  exceed elapsed budget"), so a tolerant stream completed with failures. When the operation's deadline
+  has passed, it is now refused as every other work is ("execution time budget exhausted before the
+  retry", recorded), and the stream raises `BudgetExceededError`. A retry whose delay is merely longer
+  than the time left is still refused alone, as is one whose own retry window closed first.
+- **Which window refused a request is in the message.** A request refused because its own retry window
+  (`max_retry_elapsed_per_request`) closed before the operation's deadline fails with
+  "per-request retry time budget exhausted", wherever it was refused (its permit wait, its dispatch,
+  its attempt or its retry); one the operation's deadline refused names the work refused and the
+  execution or operation time budget.
+- **Tolerant reference streams end with the deadline.** `fan_out_outcomes()` and the tolerant
+  reference traversals read their source ahead. When they had read it out before `max_elapsed` ran
+  out, the commands or bindings the deadline then refused became failures and the stream completed
+  with failures; only the cleanup failure above made it raise. They now end as the documentation
+  says and as `max_requests` ends them: they yield those failures, then raise `BudgetExceededError`,
+  whose message names the first work the deadline refused, with an `incomplete` report, also when the
+  deadline passes while a send waits for its permit or as it is granted. A deadline that passes once
+  all the work was admitted, while the consumer is slow, still ends nothing.
+- **A deadline while a batch window fills ends the batch with the budget.** When `max_elapsed` ran out
+  while `batch()` or `batch_outcomes()` waited for its source to fill a window, the stream failed with
+  `InputSourceError` (`source_failure`), and the commands already read became `CommandNotExecuted`
+  with `SOURCE_FAILED`. Those commands are now sent as any window is: the budget refuses each, so each
+  is a `CommandFailure` with `BudgetExceededError`, nothing reaches the transport, and the stream
+  raises `BudgetExceededError` (`batch()`: `BatchFailed`) with an `incomplete` report.
+- **A counted list's tail ends with the budget.** When `max_requests` or `max_elapsed` refused a page
+  of the batched tail of `iter_list_counted()`, the report's terminal reason was
+  `IncompleteTraversalError`, as for a page that failed. That refusal ends the operation, so the
+  terminal reason is now `BudgetExceededError` and the `budget_exhausted` violation reads
+  "iter_list_counted failed (BudgetExceededError)", as when the budget stops the head or another
+  traversal. The traversal still raises `IncompleteTraversalError` whose `__cause__` is that
+  `BudgetExceededError`, with an `incomplete` report. A page stopped for its request alone (its
+  attempts, its retry window or a retry delay longer than the time left) is still a failed page: the
+  terminal reason stays `IncompleteTraversalError`.
+- **A cancellation outranks a close that overruns its window.** A consumer cancelled while its
+  stream was running, whose source close then blocked past `max_elapsed`, received
+  `BudgetExceededError` ("... cleanup exceeded operation time budget") and a `budget_exhausted`
+  report. It now receives its `CancelledError`; the report is `cancelled`, with the overrun as a
+  `cleanup_failure`. This holds only for a cancellation that ended the stream: a consumer cancelled
+  after the budget (or a failure) ended it, while its cleanup waits, receives that error with an
+  `incomplete` (or `failed`) report, and the cancellation is delivered at its next `await`.
+- **A cleanup overrun has its own public error and is reported as a failed close.** A close that
+  overran its window raised `BudgetExceededError` from `aclose()` or the `async with` exit; on a
+  stream read to its end, the report also took it for the budget's end (`incomplete`, with a
+  `budget_exhausted` violation), though all the work had been admitted. It now raises
+  `b24api.errors.CleanupOverrunError`, a subclass, so `except BudgetExceededError` still catches it.
+  It refused no work, so the report is the one a close that raised any other error gets, with no
+  `budget_exhausted`: after `break` or an early `aclose()`, `early_closed` with the terminal reason
+  "stream cleanup failed"; on a stream read to its end, `failed`. Either way its `cleanup_failure`
+  violation names `CleanupOverrunError`.
+- **A close before the first pull is bounded too.** A stream closed before it was read waited for its
+  source's close without bound; it now waits as any cleanup step does.
+- **A read the client closes, and a close, raise public errors.** A read in flight when the stream's
+  client closed could raise a private exception class (for example `_BindingSourceError`) when the
+  source had failed meanwhile, and so could `aclose()` (or the `async with` exit after `break`) when
+  the source had failed during the read-ahead. Both now raise the public error the stream raises for
+  that failure otherwise: `InputSourceError` (`fan_out()`: `BatchFailed`; a failed reference window:
+  `ReferenceFailed`).
+- **A source failure chains from the source's own exception.** The `__cause__` of the
+  `InputSourceError` a failed source raises is now the exception the source raised (`BatchFailed`
+  chains to it through that `InputSourceError`); for `fan_out()`, `fan_out_outcomes()` and the
+  reference families a private carrier class stood in between.
+- **`ExecutionContext.remaining_time()` is gone, and `time_left()` is not a drop-in for it.** The
+  execution layer asks for the time left through `ExecutionContext.time_left()`, or waits under it
+  with `ExecutionContext.deadline()`. When no time is left, both record the refusal on the context
+  before raising `BudgetExceededError`, and a recorded refusal ends the operation: catching the error
+  does not undo it, and the stream still ends with `BudgetExceededError` and an `incomplete` report.
+  Call them only where running out of time should end the operation. A read that refuses nothing is
+  `ExecutionContext.coalescing_time_left()`: the time left, negative once the deadline has passed,
+  recording nothing. A cleanup step bounds its wait with `ExecutionContext.cleanup_window()` instead.
+- **`ExecutionContext.reserve_attempt()` no longer takes `retry_started`.** It reserves the request
+  and attempt budgets only; the time check is the send's own, made just before it with `time_left()`.
+- **A synchronous source is never closed during its pull.** When the operation ended while a pull of
+  a synchronous source still ran in its worker thread, its close could start before the pull ended
+  (for example once the loop, shutting down, cancelled the tasks left) and failed in the background
+  with `RuntimeError: cannot enter context ... is already entered`. The close now waits for the pull,
+  then runs in the source's one `contextvars.Context`, as documented.
+
 ## Auto keyset partitioning under a small row buffer
 
 - **Auto sizes partition lanes to the row buffer.** `AutoKeysetExecution` probed `target_lanes`
@@ -406,9 +497,12 @@ operation, even when all that is left is to read the end of the source. The repo
 with `BudgetExceededError` as its terminal reason and a `budget_exhausted` violation. The stream raises
 a plain `BudgetExceededError`, except that a fail-fast stream whose stop failed a command or a binding
 raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report carries that reason); a stop at a
-source pull, the end-of-source check or the cleanup fails none. So it depends on where the budget
-stopped the stream, not on the operation: handle both, or read the report. A send cut in flight is another case: its command may have
-run, so it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end on that ambiguity
+source pull or the end-of-source check fails none, except that commands a batch window already read are
+sent and refused, so `batch()` raises `BatchFailed`. So it depends on where the budget stopped the
+stream, not on the operation: handle both, or read the report. The cleanup no longer stops a stream
+with the budget: it gets a grace past `max_elapsed`, and a close that overruns it raises
+`CleanupOverrunError` (see "The end of `max_elapsed` is not a cleanup failure"). A send cut in flight
+is another case: its command may have run, so it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end on that ambiguity
 instead.
 
 ## Compressed bodies are decoded whole

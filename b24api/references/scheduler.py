@@ -15,14 +15,13 @@ from b24api.contracts.report import PageDispatch, PageRecord, Violation, Violati
 from b24api.contracts.request import ReplaySafety, Request, ResultSelector, TraversalIdentity
 from b24api.contracts.response import result_snapshot
 from b24api.contracts.violation import retain_violations
-from b24api.errors import BudgetExceededError, CapabilityError
+from b24api.errors import BudgetExceededError, CapabilityError, CleanupOverrunError
 from b24api.execution import (
     AsyncIteratorController,
     Executor,
     await_cleanup_resistant,
     rearm_cancellation,
 )
-from b24api.execution.context import REQUEST_BUDGET_EXHAUSTED
 from b24api.execution.facts import dropped_result
 from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
@@ -81,7 +80,6 @@ from b24api.traversal.plans import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from b24api._sources import OwnedSource
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.report import KeysetSelectionSummary
     from b24api.contracts.response import Response
@@ -201,8 +199,10 @@ class ReferenceScheduler:
         self._fast_active: set[int] = set()
         self._fast_waiting = 0
 
-    async def outcomes(self, source: OwnedSource[ReferenceRequest]) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912
-        """Yield correlated operation outcomes."""
+    async def outcomes(  # noqa: C901, PLR0912
+        self, iterator: AsyncIteratorController[ReferenceRequest]
+    ) -> AsyncGenerator[ReferenceStreamItem]:
+        """Yield correlated operation outcomes, reading bindings through ``iterator``, which this closes."""
         if self.default_program is not None:
             PaginationDriver.validate_contract(
                 self.default_program.plan,
@@ -210,11 +210,6 @@ class ReferenceScheduler:
                 self.context.policy,
             )
         await self.context.start()
-        iterator = AsyncIteratorController(
-            source,
-            input_error="reference input exceeded operation time budget",
-            cleanup_error="reference source cleanup exceeded operation time budget",
-        )
         self._source_controller = iterator
         admission = _AdmissionState(
             tasks={},
@@ -240,7 +235,14 @@ class ReferenceScheduler:
             raise
         finally:
             cleanup = await await_cleanup_resistant(self._cleanup(iterator, admission, producer, primary_error))
-            if cleanup.error is not None:
+            # A caller's cancellation outranks a cleanup that overran its window, the bound the cancellation
+            # waited by (``cancellation_outranks``): the cancellation leaves, the overrun recorded behind it.
+            outranked = isinstance(primary_error, asyncio.CancelledError) and isinstance(
+                cleanup.error, CleanupOverrunError
+            )
+            if cleanup.error is not None and outranked:
+                _record_cleanup_failure(self.violations, cleanup.error)
+            elif cleanup.error is not None:
                 cleanup_error = cleanup.error
                 if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
                     _record_cleanup_failure(self.violations, cleanup_error)
@@ -260,7 +262,8 @@ class ReferenceScheduler:
                 primary_error,
                 asyncio.CancelledError | GeneratorExit,
             ):
-                _record_cleanup_failure(self.violations, cleanup.cancellation)
+                # Re-armed behind the failure, the cancellation lands in the stream's own cleanup, which records
+                # it (``with_cleanup_attempt``), as it does behind a cleanup failure above: recorded once.
                 pending_cancellation = cleanup.cancellation
             if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
                 rearm_cancellation(pending_cancellation)
@@ -290,16 +293,14 @@ class ReferenceScheduler:
                 cleanup_errors.append(error)
         pending, task_errors = await _wait_for_cleanup_tasks(
             (producer, *admission.tasks.values()),
-            remaining=max(0.0, self.context.policy.max_elapsed - self.context.elapsed),
+            remaining=self.context.cleanup_window(),
         )
         cleanup_errors.extend(error for error in task_errors if error is not primary_error)
         if pending:
-            cleanup_errors.append(BudgetExceededError("reference task cleanup exceeded operation time budget"))
+            cleanup_errors.append(CleanupOverrunError("reference task cleanup exceeded operation time budget"))
         else:
             try:
-                await iterator.aclose(
-                    remaining=max(0.0, self.context.policy.max_elapsed - self.context.elapsed),
-                )
+                await iterator.aclose(self.context)
             except BaseException as error:  # noqa: BLE001 - attach at the stream boundary
                 if error is not primary_error:
                     cleanup_errors.append(error)
@@ -312,21 +313,20 @@ class ReferenceScheduler:
         iterator: AsyncIteratorController[ReferenceRequest],
         admission: _AdmissionState,
     ) -> None:
-        """Read and admit bindings until the source ends: read out, or closed by the spent request budget.
+        """Read and admit bindings until the source ends: read out, or closed by the budget's refusal.
 
-        Once the request budget has refused a send, no binding read could be sent, so the producer reads none and
-        ends the source as a read-out source ends. Its own task ends without error either way, so a fail-fast
-        window's failure stays the operation's only error and its cleanup records nothing. Whether the operation
-        ends with the budget is decided by the consumer from the budget itself (``_raise_if_requests_refused``),
-        not from how the source ended: a source may be read out before the budget refuses a send.
+        A pull the operation's budget refuses (``ExecutionContext.refusal``: the request budget refused a send, or
+        the deadline passed before the pull or while it ran; once either has refused work, it refuses every later
+        pull) ends the source as a read-out source ends, although the source's end was not read, so the operation
+        cannot complete. The producer's own task ends without error either way, so a fail-fast window's failure
+        stays the operation's only error and its cleanup records nothing. Whether the operation ends with the
+        budget is decided by the consumer from the budget itself (``_raise_if_budget_refused``), not from how the
+        source ended: a source may be read out before the budget refuses work.
         """
         next_index = 0
         try:
             while True:
                 await admission.slots.acquire()
-                if self.context.requests_refused:
-                    await self._end_source(admission)
-                    return
                 self.producer_state.next_key = _producer_key(next_index)
                 self.producer_state.next_index = next_index
                 self.producer_state.source_pull_in_flight = True
@@ -336,7 +336,10 @@ class ReferenceScheduler:
                 except StopAsyncIteration:
                     await self._end_source(admission)
                     return
-                except BaseException:
+                except BaseException as error:
+                    if isinstance(error, BudgetExceededError) and self.context.refusal is not None:
+                        await self._end_source(admission)
+                        return
                     self._clear_pending_pull()
                     admission.slots.release()
                     raise
@@ -368,13 +371,13 @@ class ReferenceScheduler:
         self.producer_state.source_exhausted = True
         await self._wake_lease_waiters()
 
-    def _raise_if_requests_refused(self) -> None:
-        """End the operation with its request budget once every binding read is settled, if the budget refused a send.
+    def _raise_if_budget_refused(self) -> None:
+        """End the operation with its budget once every binding read is settled, if the budget refused work.
 
-        The budget's own record decides, whether the source was read out before the refusal or closed by it.
+        The budget's own record (``ExecutionContext.refusal``) decides, whether the source was read out before the
+        refusal or closed by it.
         """
-        if self.context.requests_refused:
-            raise BudgetExceededError(REQUEST_BUDGET_EXHAUSTED)
+        self.context.raise_if_refused()
 
     def _start_binding(self, work: _Work, admission: _AdmissionState) -> None:
         """Start an admitted binding's task: its local non-execution, or the run that retires its producer."""
@@ -540,14 +543,8 @@ class ReferenceScheduler:
         self.producer_state.touch()
         try:
             # The wait is bounded by the operation's elapsed budget, as every dispatch wait is.
-            remaining = self.context.policy.max_elapsed - self.context.elapsed
-            if remaining <= 0:
-                raise BudgetExceededError("operation elapsed budget exhausted before the fast keyset lease")
-            try:
-                async with asyncio.timeout(remaining):
-                    lease = await self.buffer.lease(index, functools.partial(self._lease_size, fast, index))
-            except TimeoutError as error:
-                raise BudgetExceededError("fast keyset lease wait exceeded the operation time budget") from error
+            async with self.context.deadline("fast keyset lease wait exceeded the operation time budget"):
+                lease = await self.buffer.lease(index, functools.partial(self._lease_size, fast, index))
         finally:
             self._fast_waiting -= 1
         # Every page of a leased binding is charged to its lease, none to the free pool rows.
@@ -831,7 +828,7 @@ class ReferenceScheduler:
             admission.slots.release()
             await self._wake_lease_waiters()
         await producer
-        self._raise_if_requests_refused()
+        self._raise_if_budget_refused()
 
     async def _input(
         self,
@@ -857,7 +854,7 @@ class ReferenceScheduler:
             next_head = min(admission.tasks) if admission.tasks else head + 1
             await self.buffer.advance_head(next_head, max(self._caps.values(), default=self._head_cap(next_head)))
         await producer
-        self._raise_if_requests_refused()
+        self._raise_if_budget_refused()
 
     def _record_event_violations(self, event: _Event) -> None:
         self.violations = list(retain_violations((*self.violations, *event.violations)))

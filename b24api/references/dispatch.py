@@ -15,7 +15,7 @@ from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.report import PageDispatch
-from b24api.errors import B24ApiError, BudgetExceededError, CapabilityError
+from b24api.errors import B24ApiError, BudgetExceededError, CapabilityError, CleanupOverrunError
 from b24api.execution import (
     ExecutionContext,
     Executor,
@@ -554,11 +554,8 @@ class _RowBuffer:
         if self._closed:
             raise asyncio.CancelledError
         if not self._can_reserve(index, amount):
-            try:
-                async with asyncio.timeout(self.context.policy.max_elapsed - self.context.elapsed):
-                    await self._wait_for_rows(index, amount)
-            except TimeoutError as error:
-                raise BudgetExceededError("row buffer wait exceeded operation time budget") from error
+            async with self.context.deadline("row buffer wait exceeded operation time budget"):
+                await self._wait_for_rows(index, amount)
         return self._take(index, amount, _Hold.IN_FLIGHT)
 
     async def _wait_for_rows(self, index: int, amount: int) -> None:
@@ -887,18 +884,11 @@ class _DirectPageDispatcher:
         if transit is not None:
             transit.arrive()
         reservation = await self.context.reserve_page(reference=reference_id)
-        remaining = self.context.policy.max_elapsed - self.context.elapsed
-        if remaining <= 0:
-            self.context.release_page(reservation)
-            raise BudgetExceededError("operation elapsed budget exhausted before direct admission")
         try:
             # The deadline bounds admission only: once sent, the executor's own budgets end the request and
             # record whether it may have run, which a deadline raised around the send would discard.
-            async with asyncio.timeout(remaining):
+            async with self.context.deadline("direct scheduler admission exceeded operation time budget"):
                 await self._semaphore.acquire()
-        except TimeoutError as error:
-            self.context.release_page(reservation)
-            raise BudgetExceededError("direct scheduler admission exceeded operation time budget") from error
         except BaseException:
             self.context.release_page(reservation)
             raise
@@ -961,7 +951,7 @@ class _BatchPageDispatcher:
         self.batch_requests = 0
         self.batch_commands = 0
 
-    async def fetch(  # noqa: C901
+    async def fetch(
         self,
         request: Request,
         reference_id: str,
@@ -983,15 +973,10 @@ class _BatchPageDispatcher:
         admitted: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         pending = _PendingBatch(request, reference_id, future, admitted, settled, options=options)
-        remaining = self.context.policy.max_elapsed - self.context.elapsed
-        if remaining <= 0:
-            if reservation is not None:
-                self.context.release_page(reservation)
-            raise BudgetExceededError("operation elapsed budget exhausted before batch admission")
         try:
             # The deadline bounds admission only: once the wave is sent, the executor's own budgets end it and
             # record whether it may have run, as they do for every other send.
-            async with asyncio.timeout(remaining) as admission:
+            async with self.context.deadline("batch scheduler admission exceeded operation time budget") as admission:
                 pending.admission = admission
                 await self._queue_page(pending, transit)
                 response = await future
@@ -1002,12 +987,8 @@ class _BatchPageDispatcher:
                 # A page cancelled after its wave was sent may have executed; settlement must say so.
                 record_dispatch(error, possibly_executed=True)
             raise
-        except TimeoutError as error:
-            # A page whose wave was sent no longer has a deadline: this one was never sent.
-            future.cancel()
-            self._abandon(pending, reservation)
-            raise BudgetExceededError("batch scheduler admission exceeded operation time budget") from error
         except BaseException:
+            # A refusal by the deadline included: a page whose wave was sent no longer has one, so it was never sent.
             future.cancel()
             self._abandon(pending, reservation)
             raise
@@ -1088,10 +1069,7 @@ class _BatchPageDispatcher:
                         projected = facts
                         if self._potential({item.reference_id for item in chunk}) == 0:
                             break
-                    remaining = min(
-                        deadline - self._time(),
-                        self.context.policy.max_elapsed - self.context.elapsed,
-                    )
+                    remaining = min(deadline - self._time(), self.context.coalescing_time_left())
                     if remaining <= 0:
                         break
                     state = self._producer_state
@@ -1330,10 +1308,9 @@ class _BatchPageDispatcher:
             await asyncio.sleep(0)
             active = tuple(worker for worker in owned_workers if not worker.done())
             if active:
-                remaining = max(0.0, self.context.policy.max_elapsed - self.context.elapsed)
-                _, pending_workers = await asyncio.wait(active, timeout=remaining)
+                _, pending_workers = await asyncio.wait(active, timeout=self.context.cleanup_window())
                 if pending_workers:
-                    raise BudgetExceededError("batch dispatcher cleanup exceeded operation time budget")
+                    raise CleanupOverrunError("batch dispatcher cleanup exceeded operation time budget")
             for worker in owned_workers:
                 with contextlib.suppress(asyncio.CancelledError):
                     await worker

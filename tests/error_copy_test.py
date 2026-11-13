@@ -36,6 +36,7 @@ from b24api.errors import (
     BatchFailed,
     BudgetExceededError,
     CapabilityError,
+    CleanupOverrunError,
     ClientClosedError,
     ContinuationError,
     ContinuationReason,
@@ -113,6 +114,7 @@ _SAMPLES: dict[str, Callable[[], B24ApiError]] = {
     ),
     "BudgetExceededError": lambda: BudgetExceededError("budget", request_summary=_SUMMARY),
     "CapabilityError": lambda: CapabilityError("capability"),
+    "CleanupOverrunError": lambda: CleanupOverrunError("cleanup exceeded the operation time budget"),
     "ClientClosedError": lambda: ClientClosedError(request_summary=_SUMMARY),
     "ContinuationError": lambda: ContinuationError(
         next(iter(ContinuationReason)), "no proof", request_summary=_SUMMARY

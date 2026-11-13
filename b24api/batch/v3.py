@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from b24api.execution.executor import PhysicalAttemptOutcome
 
 _OPERATION_TIME_LIMIT = "operation_time_limit"
+_ISOLATION_REFUSAL = "execution time budget exhausted before isolating the batch's commands"
 
 
 @dataclass(slots=True)
@@ -257,22 +258,34 @@ class _V3Resolution:
         """
         safety = envelope_safety(command.request.replay_safety for command in commands)
         methods = frozenset(command.request.method for command in commands)
-        plan = self.executor.plan_replay(self.context, attempts=self.attempts, sends=((safety, methods),))
+        try:
+            plan = self.executor.plan_replay(self.context, attempts=self.attempts, sends=((safety, methods),))
+        except BudgetExceededError as refusal:
+            return str(refusal)
         if plan is None or plan.plans != (_SendPlan.SEND,):
             return _retry_refusal(plan)
         await self.executor.replay_after(self.context, attempts=self.attempts, pause=plan.pause)
         return None
 
     def _isolation_allowed(self) -> bool:
-        """One bounded attribution phase, only within the inherited attempt and retry-time budgets."""
+        """One bounded attribution phase, only within the inherited attempt and retry-time budgets.
+
+        With no time left, the phase is refused by time as any work is (``ExecutionContext.time_left``): by the
+        operation's deadline, recorded, or by the group's retry window alone.
+        """
         policy = self.context.policy
         started = self.attempts.started
-        return (
-            policy.retry.isolate_safe_batch_abort
-            and started is not None
-            and self.attempts.used < policy.max_attempts_per_request
-            and self.context.remaining_time(retry_started=started) > 0
-        )
+        if (
+            not policy.retry.isolate_safe_batch_abort
+            or started is None
+            or self.attempts.used >= policy.max_attempts_per_request
+        ):
+            return False
+        try:
+            self.context.time_left(_ISOLATION_REFUSAL, retry_started=started)
+        except BudgetExceededError:
+            return False
+        return True
 
     async def _isolate(self, pending: tuple[_Command, ...]) -> tuple[BatchOutcome, ...]:
         """Send each unresolved SAFE command individually; they are never packed into a batch again."""
