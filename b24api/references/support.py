@@ -7,12 +7,13 @@ from typing import TYPE_CHECKING
 
 from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, qualified_closure
 from b24api.contracts.completion import BindingClosure
+from b24api.contracts.dispatch import PORTAL_PAGE_ROWS
 from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     DispatchPlan,
     ItemCursorPlan,
-    KernelDirectDispatch,
+    KernelBatchDispatch,
     KeysetPlan,
     ListPlan,
     OffsetSequentialPlan,
@@ -135,6 +136,23 @@ async def _finish_task(tasks: dict[int, asyncio.Task[None]], index: int) -> None
     await task
 
 
+def _whole_result_share(dispatch: DispatchPlan, policy: ExecutionPolicy) -> int:
+    """Return one whole result's share of the row budget: the budget divided among the results in flight at once.
+
+    The results in flight are what the dispatch may keep in flight (``results_in_flight``), each an active
+    reference; a share sized for fewer would let the row pool, not the dispatch, decide how many are in flight.
+    A batch's commands coalesce into fewer, fuller batches, so a batch dispatch counts no more results than the
+    budget holds full portal pages, though never fewer than one batch: its share never drops below a page while the
+    budget allows one per command of a batch, and the row pool's reservations hold back the commands beyond.
+    """
+    budget = policy.max_buffered_rows
+    results = min(dispatch.results_in_flight, policy.max_active_references)
+    if isinstance(dispatch, KernelBatchDispatch):
+        one_batch = min(dispatch.batch_size, policy.max_active_references)
+        results = min(results, max(one_batch, budget // PORTAL_PAGE_ROWS))
+    return max(1, budget // results)
+
+
 def _page_cap(
     plan: ListPlan,
     dispatch: DispatchPlan,
@@ -144,15 +162,7 @@ def _page_cap(
     page_cap_hint: int | None,
 ) -> int:
     if whole_result:
-        if isinstance(dispatch, KernelDirectDispatch):
-            concurrent_results = min(
-                dispatch.concurrency,
-                policy.max_direct_concurrency,
-                policy.max_active_references,
-            )
-        else:
-            concurrent_results = min(dispatch.batch_size, policy.max_active_references)
-        return max(1, policy.max_buffered_rows // concurrent_results)
+        return _whole_result_share(dispatch, policy)
     if page_cap_hint is not None:
         return min(page_cap_hint, policy.max_buffered_rows)
     requested = (

@@ -411,7 +411,7 @@ def kernel_reference_stream[C](
     fast, keyset_selection = _keyset_program(traversal, page_stop)
     if fast is not None:
         preflight_fast_keyset(executor, base, fast, policy)
-    dispatch_plan = kernel_dispatch(dispatch, policy)
+    dispatch_plan = kernel_dispatch(dispatch, policy, client_concurrency=executor.coordinator.max_concurrency)
     stream = _iter_references(
         executor,
         binding_source(base, bindings, traversal, audit),

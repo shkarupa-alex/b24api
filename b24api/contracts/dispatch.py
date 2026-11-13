@@ -7,6 +7,8 @@ from enum import StrEnum
 
 # The Bitrix portal accepts at most 50 commands in one physical batch; every layer reads this constant.
 PORTAL_BATCH_CAP = 50
+# The Bitrix portal answers one list page with at most 50 rows.
+PORTAL_PAGE_ROWS = 50
 
 
 class DeliveryOrder(StrEnum):
@@ -49,7 +51,11 @@ class BatchDispatch:
     ``max_active_references`` and by ``Settings.max_concurrent_requests``, which the client's operations share;
     the smallest applies. ``ExecutionPolicy.max_direct_concurrency`` does not limit them. The commands a REST 3.0
     isolation re-sends one by one are not batches: only ``Settings.max_concurrent_requests`` bounds them. A fan-out
-    sizes each command's row share for one batch, so ``batch_size=1`` sends one batch at a time.
+    divides ``max_buffered_rows`` among the commands of every batch it may keep in flight (``batch_size`` times that
+    smallest limit, at most ``max_active_references``), so a wider ``concurrency`` gives each command a smaller
+    result limit: 312 rows under ``batch_size=1, concurrency=8``. While the budget holds a full 50-row portal page
+    per command of one batch, the limit never drops below a page: the row budget then holds back the batches beyond
+    it, so the defaults, ``concurrency=2`` and ``batch_size=20, concurrency=4`` all keep 50 rows.
     """
 
     batch_size: int = PORTAL_BATCH_CAP

@@ -141,6 +141,11 @@ class RateCoordinator:
         self._cooldown_reason: str | None = None
         self._wake_task: asyncio.Task[None] | None = None
 
+    @property
+    def max_concurrency(self) -> int:
+        """Return how many requests the coordinator keeps in flight at once, across all the client's work."""
+        return self._max_concurrency
+
     async def acquire(
         self,
         work_class: WorkClass,

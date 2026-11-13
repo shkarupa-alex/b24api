@@ -8,10 +8,11 @@ by the operation's elapsed budget.
 
 from __future__ import annotations
 import asyncio
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from b24api import Bitrix24, Settings
 from b24api.contracts import (
     BatchDispatch,
     Command,
@@ -32,6 +33,7 @@ from b24api.references.dispatch import _RowBuffer
 from tests.scripting import (
     DEADLINE_BUDGET,
     DEADLINE_SLACK,
+    UNREACHABLE_COALESCE_WAIT,
     ResponderTransport,
     assert_fired_near_deadline,
     client_for,
@@ -167,18 +169,61 @@ def _rows(count: int) -> ResponderTransport:
     return ResponderTransport(respond)
 
 
-# A command's share of the default row budget: the budget divided among the results a dispatch holds at once.
-_SHARES = [(BatchDispatch(), _DEFAULT_ROWS // 50), (DirectDispatch(), _DEFAULT_ROWS // 10)]
+# A command's share of the row budget: the budget divided among the results a dispatch has in flight at once, a
+# batch's commands times the batches in flight, at most max_active_references and never so many that a full portal
+# page (50 rows) no longer fits each. One command a batch, eight batches at once: 312 rows. Two or four batches of
+# 50 or 20 commands would leave 25 or 31 rows, less than a page: they keep 50. Ten active references cap four
+# batches of five at ten results: 250 rows.
+_SINGLE_COMMAND_BATCHES = 8
+_PAGE_ROWS = 50
+_TEN_REFERENCES = ExecutionPolicy(max_active_references=10)
+_SHARES = [
+    (BatchDispatch(), None, _PAGE_ROWS),
+    (DirectDispatch(), None, _DEFAULT_ROWS // 10),
+    (
+        BatchDispatch(batch_size=1, concurrency=_SINGLE_COMMAND_BATCHES),
+        None,
+        _DEFAULT_ROWS // _SINGLE_COMMAND_BATCHES,
+    ),
+    (BatchDispatch(concurrency=2), None, _PAGE_ROWS),
+    (BatchDispatch(batch_size=20, concurrency=4), None, _PAGE_ROWS),
+    (BatchDispatch(batch_size=5, concurrency=4), _TEN_REFERENCES, _DEFAULT_ROWS // 10),
+]
+_SHARE_IDS = [
+    "batch",
+    "direct",
+    "single-command-batches",
+    "two-full-batches",
+    "four-batches-of-twenty",
+    "active-references-cap",
+]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("dispatch", "share"), _SHARES, ids=["batch", "direct"])
+@pytest.mark.parametrize(("dispatch", "policy", "share"), _SHARES, ids=_SHARE_IDS)
+async def test_a_fan_out_result_exactly_its_share_of_the_row_budget_is_delivered(
+    dispatch: BatchDispatch | DirectDispatch, policy: ExecutionPolicy | None, share: int
+) -> None:
+    command = Command(Request("crm.item.list", {}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
+    async with client_for(_rows(share), policy=policy) as client:
+        stream = client.fan_out_outcomes([command], dispatch=dispatch)
+        (outcome,) = [outcome async for outcome in stream]
+
+    assert isinstance(outcome, CommandSuccess)
+    assert outcome.response.result == list(range(share))
+    report = stream.report
+    assert report is not None
+    assert report.buffered_rows_high_water == share
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("dispatch", "policy", "share"), _SHARES, ids=_SHARE_IDS)
 async def test_a_fan_out_result_longer_than_its_share_of_the_row_budget_reports_that_it_ran(
-    dispatch: BatchDispatch | DirectDispatch, share: int
+    dispatch: BatchDispatch | DirectDispatch, policy: ExecutionPolicy | None, share: int
 ) -> None:
     command = Command(Request("crm.item.add", {}, ReplaySafety.UNSAFE, route=RouteKind.BARE), 0)
     transport = _rows(share + 1)
-    async with client_for(transport) as client:
+    async with client_for(transport, policy=policy) as client:
         (outcome,) = [outcome async for outcome in client.fan_out_outcomes([command], dispatch=dispatch)]
         _, error = await drain_to_failure(client.fan_out([command], dispatch=dispatch), BatchFailed)
 
@@ -186,6 +231,81 @@ async def test_a_fan_out_result_longer_than_its_share_of_the_row_budget_reports_
     (failed,) = error.outcomes
     _assert_dropped(failed, rows=share + 1, limit=share)
     assert len(transport.requests) == 2  # noqa: PLR2004 - one send of each operation
+
+
+_CLIENT_LIMIT = 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dispatch",
+    [DirectDispatch(), BatchDispatch(batch_size=1, concurrency=_SINGLE_COMMAND_BATCHES)],
+    ids=_SHARE_IDS[1:3],
+)
+async def test_a_fan_out_share_counts_only_the_sends_the_client_limit_lets_in_flight(
+    dispatch: BatchDispatch | DirectDispatch,
+) -> None:
+    # The client keeps two requests in flight, so two results share the budget, however wide the dispatch.
+    share = _DEFAULT_ROWS // _CLIENT_LIMIT
+    command = Command(Request("crm.item.list", {}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
+    transport = _rows(share + 1)
+    settings = Settings(webhook_url=f"https://{transport.host}/rest/1/token/", max_concurrent_requests=_CLIENT_LIMIT)
+    async with Bitrix24(settings, transport=transport) as client:
+        (outcome,) = [outcome async for outcome in client.fan_out_outcomes([command], dispatch=dispatch)]
+
+    _assert_dropped(outcome, rows=share + 1, limit=share)
+
+
+_BATCHES_IN_FLIGHT = 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_size", [1, 5])
+async def test_a_fan_out_keeps_its_batch_concurrency_in_flight_whatever_its_batch_size(batch_size: int) -> None:
+    # Each command's row share used to be sized for one batch: under batch_size=1 one command took the whole row
+    # budget, so one batch was in flight whatever the concurrency, and batch_size=5 fit five commands in all. The
+    # share now divides the budget among every batch in flight, so the dispatch, not the row pool, sets the peak.
+    commands_in_flight = _BATCHES_IN_FLIGHT * batch_size
+    release = asyncio.Event()
+    full = asyncio.Event()
+
+    async def respond(request: Request) -> object:
+        if len(transport.requests) == _BATCHES_IN_FLIGHT:
+            full.set()
+        await release.wait()
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {"result": {"result": dict.fromkeys(commands, 1), "result_error": []}}
+
+    transport = ResponderTransport(respond)
+    commands = [
+        Command(Request("crm.item.get", {"id": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
+        for index in range(3 * commands_in_flight)
+    ]
+    dispatch = BatchDispatch(
+        batch_size=batch_size, concurrency=_BATCHES_IN_FLIGHT, coalesce_wait=UNREACHABLE_COALESCE_WAIT
+    )
+    async with client_for(transport) as client:
+        stream = client.fan_out_outcomes(on_loop(commands), dispatch=dispatch)
+
+        async def drain() -> int:
+            async with stream:
+                return len([outcome async for outcome in stream])
+
+        drained = asyncio.create_task(drain())
+        await reached(full)
+        # Every send blocks until released and the input is fed on the loop: no batch beyond the peak can start
+        # unless a limit admits more, and these turns of the loop give it the room to.
+        for _ in range(50):
+            await asyncio.sleep(0)
+        in_flight = [len(cast("dict[str, object]", request.copy_parameters()["cmd"])) for request in transport.requests]
+        release.set()
+        assert await drained == len(commands)
+
+    assert in_flight == [batch_size] * _BATCHES_IN_FLIGHT
+    report = stream.report
+    assert report is not None
+    assert report.buffered_rows_high_water <= _DEFAULT_ROWS
 
 
 @pytest.mark.asyncio
