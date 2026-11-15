@@ -19,7 +19,7 @@ from b24api.contracts.policy import (
 )
 from b24api.errors import B24ApiError, BudgetExceededError, IncompleteTraversalError, PaginationError
 from b24api.execution.context import await_cancellation_resistant, await_cleanup_resistant, rearm_cancellation
-from b24api.execution.failure import CLEANUP_FAILED_REASON, cleanup_failure_violation
+from b24api.execution.failure import CANCELLED_REASON, CLEANUP_FAILED_REASON, cleanup_failure_violation
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 
@@ -80,7 +80,7 @@ class KeysetFastStream:
         except StopAsyncIteration:
             raise
         except asyncio.CancelledError as error:
-            await self._terminate(KernelState.CANCELLED, "iteration cancelled", primary=error)
+            await self._terminate(KernelState.CANCELLED, CANCELLED_REASON, primary=error)
             _attach_report(error, self.report)
             self._closed = self._runtime.closed
             raise

@@ -18,6 +18,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.report import retain_page_trace
 from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
+from b24api.execution.failure import CANCELLED_REASON
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
@@ -138,7 +139,7 @@ class CountedItemStream:
             await self._finalize(KernelState.COMPLETED, "counted traversal completed exactly")
         except asyncio.CancelledError as error:
             primary = error
-            await self._finalize(KernelState.CANCELLED, "iteration cancelled")
+            await self._finalize(KernelState.CANCELLED, CANCELLED_REASON)
             _attach_report(error, self.report)
             raise
         except GeneratorExit as error:

@@ -17,7 +17,7 @@ from b24api.contracts.report import (
     ViolationSeverity,
 )
 from b24api.errors import IncompleteTraversalError
-from b24api.execution.failure import finalize_failure
+from b24api.execution.failure import CANCELLED_REASON, finalize_failure
 from b24api.execution.lifecycle import (
     CleanupAttempt,
     LifecycleHooks,
@@ -200,7 +200,8 @@ class MappedOperationStream[S, T]:
             self._early_closed = True
             return self._publish(forced_state=TerminalState.EARLY_CLOSED)
         if cause is TerminalCause.CANCELLED:
-            return self._publish(forced_state=TerminalState.CANCELLED)
+            # The reader's cancellation ends the stream whatever its source had reached (read out, say): its reason.
+            return self._publish(forced_state=TerminalState.CANCELLED, reason=CANCELLED_REASON)
         if cause is TerminalCause.EXHAUSTED or error is None or error is self._source.cleanup_failure:
             # A failed close of a source read to its end is in the source's report already: the close is what failed.
             return self._publish()
@@ -282,7 +283,7 @@ class MappedOperationStream[S, T]:
             keyset_selection=self._keyset_selection,
         )
 
-    def _publish(self, *, forced_state: TerminalState | None = None) -> OperationReport:
+    def _publish(self, *, forced_state: TerminalState | None = None, reason: str | None = None) -> OperationReport:
         gate = self._gate()
         if self._cleanup is not None and not self._cleanup[1].finished:
             # Cleanup given up at the deadline: the source never recorded its terminal, so the gate closes
@@ -290,7 +291,10 @@ class MappedOperationStream[S, T]:
             gate.close_after_failure(CleanupState.FAILURE)
         elif self._source.report.state is KernelState.NOT_STARTED:
             gate.abort_unstarted()
-        gate.attach_report(self._facts(self._source_report(), forced_state=forced_state))
+        source = self._source_report()
+        if reason is not None:
+            source = replace(source, terminal_reason=reason)
+        gate.attach_report(self._facts(source, forced_state=forced_state))
         self._report = gate.finish()
         self._terminated()
         return self._report

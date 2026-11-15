@@ -27,6 +27,7 @@ from b24api.execution.context import (
     spawn_settled,
 )
 from b24api.execution.failure import (
+    CANCELLED_REASON,
     EARLY_CLOSE_REASON,
     attach_report,
     cleanup_failure_violation,
@@ -101,7 +102,7 @@ def kernel_terminal(cause: TerminalCause, reason: str | None) -> tuple[KernelSta
     if cause is TerminalCause.EARLY_CLOSED:
         return KernelState.CANCELLED, EARLY_CLOSE_REASON
     if cause is TerminalCause.CANCELLED:
-        return KernelState.CANCELLED, "iteration cancelled"
+        return KernelState.CANCELLED, CANCELLED_REASON
     return KernelState.FAILED, reason or "stream failed"
 
 

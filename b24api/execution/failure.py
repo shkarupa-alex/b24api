@@ -86,6 +86,8 @@ def classify_failure(error: BaseException) -> FailureClass:  # noqa: C901, PLR09
 
 
 EARLY_CLOSE_REASON = "stream closed before exhaustion"
+# The terminal reason of every stream its reader's cancellation ended, in every family.
+CANCELLED_REASON = "iteration cancelled"
 
 
 def report_reason(error: BaseException) -> str:

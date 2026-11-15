@@ -144,6 +144,7 @@ class _Source:
         self._failure = failure or ValueError("the caller's source failed")
         self._pulled = 0
         self.release = asyncio.Event()
+        self.closing = asyncio.Event()
         self.closed = False
 
     def __aiter__(self) -> _Source:
@@ -160,6 +161,7 @@ class _Source:
 
     async def aclose(self) -> None:
         self.closed = True
+        self.closing.set()
         if self._close == "raises":
             raise RuntimeError("the caller's close failed")
         if self._close == "overruns":
@@ -319,6 +321,34 @@ async def test_a_foreign_item_fails_the_source_with_public_errors_down_to_its_ty
     chain = _chain(caught.value)
     assert chain[-2:] == [InputSourceError, TypeError]
     assert [link.__name__ for link in chain if link.__name__.startswith("_")] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_a_stream_read_out_and_cancelled_in_its_close_reports_the_cancellation_reason(family: str) -> None:
+    # The source was read to its end, but the reader's cancellation ended the stream: its state and its reason
+    # are the cancellation's, in every family, not the read-out source's ("input exhausted").
+    source = _Source(family, "overruns")
+
+    async def consume(stream: OperationStream[Any]) -> None:
+        async for _item in stream:
+            pass
+
+    async with client_for(ResponderTransport(_answer), policy=POLICIES["returns"]) as client:
+        stream = _stream(client, family, source)
+        reader = asyncio.create_task(consume(stream))
+        try:
+            await reached(source.closing)
+            reader.cancel()
+            await asyncio.sleep(0)
+        finally:
+            source.release.set()
+        assert isinstance(await _settled(reader), asyncio.CancelledError)
+
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.CANCELLED
+    assert report.terminal_reason == "iteration cancelled"
 
 
 class _Blocks:
