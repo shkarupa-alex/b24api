@@ -1004,19 +1004,27 @@ async def test_a_read_the_client_closes_raises_its_source_failure_as_a_public_er
         raise RuntimeError("the caller's source failed")
 
     blocker = Blocker()
-    async with client_for(ResponderTransport(blocker), policy=POLICY) as client:
-        if family == "iter_reference_outcomes":
-            stream: OperationStream[Any] = client.iter_reference_outcomes(
-                LIST_REQUEST, items(), traversal=TRAVERSAL, dispatch=DirectDispatch(concurrency=1)
-            )
-        else:
-            stream = client.iter_reference_source_outcomes(items(), dispatch=DirectDispatch(concurrency=1))
-        read = asyncio.create_task(anext(stream))
-        await reached(failed)
-        await reached(blocker.started)
-    # Closing the client closed the stream under the read, which ended with the source's failure.
+    reads: list[asyncio.Task[Any]] = []
+
+    async def close_the_client_under_the_read() -> None:
+        async with client_for(ResponderTransport(blocker), policy=POLICY) as client:
+            if family == "iter_reference_outcomes":
+                stream: OperationStream[Any] = client.iter_reference_outcomes(
+                    LIST_REQUEST, items(), traversal=TRAVERSAL, dispatch=DirectDispatch(concurrency=1)
+                )
+            else:
+                stream = client.iter_reference_source_outcomes(items(), dispatch=DirectDispatch(concurrency=1))
+            reads.append(asyncio.create_task(anext(stream)))
+            await reached(failed)
+            await reached(blocker.started)
+
+    # Closing the client closed the stream under the read; the close ended in the source's failure, so the client's
+    # close raises it, as for a stream with no read in flight, and so does the read the close ended.
+    with pytest.raises(InputSourceError) as closed:
+        await close_the_client_under_the_read()
     with pytest.raises(InputSourceError) as caught:
-        await asyncio.wait_for(read, timeout=HANG_BOUND)
+        await asyncio.wait_for(reads[0], timeout=HANG_BOUND)
+    assert caught.value is closed.value
     assert not type(caught.value).__name__.startswith("_")
     # It chains straight from the source's own exception, with no private carrier between them.
     assert type(caught.value.__cause__) is RuntimeError
