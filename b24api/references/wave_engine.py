@@ -16,7 +16,7 @@ from b24api.batch.outcome import settlement_of
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError
-from b24api.references.dispatch import _BatchPageError, _DecodeOptions, _failed_settlement, _page_error
+from b24api.references.dispatch import _BatchPageError, _DecodeOptions, _failed_page
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -141,7 +141,7 @@ class SharedWaveEngine:
             if isinstance(error, _BatchPageError):
                 outcomes.append(error.failure)
                 continue
-            failure = failure or _page_error(error)
+            failure = failure or _failed_page(error).error
         if failure is not None:
             raise failure
         return tuple(outcomes)
@@ -204,7 +204,7 @@ def _settlement(task: asyncio.Task[_DispatchedPage], error: BaseException | None
     A task cancelled before it ran never handed its command to the dispatcher: it was not executed.
     """
     if error is not None:
-        return _failed_settlement(error)
+        return _failed_page(error).settlement
     outcome = task.result().outcome if task.done() and not task.cancelled() else None
     return CommandSettlement.NOT_EXECUTED if outcome is None else settlement_of(outcome)
 

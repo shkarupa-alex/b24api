@@ -18,7 +18,7 @@ from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError
 from b24api.execution.facts import Execution
-from b24api.references.dispatch import _BatchPageError, _failed_dispatch, _failed_execution, _failed_settlement
+from b24api.references.dispatch import _BatchPageError, _failed_page
 from b24api.traversal.counted_io import HeadAttempt, TailReceipt
 
 if TYPE_CHECKING:
@@ -131,14 +131,14 @@ class SharedCountedWaveIO:
 
     def head_failure(self, error: BaseException) -> HeadAttempt:
         """Return the actual batch provenance of a failed head and its settlement."""
-        failed = _failed_dispatch(self._host.page_dispatch, error)
+        failed = _failed_page(error)
         return HeadAttempt(
             None,
             failed.error,
-            failed.dispatch,
+            self._host.page_dispatch,
             failed.batch_index,
-            execution=_failed_execution(error),
-            settlement=_failed_settlement(error),
+            execution=failed.execution,
+            settlement=failed.settlement,
         )
 
     async def tail_batch_size(
@@ -398,7 +398,7 @@ def _abandoned_settlement(slot: _TailSlot) -> CommandSettlement:
     if not task.cancelled() and task.exception() is None:
         return CommandSettlement.SUCCESS
     error = slot.error
-    return CommandSettlement.NOT_EXECUTED if error is None else _failed_settlement(error)
+    return CommandSettlement.NOT_EXECUTED if error is None else _failed_page(error).settlement
 
 
 __all__ = ["LeaseCountedRowAccount", "ReferenceTailStream", "SharedCountedWaveIO"]

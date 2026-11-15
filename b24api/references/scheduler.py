@@ -5,7 +5,7 @@ import asyncio
 import functools
 from dataclasses import replace
 from inspect import isawaitable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from b24api.completion.reference_recorder import ReferenceCompletionRecorder
 from b24api.contracts.completion import BindingClosure, CommandSettlement
@@ -28,15 +28,11 @@ from b24api.references.dispatch import (
     ReferenceStreamItem,
     _AdmissionState,
     _BatchPageDispatcher,
-    _BatchPageError,
-    _ChunkPageError,
     _DirectPageDispatcher,
     _DispatchedPage,
     _DoneEvent,
     _Event,
-    _failed_dispatch,
-    _failed_execution,
-    _failed_settlement,
+    _failed_page,
     _FailureEvent,
     _Hold,
     _KernelFanOutSuccess,
@@ -432,13 +428,13 @@ class ReferenceScheduler:
                 await self._drive(run, pages)
         except asyncio.CancelledError:
             raise
-        except _BatchPageError as error:
-            failure = self._failure_event(run, cast("BaseException", error.failure.error))
-            await self.publish_terminal(run, replace(failure, replay_disposition=error.failure.replay_disposition))
-        except _ChunkPageError as error:
-            await self.publish_terminal(run, self._failure_event(run, error.error))
         except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
-            await self.publish_terminal(run, self._failure_event(run, error))
+            # The binding fails with what its failed page reports, and its command's replay disposition, if any.
+            failed = _failed_page(error)
+            failure = self._failure_event(run, failed.error)
+            if failed.replay_disposition is not None:
+                failure = replace(failure, replay_disposition=failed.replay_disposition)
+            await self.publish_terminal(run, failure)
         finally:
             try:
                 if pages is not None:
@@ -658,14 +654,14 @@ class ReferenceScheduler:
         try:
             dispatched = await self.dispatch_page(run, request)
         except BaseException as error:
-            run.completion.settled(_failed_settlement(error))
+            failed = _failed_page(error)
+            run.completion.settled(failed.settlement)
             await self.abandon_page(run)
-            known = _failed_execution(error)
-            if known.dispatched:
-                failed = _failed_dispatch(self.page_dispatch, error)
-                run.driver.set_page_dispatch(dispatch=failed.dispatch, batch_index=failed.batch_index)
+            if failed.execution.dispatched:
+                dispatch = self.page_dispatch
+                run.driver.set_page_dispatch(dispatch=dispatch, batch_index=failed.batch_index)
                 run.driver.record_failed_page(
-                    dispatch=failed.dispatch, batch_index=failed.batch_index, error=failed.error, known=known
+                    dispatch=dispatch, batch_index=failed.batch_index, error=failed.error, known=failed.execution
                 )
             raise
         run.driver.set_page_dispatch(dispatch=dispatched.dispatch, batch_index=dispatched.batch_index)

@@ -22,7 +22,6 @@ from b24api.batch.outcome import (
     BatchFailure,
     BatchOutcome,
     BatchSuccess,
-    settlement_of,
 )
 from b24api.batch.v3 import _V3Resolution
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
@@ -57,7 +56,7 @@ from b24api.execution.executor import (
     _SendPlan,
     _Settled,
 )
-from b24api.execution.facts import Execution, execution, record_execution
+from b24api.execution.facts import Execution, execution, record_execution, settled_as
 
 if TYPE_CHECKING:
     from b24api.contracts.completion import CommandSettlement
@@ -287,9 +286,8 @@ class BatchProgress:
         self._opaque = frozenset(command.index for command in commands)
 
     def settlement(self, index: int) -> CommandSettlement:
-        """Return how command ``index`` settles from what it did so far: its final outcome, once it has one."""
-        outcome = self._outcome(index)
-        return self.execution(index).settlement if outcome is None else settlement_of(outcome)
+        """Return how command ``index`` settles from what it did so far, by the one rule (``settled_as``)."""
+        return settled_as(self.execution(index), succeeded=self._succeeded(index))
 
     def record(self, error: BaseException, index: int) -> None:
         """Record on ``error``, its page's failure, what command ``index`` did so far, a success included."""

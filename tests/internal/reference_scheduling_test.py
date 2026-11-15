@@ -48,9 +48,8 @@ from b24api.references.dispatch import (
     _BatchPageDispatcher,
     _ChunkPageError,
     _DoneEvent,
-    _failed_settlement,
+    _failed_page,
     _FailureEvent,
-    _page_error,
     _PendingBatch,
     _ProducerState,
     _RowBuffer,
@@ -1039,7 +1038,7 @@ async def test_a_page_whose_wave_was_sent_when_the_deadline_passed_settles_unkno
     assert not isinstance(results[0], BudgetExceededError)
     assert isinstance(results[1], BudgetExceededError)
     assert "admission" in str(results[1])
-    assert [_failed_settlement(cast("BaseException", result)) for result in results] == [
+    assert [_failed_page(cast("BaseException", result)).settlement for result in results] == [
         CommandSettlement.UNKNOWN,
         CommandSettlement.NOT_EXECUTED,
     ]
@@ -1085,7 +1084,7 @@ async def test_a_page_cancelled_after_its_wave_was_sent_settles_unknown() -> Non
 
     # The wave left with the page, so the page may have run.
     (error,) = cancelled
-    assert _failed_settlement(error) is CommandSettlement.UNKNOWN
+    assert _failed_page(error).settlement is CommandSettlement.UNKNOWN
 
 
 @pytest.mark.asyncio
@@ -1135,9 +1134,10 @@ async def test_a_send_that_breaks_an_invariant_fails_its_pages_as_possibly_run(m
     await buffer.close()
 
     # The page reports the send path's own error, and it may have run: its chunk never ended.
-    assert isinstance(_page_error(caught.value), ValueError)
-    assert "zip" in str(_page_error(caught.value))
-    assert _failed_settlement(caught.value) is CommandSettlement.UNKNOWN
+    failed = _failed_page(caught.value)
+    assert isinstance(failed.error, ValueError)
+    assert "zip" in str(failed.error)
+    assert failed.settlement is CommandSettlement.UNKNOWN
 
 
 class _EndlessReferences:

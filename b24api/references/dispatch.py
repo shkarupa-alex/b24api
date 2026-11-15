@@ -262,12 +262,6 @@ class _PendingBatch:
     progress: BatchProgress | None = None
     position: int = 0
 
-    def failed(self, error: Exception) -> _ChunkPageError:
-        """Return the page's failure when its sent chunk failed as a whole: ``error``, with its command's own fact."""
-        if self.progress is None:
-            raise RuntimeError("a page fails with its chunk only once the chunk was handed to its send")
-        return _ChunkPageError(error, self.progress.execution(self.position), self.progress.settlement(self.position))
-
     def record(self, error: BaseException) -> None:
         """Record on the page's ``error`` what its command is known to have done, if its wave was handed to its send.
 
@@ -484,61 +478,65 @@ class _AdmissionState:
     changed: asyncio.Event
 
 
-class _BatchPageError(Exception):
-    def __init__(self, failure: BatchFailure) -> None:
-        self.failure = failure
-        super().__init__("batch page command failed")
+@dataclass(frozen=True, slots=True)
+class _FailedPage:
+    """What a page whose dispatch raised reports, what its command did, and how it settles.
 
-
-class _ChunkPageError(Exception):
-    """A page of a chunk that failed as a whole: the chunk's ``error``, and what the page's own command did.
-
-    The error is the chunk's, the same for every page of it, and it is what the page reports (``_page_error``);
-    what each command did is its own, read where the chunk stands when it fails (``BatchProgress``), as a page
-    cancelled meanwhile records it.
+    ``replay_disposition`` is its command's, for a command the batch answered with a failure; ``None`` otherwise.
     """
 
-    def __init__(self, error: Exception, known: Execution, settled: CommandSettlement) -> None:
-        self.error = error
-        self.execution = known
-        self.settlement = settled
-        super().__init__("batch page failed with its chunk")
-
-
-def _page_error(error: BaseException) -> BaseException:
-    """Return the error a failed page reports: its chunk's, when the chunk failed as a whole."""
-    return error.error if isinstance(error, _ChunkPageError) else error
-
-
-def _failed_execution(error: BaseException) -> Execution:
-    """Return what a page whose dispatch raised did: from its command outcome, its chunk, or its failure's facts."""
-    if isinstance(error, _ChunkPageError):
-        return error.execution
-    return execution(error.failure.error if isinstance(error, _BatchPageError) else error)
-
-
-def _failed_settlement(error: BaseException) -> CommandSettlement:
-    """Settle a page whose dispatch raised: from its command outcome, its chunk, or its failure's facts."""
-    if isinstance(error, _ChunkPageError):
-        return error.settlement
-    return settlement_of(error.failure) if isinstance(error, _BatchPageError) else settlement(error)
-
-
-@dataclass(frozen=True, slots=True)
-class _FailedDispatch:
-    dispatch: PageDispatch
-    batch_index: int | None
     error: BaseException
+    execution: Execution
+    settlement: CommandSettlement
+    batch_index: int | None = None
+    replay_disposition: ReplayDisposition | None = None
 
 
-def _failed_dispatch(dispatch: PageDispatch, error: BaseException) -> _FailedDispatch:
-    """Return the dispatch provenance and the reportable error of a page whose dispatch raised."""
-    if isinstance(error, _BatchPageError):
-        cause = error.failure.error
-        return _FailedDispatch(
-            dispatch, error.failure.command_index, cause if isinstance(cause, BaseException) else error
+class _SentPageError(Exception):
+    """The failure the batch dispatcher gives a page whose command it sent: it carries the page's own facts."""
+
+    def __init__(self, message: str, page: _FailedPage) -> None:
+        self.page = page
+        super().__init__(message)
+
+
+class _BatchPageError(_SentPageError):
+    """A page whose command the batch answered, or ended, with its own failure (``failure``)."""
+
+    def __init__(self, failure: BatchFailure) -> None:
+        self.failure = failure
+        cause = failure.error
+        super().__init__(
+            "batch page command failed",
+            _FailedPage(
+                cause if isinstance(cause, BaseException) else self,
+                execution(cause),
+                settlement_of(failure),
+                failure.command_index,
+                failure.replay_disposition,
+            ),
         )
-    return _FailedDispatch(dispatch, None, _page_error(error))
+
+
+class _ChunkPageError(_SentPageError):
+    """A page of a chunk that failed as a whole: it reports the chunk's ``error``, and keeps what its own command did.
+
+    The error is the chunk's, the same for every page of it; what each command did is its own, read where the chunk
+    stands when it fails (``BatchProgress``), as a page cancelled meanwhile records it.
+    """
+
+    def __init__(self, error: Exception, progress: BatchProgress, position: int) -> None:
+        super().__init__(
+            "batch page failed with its chunk",
+            _FailedPage(error, progress.execution(position), progress.settlement(position)),
+        )
+
+
+def _failed_page(error: BaseException) -> _FailedPage:
+    """Return a failed page's facts: those the dispatcher gave it, or those recorded on its failure."""
+    if isinstance(error, _SentPageError):
+        return error.page
+    return _FailedPage(error, execution(error), settlement(error))
 
 
 class _RowBuffer:
@@ -1281,10 +1279,11 @@ class _BatchPageDispatcher:
             raise
         except Exception as error:  # noqa: BLE001 - total chunk correlation boundary
             # Every page fails with the chunk's error and keeps what its own command did, which the chunk's
-            # progress says, whatever failed: a sent page no longer has a deadline to end its wait.
-            for item in chunk:
+            # progress says at the page's position, whatever failed: a sent page no longer has a deadline to end
+            # its wait.
+            for position, item in enumerate(chunk):
                 if not item.future.done():
-                    item.future.set_exception(item.failed(error))
+                    item.future.set_exception(_ChunkPageError(error, progress, position))
 
     @staticmethod
     def _correlate(chunk: list[_PendingBatch], outcomes: tuple[BatchOutcome, ...]) -> None:

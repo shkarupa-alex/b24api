@@ -16,6 +16,7 @@ import asyncio
 import dataclasses
 import json
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
@@ -67,14 +68,14 @@ from b24api.contracts.page_stop import ContinuePage
 from b24api.contracts.policy import KernelState, RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError, CapabilityError, IdentityContractError, ProtocolError
-from b24api.execution import ExecutionContext, Executor, RateCoordinator
+from b24api.execution import ExecutionContext, Executor, RateCoordinator, WorkClass
 from b24api.references import wave_engine
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _RowBuffer
 from b24api.transport import WireResponse
 from b24api.traversal.keyset_fast_plan import fit_wave
 from b24api.traversal.keyset_runtime import KeysetRuntime
-from tests.scripting import BatchPortal, ResponderTransport, client_for
+from tests.scripting import HANG_BOUND, BatchPortal, ResponderTransport, client_for
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -594,6 +595,128 @@ async def test_sequential_pages_of_a_chunk_whose_replay_fails_settle_and_trace_f
         ]
     )
     assert [type(outcome) for outcome in outcomes] == [ReferenceFailure, ReferenceFailure]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ["undecodable", "cancelled"])
+async def test_a_page_whose_answer_was_lost_settles_and_traces_as_possibly_run_when_its_chunk_ends_early(
+    monkeypatch: pytest.MonkeyPatch, end: str
+) -> None:
+    # Two bindings' first pages share one chunk. The batch answer omits the first command's entry, so its final
+    # outcome is a failure that may have run; it refuses the second (QUERY_LIMIT_EXCEEDED). The send that replays
+    # the second then cannot be decoded, or the reader is cancelled while it is on the wire. The first page settles
+    # from its own final outcome, and is traced so: it may have run, though its command has an outcome.
+    events: list[object] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    portal = BatchPortal(_answer({"p0": tuple(range(1, 2000)), "p1": tuple(range(1, 2000))}))
+    replaying = asyncio.Event()
+
+    async def respond(request: Request) -> WireResponse:
+        if portal.waves:  # the replay of the refused command
+            replaying.set()
+            if end == "cancelled":
+                await asyncio.Future()
+            portal.waves.append(1)
+            return WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        lost, refused = list(commands)
+        body = json.loads(answer.body)
+        del body["result"]["result"][lost]
+        del body["result"]["result"][refused]
+        body["result"]["result_error"] = {refused: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        return WireResponse(200, answer.headers, json.dumps(body).encode())
+
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        stream = client.iter_reference_outcomes(
+            _base(), [_parent("p0"), _parent("p1")], traversal=_traversal(SequentialKeysetExecution())
+        )
+        reader = asyncio.create_task(_drain(stream))
+        if end == "cancelled":
+            await asyncio.wait_for(replaying.wait(), HANG_BOUND)
+            reader.cancel()
+        done, _pending = await asyncio.wait({reader}, timeout=HANG_BOUND)
+        assert done == {reader}
+
+    settled = {event.binding_id: event.outcome for event in events if isinstance(event, PageCommandOutcome)}
+    assert settled == {0: CommandSettlement.UNKNOWN, 1: CommandSettlement.UNKNOWN}
+    if end == "undecodable":
+        _outcomes, report = reader.result()
+        traced = [(r.outcome, r.rejection_code) for r in report.page_trace if r.outcome is not PageOutcome.COMMITTED]
+        assert traced == [(PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)] * 2
+    else:
+        assert reader.cancelled()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ["on_the_wire", "at_its_permit"])
+async def test_fast_reference_bindings_cancelled_mid_run_settle_each_page_from_what_its_command_did(
+    monkeypatch: pytest.MonkeyPatch, end: str
+) -> None:
+    # Two fast keyset bindings share the dispatcher; the reader is cancelled while a send is on the wire, or while
+    # it waits at its rate permit. Each page settles from what its own command did: one answered before the end
+    # succeeded (also one whose wave task had already taken its answer), one on the wire may have run, and one
+    # never sent, whether its send waited at its permit or it was never handed to a send, was not executed.
+    events: list[object] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    held = asyncio.Event()
+    acquire = RateCoordinator.acquire
+    permits = [0]
+
+    async def hold_third(coordinator: RateCoordinator, *args: object, **kwargs: object) -> object:
+        if end == "at_its_permit" and args and args[0] is WorkClass.BATCH:
+            permits[0] += 1
+            if permits[0] == 3:
+                held.set()
+                await asyncio.Future()
+        return await acquire(coordinator, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(RateCoordinator, "acquire", hold_third)
+    portal = BatchPortal(_answer({"p0": tuple(range(1, 2000)), "p1": tuple(range(5, 900, 3))}))
+    answered: list[int] = []
+    on_the_wire: list[int] = []
+
+    async def respond(request: Request) -> WireResponse:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        if end == "on_the_wire" and len(answered) == 1:
+            on_the_wire.append(len(commands))
+            held.set()
+            await asyncio.Future()
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        answered.append(len(commands))
+        return answer
+
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        stream = client.iter_reference_outcomes(_base(), [_parent("p0"), _parent("p1")], traversal=_traversal(_auto()))
+        reader = asyncio.create_task(_drain(stream))
+        await asyncio.wait_for(held.wait(), HANG_BOUND)
+        reader.cancel()
+        done, _pending = await asyncio.wait({reader}, timeout=HANG_BOUND)
+        assert done == {reader}
+
+    scheduled = sum(isinstance(event, PageScheduled) for event in events)
+    settled = Counter(event.outcome for event in events if isinstance(event, PageCommandOutcome))
+    never_sent = scheduled - sum(answered) - sum(on_the_wire)
+    assert never_sent > 0
+    assert sum(answered) > len(answered)  # a wave carried more than one page
+    expected = {CommandSettlement.SUCCESS: sum(answered), CommandSettlement.NOT_EXECUTED: never_sent}
+    if on_the_wire:
+        expected[CommandSettlement.UNKNOWN] = sum(on_the_wire)
+    assert settled == expected
 
 
 @pytest.mark.asyncio
