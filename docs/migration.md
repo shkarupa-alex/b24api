@@ -130,7 +130,8 @@
   earlier failure, that failure stays the terminal reason and the close adds a `cleanup_failure`
   "stream cleanup also failed (X)". X is `InputSourceError` for a close that raised (next item) and
   `CleanupOverrunError` for one that overran its window. Code that matched the old strings must
-  match these.
+  match these. The error raised behind an earlier failure no longer carries that line as a note (only
+  `batch_outcomes()` added one); read it from the report the error carries (`error.report`).
 - **Breaking: a close that raises is the source failing.** A source's close that raised, from its
   `aclose()`, its `close()` or a generator's `finally`, surfaced as the raw exception on `break` from a
   synchronous source and wrapped from an asynchronous one. Every family now raises it as it raises a
@@ -159,23 +160,37 @@
   closes raises the source's failure the same way.
 - **A rejected page chains to the public `PaginationError`.** Fail-fast `iter_references()` and
   `fan_out()` raised `ReferenceFailed` whose `__cause__` was a private `PaginationError` subclass,
-  and a budget end could chain to a private window error. Public errors now chain only to public
+  and a budget end could chain to a private window error. A foreign item a `batch()` or
+  `batch_outcomes()` source yielded chained `InputSourceError` to a private `TypeError` subclass; it
+  is now a plain `TypeError`, as in every other family. Public errors now chain only to public
   errors or to your own exception. `PaginationError` has a `rejection_code` attribute
   (`PageRejectionCode`, `None` unless a page check rejected a page), the code the rejected page's
   `PageRecord` carries.
 - **`report.emitted` counts the items the reader got.** A reader cancelled just as a read produced
   its item never got it, but the report counted it as emitted. An item now counts once the reader
   has it.
-- **No library task ends with an unretrieved exception at shutdown.** A stream's internal read task
-  that ended in a failure (for example the budget's end during the cleanup grace while the event loop
-  shut down) was reported by `asyncio.run()` as a task exception never retrieved. The read task now
-  returns the failure to the reader, which raises it.
-- **An asynchronous source keeps one context.** Each pull of an asynchronous source ran in a fresh
-  copy of the reading task's context, so an async generator that set a `ContextVar` before a `yield`
-  could not reset its token after it (`ValueError`, and the stream failed with the source).
-  As a synchronous source already did, each source now runs every pull and its close in one
-  `contextvars.Context`, copied when the call that receives it is made; the reading task drives each
-  step, so nothing else about the source's scheduling changes.
+- **No library task ends in a failure at shutdown.** When the event loop shut down while a stream
+  ended (for example during the cleanup grace after the budget's end, or while a read waited in the
+  source), `asyncio.run()` reported a library task that ended in the source's failure: a source's pull
+  or close task, or a stream's read task. Every task the library starts around your code (a source's
+  pull and close, a stream's read and cleanup, the client's close) now returns how it ended to its
+  owner, which raises the failure; only your own task receives it.
+- **A cancelled stream gives the cancellation's reason.** A stream read to its end and cancelled
+  while its source closed reported `cancelled` with the terminal reason "input exhausted" (or
+  "reference input exhausted"). Every family now gives "iteration cancelled" whenever the reader's
+  cancellation ends the stream.
+- **A stream of yours read under a closed read is cancelled.** A stream your code read inside work an
+  outer stream's read started (a transport, for example), cancelled because the outer stream was
+  closed, reported `early_closed` as if closed itself. It now reports `cancelled`.
+- **Breaking: an asynchronous source keeps one context, copied when the stream is created.** Each
+  pull of an asynchronous source ran in a fresh copy of the reading task's context, so an async
+  generator that set a `ContextVar` before a `yield` could not reset its token after it (`ValueError`,
+  and the stream failed with the source). As a synchronous source already did, each source now runs
+  every pull and its close in one `contextvars.Context`, copied when the call that creates the stream
+  (`batch()`, `fan_out()`, a reference traversal) is made; the reading task drives each step, so
+  nothing else about the source's scheduling changes. A context variable set after that call is no
+  longer seen by the source: for example, a tracing span or request id set around the `async for`
+  loop. Set it before creating the stream.
 - **An interrupt through a send keeps no credential.** A `KeyboardInterrupt`, `SystemExit` or
   `GeneratorExit` passing through `HttpxTransport` kept the transport's and HTTPX's frames in its
   traceback, whose locals hold the request with the webhook token in its URL. The transport now

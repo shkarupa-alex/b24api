@@ -941,21 +941,25 @@ an `incomplete` (or `failed`) report, and the cancellation is delivered at its n
 closed before its first pull closes its source the same way. A synchronous source is pulled and closed in worker threads, in
 one `contextvars.Context`; a pull the deadline cut while it still runs is waited for before the close
 runs in that context, so a pull that outlasts the grace leaves its close to the background the same way.
-An asynchronous source also runs every pull and its close in one context of its own, driven by the task
-that reads it, so a context variable a generator sets before a `yield` is still set when it resumes.
+An asynchronous source also runs every pull and its close in one context of its own, copied when the call
+that creates the stream is made and driven by the task that reads it, so a context variable a generator sets
+before a `yield` is still set when it resumes. A context variable the caller sets after that call (a tracing
+span around the `async for` loop, say) is not seen by the source: set it before creating the stream.
 
 Every exception a source raises, from a pull or from its close, is its failure: the stream raises
 `InputSourceError` (`batch()` and `fan_out()`: `BatchFailed`, whose `__cause__` is that
 `InputSourceError`) with the source's exception as its `__cause__`, whether the source is synchronous
-or asynchronous and even when that exception is a library error of its own. Every family reports a
+or asynchronous and even when that exception is a library error of its own. An item that is not what
+the family reads fails the source too, with a `TypeError` as that cause. Every family reports a
 failed close the same way. When nothing failed before it, the close is what failed: the terminal
 reason is "stream cleanup failed" and the report carries one `cleanup_failure` violation, "stream
 cleanup failed (X)", where X is `InputSourceError` or `CleanupOverrunError`. Behind an earlier failure,
 that failure stays the terminal reason and the close adds "stream cleanup also failed (X)". The source
 is closed in every case, even when the stream's own tasks outlast the cleanup window. A close from
 another task while a read is in flight is an early close: the read it ends raises `CancelledError`, or
-the close's failure when the close failed, which the close raises too. `report.emitted` counts the
-items the reader got.
+the close's failure when the close failed, which the close raises too. A stream its reader's
+cancellation ended reports `cancelled` with the terminal reason "iteration cancelled", whatever its
+source had reached. `report.emitted` counts the items the reader got.
 
 Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
 observed identities per operation in memory (100,000 by default). All active reference bindings

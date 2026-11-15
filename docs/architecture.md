@@ -284,14 +284,21 @@ outcome.
   close that the end of the operation starts while a cut pull still runs waits for that pull instead
   of entering the context twice. An asynchronous source's steps run in its own context too, driven by
   the reading task (`_InContext` enters the context on each resumption), and its `failure` mapper
-  turns any exception a pull or the close raises into the family's source failure.
+  turns any exception a pull or the close raises into the family's source failure. `OwnedSource.rejected`
+  keeps what its own admission (`accept`) raised, so a batch tells an item it refused from the source's
+  own failure without a private exception class.
 - A failed close is reported by one rule, built by `OperationRunner` (`cleanup_failure` and
   `cleanup_failure_violation`), for every family: "stream cleanup failed (X)" as the terminal failure
-  when nothing failed before it, "stream cleanup also failed (X)" as a secondary otherwise. A close
-  while a read is in flight is an early close: the read it ends raises the close's failure, after the
-  close has run, and the report counts an item as emitted only once `LifecycleHooks.delivered` says the
-  reader has it. The isolated read task returns a failure for the reader to raise, so it never ends
-  in one.
+  when nothing failed before it, "stream cleanup also failed (X)" as a secondary otherwise, recorded in
+  the report and never repeated as a note on the raised error. A close while a read is in flight is an
+  early close: the read it ends raises the close's failure, after the close has run (only an inline
+  kernel consults the closed read's marker; an isolated runner's own close is its CLOSING phase). A
+  stream its reader's cancellation ended gives `CANCELLED_REASON`, whatever its source reached. The
+  report counts an item as emitted only once `LifecycleHooks.delivered` says the
+  reader has it. Every task the library starts around caller code (a source's pull and close, the
+  worker-thread hop, a stream's read and cleanup, the client's close) runs through `spawn_settled`: it
+  returns how it ended (`Settled`) and its owner raises the failure, so none ends in one, which
+  `asyncio.run` would report at shutdown whether or not the owner retrieved it.
 - The default response ceiling is enforced while streaming, before JSON decoding.
 - Exact sequential, counted, and multi-reference traversal shares one operation-wide
   `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted
