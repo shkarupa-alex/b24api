@@ -46,6 +46,7 @@ from b24api.references.dispatch import (
     _RowBuffer,
     _Work,
 )
+from b24api.references.dispatch_plan import bound_dispatch
 from b24api.references.keyset_run import run_fast_keyset
 from b24api.references.outcome import (
     KernelReferenceFailure,
@@ -119,9 +120,10 @@ class ReferenceScheduler:
         fast: FastKeysetProgram | None = None,
         keyset_selection: KeysetSelectionSummary | None = None,
     ) -> None:
-        """Initialize instance state."""
+        """Initialize instance state; the dispatch plan is bounded here by the operation policy, once for every path."""
         self.executor = executor
         self.plan = plan
+        dispatch = bound_dispatch(dispatch, policy)
         self.dispatch = dispatch
         self.selector = selector
         self.identity = identity

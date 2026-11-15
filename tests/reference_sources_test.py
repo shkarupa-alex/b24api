@@ -841,3 +841,60 @@ async def test_ahomo_sources_of_one_template_trace_exactly_like_the_homogeneous_
         expected_report.logical_pages,
         expected_report.state,
     )
+
+
+@dataclass
+class _InFlightPortal(BatchPortal):
+    """Record the most physical requests on the wire at once."""
+
+    in_flight: int = 0
+    peak: int = 0
+
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            return await super().send(request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
+        finally:
+            self.in_flight -= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["references", "sources"])
+@pytest.mark.parametrize(
+    ("dispatch", "policy", "measured", "bound"),
+    [
+        (BatchDispatch(batch_size=50, concurrency=4), ExecutionPolicy(max_buffered_commands=5), "batch", 5),
+        (DirectDispatch(concurrency=8), ExecutionPolicy(max_direct_concurrency=2), "in_flight", 2),
+    ],
+    ids=["max_buffered_commands", "max_direct_concurrency"],
+)
+async def test_the_operation_policy_bounds_every_reference_operation_s_dispatch(
+    api: str,
+    dispatch: BatchDispatch | DirectDispatch,
+    policy: ExecutionPolicy,
+    measured: str,
+    bound: int,
+) -> None:
+    # The dispatch asks for more than the policy allows: a batch holds at most max_buffered_commands, and direct
+    # pages in flight are at most max_direct_concurrency, whichever API built the operation.
+    portal = _InFlightPortal(
+        lambda _method, query: {"result": [{"ID": 1}] if query.get("start", "0") == "0" else []}, wire_turns=3
+    )
+    request = Request.bare("beta.list", {}, ReplaySafety.SAFE)
+    bindings = [
+        Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), parent),), parent) for parent in range(40)
+    ]
+    client = Bitrix24(Settings(webhook_url="https://fixture.invalid/rest/1/token/"), transport=portal, policy=policy)
+    async with client:
+        stream = (
+            client.iter_reference_outcomes(request, bindings, traversal=BETA, dispatch=dispatch)
+            if api == "references"
+            else client.iter_reference_source_outcomes(
+                [ReferenceSource(request, BETA, binding) for binding in bindings], dispatch=dispatch
+            )
+        )
+        outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == len(bindings) * 2
+    assert (max(portal.waves) if measured == "batch" else portal.peak) == bound

@@ -15,7 +15,7 @@ def kernel_dispatch(dispatch: DispatchSpec, *, client_concurrency: int) -> Dispa
     """Translate a public dispatch into a plan bounded by the client's request limit.
 
     ``client_concurrency`` is ``Settings.max_concurrent_requests``. The operation policy's limits are applied once,
-    by the internal ``iter_references`` (``bound_dispatch``).
+    by the ``ReferenceScheduler`` that every reference operation runs (``bound_dispatch``).
     """
     order = ReferenceOutputOrder.READY if dispatch.output_order is DeliveryOrder.READY else ReferenceOutputOrder.INPUT
     concurrency = min(dispatch.concurrency, client_concurrency)
@@ -34,8 +34,8 @@ def kernel_dispatch(dispatch: DispatchSpec, *, client_concurrency: int) -> Dispa
 def bound_dispatch(plan: DispatchPlan, policy: ExecutionPolicy) -> DispatchPlan:
     """Bound a plan by the operation policy: the concurrency and batch size the operation can really use.
 
-    The internal ``iter_references`` passes every reference operation's plan here once, so the dispatchers take
-    its limits as they are.
+    ``ReferenceScheduler`` passes every reference operation's plan here once, so the dispatchers take its limits as
+    they are.
     """
     if isinstance(plan, KernelDirectDispatch):
         return replace(
