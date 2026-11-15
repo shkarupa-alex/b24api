@@ -183,7 +183,8 @@ def _validate_wave(
             continue
         selected_rows += receipt.selected_rows
         rejections.append(receipt)
-        host.violations.append(receipt.violation)
+        if not _budget_end(host, receipt.error):
+            host.violations.append(receipt.violation)
         page_outcome, rejection_code = classify_rejection(outcome, receipt)
         host.record_page(
             plan,
@@ -228,7 +229,7 @@ def _abort_wave(
     )
     if rejection is None:
         raise PaginationError("fast keyset wave validation failed")
-    _raise_rejection(rejection)
+    _raise_rejection(host, rejection)
 
 
 def _settlement(outcome: BatchOutcome) -> CommandSettlement:
@@ -238,15 +239,23 @@ def _settlement(outcome: BatchOutcome) -> CommandSettlement:
     return execution(outcome.error).settlement
 
 
-def _raise_rejection(rejection: ReceiptRejection) -> NoReturn:
+def _budget_end(host: KeysetTransactionHost, error: BaseException | None) -> bool:
+    """Return whether the operation's recorded budget refusal stopped a command: its end, not a failed page."""
+    return isinstance(error, BudgetExceededError) and host.context.execution_context.refusal is not None
+
+
+def _raise_rejection(host: KeysetTransactionHost, rejection: ReceiptRejection) -> NoReturn:
     """Raise a rejected command's cause; a failed command ends the traversal incomplete, with its replay.
 
     An ambiguous command is raised as is, as a direct page's is: whether it executed is unknown, so
-    the binding's outcome is unknown rather than failed.
+    the binding's outcome is unknown rather than failed. A command the operation's budget refused is
+    raised as is too: the refusal ends the operation, as it ends a direct page.
     """
     cause = rejection.error
     if cause is None:
         raise PaginationError(rejection.detail)
+    if _budget_end(host, cause):
+        raise cause
     if (
         isinstance(cause, B24ApiError)
         and execution(cause) is not Execution.POSSIBLY_RUN
@@ -480,7 +489,8 @@ def _reject_finish_receipt(
     dispatch: PageDispatch,
 ) -> NoReturn:
     """Record a rejected finish page as a rejected wave command is recorded, discard its rows, and raise."""
-    host.violations.append(receipt.violation)
+    if not _budget_end(host, receipt.error):
+        host.violations.append(receipt.violation)
     host.admission.record_raw(receipt.selected_rows, discarded=True)
     page_outcome, rejection_code = classify_rejection(outcome, receipt)
     host.record_page(
@@ -493,7 +503,7 @@ def _reject_finish_receipt(
         violation=receipt.violation,
         dispatch=dispatch,
     )
-    _raise_rejection(receipt)
+    _raise_rejection(host, receipt)
 
 
 __all__ = [

@@ -1239,7 +1239,7 @@ async def test_auto_cuts_lanes_finer_at_the_exact_request_budget_edge(max_reques
         policy=ExecutionPolicy(max_buffered_rows=250, max_requests=max_requests),
     )
 
-    with pytest.raises(IncompleteTraversalError, match="command_failure") as captured:
+    with pytest.raises(IncompleteTraversalError, match="budget_exhausted") as captured:
         _ = [row async for row in stream]
     assert isinstance(captured.value.__cause__, BudgetExceededError)
     report = stream.report
@@ -1247,6 +1247,75 @@ async def test_auto_cuts_lanes_finer_at_the_exact_request_budget_edge(max_reques
     keyset = report.keyset_execution
     assert keyset is not None
     assert keyset.anchor_probe_commands == probes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_pages", "max_requests", "kind", "reason"),
+    [
+        # Too few requests for any gain: sequential traversal from the boundary wave, whose next page
+        # the request budget refuses.
+        (None, 2, KeysetExecutionKind.SEQUENTIAL, KeysetSelectionReason.INSUFFICIENT_PREDICTED_GAIN),
+        # The probes leave no gain within 32 pages: sequential traversal after them, refused likewise.
+        (32, 6, KeysetExecutionKind.SEQUENTIAL, KeysetSelectionReason.POST_PROBE_GAIN_LOST),
+        # Partitioned: a wave command, then the finish page, are the ones refused.
+        (None, 20, KeysetExecutionKind.PARTITIONED, KeysetSelectionReason.WIDE_SPAN_PARTITIONING),
+        (None, 40, KeysetExecutionKind.PARTITIONED, KeysetSelectionReason.WIDE_SPAN_PARTITIONING),
+    ],
+    ids=["sequential", "sequential-after-probe", "partitioned-wave", "partitioned-finish"],
+)
+async def test_auto_ends_with_the_request_budget_as_explicit_sequential_traversal_does(
+    max_pages: int | None,
+    max_requests: int,
+    kind: KeysetExecutionKind,
+    reason: KeysetSelectionReason,
+) -> None:
+    # A page whose send the budget refused was never settled, and closing the binding rejected it as if
+    # it had been: a completion protocol violation instead of the budget's end. A refused wave command
+    # was a command failure.
+    policy = ExecutionPolicy(max_buffered_rows=250, max_requests=max_requests, max_pages=max_pages or 10_000)
+    identities = tuple(range(1, 2_001))
+    auto = _stream(KeysetTransport(identities), AutoKeysetExecution(StableIntegerKeysetContract()), policy=policy)
+    sequential = _stream(KeysetTransport(identities), SequentialKeysetExecution(), policy=policy)  # type: ignore[arg-type]
+
+    with pytest.raises(IncompleteTraversalError) as captured:
+        _ = [row async for row in auto]
+    with pytest.raises(BudgetExceededError):
+        _ = [row async for row in sequential]
+
+    assert isinstance(captured.value.__cause__, BudgetExceededError)
+    assert str(captured.value.__cause__) == "physical request budget exhausted"
+    report, expected = auto.report, sequential.report
+    assert report is not None
+    assert expected is not None
+    assert (report.state, report.terminal_reason, [item.code for item in report.violations]) == (
+        TerminalState.INCOMPLETE,
+        "BudgetExceededError",
+        ["budget_exhausted"],
+    )
+    assert (expected.state, expected.terminal_reason) == (report.state, report.terminal_reason)
+    assert [(item.code, item.message) for item in expected.violations] == [
+        (item.code, item.message) for item in report.violations
+    ]
+    keyset = report.keyset_execution
+    assert keyset is not None
+    assert (keyset.selected_kind, keyset.final_selection_reason or keyset.preselection_reason) == (kind, reason)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["missing", "duplicate"])
+async def test_an_ambiguous_fast_wave_closes_its_binding_unknown(fault: str) -> None:
+    # A command that may have run settles unknown, so the binding's closure is unknown, not failed.
+    stream = _stream(
+        MalformedBatchEnvelopeTransport(tuple(range(1, 21)), fault=fault),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+    )
+
+    with pytest.raises(AmbiguousExecutionError):
+        _ = [item async for item in stream]
+
+    assert stream.report is not None
+    assert [item.code for item in stream.report.violations if item.code.startswith("completion_")] == []
 
 
 @pytest.mark.parametrize(

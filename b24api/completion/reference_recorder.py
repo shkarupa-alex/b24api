@@ -272,16 +272,5 @@ class ReferenceFastLedger(FastPageLedger):
         for command_id, outcome in zip(unsettled[len(unsettled) - len(outcomes) :], outcomes, strict=True):
             self.settle(command_id, outcome)
 
-    def close(self, *, successful: bool, reason: str, unsettled: CommandSettlement) -> None:
-        """Retire every open page before the binding terminal: discarded probes, or a failed traversal."""
-        if successful:
-            self.discard_unadmitted()
-            if not self._active:
-                return
-        for command_id, page in tuple(self._active.items()):
-            if not page.settled:
-                self.settle(command_id, unsettled)
-        self._reject_active(reason)
-
 
 __all__ = ["ReferenceBindingRecorder", "ReferenceCompletionRecorder", "ReferenceFastLedger"]

@@ -45,11 +45,17 @@ class FastPageLedger:
         """Start with no scheduled command."""
         self._active: dict[str, _CommandPage] = {}
         self._negative = False
+        self._unknown = False
 
     @property
     def negative(self) -> bool:
         """Return whether any page of this binding settled or was retired negatively."""
         return self._negative
+
+    @property
+    def unknown(self) -> bool:
+        """Return whether any page of this binding settled with an unknown outcome."""
+        return self._unknown
 
     def _new_page(self) -> int:
         """Return the next page id of this binding."""
@@ -76,6 +82,7 @@ class FastPageLedger:
         self._emit_page(PageCommandOutcome, page.page_id, outcome=outcome)
         if outcome is not CommandSettlement.SUCCESS:
             self._negative = True
+            self._unknown = self._unknown or outcome is CommandSettlement.UNKNOWN
             del self._active[command_id]
 
     def validated(self, command_id: str) -> None:
@@ -134,8 +141,19 @@ class FastPageLedger:
             if page.recorded and page.remaining is None:
                 self.admit(command_id, 0)
 
-    def _reject_active(self, reason: str) -> None:
-        """Retire every page still open after an unsuccessful traversal."""
+    def close(self, *, successful: bool, reason: str, unsettled: CommandSettlement) -> None:
+        """Retire every open page before the binding terminal: discarded probes, or a failed traversal.
+
+        A page whose dispatch raised before its outcome was observed is settled ``unsettled`` first, from the
+        facts of the failure that ended the traversal: only a settled page can be rejected.
+        """
+        if successful:
+            self.discard_unadmitted()
+            if not self._active:
+                return
+        for command_id, page in tuple(self._active.items()):
+            if not page.settled:
+                self.settle(command_id, unsettled)
         for command_id, page in tuple(self._active.items()):
             self._emit_page(PageRejected, page.page_id, reason=reason)
             self._negative = True
@@ -181,22 +199,26 @@ class FastCompletionRecorder(FastPageLedger):
         cleanup: CleanupState,
         closure: BindingClosure | None = None,
         qualified_witnesses: int = 0,
+        unsettled: CommandSettlement = CommandSettlement.NOT_EXECUTED,
     ) -> None:
-        """Settle the operation only after owned scheduler cleanup has finished."""
+        """Settle the operation only after owned scheduler cleanup has finished.
+
+        ``unsettled`` settles a page whose dispatch raised: it comes from the facts of the failure that ended
+        the traversal, so a page that may have run makes the binding's closure unknown.
+        """
         if self._terminal:
             return
         self._terminal = True
-        if state is KernelState.COMPLETED and rows_emitted == rows_admitted:
-            self.discard_unadmitted()
-        else:
-            self._reject_active(state.value)
         successful = state is KernelState.COMPLETED and rows_emitted == rows_admitted
+        self.close(successful=successful, reason=state.value, unsettled=unsettled)
         if successful and closure not in {BindingClosure.SOURCE_EMPTY, BindingClosure.KEYSET_PLAN_COVERED}:
             closure = BindingClosure.FAILURE
             self._negative = True
         elif not successful:
             closure = (
-                BindingClosure.CALLER_STOP
+                BindingClosure.UNKNOWN
+                if self._unknown
+                else BindingClosure.CALLER_STOP
                 if state is KernelState.CANCELLED and not self._negative
                 else BindingClosure.FAILURE
             )
