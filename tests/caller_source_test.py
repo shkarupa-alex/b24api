@@ -738,6 +738,40 @@ async def test_a_source_sees_the_context_of_the_call_that_created_its_stream(fam
     assert seen == ["at creation"] * (ITEMS + 1)
 
 
+class _OwnError(Exception):
+    """The caller's own code failed inside ``async with stream``."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close", ["raises", "overruns"])
+@pytest.mark.parametrize("kind", ["async", "sync"])
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_the_callers_own_exception_carries_the_reports_record_of_a_failed_close(
+    family: str, kind: str, close: str
+) -> None:
+    # The caller's own exception stays what is raised; its one note is the report's violation, word for word.
+    source = SOURCE_KINDS[kind](family, close)
+    async with client_for(ResponderTransport(_answer), policy=POLICIES[close]) as client:
+        stream = _stream(client, family, source)
+
+        async def body() -> None:
+            async with stream:
+                await anext(stream)
+                raise _OwnError
+
+        try:
+            with pytest.raises(_OwnError) as raised:
+                await asyncio.wait_for(body(), timeout=HANG_BOUND)
+        finally:
+            source.release.set()
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.EARLY_CLOSED
+    assert report.terminal_reason == "stream cleanup failed"
+    assert _violations(report) == [("cleanup_failure", f"stream cleanup failed ({CLOSE_FAILURES[close]})")]
+    assert raised.value.__notes__ == [report.violations[0].message]
+
+
 class _FailsWhenCut:
     """Its second pull waits until cancelled and then fails; its close fails too."""
 

@@ -12,7 +12,7 @@ import inspect
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum, StrEnum
-from typing import TYPE_CHECKING, NoReturn, Self, cast
+from typing import TYPE_CHECKING, NoReturn, Protocol, Self, cast
 
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import Violation, ViolationSeverity
@@ -208,7 +208,16 @@ async def _settle(pull: asyncio.Future[Settled[object]], read: _Read) -> Excepti
     return None if isinstance(error, StopAsyncIteration) else error
 
 
-class OperationRunner[T, R]:
+class _Report(Protocol):
+    """A stream's published report: its violations record what failed, a failed close among them."""
+
+    @property
+    def violations(self) -> tuple[Violation, ...]:
+        """Return the report's violations."""
+        ...
+
+
+class OperationRunner[T, R: _Report]:
     """Single-use async iterator that owns one body's termination and publishes one report.
 
     ``isolated_pulls`` runs each read in a child task so ``aclose()`` from another task can cancel
@@ -294,7 +303,10 @@ class OperationRunner[T, R]:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close on exit; a close failure or cancellation never replaces the body's primary exception."""
+        """Close on exit; a close failure or cancellation never replaces the body's primary exception.
+
+        The body's own exception is noted with the report's record of the failed close, word for word.
+        """
         del exc_type, traceback
         try:
             await self.aclose()
@@ -303,10 +315,17 @@ class OperationRunner[T, R]:
                 raise
             # §3.1 X + C: the body's exception stays primary and the cancellation lands on the next await.
             rearm_cancellation(cancellation)
-        except Exception as close_error:
+        except Exception:
             if exc is None:
                 raise
-            exc.add_note(cleanup_failure_violation(close_error, secondary=True).message)
+            if (note := self._failed_close_record()) is not None:
+                exc.add_note(note)
+
+    def _failed_close_record(self) -> str | None:
+        """Return the published report's record of the failed close: its cleanup or its finalization failure."""
+        code = "report_finalize_failure" if self._finalize_error is not None else "cleanup_failure"
+        violations = self._report.violations if self._report is not None else ()
+        return next((violation.message for violation in violations if violation.code == code), None)
 
     async def __anext__(self) -> T:
         """Read one item; the read that ends the body publishes the report and raises by §3.1."""
@@ -470,7 +489,7 @@ class OperationRunner[T, R]:
 
         async def finalize() -> None:
             value = self._hooks.finalize(cause, reason, attempt)
-            published.append(cast("R", await value) if inspect.isawaitable(value) else value)
+            published.append(await value if inspect.isawaitable(value) else value)
 
         outcome = await await_cleanup_resistant(finalize())
         failed = outcome.error is not None and not published

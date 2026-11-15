@@ -130,8 +130,12 @@
   earlier failure, that failure stays the terminal reason and the close adds a `cleanup_failure`
   "stream cleanup also failed (X)". X is `InputSourceError` for a close that raised (next item) and
   `CleanupOverrunError` for one that overran its window. Code that matched the old strings must
-  match these. The error raised behind an earlier failure no longer carries that line as a note (only
-  `batch_outcomes()` added one); read it from the report the error carries (`error.report`).
+  match these. A library error raised behind an earlier failure no longer carries that line as a note
+  (only `batch_outcomes()` added one); read it from the report the error carries (`error.report`). Your
+  own exception raised inside `async with stream`, which a failed close does not replace, carries one
+  note: the report's `cleanup_failure` violation word for word (it was "stream cleanup also failed (X)",
+  with X the raised class, `BatchFailed` for `batch()` and `fan_out()`; it is now "stream cleanup
+  failed (InputSourceError)" or "stream cleanup failed (CleanupOverrunError)").
 - **Breaking: a close that raises is the source failing.** A source's close that raised, from its
   `aclose()`, its `close()` or a generator's `finally`, surfaced as the raw exception on `break` from a
   synchronous source and wrapped from an asynchronous one. Every family now raises it as it raises a

@@ -290,7 +290,10 @@ outcome.
 - A failed close is reported by one rule, built by `OperationRunner` (`cleanup_failure` and
   `cleanup_failure_violation`), for every family: "stream cleanup failed (X)" as the terminal failure
   when nothing failed before it, "stream cleanup also failed (X)" as a secondary otherwise, recorded in
-  the report and never repeated as a note on the raised error. A close while a read is in flight is an
+  the report. A library error never carries it as a note: it carries the report (`error.report`). The
+  caller's own exception raised inside `async with stream`, which the failed close does not replace,
+  carries one note: the report's `cleanup_failure` violation, word for word (`__aexit__` reads it from
+  the published report). A close while a read is in flight is an
   early close: the read it ends raises the close's failure, after the close has run (only an inline
   kernel consults the closed read's marker; an isolated runner's own close is its CLOSING phase). A
   stream its reader's cancellation ended gives `CANCELLED_REASON`, whatever its source reached. The

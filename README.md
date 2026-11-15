@@ -954,7 +954,10 @@ the family reads fails the source too, with a `TypeError` as that cause. Every f
 failed close the same way. When nothing failed before it, the close is what failed: the terminal
 reason is "stream cleanup failed" and the report carries one `cleanup_failure` violation, "stream
 cleanup failed (X)", where X is `InputSourceError` or `CleanupOverrunError`. Behind an earlier failure,
-that failure stays the terminal reason and the close adds "stream cleanup also failed (X)". The source
+that failure stays the terminal reason and the close adds "stream cleanup also failed (X)". A library
+error carries this in its report (`error.report`), not as a note; your own exception raised inside
+`async with stream` stays what is raised and carries one note, the report's `cleanup_failure` violation
+word for word. The source
 is closed in every case, even when the stream's own tasks outlast the cleanup window. A close from
 another task while a read is in flight is an early close: the read it ends raises `CancelledError`, or
 the close's failure when the close failed, which the close raises too. A stream its reader's

@@ -269,14 +269,13 @@ async def test_body_failure_survives_a_failing_source_close_on_context_exit(fami
         with pytest.raises(_BodyFailedError) as raised:
             await body()
 
-        # The body's own exception reaches the caller; the cleanup failure is a note and a report entry.
-        # The note names the error the close would have raised: the family's source failure.
-        raised_name = "BatchFailed" if family in {"batch", "fan_out"} else "InputSourceError"
-        assert f"stream cleanup also failed ({raised_name})" in raised.value.__notes__
+        # The body's own exception reaches the caller with one note: the report's record of the failed close.
         report = stream.report
         assert report is not None
         assert report.terminal_reason == "stream cleanup failed"
-        assert "cleanup_failure" in _codes(report)
+        failed_close = [violation.message for violation in report.violations if violation.code == "cleanup_failure"]
+        assert failed_close == ["stream cleanup failed (InputSourceError)"]
+        assert raised.value.__notes__ == failed_close
     assert source.closes == 1
 
 
