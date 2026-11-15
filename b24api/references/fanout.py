@@ -184,7 +184,7 @@ def kernel_fanout_stream[C](
 
     if not isinstance(executor, Executor):
         raise TypeError("executor must be an Executor")
-    dispatch_plan = kernel_dispatch(dispatch, policy, client_concurrency=executor.coordinator.max_concurrency)
+    dispatch_plan = kernel_dispatch(dispatch, client_concurrency=executor.coordinator.max_concurrency)
     stream = _iter_references(
         executor,
         commands if isinstance(commands, OwnedSource) else command_source(commands),
