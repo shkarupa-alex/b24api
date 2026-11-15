@@ -421,12 +421,14 @@ async def test_a_binding_cancelled_while_its_wave_is_on_the_wire_settles_each_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("second", ["answered", "denied"])
 async def test_a_binding_cancelled_while_its_wave_waits_to_replay_settles_each_page_from_its_own_command(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, second: str
 ) -> None:
     # The second wave is answered, but the server refuses its first command (QUERY_LIMIT_EXCEEDED), and the binding
     # is cancelled while the wave waits to send it again. The shared engine settles each page by its command id:
-    # the refused one is an answered failure, every other page succeeded.
+    # the refused one is an answered failure, as is a second one answered with a final failure (ACCESS_DENIED),
+    # and every other page succeeded.
     events: list[object] = []
     emit = CompletionGate.emit
 
@@ -446,13 +448,13 @@ async def test_a_binding_cancelled_while_its_wave_waits_to_replay_settles_each_p
 
     monkeypatch.setattr(Executor, "replay_after", observed_replay_after)
     serve = _answer({"p0": tuple(range(1, 2000))})
-    refused: list[Query] = []
+    failures = [("QUERY_LIMIT_EXCEEDED", "slow"), *([("ACCESS_DENIED", "no")] if second == "denied" else [])]
 
     def answer(method: str, query: Query) -> Envelope:
-        # The first command of the second wave, the first range wave.
-        if len(portal.waves) == 2 and not refused:
-            refused.append(query)
-            return {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}
+        # The first commands of the second wave, the first range wave.
+        if len(portal.waves) == 2 and failures:
+            error, description = failures.pop(0)
+            return {"error": error, "error_description": description}
         return serve(method, query)
 
     portal = BatchPortal(answer)
@@ -468,11 +470,9 @@ async def test_a_binding_cancelled_while_its_wave_waits_to_replay_settles_each_p
             await pull
 
     settled = {event.page_id: event.outcome for event in events if isinstance(event, PageCommandOutcome)}
+    negative = [CommandSettlement.FAILURE] * (2 if second == "denied" else 1)
     assert len(wave) == portal.waves[1]
-    assert [settled[page] for page in wave] == [
-        CommandSettlement.FAILURE,
-        *[CommandSettlement.SUCCESS] * (len(wave) - 1),
-    ]
+    assert [settled[page] for page in wave] == [*negative, *[CommandSettlement.SUCCESS] * (len(wave) - len(negative))]
 
 
 @pytest.mark.asyncio
