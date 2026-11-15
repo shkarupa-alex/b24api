@@ -45,7 +45,9 @@ from b24api.execution.facts import (
     http_success,
     possible_execution,
     record_dispatch,
+    record_stop,
     record_withheld,
+    stopped_before_send,
 )
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
@@ -369,15 +371,13 @@ class _RequestAttempts:
 
         The one rule for every stop before a send, by the budget or otherwise (a closed client), whichever single
         request, batch round or isolated send it stops: what ended the send is the outcome, and what it followed is
-        its cause.
+        its cause. The stop is recorded as one (``record_stop``), so whoever records how the request ended records
+        what the sends before it left open, never the stop as a send that may have run.
         """
-        if self.retry_cause is not None:
-            error.__cause__ = self.retry_cause
+        record_stop(error, followed=self.retry_cause)
 
     def settle(self, error: B24ApiError, policy: ExecutionPolicy) -> None:
-        """Record how the last send failed; a budget stop before the send was chained where it stopped it."""
-        if isinstance(error, BudgetExceededError):
-            return
+        """Record how the last send failed."""
         settled = _proves_not_run(error, policy) or answered_conclusively(error, policy)
         self.classified(error, may_have_run=not settled)
 
@@ -398,6 +398,17 @@ class _RequestAttempts:
     def record_unsent(self, error: BaseException) -> None:
         """Record a failure before a further send left: what the earlier sends left open stays open."""
         self.lineage.record_unsent(error)
+
+    def record_end(self, error: BaseException, policy: ExecutionPolicy) -> None:
+        """Record on the failure that ended a request after its sends what they left open.
+
+        A stop before a further send (``chain_stop``) leaves open what they did, as a batch dialect records its own
+        stops; any other failure is how the latest send ended.
+        """
+        if stopped_before_send(error):
+            self.record_unsent(error)
+        else:
+            self.record(error, policy)
 
     def withhold(self, error: BaseException) -> None:
         """Record a command the server halted before: proven not run by the last send, but not by earlier ones."""
@@ -517,7 +528,7 @@ class Executor:
             )
         except BaseException as error:
             if attempts.used > spent:
-                attempts.record(error, context.policy)
+                attempts.record_end(error, context.policy)
             raise
         try:
             response = _decode_success(wire, parsed, request_summary=request.summary)
@@ -559,7 +570,7 @@ class Executor:
             )
         except BaseException as error:
             if attempts.used:
-                attempts.record(error, context.policy)
+                attempts.record_end(error, context.policy)
             raise
         content_type = wire.content_type
         digest = hashlib.sha256(wire.body).hexdigest() if context.policy.binary_digest else None
@@ -960,9 +971,12 @@ class Executor:
         try:
             replay = self.plan_replay(context, attempts=shared, sends=((safety, methods),))
         except BudgetExceededError as refusal:
-            raise refusal from error
+            shared.chain_stop(refusal)
+            raise
         if replay is None or replay.plans != (_SendPlan.SEND,):
-            raise BudgetExceededError(_retry_refusal(replay)) from error
+            stop = BudgetExceededError(_retry_refusal(replay))
+            shared.chain_stop(stop)
+            raise stop
         await self._wait(context, shared, replay.pause)
 
     async def _wait(self, context: ExecutionContext, attempts: _RequestAttempts, pause: _Pause) -> None:

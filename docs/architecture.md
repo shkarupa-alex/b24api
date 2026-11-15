@@ -129,8 +129,9 @@ outcome.
   engine plans each command on its own safety and its own method's hold as known when planning: a
   round waits only as long as its `UNSAFE` and `UNKNOWN` commands can afford, carries a `SAFE` command
   held longer to a later round (an attempt is spent per send of the envelope, when `_RequestAttempts`
-  records it after the attempt is reserved: a round that is sent spends one, a round stopped before its
-  send, at its permit or its admission, spends none, and a carried command spends none of its own;
+  records it once its transport returned or failed: a round that is sent spends one, a round stopped
+  before its send, at its permit, its admission or its transport, spends none, and a carried command
+  spends none of its own;
   every round that carries a command plans to send another, so the attempt budget bounds the carrying:
   a command still carried when the last attempt is spent ends as the attempt budget stops it), and
   still sends the others when the window or a held method stops some, unless it is fail-fast, which is
@@ -138,11 +139,19 @@ outcome.
   when it outlasts the window. A stop before a send that follows a failure, by the budget or by any
   other failure (a closed client), is chained to the failure of the latest send in one place, where the
   executor stops it (`_RequestAttempts.chain_stop`, at the permit, at the admission and at the transport),
-  for a lone request's retry, a REST 3.0 envelope retry or isolated send and a classic round alike. A
-  transport that refuses a send before it leaves the process raises `ClientClosedError`, whichever transport
-  it is (a closed `HttpxTransport` or injected HTTPX client, for example): the executor releases the
-  attempt it reserved and records nothing sent (`Executor._dispatch`), so that send is no physical request
-  and no isolated send, and stops it as the permit does. A batch command
+  for a lone request's retry, a REST 3.0 envelope retry or isolated send and a classic round alike.
+  There the stop is recorded as one (`facts.record_stop`), never told by its exception type: whoever
+  records how a command ended records what the sends before the stop left open (`record_unsent`), the
+  executor for a lone request (`_RequestAttempts.record_end`) as the batch dialects for their own, so a
+  command a stop ended is explained by the latest send that may have run (its reason and evidence),
+  whatever stopped it: the budget, a closed coordinator or a closed transport. A transport refuses a
+  send before it leaves the process with `ClientClosedError` only because it is closed (a closed
+  `HttpxTransport` or injected HTTPX client, or any transport): the executor releases the attempt it
+  reserved and records nothing sent (`Executor._dispatch`), so that send is no physical request and no
+  isolated send, and stops it as the permit does. Until its transport returns, a send holds its
+  reservation, so a concurrent send the spent request budget refused meanwhile stays refused even when
+  that reservation is then released. Any other failure before dispatch (a credential unavailable, a
+  connection pool timeout, a refused connection) is a `TransportError` and its send counts. A batch command
   that followed its envelope's failure ends with that stop; a classic round may carry a command past a
   round, so its engine gives each command a copy of the stop caused by the failure that command
   followed. A command its own entry or element answered keeps that answer, whatever stops its replay.

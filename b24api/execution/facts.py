@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from b24api.contracts.request_summary import RequestSummary
 
 _FACTS = "_b24api_execution_facts"
+_STOPPED = "_b24api_stopped_before_send"
 _MAY_HAVE_RUN = "Command may have executed; automatic replay is forbidden"
 _HTTP_SUCCESS_MINIMUM = 200
 _HTTP_SUCCESS_MAXIMUM = 299
@@ -87,6 +88,23 @@ def dropped_result(*, rows: int, limit: int, request_summary: RequestSummary | N
     error = ResultTooLargeError(rows=rows, limit=limit, request_summary=request_summary)
     record_dispatch(error, possibly_executed=False)
     return error
+
+
+def record_stop(error: B24ApiError, *, followed: B24ApiError | None) -> None:
+    """Record that ``error`` stopped a send before it left, caused by the failure of the send it followed, if any.
+
+    Whatever stopped it (the budget, a closed coordinator or a closed transport), a stop says nothing about whether
+    a command ran: the sends before it do, and its recorder records what they left open (``record_dispatch`` with
+    their ``unproven`` failure), never the stop as a send that may have run.
+    """
+    error.__dict__[_STOPPED] = True
+    if followed is not None:
+        error.__cause__ = followed
+
+
+def stopped_before_send(error: BaseException) -> bool:
+    """Return whether ``error`` stopped a send before it left (``record_stop``)."""
+    return getattr(error, _STOPPED, False) is True
 
 
 def record_withheld(error: BaseException) -> None:
@@ -200,12 +218,15 @@ def _recorded_unproven(error: BaseException) -> B24ApiError | None:
 
 
 def _explained_by(error: B24ApiError) -> B24ApiError:
-    """Return the failure of the send that may have run: recorded, or behind an ambiguity or a stopped retry."""
+    """Return the failure of the send that may have run: recorded, or behind an ambiguity.
+
+    A stop before a send is explained only by what its recorder recorded (``record_stop``), whatever stopped it.
+    """
     recorded = _recorded_unproven(error)
     if recorded is not None:
         return recorded
     cause = error.__cause__
-    if isinstance(error, AmbiguousExecutionError | BudgetExceededError) and isinstance(cause, B24ApiError):
+    if isinstance(error, AmbiguousExecutionError) and isinstance(cause, B24ApiError):
         return _explained_by(cause)
     return error
 
@@ -230,5 +251,7 @@ __all__ = [
     "http_success",
     "possible_execution",
     "record_dispatch",
+    "record_stop",
     "record_withheld",
+    "stopped_before_send",
 ]

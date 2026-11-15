@@ -784,10 +784,10 @@ def test_live_portal_registers_and_claims_only_the_webhook_token(monkeypatch: py
     monkeypatch.setenv("BITRIX24_API_WEBHOOK_URL", "https://example.invalid" + "/rest/7/" + token + "/")
     with LivePortal(role="admin_full") as portal:
         registered = HTTPX_LOG_SHIELD.registered_secrets()
-        assert token in registered
-        assert "7" not in registered
+        assert registered.found_in(token)
+        assert not registered.found_in("7")
         assert portal.call_envelope("profile")["result"] == {"ID": "7"}
-    assert [(len(credentials), token in credentials) for credentials in claimed] == [(1, True)]
+    assert [(len(credentials), credentials.found_in(token)) for credentials in claimed] == [(1, True)]
 
 
 def test_live_refused_shield_entry_drops_the_method_url(monkeypatch: pytest.MonkeyPatch) -> None:

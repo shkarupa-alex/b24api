@@ -474,7 +474,7 @@ async def test_foreign_record_carrying_a_registered_secret_is_scrubbed_with_its_
 async def test_secret_registry_is_deduplicated_by_value_and_tied_to_client_lifetime() -> None:
     _assert_shield_idle()
     initial = len(HTTPX_LOG_SHIELD.registered_secrets())
-    assert _OWNED not in HTTPX_LOG_SHIELD.registered_secrets()
+    assert not HTTPX_LOG_SHIELD.registered_secrets().found_in(_OWNED)
     clients = [
         httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(_OK, request=request)))
         for _ in range(2)
@@ -483,15 +483,15 @@ async def test_secret_registry_is_deduplicated_by_value_and_tied_to_client_lifet
     for transport in transports:
         await transport.aclose()
     # Both injected clients are still open: the secret stays registered, once.
-    assert _OWNED in HTTPX_LOG_SHIELD.registered_secrets()
+    assert HTTPX_LOG_SHIELD.registered_secrets().found_in(_OWNED)
     assert len(HTTPX_LOG_SHIELD.registered_secrets()) == initial + 1
     await clients[0].aclose()
     assert HTTPX_LOG_SHIELD.suppresses_hpack() is True
-    assert _OWNED in HTTPX_LOG_SHIELD.registered_secrets()
+    assert HTTPX_LOG_SHIELD.registered_secrets().found_in(_OWNED)
     assert len(HTTPX_LOG_SHIELD.registered_secrets()) == initial + 1
     await clients[1].aclose()
     assert HTTPX_LOG_SHIELD.suppresses_hpack() is False
-    assert _OWNED not in HTTPX_LOG_SHIELD.registered_secrets()
+    assert not HTTPX_LOG_SHIELD.registered_secrets().found_in(_OWNED)
     assert len(HTTPX_LOG_SHIELD.registered_secrets()) == initial
 
 
@@ -515,7 +515,7 @@ async def test_registered_secret_stays_scrubbed_while_the_injected_client_outliv
     assert handler.records[-1].args == ("https://other.invalid/",)
 
     # Closing the client drops its secret at once; the next shield lifecycle event removes both filters.
-    assert _OWNED not in HTTPX_LOG_SHIELD.registered_secrets()
+    assert not HTTPX_LOG_SHIELD.registered_secrets().found_in(_OWNED)
     await HttpxTransport(f"https://portal.invalid/rest/1/{_PROBE_MARKER}/").aclose()
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
     for name in HPACK_LOGGER_NAMES:

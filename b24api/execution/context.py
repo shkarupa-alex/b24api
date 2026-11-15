@@ -226,7 +226,11 @@ class ExecutionContext:
         self._physical_requests += 1
 
     def release_attempt(self) -> None:
-        """Release a reserved attempt whose transport refused it before it left the process: no physical request."""
+        """Release a reserved attempt whose transport refused it before it left the process: no physical request.
+
+        The send held its reservation until its transport returned, so a concurrent send the spent request budget
+        refused meanwhile stays refused.
+        """
         self._physical_requests -= 1
 
     async def record_retry(self) -> None:

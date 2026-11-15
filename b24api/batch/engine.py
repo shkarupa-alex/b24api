@@ -56,6 +56,7 @@ from b24api.execution.executor import (
     _SendPlan,
     _Settled,
 )
+from b24api.execution.facts import record_stop
 
 if TYPE_CHECKING:
     from b24api.contracts.evidence import ResponseEvidence
@@ -218,7 +219,7 @@ class _Lineup:
             self._settle(waiting.state.outcome, waiting.lineage)
             return
         error = copy.copy(stop).with_traceback(stop.__traceback__)
-        error.__cause__ = waiting.state.failure
+        record_stop(error, followed=waiting.state.failure)
         waiting.lineage.record_unsent(error)
         self._settle(_shared_failure(command, error), waiting.lineage)
 
@@ -451,7 +452,7 @@ class BatchExecutor:
         except B24ApiError as error:
             failure = error
             if attempts.used == spent and spent:
-                # The budget stopped this round before its send: every command it holds was sent before.
+                # A stop before its send (the budget, a closed client): every command it holds was sent before.
                 attempts.record_unsent(error)
         else:
             try:

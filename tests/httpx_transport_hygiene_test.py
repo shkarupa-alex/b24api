@@ -693,13 +693,13 @@ async def test_the_credential_registered_with_the_log_shield_is_the_token_as_sen
         transport = HttpxTransport(url, client=http)
         try:
             # Literal dot segments are resolved, as HTTPX and Settings resolve them, before anything is derived.
-            assert FRAGMENT in HTTPX_LOG_SHIELD.registered_secrets()
+            assert HTTPX_LOG_SHIELD.registered_secrets().found_in(FRAGMENT)
             async with Bitrix24(Settings(webhook_url=url), transport=transport, policy=_ONE_ATTEMPT) as client:
                 assert await client.call(Request.bare("user.current")) == 1
         finally:
             await transport.aclose()
     assert sent == [f"https://fixture.invalid/rest/1/{FRAGMENT}/user.current"]
-    assert [(len(credentials), FRAGMENT in credentials) for credentials in owned] == [(1, True)]
+    assert [(len(credentials), credentials.found_in(FRAGMENT)) for credentials in owned] == [(1, True)]
 
 
 # Authorities URL parsers repair silently; the rule refuses them instead.

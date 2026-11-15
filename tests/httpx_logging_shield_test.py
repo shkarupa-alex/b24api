@@ -68,8 +68,8 @@ async def _assert_shield_released(logger: logging.Logger) -> None:
     lifecycle event removes it; a throwaway transport provides that event.
     """
     registered = HTTPX_LOG_SHIELD.registered_secrets()
-    assert _OWNED_MARKER not in registered
-    assert _FOREIGN_MARKER not in registered
+    assert not registered.found_in(_OWNED_MARKER)
+    assert not registered.found_in(_FOREIGN_MARKER)
     await HttpxTransport(f"https://portal.invalid/rest/1/{_PROBE_MARKER}/").aclose()
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
 

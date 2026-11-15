@@ -136,10 +136,6 @@ class WebhookSecrets:
         """Count the distinct tokens held."""
         return len(self._searched())
 
-    def __contains__(self, token: object) -> bool:
-        """Report whether ``token`` is exactly one of the tokens held."""
-        return any(webhook.token == token for webhook in self._webhooks)
-
     def __or__(self, other: WebhookSecrets) -> WebhookSecrets:
         """Hold the tokens of both."""
         if other._webhooks <= self._webhooks:

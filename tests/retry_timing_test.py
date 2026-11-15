@@ -6,6 +6,8 @@ it, so no test waits on the wall clock or asserts one.
 
 from __future__ import annotations
 import asyncio
+import contextlib
+import dataclasses
 import email.utils
 import json
 import os
@@ -24,8 +26,8 @@ from b24api.batch.correlation import _Command
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchOutcome, BatchSuccess
 from b24api.batch.stream import batch_outcome_stream
-from b24api.contracts import Command, CommandSuccess, ResultErrorSpec, ResultSelector
-from b24api.contracts.policy import ExecutionPolicy, KernelState, ReplayDisposition, RetryPolicy
+from b24api.contracts import Command, CommandOutcomeUnknown, CommandSuccess, ResultErrorSpec, ResultSelector
+from b24api.contracts.policy import AmbiguityReason, ExecutionPolicy, KernelState, ReplayDisposition, RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
@@ -41,7 +43,7 @@ from b24api.errors import (
 )
 from b24api.execution import Executor, RateCoordinator, WireResponse, WorkClass, throttle
 from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
-from b24api.execution.facts import Execution, execution
+from b24api.execution.facts import Execution, ambiguity_of, execution
 from b24api.references.fanout import kernel_fanout_stream
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from tests.scripting import ResponderTransport, always, client_for, drain_to_failure, on_loop, replies
@@ -1788,6 +1790,7 @@ class _ClosingTransport(ScriptedTransport):
     ``closing`` names what closes: the client's ``coordinator``, so no send after the last reply gets a permit, or
     the ``transport`` itself, which then refuses every send before it leaves, as any transport may: with the
     ``ClientClosedError`` that says it never left. Either way the replay asked for is stopped, not by a budget.
+    Nothing closes for a ``budget`` that stops it instead.
     """
 
     def __init__(self, replies: tuple[WireResponse | TransportError, ...], *, closing: str) -> None:
@@ -1801,6 +1804,7 @@ class _ClosingTransport(ScriptedTransport):
     async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         del request, attempt_timeout, max_response_bytes
         if not self.replies:
+            assert self.closing == "transport", "no send leaves after the last reply"
             self.refused += 1
             raise ClientClosedError("transport is closed")
         self.sends += 1
@@ -1859,11 +1863,13 @@ def _stopped_replies(dialect: str, first: str) -> tuple[WireResponse | Transport
     return (_lost(), _lost()) if dialect == "v3-isolation" else (_lost(),)
 
 
-async def _stopped_errors(dialect: str, transport: _ClosingTransport) -> tuple[list[B24ApiError], ExecutionSnapshot]:
+async def _stopped_errors(
+    dialect: str, transport: _ClosingTransport, policy: ExecutionPolicy = _NO_DELAY
+) -> tuple[list[B24ApiError], ExecutionSnapshot]:
     """Run two SAFE commands, or one lone request, and return the error each ended with and the budget."""
     executor = _executor(transport, _Time())
     transport.executor = executor
-    context = executor.context(_NO_DELAY)
+    context = executor.context(policy)
     if dialect == "lone":
         with pytest.raises(B24ApiError) as raised:
             await executor.execute(_request(ReplaySafety.SAFE, "crm.item.get"), context=context)
@@ -1951,3 +1957,87 @@ async def test_a_replay_stopped_before_its_send_by_a_closed_client_ends_with_the
         else:
             assert followed is replies[-1]
         assert execution(error) is Execution.POSSIBLY_RUN
+
+
+def _timed_out() -> TransportError:
+    """A send cut by its timeout after it left: it may have run."""
+    error = TransportError("attempt timed out", phase=FailurePhase.DISPATCH_STARTED)
+    error.__cause__ = TimeoutError()
+    return error
+
+
+def _may_have_run(failure: str) -> WireResponse | TransportError:
+    """A send that may have run and was not lost: answered by an ambiguous status, or cut by its timeout."""
+    return WireResponse(502, (), b"bad gateway") if failure == "502" else _timed_out()
+
+
+async def _fan_out_errors(transport: _ClosingTransport, policy: ExecutionPolicy) -> tuple[list[B24ApiError], int]:
+    """Run one SAFE command through the public direct fan-out; return its error and the physical requests."""
+    command = Command(Request("crm.item.get", {"id": 0}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
+    errors: list[B24ApiError] = []
+    async with client_for(transport, policy=policy) as client:
+        stream = client.fan_out_outcomes([command], dispatch=DirectDispatch(concurrency=1))
+        with contextlib.suppress(BudgetExceededError):
+            async with stream:
+                async for outcome in stream:
+                    assert isinstance(outcome, CommandOutcomeUnknown)
+                    errors.append(outcome.error)
+    assert stream.report is not None
+    return errors, stream.report.physical_requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["502", "timeout"])
+@pytest.mark.parametrize(
+    ("dialect", "closing"),
+    [
+        *(
+            (dialect, closing)
+            for dialect in ("lone", "classic", "v3", "v3-isolation")
+            for closing in ("budget", "coordinator", "transport")
+        ),
+        # The public client closes its coordinator only with its streams.
+        ("fan-out", "budget"),
+        ("fan-out", "transport"),
+    ],
+)
+async def test_a_stopped_retry_is_explained_by_the_send_it_followed_whatever_stopped_it(
+    dialect: str, failure: str, closing: str
+) -> None:
+    # The send before the stop may have run and was not lost: its answer had an ambiguous status (502) or its
+    # timeout cut it. Its retry (a lone or fanned-out request's, a batch round, a v3 envelope retry or the first
+    # isolated send of each command) is stopped before it leaves: by the request budget, the closed coordinator
+    # or the closed transport. Each command is unknown for that send, which names the reason and the evidence,
+    # never for the stop, which ran nothing.
+    replies = (_may_have_run(failure),) * (2 if dialect == "v3-isolation" else 1)
+    transport = _ClosingTransport(replies, closing=closing)
+    policy = dataclasses.replace(_NO_DELAY, max_requests=len(replies)) if closing == "budget" else _NO_DELAY
+    if dialect == "fan-out":
+        errors, physical = await _fan_out_errors(transport, policy)
+    else:
+        errors, budget = await _stopped_errors(dialect, transport, policy)
+        physical = budget.counters.physical_requests
+
+    assert transport.sends == len(replies)
+    assert physical == len(replies)
+    assert errors
+    for error in errors:
+        stop = error.__cause__ if type(error) is AmbiguousExecutionError else error
+        assert type(stop) is (BudgetExceededError if closing == "budget" else ClientClosedError)
+        followed = stop.__cause__
+        ambiguity = (
+            error
+            if type(error) is AmbiguousExecutionError
+            else ambiguity_of(error, request_summary=None, declared_unsafe=False)
+        )
+        assert isinstance(ambiguity, AmbiguousExecutionError)
+        if failure == "502":
+            assert isinstance(followed, HTTPGatewayError)
+            assert followed.http_status == 502  # noqa: PLR2004
+            assert ambiguity.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+            assert ambiguity.evidence is not None
+            assert ambiguity.evidence.http_status == 502  # noqa: PLR2004
+        else:
+            assert followed is replies[-1]
+            assert ambiguity.reason is AmbiguityReason.DEADLINE_AFTER_DISPATCH
+        assert ambiguity.evidence == followed.evidence
