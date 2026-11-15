@@ -264,9 +264,14 @@ class CountedBatchStrategy:
             async for page in continuation:
                 yield page
 
+    @property
+    def _tail_starts(self) -> range:
+        """Return the offset of every tail page: the requests, their count and each receipt's offset come from it."""
+        return range(self._stride, self._total, self._stride)
+
     def _tail_requests(self, ctx: StrategyContext) -> Iterator[_BatchInput]:
         recorder = ctx.completion_recorder
-        for start in range(self._stride, self._total, self._stride):
+        for start in self._tail_starts:
             if isinstance(recorder, CountedCompletionRecorder):
                 recorder.reserve()
             yield _BatchInput(self._page_request(ctx, start))
@@ -275,7 +280,7 @@ class CountedBatchStrategy:
         """Stream the dense tail and close it, keeping the primary failure over a cleanup failure."""
         tail = io.open_tail(
             self._tail_requests(ctx),
-            pages=len(range(self._stride, self._total, self._stride)),
+            pages=len(self._tail_starts),
             batch_size=batch_size,
             policy=ctx.context.policy,
             context=ctx.context,
@@ -305,7 +310,7 @@ class CountedBatchStrategy:
         """Validate one tail page against the planned exact range, or record its rejection."""
         failure = receipt.failure
         tail.settle(receipt)
-        start = self._stride * (receipt.ordinal + 1)
+        start = self._tail_starts[receipt.ordinal]
         ctx.schedule_page(offset=start, dispatch=PageDispatch.BATCH, batch_index=receipt.batch_index)
         if failure is not None:
             error = failure.error
