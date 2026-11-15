@@ -31,10 +31,12 @@ from b24api.references.outcome import ReferenceRequest
 from b24api.references.stream import iter_references
 from b24api.traversal.plans import KernelDirectDispatch, SingleResponsePlan
 from b24api.traversal.stream import iter_list
-from tests.scripting import HANG_BOUND, ResponderTransport, client_for
+from tests.scripting import HANG_BOUND, ResponderTransport, client_for, raised_driving_the_loop
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
+
+    from b24api.execution.context import Settled
 
 
 HOST = "fixture.invalid"
@@ -798,19 +800,22 @@ def test_a_read_whose_own_task_latched_an_interrupt_raises_it_instead_of_its_ite
 
 
 class _BetweenReads:
-    """A runner whose body starts work latching an interrupt between reads, and whose cleanup waits for a release."""
+    """A runner whose body starts work latching an interrupt between reads, and whose cleanup waits for a release.
+
+    The work goes on, in the very step that latched the interrupt, with the steps the test adds (``after_latch``).
+    """
 
     def __init__(self) -> None:
         self.interrupt = KeyboardInterrupt("between reads")
         self.go = asyncio.Event()
-        self.cleaning = asyncio.Event()
         self.release = asyncio.Event()
-        self.work: list[asyncio.Future[None]] = []
+        self.after_latch: list[Callable[[], Awaitable[None]]] = []
         self.runner: OperationRunner[int, KernelReport] = OperationRunner(
             self._body(),
             LifecycleHooks(finalize=_finalized, failure_report=_fallback, cleanup=self._cleanup),
             works_between_reads=True,
         )
+        self.work: list[asyncio.Future[None]] = []
 
     async def _body(self) -> AsyncIterator[int]:
         # Started in the read, the work is the operation's: it inherits the operation's latch.
@@ -821,10 +826,17 @@ class _BetweenReads:
     async def _latch_later(self) -> None:
         await self.go.wait()
         latch_interrupt(self.interrupt)
+        for step in self.after_latch:
+            await step()
 
     async def _cleanup(self) -> None:
-        self.cleaning.set()
         await self.release.wait()
+
+    async def read_one(self) -> None:
+        """Read the one item, let the work latch the interrupt, and go on working past the event loop's raise."""
+        assert await anext(self.runner) == 1
+        self.go.set()
+        await asyncio.sleep(HANG_BOUND)
 
 
 def _finalized(cause: TerminalCause, reason: str | None, _attempt: CleanupAttempt) -> KernelReport:
@@ -836,65 +848,86 @@ def _fallback(_cause: TerminalCause, reason: str, _attempt: CleanupAttempt) -> K
     return KernelReport(state=KernelState.FAILED, terminal_reason=reason)
 
 
-def test_a_read_cancelled_while_it_waits_for_the_end_leaves_the_interrupt_to_the_event_loop() -> None:
-    # The read waits for the end an interrupt began between reads and is cancelled before that end is over: it no
-    # longer waits, so the end, which nobody waits for any more, hands the interrupt to the event loop.
+def _ending(runner: OperationRunner[int, KernelReport]) -> asyncio.Future[Settled[None]]:
+    ending = runner._ending  # noqa: SLF001 - the task the interrupt started for the operation's end
+    assert ending is not None
+    return ending
+
+
+def test_an_interrupt_between_reads_goes_to_the_event_loop_before_its_end_is_over() -> None:
+    # Work the read started latches an interrupt between reads: the event loop raises it at once, while the end that
+    # follows waits for its cleanup. Released, that end publishes the report, in the interrupt's shape and attached
+    # to it; a read then finds the stream ended and a close returns, neither raising the interrupt again.
     operation = _BetweenReads()
-    got: list[object] = []
+    after: list[object] = []
 
-    async def main() -> None:
-        assert await anext(operation.runner) == 1
-        operation.go.set()
-        await operation.cleaning.wait()
-        waiter = asyncio.create_task(anext(operation.runner))
-        await asyncio.sleep(0)
-        waiter.cancel()
-        got.extend(await asyncio.gather(waiter, return_exceptions=True))
+    async def finish() -> None:
+        after.append(operation.runner.report)
         operation.release.set()
-        await asyncio.sleep(HANG_BOUND)
+        try:
+            await anext(operation.runner)
+        except StopAsyncIteration as error:
+            after.append(type(error))
+        await operation.runner.aclose()
+        after.append("closed")
 
-    with pytest.raises(KeyboardInterrupt) as raised:
-        asyncio.run(main())
-    assert raised.value is operation.interrupt
-    assert [type(error) for error in got] == [asyncio.CancelledError]
+    error = raised_driving_the_loop(operation.read_one, finish)
+    assert error is operation.interrupt
+    assert after == [None, StopAsyncIteration, "closed"]
+    report = operation.runner.report
+    assert report is not None
+    assert (report.state, report.terminal_reason) == (KernelState.FAILED, "operation interrupted")
+    assert getattr(error, "report", None) is report
+
+
+def test_a_close_runs_the_end_whose_own_task_was_cancelled_before_it_ran() -> None:
+    # The task the interrupt started for the operation's end is cancelled before its first step, as a loop's shutdown
+    # may cancel it: the end never began, so the close that comes next runs it, and the report is published all the
+    # same, attached to the interrupt the event loop raised.
+    operation = _BetweenReads()
+    operation.release.set()
+    closed: list[object] = []
+
+    async def cancel_the_end() -> None:
+        _ending(operation.runner).cancel()
+
+    async def close() -> None:
+        closed.append(operation.runner.report)
+        await operation.runner.aclose()
+        closed.append("closed")
+
+    operation.after_latch.append(cancel_the_end)
+    error = raised_driving_the_loop(operation.read_one, close)
+    assert error is operation.interrupt
+    assert _ending(operation.runner).cancelled()
+    assert closed == [None, "closed"]
     report = operation.runner.report
     assert report is not None
     assert report.terminal_reason == "operation interrupted"
+    assert getattr(error, "report", None) is report
 
 
-def test_a_read_cancelled_once_the_end_is_over_still_raises_its_interrupt() -> None:
-    # The end is over, its report published, and the read waiting for it is cancelled before it resumes: the end left
-    # the interrupt to that read, which raises it, ahead of its cancellation; the event loop does not as well.
+def test_the_operations_own_work_cannot_close_it_once_an_interrupt_ended_it_between_reads() -> None:
+    # The work that latched the interrupt closes the stream at once, before the end has begun: that close would run
+    # an end that waits for the operation's work, its own task included, so it is refused, as from the pull or cleanup.
     operation = _BetweenReads()
-    got: list[BaseException] = []
-    waiting: list[asyncio.Task[None]] = []
-    published = operation.runner._published  # noqa: SLF001 - cancels the waiting read the moment the end is over
-    publish = published.set
+    operation.release.set()
+    refused: list[str] = []
 
-    def publish_then_cancel() -> None:
-        publish()
-        waiting[0].cancel()
-
-    published.set = publish_then_cancel  # type: ignore[method-assign]
-
-    async def read() -> None:
+    async def close_from_the_work() -> None:
         try:
-            await anext(operation.runner)
-        except KeyboardInterrupt as error:
-            got.append(error)
+            await operation.runner.aclose()
+        except RuntimeError as refusal:
+            refused.append(str(refusal))
 
-    async def main() -> None:
-        assert await anext(operation.runner) == 1
-        operation.go.set()
-        await operation.cleaning.wait()
-        waiting.append(asyncio.create_task(read()))
-        await asyncio.sleep(0)
-        operation.release.set()
-        await waiting[0]
-        # Turns enough for an interrupt handed to the event loop to leave it.
-        for _turn in range(8):
-            await asyncio.sleep(0)
+    async def wait_for_the_end() -> None:
+        await operation.runner.aclose()
 
-    asyncio.run(main())
-    assert got == [operation.interrupt]
-    assert isinstance(got[0].__context__, asyncio.CancelledError)
+    operation.after_latch.append(close_from_the_work)
+    error = raised_driving_the_loop(operation.read_one, wait_for_the_end)
+    assert error is operation.interrupt
+    assert len(refused) == 1
+    assert refused[0].startswith("a stream cannot be closed from inside its own pull or cleanup")
+    report = operation.runner.report
+    assert report is not None
+    assert report.terminal_reason == "operation interrupted"

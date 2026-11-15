@@ -41,14 +41,24 @@ from b24api import (
 )
 from b24api.contracts import Command, ReferenceSource
 from b24api.errors import BatchFailed, BudgetExceededError, CleanupOverrunError, InputSourceError, PaginationError
-from tests.scripting import DEADLINE_BUDGET, HANG_BOUND, ResponderTransport, client_for, reached
+from tests.scripting import (
+    DEADLINE_BUDGET,
+    HANG_BOUND,
+    BatchPortal,
+    ResponderTransport,
+    client_for,
+    raised_by_asyncio_run,
+    raised_driving_the_loop,
+    reached,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 
     from b24api import Bitrix24
     from b24api.contracts.report import OperationReport
     from b24api.contracts.stream import OperationStream
+    from tests.scripting import Envelope, Query
 
 FAMILIES = (
     "batch",
@@ -1285,45 +1295,30 @@ class _InterruptsBetweenReads:
 BETWEEN_READS = ("next", "noclose", "abandon", "runloop")
 
 
-def _raised_driving_the_loop(
-    main: Callable[[], Coroutine[Any, Any, None]], after: Callable[[], Coroutine[Any, Any, None]]
-) -> BaseException:
-    """Drive ``main`` on a loop of the test's own until the loop raises; then run ``after`` there, raising nothing.
-
-    Return what the loop raised. Running the loop again shows the interrupt was handed to it once.
-    """
-    loop = asyncio.new_event_loop()
+async def _read_and_close(stream: OperationStream[Any], after: list[object]) -> None:
+    """Read an ended stream once more and close it, recording what each did."""
     try:
-        work = loop.create_task(main())
-        try:
-            loop.run_until_complete(work)
-        except BaseException as error:  # noqa: BLE001 - the test inspects what the loop raised
-            raised = error
-        else:
-            raise AssertionError("the loop raised nothing")
-        try:
-            loop.run_until_complete(after())
-            work.cancel()
-            loop.run_until_complete(asyncio.gather(work, return_exceptions=True))
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        except BaseException as error:  # noqa: BLE001 - raised again, it fails the test instead of ending the session
-            raise AssertionError(f"the loop raised again: {error!r}") from None
-    finally:
-        loop.close()
-    return raised
+        await anext(stream)
+    except StopAsyncIteration as error:
+        after.append(type(error))
+    await stream.aclose()
+    after.append("closed")
 
 
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize("reader", BETWEEN_READS)
 @pytest.mark.parametrize("family", REFERENCE_FAMILIES)
-def test_an_interrupt_latched_between_reads_ends_the_operation_at_once(
+def test_an_interrupt_latched_between_reads_goes_to_the_event_loop_at_once(
     family: str, reader: str, interrupt: type[BaseException]
 ) -> None:
     # The reader holds an item and works elsewhere while another binding's send raises the interrupt: no read is in
-    # flight to raise it, so the operation ends at once, its report in the interrupt's shape, and the event loop
-    # raises it, once, before the reader's work is over: whether the reader would read again (``next``), never reads
-    # nor closes again (``noclose``), never closes its client either (``abandon``), or drives the loop itself
-    # (``runloop``). The stream is ended: a later read finds it so, a close returns, and neither raises it again.
+    # flight to raise it, so it goes to the event loop at once, which raises it, once, before the reader's work is
+    # over: whether the reader would read again (``next``), never reads nor closes again (``noclose``), never closes
+    # its client either (``abandon``), or drives the loop itself (``runloop``). The operation's end follows, begun
+    # before the loop raises. Under ``asyncio.run`` its shutdown then cancels that end's cleanup before it closes
+    # anything, which the report records; on a loop that runs on, the end is over before a later read finds the
+    # stream ended or a close returns, neither raising the interrupt again. The report, in the interrupt's shape
+    # either way, is attached to it.
     reported: list[str] = []
     worked: list[bool] = []
     after: list[object] = []
@@ -1348,22 +1343,15 @@ def test_an_interrupt_latched_between_reads_ends_the_operation_at_once(
         async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
             await body(client)
 
-    async def read_after() -> None:
-        stream = streams[0]
-        try:
-            await anext(stream)
-        except StopAsyncIteration as error:
-            after.append(type(error))
-        await stream.aclose()
-        after.append("closed")
-
     if reader == "runloop":
-        error = _raised_driving_the_loop(main, read_after)
+        error = raised_driving_the_loop(main, lambda: _read_and_close(streams[0], after))
         assert after == [StopAsyncIteration, "closed"]
+        cancelled_cleanup = []
     else:
         with pytest.raises(interrupt) as raised:
             asyncio.run(main())
         error = raised.value
+        cancelled_cleanup = [("cleanup_failure", "stream cleanup also failed (CancelledError)")]
     gc.collect()
     assert error is transport.raised[0]
     assert worked == []
@@ -1372,7 +1360,7 @@ def test_an_interrupt_latched_between_reads_ends_the_operation_at_once(
     assert report is not None
     assert report.state is TerminalState.FAILED
     assert report.terminal_reason == "operation interrupted"
-    assert _violations(report) == [("interrupted", f"operation interrupted ({interrupt.__name__})")]
+    assert _violations(report) == [*cancelled_cleanup, ("interrupted", f"operation interrupted ({interrupt.__name__})")]
     assert getattr(error, "report", None) is report
 
 
@@ -1400,20 +1388,22 @@ class _ClosesWhenReleased:
 
 @pytest.mark.parametrize("call", ["race", "read", "close"])
 @pytest.mark.parametrize("family", REFERENCE_FAMILIES)
-def test_a_read_or_close_that_finds_the_operation_ending_waits_for_its_end_and_raises_its_interrupt(
+def test_a_read_or_close_that_finds_the_operation_ending_sees_its_end_over_and_raises_no_interrupt(
     family: str, call: str
 ) -> None:
-    # An interrupt between reads ends the operation in a task of its own. A read that starts while that end runs,
-    # in the very loop turn of the latch's wake (``race``) or while the source's close still waits (``read``), or a
-    # close then (``close``), never finds the stream ended before its report exists: it waits for the end, and the
-    # interrupt is delivered once, to that caller, which raises it with the report; not to the event loop as well.
-    # The stream is ended after that: a read finds it so and a close returns, neither raising it again.
+    # An interrupt between reads goes to the event loop at once, and the operation's end follows. A read that starts
+    # in the very loop turn of the latch's wake (``race``) runs that end itself, ahead of the end's own task; one that
+    # starts while that end waits for the source's close (``read``), or a close then (``close``), waits for it. Each
+    # sees the end over, its report published, before it returns: never the stream ended without a report. None of
+    # them raises the interrupt: the loop has, once, before any of them returned.
     reported: list[str] = []
     seen: list[object] = []
+    seen_as_the_loop_raised: list[list[object]] = []
     after: list[object] = []
     streams: list[OperationStream[Any]] = []
     transport = _InterruptsBetweenReads(KeyboardInterrupt)
     source = _ClosesWhenReleased(family)
+    done = asyncio.Event()
     releasing: list[asyncio.Task[None]] = []
 
     async def release_later() -> None:
@@ -1425,56 +1415,58 @@ def test_a_read_or_close_that_finds_the_operation_ending_waits_for_its_end_and_r
 
     async def main() -> None:
         asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
-        async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
-            stream = _stream(client, family, source, DirectDispatch(concurrency=2))
-            streams.append(stream)
-            await anext(stream)
-            transport.between.set()
-            if call == "race":
-                source.release.set()
-                await reached(transport.raising)
-            else:
-                await reached(source.closing)
-                releasing.append(asyncio.create_task(release_later()))
-            try:
-                await (stream.aclose() if call == "close" else anext(stream))
-            except KeyboardInterrupt as error:
-                report = stream.report
-                seen.extend([error, report, getattr(error, "report", None)])
-                raise
-            finally:
-                source.release.set()
-
-    async def read_after() -> None:
-        stream = streams[0]
+        client = await client_for(ResponderTransport(transport), policy=POLICIES["returns"]).__aenter__()
+        stream = _stream(client, family, source, DirectDispatch(concurrency=2))
+        streams.append(stream)
+        await anext(stream)
+        transport.between.set()
+        if call == "race":
+            source.release.set()
+            await reached(transport.raising)
+        else:
+            await reached(source.closing)
+            releasing.append(asyncio.create_task(release_later()))
         try:
-            await anext(stream)
+            if call == "close":
+                await stream.aclose()
+                seen.append("closed")
+            else:
+                await anext(stream)
         except StopAsyncIteration as error:
-            after.append(type(error))
-        await stream.aclose()
-        after.append("closed")
+            seen.append(type(error))
+        seen.append(stream.report)
+        done.set()
 
-    error = _raised_driving_the_loop(main, read_after)
+    async def finish() -> None:
+        seen_as_the_loop_raised.append(list(seen))
+        await reached(done)
+        await _read_and_close(streams[0], after)
+
+    error = raised_driving_the_loop(main, finish)
     gc.collect()
     assert error is transport.raised[0]
     report = streams[0].report
     assert report is not None
-    # The caller had the report as it got the interrupt, attached to it; the end ran and published once.
-    assert seen == [error, report, report]
+    assert seen_as_the_loop_raised == [[]]
+    assert seen == ["closed" if call == "close" else StopAsyncIteration, report]
     assert after == [StopAsyncIteration, "closed"]
     assert reported == []
-    assert report.state is TerminalState.FAILED
-    assert _violations(report) == [("interrupted", "operation interrupted (KeyboardInterrupt)")]
+    assert (report.state, _violations(report)) == (
+        TerminalState.FAILED,
+        [("interrupted", "operation interrupted (KeyboardInterrupt)")],
+    )
+    assert getattr(error, "report", None) is report
 
 
 @pytest.mark.parametrize("family", REFERENCE_FAMILIES)
-def test_an_end_between_reads_keeps_the_operation_deadline(family: str) -> None:
-    # The source's close would wait until the test gives up. The end that an interrupt between reads starts runs
-    # under the operation's deadline as any end does: the deadline ends that close, which the report puts behind the
-    # interrupt as it would for an interrupt in a read ("stream cleanup also failed"), and the event loop raises the
-    # interrupt then, while the reader still works.
+def test_a_close_overrunning_after_an_interrupt_between_reads_is_recorded_behind_it(family: str) -> None:
+    # The source's close would wait until the test gives up. The event loop raises an interrupt between reads at
+    # once; a close then waits for the operation's end, in which the operation's budget ends the source's close. The
+    # report puts that close behind the interrupt, as it would for an interrupt in a read ("stream cleanup also
+    # failed").
     reported: list[str] = []
     worked: list[bool] = []
+    closed: list[bool] = []
     streams: list[OperationStream[Any]] = []
     transport = _InterruptsBetweenReads(KeyboardInterrupt)
     source = _Source(family, "overruns")
@@ -1486,17 +1478,20 @@ def test_an_end_between_reads_keeps_the_operation_deadline(family: str) -> None:
         streams.append(stream)
         await anext(stream)
         transport.between.set()
-        await reached(transport.raising)
         await asyncio.sleep(HANG_BOUND)
         worked.append(True)
 
-    with pytest.raises(KeyboardInterrupt) as raised:
-        asyncio.run(main())
+    async def close() -> None:
+        await streams[0].aclose()
+        closed.append(True)
+
+    error = raised_driving_the_loop(main, close)
     gc.collect()
-    assert raised.value is transport.raised[0]
+    assert error is transport.raised[0]
+    assert worked == []
+    assert closed == [True]
     assert source.closed
     assert not source.release.is_set()
-    assert worked == []
     assert reported == []
     report = streams[0].report
     assert report is not None
@@ -1506,7 +1501,112 @@ def test_an_end_between_reads_keeps_the_operation_deadline(family: str) -> None:
         ("cleanup_failure", "stream cleanup also failed (CleanupOverrunError)"),
         ("interrupted", "operation interrupted (KeyboardInterrupt)"),
     ]
-    assert getattr(raised.value, "report", None) is report
+    assert getattr(error, "report", None) is report
+
+
+class _InterruptsAtShutdown:
+    """Answer binding 0 (one row, then none) on direct or batch routes; binding 1's send raises the interrupt.
+
+    ``cancel``: that send waits until ``asyncio.run``'s shutdown cancels it and raises the interrupt instead. Any
+    other case: it raises it once the test sets ``go``. Every other binding's send waits for good.
+    """
+
+    def __init__(self, case: str, interrupt: type[BaseException]) -> None:
+        self._case = case
+        self._interrupt = interrupt
+        self.sending = asyncio.Event()
+        self.go = asyncio.Event()
+        self.raised: list[BaseException] = []
+
+    async def __call__(self, method: str, query: Query) -> Envelope:
+        key = int(query.get("id") or query.get("filter[OWNER]") or 0)
+        if key == 1:
+            self.sending.set()
+            if self._case == "cancel":
+                try:
+                    await asyncio.sleep(HANG_BOUND)
+                except asyncio.CancelledError:
+                    raise self._raise() from None
+            await self.go.wait()
+            raise self._raise()
+        if key:
+            await asyncio.sleep(HANG_BOUND)
+        if method == "x.get":
+            return {"result": {"ID": 1}}
+        if "LAST_ID" in query or int(query.get("start") or 0):
+            return {"result": [], "total": 0}
+        return {"result": [{"ID": 10}], "total": 1}
+
+    def _raise(self) -> BaseException:
+        error = self._interrupt("binding 1")
+        self.raised.append(error)
+        return error
+
+
+# A loop that stops on the interrupt during its shutdown never runs again the tasks it had left: the garbage collector
+# closes them, and asyncio warns about each; a source pull it closes asks for its source's close with no loop to run it.
+@pytest.mark.filterwarnings("ignore:coroutine .* was never awaited:RuntimeWarning")
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("dispatch", ["direct", "batch"])
+@pytest.mark.parametrize("family", REFERENCE_FAMILIES)
+@pytest.mark.parametrize("case", ["cancel", "same_turn", "waiter", "control"])
+def test_an_interrupt_between_reads_leaves_asyncio_run_however_its_shutdown_meets_it(
+    case: str, family: str, dispatch: str, interrupt: type[BaseException]
+) -> None:
+    # The reader holds an item when binding 1's send raises the interrupt. It leaves ``asyncio.run``, once and without
+    # hanging, however the loop's shutdown meets the operation's end that follows: the shutdown's own cancellation of
+    # the send raised it (``cancel``), it was raised in the loop turn that stops the loop as ``main`` returned
+    # (``same_turn``), a consumer waits between reads inside ``async with stream``, whose exit the shutdown runs
+    # (``waiter``), or ``main`` still runs as it is raised (``control``). The report is what the end got to: a
+    # shutdown that stops the loop before the end begins leaves none; one that cancels the end's cleanup before it
+    # closes anything leaves that recorded.
+    reported: list[str] = []
+    streams: list[OperationStream[Any]] = []
+    transport = _InterruptsAtShutdown(case, interrupt)
+    plan = DirectDispatch(concurrency=2) if dispatch == "direct" else BatchDispatch(batch_size=1, concurrency=2)
+    holding = asyncio.Event()
+
+    async def consume(stream: OperationStream[Any]) -> None:
+        async with stream:
+            await anext(stream)
+            holding.set()
+            await asyncio.sleep(HANG_BOUND)
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        client = await client_for(BatchPortal(transport), policy=POLICIES["returns"]).__aenter__()
+        stream = _stream(client, family, _items(family), plan)
+        streams.append(stream)
+        if case in {"waiter", "control"}:
+            consumer = asyncio.create_task(consume(stream))
+            await reached(holding)
+        else:
+            await anext(stream)
+        await reached(transport.sending)
+        if case == "cancel":
+            return
+        transport.go.set()
+        if case == "control":
+            await asyncio.sleep(HANG_BOUND)
+            del consumer
+
+    error = raised_by_asyncio_run(main)
+    gc.collect()
+    assert error is transport.raised[0]
+    assert reported == []
+    report = streams[0].report
+    if case == "control":
+        assert report is not None
+        assert report.terminal_reason == "operation interrupted"
+        assert _violations(report) == [
+            ("cleanup_failure", "stream cleanup also failed (CancelledError)"),
+            ("interrupted", f"operation interrupted ({interrupt.__name__})"),
+        ]
+        assert getattr(error, "report", None) is report
+    else:
+        assert report is None
 
 
 SHAPE_FAMILIES = (*FAMILIES, "iter_list", "iter_list_counted")

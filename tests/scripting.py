@@ -12,9 +12,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qsl, urlsplit
 
 from b24api import Bitrix24, ExecutionPolicy, Settings
@@ -23,7 +24,7 @@ from b24api.references import dispatch as dispatch_module
 from b24api.transport import WireResponse
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Mapping
 
     import pytest
 
@@ -214,6 +215,60 @@ async def reached(event: asyncio.Event, bound: float = HANG_BOUND) -> None:
             await event.wait()
     except TimeoutError:
         raise AssertionError(f"the test's event was not set within {bound} s") from None
+
+
+def raised_driving_the_loop(
+    main: Callable[[], Coroutine[Any, Any, None]], after: Callable[[], Coroutine[Any, Any, None]]
+) -> BaseException:
+    """Drive ``main`` on a loop of the test's own until the loop raises; then run ``after`` there, raising nothing.
+
+    Return what the loop raised. Running the loop again shows the interrupt was handed to it once; a second raise,
+    or ``after`` not ending within ``HANG_BOUND``, fails the test instead of ending or hanging the test session.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        work = loop.create_task(main())
+        try:
+            loop.run_until_complete(work)
+        except BaseException as error:  # noqa: BLE001 - the test inspects what the loop raised
+            raised = error
+        else:
+            raise AssertionError("the loop raised nothing")
+        try:
+            loop.run_until_complete(asyncio.wait_for(after(), HANG_BOUND))
+            work.cancel()
+            loop.run_until_complete(asyncio.gather(work, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except TimeoutError:
+            raise AssertionError(f"what runs after the loop raised did not end within {HANG_BOUND} s") from None
+        except BaseException as error:  # noqa: BLE001 - raised again, it fails the test instead of ending the session
+            raise AssertionError(f"the loop raised again: {error!r}") from None
+    finally:
+        loop.close()
+    return raised
+
+
+def raised_by_asyncio_run(main: Callable[[], Coroutine[Any, Any, object]], bound: float = HANG_BOUND) -> BaseException:
+    """Return what ``asyncio.run(main())`` raised in a thread of its own; fail if it returns or hangs past ``bound``.
+
+    A hang is the failure: the thread is a daemon one, left behind rather than waited for.
+    """
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            asyncio.run(main())
+        except BaseException as error:  # noqa: BLE001 - handed to the test thread
+            raised.append(error)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(bound)
+    if worker.is_alive():
+        raise AssertionError(f"asyncio.run did not return within {bound} s")
+    if not raised:
+        raise AssertionError("asyncio.run returned without raising")
+    return raised[0]
 
 
 class WorkerStarts(ThreadPoolExecutor):
