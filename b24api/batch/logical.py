@@ -106,31 +106,34 @@ def _within_row_budget(
     """Fit a window's decoded results into the row budget; a result that does not fit is dropped, never delivered.
 
     The window has run when its rows are known, so the budget can no longer refuse to send it; it bounds what the
-    stream holds. Each outcome holds one row (a window never has more commands than the budget has rows), and a
-    success also holds the rest of its result's rows while they fit what the budget has left, in window order. A
-    success whose rows do not fit becomes a failure that keeps the execution facts: the command ran and was
-    answered (``dropped_result``), so it is neither a success, nor proven not run, nor replayed.
+    stream holds. Each outcome holds at least one row (a window never has more commands than the budget has rows),
+    and a success holds its result's rows: in window order, each is charged while it fits what the budget has left
+    after the one row of each later outcome. A success whose rows do not fit becomes a failure that keeps the
+    execution facts: the command ran and was answered (``dropped_result``), so it is neither a success, nor proven
+    not run, nor replayed.
     """
-    left = max_rows - len(outcomes)
+    left = max_rows
     fitted: list[KernelSuccess | KernelFailure] = []
-    for outcome in outcomes:
-        extra = _batch_outcome_row_weight(outcome) - 1
-        if not isinstance(outcome, KernelSuccess) or extra <= left:
-            left -= max(extra, 0)
-            fitted.append(outcome)
-            continue
-        request = outcome.request
-        fitted.append(
-            KernelFailure(
+    for position, outcome in enumerate(outcomes):
+        room = left - (len(outcomes) - position - 1)
+        if isinstance(outcome, KernelSuccess) and _batch_outcome_row_weight(outcome) > room:
+            request = outcome.request
+            outcome = KernelFailure(  # noqa: PLW2901 - the dropped result replaces the success it was
                 outcome.command_index,
                 outcome.stable_key,
                 request,
-                dropped_result(rows=outcome.decoded_rows, limit=left + 1, request_summary=request.summary),
+                dropped_result(
+                    rows=outcome.decoded_rows,
+                    limit=room,
+                    request_summary=request.summary,
+                    evidence=None if outcome.response is None else outcome.response.evidence,
+                ),
                 replay_safety=request.replay_safety,
                 correlation=outcome.correlation,
                 evidence=outcome.evidence,
             )
-        )
+        left -= _batch_outcome_row_weight(outcome)
+        fitted.append(outcome)
     return tuple(fitted)
 
 

@@ -969,7 +969,8 @@ def _raise_source_error(error: Exception) -> None:
 
 
 def _batch_outcome_row_weight(outcome: BatchOutcome) -> int:
-    return outcome.decoded_rows if isinstance(outcome, BatchSuccess) else 1
+    """Return the rows an outcome holds in the row budget: its result's rows, and at least its own one."""
+    return max(outcome.decoded_rows, 1) if isinstance(outcome, BatchSuccess) else 1
 
 
 __all__: list[str] = []
