@@ -8,6 +8,7 @@ by the operation's elapsed budget.
 
 from __future__ import annotations
 import asyncio
+import json
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -28,6 +29,7 @@ from b24api.contracts import (
 )
 from b24api.contracts.request import RouteKind
 from b24api.errors import BatchFailed, BudgetExceededError, ResultTooLargeError
+from b24api.execution import WireResponse
 from b24api.execution.facts import Execution, execution
 from b24api.references.dispatch import _RowBuffer
 from tests.scripting import (
@@ -119,6 +121,32 @@ async def test_a_window_whose_results_outgrow_the_row_budget_keeps_every_outcome
     assert report.buffered_rows_high_water <= _DEFAULT_ROWS
 
 
+def _empty_lists_then_three_rows(request: Request) -> object:
+    """Answer every command of a classic batch with an empty list, but the last with three rows."""
+    commands = request.copy_parameters()["cmd"]
+    assert isinstance(commands, dict)
+    keys = list(commands)
+    return {"result": {"result": {key: [1, 2, 3] if key == keys[-1] else [] for key in keys}, "result_error": []}}
+
+
+@pytest.mark.asyncio
+async def test_an_empty_result_holds_the_one_row_it_was_fitted_with() -> None:
+    # Two empty results and a three-row one under a budget of three rows: every outcome holds a row, so the
+    # three rows do not fit what the two empty results leave, and the stream holds the three outcomes' rows.
+    lists = [Command(Request("crm.deal.list", {"start": index}, route=RouteKind.BARE), index) for index in range(3)]
+    async with client_for(
+        ResponderTransport(_empty_lists_then_three_rows), policy=ExecutionPolicy(max_buffered_rows=3)
+    ) as client:
+        stream = client.batch_outcomes(lists)
+        outcomes = [outcome async for outcome in stream]
+
+    assert [isinstance(outcome, CommandSuccess) for outcome in outcomes] == [True, True, False]
+    _assert_dropped(outcomes[2], rows=3, limit=1)
+    report = stream.report
+    assert report is not None
+    assert report.buffered_rows_high_water == len(lists)
+
+
 def _three_rows(request: Request) -> object:
     commands = request.copy_parameters()["cmd"]
     assert isinstance(commands, dict)
@@ -155,6 +183,43 @@ async def test_a_fail_fast_batch_carries_the_dropped_result_in_its_failure() -> 
     (failed,) = error.outcomes
     _assert_dropped(failed, rows=3, limit=2)
     assert [violation.code for violation in error.report.violations] == ["budget_exhausted"]
+
+
+_REQUEST_ID = "request-7"
+
+
+def _three_rows_with_a_request_id(request: Request) -> WireResponse:
+    """Answer a direct request, or each command of a classic batch, with three rows, under a request id."""
+    commands = request.copy_parameters().get("cmd")
+    rows = [1, 2, 3]
+    body = (
+        {"result": {"result": dict.fromkeys(commands, rows), "result_error": []}}
+        if isinstance(commands, dict)
+        else {"result": rows}
+    )
+    headers = (("content-type", "application/json"), ("x-request-id", _REQUEST_ID))
+    return WireResponse(200, headers, json.dumps(body).encode())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["batch", "fan-out-batch", "fan-out-direct"])
+async def test_a_dropped_result_keeps_the_evidence_of_the_answer_it_dropped(operation: str) -> None:
+    # The command was answered: its failure names the HTTP status and the request id of that answer.
+    command = Command(Request("crm.item.list", {}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
+    transport = ResponderTransport(_three_rows_with_a_request_id)
+    async with client_for(transport, policy=ExecutionPolicy(max_buffered_rows=2)) as client:
+        stream = (
+            client.batch_outcomes([command])
+            if operation == "batch"
+            else client.fan_out_outcomes(
+                [command], dispatch=BatchDispatch() if operation == "fan-out-batch" else DirectDispatch()
+            )
+        )
+        (outcome,) = [outcome async for outcome in stream]
+
+    assert isinstance(outcome, CommandFailure)
+    assert isinstance(outcome.error, ResultTooLargeError)
+    assert (outcome.error.http_status, outcome.error.evidence.request_id) == (200, _REQUEST_ID)
 
 
 def _rows(count: int) -> ResponderTransport:

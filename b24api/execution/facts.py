@@ -26,6 +26,7 @@ from b24api.errors import (
 )
 
 if TYPE_CHECKING:
+    from b24api.contracts.evidence import ResponseEvidence
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.request_summary import RequestSummary
 
@@ -79,12 +80,15 @@ def record_dispatch(error: BaseException, *, possibly_executed: bool, unproven: 
     error.__dict__[_FACTS] = _ExecutionFacts(execution, None if unproven is error else unproven)
 
 
-def dropped_result(*, rows: int, limit: int, request_summary: RequestSummary | None) -> ResultTooLargeError:
+def dropped_result(
+    *, rows: int, limit: int, request_summary: RequestSummary | None, evidence: ResponseEvidence | None
+) -> ResultTooLargeError:
     """Return the failure of a command that ran and was answered, but whose result the row budget drops.
 
-    It is recorded answered: the command's outcome is a failure settled as failed, never one proven not run.
+    It is recorded answered: the command's outcome is a failure settled as failed, never one proven not run, and
+    it keeps the answer's ``evidence``.
     """
-    error = ResultTooLargeError(rows=rows, limit=limit, request_summary=request_summary)
+    error = ResultTooLargeError(rows=rows, limit=limit, request_summary=request_summary, evidence=evidence)
     record_dispatch(error, possibly_executed=False)
     return error
 

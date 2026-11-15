@@ -682,6 +682,7 @@ class ReferenceScheduler:
                     rows=page.retained_rows,
                     limit=run.reservation.amount,
                     request_summary=run.work.reference.request.summary,
+                    evidence=page.response.evidence,
                 )
             await self.buffer.accept(run.reservation, page.retained_rows)
 

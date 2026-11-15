@@ -473,16 +473,24 @@ class ResultTooLargeError(BudgetExceededError):
     The client drops the result rather than hold it past ``ExecutionPolicy.max_buffered_rows``, so the command's
     outcome is a ``CommandFailure`` carrying this error: it ran, unlike a command a budget refused before its send,
     and it is never replayed. ``rows`` is how many rows the result decoded to (the length of a list result),
-    ``limit`` how many the budget left it.
+    ``limit`` how many the budget left it; ``evidence`` is the answer's, its HTTP status and request id included.
     """
 
-    def __init__(self, *, rows: int, limit: int, request_summary: RequestSummary | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        rows: int,
+        limit: int,
+        request_summary: RequestSummary | None = None,
+        evidence: ResponseEvidence | None = None,
+    ) -> None:
         """Name the result's rows and the rows the budget left it."""
         self.rows = rows
         self.limit = limit
         super().__init__(
             f"decoded result of {rows} rows exceeds the {limit} the buffered row budget leaves it",
             request_summary=request_summary,
+            evidence=evidence,
         )
 
     def to_safe_dict(self) -> dict[str, object]:
