@@ -1449,6 +1449,188 @@ def test_an_interrupt_a_pull_cancelled_in_its_thread_ends_in_reaches_the_reader(
     assert pending == []
 
 
+INLINE_CASES = [
+    ("iter_list", "returns"),
+    ("iter_list_counted", "returns"),
+    ("batch", "returns"),
+    ("batch", "raises"),
+    ("batch_outcomes", "returns"),
+    ("batch_outcomes", "raises"),
+]
+
+
+@pytest.mark.parametrize(("family", "close"), INLINE_CASES)
+def test_an_interrupt_an_inline_kernels_send_raises_ends_the_operation_in_one_shape(family: str, close: str) -> None:
+    # A kernel reading inline in its stream's read sends on the reader's own path: its read is where the interrupt
+    # is first caught, and it is latched there, also when the kernel's cleanup then fails (the source's close
+    # raises), which is what the kernel ends with. The operation raises the interrupt, with its report attached, in
+    # the one shape: no cleanup failure of its own, the source's failed close behind it.
+    reported: list[str] = []
+    streams: list[OperationStream[Any]] = []
+
+    async def interrupting(request: Request) -> object:
+        del request
+        raise KeyboardInterrupt
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        async with client_for(ResponderTransport(interrupting), policy=POLICIES[close]) as client:
+            if family.startswith("iter_list"):
+                stream = getattr(client, family)(LIST_REQUEST)
+            else:
+                stream = _stream(client, family, _Source(family, close))
+            streams.append(stream)
+            async for _item in stream:
+                pass
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        asyncio.run(main())
+    gc.collect()
+    assert reported == []
+    report = streams[0].report
+    assert report is not None
+    assert report.state is TerminalState.FAILED
+    assert report.terminal_reason == "operation interrupted"
+    behind = [("cleanup_failure", "stream cleanup also failed (InputSourceError)")] if close == "raises" else []
+    assert _violations(report) == [*behind, ("interrupted", "operation interrupted (KeyboardInterrupt)")]
+    # The interrupt carries the report, as a cancellation does.
+    attached = getattr(raised.value, "report", None)
+    assert attached is report
+
+
+class _AsyncClosesLate:
+    """A caller's source whose close outlives the cleanup window, resisting its cancellation, then is interrupted."""
+
+    def __init__(self, family: str, interrupt: type[BaseException]) -> None:
+        self._items = iter(_items(family))
+        self._interrupt = interrupt
+        self.release = asyncio.Event()
+
+    def __aiter__(self) -> _AsyncClosesLate:
+        return self
+
+    async def __anext__(self) -> Any:  # noqa: ANN401 - commands
+        try:
+            return next(self._items)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        while not self.release.is_set():
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.release.wait()
+        raise self._interrupt("late close")
+
+
+class _SyncClosesLate:
+    """``_AsyncClosesLate`` as a synchronous iterator: its close waits in its worker thread, then is interrupted."""
+
+    def __init__(self, family: str, interrupt: type[BaseException]) -> None:
+        self._items = iter(_items(family))
+        self._interrupt = interrupt
+        self.release = threading.Event()
+
+    def __iter__(self) -> _SyncClosesLate:
+        return self
+
+    def __next__(self) -> Any:  # noqa: ANN401 - commands
+        return next(self._items)
+
+    def close(self) -> None:
+        self.release.wait(HANG_BOUND)
+        raise self._interrupt("late close")
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("kind", ["async", "sync"])
+@pytest.mark.parametrize("family", ["fan_out", "batch"])
+def test_an_interrupt_raised_after_the_operation_ended_stops_the_loop(
+    family: str, kind: str, interrupt: type[BaseException]
+) -> None:
+    # The source's close outlives the cleanup window: the stream ends without it (a cleanup overrun) and its operation
+    # raises nothing more. The close then raises an interrupt, which nobody would raise any longer: it is not kept
+    # but leaves the event loop out of asyncio.run, as any task's interrupt does.
+    reported: list[str] = []
+    got: list[type[BaseException]] = []
+    source = _AsyncClosesLate(family, interrupt) if kind == "async" else _SyncClosesLate(family, interrupt)
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        try:
+            async with client_for(ResponderTransport(_answer), policy=POLICIES["overruns"]) as client:
+                stream = _stream(client, family, source)
+                try:
+                    async for _item in stream:
+                        pass
+                except Exception as error:  # noqa: BLE001 - the test inspects what the reader got
+                    got.append(type(error))
+                source.release.set()
+                await asyncio.sleep(HANG_BOUND)
+        finally:
+            source.release.set()
+
+    with pytest.raises(interrupt, match="late close"):
+        asyncio.run(main())
+    gc.collect()
+    assert got == [_raised_for(family, "overruns")]
+    assert reported == []
+
+
+class _SendInterruptedLate:
+    """Answer the first command; block the second's send, ignoring its cancellation, until released, then interrupt."""
+
+    def __init__(self, interrupt: type[BaseException]) -> None:
+        self._interrupt = interrupt
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, request: Request) -> object:
+        if request.method != "batch" and request.copy_parameters().get("id") == 0:
+            return _answer(request)
+        self.started.set()
+        while not self.release.is_set():
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.release.wait()
+        raise self._interrupt("late send")
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(
+    "dispatch", [DirectDispatch(concurrency=2), BatchDispatch(batch_size=1, concurrency=2)], ids=["direct", "batch"]
+)
+def test_an_interrupt_a_send_raises_after_the_operation_ended_stops_the_loop(
+    dispatch: DirectDispatch | BatchDispatch, interrupt: type[BaseException]
+) -> None:
+    # A send outlives the cleanup window (its binding's task, or the batch sender, ignores the cancellation): the
+    # stream's close ends without it (a cleanup overrun), and the interrupt it raises afterwards leaves the event loop
+    # out of asyncio.run.
+    reported: list[str] = []
+    got: list[type[BaseException]] = []
+    transport = _SendInterruptedLate(interrupt)
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        try:
+            async with client_for(ResponderTransport(transport), policy=POLICIES["overruns"]) as client:
+                stream = client.fan_out_outcomes(_items("fan_out_outcomes"), dispatch=dispatch)
+                read = asyncio.create_task(_settled(anext(stream)))
+                await reached(transport.started)
+                closed = await _settled(stream.aclose())
+                assert closed is not None
+                got.append(type(closed))
+                await read
+                transport.release.set()
+                await asyncio.sleep(HANG_BOUND)
+        finally:
+            transport.release.set()
+
+    with pytest.raises(interrupt, match="late send"):
+        asyncio.run(main())
+    gc.collect()
+    assert got == [CleanupOverrunError]
+    assert reported == []
+
+
 class _OwnError(Exception):
     """The caller's own code failed inside ``async with stream``."""
 

@@ -36,6 +36,7 @@ from b24api.execution import (
     WorkClass,
     rearm_cancellation,
 )
+from b24api.execution.context import InterruptLatch, is_interrupt, settle
 from b24api.execution.rate import (
     CoordinatorBudgetError,
     DeadlineBudget,
@@ -45,7 +46,7 @@ from b24api.transport import httpx as httpx_transport_module
 from tests.scripting import Blocker, ResponderTransport, client_for, replies
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Iterable
+    from collections.abc import Awaitable, Generator, Iterable
 
     from tests.scripting import ClientFactory, Responder
 
@@ -1173,3 +1174,42 @@ async def test_success_model_contract_failures_are_typed_and_keep_http_evidence(
     assert captured.value.request_summary is not None
     assert captured.value.request_summary.method == "profile"
     assert isinstance(captured.value.__cause__, ValueError)
+
+
+def test_a_closed_latch_hands_each_late_interrupt_to_the_event_loop_once() -> None:
+    # Once its operation has ended, the latch keeps no interrupt: it hands one caught then to the event loop, once
+    # however many of the operation's catchers record it, and never the interrupt the operation raised itself.
+    handed: list[tuple[object, ...]] = []
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        call_soon = loop.call_soon
+        loop.call_soon = lambda _callback, *args, **_kwargs: handed.append(args)  # type: ignore[assignment,method-assign]
+        try:
+            latch = InterruptLatch()
+            own = KeyboardInterrupt("own")
+            latch.record(own)
+            assert latch.close() is own
+            late = SystemExit("late")
+            for error in (late, late, own, RuntimeError("no interrupt"), None):
+                latch.record(error)
+        finally:
+            loop.call_soon = call_soon  # type: ignore[method-assign]
+        assert handed == [(late,)]
+
+    asyncio.run(main())
+
+
+def test_a_settled_task_lets_its_coroutine_be_closed() -> None:
+    # A coroutine closed while it waits (the garbage collector closes those a stopped loop left) gets GeneratorExit:
+    # that is no way its work ended, so settle lets it through rather than return it as a failure.
+    class _Suspends:
+        def __await__(self) -> Generator[None]:
+            yield
+
+    coroutine = settle(_Suspends())
+    coroutine.send(None)
+    coroutine.close()
+    assert not is_interrupt(GeneratorExit())
+    assert is_interrupt(KeyboardInterrupt())
+    assert is_interrupt(SystemExit())
