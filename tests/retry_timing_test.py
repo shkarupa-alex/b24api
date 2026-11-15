@@ -16,13 +16,13 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from b24api import ReplaySafety, Request
+from b24api import BatchDispatch, DirectDispatch, ReplaySafety, Request, TerminalState
 from b24api.batch.correlation import _Command
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchOutcome, BatchSuccess
 from b24api.batch.stream import batch_outcome_stream
-from b24api.contracts import ResultErrorSpec, ResultSelector
-from b24api.contracts.policy import ExecutionPolicy, ReplayDisposition, RetryPolicy
+from b24api.contracts import Command, CommandSuccess, ResultErrorSpec, ResultSelector
+from b24api.contracts.policy import ExecutionPolicy, KernelState, ReplayDisposition, RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
@@ -30,14 +30,17 @@ from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
     HTTPGatewayError,
+    InputSourceError,
 )
 from b24api.execution import Executor, RateCoordinator, WireResponse, WorkClass
+from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
 from b24api.execution.facts import Execution, execution
+from b24api.references.fanout import kernel_fanout_stream
 from b24api.testing import ScriptedExchange, ScriptedTransport
-from tests.scripting import ResponderTransport, always, replies
+from tests.scripting import ResponderTransport, always, client_for, drain_to_failure, on_loop, replies
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator
 
     from b24api import Transport
     from b24api.execution.rate import DeadlineBudget, _Permit
@@ -683,7 +686,8 @@ async def test_a_permit_failure_after_a_round_refused_at_its_send_ends_the_carri
     assert permits == 3  # noqa: PLR2004
     assert isinstance(safe, BatchFailure)
     assert isinstance(safe.error, BudgetExceededError)
-    assert "permit wait" in str(safe.error)
+    # The permit wait ran into the request's retry window, which closes long before the operation's deadline.
+    assert str(safe.error) == RETRY_WINDOW_EXHAUSTED
     assert isinstance(safe.error.__cause__, HTTPGatewayError)
     _assert_unsafe_ends_refused(unsafe, HTTPGatewayError, "shorter than the wait")
 
@@ -827,7 +831,7 @@ async def test_a_carried_command_stopped_at_its_permit_reports_the_failure_it_fo
     assert isinstance(add.error, AmbiguousExecutionError)
     assert isinstance(get, BatchFailure)
     assert isinstance(get.error, BudgetExceededError)
-    assert ("coordinator hold" if stop == "hold" else "permit wait") in str(get.error)
+    assert ("coordinator hold" if stop == "hold" else RETRY_WINDOW_EXHAUSTED) in str(get.error)
     assert isinstance(get.error.__cause__, HTTPGatewayError)
     assert get.error.__cause__.http_status == 429  # noqa: PLR2004
     assert execution(get.error) is Execution.ANSWERED
@@ -1559,3 +1563,130 @@ async def test_a_spent_request_budget_refuses_a_send_before_it_queues_for_a_cool
     assert len(transport.requests) == 1
     assert time.now == 0.0
     assert context.requests_refused
+
+
+# A request refused while time is left fails alone and ends no operation: a tolerant stream goes on past it and
+# completes. Each case refuses one request at a different site, with the operation's deadline far away.
+
+_TIME_LIMIT = {"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}
+_ALONE = ExecutionPolicy(max_elapsed=60.0, max_retry_elapsed_per_request=30.0)
+
+
+def _limited_once() -> Callable[[Request], object]:
+    """``a.get`` answers OPERATION_TIME_LIMIT once, which holds the method for 120 seconds; the rest succeed."""
+    limited = False
+
+    def respond(request: Request) -> object:
+        nonlocal limited
+        if request.method != "batch":
+            if request.method == "a.get" and not limited:
+                limited = True
+                return _TIME_LIMIT
+            return {"result": {"ok": 1}}
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, Mapping)
+        results: dict[str, object] = {}
+        errors: dict[str, object] = {}
+        for key, command in commands.items():
+            if str(command).startswith("a.get") and not limited:
+                limited = True
+                errors[key] = _TIME_LIMIT
+            else:
+                results[key] = {"ok": 1}
+        return {"result": {"result": results, "result_error": errors or []}}
+
+    return respond
+
+
+def _get(method: str, identifier: int) -> Request:
+    return Request(method, {"id": identifier}, ReplaySafety.SAFE, route=RouteKind.BARE)
+
+
+async def _errors(stream: AsyncIterator[object]) -> list[str]:
+    """Drain a tolerant stream that must complete; return each outcome's error message, '' for a success."""
+    return [str(getattr(outcome, "error", "") or "") async for outcome in stream]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch", ["direct", "batch"])
+async def test_a_request_held_longer_than_it_may_wait_fails_alone_and_the_stream_completes(dispatch: str) -> None:
+    # a.get is held for 120 seconds after its first answer; a later a.get may wait at most the 30-second window:
+    # it is refused at once at its permit, sent directly or in an envelope of its own.
+    time = _Time()
+    executor = _executor(ResponderTransport(_limited_once()), time)
+    order = (("a.get", 0), ("b.get", 1), ("a.get", 9), ("b.get", 2))
+    commands = [Command(_get(method, identifier), identifier) for method, identifier in order]
+    plan = DirectDispatch(concurrency=1) if dispatch == "direct" else BatchDispatch(batch_size=1, concurrency=1)
+    stream = kernel_fanout_stream(executor, commands, dispatch=plan, policy=_ALONE, tolerant=True)
+
+    errors = await _errors(stream)
+    await executor.coordinator.close()
+
+    # The first a.get fails on its own answer, the held one is refused, and both b.get succeed.
+    assert len(errors) == len(order)
+    assert errors.count("coordinator hold exceeds execution time budget") == 1
+    assert errors.count("") == 2  # noqa: PLR2004
+    assert stream.report.state is KernelState.COMPLETED
+    assert time.sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_a_command_held_longer_than_its_envelope_may_wait_is_left_out_alone_and_the_batch_goes_on() -> None:
+    # A user's logical batch leaves the held a.get out of its envelope (``Executor.plan_first_send``) and sends the
+    # rest. That refusal is the request's alone: the source's own BudgetExceededError, raised after it, is still a
+    # source failure, not the operation's budget. Through the public client, on the wall clock: nothing waits, and
+    # the 120-second hold is four times the 30-second window, so no timing on the host changes the outcome.
+    order = (("a.get", 0), ("b.get", 1), ("a.get", 9), ("b.get", 2))
+
+    def commands() -> Iterator[Command[int]]:
+        yield from (Command(_get(method, index), index) for method, index in order)
+        # Raised inside the next window, after its first command (a window's first pull is a known follow-up).
+        yield Command(_get("b.get", 3), 3)
+        raise BudgetExceededError("nested operation budget")
+
+    async with client_for(ResponderTransport(_limited_once()), policy=_ALONE) as client:
+        stream = client.batch_outcomes(on_loop(commands()), batch_size=2)
+        async with stream:
+            delivered, _error = await drain_to_failure(stream, InputSourceError)
+    outcomes = {outcome.correlation: outcome for outcome in delivered}
+
+    assert str(getattr(outcomes[9], "error", None)) == "coordinator hold exceeds execution time budget"
+    assert all(isinstance(outcomes[index], CommandSuccess) for index in (1, 2))
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrun", "refusal"),
+    [
+        # The replay round is refused when planned: its 0.6-second backoff does not fit the 1-second window.
+        (1.0, "retry delay would exceed elapsed budget"),
+        # The replay is refused at its send: its 0.3-second backoff overran to 0.9 seconds, more than the window left.
+        (3.0, "retry window left after the wait is shorter than the wait"),
+    ],
+)
+async def test_a_replay_refused_while_time_is_left_fails_alone_and_the_stream_completes(
+    overrun: float, refusal: str
+) -> None:
+    # A v3 envelope refused with a 429 (proven not run), then the rest of the stream.
+    unsafe, safe = _v3(2, ReplaySafety.UNSAFE), _v3(3, ReplaySafety.SAFE)
+    transport = ScriptedTransport(
+        (
+            ScriptedExchange.v3_batch((unsafe,), payload={}, status=429),
+            ScriptedExchange.v3_batch((safe,), ({"item": {"id": 3}},)),
+        )
+    )
+    executor = _executor(transport, _Time(overrun=overrun))
+    backoff = 0.6 if overrun == 1.0 else 0.3
+    policy = ExecutionPolicy(max_retry_elapsed_per_request=1.0, retry=RetryPolicy(initial_delay=backoff, jitter=0))
+    commands = [Command(unsafe, 2), Command(safe, 3)]
+    plan = BatchDispatch(batch_size=1, concurrency=1)
+    stream = kernel_fanout_stream(executor, commands, dispatch=plan, policy=policy, tolerant=True)
+
+    errors = await _errors(stream)
+    await executor.coordinator.close()
+
+    assert errors == [refusal, ""]
+    assert stream.report.state is KernelState.COMPLETED
+    transport.assert_exhausted()

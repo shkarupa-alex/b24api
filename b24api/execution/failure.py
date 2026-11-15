@@ -15,6 +15,7 @@ from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
+    CleanupOverrunError,
     EnvelopeContractError,
     HTTPGatewayError,
     IdentityContractError,
@@ -62,7 +63,8 @@ def classify_failure(error: BaseException) -> FailureClass:  # noqa: C901, PLR09
         return FailureClass("capability_rejected")
     if isinstance(error, AmbiguousExecutionError):
         return FailureClass("ambiguous_execution")
-    if isinstance(error, BudgetExceededError):
+    if isinstance(error, BudgetExceededError) and not isinstance(error, CleanupOverrunError):
+        # A cleanup overrun refused no work: it is classified as any other failed close, not as the budget's end.
         return FailureClass("budget_exhausted", incomplete=True)
     if isinstance(error, ResponseTooLargeError):
         return FailureClass("response_too_large")
@@ -98,10 +100,16 @@ def report_reason(error: BaseException) -> str:
     return str(getattr(cause, "report_name", type(cause).__name__))
 
 
+def public_cause(error: BaseException) -> BaseException:
+    """Return the public failure a private carrier carries (``report_cause``); any other error is its own."""
+    cause = getattr(error, "report_cause", None)
+    return cause if isinstance(cause, BaseException) else error
+
+
 def cleanup_failure_violation(error: BaseException, *, secondary: bool, subject: str = "batch") -> Violation:
     """Record a cleanup failure; ``secondary`` marks one that follows an earlier primary failure."""
     outcome = "also failed" if secondary else "failed"
-    message = f"{subject} cleanup {outcome} ({type(error).__name__})"
+    message = f"{subject} cleanup {outcome} ({report_reason(error)})"
     return Violation(ViolationSeverity.BLOCKING, "cleanup_failure", message)
 
 

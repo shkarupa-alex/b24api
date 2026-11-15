@@ -183,12 +183,12 @@ async def test_budget_ledger_counts_attempts_pages_references_and_buffers_before
     now = [0.0]
     context = ExecutionContext(policy, RateCoordinator(), clock=lambda: now[0])
     await context.start()
-    await context.reserve_attempt(attempts_for_request=0, retry_started=0)
+    await context.reserve_attempt(attempts_for_request=0)
     now[0] = 1
-    await context.reserve_attempt(attempts_for_request=1, retry_started=0)
+    await context.reserve_attempt(attempts_for_request=1)
     assert (await context.snapshot()).counters.physical_requests == TEST_LIMIT
     with pytest.raises(BudgetExceededError, match="physical request budget"):
-        await context.reserve_attempt(attempts_for_request=0, retry_started=1)
+        await context.reserve_attempt(attempts_for_request=0)
 
     context.commit_page(await context.reserve_page(reference="A"))
     with pytest.raises(BudgetExceededError, match="per-reference page budget"):

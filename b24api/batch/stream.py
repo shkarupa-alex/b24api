@@ -26,6 +26,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.request import Request
+from b24api.errors import BudgetExceededError
 from b24api.execution import (
     AsyncIteratorController,
     ExecutionContext,
@@ -66,8 +67,12 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             raise ValueError("shared batch context must use the exact stream policy")
         self._context = context or batch_executor.executor.context(policy)
         self._logical_page_per_command = logical_page_per_command
-        self._source_controller: AsyncIteratorController[_BatchItem] | None = None
-        self._source_taken = False
+        # Owns the source from the start, so even a close before the first pull is bounded by the cleanup window.
+        self._source_controller = AsyncIteratorController(
+            self._source,
+            input_error="batch input exceeded operation time budget",
+            cleanup_error="batch source cleanup exceeded operation time budget",
+        )
         self._started = False
         self._batch_requests = 0
         self._batch_commands = 0
@@ -107,13 +112,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
     async def _run(self) -> AsyncGenerator[BatchStreamItem]:
         self._started = True
         await self._context.start()
-        source = AsyncIteratorController(
-            self._source,
-            input_error="batch input exceeded operation time budget",
-            cleanup_error="batch source cleanup exceeded operation time budget",
-        )
-        self._source_controller = source
-        self._source_taken = True
+        source = self._source_controller
         next_index = 0
         while True:
             chunk = await _next_chunk(
@@ -141,6 +140,8 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
                 yield outcome
                 buffered_rows -= outcome_rows
                 await self._context.set_buffered_rows(buffered_rows)
+            if chunk.refusal is not None:
+                raise chunk.refusal
 
     def _count_batch_request(self) -> None:
         """Count one physical batch envelope the chunk sends in its first round."""
@@ -170,15 +171,8 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         return outcomes
 
     async def _cleanup(self) -> None:
-        source = self._source_controller
-        if source is None:
-            if not self._source_taken:
-                # No controller took the source this stream opened (closed before the first pull, or the
-                # context failed to start), so the stream closes it itself. OwnedSource.aclose is idempotent.
-                (await self._source.aclose()).raise_failure()
-            return
         await self._context.set_buffered_rows(0)
-        await source.aclose(remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed))
+        await self._source_controller.aclose(self._context)
 
     async def _finalize(self, cause: TerminalCause, failure: str | None, attempt: CleanupAttempt) -> KernelReport:
         if not self._started:
@@ -262,6 +256,11 @@ async def _next_chunk(
     start_index: int,
     context: ExecutionContext,
 ) -> _Chunk:
+    """Read up to ``size`` commands; a source failure or a budget refusal after the first ends the chunk.
+
+    A pull the operation's budget refused (``ExecutionContext.refusal``) is no source failure: it is carried as the
+    chunk's ``refusal``, and the commands read before it are sent as any chunk is, the budget refusing each send.
+    """
     commands: list[_Command] = []
     for offset in range(size):
         try:
@@ -271,6 +270,8 @@ async def _next_chunk(
         except Exception as error:
             if not commands:
                 raise
+            if isinstance(error, BudgetExceededError) and context.refusal is not None:
+                return _Chunk(tuple(commands), refusal=error)
             return _Chunk(tuple(commands), error)
         index = start_index + offset
         request, correlation = (item, None) if isinstance(item, Request) else (item.request, item.correlation)

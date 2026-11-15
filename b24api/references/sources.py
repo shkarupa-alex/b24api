@@ -166,7 +166,7 @@ class SourceAdmission:
             sources,
             accept=self.admit,
             observe=None if audit is None else (lambda reference: audit(reference.request)),
-            failure=lambda _error: _BindingSourceError(),
+            failure=_BindingSourceError,
         )
         scheduler = ReferenceScheduler(
             self._executor,

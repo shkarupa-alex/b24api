@@ -125,7 +125,7 @@ class MappedOperationStream[S, T]:
                 failure_report=self._failure_report,
                 cleanup=self._source.aclose,
                 propagate=self._propagate,
-                cleanup_budget=self._cleanup_budget,
+                cleanup_budget=self._cleanup_window,
             ),
             works_between_reads=source.works_between_reads,
         )
@@ -229,9 +229,8 @@ class MappedOperationStream[S, T]:
         self._terminated()
         return self._report
 
-    def _cleanup_budget(self) -> float:
-        context = self._source.operation_context
-        return context.policy.max_elapsed - context.elapsed
+    def _cleanup_window(self) -> float:
+        return self._source.operation_context.cleanup_window()
 
     def _propagate(self, error: BaseException, report: OperationReport) -> BaseException:
         return self._error_mapper(error, report) if self._error_mapper is not None else error

@@ -84,6 +84,9 @@ type BatchStreamItem = BatchOutcome
 class _Chunk:
     commands: tuple[_Command, ...]
     source_error: Exception | None = None
+    # The operation's budget refused the pull after these commands: they are sent (the budget refuses each send
+    # in turn), then the stream ends with the refusal.
+    refusal: BudgetExceededError | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,9 +328,13 @@ class BatchExecutor:
         ``Executor.plan_first_send`` decides, so one method's cooldown never holds back or fails the other commands
         of its envelope. A refused command is never sent: it ends with ``BudgetExceededError``, proven not run.
         """
-        plan = self.executor.plan_first_send(
-            context, methods=tuple(frozenset({command.request.method}) for command in group)
-        )
+        try:
+            plan = self.executor.plan_first_send(
+                context, methods=tuple(frozenset({command.request.method}) for command in group)
+            )
+        except BudgetExceededError as refusal:
+            # No time is left: the deadline refused the envelope's permit, so none of its commands is sent.
+            return (), {command.index: _shared_failure(command, refusal) for command in group}
         if plan is None:
             return group, {}
         refused = frozenset(plan.sends(_SendPlan.REFUSE))
@@ -378,12 +385,18 @@ class BatchExecutor:
         """
         if not candidates:
             return ()
-        plan = self.executor.plan_replay(
-            context,
-            attempts=attempts,
-            sends=tuple((command.request.replay_safety, frozenset({command.request.method})) for command in candidates),
-            whole=options.halt,
-        )
+        try:
+            plan = self.executor.plan_replay(
+                context,
+                attempts=attempts,
+                sends=tuple(
+                    (command.request.replay_safety, frozenset({command.request.method})) for command in candidates
+                ),
+                whole=options.halt,
+            )
+        except BudgetExceededError as refusal:
+            lineup.stop(candidates, str(refusal))
+            return ()
         if plan is None:
             lineup.stop(candidates, _retry_refusal(plan))
             return ()

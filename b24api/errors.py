@@ -449,6 +449,18 @@ class KeysetCapabilityError(CapabilityError):
         return safe
 
 
+class CleanupOverrunError(BudgetExceededError):
+    """A cleanup step was still running when its cleanup window ended; it goes on in the background.
+
+    An operation's cleanup (closing the caller's source, cancelling the work still in flight) may wait the time the
+    operation has left, but at least a short grace, so the end of ``max_elapsed`` itself never fails it. A step that
+    outlasts that window raises this from ``aclose()`` or the ``async with`` exit when nothing else ended the
+    operation, and is reported as a ``cleanup_failure``. It refused no work: unlike any other
+    ``BudgetExceededError``, it never records the operation's refusal, and a caller's cancellation outranks it
+    (the ``CancelledError`` propagates, the overrun is recorded behind it).
+    """
+
+
 class ResponseTooLargeError(B24ApiError):
     """A decompressed response exceeded the configured byte ceiling."""
 
@@ -587,6 +599,7 @@ __all__ = (
     "BatchFailed",
     "BudgetExceededError",
     "CapabilityError",
+    "CleanupOverrunError",
     "ClientClosedError",
     "ContinuationError",
     "ContinuationReason",

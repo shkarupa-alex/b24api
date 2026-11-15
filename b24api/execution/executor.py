@@ -69,8 +69,23 @@ type Sleeper = Callable[[float], Awaitable[None]]
 
 _HTTP_STATUS_MINIMUM = 100
 _HTTP_STATUS_MAXIMUM = 599
-# Why a send is refused before it queues: a hold the coordinator already knows of outlasts what it may wait.
+# Why a send is refused before it queues: a hold the coordinator already knows of outlasts what it may wait. The
+# send is refused while time is left, so this refuses that request alone, as a retry delay too long for the window.
 _HOLD_REFUSAL = "coordinator hold exceeds execution time budget"
+# The work the deadline refuses (``ExecutionContext.time_left``): a send's permit, the wait for it, or its dispatch.
+_PERMIT_REFUSAL = "execution time budget exhausted"
+_PERMIT_WAIT_REFUSAL = "permit wait exhausted execution time budget"
+_DISPATCH_REFUSAL = "execution time budget exhausted before dispatch"
+_RETRY_REFUSAL = "execution time budget exhausted before the retry"
+
+
+def _permit_window(context: ExecutionContext, attempts: _RequestAttempts, methods: frozenset[str]) -> float:
+    """Return the time a send may wait for its permit, refusing it when the budget cannot carry the wait."""
+    context.admit_request()
+    remaining = context.time_left(_PERMIT_REFUSAL, retry_started=attempts.started)
+    if context.coordinator.admission_delay(methods) >= remaining:
+        raise BudgetExceededError(_HOLD_REFUSAL)
+    return remaining
 
 
 class _BodyMode(Enum):
@@ -323,7 +338,7 @@ class _RequestAttempts:
         return self.started
 
     def admit(self, remaining: float, safety: ReplaySafety, *, now: float) -> None:
-        """Refuse a send the window cannot carry: none is left, or one that may not be repeated gets less than its wait.
+        """Refuse a send that may not be repeated when the window left (``remaining``, above 0) is less than its wait.
 
         A send that may not be repeated and is cut by the window turns a refusal already proven into an unknown
         outcome, so it is started only with at least as much window left as it waited since its wait was planned.
@@ -332,8 +347,6 @@ class _RequestAttempts:
         or a long permit queue. A SAFE send is started with any window left, since it may still succeed and a cut
         one is replayed harmlessly. The refusal is kept as ``refusal``.
         """
-        if remaining <= 0:
-            raise BudgetExceededError("execution time budget exhausted before dispatch")
         pause = self.pause
         if safety is not ReplaySafety.SAFE and pause is not None and remaining < now - pause.planned_at:
             self.refusal = BudgetExceededError("retry window left after the wait is shorter than the wait")
@@ -569,9 +582,9 @@ class Executor:
             try:
                 async with permit:
                     retry_started = shared.open_window(self._clock)
-                    remaining = context.remaining_time(retry_started=retry_started)
+                    remaining = context.time_left(_DISPATCH_REFUSAL, retry_started=retry_started)
                     shared.admit(remaining, request.replay_safety, now=self._clock())
-                    await context.reserve_attempt(attempts_for_request=attempts, retry_started=retry_started)
+                    await context.reserve_attempt(attempts_for_request=attempts)
                     shared.dispatched()
                     wire = await self._send_attempt(request, wire_request, context=context, remaining=remaining)
             except asyncio.CancelledError:
@@ -614,22 +627,16 @@ class Executor:
         method cooldown) that outlasts the budget, fail at once instead of queueing for nothing or waiting the budget
         out. Each failure reports the failure of the request's latest send, whichever call or replay round made it.
         """
-        cause = attempts.retry_cause
         try:
-            context.admit_request()
-        except BudgetExceededError as error:
-            raise error from cause
-        if (remaining := context.remaining_time(retry_started=attempts.started)) <= 0:
-            raise BudgetExceededError("execution time budget exhausted") from cause
-        if context.coordinator.admission_delay(methods) >= remaining:
-            raise BudgetExceededError(_HOLD_REFUSAL) from cause
-        try:
-            async with asyncio.timeout(remaining):
+            remaining = _permit_window(context, attempts, methods)
+            async with context.deadline(_PERMIT_WAIT_REFUSAL, retry_started=attempts.started):
                 return await context.coordinator.acquire(
                     work_class, methods=methods, budget=DeadlineBudget(self._clock() + remaining)
                 )
-        except TimeoutError as error:
-            raise BudgetExceededError("permit wait exhausted execution time budget") from (cause or error)
+        except BudgetExceededError as error:
+            if attempts.retry_cause is None:
+                raise
+            raise error from attempts.retry_cause
 
     async def _send_attempt(
         self,
@@ -713,9 +720,9 @@ class Executor:
         )
         async with permit:
             retry_started = attempts.open_window(self._clock)
-            remaining = context.remaining_time(retry_started=retry_started)
+            remaining = context.time_left(_DISPATCH_REFUSAL, retry_started=retry_started)
             attempts.admit(remaining, envelope.replay_safety, now=self._clock())
-            await context.reserve_attempt(attempts_for_request=spent, retry_started=retry_started)
+            await context.reserve_attempt(attempts_for_request=spent)
             attempts.dispatched()
             try:
                 async with asyncio.timeout(remaining):
@@ -840,16 +847,19 @@ class Executor:
         sent whole or not at all. A backoff already waited for a send that was then refused at its admission is
         not waited again. A carried send costs no attempt of its own: every round that carries one sends another,
         which spends the round's attempt, so the attempt budget bounds how often a send is carried; one carried
-        past the round that spends the last attempt meets no plan (``None``) and is stopped by that budget.
+        past the round that spends the last attempt meets no plan (``None``) and is stopped by that budget. With no
+        window left, the round is refused by time as any work is (``ExecutionContext.time_left``): the operation's
+        deadline records its refusal and ends the operation, a retry window closed first refuses this request alone.
+        A plan that refuses a send refuses it while time is left, which ends no operation.
         """
         if attempts.started is None or attempts.used >= context.policy.max_attempts_per_request:
             return None
+        window = context.time_left(_RETRY_REFUSAL, retry_started=attempts.started)
         backoff = (
             0.0
             if attempts.pause is not None
             else _retry_delay(context.policy, retry_number=attempts.used, random_source=self._random)
         )
-        window = context.remaining_time(retry_started=attempts.started)
         now = self._clock()
         own = tuple(_Pause(backoff, context.coordinator.admission_delay(methods), window, now) for _, methods in sends)
         return _plan_round(own, tuple(safety for safety, _ in sends), whole=whole)
@@ -866,11 +876,14 @@ class Executor:
         every command can wait, or none can, the envelope goes whole to its permit, which waits within the operation's
         budget or refuses at once a hold that outlasts it, as for a lone request. Otherwise ``_plan_round`` refuses
         each command that cannot wait, the others being sent once the longest hold among them ends (the coordinator
-        enforces it at the permit). A fail-fast envelope is never planned here: it goes whole to its permit.
+        enforces it at the permit). A fail-fast envelope is never planned here: it goes whole to its permit. With no
+        time left, it raises the deadline's refusal of the permit (``ExecutionContext.time_left``), recorded.
         """
         now = self._clock()
         host = context.coordinator.admission_delay(frozenset())
-        window = min(context.remaining_time(retry_started=now), context.remaining_time(retry_started=None) - host)
+        # A window opening now cannot close before the operation's deadline unless it is shorter: no time left is
+        # the deadline's refusal, recorded.
+        window = min(context.time_left(_PERMIT_REFUSAL, retry_started=now), context.time_left(_PERMIT_REFUSAL) - host)
         pauses = tuple(_Pause(0.0, context.coordinator.admission_delay(each) - host, window, now) for each in methods)
         fits = tuple(pause.admits(ReplaySafety.SAFE) for pause in pauses)
         if all(fits) or not any(fits):
@@ -903,7 +916,10 @@ class Executor:
         retryable = _is_retryable(error, safety=safety, policy=context.policy)
         if not retryable or shared.caller_retries:
             raise error
-        replay = self.plan_replay(context, attempts=shared, sends=((safety, methods),))
+        try:
+            replay = self.plan_replay(context, attempts=shared, sends=((safety, methods),))
+        except BudgetExceededError as refusal:
+            raise refusal from error
         if replay is None or replay.plans != (_SendPlan.SEND,):
             raise BudgetExceededError(_retry_refusal(replay)) from error
         await self._wait(context, shared, replay.pause)

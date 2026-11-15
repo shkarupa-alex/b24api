@@ -9,7 +9,6 @@ property the removal relies on: each mutator finishes in one step, and concurren
 from __future__ import annotations
 import asyncio
 import random
-import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -41,7 +40,7 @@ async def test_every_ledger_mutator_completes_without_suspending() -> None:
     context = ExecutionContext(ExecutionPolicy(max_pages=4), RateCoordinator())
 
     _one_step(context.start())
-    _one_step(context.reserve_attempt(attempts_for_request=1, retry_started=time.monotonic()))
+    _one_step(context.reserve_attempt(attempts_for_request=1))
     _one_step(context.record_retry())
     _one_step(context.record_cooldown(_COOLDOWN))
     single = _one_step(context.reserve_page(reference="a"))

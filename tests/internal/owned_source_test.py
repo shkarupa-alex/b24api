@@ -14,6 +14,7 @@ from b24api.contracts import Command
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.violation import MAX_RETAINED_VIOLATIONS
 from b24api.execution.context import CleanupResult
+from tests.scripting import HANG_BOUND, WorkerStarts, reached
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -180,3 +181,47 @@ async def test_sync_source_keeps_one_context_across_its_pulls_and_close() -> Non
     assert seen == [("reset", "caller")]
     # The source's context is its own: the caller's context never sees what the generator sets.
     assert _TENANT.get() == "caller"
+
+
+_PULL: contextvars.ContextVar[str] = contextvars.ContextVar("pull", default="caller")
+
+
+@pytest.mark.asyncio
+async def test_a_close_requested_while_a_sync_pull_runs_waits_for_it_in_the_same_context() -> None:
+    # Only the owner's asyncio ordering kept the close from the pull's context: once that ordering broke (the
+    # loop shutting down cancels every task, the pull's worker task included), the close entered the context
+    # while the pull still ran in it and failed with "cannot enter context ... already entered".
+    loop = asyncio.get_running_loop()
+    workers = WorkerStarts(loop)
+    loop.set_default_executor(workers)
+    release = threading.Event()
+    trace: list[tuple[str, str]] = []
+
+    def items() -> Iterator[int]:
+        try:
+            _PULL.set("pull 1")
+            yield 1
+            _PULL.set("pull 2")
+            release.wait(HANG_BOUND)
+            trace.append(("pulled", _PULL.get()))
+            yield 2
+        finally:
+            trace.append(("closed", _PULL.get()))
+
+    source = OwnedSource.adapt(items(), accept=_identity)
+    assert await source.next() == 1
+    pull = asyncio.create_task(source.next())
+    try:
+        await reached(workers.started(1))
+        close = asyncio.create_task(source.aclose())
+        # The close's worker call has started while the pull still runs: it waits for the pull.
+        await reached(workers.started(2))
+        assert not close.done()
+    finally:
+        release.set()
+    outcome = await asyncio.wait_for(close, timeout=HANG_BOUND)
+    workers.shutdown(wait=True)
+
+    assert await pull == 2  # noqa: PLR2004
+    assert outcome == CleanupResult(None, None)
+    assert trace == [("pulled", "pull 2"), ("closed", "pull 2")]

@@ -351,8 +351,25 @@ async def test_fail_fast_batch_reports_the_command_failure_not_its_carrier() -> 
     assert _codes(report) == ["batch_command_failure"]
 
 
+def _causes(error: BaseException) -> list[type[BaseException]]:
+    causes: list[type[BaseException]] = []
+    cause = error.__cause__
+    while cause is not None:
+        causes.append(type(cause))
+        cause = cause.__cause__
+    return causes
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("family", "error"), [("batch", BatchFailed), ("fan_out_outcomes", InputSourceError)])
+@pytest.mark.parametrize(
+    ("family", "error"),
+    [
+        ("batch", BatchFailed),
+        ("batch_outcomes", InputSourceError),
+        ("fan_out", BatchFailed),
+        ("fan_out_outcomes", InputSourceError),
+    ],
+)
 async def test_source_failure_is_reported_as_an_input_source_failure(
     family: str,
     error: type[B24ApiError],
@@ -366,6 +383,10 @@ async def test_source_failure_is_reported_as_an_input_source_failure(
     assert report.terminal_reason == "InputSourceError"
     assert "source_failure" in _codes(report)
     assert "internal_failure" not in _codes(report)
+    # The chain runs from the public error to the source's own, through public failures only.
+    causes = _causes(raised.value)
+    assert causes[-1] is _SourceFailedError
+    assert set(causes[:-1]) <= {InputSourceError}
 
 
 async def _failing_bindings() -> AsyncIterator[Binding[int]]:
@@ -388,3 +409,4 @@ async def test_reference_binding_source_failure_is_reported_as_an_input_source_f
     report = _published(raised.value)
     assert report.terminal_reason == "InputSourceError"
     assert "source_failure" in _codes(report)
+    assert _causes(raised.value) == [_SourceFailedError]

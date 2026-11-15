@@ -145,18 +145,49 @@ outcome.
   sends the rest; otherwise the envelope goes whole to its permit. A fail-fast envelope, traversal
   pages and dispatcher waves (`BatchExecutor.execute_requests`) are never split: leaving a command out
   of them lets no other command go.
-- The request budget ends an operation: `ExecutionContext.admit_request` refuses a send once
-  `max_requests` is spent, before its permit and again at its reservation, and records the refusal
-  (`requests_refused`), after which no send can be admitted. `AsyncIteratorController.get`, the one
-  source pull of the batch streams, then refuses further input, so the operation ends with
-  `BudgetExceededError`, as the time budget ends it at the next pull. The reference scheduler's
-  producer reads no binding once the refusal is recorded and ends the source as a read-out source
-  ends (lease waiters are woken, and the source no longer counts as one that may still bring a
-  binding). Its task ends without error, so a fail-fast window's failure stays the operation's only
-  error and cleanup records nothing. The consumer decides from `requests_refused` itself, not from how
-  the source ended (the producer reads ahead and may read a finite source out before a refusal), and
-  raises `BudgetExceededError` once the bindings already read are settled. A budget the last
-  needed send spends exactly ends nothing.
+- The request budget and the deadline end an operation: `ExecutionContext.admit_request` refuses a
+  send once `max_requests` is spent, before its permit and again at its reservation, and records the
+  refusal (`requests_refused`), after which no send can be admitted. Time refuses work only through
+  `ExecutionContext.time_left`, which returns the time left or refuses when none is, and
+  `ExecutionContext.deadline`, which waits under it (a send's permit and its dispatch,
+  the plan of a retry, a batch replay round or an envelope's first send, a batch's isolation phase, a
+  page reservation, a row-capacity wait, a dispatcher admission, a fast keyset lease, a source pull).
+  Both record the refusal when the operation's deadline is what closed, and record nothing when a
+  request's own retry window closed first, which refuses that request alone with "per-request retry
+  time budget exhausted". The time left is read otherwise only by `coalescing_time_left`, at the batch
+  dispatcher's coalescing wait, which ends in a send, never a refusal, and by `cleanup_window`, at the
+  cleanup steps below. Each site that refuses work at the deadline has a behavioural test showing the
+  refusal recorded and the operation ended with it; those tests are what hold the rule.
+  `tests/internal/deadline_refusal_test.py` adds a cheap static tripwire for the usual idioms (the
+  `ExecutionContext` members that read its clock, the readers that refuse nothing, the timeouts armed
+  through `asyncio`, every `BudgetExceededError` constructed), which a site written otherwise passes. The refusals of one request while time is left, for a
+  coordinator hold or a retry delay its window cannot carry, or a send that may not be repeated left
+  less window than its wait, record nothing. `ExecutionContext.refusal` keeps the first recorded refusal's message.
+  `AsyncIteratorController.get`, the one source pull of the batch streams, refuses further input once
+  a send was refused or the deadline has passed, so the operation ends with `BudgetExceededError`; the
+  commands a batch window read before such a pull are sent as any window is, the budget refusing each,
+  and the stream then raises the pull's refusal. A pull the budget refuses ends the reference
+  scheduler's source as a read-out source ends (lease waiters are woken, and the source no longer
+  counts as one that may still bring a binding), without its end having been read. Its task ends
+  without error, so a fail-fast window's failure stays the operation's only error and cleanup records
+  nothing. The consumer decides from `refusal` itself, not from how the source ended (the producer
+  reads ahead and may read a finite source out before a refusal), and raises `BudgetExceededError`
+  with that message once the bindings already read are settled. A budget the last needed send spends
+  exactly, or a deadline that passes once nothing is left to admit, ends nothing.
+- Cleanup is bounded by `ExecutionContext.cleanup_window()`: what is left of `max_elapsed`, but at
+  least `CLEANUP_GRACE_SECONDS` (0.1 s), since cleanup typically starts when the deadline has passed.
+  The source close (`AsyncIteratorController.aclose`), the reference scheduler's wait for its
+  cancelled tasks and the batch dispatcher's wait for its workers each wait that long; what is still
+  running then finishes in the background and is reported as a `cleanup_failure`
+  (`b24api.errors.CleanupOverrunError`, a public `BudgetExceededError` that records no refusal and
+  that `classify_failure` classifies as any failed close, never as `budget_exhausted`),
+  secondary to the error that ended
+  the operation; behind a caller's cancellation, the cancellation is raised and the stream is
+  cancelled. A stream owns its source through its `AsyncIteratorController` from the start, so a close
+  before the first pull is bounded the same way. `OwnedSource` runs a synchronous source's pulls and
+  close one at a time in its one `contextvars.Context`, under a lock its worker threads take, so a
+  close that the end of the operation starts while a cut pull still runs waits for that pull instead
+  of entering the context twice.
 - The default response ceiling is enforced while streaming, before JSON decoding.
 - Exact sequential, counted, and multi-reference traversal shares one operation-wide
   `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted
@@ -171,8 +202,9 @@ outcome.
   cancelled task is sent, while a later cancellation still ends it, even when a foreign transport
   suppressed it into a response or a failure. An isolated pull that absorbs its reader's
   cancellation by failing in cleanup hands the cancellation back to the reader's next await. A
-  stream's close and cleanup defer a cancellation only while the operation's `max_elapsed` budget
-  lasts; cleanup still running then finishes in the background and the report records it as failed.
+  stream's close and cleanup defer a cancellation only for the operation's cleanup window (what is
+  left of `max_elapsed`, at least the cleanup grace); cleanup still running then finishes in the
+  background and the report records it as failed.
 - Caller code a stream's read or cleanup runs (a page-stop callback, an async command, binding or
   reference source, an injected transport, or a task one of them starts) cannot close that stream
   or its client while the read or cleanup is in progress, nor at all on a reference-scheduler
