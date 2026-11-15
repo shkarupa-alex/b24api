@@ -29,7 +29,12 @@
   now ends as a budget stop already ended it: with the stop, which is what ended it, caused by the
   failure it followed, and reported possibly run only when a send it was in may have run (a batch
   command then ends `AmbiguousExecutionError` whose cause is that stop; a lone request raises the stop,
-  its execution facts saying so). The same holds now for a REST 3.0 envelope retry after an abort or a
+  its execution facts saying so). A send its transport refused before it left (a closed `HttpxTransport`
+  or injected HTTPX client, or any transport raising `ClientClosedError`) is such a stop too: it ended a
+  lone request with the bare `ClientClosedError` and a batch command unknown caused by that refusal, the
+  failure it followed dropped, and was counted in `physical_requests` and `batch_isolation_requests`
+  though nothing was sent. It now ends as a stop at the permit does, and is counted in neither. The same
+  holds now for a REST 3.0 envelope retry after an abort or a
   lost answer that the budget stops at its permit, which kept the envelope's failure. A command its own
   entry or element answered keeps that answer whatever stops its replay: a classic command its own
   entry answered with a transient error (`QUERY_LIMIT_EXCEEDED`, for example), whose replay such a
@@ -394,7 +399,8 @@ send meets a method pause, have changed.
   "transport is closed" or "HTTP client is closed" for a send after its transport or injected HTTPX
   client closed. Each now raises `b24api.errors.ClientClosedError`. It is a `TransportError` of phase
   `not_dispatched` and `retryable=False`: the attempt it stopped never left the process, and it is never
-  retried. The phase covers that attempt alone. A `SAFE` request waiting for the permit of a retry may
+  retried. A custom transport that refuses a send before it leaves raises it too: the executor then
+  counts no physical request for that send. The phase covers that attempt alone. A `SAFE` request waiting for the permit of a retry may
   have run on an earlier attempt; an `UNSAFE` or `UNKNOWN` one is retried only after a failure that
   proved it did not run (a transport failure before dispatch, or a refusal listed in `AmbiguityPolicy`),
   so it stays proven not run. It also derives from `RuntimeError`, so

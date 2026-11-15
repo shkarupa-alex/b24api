@@ -225,6 +225,10 @@ class ExecutionContext:
             raise BudgetExceededError("per-request attempt budget exhausted")
         self._physical_requests += 1
 
+    def release_attempt(self) -> None:
+        """Release a reserved attempt whose transport refused it before it left the process: no physical request."""
+        self._physical_requests -= 1
+
     async def record_retry(self) -> None:
         """Record the retry."""
         self._retries += 1

@@ -137,8 +137,12 @@ outcome.
   sent whole or not at all. A hold that appears during the wait is met at the permit and stops the whole round
   when it outlasts the window. A stop before a send that follows a failure, by the budget or by any
   other failure (a closed client), is chained to the failure of the latest send in one place, where the
-  executor stops it (`_RequestAttempts.chain_stop`, at the permit and at the admission), for a lone
-  request's retry, a REST 3.0 envelope retry or isolated send and a classic round alike. A batch command
+  executor stops it (`_RequestAttempts.chain_stop`, at the permit, at the admission and at the transport),
+  for a lone request's retry, a REST 3.0 envelope retry or isolated send and a classic round alike. A
+  transport that refuses a send before it leaves the process raises `ClientClosedError`, whichever transport
+  it is (a closed `HttpxTransport` or injected HTTPX client, for example): the executor releases the
+  attempt it reserved and records nothing sent (`Executor._dispatch`), so that send is no physical request
+  and no isolated send, and stops it as the permit does. A batch command
   that followed its envelope's failure ends with that stop; a classic round may carry a command past a
   round, so its engine gives each command a copy of the stop caused by the failure that command
   followed. A command its own entry or element answered keeps that answer, whatever stops its replay.

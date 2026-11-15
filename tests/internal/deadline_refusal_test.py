@@ -81,7 +81,7 @@ TIMEOUTS = Counter(
     {
         (CONTEXT, f"{LEDGER}.deadline", "timeout"): 1,
         ("execution/executor.py", "Executor._send_attempt", "timeout"): 1,
-        ("execution/executor.py", "Executor._send_envelope", "timeout"): 1,
+        ("execution/executor.py", "_send_envelope_attempt", "timeout"): 1,
         ("execution/rate.py", "RateCoordinator.acquire", "timeout_at"): 1,
         # The batch dispatcher's coalescing wait, handed ``coalescing_time_left``: it ends in a send.
         ("references/dispatch.py", "_wait_first", "wait"): 1,

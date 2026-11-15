@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
 
     from b24api import Transport
+    from b24api.execution.context import ExecutionSnapshot
     from b24api.execution.rate import DeadlineBudget, _Permit
     from b24api.transport import WireRequest
 
@@ -1782,22 +1783,29 @@ _NO_DELAY = ExecutionPolicy(retry=RetryPolicy(initial_delay=0, maximum_delay=0, 
 
 
 class _ClosingTransport(ScriptedTransport):
-    """Answer each send with the next of ``replies``, closing the client's coordinator during the last one first.
+    """Answer each send with the next of ``replies``, closing the client during the last one first.
 
-    No send after the last reply gets a permit: the replay it asked for is stopped there, not by a budget.
+    ``closing`` names what closes: the client's ``coordinator``, so no send after the last reply gets a permit, or
+    the ``transport`` itself, which then refuses every send before it leaves, as any transport may: with the
+    ``ClientClosedError`` that says it never left. Either way the replay asked for is stopped, not by a budget.
     """
 
-    def __init__(self, replies: tuple[WireResponse | TransportError, ...]) -> None:
+    def __init__(self, replies: tuple[WireResponse | TransportError, ...], *, closing: str) -> None:
         super().__init__(())
         self.replies = list(replies)
+        self.closing = closing
         self.executor: Executor | None = None
         self.sends = 0
+        self.refused = 0
 
     async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         del request, attempt_timeout, max_response_bytes
+        if not self.replies:
+            self.refused += 1
+            raise ClientClosedError("transport is closed")
         self.sends += 1
         reply = self.replies.pop(0)
-        if not self.replies:
+        if not self.replies and self.closing == "coordinator":
             assert self.executor is not None
             await self.executor.coordinator.close()
         if isinstance(reply, TransportError):
@@ -1805,11 +1813,12 @@ class _ClosingTransport(ScriptedTransport):
         return reply
 
 
-def _assert_raised_at_the_closed_permit(stop: BaseException) -> None:
-    """Each command's copy of the stop keeps the stop's own traceback, down to the closed coordinator's refusal."""
+def _assert_raised_where_refused(stop: BaseException, closing: str) -> None:
+    """Each command's copy of the stop keeps the stop's own traceback, down to the refusal of what closed."""
     frames = traceback.extract_tb(stop.__traceback__)
     assert frames
-    assert (Path(frames[-1].filename).name, frames[-1].name) == ("rate.py", "acquire")
+    refused_at = ("rate.py", "acquire") if closing == "coordinator" else (Path(__file__).name, "send_wire")
+    assert (Path(frames[-1].filename).name, frames[-1].name) == refused_at
 
 
 def _answered_by_each_command(dialect: str) -> WireResponse:
@@ -1830,12 +1839,18 @@ def _lost() -> TransportError:
 _V3_ABORT = WireResponse(
     400, _JSON, json.dumps({"error": {"code": "SYNTHETIC_NOT_FOUND", "message": "not found"}}).encode()
 )
+# The portal too busy to take the request, which proves a lone request or a classic envelope not run.
+_BUSY = WireResponse(
+    503, _JSON, json.dumps({"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow down"}).encode()
+)
 
 
 def _stopped_replies(dialect: str, first: str) -> tuple[WireResponse | TransportError, ...]:
     """The answers to the sends before the stopped one."""
     if first == "refused":
         return (WireResponse(429, (), b""),)
+    if first == "busy":
+        return (_BUSY,)
     if first == "answered":
         return (_answered_by_each_command(dialect),)
     if first == "aborted":
@@ -1844,14 +1859,15 @@ def _stopped_replies(dialect: str, first: str) -> tuple[WireResponse | Transport
     return (_lost(), _lost()) if dialect == "v3-isolation" else (_lost(),)
 
 
-async def _stopped_errors(dialect: str, transport: _ClosingTransport) -> list[B24ApiError]:
-    """Run two SAFE commands, or one lone request, and return the error each ended with."""
+async def _stopped_errors(dialect: str, transport: _ClosingTransport) -> tuple[list[B24ApiError], ExecutionSnapshot]:
+    """Run two SAFE commands, or one lone request, and return the error each ended with and the budget."""
     executor = _executor(transport, _Time())
     transport.executor = executor
+    context = executor.context(_NO_DELAY)
     if dialect == "lone":
         with pytest.raises(B24ApiError) as raised:
-            await executor.execute(_request(ReplaySafety.SAFE, "crm.item.get"), policy=_NO_DELAY)
-        return [raised.value]
+            await executor.execute(_request(ReplaySafety.SAFE, "crm.item.get"), context=context)
+        return [raised.value], await context.snapshot()
     route = RouteKind.BARE if dialect == "classic" else RouteKind.API_V3
     error_spec = ResultErrorSpec(ResultSelector(("error",)), ("code",), ("message",))
     requests = tuple(
@@ -1864,40 +1880,45 @@ async def _stopped_errors(dialect: str, transport: _ClosingTransport) -> list[B2
         )
         for index, method in enumerate(("crm.item.get", "crm.item.list"))
     )
-    outcomes = await BatchExecutor(executor).execute_requests(requests, context=executor.context(_NO_DELAY))
+    outcomes = await BatchExecutor(executor).execute_requests(requests, context=context)
     errors: list[B24ApiError] = []
     for outcome in outcomes:
         assert isinstance(outcome, BatchFailure)
         assert isinstance(outcome.error, B24ApiError)
         errors.append(outcome.error)
-    return errors
+    return errors, await context.snapshot()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("closing", ["coordinator", "transport"])
 @pytest.mark.parametrize(
     ("dialect", "first"),
     [
-        *((dialect, first) for dialect in ("classic", "v3") for first in ("refused", "lost", "answered")),
+        *((dialect, first) for dialect in ("classic", "v3") for first in ("refused", "busy", "lost", "answered")),
         ("v3-isolation", "aborted"),
         ("v3-isolation", "lost"),
-        ("lone", "refused"),
-        ("lone", "lost"),
+        *(("lone", first) for first in ("refused", "busy", "lost")),
     ],
 )
 async def test_a_replay_stopped_before_its_send_by_a_closed_client_ends_with_the_stop_caused_by_what_it_followed(
-    dialect: str, first: str
+    dialect: str, first: str, closing: str
 ) -> None:
     # The last send before the stop is refused as a whole (proven not run), its answer is lost or it is aborted
     # (it may have run), or each command's own entry or element answers it with a transient error; the client is
     # closed meanwhile, so the SAFE replay (a batch round, a v3 envelope retry or isolated send, or a lone
-    # request's retry) is stopped at its permit, not by a budget. What followed a failure ends with that stop,
-    # which is what ended it, caused by the failure it followed; a command its own answer replayed keeps it.
+    # request's retry) is stopped before it leaves, not by a budget: at its permit by the closed coordinator, or
+    # by the closed transport it was handed to. What followed a failure ends with that stop, which is what ended
+    # it, caused by the failure it followed; a command its own answer replayed keeps it. A send the transport
+    # refused never left: it is no physical request, nor an isolated send.
     replies = _stopped_replies(dialect, first)
-    transport = _ClosingTransport(replies)
+    transport = _ClosingTransport(replies, closing=closing)
 
-    errors = await _stopped_errors(dialect, transport)
+    errors, budget = await _stopped_errors(dialect, transport)
 
     assert transport.sends == len(replies)
+    assert transport.refused == (0 if closing == "coordinator" else 2 if dialect == "v3-isolation" else 1)
+    assert budget.counters.physical_requests == len(replies)
+    assert budget.batch_isolation_requests == 0
     for error in errors:
         if first == "answered":
             # Its own answer is what the portal said about it: the stop of its replay does not replace it.
@@ -1909,19 +1930,24 @@ async def test_a_replay_stopped_before_its_send_by_a_closed_client_ends_with_the
         # request raises the stop itself.
         stop = error.__cause__ if type(error) is AmbiguousExecutionError else error
         assert type(stop) is ClientClosedError
-        _assert_raised_at_the_closed_permit(stop)
+        _assert_raised_where_refused(stop, closing)
         followed = stop.__cause__
-        if first == "refused":
+        if first == "refused" or (first == "busy" and dialect != "v3"):
             # Proven not run by the refusal: the stop is the outcome, recorded as answered.
             assert stop is error
-            assert isinstance(followed, HTTPGatewayError)
-            assert followed.http_status == 429  # noqa: PLR2004
+            if first == "busy":
+                assert isinstance(followed, ApiResponseError)
+                assert followed.normalized_code == "query_limit_exceeded"
+            else:
+                assert isinstance(followed, HTTPGatewayError)
+                assert followed.http_status == 429  # noqa: PLR2004
             assert execution(error) is Execution.ANSWERED
             continue
         assert type(error) is (ClientClosedError if dialect == "lone" else AmbiguousExecutionError)
-        if first == "aborted":
+        if first in {"aborted", "busy"}:
+            # A v3 envelope's own error does not prove its commands not run.
             assert isinstance(followed, ApiResponseError)
-            assert followed.original_code == "SYNTHETIC_NOT_FOUND"
+            assert followed.original_code == ("SYNTHETIC_NOT_FOUND" if first == "aborted" else "QUERY_LIMIT_EXCEEDED")
         else:
             assert followed is replies[-1]
         assert execution(error) is Execution.POSSIBLY_RUN

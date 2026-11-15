@@ -620,6 +620,29 @@ def test_registering_a_client_builds_no_secrets(monkeypatch: pytest.MonkeyPatch)
     assert _messages(handler) == ["foreign record [REDACTED]"] * 3
 
 
+def test_an_owned_dispatch_builds_no_secrets_until_a_record_needs_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A dispatch that logs nothing searches nothing: taking ownership checks that it holds a credential without
+    # picking the tokens it searches with.
+    _assert_shield_idle()
+    searched: list[int] = []
+    distinct_tokens = _webhook._distinct_tokens  # noqa: SLF001 - counts the token sets built
+
+    def counted_tokens(webhooks: frozenset[Webhook]) -> tuple[Webhook, ...]:
+        searched.append(len(webhooks))
+        return distinct_tokens(webhooks)
+
+    monkeypatch.setattr(_webhook, "_distinct_tokens", counted_tokens)
+    with (
+        _registered("synthetic-other-secret-1"),
+        _capture() as handler,
+        HTTPX_LOG_SHIELD.request(webhook=_OWNED_WEBHOOK),
+    ):
+        assert searched == []
+        logging.getLogger("httpx").info("owned record %s", _OWNED)
+        assert searched != []
+    assert _messages(handler) == ["owned record [REDACTED]"]
+
+
 def test_an_owned_dispatch_joins_its_secrets_to_the_registered_ones_once(monkeypatch: pytest.MonkeyPatch) -> None:
     # The owned webhook is not among the registered ones (a client that cannot be registered): each record of the
     # dispatch needs both, joined once for the registry's state, not once per record.

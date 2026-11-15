@@ -825,6 +825,44 @@ async def test_a21_throttle_structured_quota_safe_abort_is_retried_once_as_an_en
     transport.assert_exhausted()
 
 
+class _LosingPortal(ScriptedTransport):
+    """Lose the answer to every v3 envelope, and answer each command sent alone with its item.
+
+    ``sent`` records each send: ``"envelope"``, or the id of the command sent alone.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(())
+        self.sent: list[object] = []
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        if request.array_body is not None:
+            self.sent.append("envelope")
+            raise TransportError("reset", phase=FailurePhase.DISPATCH_STARTED)
+        identifier = request.parameters["id"]
+        self.sent.append(identifier)
+        return WireResponse(200, JSON_HEADERS, json.dumps({"result": _item(int(str(identifier)))}).encode())
+
+
+@pytest.mark.asyncio
+async def test_a21_lineage_a_safe_envelope_is_retried_whole_once_then_its_commands_are_isolated() -> None:
+    """A SAFE envelope lost twice is sent whole once more, never again: the second loss isolates its commands.
+
+    The attempt budget would allow a third envelope; the one envelope retry is spent, not the budget.
+    """
+    requests = (_v3(1), _v3(2))
+    transport = _LosingPortal()
+
+    outcomes, report = await _run(transport, requests, policy=_policy(max_attempts_per_request=5))
+
+    assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+    assert transport.sent == ["envelope", "envelope", 1, 2]
+    assert report.physical_requests == FOUR
+    assert report.ambiguous_physical_attempts == TWO
+    assert report.batch_isolation_requests == TWO
+
+
 @pytest.mark.asyncio
 async def test_a21_throttle_v3_rate_limit_safe_abort_is_retried_once_as_an_envelope() -> None:
     """Issue 31: the REST 3.0 rate limit aborting a SAFE envelope is a transient code, retried as one envelope."""

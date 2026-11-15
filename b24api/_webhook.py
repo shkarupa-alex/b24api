@@ -128,6 +128,10 @@ class WebhookSecrets:
         """Name the number of tokens held, never one of them."""
         return f"<WebhookSecrets: {len(self)} hidden>"
 
+    def __bool__(self) -> bool:
+        """Report whether any token is held, without picking the webhooks it searches with."""
+        return bool(self._webhooks)
+
     def __len__(self) -> int:
         """Count the distinct tokens held."""
         return len(self._searched())
