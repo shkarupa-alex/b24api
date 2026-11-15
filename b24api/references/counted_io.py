@@ -343,9 +343,12 @@ class ReferenceTailStream:
         run = self._run
         try:
             dispatched = await task
-        except _BatchPageError as error:
-            self._take(slot)
-            return TailReceipt(slot.ordinal, None, error.failure, error.failure.command_index)
+        except Exception as error:
+            failure = _failed_page(error).failure
+            if failure is None:
+                raise
+            self._take(slot)  # the command's own failure is the page's outcome
+            return TailReceipt(slot.ordinal, None, failure, failure.command_index)
         self._take(slot)
         run.page_state += 1
         return TailReceipt(slot.ordinal, dispatched.response, None, dispatched.batch_index)

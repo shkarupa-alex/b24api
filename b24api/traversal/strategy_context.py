@@ -13,13 +13,13 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from b24api.completion.recorder import CompletionSink
+    from b24api.contracts.completion import CommandSettlement
     from b24api.contracts.json import FrozenJson, JsonValue
     from b24api.contracts.policy import ConfirmationPolicy
     from b24api.contracts.report import PageDispatch
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
     from b24api.contracts.response import Response
     from b24api.execution import ExecutionContext, Executor
-    from b24api.execution.facts import Execution
     from b24api.execution.snapshot import KernelReport
     from b24api.traversal.identity import PageFetch, _Page
     from b24api.traversal.page_adaptation import _SourcePageState
@@ -74,9 +74,9 @@ class StrategyContext(Protocol):
         ...
 
     def record_failed_page(
-        self, *, dispatch: PageDispatch, batch_index: int | None, error: BaseException, known: Execution
+        self, *, dispatch: PageDispatch, batch_index: int | None, error: BaseException, settled: CommandSettlement
     ) -> None:
-        """Record a dispatched page whose command failed, traced from what its command did (``known``)."""
+        """Record a dispatched page whose command failed, traced the way it settles (``settled``)."""
         ...
 
     def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:

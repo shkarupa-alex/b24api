@@ -59,11 +59,16 @@ done and whether it succeeded; its callers only read those two facts from what t
 facts (`facts.settlement`), a final batch outcome (`batch.outcome.settlement_of`), a command of a running chunk
 (`BatchProgress.settlement`) and a shared wave's dispatch task. `b24api.execution.facts` holds the one
 mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
-(`Execution.settlement`), and `b24api.traversal.page_failure` maps it to a failed page's trace: unknown
-only when it may have run, otherwise rejected. A page's trace and its settlement read the same fact, the
-page's own: for a page of a chunk that failed as a whole, its command's in the chunk's `BatchProgress`. Every failure the batch page dispatcher gives a page it sent carries those facts (`_FailedPage`: what it
-reports, what its command did, how it settles), and every caller reads a failed page through one function
-(`_failed_page`), which falls back to the facts recorded on any other failure. Classic and REST v3 batch, `call()`, direct and batch
+(`Execution.settlement`), and `b24api.traversal.page_failure` maps a failed page's settlement to its
+trace: unknown only when it may have run, otherwise rejected; a page whose own command succeeded is
+rejected as `transaction_aborted`, the code of a page dropped with the unit around it, not as a
+`command_failure`. A page's trace and its settlement read the same fact, the page's own: for a page of a
+chunk that failed as a whole, its command's in the chunk's `BatchProgress`. Every failure the batch page
+dispatcher gives a page it sent carries those facts (`_FailedPage`: what it reports, what its command did,
+how it settles, and the command's own failure when the batch answered or ended it), and every caller reads a
+failed page through one function (`_failed_page`), which falls back to the facts recorded on any other
+failure: the binding's failure, a page's settlement and trace, and a wave or a counted tail that takes a
+command's own failure as its outcome. Classic and REST v3 batch, `call()`, direct and batch
 fan-out, references and list traversal all use them, and none of them chooses from the exception type,
 which names the cause of a failure and never proves that a command did not run. A sent command is
 unknown unless a listed refusal proves it did not run or a conclusive answer settles it. A conclusive

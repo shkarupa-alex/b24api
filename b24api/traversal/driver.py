@@ -42,7 +42,7 @@ from b24api.errors import (
     ResultShapeError,
 )
 from b24api.execution import WorkClass
-from b24api.execution.facts import Execution, execution, settlement
+from b24api.execution.facts import execution, settlement
 from b24api.traversal.continuation import ContinuationStrategy
 from b24api.traversal.control_preflight import preflight_controls
 from b24api.traversal.counted_batch import CountedBatchStrategy, empty_source_head_eligible
@@ -305,7 +305,7 @@ class PaginationDriver:
             if execution(error).dispatched:
                 self.set_page_dispatch(dispatch=PageDispatch.DIRECT)
                 self.record_failed_page(
-                    dispatch=PageDispatch.DIRECT, batch_index=None, error=error, known=execution(error)
+                    dispatch=PageDispatch.DIRECT, batch_index=None, error=error, settled=settlement(error)
                 )
             raise
         return response
@@ -681,10 +681,10 @@ class PaginationDriver:
         dispatch: PageDispatch,
         batch_index: int | None,
         error: BaseException,
-        known: Execution,
+        settled: CommandSettlement,
     ) -> None:
-        """Record a dispatched page whose command failed: traced from what its command did, as it settles."""
-        outcome, code = failed_page(error, known)
+        """Record a dispatched page whose command failed: traced the way it settles, from what its command did."""
+        outcome, code = failed_page(error, settled)
         self._append_page_record(
             PageRecord(
                 sequence=0,

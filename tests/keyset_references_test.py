@@ -547,7 +547,8 @@ async def test_sequential_pages_of_a_chunk_whose_replay_fails_settle_and_trace_f
     # Two bindings' first pages share one chunk. The server answers one and refuses the other
     # (QUERY_LIMIT_EXCEEDED); the send that replays the refused one cannot be decoded, a failure that is not the
     # client's own, and the chunk fails as a whole. Each page settles and is traced from what its own command did:
-    # the answered one succeeded and is rejected with its chunk, the replayed one may have run.
+    # the answered one succeeded and is rejected with the chunk that failed around it (``transaction_aborted``: its
+    # own command did not fail), the replayed one may have run.
     events: list[object] = []
     emit = CompletionGate.emit
 
@@ -590,7 +591,7 @@ async def test_sequential_pages_of_a_chunk_whose_replay_fails_settle_and_trace_f
     )
     assert traced == sorted(
         [
-            (PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE),
+            (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED),
             (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION),
         ]
     )

@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.batch.outcome import BatchFailure, BatchSuccess, settlement_of
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import ReplayDisposition
@@ -19,7 +19,6 @@ from b24api.errors import (
     PageAdaptationError,
     PaginationError,
 )
-from b24api.execution.facts import execution
 from b24api.traversal.keyset_geometry import closure_witness
 from b24api.traversal.page_adaptation import PageTokens, adapt_page
 from b24api.traversal.page_failure import failed_page
@@ -115,7 +114,7 @@ def classify_rejection(outcome: BatchOutcome, receipt: ReceiptRejection) -> tupl
         return PageOutcome.REJECTED, PageRejectionCode.IDENTITY_CONTRACT
     if not isinstance(outcome, BatchFailure):
         return PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION
-    return failed_page(outcome.error, execution(outcome.error))
+    return failed_page(outcome.error, settlement_of(outcome))
 
 
 def validate_lane_receipt(  # noqa: PLR0913

@@ -482,14 +482,20 @@ class _AdmissionState:
 class _FailedPage:
     """What a page whose dispatch raised reports, what its command did, and how it settles.
 
-    ``replay_disposition`` is its command's, for a command the batch answered with a failure; ``None`` otherwise.
+    Every reader of a failed page reads it through ``_failed_page``: the binding's failure and its replay
+    disposition, the page's settlement and trace, and a command failure that a wave or a tail takes as an outcome.
     """
 
     error: BaseException
     execution: Execution
     settlement: CommandSettlement
-    batch_index: int | None = None
-    replay_disposition: ReplayDisposition | None = None
+    # The command's own final outcome, when the batch answered or ended it: a failure of that command alone.
+    failure: BatchFailure | None = None
+
+    @property
+    def batch_index(self) -> int | None:
+        """Return the command's index in its physical batch, known from its own outcome."""
+        return None if self.failure is None else self.failure.command_index
 
 
 class _SentPageError(Exception):
@@ -504,16 +510,11 @@ class _BatchPageError(_SentPageError):
     """A page whose command the batch answered, or ended, with its own failure (``failure``)."""
 
     def __init__(self, failure: BatchFailure) -> None:
-        self.failure = failure
         cause = failure.error
         super().__init__(
             "batch page command failed",
             _FailedPage(
-                cause if isinstance(cause, BaseException) else self,
-                execution(cause),
-                settlement_of(failure),
-                failure.command_index,
-                failure.replay_disposition,
+                cause if isinstance(cause, BaseException) else self, execution(cause), settlement_of(failure), failure
             ),
         )
 

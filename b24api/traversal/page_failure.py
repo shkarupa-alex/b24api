@@ -1,23 +1,27 @@
-"""The one mapping from a failed page's execution facts to its trace outcome and rejection code."""
+"""The one mapping from a failed page's settlement to its trace outcome and rejection code."""
 
 from __future__ import annotations
 
+from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageOutcome, PageRejectionCode
 from b24api.errors import ProtocolError
-from b24api.execution.facts import Execution
 
 
-def failed_page(error: object, known: Execution) -> tuple[PageOutcome, PageRejectionCode]:
+def failed_page(error: object, settled: CommandSettlement) -> tuple[PageOutcome, PageRejectionCode]:
     """Return how a page whose command failed is traced.
 
-    The outcome follows the command's execution facts, as its settlement does: unknown only when it may have run,
-    otherwise rejected. The code names why, from the failure that explains it: the physical batch envelope's own
-    protocol failure, or the command's.
+    The page is traced the way it settles (``settled``): unknown only when it may have run, otherwise rejected. The
+    code names why, from the failure that explains it: the physical batch envelope's own protocol failure, or the
+    command's; a page whose own command succeeded was dropped with the batch that failed around it, as a page of an
+    aborted keyset transaction is (``TRANSACTION_ABORTED``), not by a failure of its command.
     """
-    if known is Execution.POSSIBLY_RUN:
+    if settled is CommandSettlement.UNKNOWN:
         if _batch_envelope_failure(getattr(error, "__cause__", None)):
             return PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE
         return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION
+    if settled is CommandSettlement.SUCCESS:
+        # Its own command succeeded: the page is rejected with the physical batch that failed around it.
+        return PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED
     if _batch_envelope_failure(error):
         return PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE
     return PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE

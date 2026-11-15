@@ -16,7 +16,7 @@ from b24api.batch.outcome import settlement_of
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError
-from b24api.references.dispatch import _BatchPageError, _DecodeOptions, _failed_page
+from b24api.references.dispatch import _DecodeOptions, _failed_page
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -138,10 +138,11 @@ class SharedWaveEngine:
                     outcomes.append(outcome)
                     self._run.page_state += 1
                     continue
-            if isinstance(error, _BatchPageError):
-                outcomes.append(error.failure)
+            failed = _failed_page(error)
+            if failed.failure is not None:  # the command's own failure is its outcome
+                outcomes.append(failed.failure)
                 continue
-            failure = failure or _failed_page(error).error
+            failure = failure or failed.error
         if failure is not None:
             raise failure
         return tuple(outcomes)

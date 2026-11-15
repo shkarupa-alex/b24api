@@ -431,10 +431,10 @@ class ReferenceScheduler:
         except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
             # The binding fails with what its failed page reports, and its command's replay disposition, if any.
             failed = _failed_page(error)
-            failure = self._failure_event(run, failed.error)
-            if failed.replay_disposition is not None:
-                failure = replace(failure, replay_disposition=failed.replay_disposition)
-            await self.publish_terminal(run, failure)
+            event = self._failure_event(run, failed.error)
+            if failed.failure is not None:
+                event = replace(event, replay_disposition=failed.failure.replay_disposition)
+            await self.publish_terminal(run, event)
         finally:
             try:
                 if pages is not None:
@@ -658,10 +658,11 @@ class ReferenceScheduler:
             run.completion.settled(failed.settlement)
             await self.abandon_page(run)
             if failed.execution.dispatched:
-                dispatch = self.page_dispatch
-                run.driver.set_page_dispatch(dispatch=dispatch, batch_index=failed.batch_index)
                 run.driver.record_failed_page(
-                    dispatch=dispatch, batch_index=failed.batch_index, error=failed.error, known=failed.execution
+                    dispatch=self.page_dispatch,
+                    batch_index=failed.batch_index,
+                    error=failed.error,
+                    settled=failed.settlement,
                 )
             raise
         run.driver.set_page_dispatch(dispatch=dispatched.dispatch, batch_index=dispatched.batch_index)
