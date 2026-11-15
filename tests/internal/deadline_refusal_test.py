@@ -28,7 +28,7 @@ from b24api.batch.correlation import _Command
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure
 from b24api.errors import B24ApiError, BudgetExceededError
-from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse
+from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse, WorkClass
 from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
 from tests.scripting import DEADLINE_BUDGET, HANG_BOUND, ResponderTransport, always
 
@@ -510,6 +510,31 @@ async def test_a_send_with_no_time_left_before_its_permit_ends_the_operation() -
     assert transport.requests == []
     assert context.refusal == "execution time budget exhausted"
     await executor.coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_passing_while_a_send_waits_for_its_permit_ends_the_operation() -> None:
+    # The client's one permit is held elsewhere, and the operation's deadline passes while the send queues for it:
+    # the wait is refused by time, recorded, and nothing is sent.
+    clock = _Clock()
+    transport = ResponderTransport(always(WireResponse(200, _JSON, b'{"result":{}}')))
+    coordinator = RateCoordinator(max_concurrency=1, clock=clock)
+    executor = Executor(transport, coordinator=coordinator, clock=clock)
+    context = await _started(executor, POLICY)
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.list"}))
+    clock.now = POLICY.max_elapsed - DEADLINE_BUDGET
+
+    try:
+        async with asyncio.timeout(HANG_BOUND):
+            with pytest.raises(BudgetExceededError) as refused:
+                await executor.execute(_get(), context=context)
+    finally:
+        await held.release()
+
+    assert str(refused.value) == "permit wait exhausted execution time budget"
+    assert context.refusal == "permit wait exhausted execution time budget"
+    assert transport.requests == []
+    await coordinator.close()
 
 
 @pytest.mark.asyncio

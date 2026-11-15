@@ -12,6 +12,7 @@ import os
 import random
 from collections.abc import Mapping
 from time import gmtime, strftime, tzset
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -29,10 +30,13 @@ from b24api.errors import (
     ApiResponseError,
     BatchCommandError,
     BudgetExceededError,
+    ClientClosedError,
+    FailurePhase,
     HTTPGatewayError,
     InputSourceError,
+    TransportError,
 )
-from b24api.execution import Executor, RateCoordinator, WireResponse, WorkClass
+from b24api.execution import Executor, RateCoordinator, WireResponse, WorkClass, throttle
 from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
 from b24api.execution.facts import Execution, execution
 from b24api.references.fanout import kernel_fanout_stream
@@ -168,6 +172,19 @@ def east_of_utc() -> Iterator[None]:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("east_of_utc")
+@pytest.mark.parametrize(
+    ("local_offset", "cooldown"),
+    [
+        # The local clock runs half a minute ahead of the server's: the hint is measured against the server's Date.
+        (30.0, 10.0),
+        # The local clock runs an hour behind: the Date is measured against, and the hint is not an hour longer.
+        (-3_600.0, 10.0),
+        # The Date is an hour older than the local clock, a stale answer or a server clock set back: the local
+        # clock measures the hint, which is not an hour longer either.
+        (3_600.0, None),
+    ],
+    ids=["local-ahead", "local-behind", "date-stale"],
+)
 @pytest.mark.parametrize("date_form", sorted(_DATE_FORMS))
 @pytest.mark.parametrize(
     "hint",
@@ -177,7 +194,10 @@ def east_of_utc() -> Iterator[None]:
     ],
     ids=[*(f"retry-after-{name}" for name in _DATE_FORMS), "reset-epoch"],
 )
-async def test_a_dated_hint_is_measured_against_the_response_date(hint: tuple[str, str], date_form: str) -> None:
+async def test_a_dated_hint_is_measured_against_a_plausible_response_date(
+    monkeypatch: pytest.MonkeyPatch, hint: tuple[str, str], date_form: str, local_offset: float, cooldown: float | None
+) -> None:
+    monkeypatch.setattr(throttle, "time", SimpleNamespace(time=lambda: _SERVER_NOW + local_offset))
     time = _Time()
     date = ("date", _DATE_FORMS[date_form](_SERVER_NOW))
     transport = ResponderTransport(always(WireResponse(429, (date, hint), b"")))
@@ -190,9 +210,10 @@ async def test_a_dated_hint_is_measured_against_the_response_date(hint: tuple[st
     snapshot = await executor.coordinator.snapshot()
     await executor.coordinator.close()
 
-    # Ten seconds after the server's own Date, however far the local clock runs ahead of it, and whichever HTTP
-    # date form either header uses: a date without a zone is GMT, not local time.
-    assert snapshot.cooldown_until == 10.0  # noqa: PLR2004
+    # Ten seconds after the server's own Date unless that Date is more than a minute older than the local clock,
+    # whichever HTTP date form either header uses: a date without a zone is GMT, not local time. The stale Date's
+    # hint, ten seconds after it, has passed by the local clock, so nothing holds the host; it would have for an hour.
+    assert snapshot.cooldown_until == cooldown
 
 
 @pytest.mark.asyncio
@@ -1690,3 +1711,60 @@ async def test_a_replay_refused_while_time_is_left_fails_alone_and_the_stream_co
     assert errors == [refusal, ""]
     assert stream.report.state is KernelState.COMPLETED
     transport.assert_exhausted()
+
+
+_NO_DELAY = ExecutionPolicy(retry=RetryPolicy(initial_delay=0, maximum_delay=0, jitter=0))
+
+
+def _closing_after(executor: list[Executor], reply: WireResponse | TransportError) -> Callable[[Request], object]:
+    """Answer the first send with ``reply`` after closing the client's coordinator, so no later send gets a permit."""
+
+    async def respond(_request: Request) -> WireResponse | TransportError:
+        await executor[0].coordinator.close()
+        return reply
+
+    return respond
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("safety", [ReplaySafety.SAFE, ReplaySafety.UNSAFE])
+async def test_a_classic_replay_stopped_before_its_send_by_a_closed_client_keeps_the_lost_send_as_its_cause(
+    safety: ReplaySafety,
+) -> None:
+    # The first round's answer is lost, so its commands may have run; the SAFE replay is stopped at its permit by
+    # the closed client, which is not a budget: each command is unknown, explained by the lost send alone.
+    lost = TransportError("reset", phase=FailurePhase.DISPATCH_STARTED)
+    holder: list[Executor] = []
+    transport = ResponderTransport(_closing_after(holder, lost))
+    holder.append(_executor(transport, _Time()))
+    requests = (_request(safety, "crm.item.get"), _request(safety, "crm.item.list"))
+
+    outcomes = await BatchExecutor(holder[0]).execute_requests(requests, context=holder[0].context(_NO_DELAY))
+
+    assert len(transport.requests) == 1
+    for outcome in outcomes:
+        assert isinstance(outcome, BatchFailure)
+        assert type(outcome.error) is AmbiguousExecutionError
+        assert outcome.error.__cause__ is lost
+        assert execution(outcome.error) is Execution.POSSIBLY_RUN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("safety", [ReplaySafety.SAFE, ReplaySafety.UNSAFE])
+async def test_a_classic_replay_stopped_before_its_send_by_a_closed_client_after_a_refusal_ends_answered(
+    safety: ReplaySafety,
+) -> None:
+    # The first round is refused as a whole, proven not run, and its replay is stopped at its permit by the closed
+    # client: each command ends with that stop, recorded as sent and answered, never as a command never sent.
+    holder: list[Executor] = []
+    transport = ResponderTransport(_closing_after(holder, _refused()))
+    holder.append(_executor(transport, _Time()))
+    requests = (_request(safety, "crm.item.get"), _request(safety, "crm.item.list"))
+
+    outcomes = await BatchExecutor(holder[0]).execute_requests(requests, context=holder[0].context(_NO_DELAY))
+
+    assert len(transport.requests) == 1
+    for outcome in outcomes:
+        assert isinstance(outcome, BatchFailure)
+        assert type(outcome.error) is ClientClosedError
+        assert execution(outcome.error) is Execution.ANSWERED

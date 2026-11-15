@@ -209,10 +209,13 @@ the cost of first sends that a long queue leaves only a sliver of it, and a know
 it fails at once). Every send, retry wait and later permit wait then comes out of the window. There
 is no separate per-attempt timeout: each send may use what is left of the window. A retry waits the
 longer of its own exponential backoff and the server's hint (`Retry-After` or
-`X-Bitrix-RateLimit-Reset`, a date measured against the response's `Date`), so a hint of zero or a
-past date never cancels the backoff. A retry of an `UNSAFE` or `UNKNOWN` request is sent only while
-the window it would have left is at least as long as it waited (as planned, or longer when the wait
-overran). Otherwise the request ends with `BudgetExceededError`, whose cause is the refusal that
+`X-Bitrix-RateLimit-Reset`), so a hint of zero or a past date never cancels the backoff. A hint given
+as a date is measured against the response's `Date`, so a local clock running ahead cannot shorten it,
+unless that `Date` is more than a minute behind the local clock (a stale answer or a server clock set
+back), when the local clock measures it: a dated hint never waits more than a minute longer than the
+local clock says, and never more than an hour. A retry of an `UNSAFE` or `UNKNOWN` request is sent
+only while the window it would have left is at least as long as it waited (as planned, or longer when
+the wait overran). Otherwise the request ends with `BudgetExceededError`, whose cause is the refusal that
 proved the earlier send did not run, instead of a send whose wait took most of the window: under the
 default 30 s window, a `Retry-After` of 15 s or more ends such a request without a retry even when its
 first send took no time. `SAFE` requests are retried with whatever window is left, and so are the
@@ -906,8 +909,12 @@ carries that reason). A stop at a source pull or at the end-of-source check fail
 `batch()` and `batch_outcomes()` still send the commands they read into the window before it, which the
 budget refuses in turn (each a `CommandFailure` with `BudgetExceededError`), so `batch()` then raises
 `BatchFailed`. So it depends on where the budget stopped the stream, not on the operation: handle both,
-or read the report. Cleanup never ends a stream with the budget. A send cut in flight is another case:
-its command may have run, so it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end
+or read the report. A refusal of one request while time is left ends that request alone: a retry whose
+wait is longer than the time left, one whose own retry window closed first, a known pause that outlasts
+what it may wait, or a spent `max_attempts_per_request`. The request or command fails with
+`BudgetExceededError`, nothing is recorded, and a tolerant stream goes on: with no other failure it ends
+`completed_with_failures`, with no `budget_exhausted`. Cleanup never ends a stream with the budget. A
+send cut in flight is another case: its command may have run, so it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end
 on that ambiguity instead.
 
 Cleanup runs once the operation has ended, often because `max_elapsed` ran out, so it is not cut at

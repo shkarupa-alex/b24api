@@ -15,6 +15,14 @@
   attempt left, its retry window closed, or a wait longer than the window left) sends nothing, records
   nothing, and leaves each command unknown, explained by the envelope's failure, as before. An envelope
   retry the budget refused is no longer followed by an isolation, which the same budget would refuse.
+- **A stale `Date` no longer stretches a dated throttle hint.** A `Retry-After` given as an HTTP date,
+  or an `X-Bitrix-RateLimit-Reset` given as a date or an epoch, was measured against the response's
+  `Date` whatever that `Date` said, so an answer whose `Date` was an hour old (from a cache or a relay,
+  or a server clock set back) held every request to the portal for the hour cap. The `Date` is now used
+  only when it is at most a minute behind the local clock; otherwise the local clock measures the hint,
+  as it does without a `Date`. A local clock running ahead of the server by less than a minute still
+  cannot shorten a hint; one further ahead now can, which costs at worst an early retry that the server
+  throttles again. A delta in seconds is unchanged, and every hint is still capped at an hour.
 
 ## The end of `max_elapsed` is not a cleanup failure
 
@@ -34,7 +42,9 @@
   exceed elapsed budget"), so a tolerant stream completed with failures. When the operation's deadline
   has passed, it is now refused as every other work is ("execution time budget exhausted before the
   retry", recorded), and the stream raises `BudgetExceededError`. A retry whose delay is merely longer
-  than the time left is still refused alone, as is one whose own retry window closed first.
+  than the time left is still refused alone, as is one whose own retry window closed first: that request
+  fails with `BudgetExceededError`, nothing is recorded, and a tolerant stream goes on and completes with
+  failures (`completed_with_failures`, with no `budget_exhausted`).
 - **Which window refused a request is in the message.** A request refused because its own retry window
   (`max_retry_elapsed_per_request`) closed before the operation's deadline fails with
   "per-request retry time budget exhausted", wherever it was refused (its permit wait, its dispatch,
@@ -419,7 +429,7 @@ Public signatures are unchanged; when a retry waits and when it is sent have cha
   its exponential backoff and the hint, and the same holds for a method paused by
   `OPERATION_TIME_LIMIT`. A hint given as a date or an epoch is measured against the response's
   `Date` header when it has one, not the local clock, so a local clock running ahead no longer
-  shortens it.
+  shortens it (unless that `Date` is more than a minute behind the local clock: see "The retry path").
 - **Breaking: a call may now wait up to `max_elapsed` for its first permit.** The retry window
   `max_retry_elapsed_per_request` (`Settings.http_timeout`, 30 s by default, for the client's default
   policy) used to start before the request queued for a permit of the client's shared limiter. A
