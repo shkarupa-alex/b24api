@@ -120,6 +120,7 @@ class MappedOperationStream[S, T]:
         self._keyset_selection = keyset_selection
         self._source_violations = source_violations
         self._deregister = deregister
+        # The report this stream built, which the runner publishes (an interrupt's shape on it, ``with_interrupt``).
         self._report: OperationReport | None = None
         self._early_closed = False
         self._cleanup: tuple[TerminalCause, CleanupAttempt] | None = None
@@ -138,6 +139,7 @@ class MappedOperationStream[S, T]:
                 propagate=self._propagate,
                 cleanup_budget=self._cleanup_window,
                 delivered=self._delivered,
+                interrupted=with_interrupt,
             ),
             works_between_reads=source.works_between_reads,
         )
@@ -145,7 +147,7 @@ class MappedOperationStream[S, T]:
     @property
     def report(self) -> OperationReport | None:
         """Return the same frozen terminal report after cleanup."""
-        return self._report
+        return self._runner.report
 
     @property
     def inside_own_work(self) -> bool:
@@ -201,11 +203,7 @@ class MappedOperationStream[S, T]:
 
     def _finalize(self, cause: TerminalCause, _reason: str | None, attempt: CleanupAttempt) -> OperationReport:
         self._cleanup = (cause, attempt)
-        report = self._ended_report(cause)
-        if (interrupt := self._runner.interrupt) is not None:
-            # Whatever ended the stream, an interrupt is what leaves: one shape (``with_interrupt``).
-            report = self._report = with_interrupt(report, interrupt)
-        return report
+        return self._ended_report(cause)
 
     def _ended_report(self, cause: TerminalCause) -> OperationReport:
         error = self._runner.primary_error
@@ -246,8 +244,6 @@ class MappedOperationStream[S, T]:
         )
         cleanup = CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS
         self._report = self._gate().publish_failure(facts, cleanup)
-        if (interrupt := self._runner.interrupt) is not None:
-            self._report = with_interrupt(self._report, interrupt)
         self._terminated()
         return self._report
 

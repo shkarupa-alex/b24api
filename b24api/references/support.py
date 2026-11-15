@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, qualified_closure
 from b24api.contracts.completion import BindingClosure
 from b24api.contracts.dispatch import PORTAL_PAGE_ROWS
-from b24api.execution.context import Settled
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     DispatchPlan,
@@ -24,6 +23,7 @@ if TYPE_CHECKING:
     from b24api.completion.reference_recorder import ReferenceCompletionRecorder
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.report import PageRecord
+    from b24api.execution.context import Settled
     from b24api.references.dispatch import _DoneEvent, _Event
     from b24api.traversal.driver import PaginationDriver
 
@@ -100,10 +100,10 @@ async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[S
 
 
 async def _wait_for_cleanup_tasks(
-    tasks: tuple[asyncio.Task[Any], ...],
+    tasks: tuple[asyncio.Task[Settled[Any]], ...],
     *,
     remaining: float,
-) -> tuple[set[asyncio.Task[Any]], list[BaseException]]:
+) -> tuple[set[asyncio.Task[Settled[Any]]], list[BaseException]]:
     active = set(tasks)
     if not active:
         return set(), []
@@ -115,14 +115,9 @@ async def _wait_for_cleanup_tasks(
     return pending, errors
 
 
-def _failure(task: asyncio.Task[object]) -> BaseException | None:
-    """Return what a finished task failed with: its exception, or the failure it returned (``Settled``)."""
-    if task.cancelled():
-        return None
-    if (error := task.exception()) is not None:
-        return error
-    result = task.result()
-    return result.error if isinstance(result, Settled) else None
+def _failure(task: asyncio.Task[Settled[Any]]) -> BaseException | None:
+    """Return the failure a finished task returned (``Settled``): a ``spawn_settled`` task ends in none."""
+    return None if task.cancelled() else task.result().error
 
 
 def _consume_task_result(task: asyncio.Task[object]) -> None:

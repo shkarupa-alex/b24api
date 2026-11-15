@@ -7,6 +7,7 @@ import inspect
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Protocol, TypeGuard, cast
 from uuid import uuid4
 
@@ -461,63 +462,74 @@ def is_interrupt(error: BaseException | None) -> bool:
     return error is not None and not isinstance(error, Exception | asyncio.CancelledError | GeneratorExit)
 
 
+class LatchState(Enum):
+    """Where an operation's ``InterruptLatch`` stands: running, ending, or ended."""
+
+    # The operation runs: the first interrupt latched wakes its owner, which ends the operation at once.
+    ARMED = "armed"
+    # The operation is cleaning up: an interrupt latched now is raised at its end, waking nothing (its cleanup runs
+    # then, an inline kernel's in the very read a wake would cancel).
+    ENDING = "ending"
+    # The operation ended and its interrupt is out, raised or handed on: any other one goes to the event loop.
+    CLOSED = "closed"
+
+
 class InterruptLatch:
     """The first interrupt (``is_interrupt``) an operation saw, wherever its own code caught it.
 
     Library code that first catches a ``BaseException`` in an operation's work latches it (``latch_interrupt``) and
     goes on as with any failure: turns it into a binding's end, a page's failure or a task's ``Settled`` result. The
-    operation raises the latched interrupt as its end, ahead of anything else, once its report is published, so no
-    route an interrupt takes (an event, a future, a task's result) can drop it. Once the operation has ended
-    (``close``), nobody would raise it: the latch hands an interrupt caught then to the event loop, which raises it
-    out of ``asyncio.run`` as it does any task's, once, while its catchers go on as with any failure.
+    operation's end takes the latched interrupt (``close``), ahead of anything else, once its report is published, so
+    no route an interrupt takes (an event, a future, a task's result) can drop it. Once the operation has ended,
+    nobody would raise another: the latch hands one caught then to the event loop (``hand_on``), which raises it out
+    of ``asyncio.run`` as it does any task's, once, while its catchers go on as with any failure.
     """
 
-    __slots__ = ("_closed", "_passed", "_wake", "first")
+    __slots__ = ("_handed", "_wake", "first", "state")
 
     def __init__(self, wake: Callable[[], None] | None = None) -> None:
         """Hold no interrupt yet; ``wake`` ends the operation at once when one is latched while it runs."""
         self.first: BaseException | None = None
+        self.state = LatchState.ARMED
         self._wake = wake
-        # Whether the operation has ended: it raised its interrupt, or will never raise one.
-        self._closed = False
-        # The interrupts caught after the operation ended, each handed to the event loop once.
-        self._passed: list[BaseException] = []
+        # The interrupts handed to the event loop, each once however many catch it.
+        self._handed: list[BaseException] = []
 
     def end(self) -> None:
-        """The operation is ending: an interrupt latched from now on is raised at its end, waking nothing.
-
-        Its cleanup runs then, an inline kernel's in the very read ``wake`` would cancel.
-        """
-        self._wake = None
+        """The operation is ending: an interrupt latched from now on is raised at its end, waking nothing."""
+        if self.state is LatchState.ARMED:
+            self.state = LatchState.ENDING
 
     def close(self) -> BaseException | None:
-        """The operation raises what it ends with: return its interrupt, if any; none is latched from now on.
+        """The operation ended: return its interrupt, if any, for its end to raise or hand on; none is latched now.
 
-        The latch outlives the operation in the context of any task its work started, so it lets go of ``wake``.
+        The latch outlives the operation in the context of any task its work started, so it lets go of its owner.
         """
-        self._closed = True
+        self.state = LatchState.CLOSED
         self._wake = None
-        if self.first is not None and self.first not in self._passed:
-            # Raised by the operation itself: whoever catches it later does not hand it to the loop again.
-            self._passed.append(self.first)
         return self.first
 
     def record(self, error: BaseException | None) -> None:
         """Latch ``error`` when it is the operation's first interrupt; anything else is not this latch's.
 
-        After the operation ended, the interrupt goes to the event loop instead, once however many catch it.
+        After the operation ended, an interrupt other than its own goes to the event loop instead.
         """
         if error is None or not is_interrupt(error):
             return
-        if self._closed:
-            if error not in self._passed:
-                self._passed.append(error)
-                asyncio.get_running_loop().call_soon(_raise, error)
+        if self.state is LatchState.CLOSED:
+            if error is not self.first:
+                self.hand_on(error)
             return
         if self.first is None:
             self.first = error
-            if self._wake is not None:
+            if self.state is LatchState.ARMED and self._wake is not None:
                 self._wake()
+
+    def hand_on(self, error: BaseException) -> None:
+        """Hand ``error`` to the event loop, which raises it out of ``asyncio.run``: no reader of the operation will."""
+        if error not in self._handed:
+            self._handed.append(error)
+            asyncio.get_running_loop().call_soon(_raise, error)
 
 
 def _raise(error: BaseException) -> None:
