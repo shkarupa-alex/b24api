@@ -104,18 +104,20 @@ class _V3Resolution:
             elements = _complete_array(attempt.response, len(pending))
             if elements is not None:
                 return await self._attributed(pending, elements, attempt.response), False
-            malformed = ProtocolError(
+            # An answer that attributes nothing leaves the envelope possibly run, as a lost answer does.
+            error: B24ApiError = ProtocolError(
                 "REST v3 batch result is not a complete array of command responses",
                 evidence=attempt.response.evidence,
             )
-            return await self._unresolved(pending, malformed, safe=safe), True
-        error = attempt.error
-        if not isinstance(error, B24ApiError):
-            raise TypeError("physical batch attempt failed without a typed error")
-        if not attempt.dispatch_started:
-            return self._stop(pending, error, followed=followed), False
-        if attempt.transport_proves_not_accepted or _unstructured_refusal(error, self.context):
-            return await self._not_run(pending, error, safe=safe), True
+        else:
+            failure = attempt.error
+            if not isinstance(failure, B24ApiError):
+                raise TypeError("physical batch attempt failed without a typed error")
+            if not attempt.dispatch_started:
+                return self._stop(pending, failure, followed=followed), False
+            if attempt.transport_proves_not_accepted or _unstructured_refusal(failure, self.context):
+                return await self._not_run(pending, failure, safe=safe), True
+            error = failure
         return await self._unresolved(pending, error, safe=safe), True
 
     async def _attributed(

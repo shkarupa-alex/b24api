@@ -39,6 +39,7 @@ from b24api.errors import (
     FailurePhase,
     HTTPGatewayError,
     InputSourceError,
+    ProtocolError,
     TransportError,
 )
 from b24api.execution import Executor, RateCoordinator, WireResponse, WorkClass, throttle
@@ -1847,6 +1848,9 @@ def _lost() -> TransportError:
 _V3_ABORT = WireResponse(
     400, _JSON, json.dumps({"error": {"code": "SYNTHETIC_NOT_FOUND", "message": "not found"}}).encode()
 )
+# A v3 envelope of two commands answered with one element: it attributes nothing, the envelope may have run, and
+# its commands are isolated, as no retry of the whole envelope can make it attribute them.
+_SHORT_ARRAY = WireResponse(200, _JSON, json.dumps({"result": [{"item": {"id": 0}}]}).encode())
 # The portal too busy to take the request, which proves a lone request or a classic envelope not run.
 _BUSY = WireResponse(
     503, _JSON, json.dumps({"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow down"}).encode()
@@ -1863,6 +1867,8 @@ def _stopped_replies(dialect: str, first: str) -> tuple[WireResponse | Transport
         return (_answered_by_each_command(dialect),)
     if first == "aborted":
         return (_V3_ABORT,)
+    if first == "short":
+        return (_SHORT_ARRAY,)
     # Lost twice: the second loss, of the one envelope retry, isolates the commands.
     return (_lost(), _lost()) if dialect == "v3-isolation" else (_lost(),)
 
@@ -1906,6 +1912,7 @@ async def _stopped_errors(
     ("dialect", "first"),
     [
         *((dialect, first) for dialect in ("classic", "v3") for first in ("refused", "busy", "lost", "answered")),
+        ("v3", "short"),
         ("v3-isolation", "aborted"),
         ("v3-isolation", "lost"),
         *(("lone", first) for first in ("refused", "busy", "lost")),
@@ -1927,7 +1934,10 @@ async def test_a_replay_stopped_before_its_send_by_a_closed_client_ends_with_the
     errors, budget = await _stopped_errors(dialect, transport)
 
     assert transport.sends == len(replies)
-    assert transport.refused == (0 if closing == "coordinator" else 2 if dialect == "v3-isolation" else 1)
+    # The commands an unresolved envelope leaves are sent alone after it, never in it again, when nothing retries
+    # it whole: after its one retry was lost too, or after an answer that attributes nothing (a short array).
+    isolated = dialect == "v3-isolation" or first == "short"
+    assert transport.refused == (0 if closing == "coordinator" else 2 if isolated else 1)
     assert budget.counters.physical_requests == len(replies)
     assert budget.batch_isolation_requests == 0
     for error in errors:
@@ -1959,6 +1969,10 @@ async def test_a_replay_stopped_before_its_send_by_a_closed_client_ends_with_the
             # A v3 envelope's own error does not prove its commands not run.
             assert isinstance(followed, ApiResponseError)
             assert followed.original_code == ("SYNTHETIC_NOT_FOUND" if first == "aborted" else "QUERY_LIMIT_EXCEEDED")
+        elif first == "short":
+            # An answer that attributes nothing: the envelope may have run.
+            assert isinstance(followed, ProtocolError)
+            assert followed.http_status == 200  # noqa: PLR2004
         else:
             assert followed is replies[-1]
         assert execution(error) is Execution.POSSIBLY_RUN

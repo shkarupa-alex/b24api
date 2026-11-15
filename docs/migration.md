@@ -140,6 +140,8 @@
   recording nothing. A cleanup step bounds its wait with `ExecutionContext.cleanup_window()` instead.
 - **`ExecutionContext.reserve_attempt()` no longer takes `retry_started`.** It reserves the request
   and attempt budgets only; the time check is the send's own, made just before it with `time_left()`.
+  The new `ExecutionContext.release_attempt()` gives back an attempt reserved for a send its transport
+  then refused because it is closed: that send is no physical request. Call it only for such a send.
 - **A synchronous source is never closed during its pull.** When the operation ended while a pull of
   a synchronous source still ran in its worker thread, its close could start before the pull ended
   (for example once the loop, shutting down, cancelled the tasks left) and failed in the background
