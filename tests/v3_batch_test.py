@@ -51,7 +51,7 @@ from b24api.transport import HttpxTransport, TransportCapabilities, WireRequest,
 from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, drain_to_failure
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
 
     from b24api.contracts import CommandOutcome, OperationStream
     from b24api.execution.rate import DeadlineBudget, _Permit
@@ -1545,7 +1545,7 @@ async def test_a21_isolation_refused_at_the_operation_deadline_is_recorded_and_e
         _ends_with_the_refusal_caused_by_the_abort(errors[identifier], str(ended))
 
 
-_TRANSIENT_ENVELOPE_FAILURES = {
+_TRANSIENT_ENVELOPE_FAILURES: dict[str, Callable[[], WireResponse | TransportError]] = {
     # An answer with an ambiguous status: the envelope may have run.
     "502": lambda: WireResponse(502, (), b"bad gateway"),
     # A lost answer.
@@ -1638,4 +1638,5 @@ async def test_a21_lineage_an_envelope_retry_the_budget_refused_is_not_followed_
             assert followed is envelope_failure
         else:
             assert isinstance(followed, B24ApiError)
+            assert isinstance(envelope_failure, WireResponse)
             assert followed.http_status == envelope_failure.status_code
