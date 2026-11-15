@@ -14,6 +14,7 @@ selection, geometry and cost must match it.
 from __future__ import annotations
 import asyncio
 import dataclasses
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
@@ -52,13 +53,14 @@ from b24api.contracts import (
 from b24api.contracts.page_stop import ContinuePage
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError, CapabilityError, IdentityContractError
-from b24api.execution import ExecutionContext
+from b24api.execution import ExecutionContext, Executor
 from b24api.references import wave_engine
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _RowBuffer
+from b24api.transport import WireResponse
 from b24api.traversal.keyset_fast_plan import fit_wave
 from b24api.traversal.keyset_runtime import KeysetRuntime
-from tests.scripting import BatchPortal, client_for
+from tests.scripting import BatchPortal, ResponderTransport, client_for
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -791,3 +793,77 @@ async def test_a_keyset_binding_finish_the_request_budget_refuses_ends_with_the_
     assert report is not None
     assert (report.state, report.terminal_reason) == (TerminalState.INCOMPLETE, "BudgetExceededError")
     assert {item.code for item in report.violations} == {"budget_exhausted", "reference_failure"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spent_at", [4, 6, 7, 10, 11, 13, 16, 19, 25, 32])
+async def test_keyset_bindings_the_deadline_ends_record_no_failed_command(
+    monkeypatch: pytest.MonkeyPatch, spent_at: int
+) -> None:
+    # The deadline passes while the spent_at-th request is answered. Another binding's admission or page reservation
+    # is refused first, and every keyset command refused after it names other work (its permit, its dispatch): each
+    # is the same operation's end, so none is a failed command.
+    skew = [0.0]
+
+    def context(executor: Executor, policy: ExecutionPolicy | None = None) -> ExecutionContext:
+        return ExecutionContext(
+            policy or ExecutionPolicy(), executor.coordinator, clock=lambda: time.monotonic() + skew[0]
+        )
+
+    monkeypatch.setattr(Executor, "context", context)
+    data = {f"p{index}": DISTRIBUTIONS["sparse"] for index in range(3)}
+    answer = _answer(data)
+
+    def spending(method: str, query: Query) -> Envelope:
+        if len(portal.waves) == spent_at and not skew[0]:
+            skew[0] = 10_000.0
+        return answer(method, query)
+
+    portal = BatchPortal(spending)
+    async with client_for(portal, policy=ExecutionPolicy(max_elapsed=600.0)) as client:
+        stream = client.iter_reference_outcomes(
+            _base(), [_parent(name) for name in data], traversal=_traversal(_range()), dispatch=BatchDispatch()
+        )
+        with pytest.raises(BudgetExceededError, match="exceeded operation time budget"):
+            async with stream:
+                _ = [outcome async for outcome in stream]
+
+    report = stream.report
+    assert report is not None
+    assert (report.state, report.terminal_reason) == (TerminalState.INCOMPLETE, "BudgetExceededError")
+    assert {item.code for item in report.violations} == {"budget_exhausted", "reference_failure"}
+
+
+@pytest.mark.asyncio
+async def test_a_keyset_command_its_own_budget_stops_fails_also_once_the_operation_is_refused() -> None:
+    # The first wave is answered 429 only after the next binding's batch went and the third one's send was refused
+    # by the request budget, which ends the operation. The wave's commands, with no attempt left for a retry, are
+    # stopped by their own attempt budget: that refuses them alone, so they fail as commands, not as the end.
+    data = {f"p{index}": DISTRIBUTIONS["dense"] for index in range(3)}
+    portal = BatchPortal(_answer(data))
+
+    async def respond(request: Request) -> WireResponse:
+        if not transport.requests[1:]:
+            for _turn in range(20):
+                await asyncio.sleep(0)
+            return WireResponse(429, (("content-type", "text/plain"),), b"slow down")
+        return await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 20)
+
+    transport = ResponderTransport(respond)
+    policy = ExecutionPolicy(max_requests=2, max_attempts_per_request=1)
+    async with client_for(transport, policy=policy) as client:
+        stream = client.iter_reference_outcomes(
+            _base(),
+            [_parent(name) for name in data],
+            traversal=_traversal(_range()),
+            dispatch=BatchDispatch(batch_size=2, concurrency=2),
+        )
+        with pytest.raises(BudgetExceededError, match="physical request budget exhausted"):
+            async with stream:
+                _ = [outcome async for outcome in stream]
+
+    report = stream.report
+    assert report is not None
+    failures = [item for item in report.violations if item.code == "command_failure"]
+    assert failures
+    assert report.terminal_reason == "BudgetExceededError"

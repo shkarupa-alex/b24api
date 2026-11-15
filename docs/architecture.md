@@ -193,6 +193,13 @@ outcome.
   through `asyncio`, every `BudgetExceededError` constructed), which a site written otherwise passes. The refusals of one request while time is left, for a
   coordinator hold or a retry delay its window cannot carry, or a send that may not be repeated left
   less window than its wait, record nothing. `ExecutionContext.refusal` keeps the first recorded refusal's message.
+  Whether an error is the operation's refusal, which ends it, is told by identity, not by its text or its type:
+  the context marks every error it raises as such (`operation_refusal`, from `_refuse`, `admit_request`,
+  `raise_if_refused` and the source pull; a replay round's stopped commands carry the mark of the refusal
+  that stopped them, `stopped_by`), and `ExecutionContext.ended_by` is the one check, used by the
+  reference scheduler's source pull, the batch window's pull, the counted tail and the fast keyset
+  commands. Every later work the budget refuses names its own work but is that same end; a request's own
+  refusal or a dropped result is not marked and fails its work alone.
   `AsyncIteratorController.get`, the one source pull of the batch streams, refuses further input once
   a send was refused or the deadline has passed, so the operation ends with `BudgetExceededError`; the
   commands a batch window read before such a pull are sent as any window is, the budget refusing each,

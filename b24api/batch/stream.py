@@ -26,7 +26,6 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.request import Request
-from b24api.errors import BudgetExceededError
 from b24api.execution import (
     AsyncIteratorController,
     ExecutionContext,
@@ -303,7 +302,7 @@ async def _next_chunk(
 ) -> _Chunk:
     """Read up to ``size`` commands; a source failure or a budget refusal after the first ends the chunk.
 
-    A pull the operation's budget refused (``ExecutionContext.refusal``) is no source failure: it is carried as the
+    A pull the operation's budget refused (``ExecutionContext.ended_by``) is no source failure: it is carried as the
     chunk's ``refusal``, and the commands read before it are sent as any chunk is, the budget refusing each send.
     """
     commands: list[_Command] = []
@@ -315,7 +314,7 @@ async def _next_chunk(
         except Exception as error:
             if not commands:
                 raise
-            if isinstance(error, BudgetExceededError) and context.refusal is not None:
+            if context.ended_by(error):
                 return _Chunk(tuple(commands), refusal=error)
             return _Chunk(tuple(commands), error)
         index = start_index + offset

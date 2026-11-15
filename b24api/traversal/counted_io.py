@@ -16,7 +16,7 @@ from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.batch.stream import _BatchOutcomeStream
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
-from b24api.errors import B24ApiError, BudgetExceededError, CapabilityError, IncompleteTraversalError
+from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
 from b24api.execution.facts import execution
 
 if TYPE_CHECKING:
@@ -200,7 +200,7 @@ class _FlatTailStream:
     def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
         del receipt
         error = outcome.error
-        if isinstance(error, BudgetExceededError) and self._context.refusal is not None:
+        if self._context.ended_by(error):
             # The operation's budget refused the page's send and ends the operation: its end, not a failed page.
             return error
         if isinstance(error, B24ApiError):

@@ -5,7 +5,7 @@ import asyncio
 import contextlib
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeGuard
 
 from b24api.contracts.policy import BudgetCounters, ExecutionPolicy
 from b24api.errors import BudgetExceededError, CleanupOverrunError
@@ -22,6 +22,8 @@ REQUEST_BUDGET_EXHAUSTED = "physical request budget exhausted"
 # A request's own retry window closed before the operation's deadline: that request alone is refused, whatever the
 # work it was refused (``ExecutionContext.time_left``), and the operation goes on.
 RETRY_WINDOW_EXHAUSTED = "per-request retry time budget exhausted"
+# Where an error carries the mark of the context whose refusal it is (``ExecutionContext.ended_by``).
+_ENDS_OPERATION = "_b24api_ends_operation"
 
 # The least time a cleanup step may wait for what it closes: a caller source's close, or the workers and tasks the
 # operation cancelled. Cleanup runs when the operation ends, which is often because ``max_elapsed`` ran out, so the
@@ -29,6 +31,19 @@ RETRY_WINDOW_EXHAUSTED = "per-request retry time budget exhausted"
 # worker-thread hop. The grace lets such a close finish, so the budget's end is never reported as a cleanup failure,
 # while a close that really blocks overruns the budget by at most this much per step.
 CLEANUP_GRACE_SECONDS = 0.1
+
+
+def stopped_by(refusal: BudgetExceededError | str) -> BudgetExceededError:
+    """Return the failure of a command a budget refusal kept from being sent again: the operation's end iff it was.
+
+    A replay round stops each command with its own error, caused by its own last failure; it carries the mark of
+    the refusal it restates (``ExecutionContext.ended_by``), and none for a request's own refusal (a message).
+    """
+    error = BudgetExceededError(str(refusal))
+    mark = getattr(refusal, _ENDS_OPERATION, None)
+    if mark is not None:
+        error.__dict__[_ENDS_OPERATION] = mark
+    return error
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +112,8 @@ class ExecutionContext:
         # The first refusal of work by the request budget or the operation's deadline (a send, a page, an admission
         # or a pull), which ends the operation: neither budget comes back, so no later work can be admitted either.
         self._refusal: str | None = None
+        # Marks the errors this context raises as that refusal, so a refusal is told by identity, not by its text.
+        self._refusal_mark = object()
         self._logical_pages = 0
         self._buffered_rows = 0
         self._buffered_rows_high_water = 0
@@ -185,7 +202,26 @@ class ExecutionContext:
     def raise_if_refused(self) -> None:
         """Raise the operation's recorded refusal (``refusal``) again, if there is one."""
         if self._refusal is not None:
-            raise BudgetExceededError(self._refusal)
+            raise self.operation_refusal(self._refusal)
+
+    def operation_refusal(self, message: str) -> BudgetExceededError:
+        """Return an error that ends the operation with its refusal (``ended_by``); only a refusal site builds one.
+
+        Every work the budget refuses once it has refused work is refused as the operation's end, whatever its
+        message names (the permit, a page's rows, an admission, the source pull): the message names the work, the
+        mark says whose end it is.
+        """
+        error = BudgetExceededError(message)
+        error.__dict__[_ENDS_OPERATION] = self._refusal_mark
+        return error
+
+    def ended_by(self, error: object) -> TypeGuard[BudgetExceededError]:
+        """Return whether ``error`` is this operation's refusal, which ends it: one this context made as such.
+
+        Any other budget error, such as a request's own retry window closing or a result the row budget dropped,
+        fails its work alone, also once the operation has recorded a refusal.
+        """
+        return isinstance(error, BudgetExceededError) and getattr(error, _ENDS_OPERATION, None) is self._refusal_mark
 
     def _refuse(self, refusal: str, retry_started: float | None) -> BudgetExceededError:
         start = self._start
@@ -196,7 +232,7 @@ class ExecutionContext:
         ):
             return BudgetExceededError(RETRY_WINDOW_EXHAUSTED)
         self._record_refusal(refusal)
-        return BudgetExceededError(refusal)
+        return self.operation_refusal(refusal)
 
     def _record_refusal(self, message: str) -> None:
         if self._refusal is None:
@@ -211,7 +247,7 @@ class ExecutionContext:
         if self._physical_requests >= self.policy.max_requests:
             self._requests_refused = True
             self._record_refusal(REQUEST_BUDGET_EXHAUSTED)
-            raise BudgetExceededError(REQUEST_BUDGET_EXHAUSTED)
+            raise self.operation_refusal(REQUEST_BUDGET_EXHAUSTED)
 
     async def start(self) -> None:
         """Start the operation clock exactly once when execution first begins."""
@@ -444,7 +480,7 @@ class AsyncIteratorController[T]:
             raise RuntimeError("source cleanup has already started")
         if context.requests_refused:
             # No item pulled now could be sent: the operation ends with its request budget, as with its time budget.
-            raise BudgetExceededError(REQUEST_BUDGET_EXHAUSTED)
+            raise context.operation_refusal(REQUEST_BUDGET_EXHAUSTED)
         pull: asyncio.Task[T] | None = None
         try:
             async with context.deadline(self._input_error):

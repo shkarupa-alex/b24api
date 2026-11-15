@@ -338,7 +338,7 @@ class ReferenceScheduler:
                     await self._end_source(admission)
                     return
                 except BaseException as error:
-                    if isinstance(error, BudgetExceededError) and self.context.refusal is not None:
+                    if self.context.ended_by(error):
                         await self._end_source(admission)
                         return
                     self._clear_pending_pull()
