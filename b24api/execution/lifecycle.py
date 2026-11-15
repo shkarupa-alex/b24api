@@ -185,6 +185,8 @@ class _Read:
 
 # The isolated read whose task runs the current code. A kernel runner reads inline in its outer runner's read, so
 # a cancellation that the outer runner's close delivers ends the kernel by that close, not by a caller's cancel.
+# Only such an inline runner consults it: an isolated runner's own close is its CLOSING phase, and a stream of the
+# caller's that code run by the read reads (a transport, say, in a task the read started) is not this read's.
 _CURRENT_READ: ContextVar[_Read | None] = ContextVar("b24api_current_read", default=None)
 
 
@@ -337,7 +339,7 @@ class OperationRunner[T, R]:
                 TerminalCause.EXHAUSTED
                 if isinstance(error, StopAsyncIteration)
                 else TerminalCause.EARLY_CLOSED
-                if _closed_by_owner(error)
+                if not self._isolated and _closed_by_owner(error)
                 else TerminalCause.CANCELLED
                 if isinstance(error, asyncio.CancelledError)
                 else TerminalCause.FAILED

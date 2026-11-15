@@ -356,6 +356,40 @@ async def test_a_stream_read_out_and_cancelled_in_its_close_reports_the_cancella
     assert report.terminal_reason == "iteration cancelled"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_a_callers_own_stream_read_under_a_closed_read_is_cancelled_not_early_closed(family: str) -> None:
+    # The transport the outer stream's read runs reads a stream of the caller's own, in a task the read started.
+    # Closing the outer stream cancels that task, and so that inner read: the inner stream was cancelled, not
+    # closed early by a close of its own, though it ran under the outer read the close ended.
+    inner_started = asyncio.Event()
+
+    async def inner_blocks(_request: Request) -> object:
+        inner_started.set()
+        return await asyncio.Event().wait()
+
+    async with client_for(ResponderTransport(inner_blocks), policy=POLICIES["returns"]) as inner_client:
+        inner = _stream(inner_client, "fan_out_outcomes", _items("fan_out_outcomes"))
+
+        async def outer_reads_inner(request: Request) -> object:
+            await anext(inner)
+            return _answer(request)
+
+        async with client_for(ResponderTransport(outer_reads_inner), policy=POLICIES["returns"]) as client:
+            outer = _stream(client, family, _Source(family, "returns"))
+            read = asyncio.create_task(anext(outer))
+            await reached(inner_started)
+            assert await _settled(outer.aclose()) is None
+            assert isinstance(await _settled(read), asyncio.CancelledError)
+
+        assert outer.report is not None
+        assert outer.report.state is TerminalState.EARLY_CLOSED
+        inner_report = inner.report
+        assert inner_report is not None
+        assert inner_report.state is TerminalState.CANCELLED
+        assert inner_report.terminal_reason == "iteration cancelled"
+
+
 class _Blocks:
     """Answer the first ``answered`` sends; block each later one until released.
 
