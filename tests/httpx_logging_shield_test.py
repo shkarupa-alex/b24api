@@ -874,14 +874,13 @@ def _webhook(token: str) -> Webhook:
     return Webhook(WebhookAddress("https", "portal.invalid", None, "1"), token)
 
 
-@pytest.mark.parametrize("webhook", [None, _webhook("")], ids=["none", "empty"])
-def test_a_dispatch_without_a_credential_does_not_leave_the_filter_in_flight(webhook: Webhook | None) -> None:
+def test_a_dispatch_without_a_credential_does_not_leave_the_filter_in_flight() -> None:
     logger = logging.getLogger("httpx")
     HTTPX_LOG_SHIELD.register_transport()
     try:
         with (
             pytest.raises(ValueError, match="webhook credential of the owned request"),
-            HTTPX_LOG_SHIELD.request(webhook=webhook),  # type: ignore[arg-type]
+            HTTPX_LOG_SHIELD.request(webhook=_webhook("")),
         ):
             pass
         assert HTTPX_LOG_SHIELD._in_flight == 0  # noqa: SLF001 - in-flight accounting control

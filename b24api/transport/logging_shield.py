@@ -101,7 +101,7 @@ class LogOwnership:
 
     def __init__(self, webhook: Webhook) -> None:
         """Bind the webhook the owned request is sent with."""
-        self._credentials = WebhookSecrets((webhook,) if isinstance(webhook, Webhook) else ())
+        self._credentials = WebhookSecrets((webhook,))
         if not self._credentials:
             raise ValueError("HTTPX log shield requires the webhook credential of the owned request")
         self._request: weakref.ref[httpx.Request] | None = None

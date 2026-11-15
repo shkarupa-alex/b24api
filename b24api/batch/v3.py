@@ -33,7 +33,6 @@ from b24api.errors import (
     HTTPGatewayError,
     ProtocolError,
 )
-from b24api.execution import WorkClass
 from b24api.execution.executor import (
     _is_retryable,
     _proves_not_run,
@@ -70,6 +69,8 @@ class _V3Resolution:
     settled: dict[int, BatchOutcome] = field(default_factory=dict)
     # The outcome each command last received, kept when a later round is stopped before it is sent.
     last: dict[int, BatchOutcome] = field(default_factory=dict)
+    # The lineage of the command sent alone right now (``_isolate_one``): the group's and that command's own sends.
+    alone: _RequestAttempts | None = None
 
     async def run(self, commands: tuple[_Command, ...]) -> tuple[BatchOutcome, ...]:
         """Send the group's envelopes until every command has its one settled outcome."""
@@ -78,14 +79,21 @@ class _V3Resolution:
         # Whether the pending commands are sent again after a failure of their whole envelope, not after their own
         # elements answered them.
         followed = False
-        while pending:
-            attempt = await self.executor._execute_physical_batch_attempt(  # noqa: SLF001 - batch-owned physical port
-                _envelope(pending),
-                context=self.context,
-                attempts=self.attempts,
-                methods=frozenset(command.request.method for command in pending),
-            )
-            pending, followed = await self._classify(pending, attempt, safe=safe, followed=followed)
+        try:
+            while pending:
+                attempt = await self.executor._execute_physical_batch_attempt(  # noqa: SLF001 - batch-owned port
+                    _envelope(pending),
+                    context=self.context,
+                    attempts=self.attempts,
+                    methods=frozenset(command.request.method for command in pending),
+                )
+                pending, followed = await self._classify(pending, attempt, safe=safe, followed=followed)
+        except BaseException as error:
+            # What ends the group instead of an outcome (a cancellation, in flight or in a wait) carries what its
+            # sends left open, as a request's does (``Executor.execute``): its envelopes', and the isolated sends'
+            # of the command sent alone when it ended; before any send, nothing.
+            (self.alone or self.attempts).record_open(error)
+            raise
         return tuple(self.settled[command.index] for command in commands)
 
     async def _classify(
@@ -98,7 +106,7 @@ class _V3Resolution:
     ) -> tuple[tuple[_Command, ...], bool]:
         """Classify one physical attempt; return the commands sent again, and whether an envelope failure sent them."""
         if attempt.kind == "cancelled":
-            # Cancellation after dispatch: nothing is replayed and nothing is guessed; it propagates.
+            # Cancellation after dispatch: nothing is replayed and nothing is guessed; it propagates (``run``).
             raise attempt.error if isinstance(attempt.error, BaseException) else asyncio.CancelledError
         if attempt.kind == "response" and attempt.response is not None:
             elements = _complete_array(attempt.response, len(pending))
@@ -290,24 +298,22 @@ class _V3Resolution:
             self.last[command.index] = await self._isolate_one(command)
 
     async def _isolate_one(self, command: _Command) -> BatchOutcome:
-        # A per-command snapshot of the group lineage: started, used and possible-execution flags carry over.
-        lineage = dataclasses.replace(self.attempts)
+        # A per-command snapshot of the group lineage: started, used and possible-execution flags carry over. The
+        # executor records how the command ended from it, its own send's answer or the envelope's when the isolated
+        # send never left; and admits the send as a retry, since the lineage has sent already.
+        lineage = self.alone = dataclasses.replace(self.attempts)
         spent = lineage.used
         try:
-            response = await self.executor.execute(
-                command.request,
-                context=self.context,
-                work_class=WorkClass.RETRY,
-                _attempts=lineage,
-            )
+            response = await self.executor.execute(command.request, context=self.context, _attempts=lineage)
         except B24ApiError as error:
-            if lineage.used == spent:
-                # The executor records facts for its own sends; the envelope already sent this command.
-                lineage.record_open(error)
-            return _isolated_failure(command, error)
+            outcome = _isolated_failure(command, error)
+        else:
+            outcome = _command_success(command, response, BatchCommandEvidence(command.index, command.stable_key))
         finally:
             self.context.record_batch_isolation_requests(lineage.used - spent)
-        return _command_success(command, response, BatchCommandEvidence(command.index, command.stable_key))
+        # Resolved: what ends the group now is explained by the group's sends again. Anything else ends it (``run``).
+        self.alone = None
+        return outcome
 
 
 def _isolated_failure(command: _Command, error: B24ApiError) -> BatchOutcome:

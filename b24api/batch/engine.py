@@ -161,12 +161,14 @@ class _Lineup:
     which the budget that stops it reports as its cause, as a lone request's would be. Each waiting command
     keeps the lineage of the sends it was in: a SAFE command the last plan left for a later round is
     ``carried``, misses that round, and is planned again with the next round's commands, so what a round's
-    send left open is added only to the commands that were in it.
+    send left open is added only to the commands that were in it. ``sent`` is what every round sent so far left
+    open, whichever commands it carried: what ends the envelope instead of an outcome (a cancellation) carries it.
     """
 
     settled: dict[int, BatchOutcome] = field(default_factory=dict)
     waiting: dict[int, _Waiting] = field(default_factory=dict)
     carried: tuple[_Command, ...] = ()
+    sent: _Lineage = field(default_factory=_Lineage)
 
     def after_round(self, sent: _Round, commands: tuple[_Command, ...]) -> tuple[_Command, ...]:
         """Record what a round gave its commands; return those that may run again, carried ones included.
@@ -176,6 +178,7 @@ class _Lineup:
         stops a round before its send, the budget's or any other (a closed client), stops each command it holds
         as ``_stop`` does, whichever command's failure asked for that round.
         """
+        self.sent = self.sent.after(sent.send)
         again = {command.index for command in sent.replay}
         for command, outcome in zip(commands, sent.outcomes, strict=True):
             before = self.waiting.pop(command.index, None)
@@ -367,12 +370,22 @@ class BatchExecutor:
         attempts = _RequestAttempts(caller_retries=True)
         lineup = _Lineup()
         pending = eligible
-        while pending:
-            sent = await self._dispatch_round(pending, context=context, options=options, attempts=attempts)
-            # Only the commands that may run again are sent again, in a smaller physical batch; the rest keep
-            # the outcome this round gave them.
-            candidates = lineup.after_round(sent, pending)
-            pending = await self._next_round(candidates, lineup, context=context, attempts=attempts, options=options)
+        try:
+            while pending:
+                sent = await self._dispatch_round(pending, context=context, options=options, attempts=attempts)
+                # Only the commands that may run again are sent again, in a smaller physical batch; the rest keep
+                # the outcome this round gave them. ``attempts`` covers the next round from here on.
+                candidates = lineup.after_round(sent, pending)
+                attempts.start_round()
+                pending = await self._next_round(
+                    candidates, lineup, context=context, attempts=attempts, options=options
+                )
+        except BaseException as error:
+            # What ends the envelope instead of an outcome (a cancellation, in flight or in a wait) carries what its
+            # rounds left open, the one in flight included, as a request's does (``Executor.execute``); before any
+            # send, nothing.
+            lineup.sent.after(attempts.lineage).record_open(error)
+            raise
         return tuple(lineup.settled.values())
 
     async def _next_round(
@@ -432,7 +445,6 @@ class BatchExecutor:
         """
         request = _batch_request(commands, halt=options.halt)
         spent = attempts.used
-        attempts.start_round()
         # A failure of the executor carries the facts it recorded about this round's send; one of the engine's own
         # is recorded here. What each command's earlier sends left open is its own (``_Lineup``).
         failure: B24ApiError | None = None

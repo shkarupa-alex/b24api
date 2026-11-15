@@ -189,12 +189,14 @@ class _Lineage:
         )
 
     def record_open(self, error: BaseException) -> None:
-        """Record on a failure what these sends left open, as their answers were classified.
+        """Record on a failure what these sends left open, as their answers were classified; with none, nothing.
 
         The failure adds nothing to them: it stopped a further send before it left, cut the latest one before its
-        answer (a cancellation), or is the failure the latest send's classification already holds.
+        answer (a cancellation), or is the failure the latest send's classification already holds. A failure
+        before any send keeps no facts: it was never sent, and no recorder can say otherwise.
         """
-        record_dispatch(error, possibly_executed=self.left_open() is not None, unproven=self.unproven)
+        if self.latest is not _Settled.NOTHING_SENT:
+            record_dispatch(error, possibly_executed=self.left_open() is not None, unproven=self.unproven)
 
     def withhold(self, error: BaseException) -> None:
         """Record a command the server halted before: proven not run by the latest send, but not by earlier ones."""
@@ -399,7 +401,7 @@ class _RequestAttempts:
         self.lineage.record(error, policy)
 
     def record_open(self, error: BaseException) -> None:
-        """Record on a failure what the sends so far left open, as their answers were classified."""
+        """Record on a failure what the sends so far left open, as their answers were classified; with none, nothing."""
         self.lineage.record_open(error)
 
     def withhold(self, error: BaseException) -> None:
@@ -508,7 +510,6 @@ class Executor:
             raise TypeError("strict_json_members must be a boolean")
         context = context or self.context(policy)
         attempts = _attempts or _RequestAttempts()
-        spent = attempts.used
         try:
             wire, parsed = await self._execute_wire_attempts(
                 request,
@@ -519,10 +520,10 @@ class Executor:
                 shared=attempts,
             )
         except BaseException as error:
-            if attempts.used > spent:
-                # Each send's failure was classified where it ended; a failure that ends the request after them adds
-                # nothing (a stop before a further send, or a cancellation): what they left open is the lineage's.
-                attempts.record_open(error)
+            # Each send's failure was classified where it ended; a failure that ends the request after them adds
+            # nothing (a stop before a further send, or a cancellation): what they left open is the lineage's, the
+            # sends of an envelope an isolated command was in included. Before any send it keeps no facts.
+            attempts.record_open(error)
             raise
         try:
             response = _decode_success(wire, parsed, request_summary=request.summary)
@@ -563,8 +564,7 @@ class Executor:
                 shared=attempts,
             )
         except BaseException as error:
-            if attempts.used:
-                attempts.record_open(error)
+            attempts.record_open(error)
             raise
         content_type = wire.content_type
         digest = hashlib.sha256(wire.body).hexdigest() if context.policy.binary_digest else None

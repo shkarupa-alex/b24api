@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from b24api import BatchDispatch, BatchFailed, ExecutionPolicy, ReplaySafety, Request, RetryPolicy, RouteKind
+from b24api import BatchDispatch, BatchFailed, Bitrix24, ExecutionPolicy, ReplaySafety, Request, RetryPolicy, RouteKind
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts import (
@@ -20,6 +20,7 @@ from b24api.contracts import (
     CommandFailure,
     CommandNotExecuted,
     CommandOutcomeUnknown,
+    CommandSettlement,
     CommandSuccess,
     NotExecutedReason,
     ResultErrorSpec,
@@ -35,6 +36,7 @@ from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
+    ClientClosedError,
     FailurePhase,
     HTTPGatewayError,
     ProtocolError,
@@ -43,6 +45,7 @@ from b24api.errors import (
 )
 from b24api.execution import Executor, RateCoordinator, WorkClass
 from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
+from b24api.execution.facts import execution
 from b24api.references.dispatch import _KernelFanOutSuccess
 from b24api.references.fanout import kernel_fanout_stream
 from b24api.references.outcome import KernelReferenceFailure
@@ -1683,3 +1686,91 @@ async def test_a21_isolation_an_isolated_send_cancelled_in_flight_is_counted() -
     assert report is not None
     assert report.physical_requests == TWO
     assert report.batch_isolation_requests == 1
+
+
+async def _first_envelope_stopped(stop: str, how: str) -> tuple[list[CommandOutcome[int]], OperationReport]:
+    """Run two SAFE REST v3 commands whose first envelope ``stop`` stops before it leaves, through ``how``."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={"result": []})))
+    transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
+    coordinator = RateCoordinator()
+    executor = Executor(transport, coordinator=coordinator)
+    policy = _policy()
+    if stop == "closed client":
+        await client.aclose()  # the user closed the HTTPX client it injected
+    elif stop == "closed coordinator":
+        await coordinator.close()
+    else:
+        # A hold that outlasts the operation's budget refuses the first permit at once.
+        await coordinator.observe_throttle(600.0, reason="test hold")
+        policy = _policy(max_elapsed=5.0)
+    api = Bitrix24._from_executor(executor)  # noqa: SLF001 - caller-owned executor seam, to close its coordinator
+    commands = [Command(_v3(identifier), identifier) for identifier in range(TWO)]
+    stream = (
+        api.fan_out_outcomes(commands, dispatch=BatchDispatch(concurrency=1), policy=policy)
+        if how == "batch fan-out"
+        else api.batch_outcomes(commands, policy=policy)
+    )
+    try:
+        async with stream:
+            outcomes = [outcome async for outcome in stream]
+    finally:
+        await api.aclose()
+        await coordinator.close()
+        await transport.aclose()
+        await client.aclose()
+    report = stream.report
+    assert report is not None
+    return outcomes, report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop", "error_type"),
+    [
+        ("closed client", ClientClosedError),
+        ("closed coordinator", ClientClosedError),
+        ("budget at the first permit", BudgetExceededError),
+    ],
+)
+@pytest.mark.parametrize("how", ["batch fan-out", "logical batch"])
+async def test_a_first_envelope_stopped_before_its_send_ends_its_commands_never_sent(
+    stop: str, error_type: type[B24ApiError], how: str
+) -> None:
+    # Nothing left: no request counts, no page was sent, and each command ends with the stop, settled not executed.
+    outcomes, report = await _first_envelope_stopped(stop, how)
+
+    assert [type(outcome) for outcome in outcomes] == [CommandFailure, CommandFailure]
+    for outcome in outcomes:
+        assert isinstance(outcome, CommandFailure)
+        assert isinstance(outcome.error, error_type)
+        assert execution(outcome.error).settlement is CommandSettlement.NOT_EXECUTED
+    assert report.physical_requests == 0
+    assert report.page_trace == ()
+
+
+@pytest.mark.asyncio
+async def test_a21_isolation_an_isolated_answer_that_cannot_be_decoded_explains_its_own_unknown_outcome() -> None:
+    # The envelope aborts and each command is sent alone; its own 200 answer cannot be decoded, so it may have run:
+    # the ambiguity names that answer, the latest send that may have run, not the envelope's abort.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/batch"):
+            return httpx.Response(BAD_REQUEST, json=_abort("SYNTHETIC_NOT_FOUND"), request=request)
+        return httpx.Response(200, content=b'{"result": NaN}', headers=dict(JSON_HEADERS), request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
+    try:
+        outcomes, report = await _run(transport, [_v3(identifier) for identifier in range(TWO)])
+    finally:
+        await transport.aclose()
+        await client.aclose()
+
+    assert report.batch_isolation_requests == TWO
+    for outcome in outcomes:
+        assert isinstance(outcome, CommandOutcomeUnknown)
+        ambiguity = outcome.error
+        assert isinstance(ambiguity, AmbiguousExecutionError)
+        assert ambiguity.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+        assert ambiguity.evidence is not None
+        assert ambiguity.evidence.http_status == 200  # noqa: PLR2004
+        assert isinstance(ambiguity.__cause__, ProtocolError)
