@@ -135,18 +135,23 @@ outcome.
   a command still carried when the last attempt is spent ends as the attempt budget stops it), and
   still sends the others when the window or a held method stops some, unless it is fail-fast, which is
   sent whole or not at all. A hold that appears during the wait is met at the permit and stops the whole round
-  when it outlasts the window. A stop before a replay round's send, by the budget or by any other
-  failure (a closed client), ends each command that followed its envelope's failure with that stop,
-  caused by the failure it followed, in both dialects (`_stopped_after`); a command its own entry or
-  element answered keeps that answer, whatever stops its replay. The REST 3.0 isolation of an unresolved `SAFE` envelope is
+  when it outlasts the window. A stop before a send that follows a failure, by the budget or by any
+  other failure (a closed client), is chained to the failure of the latest send in one place, where the
+  executor stops it (`_RequestAttempts.chain_stop`, at the permit and at the admission), for a lone
+  request's retry, a REST 3.0 envelope retry or isolated send and a classic round alike. A batch command
+  that followed its envelope's failure ends with that stop; a classic round may carry a command past a
+  round, so its engine gives each command a copy of the stop caused by the failure that command
+  followed. A command its own entry or element answered keeps that answer, whatever stops its replay.
+  The REST 3.0 isolation of an unresolved `SAFE` envelope is
   a replay round of its group like its one envelope retry: planned whole by `plan_replay` and waited out
   by `replay_after` (the longer of the backoff and the coordinator's hold, within the attempt budget,
   the retry window and the deadline), then its commands are sent one at a time, inside the dispatch
   slot the envelope held, so a `BatchDispatch` never has more requests in flight than its concurrency.
   Each isolated send is an ordinary request on its command's copy of the lineage, which the executor
-  admits at its permit and paces through its own retries. A replay refused while time is left, by the
-  attempts, the window or a wait it cannot carry, sends nothing more and leaves each command its
-  envelope's failure. An envelope's first send is admitted under all its methods, so for a user's
+  admits at its permit and paces through its own retries. A replay its plan refuses, by the deadline
+  (recorded) or while time is left by the attempts, the window or a wait it cannot carry, sends nothing
+  more and ends each command with that refusal caused by the envelope's failure, in both dialects, as a
+  lone request's refused retry ends. An envelope's first send is admitted under all its methods, so for a user's
   logical batch (`batch()`, `batch_outcomes()`) `Executor.plan_first_send` weighs its commands with
   the same `_Pause.admits` and `_plan_round`, with no backoff, by how much longer each command's own
   method is held than the host, against the window its send opens or what the operation has left after
@@ -289,8 +294,9 @@ an internal JSON-array envelope that the transport must advertise; one physical-
 decides, before any retry, whether an envelope failure proves non-execution, attributes per-command
 results, or leaves the envelope unresolved for bounded `SAFE` isolation. Isolation, a planned replay of
 the envelope's group, sends each `SAFE` command alone, one at a time, and returns its success; a failure stays unknown, because the envelope may have run the
-command, and is explained by that envelope like any other earlier send that may have run, also when
-the budget leaves no isolated send.
+command, and is explained by that envelope like any other earlier send that may have run. When the
+budget leaves no isolated send, the command ends unknown with that refusal, caused by the envelope's
+failure.
 
 Traversal contracts separately declare progression (`server next`, observed width, or fixed step),
 completion (empty confirmation or caller-qualified exact total), collection shape, and identity.

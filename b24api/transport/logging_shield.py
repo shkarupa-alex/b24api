@@ -101,9 +101,9 @@ class LogOwnership:
 
     def __init__(self, webhook: Webhook) -> None:
         """Bind the webhook the owned request is sent with."""
-        if not isinstance(webhook, Webhook) or not webhook.token:
+        self._credentials = WebhookSecrets((webhook,) if isinstance(webhook, Webhook) else ())
+        if not self._credentials:
             raise ValueError("HTTPX log shield requires the webhook credential of the owned request")
-        self._credentials = WebhookSecrets((webhook,))
         self._request: weakref.ref[httpx.Request] | None = None
 
     @property
@@ -184,6 +184,7 @@ class _OwnedRequestFilter(logging.Filter):
                 rewrite_record(record, lambda value: redact_registered_value(value, registered), protected=False)
             return True
         root = _emitting_root()
+        # Built once per registry state: the registered carrier is replaced only when a registration changes.
         credentials = owner.credentials | registered
         if root is _UNATTRIBUTED or owner.owns(root):
             rewrite_record(record, lambda value: redact_owned_value(value, credentials), protected=True)
@@ -225,10 +226,11 @@ class HttpxLogShield:
         self._transports = 0
         self._in_flight = 0
         self._clients: weakref.WeakKeyDictionary[_Client, _ClientRegistration] = weakref.WeakKeyDictionary()
-        # How many open clients registered each webhook, and the secrets of them all; a ``Webhook`` and the
-        # carrier keep its token out of every rendering.
+        # How many open clients registered each webhook, and the secrets of them all, built on the first read after
+        # a change (``None`` until then), so a registration costs O(1); a ``Webhook`` and the carrier keep its token
+        # out of every rendering.
         self._webhooks: dict[Webhook, int] = {}
-        self._registered = WebhookSecrets()
+        self._registered: WebhookSecrets | None = WebhookSecrets()
 
     def register_transport(self, *, webhook: Webhook | None = None, client: _Client | None = None) -> bool:
         """Install both filters while a transport can issue requests, before it creates or uses a client.
@@ -260,10 +262,10 @@ class HttpxLogShield:
                     registration.finalizer = weakref.finalize(client, self._forget, registration)
             except TypeError:
                 return False
-            if webhook is not None and webhook.token and webhook not in registration.webhooks:
+            if webhook is not None and webhook not in registration.webhooks:
                 registration.webhooks.add(webhook)
                 self._webhooks[webhook] = self._webhooks.get(webhook, 0) + 1
-                self._registered = WebhookSecrets(self._webhooks)
+                self._registered = None
             self._ensure_installed()
             return True
 
@@ -301,6 +303,9 @@ class HttpxLogShield:
         with self._lock:
             # Pruning touches only the registries, never a logger's filter list, so it is safe while logging.
             self._prune_closed()
+            if self._registered is None:
+                # A set of the webhooks; the carrier compiles its matcher on first use, outside this lock.
+                self._registered = WebhookSecrets(self._webhooks)
             return self._registered
 
     def suppresses_hpack(self) -> bool:
@@ -340,7 +345,7 @@ class HttpxLogShield:
                     del self._webhooks[webhook]
             if registration.webhooks:
                 registration.webhooks.clear()
-                self._registered = WebhookSecrets(self._webhooks)
+                self._registered = None
 
     def _prune_closed(self) -> None:
         for client, registration in list(self._clients.items()):

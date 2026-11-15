@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import copy
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
@@ -14,7 +15,6 @@ from b24api.batch.correlation import (
     _command_failure,
     _command_success,
     _shared_failure,
-    _stopped_after,
     _withheld,
 )
 from b24api.batch.outcome import (
@@ -207,11 +207,19 @@ class _Lineup:
             self._stop(command, self.waiting.pop(command.index), refusal)
 
     def _stop(self, command: _Command, waiting: _Waiting, stop: B24ApiError) -> None:
-        """End a command ``stop`` keeps from being sent again (``_stopped_after``): its entry's answer, or the stop."""
+        """End a command ``stop`` keeps from being sent again: with its entry's answer, or with the stop.
+
+        The stop is what ended a command that followed its round's failure, so it is the outcome, caused by the
+        failure that command followed, possibly run only when a send it was in may have run. The executor chains a
+        stop to the batch's latest failure, but a command carried past a round followed an earlier one, so each
+        command gets its own copy of the stop, with the stop's traceback and its own cause.
+        """
         if isinstance(waiting.state, _Answered):
             self._settle(waiting.state.outcome, waiting.lineage)
             return
-        error = _stopped_after(stop, waiting.state.failure, waiting.lineage)
+        error = copy.copy(stop).with_traceback(stop.__traceback__)
+        error.__cause__ = waiting.state.failure
+        waiting.lineage.record_unsent(error)
         self._settle(_shared_failure(command, error), waiting.lineage)
 
     def _settle(self, outcome: BatchOutcome, lineage: _Lineage) -> None:

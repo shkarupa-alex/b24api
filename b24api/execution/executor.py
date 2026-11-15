@@ -318,7 +318,7 @@ class _RequestAttempts:
     started: float | None = None
     used: int = 0
     lineage: _Lineage = _Lineage()
-    # The latest failure a send ended with: the one a budget that stops the retry it asked for reports.
+    # The latest failure a send ended with: the cause of whatever stops the next send before it leaves (``chain_stop``).
     retry_cause: B24ApiError | None = None
     # Whoever decides each send after a failure: the executor retries within one ``execute`` call, unless the
     # classic batch engine that shares these attempts decides every replay round itself and sends once per call.
@@ -363,11 +363,19 @@ class _RequestAttempts:
         self.used += 1
         self.pause = None
 
+    def chain_stop(self, error: B24ApiError) -> None:
+        """Chain a failure that stopped a send before it left to the failure of the latest send, if one failed.
+
+        The one rule for every stop before a send, by the budget or otherwise (a closed client), whichever single
+        request, batch round or isolated send it stops: what ended the send is the outcome, and what it followed is
+        its cause.
+        """
+        if self.retry_cause is not None:
+            error.__cause__ = self.retry_cause
+
     def settle(self, error: B24ApiError, policy: ExecutionPolicy) -> None:
-        """Record how the last send failed; a budget that stops a retry reports the failure that asked for it."""
+        """Record how the last send failed; a budget stop before the send was chained where it stopped it."""
         if isinstance(error, BudgetExceededError):
-            if error.__cause__ is None:
-                error.__cause__ = self.retry_cause
             return
         settled = _proves_not_run(error, policy) or answered_conclusively(error, policy)
         self.classified(error, may_have_run=not settled)
@@ -581,11 +589,7 @@ class Executor:
             )
             try:
                 async with permit:
-                    retry_started = shared.open_window(self._clock)
-                    remaining = context.time_left(_DISPATCH_REFUSAL, retry_started=retry_started)
-                    shared.admit(remaining, request.replay_safety, now=self._clock())
-                    await context.reserve_attempt(attempts_for_request=attempts)
-                    shared.dispatched()
+                    remaining = await self._start_send(context, shared, request.replay_safety, spent=attempts)
                     wire = await self._send_attempt(request, wire_request, context=context, remaining=remaining)
             except asyncio.CancelledError:
                 raise
@@ -625,7 +629,9 @@ class Executor:
 
         A spent request budget, and a hold the coordinator already has on ``methods`` (a host throttle hint or a
         method cooldown) that outlasts the budget, fail at once instead of queueing for nothing or waiting the budget
-        out. Each failure reports the failure of the request's latest send, whichever call or replay round made it.
+        out. Every failure here stops a send before it leaves, by the budget or otherwise (a closed client): after
+        a failed send, it is caused by the failure of the request's latest send, whichever call or replay round
+        made it, which is the one place that rule is applied for single requests, batch rounds and isolated sends.
         """
         try:
             remaining = _permit_window(context, attempts, methods)
@@ -633,10 +639,28 @@ class Executor:
                 return await context.coordinator.acquire(
                     work_class, methods=methods, budget=DeadlineBudget(self._clock() + remaining)
                 )
-        except BudgetExceededError as error:
-            if attempts.retry_cause is None:
-                raise
-            raise error from attempts.retry_cause
+        except B24ApiError as error:
+            attempts.chain_stop(error)
+            raise
+
+    async def _start_send(
+        self, context: ExecutionContext, attempts: _RequestAttempts, safety: ReplaySafety, *, spent: int
+    ) -> float:
+        """Admit and count the send a permit was granted for, and return the window left for it.
+
+        Refused here, by the deadline, the retry window or the attempt budget, the send never leaves: the refusal
+        is chained to the failure it followed, as at the permit.
+        """
+        try:
+            retry_started = attempts.open_window(self._clock)
+            remaining = context.time_left(_DISPATCH_REFUSAL, retry_started=retry_started)
+            attempts.admit(remaining, safety, now=self._clock())
+            await context.reserve_attempt(attempts_for_request=spent)
+        except B24ApiError as error:
+            attempts.chain_stop(error)
+            raise
+        attempts.dispatched()
+        return remaining
 
     async def _send_attempt(
         self,
@@ -719,11 +743,7 @@ class Executor:
             context, attempts, work_class=WorkClass.BATCH if spent == 0 else WorkClass.RETRY, methods=methods
         )
         async with permit:
-            retry_started = attempts.open_window(self._clock)
-            remaining = context.time_left(_DISPATCH_REFUSAL, retry_started=retry_started)
-            attempts.admit(remaining, envelope.replay_safety, now=self._clock())
-            await context.reserve_attempt(attempts_for_request=spent)
-            attempts.dispatched()
+            remaining = await self._start_send(context, attempts, envelope.replay_safety, spent=spent)
             try:
                 async with asyncio.timeout(remaining):
                     return await send_wire_envelope(

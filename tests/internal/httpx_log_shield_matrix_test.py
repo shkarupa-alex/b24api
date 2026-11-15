@@ -11,6 +11,7 @@ import importlib
 import io
 import logging
 import pkgutil
+import re
 import sys
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
@@ -20,15 +21,16 @@ import hpack
 import httpx
 import pytest
 
-from b24api._webhook import Webhook, WebhookAddress
+from b24api import _webhook
+from b24api._webhook import Webhook, WebhookAddress, WebhookSecrets
 from b24api.contracts import Request, RouteKind
 from b24api.errors import CapabilityError
-from b24api.transport import HttpxTransport
+from b24api.transport import HttpxTransport, logging_shield
 from b24api.transport.logging_shield import HPACK_LOGGER_NAMES, HTTPX_LOG_SHIELD
 from tests.h2c_server import H2cServer
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
 
 _OWNED = "synthetic-owned-h2-secret-424242"
 _OWNED_WEBHOOK = Webhook(WebhookAddress("https", "portal.invalid", None, "1"), _OWNED)
@@ -38,6 +40,7 @@ _PROBE_MARKER = "synthetic-probe-secret-000000"
 _OK = 200
 _MOVED = 301
 _SEQUENTIAL_CLIENTS = 12
+_BOUND_CLIENTS = 200
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 _FORMATTER = logging.Formatter("%(name)s %(message)s")
 
@@ -518,3 +521,99 @@ async def test_registered_secret_stays_scrubbed_while_the_injected_client_outliv
     for name in HPACK_LOGGER_NAMES:
         assert HTTPX_LOG_SHIELD._hpack_filter not in logging.getLogger(name).filters  # noqa: SLF001
     _assert_shield_idle()
+
+
+_ADDRESS = WebhookAddress("https", "portal.invalid", None, "1")
+
+
+@contextmanager
+def _registered(*tokens: str) -> Iterator[None]:
+    """Keep one open client registered with each webhook token, then release them all."""
+    clients = [httpx.Client() for _ in tokens]
+    for client, token in zip(clients, tokens, strict=True):
+        HTTPX_LOG_SHIELD.register_transport(webhook=Webhook(_ADDRESS, token), client=client)
+    try:
+        yield
+    finally:
+        for client in clients:
+            HTTPX_LOG_SHIELD.release_transport()
+            client.close()
+
+
+def _messages(handler: _Capture) -> list[str]:
+    return [record.getMessage() for record in handler.named("httpx")]
+
+
+def test_a_registered_token_another_registered_token_starts_is_scrubbed_whole() -> None:
+    _assert_shield_idle()
+    with _registered("prefixtok", "prefixtokTAILSECRET"), _capture() as handler:
+        logging.getLogger("httpx").info("foreign record %s", "https://other.invalid/prefixtokTAILSECRET/profile")
+    assert _messages(handler) == ["foreign record https://other.invalid/[REDACTED]/profile"]
+
+
+def test_overlapping_registered_tokens_leave_no_part_of_either() -> None:
+    _assert_shield_idle()
+    with _registered("abcd", "cdef"), _capture() as handler:
+        logging.getLogger("httpx").info("foreign record %s and %s", "xabcdefy", "abcd-cdef")
+    assert _messages(handler) == ["foreign record x[REDACTED]y and [REDACTED]-[REDACTED]"]
+
+
+def test_an_owned_record_scrubs_every_registered_token_with_the_owned_one() -> None:
+    _assert_shield_idle()
+    # A short registered token has no credential shape the owned scrub could find without it.
+    with _registered(_OWNED, "abcd"), _capture() as handler, HTTPX_LOG_SHIELD.request(webhook=_OWNED_WEBHOOK):
+        logging.getLogger("httpx").info("owned record %s %s", _OWNED, "abcd")
+    assert _messages(handler) == ["owned record [REDACTED] [REDACTED]"]
+
+
+def test_an_empty_token_is_no_secret() -> None:
+    _assert_shield_idle()
+    initial = len(HTTPX_LOG_SHIELD.registered_secrets())
+    with _registered(""), _capture() as handler:
+        assert len(HTTPX_LOG_SHIELD.registered_secrets()) == initial
+        logging.getLogger("httpx").info("foreign record %s", "abc")
+    assert _messages(handler) == ["foreign record abc"]
+    with pytest.raises(ValueError, match="requires the webhook credential"):
+        HTTPX_LOG_SHIELD.request(webhook=Webhook(_ADDRESS, "")).__enter__()
+
+
+def test_no_matcher_of_a_released_token_outlives_its_registration() -> None:
+    _assert_shield_idle()
+    token = "synthetic-matcher-secret-878787"  # noqa: S105 - a synthetic webhook token
+    with _registered(token), _capture() as handler:
+        logging.getLogger("httpx").info("foreign record %s", token)
+    assert _messages(handler) == ["foreign record [REDACTED]"]
+    # The next lifecycle event prunes the closed client and its secret; no regex cache keeps a matcher of it.
+    HTTPX_LOG_SHIELD.registered_secrets()
+    gc.collect()
+    matchers = [pattern for pattern in gc.get_objects() if isinstance(pattern, re.Pattern)]
+    # A matcher holds each token escaped.
+    assert [pattern for pattern in matchers if re.escape(token) in str(pattern.pattern)] == []
+
+
+def test_registering_a_client_builds_no_matcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Registration stays O(1) however many webhooks are registered: the registered secrets and their matcher are
+    # built once, on the first read after a change, and reused until the next change.
+    _assert_shield_idle()
+    compiles: list[str] = []
+    carriers: list[int] = []
+    compile_uncached = _webhook._compile_uncached  # noqa: SLF001 - counts the matcher compilations
+
+    def counted_compile(pattern: str, flags: int) -> re.Pattern[str]:
+        compiles.append(pattern)
+        return compile_uncached(pattern, flags)
+
+    class _CountedSecrets(WebhookSecrets):
+        def __init__(self, webhooks: Iterable[Webhook] = ()) -> None:
+            carriers.append(1)
+            super().__init__(webhooks)
+
+    monkeypatch.setattr(_webhook, "_compile_uncached", counted_compile)
+    monkeypatch.setattr(logging_shield, "WebhookSecrets", _CountedSecrets)
+    tokens = [f"synthetic-bound-secret-{index:04d}" for index in range(_BOUND_CLIENTS)]
+    with _registered(*tokens), _capture() as handler:
+        assert (len(compiles), len(carriers)) == (0, 0)
+        for token in tokens[:3]:
+            logging.getLogger("httpx").info("foreign record %s", token)
+        assert (len(compiles), len(carriers)) == (1, 1)
+    assert _messages(handler) == ["foreign record [REDACTED]"] * 3

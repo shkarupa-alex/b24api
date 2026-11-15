@@ -1,7 +1,6 @@
 """Correlated per-command outcomes shared by the classic and the native v3 batch dialects."""
 
 from __future__ import annotations
-import copy
 import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -14,7 +13,7 @@ from b24api.execution.facts import ambiguity_of, possible_execution, record_with
 
 if TYPE_CHECKING:
     from b24api.contracts.response import Response
-    from b24api.execution.executor import _Lineage, _PossiblyRun
+    from b24api.execution.executor import _PossiblyRun
 
 
 class _BatchNotExecutedError(ProtocolError):
@@ -53,21 +52,6 @@ def _command_failure(
         correlation=command.correlation,
         evidence=evidence,
     )
-
-
-def _stopped_after(stop: B24ApiError, followed: B24ApiError, lineage: _Lineage) -> B24ApiError:
-    """End a command that followed its envelope's ``followed`` failure and that ``stop`` kept from being sent again.
-
-    The one rule of both batch dialects for a replay stopped before its send, by the budget or by any other failure
-    (a closed client, for example): the stop is what ended the command, so it is the outcome, caused by the failure
-    the command followed, and it carries what the command's sends (``lineage``) left open. A command its own entry
-    or element answered keeps that answer instead. Each stopped command gets its own copy of the stop, whose cause
-    is the failure that command followed and whose traceback is the stop's, where it was raised.
-    """
-    ended = copy.copy(stop).with_traceback(stop.__traceback__)
-    ended.__cause__ = followed
-    lineage.record_unsent(ended)
-    return ended
 
 
 def _shared_failure(command: _Command, error: B24ApiError) -> BatchFailure:

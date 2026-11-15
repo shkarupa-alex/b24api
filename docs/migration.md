@@ -13,22 +13,29 @@
   flight than its `concurrency`. An isolation refused because the operation's
   deadline has passed now fails with "execution time budget exhausted before the retry", as any retry
   does, and still ends the stream with `BudgetExceededError`. One refused for its own request alone (no
-  attempt left, its retry window closed, or a wait longer than the window left) sends nothing, records
-  nothing, and leaves each command unknown, explained by the envelope's failure, as before. An envelope
-  retry the budget refused is no longer followed by an isolation, which the same budget would refuse.
-- **Breaking: a replay stopped before its send ends the same way in both batch dialects.** When a
-  classic or a REST 3.0 batch was sent again after its envelope failed as a whole and that replay was
-  stopped before its send by something other than the budget (the client closed meanwhile, for
-  example), a classic command ended with that stop but without the failure it followed, and a REST 3.0
-  command kept the envelope's failure and dropped the stop. Both now end as a budget stop already ends
-  them: with the stop, which is what ended the command, caused by the envelope failure it followed, and
-  reported possibly run only when a send it was in may have run (then `AmbiguousExecutionError`, whose
-  cause is that stop). The same holds now for a REST 3.0 envelope retry after an abort or a lost answer
-  that the budget stops at its permit, which kept the envelope's failure. A command its own entry or
-  element answered keeps that answer whatever stops its replay: a classic command its own entry answered
-  with a transient error (`QUERY_LIMIT_EXCEEDED`, for example), whose replay such a non-budget stop kept
-  from being sent, ended with that stop (`ClientClosedError`) and now keeps its `BatchCommandError`, as
-  it already did when the budget stopped its replay and as a REST 3.0 command its element answered did.
+  attempt left, its retry window closed, or a wait longer than the window left) sends nothing and records
+  nothing. Either refusal, and one of the envelope retry, now ends each command as a refused retry of a
+  classic batch does: unknown, with the refusal (`BudgetExceededError`) caused by the envelope's failure,
+  where it kept the envelope's failure alone. An envelope retry the budget refused is no longer followed
+  by an isolation, which the same budget would refuse.
+- **Breaking: a retry stopped before its send ends with that stop, caused by what it followed.** When
+  a request or a batch was sent again after a failure and that retry was stopped before its send by
+  something other than the budget (the client closed meanwhile, for example), the stop was reported
+  without the failure it followed, or not at all. A lone request raised the bare `ClientClosedError`. A
+  classic command proven not run (its envelope refused whole) ended with the bare `ClientClosedError`,
+  and one whose send may have run ended unknown (`AmbiguousExecutionError`) caused by that send's
+  failure, the stop dropped; a REST 3.0 command, after its envelope retry or isolated send was stopped,
+  ended unknown caused by the envelope's failure, the stop dropped. Every retry stopped before its send
+  now ends as a budget stop already ended it: with the stop, which is what ended it, caused by the
+  failure it followed, and reported possibly run only when a send it was in may have run (a batch
+  command then ends `AmbiguousExecutionError` whose cause is that stop; a lone request raises the stop,
+  its execution facts saying so). The same holds now for a REST 3.0 envelope retry after an abort or a
+  lost answer that the budget stops at its permit, which kept the envelope's failure. A command its own
+  entry or element answered keeps that answer whatever stops its replay: a classic command its own
+  entry answered with a transient error (`QUERY_LIMIT_EXCEEDED`, for example), whose replay such a
+  non-budget stop kept from being sent, ended with that stop (`ClientClosedError`) and now keeps its
+  `BatchCommandError`, as it already did when the budget stopped its replay and as a REST 3.0 command
+  its element answered did.
 - **A stale `Date` no longer stretches a dated throttle hint.** A `Retry-After` given as an HTTP date,
   or an `X-Bitrix-RateLimit-Reset` given as a date or an epoch, was measured against the response's
   `Date` whatever that `Date` said, so an answer whose `Date` was an hour old (from a cache or a relay,

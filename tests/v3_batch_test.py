@@ -41,6 +41,7 @@ from b24api.errors import (
     TransportError,
 )
 from b24api.execution import Executor, RateCoordinator, WorkClass
+from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
 from b24api.references.dispatch import _KernelFanOutSuccess
 from b24api.references.fanout import kernel_fanout_stream
 from b24api.references.outcome import KernelReferenceFailure
@@ -1436,29 +1437,36 @@ def _command_id(request: Request) -> int:
     return identifier
 
 
-def _keeps_the_envelope_failure(error: object) -> None:
-    """Assert that a command its isolation never reached is unknown, explained by its envelope's abort alone."""
+def _ends_with_the_refusal_caused_by_the_abort(error: object, refusal: str) -> None:
+    """Assert that a command its isolation never reached is unknown, ended by the refusal, caused by the abort."""
     assert type(error) is AmbiguousExecutionError
     assert error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
-    cause = error.__cause__
+    stop = error.__cause__
+    assert type(stop) is BudgetExceededError
+    assert refusal in str(stop)
+    cause = stop.__cause__
     assert type(cause) is ApiResponseError
     assert cause.original_code == "SYNTHETIC_NOT_FOUND"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("label", "abort_takes", "retry_after"),
+    ("label", "abort_takes", "retry_after", "refusal"),
     [
         # The envelope's abort comes after its retry window closed, long before the operation's deadline.
-        ("window_closed", 30.0, None),
+        ("window_closed", 30.0, None, RETRY_WINDOW_EXHAUSTED),
         # The host holds the methods for longer than the window left: a wait the window cannot carry.
-        ("hold", 0.0, 60.0),
+        ("hold", 0.0, 60.0, "retry delay would exceed"),
     ],
 )
-async def test_a21_isolation_refused_for_the_request_alone_keeps_the_envelope_failure_and_the_stream_goes_on(
-    label: str, abort_takes: float, retry_after: float | None
+async def test_a21_isolation_refused_for_the_request_alone_ends_with_the_refusal_and_the_stream_goes_on(
+    label: str, abort_takes: float, retry_after: float | None, refusal: str
 ) -> None:
-    """RS_isolation: a replay refused for the group alone sends nothing more, records nothing and ends nothing."""
+    """RS_isolation: a replay refused for the group alone sends nothing more, records nothing and ends nothing.
+
+    Each command ends as a refused retry of a lone request or a classic batch does: with the refusal, caused by
+    the envelope's abort, unknown since that envelope may have run.
+    """
     portal = _V3Portal(_Clock(), abort_takes=abort_takes, retry_after=retry_after)
     policy = _policy(max_elapsed=1000.0, max_retry_elapsed_per_request=10.0)
 
@@ -1469,7 +1477,7 @@ async def test_a21_isolation_refused_for_the_request_alone_keeps_the_envelope_fa
     aborted = set(portal.sent[0][0])
     for identifier, error in errors.items():
         if identifier in aborted:
-            _keeps_the_envelope_failure(error)
+            _ends_with_the_refusal_caused_by_the_abort(error, refusal)
         else:
             assert error is None
     # Each unknown command is a warning; nothing records a budget's end.
@@ -1495,4 +1503,4 @@ async def test_a21_isolation_refused_at_the_operation_deadline_is_recorded_and_e
     assert report.batch_isolation_requests == 0
     assert len(portal.sent) == 1
     for identifier in portal.sent[0][0]:
-        _keeps_the_envelope_failure(errors[identifier])
+        _ends_with_the_refusal_caused_by_the_abort(errors[identifier], str(ended))
