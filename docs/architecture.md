@@ -282,7 +282,16 @@ outcome.
   before the first pull is bounded the same way. `OwnedSource` runs a synchronous source's pulls and
   close one at a time in its one `contextvars.Context`, under a lock its worker threads take, so a
   close that the end of the operation starts while a cut pull still runs waits for that pull instead
-  of entering the context twice.
+  of entering the context twice. An asynchronous source's steps run in its own context too, driven by
+  the reading task (`_InContext` enters the context on each resumption), and its `failure` mapper
+  turns any exception a pull or the close raises into the family's source failure.
+- A failed close is reported by one rule, built by `OperationRunner` (`cleanup_failure` and
+  `cleanup_failure_violation`), for every family: "stream cleanup failed (X)" as the terminal failure
+  when nothing failed before it, "stream cleanup also failed (X)" as a secondary otherwise. A close
+  while a read is in flight is an early close: the read it ends raises the close's failure, after the
+  close has run, and the report counts an item as emitted only once `LifecycleHooks.delivered` says the
+  reader has it. The isolated read task returns a failure for the reader to raise, so it never ends
+  in one.
 - The default response ceiling is enforced while streaming, before JSON decoding.
 - Exact sequential, counted, and multi-reference traversal shares one operation-wide
   `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted

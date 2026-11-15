@@ -167,7 +167,8 @@ sent, with the same consequence for `UNSAFE` and `UNKNOWN` work; the failure its
 `TransportError` that names the exception's class and any HTTP status the client received
 (`error.http_status`), without the exception, which would carry the webhook URL, on its chain. A
 cancellation is re-raised with the same arguments, without the HTTPX frames it was raised in, and an
-exception that is not an `Exception` (`KeyboardInterrupt`) passes through unchanged. A response the
+exception that is not an `Exception` (`KeyboardInterrupt`) passes through unchanged but for those
+frames, which hold the request. A response the
 transport refuses itself is reported as `ProtocolError` (a status outside 100-599) or
 `ResponseTooLargeError` rather than `TransportError`.
 A physical batch applies these rules to each command: after a failure, only the commands that
@@ -940,6 +941,21 @@ an `incomplete` (or `failed`) report, and the cancellation is delivered at its n
 closed before its first pull closes its source the same way. A synchronous source is pulled and closed in worker threads, in
 one `contextvars.Context`; a pull the deadline cut while it still runs is waited for before the close
 runs in that context, so a pull that outlasts the grace leaves its close to the background the same way.
+An asynchronous source also runs every pull and its close in one context of its own, driven by the task
+that reads it, so a context variable a generator sets before a `yield` is still set when it resumes.
+
+Every exception a source raises, from a pull or from its close, is its failure: the stream raises
+`InputSourceError` (`batch()` and `fan_out()`: `BatchFailed`, whose `__cause__` is that
+`InputSourceError`) with the source's exception as its `__cause__`, whether the source is synchronous
+or asynchronous and even when that exception is a library error of its own. Every family reports a
+failed close the same way. When nothing failed before it, the close is what failed: the terminal
+reason is "stream cleanup failed" and the report carries one `cleanup_failure` violation, "stream
+cleanup failed (X)", where X is `InputSourceError` or `CleanupOverrunError`. Behind an earlier failure,
+that failure stays the terminal reason and the close adds "stream cleanup also failed (X)". The source
+is closed in every case, even when the stream's own tasks outlast the cleanup window. A close from
+another task while a read is in flight is an early close: the read it ends raises `CancelledError`, or
+the close's failure when the close failed, which the close raises too. `report.emitted` counts the
+items the reader got.
 
 Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
 observed identities per operation in memory (100,000 by default). All active reference bindings
