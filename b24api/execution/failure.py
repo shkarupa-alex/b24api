@@ -147,6 +147,30 @@ def with_cleanup_failure_behind(report: KernelReport, error: BaseException) -> K
     return replace(report, violations=(*violations, cleanup_failure_violation(error, secondary=True)))
 
 
+INTERRUPTED_REASON = "operation interrupted"
+
+
+def with_interrupt[R](report: R, interrupt: BaseException) -> R:
+    """Return the report of an operation an interrupt (``is_interrupt``) ended, in one shape however it ended.
+
+    The interrupt is what leaves, whatever came before it: the report is failed with ``INTERRUPTED_REASON``, keeps
+    every violation recorded before it (an earlier failure's first) and adds one ``interrupted`` violation last,
+    "operation interrupted (X)".
+    """
+    message = f"{INTERRUPTED_REASON} ({report_reason(interrupt)})"
+    violation = Violation(ViolationSeverity.BLOCKING, "interrupted", message)
+    violations = tuple(getattr(report, "violations", ()))
+    if not any(item.code == violation.code for item in violations):
+        violations = (*violations, violation)
+    state = KernelState.FAILED if isinstance(getattr(report, "state", None), KernelState) else TerminalState.FAILED
+    changes: dict[str, object] = {"state": state, "terminal_reason": INTERRUPTED_REASON, "violations": violations}
+    if hasattr(report, "exhausted"):
+        changes["exhausted"] = False
+    if getattr(report, "empty_source_witness", None) is not None:
+        changes["empty_source_witness"] = None
+    return cast("R", replace(cast("Any", report), **changes))
+
+
 def attach_report(error: BaseException, report: object) -> None:
     """Attach immutable report evidence without replacing the primary error."""
     with contextlib.suppress(AttributeError, TypeError):
@@ -222,6 +246,7 @@ def finalize_failure[R](
 __all__ = [
     "CLEANUP_FAILED_REASON",
     "EARLY_CLOSE_REASON",
+    "INTERRUPTED_REASON",
     "FailureClass",
     "classify_failure",
     "cleanup_failure_violation",
@@ -229,4 +254,5 @@ __all__ = [
     "report_reason",
     "with_cleanup_failure",
     "with_cleanup_failure_behind",
+    "with_interrupt",
 ]

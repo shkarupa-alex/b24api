@@ -35,6 +35,7 @@ from b24api.execution.context import (
     CleanupResult,
     Settled,
     await_cleanup_resistant,
+    is_interrupt,
     spawn_settled,
 )
 
@@ -105,7 +106,9 @@ def _in_context[R](step: Awaitable[R], context: contextvars.Context) -> Generato
 async def _finish_in_thread[R](call: Callable[[], R]) -> R:
     """Run ``call`` in a worker thread that a cancellation waits for instead of abandoning.
 
-    The cancelled call's failure is dropped, but not an interrupt (``KeyboardInterrupt``, ``SystemExit``): it is raised.
+    The cancelled call's failure is dropped, but not an interrupt (``is_interrupt``): it is raised in place of the
+    cancellation, and the operation latches it where it catches it (``InterruptLatch``). The hop runs in the source's
+    own context, which is not the operation's, so it does not latch it itself.
     """
     work = spawn_settled(asyncio.to_thread(call))
     try:
@@ -114,7 +117,7 @@ async def _finish_in_thread[R](call: Callable[[], R]) -> R:
         ended: Settled[R] | None = None
         with contextlib.suppress(asyncio.CancelledError):
             ended = await work
-        if ended is not None and isinstance(ended.error, KeyboardInterrupt | SystemExit):
+        if ended is not None and ended.error is not None and is_interrupt(ended.error):
             raise ended.error from None
         raise
 

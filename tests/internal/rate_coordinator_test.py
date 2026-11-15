@@ -199,7 +199,7 @@ async def test_owned_cleanup_closes_streams_then_coordinator_then_transport_keep
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
 @pytest.mark.asyncio
 async def test_owned_cleanup_raises_an_interrupt_ahead_of_an_earlier_failure(interrupt: type[BaseException]) -> None:
-    # An interrupt is never behind a failure: it is what leaves, every resource still closed, the failure a note.
+    # An interrupt is never behind a failure: the first one latched is what leaves, as it is, every resource closed.
     order: list[str] = []
     streams = (
         _Resource("failing-stream", order, fail=True),
@@ -214,12 +214,7 @@ async def test_owned_cleanup_raises_an_interrupt_ahead_of_an_earlier_failure(int
         )
 
     assert order == ["failing-stream", "interrupted-stream", "coordinator", "transport"]
-    # The first interrupt stays the one raised; whatever failed besides it, before or after, is a note.
-    assert captured.value.__notes__ == [
-        "earlier cleanup failure: RuntimeError",
-        "coordinator cleanup failure: KeyboardInterrupt",
-        "transport cleanup failure: RuntimeError",
-    ]
+    assert not hasattr(captured.value, "__notes__")
 
 
 @pytest.mark.asyncio

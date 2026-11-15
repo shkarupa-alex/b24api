@@ -18,8 +18,10 @@ from b24api.contracts.policy import KernelState
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.stream import PartialResult
 from b24api.execution.context import (
+    INTERRUPTS,
     WORK_OWNERS,
     CancellationMark,
+    InterruptLatch,
     Settled,
     await_cleanup_resistant,
     is_interrupt,
@@ -29,6 +31,7 @@ from b24api.execution.context import (
 from b24api.execution.failure import (
     CANCELLED_REASON,
     EARLY_CLOSE_REASON,
+    INTERRUPTED_REASON,
     attach_report,
     public_cause,
     report_reason,
@@ -59,6 +62,12 @@ class TerminalCause(StrEnum):
     EARLY_CLOSED = "early_closed"
     CANCELLED = "cancelled"
     FAILED = "failed"
+    # An interrupt (``is_interrupt``) ended it; the operation raises it and reports it (``with_interrupt``).
+    INTERRUPTED = "interrupted"
+
+
+# The causes behind which a failed cleanup is secondary: something failed first.
+_FAILING = frozenset({TerminalCause.FAILED, TerminalCause.INTERRUPTED})
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +111,8 @@ def kernel_terminal(cause: TerminalCause, reason: str | None) -> tuple[KernelSta
         return KernelState.CANCELLED, EARLY_CLOSE_REASON
     if cause is TerminalCause.CANCELLED:
         return KernelState.CANCELLED, CANCELLED_REASON
+    if cause is TerminalCause.INTERRUPTED:
+        return KernelState.FAILED, INTERRUPTED_REASON
     return KernelState.FAILED, reason or "stream failed"
 
 
@@ -109,13 +120,13 @@ def with_cleanup_attempt(report: KernelReport, cause: TerminalCause, attempt: Cl
     """Record a cleanup result on a kernel report by the §3.1 table.
 
     Without a primary failure a cleanup failure turns the report FAILED ("stream cleanup failed"); a
-    cancellation during that cleanup is raised but not recorded. Behind a FAILED primary both the
-    cleanup failure and a cleanup cancellation are secondary violations, as is any cleanup failure but an
-    interrupt behind a caller's cancellation (``cancellation_outranks``).
+    cancellation during that cleanup is raised but not recorded. Behind a FAILED primary or an interrupt both the
+    cleanup failure and a cleanup cancellation are secondary violations, as is a cleanup failure behind a caller's
+    cancellation (``cancellation_outranks``). An interrupt is never a cleanup failure: the runner latches it.
     """
     if cancellation_outranks(cause, attempt):
         return with_cleanup_failure(report, cast("BaseException", attempt.error), terminal=False)
-    if cause is not TerminalCause.FAILED:
+    if cause not in _FAILING:
         if attempt.error is None:
             return report
         return with_cleanup_failure(report, attempt.error, terminal=True)
@@ -130,19 +141,18 @@ def cancellation_outranks(cause: TerminalCause, attempt: CleanupAttempt) -> bool
 
     The reader's cancellation ended the stream before its close failed or overran its window, so the cancellation
     is raised and the stream is cancelled, the close failure a secondary violation ("stream cleanup also failed").
-    An interrupt (``is_interrupt``) is the exception: it is never behind anything.
     """
-    return cause is TerminalCause.CANCELLED and attempt.error is not None and not is_interrupt(attempt.error)
+    return cause is TerminalCause.CANCELLED and attempt.error is not None
 
 
 def cleanup_failed(cause: TerminalCause, attempt: CleanupAttempt) -> bool:
     """Whether the gate must record ``CleanupState.FAILURE`` for this attempt."""
-    return attempt.error is not None or (cause is TerminalCause.FAILED and attempt.cancellation is not None)
+    return attempt.error is not None or (cause in _FAILING and attempt.cancellation is not None)
 
 
 def with_fallback_cleanup(report: KernelReport, cause: TerminalCause, attempt: CleanupAttempt) -> KernelReport:
     """Keep a cleanup result on a fallback report; the finalization failure stays its terminal reason."""
-    cancellation = attempt.cancellation if cause is TerminalCause.FAILED else None
+    cancellation = attempt.cancellation if cause in _FAILING else None
     for failure in (attempt.error, cancellation):
         if failure is not None:
             report = with_cleanup_failure(report, failure, terminal=False)
@@ -223,6 +233,10 @@ class OperationRunner[T, R: _Report]:
     ``isolated_pulls`` runs each read in a child task so ``aclose()`` from another task can cancel
     only that read; a kernel runner driven by one outer runner reads inline instead. ``works_between_reads``
     declares a body whose own tasks keep running caller code while no read is in progress.
+
+    An isolated runner is its operation's: it owns the operation's ``InterruptLatch``, set in its read and cleanup
+    tasks for all the work they start. A latched interrupt cancels the read in flight, and every end of the
+    stream raises it once the report is published.
     """
 
     def __init__(
@@ -246,6 +260,7 @@ class OperationRunner[T, R: _Report]:
         self._primary: BaseException | None = None
         self._finalize_error: BaseException | None = None
         self._cleanup_failure: BaseException | None = None
+        self._interrupts = InterruptLatch(self._interrupted)
         self._work_token = object()
         # The one cleanup, kept even when a deadline stopped waiting for it, so it lives until it ends.
         self._cleanup_task: asyncio.Future[Settled[None]] | None = None
@@ -259,6 +274,11 @@ class OperationRunner[T, R: _Report]:
     def primary_error(self) -> BaseException | None:
         """Return the body failure or cancellation being finalized, for the family's report hook."""
         return self._primary
+
+    @property
+    def interrupt(self) -> BaseException | None:
+        """Return the interrupt that ends this stream's operation (``InterruptLatch``), ``None`` without one."""
+        return self._latch().first
 
     @property
     def cleanup_failure(self) -> BaseException | None:
@@ -322,10 +342,9 @@ class OperationRunner[T, R: _Report]:
                 exc.add_note(note)
 
     def _failed_close_record(self) -> str | None:
-        """Return the published report's record of the failed close: its cleanup or its finalization failure."""
-        code = "report_finalize_failure" if self._finalize_error is not None else "cleanup_failure"
+        """Return the published report's record of the failed close."""
         violations = self._report.violations if self._report is not None else ()
-        return next((violation.message for violation in violations if violation.code == code), None)
+        return next((violation.message for violation in violations if violation.code == "cleanup_failure"), None)
 
     async def __anext__(self) -> T:
         """Read one item; the read that ends the body publishes the report and raises by §3.1."""
@@ -335,6 +354,7 @@ class OperationRunner[T, R: _Report]:
             raise RuntimeError("concurrent stream pull")
         # Taken before any state changes, so a failing budget hook cannot leave the read half-started.
         deadline = self._cleanup_deadline()
+        await self._end_if_interrupted(deadline)
         self._phase = _Phase.PULLING
         reader = CancellationMark.now()
         try:
@@ -349,27 +369,20 @@ class OperationRunner[T, R: _Report]:
             if self._phase is _Phase.CLOSING:
                 # A concurrent aclose() owns termination; this read reports the published report.
                 await self._published.wait()
+                self._raise_latched()
                 closed = self._closed_read_error(error)
                 if closed is error:
                     raise
                 raise closed from _carried_cause(closed, error)
             self._phase = _Phase.CLOSING
-            cause = (
-                TerminalCause.EXHAUSTED
-                if isinstance(error, StopAsyncIteration)
-                else TerminalCause.EARLY_CLOSED
-                if not self._isolated and _closed_by_owner(error)
-                else TerminalCause.CANCELLED
-                if isinstance(error, asyncio.CancelledError)
-                else TerminalCause.FAILED
-            )
+            cause = self._cause_of(error)
             # A pull task that ends in its own failure absorbs the reader's cancellation it was handed.
             absorbed = None
             if reader.requested() and not isinstance(error, asyncio.CancelledError):
                 absorbed = asyncio.CancelledError()
             await self._terminate(
                 cause,
-                None if cause in {TerminalCause.EXHAUSTED, TerminalCause.EARLY_CLOSED} else error,
+                error if cause in {TerminalCause.CANCELLED, TerminalCause.FAILED} else None,
                 pending=absorbed,
                 deadline=deadline,
             )
@@ -380,6 +393,29 @@ class OperationRunner[T, R: _Report]:
         if self._hooks.delivered is not None:
             self._hooks.delivered()
         return item
+
+    async def _end_if_interrupted(self, deadline: float | None) -> None:
+        """End the stream without another read when work running between reads latched an interrupt."""
+        if self._interrupts.first is not None:
+            self._phase = _Phase.CLOSING
+            await self._terminate(TerminalCause.INTERRUPTED, None, deadline=deadline)
+
+    def _cause_of(self, error: BaseException) -> TerminalCause:
+        """Classify the end of the read that ended the body; an interrupt is latched, and ends it as interrupted.
+
+        A read the latch cancelled (``_interrupted``) ends by the interrupt, not by a caller's cancellation.
+        """
+        latch = self._latch()
+        latch.record(error)
+        if isinstance(error, StopAsyncIteration):
+            return TerminalCause.EXHAUSTED
+        if is_interrupt(error) or (latch.first is not None and isinstance(error, asyncio.CancelledError)):
+            return TerminalCause.INTERRUPTED
+        if not self._isolated and _closed_by_owner(error):
+            return TerminalCause.EARLY_CLOSED
+        if isinstance(error, asyncio.CancelledError):
+            return TerminalCause.CANCELLED
+        return TerminalCause.FAILED
 
     def _closed_read_error(self, error: BaseException) -> BaseException:
         """Return what a read a concurrent close ended raises: its own end, a failure mapped as the stream's are."""
@@ -459,6 +495,32 @@ class OperationRunner[T, R: _Report]:
     def _mark_own_work(self) -> None:
         # Called first in the pull or cleanup task, whose context is its own copy, so it needs no reset.
         WORK_OWNERS.set((*WORK_OWNERS.get(), self._work_token))
+        if self._isolated:
+            INTERRUPTS.set(self._interrupts)
+
+    def _latch(self) -> InterruptLatch:
+        """Return the operation's latch: this runner's own, or its outer runner's when it reads inline in it."""
+        if self._isolated:
+            return self._interrupts
+        return INTERRUPTS.get() or self._interrupts
+
+    def _interrupted(self) -> None:
+        """End the read in flight once an interrupt is latched, unless the interrupt is ending it already."""
+        pull = self._pull
+        if self._phase is _Phase.PULLING and pull is not None and pull is not asyncio.current_task():
+            pull.cancel()
+
+    def _raise_latched(self) -> None:
+        """Raise the operation's interrupt, ahead of whatever else would leave, with the published report.
+
+        Only the latch's owner raises it: a runner reading inline in its operation's read ends as it would otherwise,
+        so the operation's report keeps what ended it first, and its owner raises the interrupt.
+        """
+        latch = self._latch()
+        if latch is self._interrupts and (interrupt := latch.first) is not None:
+            if self._report is not None:
+                self._hooks.attach(interrupt, self._report)
+            raise interrupt
 
     async def _pull_next(self, read: _Read) -> T:
         # Run as a settled task: the reader raises the failure it ends in. The reader replays the cancellation it
@@ -524,14 +586,18 @@ class OperationRunner[T, R: _Report]:
         cleanup still running then finishes in the background and is reported as failed.
         """
         self._primary = primary
+        # The operation is ending: an interrupt latched from now on is raised at its end, cancelling no read.
+        self._latch().end()
         cancelled = pending is not None or isinstance(primary, asyncio.CancelledError)
         self._cleanup_task = spawn_settled(self._clean_up(read))
         cleanup = await await_cleanup_resistant(self._cleanup_task, deadline=deadline, cancelled=cancelled)
-        attempt = CleanupAttempt(cleanup.error, cleanup.cancellation or pending, finished=cleanup.unfinished is None)
+        self._latch().record(cleanup.error)
+        # An interrupt is never a cleanup failure: it is latched, and leaves as the operation's end.
+        error = None if is_interrupt(cleanup.error) else cleanup.error
+        attempt = CleanupAttempt(error, cleanup.cancellation or pending, finished=cleanup.unfinished is None)
         reason = report_reason(primary) if cause is TerminalCause.FAILED and primary is not None else None
         report, finalize_failed = await self._publish(cause, reason, attempt)
-        if is_interrupt(attempt.error):
-            self._raise_interrupt(cast("BaseException", attempt.error), report)
+        self._raise_latched()
         if cause is TerminalCause.FAILED and primary is not None:
             self._raise_failed(primary, report, attempt, finalize_failed=finalize_failed)
         if finalize_failed and self._finalize_error is not None and primary is None:
@@ -540,15 +606,6 @@ class OperationRunner[T, R: _Report]:
             rearm_cancellation(attempt.cancellation)
             raise self._finalize_error
         self._raise_terminal(cause, primary, report, attempt)
-
-    def _raise_interrupt(self, interrupt: BaseException, report: R) -> NoReturn:
-        """Raise an interrupt the cleanup ended in, ahead of any earlier failure or cancellation (``is_interrupt``).
-
-        The report records it as the cleanup's failure; a runner driving this one reads it as that close's failure.
-        """
-        self._cleanup_failure = interrupt
-        self._hooks.attach(interrupt, report)
-        raise interrupt
 
     def _raise_failed(
         self,

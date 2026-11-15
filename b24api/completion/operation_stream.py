@@ -17,7 +17,12 @@ from b24api.contracts.report import (
     ViolationSeverity,
 )
 from b24api.errors import IncompleteTraversalError
-from b24api.execution.failure import CANCELLED_REASON, finalize_failure, with_cleanup_failure_behind
+from b24api.execution.failure import (
+    CANCELLED_REASON,
+    finalize_failure,
+    with_cleanup_failure_behind,
+    with_interrupt,
+)
 from b24api.execution.lifecycle import (
     CleanupAttempt,
     LifecycleHooks,
@@ -196,7 +201,16 @@ class MappedOperationStream[S, T]:
 
     def _finalize(self, cause: TerminalCause, _reason: str | None, attempt: CleanupAttempt) -> OperationReport:
         self._cleanup = (cause, attempt)
+        report = self._ended_report(cause)
+        if (interrupt := self._runner.interrupt) is not None:
+            # Whatever ended the stream, an interrupt is what leaves: one shape (``with_interrupt``).
+            report = self._report = with_interrupt(report, interrupt)
+        return report
+
+    def _ended_report(self, cause: TerminalCause) -> OperationReport:
         error = self._runner.primary_error
+        if cause is TerminalCause.INTERRUPTED:
+            return self._publish(forced_state=TerminalState.FAILED)
         if cause is TerminalCause.EARLY_CLOSED:
             self._early_closed = True
             return self._publish(forced_state=TerminalState.EARLY_CLOSED)
@@ -232,6 +246,8 @@ class MappedOperationStream[S, T]:
         )
         cleanup = CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS
         self._report = self._gate().publish_failure(facts, cleanup)
+        if (interrupt := self._runner.interrupt) is not None:
+            self._report = with_interrupt(self._report, interrupt)
         self._terminated()
         return self._report
 

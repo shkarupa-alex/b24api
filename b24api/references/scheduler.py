@@ -16,7 +16,7 @@ from b24api.contracts.request import ReplaySafety, Request, ResultSelector, Trav
 from b24api.contracts.response import result_snapshot
 from b24api.contracts.violation import retain_violations
 from b24api.errors import BudgetExceededError, CapabilityError, CleanupOverrunError
-from b24api.execution.context import is_interrupt, spawn_settled
+from b24api.execution.context import latch_interrupt, spawn_settled
 from b24api.execution.facts import dropped_result
 from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
@@ -246,11 +246,11 @@ class ReferenceScheduler:
         try:
             await iterator.aclose(self.context)
         except BaseException as error:  # noqa: BLE001 - every owned resource is closed before the first failure
+            latch_interrupt(error)
             if error is not primary_error:
                 cleanup_errors.append(error)
         if cleanup_errors:
-            # The first failure, unless an interrupt came later: an interrupt is never behind another.
-            raise next((error for error in cleanup_errors if is_interrupt(error)), cleanup_errors[0])
+            raise cleanup_errors[0]
 
     async def _stop_work(
         self,
@@ -267,11 +267,13 @@ class ReferenceScheduler:
         try:
             await self.buffer.close()
         except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
+            latch_interrupt(error)
             if error is not primary_error:
                 cleanup_errors.append(error)
         try:
             await self.dispatcher.aclose()
         except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
+            latch_interrupt(error)
             if error is not primary_error:
                 cleanup_errors.append(error)
         pending, task_errors = await _wait_for_cleanup_tasks(
@@ -407,8 +409,9 @@ class ReferenceScheduler:
             raise
         except BaseException as error:  # noqa: BLE001 - per-reference tolerant outcome boundary, an interrupt's too
             # The binding fails with what its failed page reports, and its command's replay disposition, if any. An
-            # interrupt (``is_interrupt``) is published as the binding's end too, so its consumer raises it.
+            # interrupt (``is_interrupt``) is the operation's latch's too: the runner raises it.
             failed = _failed_page(error)
+            latch_interrupt(failed.error)
             event = self._failure_event(run, failed.error)
             if failed.failure is not None:
                 event = replace(event, replay_disposition=failed.failure.replay_disposition)
@@ -920,9 +923,6 @@ class ReferenceScheduler:
                     event.keyset_execution,
                 )
             return
-        if is_interrupt(event.error):
-            # Never an outcome nor a window failure: an interrupt leaves as itself, in every family.
-            raise event.error
         request = event.work.reference.request
         self.completion.terminal(
             event.work.index,

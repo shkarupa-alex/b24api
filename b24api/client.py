@@ -33,7 +33,7 @@ from b24api.execution import (
     rearm_cancellation,
 )
 from b24api.execution.cleanup import OwnedStream, close_owned_resources
-from b24api.execution.context import Settled, spawn_settled
+from b24api.execution.context import Settled, is_interrupt, spawn_settled
 from b24api.redaction import Redactor, secret_values
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
@@ -188,7 +188,8 @@ class Bitrix24(_TraversalFacade):
         try:
             await self.aclose()
         except BaseException as cleanup_error:
-            if primary is not None:
+            # An interrupt the close raised (a stream's, ``InterruptLatch``) leaves ahead of the body's exception.
+            if primary is not None and not is_interrupt(cleanup_error):
                 raise primary.with_traceback(traceback) from cleanup_error
             raise
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
-from b24api.execution.context import is_interrupt
+from b24api.execution.context import InterruptLatch
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -31,7 +31,7 @@ async def close_owned_resources(
     transport: CloseableResource | None,
     coordinator: CloseableResource | None = None,
 ) -> None:
-    """Attempt every owned close and preserve the first cleanup failure; an interrupt outranks it (``is_interrupt``).
+    """Attempt every owned close and preserve the first cleanup failure; an interrupt outranks it (``InterruptLatch``).
 
     Order: streams, then the owned rate coordinator (its cooldown wake task is awaited), then the
     owned transport.
@@ -42,17 +42,19 @@ async def close_owned_resources(
         for resource, label in ((coordinator, "coordinator"), (transport, "transport"))
         if resource is not None
     )
+    interrupts = InterruptLatch()
     primary: BaseException | None = None
     for resource, label in ordered:
         try:
             await resource.aclose()
         except BaseException as error:  # noqa: BLE001 - every owned resource must still be closed
-            if primary is None or (is_interrupt(error) and not is_interrupt(primary)):
-                if primary is not None:
-                    error.add_note(f"earlier cleanup failure: {type(primary).__name__}")
+            interrupts.record(error)
+            if primary is None:
                 primary = error
             else:
                 primary.add_note(f"{label} cleanup failure: {type(error).__name__}")
+    if interrupts.first is not None:
+        raise interrupts.first
     if primary is not None:
         raise primary
 

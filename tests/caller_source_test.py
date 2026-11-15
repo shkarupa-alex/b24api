@@ -560,7 +560,8 @@ async def test_an_interrupt_from_the_close_outranks_reference_work_that_outlasts
     dispatch: DirectDispatch | BatchDispatch, interrupt: type[BaseException]
 ) -> None:
     # The work's overrun is a cleanup failure found first; the source's close then raises an interrupt, which is
-    # never behind another failure: the close raises it, and so does the read the close ended.
+    # never behind another failure: the close raises it, and so does the read the close ended. The overrun stays
+    # in the report, ahead of the interrupt.
     direct = isinstance(dispatch, DirectDispatch)
     transport = _Blocks(answered=1 if direct else 0, resists=True)
     source = _CommandsWhoseCloseIsInterrupted(interrupt)
@@ -584,7 +585,12 @@ async def test_an_interrupt_from_the_close_outranks_reference_work_that_outlasts
     assert source.closed
     report = stream.report
     assert report is not None
-    assert ("cleanup_failure", f"stream cleanup failed ({interrupt.__name__})") in _violations(report)
+    assert report.state is TerminalState.FAILED
+    assert report.terminal_reason == "operation interrupted"
+    assert _violations(report) == [
+        ("cleanup_failure", "stream cleanup failed (CleanupOverrunError)"),
+        ("interrupted", f"operation interrupted ({interrupt.__name__})"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -919,37 +925,57 @@ class _AsyncClosesInterrupted(_ClosesInterrupted):
 
 
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
-@pytest.mark.parametrize("before", ["nothing", "failure", "cancellation"])
+@pytest.mark.parametrize("before", ["nothing", "failure", "cancellation_between_reads", "cancellation_during_a_read"])
 @pytest.mark.parametrize("kind", ["async", "sync"])
 @pytest.mark.parametrize("family", FAMILIES)
 def test_an_interrupt_from_a_close_outranks_whatever_ended_the_stream_before_it(
     family: str, kind: str, before: str, interrupt: type[BaseException]
 ) -> None:
-    # An interrupt is never behind anything: after a read to the end, a failure or the reader's cancellation, the
-    # close's interrupt is what leaves; the report records it as the close's failure.
+    # An interrupt is never behind anything: after a read to the end, a failure or the reader's cancellation (between
+    # reads or while a send blocks), the close's interrupt is what leaves. The report has one shape whatever came
+    # before: failed, interrupted, an earlier failure's violation first and the interrupt's last; the close is no
+    # cleanup failure.
     reported: list[str] = []
+    pending: list[str] = []
     streams: list[OperationStream[Any]] = []
     source_type = _AsyncClosesInterrupted if kind == "async" else _ClosesInterrupted
+    transport = _Blocks(answered=0 if before == "cancellation_during_a_read" else 1_000)
 
     async def main() -> None:
         asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
-        async with client_for(ResponderTransport(_answer), policy=POLICIES["returns"]) as client:
-            stream = _stream(client, family, source_type(family, interrupt, fail_pull=before == "failure"))
-            streams.append(stream)
-            async for _item in stream:
-                if before == "cancellation":
-                    task = asyncio.current_task()
-                    assert task is not None
-                    task.cancel()
+        try:
+            async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
+                stream = _stream(client, family, source_type(family, interrupt, fail_pull=before == "failure"))
+                streams.append(stream)
+
+                async def read() -> None:
+                    async for _item in stream:
+                        if before == "cancellation_between_reads":
+                            task = asyncio.current_task()
+                            assert task is not None
+                            task.cancel()
+
+                reader = asyncio.create_task(_settled(read()))
+                if before == "cancellation_during_a_read":
+                    await reached(transport.started)
+                    reader.cancel()
+                got = await reader
+        finally:
+            pending.extend(_others())
+        if got is not None:
+            raise got
 
     with pytest.raises(interrupt):
         asyncio.run(main())
     gc.collect()
     assert reported == []
+    assert pending == []
     report = streams[0].report
     assert report is not None
-    outcome = "also failed" if before == "failure" else "failed"
-    assert ("cleanup_failure", f"stream cleanup {outcome} ({interrupt.__name__})") in _violations(report)
+    assert report.state is TerminalState.FAILED
+    assert report.terminal_reason == "operation interrupted"
+    earlier = [("source_failure", f"{report.operation} failed (InputSourceError)")] if before == "failure" else []
+    assert _violations(report) == [*earlier, ("interrupted", f"operation interrupted ({interrupt.__name__})")]
 
 
 @pytest.mark.asyncio
@@ -995,6 +1021,12 @@ async def test_a_cancelled_reader_whose_close_then_fails_is_cancelled_whenever_t
     assert report.state is TerminalState.CANCELLED
     assert report.terminal_reason == "iteration cancelled"
     assert _violations(report) == [("cleanup_failure", "stream cleanup also failed (InputSourceError)")]
+    # The cancellation carries the close's failure as its cause, and the report.
+    cause = raised[0].__cause__
+    assert isinstance(cause, InputSourceError)
+    assert type(cause.__cause__) is RuntimeError
+    assert str(cause.__cause__) == "the caller's close failed"
+    assert getattr(raised[0], "report", None) is report
 
 
 class _WaitsThenClosesInterrupted:
@@ -1050,7 +1082,7 @@ async def test_a_read_a_close_ends_gets_the_interrupt_the_close_raises(
     assert [type(error) for error in got] == [interrupt]
 
 
-@pytest.mark.parametrize("call", [1, 2, 3])
+@pytest.mark.parametrize("call", [1, 2])
 @pytest.mark.parametrize(
     ("family", "dispatch"),
     # A batch dispatch's sender sends the fan-out families' commands; the others' list pages go direct here.
@@ -1060,8 +1092,10 @@ def test_an_interrupt_a_transport_raises_leaves_the_loop_with_no_task_behind(
     family: str, dispatch: str, call: int
 ) -> None:
     # The transport runs in the library's own tasks (a binding's run, a batch sender); its interrupt reaches the
-    # caller's task, which raises it out of asyncio.run, with no library task ending in it.
+    # caller's task, which raises it out of asyncio.run, with no library task ending in it. Each of the two items is
+    # sent alone, so both calls come.
     reported: list[str] = []
+    pending: list[str] = []
     calls = 0
 
     def answer(request: Request) -> object:
@@ -1071,22 +1105,158 @@ def test_an_interrupt_a_transport_raises_leaves_the_loop_with_no_task_behind(
             raise KeyboardInterrupt
         return _answer(request)
 
-    plan = DirectDispatch(concurrency=2) if dispatch == "direct" else BatchDispatch(batch_size=2, concurrency=2)
+    plan = DirectDispatch(concurrency=2) if dispatch == "direct" else BatchDispatch(batch_size=1, concurrency=2)
 
     async def main() -> None:
         asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
-        async with client_for(ResponderTransport(answer), policy=POLICIES["returns"]) as client:
-            await _end(_stream(client, family, _items(family), plan), "read_to_end")
+        try:
+            async with client_for(ResponderTransport(answer), policy=POLICIES["returns"]) as client:
+                await _end(_stream(client, family, _items(family), plan), "read_to_end")
+        finally:
+            pending.extend(_others())
 
-    if call == 1:
-        with pytest.raises(KeyboardInterrupt):
-            asyncio.run(main())
-    else:
-        # A stream sends as few requests as it needs: a later call may never come.
-        with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(main())
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(main())
     gc.collect()
     assert reported == []
+    assert pending == []
+
+
+def _others() -> list[str]:
+    """Return the tasks still running besides the current one."""
+    current = asyncio.current_task()
+    return [task.get_name() for task in asyncio.all_tasks() if task is not current]
+
+
+REFERENCE_FAMILIES = tuple(family for family in FAMILIES if family not in {"batch", "batch_outcomes"})
+
+
+class _Interrupting:
+    """A transport that interrupts the operation one of three ways (the reference families' routes to drop it).
+
+    ``queued``: the first send blocks while the second raises ``KeyboardInterrupt`` at once, so the interrupt is in a
+    binding the reader does not read yet (``interrupted`` is set as it is raised). ``converted``: every send blocks
+    and turns the cancellation that ends it into ``KeyboardInterrupt``. ``after_failure``: the first send fails once
+    the second has started, and the second raises ``KeyboardInterrupt`` behind that failure: when the stream the
+    failure ended cancels it, or a few loop turns later in a stream the failure does not end.
+    """
+
+    def __init__(self, scenario: str) -> None:
+        self._scenario = scenario
+        self._calls = 0
+        self.started = asyncio.Event()
+        self.interrupted = asyncio.Event()
+
+    async def __call__(self, request: Request) -> object:
+        del request
+        self._calls += 1
+        if self._scenario == "after_failure":
+            return await self._after_failure()
+        if self._scenario == "queued" and self._calls == 2:  # noqa: PLR2004 - the second binding's send
+            self.interrupted.set()
+            raise KeyboardInterrupt
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if self._scenario == "converted":
+                raise KeyboardInterrupt from None
+            raise
+        raise AssertionError("never answered")
+
+    async def _after_failure(self) -> object:
+        if self._calls == 1:
+            await reached(self.started)
+            raise RuntimeError("the first send failed")
+        self.started.set()
+        try:
+            for _turn in range(HANDOVER_TURNS):
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise KeyboardInterrupt from None
+        raise KeyboardInterrupt
+
+
+def _failure_before(family: str, dispatch: str, scenario: str, operation: str) -> list[tuple[str, str]]:
+    """Return the violation the first send's failure leaves ahead of the interrupt (none unless ``after_failure``)."""
+    if scenario != "after_failure":
+        return []
+    if family.endswith("_outcomes"):
+        return [("reference_failure", "one reference produced a typed failure outcome")]
+    if dispatch == "direct":
+        return [("transport_failure", f"{operation} failed (TransportError)")]
+    return [("ambiguous_execution", f"{operation} failed (AmbiguousExecutionError)")]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "ending"),
+    [
+        *((scenario, ending) for scenario in ("queued", "converted") for ending in ("cancel", "timeout", "aclose")),
+        ("after_failure", "read_to_end"),
+    ],
+)
+@pytest.mark.parametrize("dispatch", ["direct", "batch"])
+@pytest.mark.parametrize("family", REFERENCE_FAMILIES)
+def test_an_interrupt_on_any_route_ends_the_operation_and_leaves_asyncio_run(
+    family: str, dispatch: str, scenario: str, ending: str
+) -> None:
+    # Wherever the interrupt is caught (a binding's end waiting in its queue, a task the cleanup cancels, a failure
+    # that ended the stream first), it is latched and the operation raises it: the reader gets it, whatever ends its
+    # read (its cancellation, a timeout, another task's close), the loop reports nothing and no task is left.
+    reported: list[str] = []
+    pending: list[str] = []
+    transport = _Interrupting(scenario)
+    plan = DirectDispatch(concurrency=2) if dispatch == "direct" else BatchDispatch(batch_size=1, concurrency=2)
+    got: list[BaseException] = []
+    streams: list[OperationStream[Any]] = []
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        try:
+            async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
+                stream = _stream(client, family, _items(family), plan)
+                streams.append(stream)
+
+                async def read() -> None:
+                    try:
+                        if ending == "timeout":
+                            async with asyncio.timeout(0.2):
+                                await _end(stream, "read_to_end")
+                        else:
+                            await _end(stream, "read_to_end")
+                    except BaseException as error:  # noqa: BLE001 - the test inspects what the reader got
+                        got.append(error)
+
+                reader = asyncio.create_task(read())
+                if scenario != "after_failure":
+                    await reached(transport.started)
+                if scenario == "queued":
+                    await reached(transport.interrupted)
+                if ending == "cancel":
+                    reader.cancel()
+                elif ending == "aclose":
+                    with contextlib.suppress(KeyboardInterrupt):
+                        await stream.aclose()
+                await reader
+        finally:
+            pending.extend(_others())
+        raise got[0]
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(main())
+    gc.collect()
+    assert [type(error) for error in got] == [KeyboardInterrupt]
+    assert reported == []
+    assert pending == []
+    report = streams[0].report
+    assert report is not None
+    # One report shape on every route: failed, interrupted; the failure that came first keeps its violation, first.
+    assert report.state is TerminalState.FAILED
+    assert report.terminal_reason == "operation interrupted"
+    assert _violations(report) == [
+        *_failure_before(family, dispatch, scenario, report.operation),
+        ("interrupted", "operation interrupted (KeyboardInterrupt)"),
+    ]
 
 
 class _OwnError(Exception):

@@ -1816,9 +1816,10 @@ async def test_a21_isolation_an_isolated_answer_that_cannot_be_decoded_explains_
 def test_an_interrupt_an_isolated_send_raises_leaves_the_loop_with_no_task_behind(call: int) -> None:
     # After a safe abort (its envelope goes through send_wire) each command is sent alone, one at a time in the
     # batch's own work: an interrupt one of those sends raises reaches the caller's task, which raises it out of
-    # asyncio.run, with no library task ending in it.
+    # asyncio.run, with no library task ending in it or left behind.
     reported: list[str] = []
     reached: list[type[BaseException]] = []
+    pending: list[str] = []
     requests = (_v3(1), _v3(2), _v3(3))
     transport = ScriptedTransport(
         (
@@ -1845,6 +1846,9 @@ def test_an_interrupt_an_isolated_send_raises_leaves_the_loop_with_no_task_behin
         except BaseException as error:
             reached.append(type(error))
             raise
+        finally:
+            current = asyncio.current_task()
+            pending.extend(task.get_name() for task in asyncio.all_tasks() if task is not current)
 
     with pytest.raises(KeyboardInterrupt):
         asyncio.run(main())
@@ -1852,3 +1856,4 @@ def test_an_interrupt_an_isolated_send_raises_leaves_the_loop_with_no_task_behin
     # The interrupt reached the caller's own task, not a cancellation from a loop it stopped.
     assert reached == [KeyboardInterrupt]
     assert reported == []
+    assert pending == []

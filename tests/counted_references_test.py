@@ -685,9 +685,10 @@ async def test_ax_cancelling_the_consumer_keeps_the_primary_cancellation() -> No
 @pytest.mark.parametrize("call", [1, 3, 10])
 def test_an_interrupt_a_counted_tail_send_raises_leaves_the_loop_with_no_task_behind(call: int) -> None:
     # A counted binding's tail pages are fetched by tasks of the library's own (the heads come first, in calls 1
-    # and 2): the transport's interrupt reaches the caller's task, with no library task ending in it.
+    # and 2): the transport's interrupt reaches the caller's task, with no library task ending in it or left behind.
     reported: list[str] = []
     reached: list[type[BaseException]] = []
+    pending: list[str] = []
     answer = _dense(ROWS)
     calls = 0
 
@@ -705,6 +706,9 @@ def test_an_interrupt_a_counted_tail_send_raises_leaves_the_loop_with_no_task_be
         except BaseException as error:
             reached.append(type(error))
             raise
+        finally:
+            current = asyncio.current_task()
+            pending.extend(task.get_name() for task in asyncio.all_tasks() if task is not current)
 
     with pytest.raises(KeyboardInterrupt):
         asyncio.run(main())
@@ -712,6 +716,7 @@ def test_an_interrupt_a_counted_tail_send_raises_leaves_the_loop_with_no_task_be
     # The interrupt reached the caller's own task, not a cancellation from a loop it stopped.
     assert reached == [KeyboardInterrupt]
     assert reported == []
+    assert pending == []
 
 
 # --- What a failed or abandoned page reports and how it settles ------------------------------------

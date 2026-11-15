@@ -21,6 +21,7 @@ from b24api.execution import (
     Executor,
     WorkClass,
 )
+from b24api.execution.context import latch_interrupt
 from b24api.execution.facts import settlement
 from b24api.references.outcome import (
     KernelReferenceFailure,
@@ -1289,7 +1290,8 @@ class _BatchPageDispatcher:
             # Every page fails with the chunk's error and keeps what its own command did, which the chunk's
             # progress says at the page's position, whatever failed: a sent page no longer has a deadline to end
             # its wait. An interrupt (``is_interrupt``) reaches every page's fetch as itself: the sender never ends
-            # in it, and it is no page's outcome.
+            # in it, and it is no page's outcome: the operation's latch has it.
+            latch_interrupt(error)
             for position, item in enumerate(chunk):
                 if not item.future.done():
                     item.future.set_exception(

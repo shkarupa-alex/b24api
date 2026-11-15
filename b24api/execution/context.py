@@ -456,10 +456,53 @@ class OwnedPull[T](Protocol):
 def is_interrupt(error: BaseException | None) -> bool:
     """Whether ``error`` interrupts the program rather than fails work: neither an ``Exception`` nor a cancellation.
 
-    ``KeyboardInterrupt`` and ``SystemExit`` are the usual ones. An interrupt is never a failure to report only, nor
-    one behind another: whatever came before it, it is what leaves, and a report may record it besides.
+    ``KeyboardInterrupt`` and ``SystemExit`` are the usual ones.
     """
     return error is not None and not isinstance(error, Exception | asyncio.CancelledError)
+
+
+class InterruptLatch:
+    """The first interrupt (``is_interrupt``) an operation saw, wherever its own code caught it.
+
+    Library code that catches a ``BaseException`` in an operation's work latches it (``latch_interrupt``) and goes on
+    as with any failure: turns it into a binding's end, a page's failure or a task's ``Settled`` result. The
+    operation raises the latched interrupt as its end, ahead of anything else, once its report is published, so no
+    route an interrupt takes (an event, a future, a task's result) can drop it. ``wake`` lets the operation end at
+    once instead of when it would have ended otherwise, until the operation is ending (``end``).
+    """
+
+    __slots__ = ("_wake", "first")
+
+    def __init__(self, wake: Callable[[], None] | None = None) -> None:
+        """Hold no interrupt yet."""
+        self.first: BaseException | None = None
+        self._wake = wake
+
+    def end(self) -> None:
+        """The operation is ending: an interrupt latched from now on is raised at its end, waking nothing.
+
+        The latch outlives the operation in the context of any task its work started, so it lets go of ``wake``.
+        """
+        self._wake = None
+
+    def record(self, error: BaseException | None) -> None:
+        """Keep ``error`` when it is the operation's first interrupt; anything else is not this latch's."""
+        if self.first is not None or not is_interrupt(error):
+            return
+        self.first = error
+        if self._wake is not None:
+            self._wake()
+
+
+# The latch of the operation whose work runs the current code: its runner sets it in its read and cleanup tasks, and
+# every task they start inherits it.
+INTERRUPTS: ContextVar[InterruptLatch | None] = ContextVar("b24api_interrupts", default=None)
+
+
+def latch_interrupt(error: BaseException) -> None:
+    """Latch ``error`` on the current operation's ``InterruptLatch`` when it is an interrupt."""
+    if (latch := INTERRUPTS.get()) is not None:
+        latch.record(error)
 
 
 class Settled[T]:
@@ -469,7 +512,8 @@ class Settled[T]:
     instead of ending in the failure. ``asyncio.run`` reports every task that its shutdown cancelled and that then
     ended in an exception, whether or not its owner retrieves it later, so only a task that never ends in one keeps
     the failure its owner's alone. That includes ``KeyboardInterrupt`` and ``SystemExit``: a task ending in one
-    stops the event loop from inside that task, leaving the owner waiting, so the owner raises it instead.
+    stops the event loop from inside that task, leaving the owner waiting. An interrupt is latched on the operation
+    besides (``InterruptLatch``), which raises it as its end whatever the owner does with the result.
     """
 
     __slots__ = ("error", "value")
@@ -493,6 +537,7 @@ async def settle[T](work: Awaitable[T]) -> Settled[T]:
     except asyncio.CancelledError:
         raise
     except BaseException as error:  # noqa: BLE001 - returned for the task's owner to raise: the task ends without it
+        latch_interrupt(error)
         settled: Settled[T] = Settled(error=error)
     # The work's cleanup may have re-armed a cancellation it absorbed on this task, which would end it cancelled and
     # lose the failure. Whoever cancelled it learns how it ended from its owner, so the task takes the cancellation.
@@ -694,6 +739,7 @@ async def await_cleanup_resistant(
             return CleanupResult(cancellation, None)
         return CleanupResult(None, error)
     except BaseException as error:  # noqa: BLE001 - cleanup failure is returned with cancellation
+        latch_interrupt(error)
         return CleanupResult(cancellation, error)
     return CleanupResult(cancellation, None)
 

@@ -1229,9 +1229,11 @@ async def test_two_partitioned_sources_and_an_ordinary_one_exhaust_in_input_orde
 @pytest.mark.parametrize("call", [1, 2, 4, 8])
 def test_an_interrupt_a_wave_send_raises_leaves_the_loop_with_no_task_behind(call: int) -> None:
     # A fast binding's pages are fetched in waves, each page by a task of the library's own: the transport's
-    # interrupt reaches the caller's task, which raises it out of asyncio.run, with no library task ending in it.
+    # interrupt reaches the caller's task, which raises it out of asyncio.run, with no library task ending in it or
+    # left behind.
     reported: list[str] = []
     reached: list[type[BaseException]] = []
+    pending: list[str] = []
     names = ("p0", "p1")
     answer = _answer(dict.fromkeys(names, DISTRIBUTIONS["dense"]))
     calls = 0
@@ -1258,6 +1260,9 @@ def test_an_interrupt_a_wave_send_raises_leaves_the_loop_with_no_task_behind(cal
         except BaseException as error:
             reached.append(type(error))
             raise
+        finally:
+            current = asyncio.current_task()
+            pending.extend(task.get_name() for task in asyncio.all_tasks() if task is not current)
 
     with pytest.raises(KeyboardInterrupt):
         asyncio.run(main())
@@ -1265,6 +1270,7 @@ def test_an_interrupt_a_wave_send_raises_leaves_the_loop_with_no_task_behind(cal
     # The interrupt reached the caller's own task, not a cancellation from a loop it stopped.
     assert reached == [KeyboardInterrupt]
     assert reported == []
+    assert pending == []
 
 
 @pytest.mark.asyncio
