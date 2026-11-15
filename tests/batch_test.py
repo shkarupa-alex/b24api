@@ -33,9 +33,11 @@ from b24api.errors import (
     CapabilityError,
     FailurePhase,
     ProtocolError,
+    ResultTooLargeError,
     TransportError,
 )
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse
+from b24api.execution.facts import Execution, execution
 from tests.ledger_hold import LedgerHold
 from tests.scripting import (
     DEADLINE_BUDGET,
@@ -256,18 +258,21 @@ async def test_batch_list_result_uses_nested_decoded_row_weight() -> None:
         ).encode()
         return WireResponse(200, (("content-type", "application/json"),), body)
 
+    # The command ran: its result, longer than the row budget, is dropped as an answered failure, never lost.
     rejected = batch_outcome_stream(
         BatchExecutor(Executor(ResponderTransport(list_result))),
         [Request("profile", route=RouteKind.BARE)],
         batch_size=1,
         policy=ExecutionPolicy(max_buffered_rows=1),
     )
-    with pytest.raises(BudgetExceededError, match="buffer") as captured:
-        await anext(rejected)
-    assert attached_report(captured.value) is rejected.report
-    assert rejected.report.state is KernelState.FAILED
-    assert rejected.report.emitted_rows == 0
-    assert rejected.report.buffered_rows_high_water == 0
+    dropped = await anext(rejected)
+    assert isinstance(dropped, BatchFailure)
+    assert isinstance(dropped.error, ResultTooLargeError)
+    assert (dropped.error.rows, dropped.error.limit) == (NESTED_ROW_COUNT, 1)
+    assert execution(dropped.error) is Execution.ANSWERED
+    assert [item async for item in rejected] == []
+    assert rejected.report.state is KernelState.COMPLETED
+    assert rejected.report.buffered_rows_high_water == 1
 
     admitted = batch_outcome_stream(
         BatchExecutor(Executor(ResponderTransport(list_result))),

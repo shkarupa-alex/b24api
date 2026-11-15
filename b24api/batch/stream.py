@@ -16,7 +16,7 @@ from b24api.batch.engine import (
     _Chunk,
     _raise_source_error,
 )
-from b24api.batch.outcome import BatchSuccess
+from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts.policy import (
     CompletionAssurance,
     ExecutionPolicy,
@@ -31,6 +31,7 @@ from b24api.execution import (
     AsyncIteratorController,
     ExecutionContext,
 )
+from b24api.execution.facts import dropped_result
 from b24api.execution.lifecycle import (
     CleanupAttempt,
     LifecycleHooks,
@@ -131,7 +132,8 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             if chunk.source_error is not None:
                 _raise_source_error(chunk.source_error)
             self._batch_commands += len(chunk.commands)
-            outcomes = await self._execute(chunk.commands)
+            # The window has run: a result its rows leave no room for is dropped as answered, never lost unsent.
+            outcomes = _within_row_budget(await self._execute(chunk.commands), self._context.policy.max_buffered_rows)
             buffered_rows = sum(_batch_outcome_row_weight(outcome) for outcome in outcomes)
             await self._context.set_buffered_rows(buffered_rows)
             for outcome in outcomes:
@@ -216,6 +218,43 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         )
         self.report = with_cleanup_attempt(self.report, cause, attempt)
         return self.report
+
+
+def _within_row_budget(
+    outcomes: tuple[BatchSuccess | BatchFailure, ...], max_rows: int
+) -> tuple[BatchSuccess | BatchFailure, ...]:
+    """Fit a window's decoded results into the row budget; a result that does not fit is dropped, never delivered.
+
+    The window has run when its rows are known, so the budget can no longer refuse to send it; it bounds what the
+    stream holds. Each outcome holds at least one row (a window never has more commands than the budget has rows),
+    and a success holds its result's rows: in window order, each is charged while it fits what the budget has left
+    after the one row of each later outcome. A success whose rows do not fit becomes a failure that keeps the
+    execution facts: the command ran and was answered (``dropped_result``), so it is neither a success, nor proven
+    not run, nor replayed.
+    """
+    left = max_rows
+    fitted: list[BatchSuccess | BatchFailure] = []
+    for position, outcome in enumerate(outcomes):
+        room = left - (len(outcomes) - position - 1)
+        if isinstance(outcome, BatchSuccess) and _batch_outcome_row_weight(outcome) > room:
+            request = outcome.request
+            outcome = BatchFailure(  # noqa: PLW2901 - the dropped result replaces the success it was
+                outcome.command_index,
+                outcome.stable_key,
+                request,
+                dropped_result(
+                    rows=outcome.decoded_rows,
+                    limit=room,
+                    request_summary=request.summary,
+                    evidence=None if outcome.response is None else outcome.response.evidence,
+                ),
+                replay_safety=request.replay_safety,
+                correlation=outcome.correlation,
+                evidence=outcome.evidence,
+            )
+        left -= _batch_outcome_row_weight(outcome)
+        fitted.append(outcome)
+    return tuple(fitted)
 
 
 def _failure_report(cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
