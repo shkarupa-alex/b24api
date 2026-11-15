@@ -166,6 +166,35 @@ class _Source:
             await reached(self.release)
 
 
+class _SyncSource:
+    """``_Source`` as a synchronous iterator: pulled and closed in worker threads, its close blocking there."""
+
+    def __init__(
+        self, family: str, close: str, *, fail_after: int | None = None, failure: Exception | None = None
+    ) -> None:
+        self._items = iter(_items(family))
+        self._close = close
+        self._fail_after = fail_after
+        self._failure = failure or ValueError("the caller's source failed")
+        self._pulled = 0
+        self.release = threading.Event()
+
+    def __iter__(self) -> _SyncSource:
+        return self
+
+    def __next__(self) -> Any:  # noqa: ANN401 - commands, bindings or reference sources
+        if self._pulled == self._fail_after:
+            raise self._failure
+        self._pulled += 1
+        return next(self._items)
+
+    def close(self) -> None:
+        if self._close == "raises":
+            raise RuntimeError("the caller's close failed")
+        if self._close == "overruns":
+            self.release.wait(HANG_BOUND)
+
+
 def _stream(client: Bitrix24, family: str, source: Iterable[Any] | AsyncIterator[Any]) -> OperationStream[Any]:
     direct = DirectDispatch(concurrency=1)
     if family == "iter_cursors":
@@ -188,10 +217,12 @@ async def _end(stream: OperationStream[Any], ending: str) -> None:
                 break
 
 
+SOURCE_KINDS: dict[str, type[_Source | _SyncSource]] = {"async": _Source, "sync": _SyncSource}
+
+
 async def _close_fails(
-    family: str, close: str, ending: str, *, fail_after: int | None = None, failure: Exception | None = None
+    source: _Source | _SyncSource, family: str, close: str, ending: str
 ) -> tuple[BaseException, OperationReport]:
-    source = _Source(family, close, fail_after=fail_after, failure=failure)
     async with client_for(ResponderTransport(_answer), policy=POLICIES[close]) as client:
         stream = _stream(client, family, source)
         try:
@@ -209,13 +240,15 @@ def _violations(report: OperationReport) -> list[tuple[str, str]]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["async", "sync"])
 @pytest.mark.parametrize("close", ["raises", "overruns"])
 @pytest.mark.parametrize("ending", ["read_to_end", "break", "aclose_before_read"])
 @pytest.mark.parametrize("family", FAMILIES)
 async def test_a_failed_close_is_what_failed_when_nothing_failed_before_it(
-    family: str, ending: str, close: str
+    family: str, ending: str, close: str, kind: str
 ) -> None:
-    error, report = await _close_fails(family, close, ending)
+    # A synchronous source's ``close()`` and an asynchronous one's ``aclose()`` fail the same way.
+    error, report = await _close_fails(SOURCE_KINDS[kind](family, close), family, close, ending)
 
     name = CLOSE_FAILURES[close]
     assert type(error) is _raised_for(family, close)
@@ -228,10 +261,12 @@ async def test_a_failed_close_is_what_failed_when_nothing_failed_before_it(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["async", "sync"])
 @pytest.mark.parametrize("close", ["raises", "overruns"])
 @pytest.mark.parametrize("family", FAMILIES)
-async def test_a_failed_close_behind_an_earlier_failure_is_its_secondary(family: str, close: str) -> None:
-    error, report = await _close_fails(family, close, "read_to_end", fail_after=1)
+async def test_a_failed_close_behind_an_earlier_failure_is_its_secondary(family: str, close: str, kind: str) -> None:
+    source = SOURCE_KINDS[kind](family, close, fail_after=1)
+    error, report = await _close_fails(source, family, close, "read_to_end")
 
     name = CLOSE_FAILURES[close]
     assert type(error) is SOURCE_FAILURE[family]
@@ -245,15 +280,17 @@ async def test_a_failed_close_behind_an_earlier_failure_is_its_secondary(family:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["async", "sync"])
 @pytest.mark.parametrize("failure", [BudgetExceededError("the caller's budget"), PaginationError("the caller's page")])
 @pytest.mark.parametrize("fail_after", [0, 1])
 @pytest.mark.parametrize("family", FAMILIES)
 async def test_a_source_raising_a_library_error_of_its_own_is_its_failure(
-    family: str, fail_after: int, failure: Exception
+    family: str, fail_after: int, failure: Exception, kind: str
 ) -> None:
     # Whichever pull raises it, the first of a batch window included, it is neither the operation's budget end
     # nor a failed page: the source failed, and the stream says so with the caller's exception as the cause.
-    error, report = await _close_fails(family, "raises", "read_to_end", fail_after=fail_after, failure=failure)
+    source = SOURCE_KINDS[kind](family, "raises", fail_after=fail_after, failure=failure)
+    error, report = await _close_fails(source, family, "raises", "read_to_end")
 
     assert type(error) is SOURCE_FAILURE[family]
     assert _chain(error)[-2:] == [InputSourceError, type(failure)]
