@@ -8,7 +8,6 @@ redaction) comes from the one ``Webhook`` value, so no two readers disagree.
 
 from __future__ import annotations
 import contextlib
-import importlib
 import ipaddress
 import re
 import secrets
@@ -22,7 +21,7 @@ import httpx
 from pydantic import HttpUrl, TypeAdapter, ValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Iterable
 
 _DEFAULT_PORTS = MappingProxyType({"http": 80, "https": 443})
 # Percent-encoded characters are refused rather than decoded, so the path HTTPX sends is the classic base
@@ -46,8 +45,6 @@ _PORT_MAXIMUM = 65535
 # Leading and trailing C0 controls and spaces are dropped, as URL parsers drop them; any other is refused.
 _SURROUNDING = "".join(map(chr, range(0x21)))
 _HTTP_URL: TypeAdapter[HttpUrl] = TypeAdapter(HttpUrl)
-# What ``re.compile`` runs on a cache miss: a matcher of webhook tokens must not stay in the module's cache.
-_compile_uncached: Callable[[str, int], re.Pattern[str]] = importlib.import_module("re._compiler").compile
 
 
 class WebhookRefusal(Enum):
@@ -113,17 +110,17 @@ class WebhookSecrets:
 
     Whoever keeps webhook secrets to scrub (the HTTPX log shield and its filter) holds this carrier, not the
     tokens, so neither a frame local nor an attribute a traceback renders shows one: its ``repr`` names only
-    how many it holds, and it is not iterable. An empty token is no secret and is not held. The matcher is
-    compiled on first use, not when the carrier is built, and only this carrier keeps it: nothing caches it.
+    how many it holds, and it is not iterable. An empty token is no secret and is not held. Tokens are found by
+    plain string search, so nothing outside the carrier (no regex cache) ever keeps one; the one webhook per
+    distinct token it searches with is picked on first use, not when the carrier is built.
     """
 
-    __slots__ = ("_compiled", "_pattern", "_union", "_webhooks")
+    __slots__ = ("_distinct", "_union", "_webhooks")
 
     def __init__(self, webhooks: Iterable[Webhook] = ()) -> None:
         """Hold the tokens of ``webhooks``, ignoring an empty one."""
         self._webhooks = frozenset(webhook for webhook in webhooks if webhook.token)
-        self._pattern: re.Pattern[str] | None = None
-        self._compiled = False
+        self._distinct: tuple[Webhook, ...] | None = None
         # The carrier last joined to this one and the union, so joining the same two again builds nothing.
         self._union: tuple[WebhookSecrets, WebhookSecrets] | None = None
 
@@ -133,7 +130,7 @@ class WebhookSecrets:
 
     def __len__(self) -> int:
         """Count the distinct tokens held."""
-        return len({webhook.token for webhook in self._webhooks})
+        return len(self._searched())
 
     def __contains__(self, token: object) -> bool:
         """Report whether ``token`` is exactly one of the tokens held."""
@@ -153,56 +150,47 @@ class WebhookSecrets:
 
     def found_in(self, text: str) -> bool:
         """Report whether any token held occurs in ``text``."""
-        matcher = self._matcher()
-        return matcher is not None and matcher.search(text) is not None
+        return any(webhook.token in text for webhook in self._searched())
 
     def replaced_in(self, text: str, replacement: str) -> str:
         """Return ``text`` with every stretch any token held covers replaced, once, by ``replacement``.
 
-        Occurrences that overlap or touch, of one token or of several, form one stretch, so no part of any token
-        survives: ``abcd`` and ``cdef`` over ``abcdef`` leave nothing of it.
+        Every occurrence of every token is found, overlapping ones too, and occurrences that overlap or touch
+        form one stretch, so no part of any token survives: ``abcd`` and ``cdef`` over ``abcdef`` leave nothing.
         """
-        matcher = self._matcher()
-        if matcher is None:
+        spans: list[tuple[int, int]] = []
+        for webhook in self._searched():
+            start = text.find(webhook.token)
+            while start != -1:
+                spans.append((start, start + len(webhook.token)))
+                # Searched again one past this occurrence, not after it, so an overlapping one is found too.
+                start = text.find(webhook.token, start + 1)
+        if not spans:
             return text
-        stretches: list[list[int]] = []
-        match = matcher.search(text)
-        while match is not None:
-            start, end = match.span()
-            if stretches and start <= stretches[-1][1]:
-                stretches[-1][1] = max(stretches[-1][1], end)
-            else:
-                stretches.append([start, end])
-            # The next search starts one past this match, not at its end, so an overlapping token is found too.
-            match = matcher.search(text, start + 1)
-        if not stretches:
-            return text
+        spans.sort()
         pieces: list[str] = []
         kept = 0
-        for start, end in stretches:
-            pieces += (text[kept:start], replacement)
-            kept = end
-        pieces.append(text[kept:])
+        stretch_start, stretch_end = spans[0]
+        for start, end in spans[1:]:
+            if start <= stretch_end:
+                stretch_end = max(stretch_end, end)
+                continue
+            pieces += (text[kept:stretch_start], replacement)
+            kept = stretch_end
+            stretch_start, stretch_end = start, end
+        pieces += (text[kept:stretch_start], replacement, text[stretch_end:])
         return "".join(pieces)
 
-    def _matcher(self) -> re.Pattern[str] | None:
-        if not self._compiled:
-            # Racing threads compile the same matcher; either result is kept.
-            self._pattern = _token_pattern(self._webhooks)
-            self._compiled = True
-        return self._pattern
+    def _searched(self) -> tuple[Webhook, ...]:
+        if self._distinct is None:
+            # Racing threads pick the same webhooks; either result is kept.
+            self._distinct = _distinct_tokens(self._webhooks)
+        return self._distinct
 
 
-def _token_pattern(webhooks: frozenset[Webhook]) -> re.Pattern[str] | None:
-    """Match, at the first position a token starts, the longest token starting there.
-
-    The longest first, so a token that starts another never hides the rest of it. The pattern holds plain tokens,
-    so it is compiled without the ``re`` module's cache, which would keep it for as long as the process runs.
-    """
-    if not webhooks:
-        return None
-    ordered = sorted(webhooks, key=lambda webhook: len(webhook.token), reverse=True)
-    return _compile_uncached("|".join(re.escape(webhook.token) for webhook in ordered), 0)
+def _distinct_tokens(webhooks: frozenset[Webhook]) -> tuple[Webhook, ...]:
+    """One webhook per distinct token, so a token two webhooks share is searched for once."""
+    return tuple({webhook.token: webhook for webhook in webhooks}.values())
 
 
 def parse_webhook(url: object) -> Webhook | WebhookRefusal:

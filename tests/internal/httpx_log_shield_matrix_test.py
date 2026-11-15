@@ -553,9 +553,10 @@ def test_a_registered_token_another_registered_token_starts_is_scrubbed_whole() 
 
 def test_overlapping_registered_tokens_leave_no_part_of_either() -> None:
     _assert_shield_idle()
-    with _registered("abcd", "cdef"), _capture() as handler:
-        logging.getLogger("httpx").info("foreign record %s and %s", "xabcdefy", "abcd-cdef")
-    assert _messages(handler) == ["foreign record x[REDACTED]y and [REDACTED]-[REDACTED]"]
+    # Two tokens over one stretch, and one token over itself.
+    with _registered("abcd", "cdef", "abab"), _capture() as handler:
+        logging.getLogger("httpx").info("foreign record %s and %s, %s", "xabcdefy", "abcd-cdef", "zabababz")
+    assert _messages(handler) == ["foreign record x[REDACTED]y and [REDACTED]-[REDACTED], z[REDACTED]z"]
 
 
 def test_an_owned_record_scrubs_every_registered_token_with_the_owned_one() -> None:
@@ -577,43 +578,69 @@ def test_an_empty_token_is_no_secret() -> None:
         HTTPX_LOG_SHIELD.request(webhook=Webhook(_ADDRESS, "")).__enter__()
 
 
-def test_no_matcher_of_a_released_token_outlives_its_registration() -> None:
+def test_no_regex_keeps_a_released_token() -> None:
     _assert_shield_idle()
     token = "synthetic-matcher-secret-878787"  # noqa: S105 - a synthetic webhook token
     with _registered(token), _capture() as handler:
         logging.getLogger("httpx").info("foreign record %s", token)
     assert _messages(handler) == ["foreign record [REDACTED]"]
-    # The next lifecycle event prunes the closed client and its secret; no regex cache keeps a matcher of it.
+    # The next lifecycle event prunes the closed client and its secret; no regex, compiled or cached, holds it.
     HTTPX_LOG_SHIELD.registered_secrets()
     gc.collect()
     matchers = [pattern for pattern in gc.get_objects() if isinstance(pattern, re.Pattern)]
-    # A matcher holds each token escaped.
-    assert [pattern for pattern in matchers if re.escape(token) in str(pattern.pattern)] == []
+    held = (token, re.escape(token))
+    assert [pattern for pattern in matchers if any(form in str(pattern.pattern) for form in held)] == []
 
 
-def test_registering_a_client_builds_no_matcher(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Registration stays O(1) however many webhooks are registered: the registered secrets and their matcher are
-    # built once, on the first read after a change, and reused until the next change.
+def test_registering_a_client_builds_no_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Registration stays O(1) however many webhooks are registered: the registered secrets, and the tokens they
+    # search for, are built once, on the first read after a change, and reused until the next change.
     _assert_shield_idle()
-    compiles: list[str] = []
+    searched: list[int] = []
     carriers: list[int] = []
-    compile_uncached = _webhook._compile_uncached  # noqa: SLF001 - counts the matcher compilations
+    distinct_tokens = _webhook._distinct_tokens  # noqa: SLF001 - counts the token sets built
 
-    def counted_compile(pattern: str, flags: int) -> re.Pattern[str]:
-        compiles.append(pattern)
-        return compile_uncached(pattern, flags)
+    def counted_tokens(webhooks: frozenset[Webhook]) -> tuple[Webhook, ...]:
+        searched.append(len(webhooks))
+        return distinct_tokens(webhooks)
 
     class _CountedSecrets(WebhookSecrets):
         def __init__(self, webhooks: Iterable[Webhook] = ()) -> None:
             carriers.append(1)
             super().__init__(webhooks)
 
-    monkeypatch.setattr(_webhook, "_compile_uncached", counted_compile)
+    monkeypatch.setattr(_webhook, "_distinct_tokens", counted_tokens)
     monkeypatch.setattr(logging_shield, "WebhookSecrets", _CountedSecrets)
     tokens = [f"synthetic-bound-secret-{index:04d}" for index in range(_BOUND_CLIENTS)]
     with _registered(*tokens), _capture() as handler:
-        assert (len(compiles), len(carriers)) == (0, 0)
+        assert (len(searched), len(carriers)) == (0, 0)
         for token in tokens[:3]:
             logging.getLogger("httpx").info("foreign record %s", token)
-        assert (len(compiles), len(carriers)) == (1, 1)
+        assert (len(searched), len(carriers)) == (1, 1)
     assert _messages(handler) == ["foreign record [REDACTED]"] * 3
+
+
+def test_an_owned_dispatch_joins_its_secrets_to_the_registered_ones_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The owned webhook is not among the registered ones (a client that cannot be registered): each record of the
+    # dispatch needs both, joined once for the registry's state, not once per record.
+    _assert_shield_idle()
+    searched: list[int] = []
+    distinct_tokens = _webhook._distinct_tokens  # noqa: SLF001 - counts the token sets built
+
+    def counted_tokens(webhooks: frozenset[Webhook]) -> tuple[Webhook, ...]:
+        searched.append(len(webhooks))
+        return distinct_tokens(webhooks)
+
+    monkeypatch.setattr(_webhook, "_distinct_tokens", counted_tokens)
+    logger = logging.getLogger("httpx")
+    with (
+        _registered("synthetic-other-secret-1"),
+        _capture() as handler,
+        HTTPX_LOG_SHIELD.request(webhook=_OWNED_WEBHOOK),
+    ):
+        logger.info("owned record %s", _OWNED)
+        built = len(searched)
+        for _ in range(3):
+            logger.info("owned record %s", "synthetic-other-secret-1")
+        assert len(searched) == built
+    assert _messages(handler) == ["owned record [REDACTED]"] * 4
