@@ -2593,6 +2593,13 @@ async def test_later_partition_lanes_are_not_rescheduled_while_frontier_is_open(
     await stream.aclose()
 
 
+def _fast_execution(kind: str) -> RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution:
+    contract = StableIntegerKeysetContract()
+    if kind == "range":
+        return RangeKeysetExecution(contract)
+    return PartitionedKeysetExecution(contract) if kind == "partitioned" else AutoKeysetExecution(contract)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["range", "partitioned", "auto"])
 @pytest.mark.parametrize("refused_at", [2, 3, 4])
@@ -2619,12 +2626,7 @@ async def test_a_wave_retry_the_deadline_refuses_ends_the_traversal_with_the_bud
         return await keyset.send(request, attempt_timeout=1.0, max_response_bytes=1 << 20)
 
     transport = ResponderTransport(respond, host=keyset.host)
-    contract = StableIntegerKeysetContract()
-    execution = {
-        "range": RangeKeysetExecution(contract),
-        "partitioned": PartitionedKeysetExecution(contract),
-        "auto": AutoKeysetExecution(contract),
-    }[kind]
+    execution = _fast_execution(kind)
     stream = _stream(
         transport, execution, policy=ExecutionPolicy(max_elapsed=600.0, max_retry_elapsed_per_request=600.0)
     )
@@ -2670,12 +2672,7 @@ async def test_a_wave_cancelled_while_it_waits_for_its_replay_settles_unknown(
         return WireResponse(200, answer.headers, json.dumps(body).encode())
 
     transport = ResponderTransport(respond, host=keyset.host)
-    contract = StableIntegerKeysetContract()
-    execution = {
-        "range": RangeKeysetExecution(contract),
-        "partitioned": PartitionedKeysetExecution(contract),
-        "auto": AutoKeysetExecution(contract),
-    }[kind]
+    execution = _fast_execution(kind)
     stream = _stream(transport, execution)
     gate = stream._source.completion_gate
     events: list[object] = []
