@@ -439,9 +439,14 @@ class CompletionGate:
             raise RuntimeError("completion report facts must be attached once")
         self._report_facts = facts
 
+    @property
+    def unstarted(self) -> bool:
+        """Whether the operation was never pulled: no page and no stream terminal reached the gate."""
+        return self._stream is None and not self._pages
+
     def abort_unstarted(self) -> None:
         """Close a lazy operation that was never pulled, without claiming exhaustion."""
-        if self._stream is not None or self._pages:
+        if not self.unstarted:
             raise RuntimeError("only an unstarted gate can be aborted")
         sequence = self._sequence + 1
         for binding_id in tuple(self._bindings):

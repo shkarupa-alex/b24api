@@ -470,7 +470,8 @@ class LatchState(Enum):
     # The operation is cleaning up: an interrupt latched now is raised at its end, waking nothing (its cleanup runs
     # then, an inline kernel's in the very read a wake would cancel).
     ENDING = "ending"
-    # The operation ended and its interrupt is out, raised or handed on: any other one goes to the event loop.
+    # The interrupt is out: raised at the operation's end, or handed to the event loop as it was latched between
+    # reads. Any other one goes to the event loop.
     CLOSED = "closed"
 
 
@@ -479,10 +480,11 @@ class InterruptLatch:
 
     Library code that first catches a ``BaseException`` in an operation's work latches it (``latch_interrupt``) and
     goes on as with any failure: turns it into a binding's end, a page's failure or a task's ``Settled`` result. The
-    operation's end takes the latched interrupt (``close``), ahead of anything else, once its report is published, so
-    no route an interrupt takes (an event, a future, a task's result) can drop it. Once the operation has ended,
-    nobody would raise another: the latch hands one caught then to the event loop (``hand_on``), which raises it out
-    of ``asyncio.run`` as it does any task's, once, while its catchers go on as with any failure.
+    operation's end takes the latched interrupt (``close``), ahead of anything else, once its report is published; one
+    latched while no read is in flight is taken at once and handed to the event loop. So no route an interrupt takes
+    (an event, a future, a task's result) can drop it. Once its interrupt is out, nobody would raise another: the
+    latch hands one caught then to the event loop (``hand_on``), which raises it out of ``asyncio.run`` as it does
+    any task's, once, while its catchers go on as with any failure.
     """
 
     __slots__ = ("_handed", "_wake", "first", "state")
@@ -501,7 +503,7 @@ class InterruptLatch:
             self.state = LatchState.ENDING
 
     def close(self) -> BaseException | None:
-        """The operation ended: return its interrupt, if any, for its end to raise or hand on; none is latched now.
+        """The interrupt is out now: return it, if any, for the caller to raise or hand on; none is latched from now on.
 
         The latch outlives the operation in the context of any task its work started, so it lets go of its owner.
         """
