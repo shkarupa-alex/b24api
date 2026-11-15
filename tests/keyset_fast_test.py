@@ -78,6 +78,7 @@ from tests.scripting import ResponderTransport, client_for
 
 if TYPE_CHECKING:
     from b24api.contracts import JsonValue
+    from b24api.contracts.completion import CompletionEvidence
     from b24api.execution.executor import _Pause, _RequestAttempts
 
 PAGE_SIZE = 5
@@ -2673,16 +2674,15 @@ async def test_a_wave_cancelled_while_it_waits_for_its_replay_settles_unknown(
 
     transport = ResponderTransport(respond, host=keyset.host)
     execution = _fast_execution(kind)
-    stream = _stream(transport, execution)
-    gate = stream._source.completion_gate
     events: list[object] = []
-    emit = gate.emit
+    emit = CompletionGate.emit
 
-    def observe(event: object) -> None:
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
         events.append(event)
-        emit(event)
+        emit(gate, event)
 
-    gate.emit = observe
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    stream = _stream(transport, execution)
 
     async def consume() -> None:
         async for _ in stream:
