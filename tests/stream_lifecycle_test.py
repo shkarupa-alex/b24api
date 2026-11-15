@@ -138,6 +138,20 @@ def _published(error: BaseException) -> OperationReport:
     return report
 
 
+# A failed close is the source failing: it raises the family's source failure, chained to the caller's exception.
+CLOSE_FAILURE = (BatchFailed, InputSourceError)
+
+
+def _assert_close_failure(error: BaseException, family: str) -> None:
+    assert type(error) is (BatchFailed if family in {"batch", "fan_out"} else InputSourceError)
+    causes = []
+    cause: BaseException | None = error
+    while cause is not None:
+        causes.append(type(cause))
+        cause = cause.__cause__
+    assert causes[-2:] == [InputSourceError, _CloseFailedError]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
 async def test_early_close_with_failing_source_close_publishes_one_report(family: str) -> None:
@@ -145,8 +159,9 @@ async def test_early_close_with_failing_source_close_publishes_one_report(family
     async with _client(_Portal()) as client:
         stream = _stream(client, family, source)
         await anext(stream)
-        with pytest.raises(_CloseFailedError) as raised:
+        with pytest.raises(CLOSE_FAILURE) as raised:
             await stream.aclose()
+        _assert_close_failure(raised.value, family)
 
         report = stream.report
         assert report is not None
@@ -205,8 +220,9 @@ async def test_failing_source_close_before_the_first_pull_is_a_cleanup_failure(f
     source = _Source(close_fails=True)
     async with _client(_Portal()) as client:
         stream = _stream(client, family, source)
-        with pytest.raises(_CloseFailedError) as raised:
+        with pytest.raises(CLOSE_FAILURE) as raised:
             await stream.aclose()
+        _assert_close_failure(raised.value, family)
 
         report = stream.report
         assert report is not None
@@ -239,7 +255,9 @@ async def test_body_failure_survives_a_failing_source_close_on_context_exit(fami
             await body()
 
         # The body's own exception reaches the caller; the cleanup failure is a note and a report entry.
-        assert any("_CloseFailedError" in note for note in raised.value.__notes__)
+        # The note names the error the close would have raised: the family's source failure.
+        raised_name = "BatchFailed" if family in {"batch", "fan_out"} else "InputSourceError"
+        assert f"stream cleanup also failed ({raised_name})" in raised.value.__notes__
         report = stream.report
         assert report is not None
         assert report.terminal_reason == "stream cleanup failed"
@@ -258,8 +276,9 @@ async def test_context_exit_without_a_body_failure_still_raises_the_cleanup_fail
             async with stream:
                 await anext(stream)
 
-        with pytest.raises(_CloseFailedError):
+        with pytest.raises(CLOSE_FAILURE) as raised:
             await body()
+        _assert_close_failure(raised.value, family)
         assert stream.report is not None
     assert source.closes == 1
 
@@ -268,14 +287,16 @@ async def test_context_exit_without_a_body_failure_still_raises_the_cleanup_fail
 @pytest.mark.parametrize("family", FAMILIES)
 async def test_source_close_failure_after_exhaustion_is_a_cleanup_failure_not_a_source_failure(family: str) -> None:
     # The owned source is closed by its owner's cleanup, not inside the final pull (§3.2), so every
-    # command is still delivered and the close failure never masquerades as a failed input source.
+    # command is still delivered, and the close failure, raised as the source's failure, is reported as the
+    # cleanup failure it is, never as a failed read of the source.
     source = _Source(close_fails=True)
     async with _client(_Portal()) as client:
         stream = _stream(client, family, source)
         for _ in range(COMMANDS):
             await anext(stream)
-        with pytest.raises(_CloseFailedError) as raised:
+        with pytest.raises(CLOSE_FAILURE) as raised:
             await anext(stream)
+        _assert_close_failure(raised.value, family)
 
     report = _published(raised.value)
     assert report.state is TerminalState.FAILED
@@ -296,8 +317,9 @@ async def test_cancelled_pull_with_failing_source_close_raises_the_cleanup_failu
         pull = asyncio.ensure_future(anext(stream))
         await portal.entered.wait()
         pull.cancel()
-        with pytest.raises(_CloseFailedError) as raised:
+        with pytest.raises(CLOSE_FAILURE) as raised:
             await pull
+        _assert_close_failure(raised.value, family)
 
         report = stream.report
         assert report is not None
@@ -317,8 +339,9 @@ async def test_logical_batch_cancel_cleanup_failure_is_a_terminal_cleanup_failur
         pull = asyncio.ensure_future(anext(stream))
         await portal.entered.wait()
         pull.cancel()
-        with pytest.raises(_CloseFailedError):
+        with pytest.raises(CLOSE_FAILURE) as raised:
             await pull
+        _assert_close_failure(raised.value, family)
     assert stream.report is not None
     assert stream.report.terminal_reason == "stream cleanup failed"
 

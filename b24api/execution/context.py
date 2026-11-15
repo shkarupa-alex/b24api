@@ -530,7 +530,8 @@ class AsyncIteratorController[T]:
         try:
             await self._close_source()
         except BaseException as close_error:
-            if pull_error is not None:
+            # A close failure that already chains to its own cause (the source's exception) keeps it.
+            if pull_error is not None and close_error.__cause__ is None:
                 raise close_error from pull_error
             raise
         if pull_error is not None:

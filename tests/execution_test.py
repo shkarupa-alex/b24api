@@ -23,6 +23,7 @@ from b24api.errors import (
     ClientClosedError,
     FailurePhase,
     HTTPGatewayError,
+    InputSourceError,
     ProtocolError,
     ResponseTooLargeError,
     TransportError,
@@ -358,7 +359,7 @@ async def test_a_stream_cleanup_failure_still_delivers_the_reader_cancellation()
     async with client_for(ResponderTransport(blocker)) as api:
 
         async def reader() -> None:
-            with contextlib.suppress(CloseFailedError):
+            with contextlib.suppress(InputSourceError):
                 async for _outcome in api.batch_outcomes(Source(), batch_size=2):
                     pass
             steps.append("cleanup failure raised")

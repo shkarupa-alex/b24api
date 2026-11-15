@@ -12,7 +12,7 @@ the iterator is never closed while it runs and the context is never entered twic
 wait is bounded on the event loop by the operation's cleanup window; past it the close finishes in
 the background. ``accept`` maps each raw item to the
 family's item and raises for a foreign one, ``observe`` records a bounded violation per admitted
-item, and ``failure`` maps a pull or admission failure onto the family's carrier. ``aclose``
+item, and ``failure`` maps a pull, admission or close failure onto the family's carrier. ``aclose``
 never raises: it returns the cleanup outcome and the lifecycle owner decides what to report.
 """
 
@@ -175,11 +175,17 @@ class OwnedSource[T](AsyncIterator[T]):
 
     async def _close_iterator(self) -> None:
         iterator = self._iterator
-        if isinstance(iterator, AsyncIterator):
-            if isinstance(iterator, AsyncClosable):
-                await iterator.aclose()
-        elif isinstance(iterator, SyncClosable):
-            await _finish_in_thread(functools.partial(self._run_in_context, iterator.close))
+        try:
+            if isinstance(iterator, AsyncIterator):
+                if isinstance(iterator, AsyncClosable):
+                    await iterator.aclose()
+            elif isinstance(iterator, SyncClosable):
+                await _finish_in_thread(functools.partial(self._run_in_context, iterator.close))
+        except Exception as error:
+            # The caller's close failing is its source failing, mapped as a failed pull is.
+            if self._failure is None:
+                raise
+            raise self._failure(error) from error
 
     def _run_in_context[R](self, call: Callable[..., R], *args: object) -> R:
         """Run ``call`` in the source's context in a worker thread, after any call still running there returns."""

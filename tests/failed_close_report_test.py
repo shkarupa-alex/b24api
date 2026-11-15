@@ -1,7 +1,9 @@
 """One report for a failed close, in every stream family that reads a caller's source.
 
 A close that raised, or that overran its cleanup window (``CleanupOverrunError``), is reported the same
-way whichever family read the source and however the stream ended: when nothing failed before it, the
+way whichever family read the source and however the stream ended. A close that raised is the source
+failing: it raises the family's source failure (``InputSourceError``, wrapped by ``BatchFailed`` in a
+fail-fast batch family) chained to the caller's exception, as a failed pull does. When nothing failed before it, the
 close is what failed (terminal reason "stream cleanup failed", one ``cleanup_failure`` violation
 "stream cleanup failed (X)", no other); behind an earlier failure it is that failure's secondary
 ("stream cleanup also failed (X)") and the earlier failure stays the terminal reason.
@@ -29,10 +31,12 @@ from b24api import (
     TerminalState,
 )
 from b24api.contracts import Command, ReferenceSource
-from b24api.errors import BatchFailed, CleanupOverrunError, InputSourceError
+from b24api.errors import BatchFailed, BudgetExceededError, CleanupOverrunError, InputSourceError, PaginationError
 from tests.scripting import DEADLINE_BUDGET, HANG_BOUND, ResponderTransport, client_for, reached
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from b24api import Bitrix24
     from b24api.contracts.report import OperationReport
     from b24api.contracts.stream import OperationStream
@@ -64,7 +68,20 @@ CURSOR = CursorSpec(
 )
 # A close that raises at once ends well within this budget; one that blocks overruns the short one.
 POLICIES = {"raises": ExecutionPolicy(max_elapsed=60.0), "overruns": ExecutionPolicy(max_elapsed=DEADLINE_BUDGET)}
-CLOSE_ERRORS: dict[str, type[Exception]] = {"raises": RuntimeError, "overruns": CleanupOverrunError}
+# What the report names: a close that raised is the source failing; an overrun is the library's own error.
+CLOSE_FAILURES = {"raises": "InputSourceError", "overruns": "CleanupOverrunError"}
+
+
+def _raised_for(family: str, close: str) -> type[Exception]:
+    return SOURCE_FAILURE[family] if close == "raises" else CleanupOverrunError
+
+
+def _chain(error: BaseException | None) -> list[type[BaseException]]:
+    chain: list[type[BaseException]] = []
+    while error is not None:
+        chain.append(type(error))
+        error = error.__cause__
+    return chain
 
 
 def _answer(request: Request) -> object:
@@ -80,7 +97,9 @@ def _answer(request: Request) -> object:
         return {"result": [], "total": 0}
     owner = parameters.get("filter")
     assert isinstance(owner, dict)
-    return {"result": [{"ID": 10 + int(owner["OWNER"])}], "total": 1}
+    index = owner["OWNER"]
+    assert isinstance(index, int)
+    return {"result": [{"ID": 10 + index}], "total": 1}
 
 
 def _binding(index: int) -> Binding[int]:
@@ -105,10 +124,13 @@ def _items(family: str) -> list[Any]:
 class _Source:
     """A caller's source whose close fails: it raises, or blocks until released; it may fail after one item."""
 
-    def __init__(self, family: str, close: str, *, fail_after: int | None = None) -> None:
+    def __init__(
+        self, family: str, close: str, *, fail_after: int | None = None, failure: Exception | None = None
+    ) -> None:
         self._items = iter(_items(family))
         self._close = close
         self._fail_after = fail_after
+        self._failure = failure or ValueError("the caller's source failed")
         self._pulled = 0
         self.release = asyncio.Event()
 
@@ -117,7 +139,7 @@ class _Source:
 
     async def __anext__(self) -> Any:  # noqa: ANN401 - commands, bindings or reference sources
         if self._pulled == self._fail_after:
-            raise ValueError("the caller's source failed")
+            raise self._failure
         self._pulled += 1
         try:
             return next(self._items)
@@ -132,13 +154,14 @@ class _Source:
 
 def _stream(client: Bitrix24, family: str, source: _Source) -> OperationStream[Any]:
     direct = DirectDispatch(concurrency=1)
-    if family in {"batch", "batch_outcomes"}:
-        return getattr(client, family)(source, batch_size=1)
-    if family in {"fan_out", "fan_out_outcomes", "iter_reference_sources", "iter_reference_source_outcomes"}:
-        return getattr(client, family)(source, dispatch=direct)
     if family == "iter_cursors":
         return client.iter_cursors(LIST_REQUEST, source, selector=ResultSelector(()), cursor=CURSOR, dispatch=direct)
-    return getattr(client, family)(LIST_REQUEST, source, traversal=TRAVERSAL, dispatch=direct)
+    build: Callable[..., OperationStream[Any]] = getattr(client, family)
+    if family in {"batch", "batch_outcomes"}:
+        return build(source, batch_size=1)
+    if family in {"fan_out", "fan_out_outcomes", "iter_reference_sources", "iter_reference_source_outcomes"}:
+        return build(source, dispatch=direct)
+    return build(LIST_REQUEST, source, traversal=TRAVERSAL, dispatch=direct)
 
 
 async def _end(stream: OperationStream[Any], ending: str) -> None:
@@ -152,9 +175,9 @@ async def _end(stream: OperationStream[Any], ending: str) -> None:
 
 
 async def _close_fails(
-    family: str, close: str, ending: str, *, fail_after: int | None = None
+    family: str, close: str, ending: str, *, fail_after: int | None = None, failure: Exception | None = None
 ) -> tuple[BaseException, OperationReport]:
-    source = _Source(family, close, fail_after=fail_after)
+    source = _Source(family, close, fail_after=fail_after, failure=failure)
     async with client_for(ResponderTransport(_answer), policy=POLICIES[close]) as client:
         stream = _stream(client, family, source)
         try:
@@ -180,8 +203,10 @@ async def test_a_failed_close_is_what_failed_when_nothing_failed_before_it(
 ) -> None:
     error, report = await _close_fails(family, close, ending)
 
-    name = CLOSE_ERRORS[close].__name__
-    assert type(error) is CLOSE_ERRORS[close]
+    name = CLOSE_FAILURES[close]
+    assert type(error) is _raised_for(family, close)
+    if close == "raises":
+        assert _chain(error)[-2:] == [InputSourceError, RuntimeError]
     assert report.state is (TerminalState.FAILED if ending == "read_to_end" else TerminalState.EARLY_CLOSED)
     assert report.terminal_reason == "stream cleanup failed"
     # The close's failure alone: no classification of it as the work's failure, no budget end, no "also".
@@ -194,11 +219,30 @@ async def test_a_failed_close_is_what_failed_when_nothing_failed_before_it(
 async def test_a_failed_close_behind_an_earlier_failure_is_its_secondary(family: str, close: str) -> None:
     error, report = await _close_fails(family, close, "read_to_end", fail_after=1)
 
-    name = CLOSE_ERRORS[close].__name__
+    name = CLOSE_FAILURES[close]
     assert type(error) is SOURCE_FAILURE[family]
+    assert _chain(error)[-2:] == [InputSourceError, ValueError]
     assert report.state is TerminalState.FAILED
     assert report.terminal_reason == "InputSourceError"
     assert sorted(_violations(report)) == [
         ("cleanup_failure", f"stream cleanup also failed ({name})"),
         ("source_failure", f"{report.operation} failed (InputSourceError)"),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [BudgetExceededError("the caller's budget"), PaginationError("the caller's page")])
+@pytest.mark.parametrize("fail_after", [0, 1])
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_a_source_raising_a_library_error_of_its_own_is_its_failure(
+    family: str, fail_after: int, failure: Exception
+) -> None:
+    # Whichever pull raises it, the first of a batch window included, it is neither the operation's budget end
+    # nor a failed page: the source failed, and the stream says so with the caller's exception as the cause.
+    error, report = await _close_fails(family, "raises", "read_to_end", fail_after=fail_after, failure=failure)
+
+    assert type(error) is SOURCE_FAILURE[family]
+    assert _chain(error)[-2:] == [InputSourceError, type(failure)]
+    assert report.state is TerminalState.FAILED
+    assert report.terminal_reason == "InputSourceError"
+    assert "budget_exhausted" not in {code for code, _message in _violations(report)}

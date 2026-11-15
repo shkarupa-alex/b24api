@@ -513,9 +513,12 @@ def test_a_source_closing_from_its_own_finally_is_refused_during_the_stream_clea
 
         stream = client.batch(commands(), batch_size=1)
         opened.append(stream)
-        with pytest.raises(RuntimeError, match=_REFUSALS[target]):
+        # The refusal fails the source's close, raised as any failed close of a ``batch()`` source is.
+        with pytest.raises(BatchFailed) as raised:
             async with stream:
                 await anext(stream)
+        assert isinstance(raised.value.__cause__, InputSourceError)
+        assert raised.value.__cause__.__cause__ is refusals[0]
         assert _REFUSALS[target] in str(refusals[0])
         report = stream.report
         assert report is not None
