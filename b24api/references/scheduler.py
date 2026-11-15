@@ -402,7 +402,9 @@ class ReferenceScheduler:
                 await run_fast_keyset(self, run, program.fast)
             elif pages is not None:
                 await self._drive(run, pages)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
+            # A cancellation ends the task cancelled; a GeneratorExit closes its coroutine (``settle``): neither is
+            # how the reference ended.
             raise
         except BaseException as error:  # noqa: BLE001 - per-reference tolerant outcome boundary, an interrupt's too
             # The binding fails with what its failed page reports, and its command's replay disposition, if any. An

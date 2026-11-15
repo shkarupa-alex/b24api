@@ -268,8 +268,11 @@ class OperationRunner[T, R: _Report]:
         self._work_token = object()
         # The one cleanup, kept even when a deadline stopped waiting for it, so it lives until it ends.
         self._cleanup_task: asyncio.Future[Settled[None]] | None = None
-        # The end an interrupt latched between reads runs, kept so it lives until it ends.
+        # The end an interrupt latched between reads runs. The event loop keeps only a weak reference to a task, so
+        # this one keeps it from being collected before it ends: nothing else refers to it.
         self._ending: asyncio.Future[Settled[None]] | None = None
+        # The reads and closes waiting for the operation's end in progress (``_await_end``).
+        self._observers = 0
 
     @property
     def report(self) -> R | None:
@@ -354,8 +357,7 @@ class OperationRunner[T, R: _Report]:
 
     async def __anext__(self) -> T:
         """Read one item; the read that ends the body publishes the report and raises by §3.1."""
-        if self._phase in {_Phase.CLOSING, _Phase.CLOSED}:
-            raise StopAsyncIteration
+        await self._stop_if_ended()
         if self._phase is _Phase.PULLING:
             raise RuntimeError("concurrent stream pull")
         # Taken before any state changes, so a failing budget hook cannot leave the read half-started.
@@ -402,6 +404,18 @@ class OperationRunner[T, R: _Report]:
         if self._hooks.delivered is not None:
             self._hooks.delivered()
         return item
+
+    async def _stop_if_ended(self) -> None:
+        """Raise ``StopAsyncIteration`` for a read of a stream that ended.
+
+        A read that finds the operation ending waits for its end first, so it never finds the stream ended before its
+        report exists, and raises the end's interrupt (``_await_end``). Only a read from the stream's own cleanup
+        cannot wait for it.
+        """
+        if self._phase is _Phase.CLOSING and not self.inside_own_work:
+            await self._await_end()
+        if self._phase in {_Phase.CLOSING, _Phase.CLOSED}:
+            raise StopAsyncIteration
 
     async def _end_if_interrupted(self, deadline: float | None) -> None:
         """End the stream with this read when an interrupt was latched while it ran, though the read returned an item.
@@ -457,7 +471,7 @@ class OperationRunner[T, R: _Report]:
         if self.inside_own_work:
             raise RuntimeError(_SELF_CLOSE)
         if self._phase is _Phase.CLOSING:
-            await self._published.wait()
+            await self._await_end()
             return
         pull = self._pull
         if self._phase is _Phase.PULLING and pull is None:
@@ -527,19 +541,37 @@ class OperationRunner[T, R: _Report]:
             self._ending = spawn_settled(self._end_between_reads())
 
     async def _end_between_reads(self) -> None:
-        """Clean up and publish the operation an interrupt ended between reads; the event loop raises the interrupt.
+        """Clean up and publish the operation an interrupt ended between reads, then deliver the interrupt once.
 
-        The stream is ended: a later read finds it so (``StopAsyncIteration``), a close returns, and neither raises
-        the interrupt again.
+        The reads and closes that waited for this end raise it (``_await_end``); with none waiting, no caller is
+        there to, and the event loop raises it. The stream is ended: a later read finds it so
+        (``StopAsyncIteration``), a close returns, and neither raises the interrupt again.
         """
         await self._end(TerminalCause.INTERRUPTED, None, deadline=self._cleanup_deadline())
-        self._raise_latched(reader=False)
+        if not self._observers:
+            self._raise_latched(reader=False)
+
+    async def _await_end(self) -> None:
+        """Wait for the operation's end in progress, its report published, then raise its interrupt, if any.
+
+        Every caller that sees the operation's end raises its interrupt, a read or close that waited for it included,
+        even one cancelled once the end was over: the interrupt outranks that cancellation. A waiter cancelled before
+        that stops waiting, and an end nobody waits for any more hands the interrupt to the event loop.
+        """
+        self._observers += 1
+        try:
+            await self._published.wait()
+        finally:
+            self._observers -= 1
+            if self._published.is_set():
+                self._raise_latched()
 
     def _raise_latched(self, *, reader: bool = True) -> None:
         """The one raise point of the operation's interrupt: close its latch and raise it, with the report.
 
-        Every end of the stream raises it, ahead of whatever else would leave: the read or close that ended it, and a
-        read a concurrent close ended. An end with no ``reader`` (between reads) hands it to the event loop instead.
+        Every end of the stream raises it, ahead of whatever else would leave: the read or close that ended it, a read
+        a concurrent close ended, and a read or close that waited for the end. An end no caller sees, one an interrupt
+        began between reads with nobody waiting for it (``reader`` false), hands it to the event loop instead.
         Only the latch's owner raises it: a runner reading inline in its operation's read ends as it would otherwise,
         so the operation's report keeps what ended it first, and its owner raises the interrupt. Once closed, the latch
         keeps no interrupt: one caught later goes to the event loop (``InterruptLatch.record``).
@@ -617,6 +649,10 @@ class OperationRunner[T, R: _Report]:
         """End the operation (``_end``) and raise by the §3.1 rows."""
         ended = await self._end(cause, primary, pending=pending, read=read, deadline=deadline)
         report, attempt, finalize_failed = ended
+        if pending is not None and attempt.cancellation is None:
+            # The reader's own cancellation, which its read absorbed before cleanup began, is no close failure: the
+            # report never records it, but the end raises it as one cleanup deferred.
+            attempt = CleanupAttempt(attempt.error, pending, finished=attempt.finished)
         # The operation's end: its interrupt is raised now, ahead of anything else.
         self._raise_latched()
         if cause is TerminalCause.FAILED and primary is not None:
@@ -651,7 +687,7 @@ class OperationRunner[T, R: _Report]:
         cleanup = await await_cleanup_resistant(self._cleanup_task, deadline=deadline, cancelled=cancelled)
         # An interrupt is never a cleanup failure: its task latched it (``settle``), and it leaves as the end.
         error = None if is_interrupt(cleanup.error) else cleanup.error
-        attempt = CleanupAttempt(error, cleanup.cancellation or pending, finished=cleanup.unfinished is None)
+        attempt = CleanupAttempt(error, cleanup.cancellation, finished=cleanup.unfinished is None)
         reason = report_reason(primary) if cause is TerminalCause.FAILED and primary is not None else None
         report, finalize_failed = await self._publish(cause, reason, attempt)
         return report, attempt, finalize_failed
