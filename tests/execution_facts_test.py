@@ -39,18 +39,22 @@ from b24api.contracts import (
     SequentialTraversal,
 )
 from b24api.contracts.completion import PageCommandOutcome
+from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.policy import AmbiguityReason
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
     B24ApiError,
     BatchCommandError,
+    BudgetExceededError,
+    ClientClosedError,
     EnvelopeContractError,
     FailurePhase,
     HTTPGatewayError,
     ProtocolError,
     TransportError,
 )
+from b24api.execution.facts import possible_execution, record_dispatch, record_stop, stopped_before_send
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from b24api.transport import WireRequest, WireResponse
 from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, on_loop
@@ -629,3 +633,24 @@ async def test_a_failure_answered_after_the_time_budget_meets_the_ambiguity_rule
     assert raised.value.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
     assert isinstance(raised.value.__cause__, HTTPGatewayError)
     assert not isinstance(raised.value.__cause__, EnvelopeContractError)
+
+
+@pytest.mark.parametrize(
+    "stop", [BudgetExceededError("refused"), ClientClosedError("closed")], ids=["budget", "closed"]
+)
+def test_a_stop_is_explained_only_by_the_send_its_recorder_recorded_never_by_its_type(stop: B24ApiError) -> None:
+    # A stop ran nothing: what its recorder recorded explains it, never its type or its cause chain, whatever stopped
+    # it; so a recorder that records it as a send that may have run is caught, not covered up.
+    answered = HTTPGatewayError("bad gateway", evidence=ResponseEvidence(http_status=502))
+    record_stop(stop, followed=answered)
+    assert stopped_before_send(stop)
+    record_dispatch(stop, possibly_executed=True)
+
+    unexplained = possible_execution(stop, request_summary=None, declared_unsafe=False)
+
+    assert unexplained.evidence == stop.evidence
+    record_dispatch(stop, possibly_executed=True, unproven=answered)
+    explained = possible_execution(stop, request_summary=None, declared_unsafe=False)
+    assert explained.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    assert explained.evidence == answered.evidence
+    assert explained.__cause__ is stop

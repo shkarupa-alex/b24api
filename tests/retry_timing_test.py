@@ -43,7 +43,7 @@ from b24api.errors import (
 )
 from b24api.execution import Executor, RateCoordinator, WireResponse, WorkClass, throttle
 from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
-from b24api.execution.facts import Execution, ambiguity_of, execution
+from b24api.execution.facts import Execution, ambiguity_of, execution, stopped_before_send
 from b24api.references.fanout import kernel_fanout_stream
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from tests.scripting import ResponderTransport, always, client_for, drain_to_failure, on_loop, replies
@@ -1790,7 +1790,7 @@ class _ClosingTransport(ScriptedTransport):
     ``closing`` names what closes: the client's ``coordinator``, so no send after the last reply gets a permit, or
     the ``transport`` itself, which then refuses every send before it leaves, as any transport may: with the
     ``ClientClosedError`` that says it never left. Either way the replay asked for is stopped, not by a budget.
-    Nothing closes for a ``budget`` that stops it instead.
+    Nothing closes for a ``budget`` that stops it instead; the last reply spends the retry ``window``.
     """
 
     def __init__(self, replies: tuple[WireResponse | TransportError, ...], *, closing: str) -> None:
@@ -1798,6 +1798,7 @@ class _ClosingTransport(ScriptedTransport):
         self.replies = list(replies)
         self.closing = closing
         self.executor: Executor | None = None
+        self.time: _Time | None = None
         self.sends = 0
         self.refused = 0
 
@@ -1812,6 +1813,9 @@ class _ClosingTransport(ScriptedTransport):
         if not self.replies and self.closing == "coordinator":
             assert self.executor is not None
             await self.executor.coordinator.close()
+        if not self.replies and self.closing == "window":
+            assert self.time is not None
+            self.time.now += _SPENT_WINDOW
         if isinstance(reply, TransportError):
             raise reply
         return reply
@@ -1867,8 +1871,9 @@ async def _stopped_errors(
     dialect: str, transport: _ClosingTransport, policy: ExecutionPolicy = _NO_DELAY
 ) -> tuple[list[B24ApiError], ExecutionSnapshot]:
     """Run two SAFE commands, or one lone request, and return the error each ended with and the budget."""
-    executor = _executor(transport, _Time())
-    transport.executor = executor
+    time = _Time()
+    executor = _executor(transport, time)
+    transport.executor, transport.time = executor, time
     context = executor.context(policy)
     if dialect == "lone":
         with pytest.raises(B24ApiError) as raised:
@@ -1959,6 +1964,10 @@ async def test_a_replay_stopped_before_its_send_by_a_closed_client_ends_with_the
         assert execution(error) is Execution.POSSIBLY_RUN
 
 
+# Longer than the retry window of a ``window`` stop, within the operation's.
+_SPENT_WINDOW = 11.0
+
+
 def _timed_out() -> TransportError:
     """A send cut by its timeout after it left: it may have run."""
     error = TransportError("attempt timed out", phase=FailurePhase.DISPATCH_STARTED)
@@ -1994,7 +2003,7 @@ async def _fan_out_errors(transport: _ClosingTransport, policy: ExecutionPolicy)
         *(
             (dialect, closing)
             for dialect in ("lone", "classic", "v3", "v3-isolation")
-            for closing in ("budget", "coordinator", "transport")
+            for closing in ("budget", "window", "coordinator", "transport")
         ),
         # The public client closes its coordinator only with its streams.
         ("fan-out", "budget"),
@@ -2006,12 +2015,15 @@ async def test_a_stopped_retry_is_explained_by_the_send_it_followed_whatever_sto
 ) -> None:
     # The send before the stop may have run and was not lost: its answer had an ambiguous status (502) or its
     # timeout cut it. Its retry (a lone or fanned-out request's, a batch round, a v3 envelope retry or the first
-    # isolated send of each command) is stopped before it leaves: by the request budget, the closed coordinator
-    # or the closed transport. Each command is unknown for that send, which names the reason and the evidence,
-    # never for the stop, which ran nothing.
+    # isolated send of each command) is stopped before it leaves: by the request budget, the retry window that
+    # send spent, the closed coordinator or the closed transport. Each command is unknown for that send, which
+    # names the reason and the evidence, never for the stop, which ran nothing.
     replies = (_may_have_run(failure),) * (2 if dialect == "v3-isolation" else 1)
     transport = _ClosingTransport(replies, closing=closing)
-    policy = dataclasses.replace(_NO_DELAY, max_requests=len(replies)) if closing == "budget" else _NO_DELAY
+    policy = {
+        "budget": dataclasses.replace(_NO_DELAY, max_requests=len(replies)),
+        "window": dataclasses.replace(_NO_DELAY, max_retry_elapsed_per_request=_SPENT_WINDOW - 1),
+    }.get(closing, _NO_DELAY)
     if dialect == "fan-out":
         errors, physical = await _fan_out_errors(transport, policy)
     else:
@@ -2023,7 +2035,8 @@ async def test_a_stopped_retry_is_explained_by_the_send_it_followed_whatever_sto
     assert errors
     for error in errors:
         stop = error.__cause__ if type(error) is AmbiguousExecutionError else error
-        assert type(stop) is (BudgetExceededError if closing == "budget" else ClientClosedError)
+        assert type(stop) is (BudgetExceededError if closing in {"budget", "window"} else ClientClosedError)
+        assert stopped_before_send(stop)
         followed = stop.__cause__
         ambiguity = (
             error
