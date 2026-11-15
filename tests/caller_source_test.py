@@ -688,6 +688,88 @@ async def test_a_source_cancelled_in_its_pull_resets_its_context_in_that_context
     assert report.violations == ()
 
 
+_SPAN: contextvars.ContextVar[str] = contextvars.ContextVar("span", default="unset")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["async", "sync"])
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_a_source_sees_the_context_of_the_call_that_created_its_stream(family: str, kind: str) -> None:
+    # The source's context is copied when the stream is created: a variable the caller changes afterwards (a
+    # tracing span around the loop, say) is not what the source sees, in any pull or in its close.
+    seen: list[str] = []
+
+    async def async_source() -> AsyncIterator[Any]:
+        for item in _items(family):
+            seen.append(_SPAN.get())
+            yield item
+        seen.append(_SPAN.get())
+
+    def sync_source() -> Iterator[Any]:
+        for item in _items(family):
+            seen.append(_SPAN.get())
+            yield item
+        seen.append(_SPAN.get())
+
+    async with client_for(ResponderTransport(_answer), policy=POLICIES["returns"]) as client:
+        token = _SPAN.set("at creation")
+        try:
+            stream = _stream(client, family, async_source() if kind == "async" else sync_source())
+            _SPAN.set("after creation")
+            await asyncio.wait_for(_end(stream, "read_to_end"), timeout=HANG_BOUND)
+        finally:
+            _SPAN.reset(token)
+
+    assert seen == ["at creation"] * (ITEMS + 1)
+
+
+class _FailsWhenCut:
+    """Its second pull waits until cancelled and then fails; its close fails too."""
+
+    def __init__(self, family: str) -> None:
+        self._items = iter(_items(family))
+        self._pulled = 0
+        self.pulling = asyncio.Event()
+
+    def __aiter__(self) -> _FailsWhenCut:
+        return self
+
+    async def __anext__(self) -> Any:  # noqa: ANN401 - commands, bindings or reference sources
+        self._pulled += 1
+        if self._pulled == ITEMS:
+            self.pulling.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise ValueError("the caller's pull failed as it was cut") from None
+        return next(self._items)
+
+    async def aclose(self) -> None:
+        raise RuntimeError("the caller's close failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_a_failed_close_after_a_pull_the_close_cut_keeps_its_own_cause(family: str) -> None:
+    # A close cuts a pull, which fails as it is cut; the source's close then fails as well. The close failure
+    # already chains to its own cause, the caller's close exception: the pull's failure does not replace it.
+    source = _FailsWhenCut(family)
+    async with client_for(ResponderTransport(_answer), policy=POLICIES["returns"]) as client:
+        stream = _stream(client, family, source)
+        read = asyncio.create_task(_end(stream, "read_to_end"))
+        await reached(source.pulling)
+        closed = await _settled(stream.aclose())
+        read_end = await _settled(read)
+
+    for raised in (closed, read_end):
+        assert type(raised) is SOURCE_FAILURE[family]
+        assert _chain(raised)[-2:] == [InputSourceError, RuntimeError]
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.EARLY_CLOSED
+    assert _violations(report) == [("cleanup_failure", "stream cleanup failed (InputSourceError)")]
+
+
 class _Gate:
     """Where a source's second pull waits, and the release that only the event loop's shutdown gives it.
 
