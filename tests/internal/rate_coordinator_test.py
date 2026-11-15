@@ -164,13 +164,18 @@ async def test_a_closed_coordinator_stops_a_flat_counted_head_which_is_not_trace
 
 
 class _Resource:
-    def __init__(self, name: str, order: list[str], *, fail: bool = False) -> None:
+    def __init__(
+        self, name: str, order: list[str], *, fail: bool = False, interrupt: type[BaseException] | None = None
+    ) -> None:
         self.name = name
         self.order = order
         self.fail = fail
+        self.interrupt = interrupt
 
     async def aclose(self) -> None:
         self.order.append(self.name)
+        if self.interrupt is not None:
+            raise self.interrupt(f"{self.name} interrupted")
         if self.fail:
             raise RuntimeError(f"{self.name} cleanup failed")
 
@@ -189,6 +194,32 @@ async def test_owned_cleanup_closes_streams_then_coordinator_then_transport_keep
 
     assert order == ["stream", "failing-stream", "coordinator", "transport"]
     assert captured.value.__notes__ == ["coordinator cleanup failure: RuntimeError"]
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.asyncio
+async def test_owned_cleanup_raises_an_interrupt_ahead_of_an_earlier_failure(interrupt: type[BaseException]) -> None:
+    # An interrupt is never behind a failure: it is what leaves, every resource still closed, the failure a note.
+    order: list[str] = []
+    streams = (
+        _Resource("failing-stream", order, fail=True),
+        _Resource("interrupted-stream", order, interrupt=interrupt),
+    )
+
+    with pytest.raises(interrupt, match="interrupted-stream interrupted") as captured:
+        await close_owned_resources(
+            streams,
+            _Resource("transport", order, fail=True),
+            _Resource("coordinator", order, interrupt=KeyboardInterrupt),
+        )
+
+    assert order == ["failing-stream", "interrupted-stream", "coordinator", "transport"]
+    # The first interrupt stays the one raised; whatever failed besides it, before or after, is a note.
+    assert captured.value.__notes__ == [
+        "earlier cleanup failure: RuntimeError",
+        "coordinator cleanup failure: KeyboardInterrupt",
+        "transport cleanup failure: RuntimeError",
+    ]
 
 
 @pytest.mark.asyncio

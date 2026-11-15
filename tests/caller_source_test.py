@@ -539,6 +539,54 @@ async def test_reference_work_that_outlasts_the_cleanup_window_fails_the_close_a
     assert _violations(report) == [("cleanup_failure", "stream cleanup failed (CleanupOverrunError)")]
 
 
+class _CommandsWhoseCloseIsInterrupted(_Commands):
+    """``_Commands`` whose close, once run, raises an interrupt."""
+
+    def __init__(self, interrupt: type[BaseException]) -> None:
+        super().__init__()
+        self._interrupt = interrupt
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        raise self._interrupt("close interrupted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(
+    "dispatch", [DirectDispatch(concurrency=2), BatchDispatch(batch_size=1, concurrency=2)], ids=["direct", "batch"]
+)
+async def test_an_interrupt_from_the_close_outranks_reference_work_that_outlasts_the_cleanup_window(
+    dispatch: DirectDispatch | BatchDispatch, interrupt: type[BaseException]
+) -> None:
+    # The work's overrun is a cleanup failure found first; the source's close then raises an interrupt, which is
+    # never behind another failure: the close raises it, and so does the read the close ended.
+    direct = isinstance(dispatch, DirectDispatch)
+    transport = _Blocks(answered=1 if direct else 0, resists=True)
+    source = _CommandsWhoseCloseIsInterrupted(interrupt)
+    async with client_for(ResponderTransport(transport), policy=POLICIES["overruns"]) as client:
+        stream = client.fan_out_outcomes(source, dispatch=dispatch)
+        read = None
+        try:
+            if direct:
+                await anext(stream)
+            else:
+                # The read settles inside its task: a task of the test's own ending in an interrupt would stop the loop.
+                read = asyncio.create_task(_settled(anext(stream)))
+            await reached(transport.started)
+            closed = await _settled(stream.aclose())
+            if read is not None:
+                assert type(await read) is interrupt
+        finally:
+            transport.release.set()
+
+    assert type(closed) is interrupt
+    assert source.closed
+    report = stream.report
+    assert report is not None
+    assert ("cleanup_failure", f"stream cleanup failed ({interrupt.__name__})") in _violations(report)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "dispatch", [DirectDispatch(concurrency=2), BatchDispatch(batch_size=1, concurrency=2)], ids=["direct", "batch"]

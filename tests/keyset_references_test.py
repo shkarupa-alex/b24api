@@ -14,6 +14,7 @@ selection, geometry and cost must match it.
 from __future__ import annotations
 import asyncio
 import dataclasses
+import gc
 import json
 import time
 from collections import Counter
@@ -1223,6 +1224,47 @@ async def test_two_partitioned_sources_and_an_ordinary_one_exhaust_in_input_orde
     assert set(_completes(outcomes)) == set(data)
     assert report.state is TerminalState.COMPLETED
     assert leases.outstanding == 0
+
+
+@pytest.mark.parametrize("call", [1, 2, 4, 8])
+def test_an_interrupt_a_wave_send_raises_leaves_the_loop_with_no_task_behind(call: int) -> None:
+    # A fast binding's pages are fetched in waves, each page by a task of the library's own: the transport's
+    # interrupt reaches the caller's task, which raises it out of asyncio.run, with no library task ending in it.
+    reported: list[str] = []
+    reached: list[type[BaseException]] = []
+    names = ("p0", "p1")
+    answer = _answer(dict.fromkeys(names, DISTRIBUTIONS["dense"]))
+    calls = 0
+
+    def interrupting(method: str, query: Query) -> Envelope:
+        nonlocal calls
+        calls += 1
+        if calls == call:
+            raise KeyboardInterrupt
+        return answer(method, query)
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        try:
+            async with client_for(BatchPortal(interrupting), policy=ExecutionPolicy(max_pages=50_000)) as client:
+                await _drain(
+                    client.iter_reference_outcomes(
+                        _base(),
+                        [_parent(name) for name in names],
+                        traversal=_traversal(_range()),
+                        dispatch=BatchDispatch(batch_size=50),
+                    )
+                )
+        except BaseException as error:
+            reached.append(type(error))
+            raise
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(main())
+    gc.collect()
+    # The interrupt reached the caller's own task, not a cancellation from a loop it stopped.
+    assert reached == [KeyboardInterrupt]
+    assert reported == []
 
 
 @pytest.mark.asyncio

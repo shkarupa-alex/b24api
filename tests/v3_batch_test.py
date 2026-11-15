@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+import gc
 import inspect
 import json
 import time
@@ -1809,3 +1810,45 @@ async def test_a21_isolation_an_isolated_answer_that_cannot_be_decoded_explains_
         assert ambiguity.evidence is not None
         assert ambiguity.evidence.http_status == 200  # noqa: PLR2004
         assert isinstance(ambiguity.__cause__, ProtocolError)
+
+
+@pytest.mark.parametrize("call", [1, 2, 3])
+def test_an_interrupt_an_isolated_send_raises_leaves_the_loop_with_no_task_behind(call: int) -> None:
+    # After a safe abort (its envelope goes through send_wire) each command is sent alone, one at a time in the
+    # batch's own work: an interrupt one of those sends raises reaches the caller's task, which raises it out of
+    # asyncio.run, with no library task ending in it.
+    reported: list[str] = []
+    reached: list[type[BaseException]] = []
+    requests = (_v3(1), _v3(2), _v3(3))
+    transport = ScriptedTransport(
+        (
+            _poisoned(requests),
+            *(_direct(request, {"result": _item(index + 1)}) for index, request in enumerate(requests)),
+        ),
+    )
+    send = transport.send
+    sent = 0
+
+    async def interrupting(request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        nonlocal sent
+        sent += 1
+        if sent == call:
+            raise KeyboardInterrupt
+        return await send(request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
+
+    transport.send = interrupting  # type: ignore[method-assign]
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        try:
+            await _run(transport, requests)
+        except BaseException as error:
+            reached.append(type(error))
+            raise
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(main())
+    gc.collect()
+    # The interrupt reached the caller's own task, not a cancellation from a loop it stopped.
+    assert reached == [KeyboardInterrupt]
+    assert reported == []
