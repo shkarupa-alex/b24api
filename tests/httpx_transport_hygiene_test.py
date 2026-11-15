@@ -26,7 +26,7 @@ from b24api import (
     TransportError,
 )
 from b24api._error_types import FailurePhase
-from b24api._webhook import TokenVault, Webhook, WebhookRefusal, parse_webhook
+from b24api._webhook import TokenVault, Webhook, WebhookRefusal, WebhookSecrets, parse_webhook
 from b24api.contracts import RequestHeaders
 from b24api.contracts.request import RouteKind
 from b24api.errors import ResponseTooLargeError
@@ -678,7 +678,7 @@ async def test_an_empty_userinfo_is_no_userinfo_as_in_settings(url: str) -> None
     ids=["dot-before-user", "dot-before-token", "dot-dot", "case-default-port-no-slash"],
 )
 async def test_the_credential_registered_with_the_log_shield_is_the_token_as_sent(url: str) -> None:
-    owned: list[tuple[str, ...]] = []
+    owned: list[WebhookSecrets] = []
 
     async def record_ownership(request: httpx.Request) -> None:
         owned.append(request.extensions["b24api_log_owner"].credentials)
@@ -699,7 +699,7 @@ async def test_the_credential_registered_with_the_log_shield_is_the_token_as_sen
         finally:
             await transport.aclose()
     assert sent == [f"https://fixture.invalid/rest/1/{FRAGMENT}/user.current"]
-    assert owned == [(FRAGMENT,)]
+    assert [(len(credentials), FRAGMENT in credentials) for credentials in owned] == [(1, True)]
 
 
 # Authorities URL parsers repair silently; the rule refuses them instead.
@@ -947,3 +947,34 @@ def test_a_dispatch_the_log_shield_refuses_renders_no_credential_with_frame_loca
     del webhook
     for text in _rendered_texts(refused.value):
         assert FRAGMENT not in text
+
+
+class _Unrenderable:
+    """A log argument whose rendering fails, stopping the shield's filter in the middle of a scrub."""
+
+    def __str__(self) -> str:
+        raise LookupError("unrenderable log argument")
+
+
+@pytest.mark.parametrize("dispatch", ["owned", "none"])
+def test_a_record_the_log_shield_fails_to_scrub_renders_no_credential_with_frame_locals(dispatch: str) -> None:
+    # Every frame from the logging call down to the redaction holds the shield's secrets as ``WebhookSecrets``,
+    # the registered ones and the owned dispatch's alike, whose repr leaves each token out.
+    owned = dispatch == "owned"
+    webhook = parse_webhook(WEBHOOK)
+    assert isinstance(webhook, Webhook)
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)))
+    HTTPX_LOG_SHIELD.register_transport(webhook=webhook, client=client)
+    try:
+        with (
+            HTTPX_LOG_SHIELD.request(webhook=webhook) if owned else contextlib.nullcontext(),
+            pytest.raises(LookupError, match="unrenderable") as failed,
+        ):
+            logging.getLogger("httpx").error("caller value %s", _Unrenderable())
+    finally:
+        HTTPX_LOG_SHIELD.release_transport()
+        client.close()
+    del webhook
+    frames = [frame.name for frame in traceback.extract_tb(failed.value.__traceback__)]
+    assert {"filter", "redact_owned_value" if owned else "redact_registered_value"} <= set(frames)
+    assert [text for text in _rendered_texts(failed.value) if FRAGMENT in text] == []

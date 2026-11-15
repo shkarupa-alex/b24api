@@ -10,7 +10,9 @@ import email.utils
 import json
 import os
 import random
+import traceback
 from collections.abc import Mapping
+from pathlib import Path
 from time import gmtime, strftime, tzset
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -174,34 +176,47 @@ def east_of_utc() -> Iterator[None]:
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("east_of_utc")
 @pytest.mark.parametrize(
-    ("local_offset", "cooldown"),
+    # How far the local clock runs ahead of the response's Date, how long after that Date the hint ends, and the
+    # cooldown the hint holds the host for.
+    "clocks",
     [
         # The local clock runs half a minute ahead of the server's: the hint is measured against the server's Date.
-        (30.0, 10.0),
+        (30.0, 10, 10.0),
         # The local clock runs an hour behind: the Date is measured against, and the hint is not an hour longer.
-        (-3_600.0, 10.0),
-        # The Date is an hour older than the local clock, a stale answer or a server clock set back: the local
-        # clock measures the hint, which is not an hour longer either.
-        (3_600.0, None),
+        (-3_600.0, 10, 10.0),
+        # A Date up to a minute older than the local clock is plausible and still measures the hint.
+        (59.0, 10, 10.0),
+        (60.0, 10, 10.0),
+        # A Date more than a minute older is stale, an old answer or a server clock set back: the local clock
+        # measures the hint, ten seconds after that Date, which has passed, so nothing holds the host.
+        (61.0, 10, None),
+        (90.0, 10, None),
+        (3_600.0, 10, None),
+        # Half an hour stale with an hour's hint: half an hour is left by the local clock, not the whole hour.
+        (1_800.0, 3_600, 1_800.0),
     ],
-    ids=["local-ahead", "local-behind", "date-stale"],
+    ids=["local-ahead", "local-behind", "lag-59", "lag-60", "lag-61", "lag-90", "lag-hour", "lag-half-hour"],
 )
 @pytest.mark.parametrize("date_form", sorted(_DATE_FORMS))
 @pytest.mark.parametrize(
     "hint",
     [
-        *(("retry-after", form(_SERVER_NOW + 10)) for form in _DATE_FORMS.values()),
-        ("x-bitrix-ratelimit-reset", str(int(_SERVER_NOW) + 10)),
+        *((lambda moment, form=form: ("retry-after", form(moment))) for form in _DATE_FORMS.values()),
+        lambda moment: ("x-bitrix-ratelimit-reset", str(int(moment))),
     ],
     ids=[*(f"retry-after-{name}" for name in _DATE_FORMS), "reset-epoch"],
 )
 async def test_a_dated_hint_is_measured_against_a_plausible_response_date(
-    monkeypatch: pytest.MonkeyPatch, hint: tuple[str, str], date_form: str, local_offset: float, cooldown: float | None
+    monkeypatch: pytest.MonkeyPatch,
+    hint: Callable[[float], tuple[str, str]],
+    date_form: str,
+    clocks: tuple[float, int, float | None],
 ) -> None:
+    local_offset, after, cooldown = clocks
     monkeypatch.setattr(throttle, "time", SimpleNamespace(time=lambda: _SERVER_NOW + local_offset))
     time = _Time()
     date = ("date", _DATE_FORMS[date_form](_SERVER_NOW))
-    transport = ResponderTransport(always(WireResponse(429, (date, hint), b"")))
+    transport = ResponderTransport(always(WireResponse(429, (date, hint(_SERVER_NOW + after)), b"")))
     executor = _executor(transport, time)
 
     with pytest.raises(BudgetExceededError, match="attempt budget"):
@@ -211,9 +226,8 @@ async def test_a_dated_hint_is_measured_against_a_plausible_response_date(
     snapshot = await executor.coordinator.snapshot()
     await executor.coordinator.close()
 
-    # Ten seconds after the server's own Date unless that Date is more than a minute older than the local clock,
-    # whichever HTTP date form either header uses: a date without a zone is GMT, not local time. The stale Date's
-    # hint, ten seconds after it, has passed by the local clock, so nothing holds the host; it would have for an hour.
+    # The hint is measured from the server's own Date unless that Date is more than a minute older than the local
+    # clock, whichever HTTP date form either header uses: a date without a zone is GMT, not local time.
     assert snapshot.cooldown_until == cooldown
 
 
@@ -862,7 +876,8 @@ async def test_a_carried_command_stopped_at_its_permit_reports_the_failure_it_fo
 @pytest.mark.asyncio
 async def test_a_command_carried_past_an_unknown_round_and_then_stopped_ends_as_proven_not_run() -> None:
     # The get was sent once, in the refused first send. The third round's 1.2-second backoff exceeds the window,
-    # so the budget stops the list and the get: the list may have run in the second send, the get never did.
+    # so the budget stops the list and the get: the list may have run in the second send, the get never did. The
+    # one stop of their round ends each of them caused by the failure that command followed, which differ.
     time = _Time()
     transport, executor, requests = _carried_past_an_unknown_round(time, None)
     policy = ExecutionPolicy(
@@ -886,6 +901,16 @@ async def test_a_command_carried_past_an_unknown_round_and_then_stopped_ends_as_
         assert isinstance(unknown, BatchFailure)
         assert isinstance(unknown.error, AmbiguousExecutionError)
         assert execution(unknown.error) is Execution.POSSIBLY_RUN
+    assert isinstance(listed, BatchFailure)
+    assert isinstance(listed.error, AmbiguousExecutionError)
+    stop = listed.error.__cause__
+    assert isinstance(stop, BudgetExceededError)
+    assert "retry delay" in str(stop)
+    assert stop is not get.error
+    # The list follows the second round's failure, unknown after the bare 500; the get, the first round's 429.
+    assert isinstance(stop.__cause__, AmbiguousExecutionError)
+    assert isinstance(stop.__cause__.__cause__, HTTPGatewayError)
+    assert stop.__cause__.__cause__.http_status == 500  # noqa: PLR2004
 
 
 @pytest.mark.asyncio
@@ -1739,21 +1764,50 @@ class _ClosingTransport(ScriptedTransport):
         return await self._first()
 
 
+def _assert_raised_at_the_closed_permit(stop: BaseException) -> None:
+    """Each command's copy of the stop keeps the stop's own traceback, down to the closed coordinator's refusal."""
+    frames = traceback.extract_tb(stop.__traceback__)
+    assert frames
+    assert (Path(frames[-1].filename).name, frames[-1].name) == ("rate.py", "acquire")
+
+
+def _answered_by_each_command(dialect: RouteKind) -> WireResponse:
+    """Each of two commands answered by its own entry or element with a transient, replayable quota error."""
+    transient = {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow down"}
+    if dialect is RouteKind.BARE:
+        payload: object = {"result": {"result": [], "result_error": {f"c{index:012d}": transient for index in (0, 1)}}}
+    else:
+        payload = {"result": [{"error": {"code": "QUERY_LIMIT_EXCEEDED", "message": "slow down"}}] * 2}
+    return WireResponse(200, _JSON, json.dumps(payload).encode())
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dialect", [RouteKind.BARE, RouteKind.API_V3], ids=["classic", "v3"])
-@pytest.mark.parametrize("first", ["refused", "lost"])
+@pytest.mark.parametrize("first", ["refused", "lost", "answered"])
 async def test_a_replay_stopped_before_its_send_by_a_closed_client_ends_with_the_stop_caused_by_what_it_followed(
     dialect: RouteKind, first: str
 ) -> None:
-    # The first envelope is refused as a whole (proven not run) or its answer is lost (it may have run), and the
-    # client is closed meanwhile: the SAFE replay is stopped at its permit, not by a budget. In both dialects each
-    # command ends with that stop, which is what ended it, caused by the failure it followed.
-    lost = TransportError("reset", phase=FailurePhase.DISPATCH_STARTED)
-    transport = _ClosingTransport(WireResponse(429, (), b"") if first == "refused" else lost)
+    # The first envelope is refused as a whole (proven not run), its answer is lost (it may have run), or each
+    # command's own entry or element answers it with a transient error; the client is closed meanwhile, so the SAFE
+    # replay is stopped at its permit, not by a budget. A command that followed its envelope's failure ends with
+    # that stop, which is what ended it, caused by the failure it followed; one its own answer replayed keeps it.
+    replies: dict[str, WireResponse | TransportError] = {
+        "refused": WireResponse(429, (), b""),
+        "lost": TransportError("reset", phase=FailurePhase.DISPATCH_STARTED),
+        "answered": _answered_by_each_command(dialect),
+    }
+    transport = _ClosingTransport(replies[first])
     executor = _executor(transport, _Time())
     transport.executor = executor
+    error_spec = ResultErrorSpec(ResultSelector(("error",)), ("code",), ("message",))
     requests = tuple(
-        Request(method, {"id": index}, ReplaySafety.SAFE, route=dialect)
+        Request(
+            method,
+            {"id": index},
+            ReplaySafety.SAFE,
+            route=dialect,
+            result_error=error_spec if dialect is RouteKind.API_V3 else None,
+        )
         for index, method in enumerate(("crm.item.get", "crm.item.list"))
     )
 
@@ -1765,13 +1819,20 @@ async def test_a_replay_stopped_before_its_send_by_a_closed_client_ends_with_the
         if first == "refused":
             # Proven not run by the refusal, and sent once: the stop is the outcome, recorded as answered.
             assert type(outcome.error) is ClientClosedError
+            _assert_raised_at_the_closed_permit(outcome.error)
             assert isinstance(outcome.error.__cause__, HTTPGatewayError)
             assert outcome.error.__cause__.http_status == 429  # noqa: PLR2004
             assert execution(outcome.error) is Execution.ANSWERED
-        else:
+        elif first == "lost":
             # The lost send may have run: unknown, named after it, with the stop and then the lost send as causes.
             assert type(outcome.error) is AmbiguousExecutionError
             stop = outcome.error.__cause__
             assert type(stop) is ClientClosedError
-            assert stop.__cause__ is lost
+            _assert_raised_at_the_closed_permit(stop)
+            assert stop.__cause__ is replies["lost"]
             assert execution(outcome.error) is Execution.POSSIBLY_RUN
+        else:
+            # Its own answer is what the portal said about it: the stop of its replay does not replace it.
+            assert type(outcome.error) is BatchCommandError
+            assert outcome.error.normalized_code == "query_limit_exceeded"
+            assert execution(outcome.error) is Execution.ANSWERED

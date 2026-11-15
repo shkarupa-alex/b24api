@@ -67,7 +67,9 @@ async def _assert_shield_released(logger: logging.Logger) -> None:
     A client closed after its transport leaves the filter inert, holding no secret, until the next shield
     lifecycle event removes it; a throwaway transport provides that event.
     """
-    assert not {_OWNED_MARKER, _FOREIGN_MARKER} & set(HTTPX_LOG_SHIELD.registered_secrets())
+    registered = HTTPX_LOG_SHIELD.registered_secrets()
+    assert _OWNED_MARKER not in registered
+    assert _FOREIGN_MARKER not in registered
     await HttpxTransport(f"https://portal.invalid/rest/1/{_PROBE_MARKER}/").aclose()
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
 

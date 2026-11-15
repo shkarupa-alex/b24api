@@ -15,9 +15,13 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 import httpx
 from pydantic import HttpUrl, TypeAdapter, ValidationError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 _DEFAULT_PORTS = MappingProxyType({"http": 80, "https": 443})
 # Percent-encoded characters are refused rather than decoded, so the path HTTPX sends is the classic base
@@ -99,6 +103,60 @@ class Webhook:
     def api_v3_url(self) -> str:
         """The REST 3.0 base of the same webhook."""
         return self.address.api_v3_url(self.token)
+
+
+class WebhookSecrets:
+    """The tokens of some webhooks, found and replaced in a text without ever being handed out.
+
+    Whoever keeps webhook secrets to scrub (the HTTPX log shield and its filter) holds this carrier, not the
+    tokens, so neither a frame local nor an attribute a traceback renders shows one: its ``repr`` names only
+    how many it holds, and it is not iterable.
+    """
+
+    __slots__ = ("_pattern", "_webhooks")
+
+    def __init__(self, webhooks: Iterable[Webhook] = ()) -> None:
+        """Hold the tokens of ``webhooks``."""
+        self._webhooks = frozenset(webhooks)
+        self._pattern = _token_pattern(self._webhooks)
+
+    def __repr__(self) -> str:
+        """Name the number of tokens held, never one of them."""
+        return f"<WebhookSecrets: {len(self)} hidden>"
+
+    def __len__(self) -> int:
+        """Count the distinct tokens held."""
+        return len({webhook.token for webhook in self._webhooks})
+
+    def __contains__(self, token: object) -> bool:
+        """Report whether ``token`` is exactly one of the tokens held."""
+        return any(webhook.token == token for webhook in self._webhooks)
+
+    def __or__(self, other: WebhookSecrets) -> WebhookSecrets:
+        """Hold the tokens of both."""
+        if other._webhooks <= self._webhooks:
+            return self
+        if self._webhooks <= other._webhooks:
+            return other
+        return WebhookSecrets(self._webhooks | other._webhooks)
+
+    def found_in(self, text: str) -> bool:
+        """Report whether any token held occurs in ``text``."""
+        return self._pattern is not None and self._pattern.search(text) is not None
+
+    def replaced_in(self, text: str, replacement: str) -> str:
+        """Return ``text`` with every occurrence of a token held replaced by ``replacement``, taken literally."""
+        if self._pattern is None:
+            return text
+        return self._pattern.sub(replacement.replace("\\", "\\\\"), text)
+
+
+def _token_pattern(webhooks: frozenset[Webhook]) -> re.Pattern[str] | None:
+    if not webhooks:
+        return None
+    # Longest first, so no token found inside a longer one leaves the rest of that one behind.
+    ordered = sorted(webhooks, key=lambda webhook: len(webhook.token), reverse=True)
+    return re.compile("|".join(re.escape(webhook.token) for webhook in ordered))
 
 
 def parse_webhook(url: object) -> Webhook | WebhookRefusal:

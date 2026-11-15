@@ -470,7 +470,8 @@ async def test_foreign_record_carrying_a_registered_secret_is_scrubbed_with_its_
 @pytest.mark.asyncio
 async def test_secret_registry_is_deduplicated_by_value_and_tied_to_client_lifetime() -> None:
     _assert_shield_idle()
-    initial = set(HTTPX_LOG_SHIELD.registered_secrets())
+    initial = len(HTTPX_LOG_SHIELD.registered_secrets())
+    assert _OWNED not in HTTPX_LOG_SHIELD.registered_secrets()
     clients = [
         httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(_OK, request=request)))
         for _ in range(2)
@@ -479,13 +480,16 @@ async def test_secret_registry_is_deduplicated_by_value_and_tied_to_client_lifet
     for transport in transports:
         await transport.aclose()
     # Both injected clients are still open: the secret stays registered, once.
-    assert set(HTTPX_LOG_SHIELD.registered_secrets()) == {*initial, _OWNED}
+    assert _OWNED in HTTPX_LOG_SHIELD.registered_secrets()
+    assert len(HTTPX_LOG_SHIELD.registered_secrets()) == initial + 1
     await clients[0].aclose()
     assert HTTPX_LOG_SHIELD.suppresses_hpack() is True
-    assert set(HTTPX_LOG_SHIELD.registered_secrets()) == {*initial, _OWNED}
+    assert _OWNED in HTTPX_LOG_SHIELD.registered_secrets()
+    assert len(HTTPX_LOG_SHIELD.registered_secrets()) == initial + 1
     await clients[1].aclose()
     assert HTTPX_LOG_SHIELD.suppresses_hpack() is False
-    assert set(HTTPX_LOG_SHIELD.registered_secrets()) == initial
+    assert _OWNED not in HTTPX_LOG_SHIELD.registered_secrets()
+    assert len(HTTPX_LOG_SHIELD.registered_secrets()) == initial
 
 
 @pytest.mark.asyncio

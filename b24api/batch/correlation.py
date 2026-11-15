@@ -62,9 +62,9 @@ def _stopped_after(stop: B24ApiError, followed: B24ApiError, lineage: _Lineage) 
     (a closed client, for example): the stop is what ended the command, so it is the outcome, caused by the failure
     the command followed, and it carries what the command's sends (``lineage``) left open. A command its own entry
     or element answered keeps that answer instead. Each stopped command gets its own copy of the stop, whose cause
-    is the failure that command followed.
+    is the failure that command followed and whose traceback is the stop's, where it was raised.
     """
-    ended = copy.copy(stop)
+    ended = copy.copy(stop).with_traceback(stop.__traceback__)
     ended.__cause__ = followed
     lineage.record_unsent(ended)
     return ended
