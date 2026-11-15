@@ -865,11 +865,12 @@ async def test_the_operation_policy_bounds_every_reference_operation_s_dispatch(
     in_flight, peak = 0, 0
 
     async def answer(_method: str, query: Query) -> Envelope:
-        # A direct page is one request: count the pages answered at once, each held for a few loop turns.
+        # A direct page is one request: count the pages answered at once, each held long enough, in loop turns,
+        # for every page the dispatch would allow to be sent meanwhile (8 without the policy's bound).
         nonlocal in_flight, peak
         in_flight += 1
         peak = max(peak, in_flight)
-        for _turn in range(3):
+        for _turn in range(50):
             await asyncio.sleep(0)
         in_flight -= 1
         return {"result": [{"ID": 1}] if query.get("start", "0") == "0" else []}

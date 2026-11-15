@@ -454,7 +454,12 @@ async def test_rows_promised_to_a_woken_page_are_its_own_until_it_resumes(taker:
     await asyncio.sleep(0)
 
     await buffer.release(held, 5)
-    later = asyncio.create_task(buffer.reserve(2, 1) if taker == "page" else buffer.lease(2, lambda free: free or None))
+    # Eager, so the later request asks before the woken page resumes, as one already running would.
+    later = asyncio.eager_task_factory(
+        asyncio.get_running_loop(),
+        buffer.reserve(2, 1) if taker == "page" else buffer.lease(2, lambda free: free or None),
+    )
+    assert not later.done()
     async with asyncio.timeout(HANG_BOUND):
         reservation = await woken
     assert (reservation.amount, later.done()) == (5, False)
