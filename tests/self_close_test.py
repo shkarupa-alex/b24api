@@ -492,6 +492,38 @@ def test_a_fan_out_source_cannot_close_its_stream_between_reads() -> None:
     _bounded(scenario)
 
 
+def test_a_source_reading_its_stream_from_its_own_finally_finds_it_ended_at_once() -> None:
+    # The reader leaves early, so the stream's cleanup closes the source, whose ``finally`` reads the stream again.
+    # That read runs inside the very end it would wait for: it finds the stream ended at once, and the end goes on.
+    async def scenario() -> None:
+        reads: list[object] = []
+        opened: list[OperationStream[Any]] = []
+        client = _client(_Portal())
+
+        async def commands() -> AsyncIterator[Command[int]]:
+            try:
+                for index in range(100):
+                    yield Command(Request("x.get", {"id": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
+            finally:
+                try:
+                    await anext(opened[0])
+                except StopAsyncIteration as ended:
+                    reads.append(type(ended))
+
+        stream = client.batch(commands(), batch_size=1)
+        opened.append(stream)
+        async with stream:
+            await anext(stream)
+        assert reads == [StopAsyncIteration]
+        report = stream.report
+        assert report is not None
+        assert report.state is TerminalState.EARLY_CLOSED
+        assert report.violations == ()
+        await client.aclose()
+
+    _bounded(scenario)
+
+
 @pytest.mark.parametrize("target", tuple(_REFUSALS))
 def test_a_source_closing_from_its_own_finally_is_refused_during_the_stream_cleanup(target: str) -> None:
     # The reader leaves early, so the stream's cleanup closes the source, whose ``finally`` closes again.

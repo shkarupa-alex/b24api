@@ -1301,10 +1301,13 @@ def _raised_driving_the_loop(
             raised = error
         else:
             raise AssertionError("the loop raised nothing")
-        loop.run_until_complete(after())
-        work.cancel()
-        loop.run_until_complete(asyncio.gather(work, return_exceptions=True))
-        loop.run_until_complete(loop.shutdown_asyncgens())
+        try:
+            loop.run_until_complete(after())
+            work.cancel()
+            loop.run_until_complete(asyncio.gather(work, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except BaseException as error:  # noqa: BLE001 - raised again, it fails the test instead of ending the session
+            raise AssertionError(f"the loop raised again: {error!r}") from None
     finally:
         loop.close()
     return raised
@@ -1462,6 +1465,48 @@ def test_a_read_or_close_that_finds_the_operation_ending_waits_for_its_end_and_r
     assert reported == []
     assert report.state is TerminalState.FAILED
     assert _violations(report) == [("interrupted", "operation interrupted (KeyboardInterrupt)")]
+
+
+@pytest.mark.parametrize("family", REFERENCE_FAMILIES)
+def test_an_end_between_reads_keeps_the_operation_deadline(family: str) -> None:
+    # The source's close would wait until the test gives up. The end that an interrupt between reads starts runs
+    # under the operation's deadline as any end does: the deadline ends that close, which the report puts behind the
+    # interrupt as it would for an interrupt in a read ("stream cleanup also failed"), and the event loop raises the
+    # interrupt then, while the reader still works.
+    reported: list[str] = []
+    worked: list[bool] = []
+    streams: list[OperationStream[Any]] = []
+    transport = _InterruptsBetweenReads(KeyboardInterrupt)
+    source = _Source(family, "overruns")
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        client = await client_for(ResponderTransport(transport), policy=POLICIES["overruns"]).__aenter__()
+        stream = _stream(client, family, source, DirectDispatch(concurrency=2))
+        streams.append(stream)
+        await anext(stream)
+        transport.between.set()
+        await reached(transport.raising)
+        await asyncio.sleep(HANG_BOUND)
+        worked.append(True)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        asyncio.run(main())
+    gc.collect()
+    assert raised.value is transport.raised[0]
+    assert source.closed
+    assert not source.release.is_set()
+    assert worked == []
+    assert reported == []
+    report = streams[0].report
+    assert report is not None
+    assert report.state is TerminalState.FAILED
+    assert report.terminal_reason == "operation interrupted"
+    assert _violations(report) == [
+        ("cleanup_failure", "stream cleanup also failed (CleanupOverrunError)"),
+        ("interrupted", "operation interrupted (KeyboardInterrupt)"),
+    ]
+    assert getattr(raised.value, "report", None) is report
 
 
 SHAPE_FAMILIES = (*FAMILIES, "iter_list", "iter_list_counted")
