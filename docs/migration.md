@@ -55,6 +55,35 @@
   cannot shorten a hint; one further ahead now can, which costs at worst an early retry that the server
   throttles again. A delta in seconds is unchanged, and every hint is still capped at an hour.
 
+## Traversals that end with the budget, and dropped results
+
+- **A keyset traversal the request budget ends reports the budget, not a protocol violation.** When
+  `max_requests` or `max_pages` refused a wave or the final confirmation of an automatic keyset
+  traversal, sequential or partitioned, or of a `PartitionedKeysetExecution`, the report recorded a
+  `completion_rejection_before_settlement` protocol violation, and a partitioned traversal also a
+  `command_failure` for each refused lane. Such a run now ends as an explicit
+  `SequentialKeysetExecution` ends on its budget: the report is `incomplete`, with
+  `BudgetExceededError` as its terminal reason and `budget_exhausted` as its only violation.
+  `iter_list_keyset()` still raises `IncompleteTraversalError` whose cause is the
+  `BudgetExceededError`. A fast keyset wave whose batch answer was ambiguous (a command's answer
+  missing or repeated) no longer records `completion_unknown_binding_claimed_known`: its binding
+  closes as unknown.
+- **A counted tail page larger than its share is an answered failure.** When a tail page of
+  `iter_list_counted()` decoded to more rows than `max_buffered_rows` left it, the traversal raised
+  `IncompleteTraversalError` caused by `BudgetExceededError` ("buffered row budget exhausted"), and the
+  pages of that window that did fit were lost: neither yielded nor in the page trace, though they had
+  run. The tail window is now fitted as a `batch()` window is: the pages before the oversized one are
+  yielded and committed, and that page is rejected with `ResultTooLargeError`, recorded as answered. The
+  stream still raises `IncompleteTraversalError`, now caused by that `ResultTooLargeError` (still a
+  `BudgetExceededError`), and the report's terminal reason is `IncompleteTraversalError`.
+- **`ResultTooLargeError` keeps the answer's evidence.** Its `http_status` and `request_id` were
+  `None`, although the command it reports was answered. They are now those of the response whose result
+  was dropped.
+- **An empty batch result counts its one row.** `batch()` and `batch_outcomes()` already fitted every
+  outcome as at least one row of `max_buffered_rows`, but an empty list result was then charged no
+  row, so the report's `buffered_rows_high_water` could stay below what the window held. It now counts one row,
+  as it was fitted.
+
 ## The end of `max_elapsed` is not a cleanup failure
 
 - **Cleanup gets a grace past the budget.** Every stream but `iter_list()` waited for its source's

@@ -478,7 +478,9 @@ async with stream:
 
 The first direct page must contain an exact filtered `total` and, when more rows exist, `next`.
 The client derives all remaining offsets from the observed head width and sends tail pages through
-bounded physical batches.
+bounded physical batches. A tail page whose rows do not fit what `max_buffered_rows` leaves it is
+dropped: the pages before it are yielded, and the traversal raises `IncompleteTraversalError` caused
+by `ResultTooLargeError`.
 
 <!-- tested: tests/client_v2_test.py::test_counted_traversal_preserves_frozen_request_shape_and_exact_identity -->
 ```python

@@ -101,9 +101,9 @@ outcome.
   client-wide ceiling: the permits of the client's shared rate coordinator,
   `Settings.max_concurrent_requests`. An operation's limits only narrow it.
 - The row budget bounds what an operation holds, not what it sends: a result's rows are known only
-  after its command ran. A logical batch fits a window's results into `max_buffered_rows` in input
-  order (`_within_row_budget`), and the reference scheduler fits each page into the rows reserved for
-  it before the page is accepted. A result that does not fit is dropped, and its command fails with
+  after its command ran. A logical batch and a counted traversal's tail fit a window's results into
+  `max_buffered_rows` in input order (`_within_row_budget`), and the reference scheduler fits each
+  page into the rows reserved for it before the page is accepted. A result that does not fit is dropped, and its command fails with
   `ResultTooLargeError`, recorded answered by `b24api.execution.facts.dropped_result`: a failure that
   ran, never one proven not run. A page's wait for row capacity (`_RowBuffer.reserve`) is bounded by
   the operation's elapsed budget, as every other dispatch wait is. A binding's wait for the consumer is
@@ -267,8 +267,10 @@ consumer drains. The pool counts the rows each binding holds, and those of its q
 binding, and sums the producers' rooms in binding order, so a check scans no reservation. A page that
 cannot reserve waits in binding order; a change of the pool wakes only the waiting pages that fit,
 nearest the frontier first, and stops at the first page behind the frontier that does not fit, since
-every later page keeps more room free. Under `READY` delivery a change wakes every waiting page, whose
-check is a count. A counted binding reads its head and its known tail offsets as ordinary pages of
+every later page keeps more room free. Under `READY` delivery a page's check is a count, and a change
+wakes the waiting pages that fit in the order they came. Under both, a page is woken only for rows free
+beyond those promised to the pages already woken and not yet resumed, so a release wakes the pages its
+rows serve, not every waiting page. A counted binding reads its head and its known tail offsets as ordinary pages of
 that pool and commits them in offset order. A fast or automatic keyset binding instead holds one row
 lease from activation to its
 terminal event. Its runtime plans and fits every wave against a view of the operation policy that
