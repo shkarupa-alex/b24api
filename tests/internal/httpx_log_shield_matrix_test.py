@@ -20,6 +20,7 @@ import hpack
 import httpx
 import pytest
 
+from b24api._webhook import Webhook, WebhookAddress
 from b24api.contracts import Request, RouteKind
 from b24api.errors import CapabilityError
 from b24api.transport import HttpxTransport
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 _OWNED = "synthetic-owned-h2-secret-424242"
+_OWNED_WEBHOOK = Webhook(WebhookAddress("https", "portal.invalid", None, "1"), _OWNED)
 _HOP = "synthetic-hop-h2-secret-515151"
 _FOREIGN = "synthetic-foreign-h2-secret-636363"
 _PROBE_MARKER = "synthetic-probe-secret-000000"
@@ -404,7 +406,7 @@ def test_foreign_record_with_an_exception_but_no_secret_keeps_every_field_object
                     logger.error("foreign %s", foreign_url, exc_info=exc_info)
                     logger.info("plain foreign %s", foreign_url)
                 else:
-                    with HTTPX_LOG_SHIELD.request(credentials=(_OWNED,)) as ownership:
+                    with HTTPX_LOG_SHIELD.request(webhook=_OWNED_WEBHOOK) as ownership:
                         ownership.claim(httpx.Request("POST", owned_url))
                         _foreign_client_log(logger, foreign_url, exc_info)
             failed, plain = (record for record in handler.records if record.msg != 'HTTP Request: %s %s "%s %d %s"')

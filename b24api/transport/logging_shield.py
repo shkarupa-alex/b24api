@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from b24api._webhook import Webhook
 from b24api.errors import CapabilityError
 from b24api.transport.log_records import redact_owned_value, redact_registered_value, rewrite_record
 
@@ -90,17 +91,25 @@ def _may_negotiate_http2(client: _Client) -> bool:
 
 
 class LogOwnership:
-    """Recognize the redirect chains of one owned dispatch by the identity of its root request."""
+    """Recognize the redirect chains of one owned dispatch by the identity of its root request.
 
-    __slots__ = ("_request", "credentials")
+    The webhook the request is sent with travels as its ``Webhook``, whose ``repr`` leaves the token out, so no
+    frame that holds it renders the credential.
+    """
 
-    def __init__(self, credentials: tuple[str, ...]) -> None:
-        """Bind the owned webhook credentials, the token of the webhook the request is sent with."""
-        if not credentials or not all(isinstance(credential, str) and credential for credential in credentials):
-            credentials = ()  # a raising frame renders its locals
+    __slots__ = ("_request", "_webhook")
+
+    def __init__(self, webhook: Webhook) -> None:
+        """Bind the webhook the owned request is sent with."""
+        if not isinstance(webhook, Webhook) or not webhook.token:
             raise ValueError("HTTPX log shield requires the webhook credential of the owned request")
-        self.credentials = credentials
+        self._webhook = webhook
         self._request: weakref.ref[httpx.Request] | None = None
+
+    @property
+    def credentials(self) -> tuple[str, ...]:
+        """Return the owned webhook credential, its token."""
+        return (self._webhook.token,)
 
     def claim(self, request: httpx.Request) -> None:
         """Bind the exact owned request before it is sent; the extension only labels it for observers."""
@@ -218,11 +227,11 @@ class HttpxLogShield:
         self._clients: weakref.WeakKeyDictionary[_Client, _ClientRegistration] = weakref.WeakKeyDictionary()
         self._secrets: dict[str, int] = {}
 
-    def register_transport(self, *, credentials: tuple[str, ...] = (), client: _Client | None = None) -> bool:
+    def register_transport(self, *, webhook: Webhook | None = None, client: _Client | None = None) -> bool:
         """Install both filters while a transport can issue requests, before it creates or uses a client.
 
         Args:
-            credentials: Webhook secrets registered for the lifetime of ``client``.
+            webhook: The webhook whose secret is registered for the lifetime of ``client``.
             client: A client that already exists; a transport creating its own binds it afterwards.
 
         Returns:
@@ -231,9 +240,9 @@ class HttpxLogShield:
         with self._lock:
             self._transports += 1
             self._ensure_installed()
-        return True if client is None else self.bind_client(client, credentials=credentials)
+        return True if client is None else self.bind_client(client, webhook=webhook)
 
-    def bind_client(self, client: _Client, *, credentials: tuple[str, ...]) -> bool:
+    def bind_client(self, client: _Client, *, webhook: Webhook | None) -> bool:
         """Tie hpack suppression and registered secrets to the client's own life, once per client and secret.
 
         Returns:
@@ -248,10 +257,9 @@ class HttpxLogShield:
                     registration.finalizer = weakref.finalize(client, self._forget, registration)
             except TypeError:
                 return False
-            for credential in credentials:
-                if credential not in registration.credentials:
-                    registration.credentials.add(credential)
-                    self._secrets[credential] = self._secrets.get(credential, 0) + 1
+            if webhook is not None and webhook.token and webhook.token not in registration.credentials:
+                registration.credentials.add(webhook.token)
+                self._secrets[webhook.token] = self._secrets.get(webhook.token, 0) + 1
             self._ensure_installed()
             return True
 
@@ -298,12 +306,9 @@ class HttpxLogShield:
             return bool(self._transports or self._in_flight or len(self._clients))
 
     @contextmanager
-    def request(self, *, credentials: tuple[str, ...]) -> Iterator[LogOwnership]:
-        """Protect one dispatch; the caller claims its HTTPX request with the yielded marker."""
-        ownership = LogOwnership(credentials)
-        # The ownership keeps the credentials; this generator frame, rendered in any traceback through the
-        # dispatch, does not.
-        credentials = ()
+    def request(self, *, webhook: Webhook) -> Iterator[LogOwnership]:
+        """Protect one dispatch with ``webhook``; the caller claims its HTTPX request with the yielded marker."""
+        ownership = LogOwnership(webhook)
         with self._lock:
             if self._transports < 1:
                 raise RuntimeError("HTTPX log shield has no registered transport")

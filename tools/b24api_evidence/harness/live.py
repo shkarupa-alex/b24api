@@ -191,10 +191,7 @@ class LivePortal:
         self._client = cast("httpx.Client", resolved_client)
         self.attempts = 0
         # Registered only once the client exists, so a failed initialization leaves no registration behind.
-        HTTPX_LOG_SHIELD.register_transport(
-            credentials=(webhook.token,),
-            client=self._client,
-        )
+        HTTPX_LOG_SHIELD.register_transport(webhook=webhook, client=self._client)
         self._shield_finalizer = weakref.finalize(self, HTTPX_LOG_SHIELD.release_transport)
 
     def close(self) -> None:
@@ -235,7 +232,7 @@ class LivePortal:
         # The same shield as HttpxTransport: HTTPX logs the full method URL at INFO, and attribution by
         # the sync client's ``_send_handling_auth`` root tells this request's records from foreign ones.
         # The request is built inside it, and no local of this frame holds the method URL.
-        with HTTPX_LOG_SHIELD.request(credentials=(webhook.token,)) as ownership:
+        with HTTPX_LOG_SHIELD.request(webhook=webhook) as ownership:
             try:
                 request = self._client.build_request(
                     "POST",

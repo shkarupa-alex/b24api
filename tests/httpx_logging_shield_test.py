@@ -15,6 +15,7 @@ from packaging.requirements import Requirement
 from packaging.version import Version
 
 from b24api import Request, RouteKind
+from b24api._webhook import Webhook, WebhookAddress
 from b24api.contracts import BodyEncoding
 from b24api.errors import TransportError
 from b24api.transport import HttpxTransport
@@ -867,14 +868,18 @@ async def test_owned_and_foreign_extra_value_matrix() -> None:
     await _assert_shield_released(logger)
 
 
-@pytest.mark.parametrize("credentials", [(), ("",)], ids=["none", "empty"])
-def test_a_dispatch_without_a_credential_does_not_leave_the_filter_in_flight(credentials: tuple[str, ...]) -> None:
+def _webhook(token: str) -> Webhook:
+    return Webhook(WebhookAddress("https", "portal.invalid", None, "1"), token)
+
+
+@pytest.mark.parametrize("webhook", [None, _webhook("")], ids=["none", "empty"])
+def test_a_dispatch_without_a_credential_does_not_leave_the_filter_in_flight(webhook: Webhook | None) -> None:
     logger = logging.getLogger("httpx")
     HTTPX_LOG_SHIELD.register_transport()
     try:
         with (
             pytest.raises(ValueError, match="webhook credential of the owned request"),
-            HTTPX_LOG_SHIELD.request(credentials=credentials),
+            HTTPX_LOG_SHIELD.request(webhook=webhook),  # type: ignore[arg-type]
         ):
             pass
         assert HTTPX_LOG_SHIELD._in_flight == 0  # noqa: SLF001 - in-flight accounting control
@@ -891,7 +896,7 @@ def test_record_without_an_emitting_httpx_request_is_scrubbed_conservatively() -
     logger.setLevel(logging.INFO)
     HTTPX_LOG_SHIELD.register_transport()
     try:
-        with HTTPX_LOG_SHIELD.request(credentials=(_OWNED_MARKER,)):
+        with HTTPX_LOG_SHIELD.request(webhook=_webhook(_OWNED_MARKER)):
             logger.info("hop %s", f"https://redirect.invalid/rest/1/{_SECOND_MARKER}/profile")
         assert len(handler.records) == 1
         assert _SECOND_MARKER not in handler.records[0].getMessage()

@@ -31,7 +31,7 @@ from b24api.contracts import RequestHeaders
 from b24api.contracts.request import RouteKind
 from b24api.errors import ResponseTooLargeError
 from b24api.transport import HttpxTransport
-from b24api.transport.logging_shield import HTTPX_LOG_SHIELD, LogOwnership
+from b24api.transport.logging_shield import HTTPX_LOG_SHIELD
 from tests.scripting import client_for
 
 if TYPE_CHECKING:
@@ -932,8 +932,18 @@ async def test_a_refused_shield_entry_renders_no_webhook_with_frame_locals(monke
         assert FRAGMENT not in text
 
 
-def test_a_refused_log_ownership_renders_no_credential_with_frame_locals() -> None:
-    with pytest.raises(ValueError, match="requires the webhook credential") as refused:
-        LogOwnership((FRAGMENT, ""))
+def test_a_dispatch_the_log_shield_refuses_renders_no_credential_with_frame_locals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The shield's frames hold the webhook itself, whose repr leaves the token out: none clears a local by hand.
+    webhook = parse_webhook(f"https://fixture.invalid/rest/1/{FRAGMENT}/")
+    assert isinstance(webhook, Webhook)
+    monkeypatch.setattr(HTTPX_LOG_SHIELD, "_transports", 0)
+    with (
+        pytest.raises(RuntimeError, match="no registered transport") as refused,
+        HTTPX_LOG_SHIELD.request(webhook=webhook),
+    ):
+        pass
+    del webhook
     for text in _rendered_texts(refused.value):
         assert FRAGMENT not in text
