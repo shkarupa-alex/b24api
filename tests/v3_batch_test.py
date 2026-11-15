@@ -1910,3 +1910,10 @@ def test_an_interrupt_isolated_sends_raise_as_their_reader_is_cancelled_leaves_t
     assert [type(error) for error in got] == [KeyboardInterrupt]
     assert reported == []
     assert pending == []
+    # The reader's own cancellation, which ended the isolated send, is no failed close: the interrupt alone.
+    report = getattr(got[0], "report", None)
+    assert isinstance(report, OperationReport)
+    assert report.state is TerminalState.FAILED
+    assert [(violation.code, violation.message) for violation in report.violations] == [
+        ("interrupted", "operation interrupted (KeyboardInterrupt)")
+    ]
