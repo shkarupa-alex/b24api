@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 
     from b24api import Transport
     from b24api.execution.rate import DeadlineBudget, _Permit
+    from b24api.transport import WireRequest
 
 _JSON = (("content-type", "application/json"),)
 # The response's own clock, years behind the local one: a hint measured locally would have passed long ago.
@@ -1716,55 +1717,61 @@ async def test_a_replay_refused_while_time_is_left_fails_alone_and_the_stream_co
 _NO_DELAY = ExecutionPolicy(retry=RetryPolicy(initial_delay=0, maximum_delay=0, jitter=0))
 
 
-def _closing_after(executor: list[Executor], reply: WireResponse | TransportError) -> Callable[[Request], object]:
+class _ClosingTransport(ScriptedTransport):
     """Answer the first send with ``reply`` after closing the client's coordinator, so no later send gets a permit."""
 
-    async def respond(_request: Request) -> WireResponse | TransportError:
-        await executor[0].coordinator.close()
-        return reply
+    def __init__(self, reply: WireResponse | TransportError) -> None:
+        super().__init__(())
+        self.reply = reply
+        self.executor: Executor | None = None
+        self.sends = 0
 
-    return respond
+    async def _first(self) -> WireResponse:
+        self.sends += 1
+        assert self.executor is not None
+        await self.executor.coordinator.close()
+        if isinstance(self.reply, TransportError):
+            raise self.reply
+        return self.reply
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del request, attempt_timeout, max_response_bytes
+        return await self._first()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("safety", [ReplaySafety.SAFE, ReplaySafety.UNSAFE])
-async def test_a_classic_replay_stopped_before_its_send_by_a_closed_client_keeps_the_lost_send_as_its_cause(
-    safety: ReplaySafety,
+@pytest.mark.parametrize("dialect", [RouteKind.BARE, RouteKind.API_V3], ids=["classic", "v3"])
+@pytest.mark.parametrize("first", ["refused", "lost"])
+async def test_a_replay_stopped_before_its_send_by_a_closed_client_ends_with_the_stop_caused_by_what_it_followed(
+    dialect: RouteKind, first: str
 ) -> None:
-    # The first round's answer is lost, so its commands may have run; the SAFE replay is stopped at its permit by
-    # the closed client, which is not a budget: each command is unknown, explained by the lost send alone.
+    # The first envelope is refused as a whole (proven not run) or its answer is lost (it may have run), and the
+    # client is closed meanwhile: the SAFE replay is stopped at its permit, not by a budget. In both dialects each
+    # command ends with that stop, which is what ended it, caused by the failure it followed.
     lost = TransportError("reset", phase=FailurePhase.DISPATCH_STARTED)
-    holder: list[Executor] = []
-    transport = ResponderTransport(_closing_after(holder, lost))
-    holder.append(_executor(transport, _Time()))
-    requests = (_request(safety, "crm.item.get"), _request(safety, "crm.item.list"))
+    transport = _ClosingTransport(WireResponse(429, (), b"") if first == "refused" else lost)
+    executor = _executor(transport, _Time())
+    transport.executor = executor
+    requests = tuple(
+        Request(method, {"id": index}, ReplaySafety.SAFE, route=dialect)
+        for index, method in enumerate(("crm.item.get", "crm.item.list"))
+    )
 
-    outcomes = await BatchExecutor(holder[0]).execute_requests(requests, context=holder[0].context(_NO_DELAY))
+    outcomes = await BatchExecutor(executor).execute_requests(requests, context=executor.context(_NO_DELAY))
 
-    assert len(transport.requests) == 1
+    assert transport.sends == 1
     for outcome in outcomes:
         assert isinstance(outcome, BatchFailure)
-        assert type(outcome.error) is AmbiguousExecutionError
-        assert outcome.error.__cause__ is lost
-        assert execution(outcome.error) is Execution.POSSIBLY_RUN
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("safety", [ReplaySafety.SAFE, ReplaySafety.UNSAFE])
-async def test_a_classic_replay_stopped_before_its_send_by_a_closed_client_after_a_refusal_ends_answered(
-    safety: ReplaySafety,
-) -> None:
-    # The first round is refused as a whole, proven not run, and its replay is stopped at its permit by the closed
-    # client: each command ends with that stop, recorded as sent and answered, never as a command never sent.
-    holder: list[Executor] = []
-    transport = ResponderTransport(_closing_after(holder, _refused()))
-    holder.append(_executor(transport, _Time()))
-    requests = (_request(safety, "crm.item.get"), _request(safety, "crm.item.list"))
-
-    outcomes = await BatchExecutor(holder[0]).execute_requests(requests, context=holder[0].context(_NO_DELAY))
-
-    assert len(transport.requests) == 1
-    for outcome in outcomes:
-        assert isinstance(outcome, BatchFailure)
-        assert type(outcome.error) is ClientClosedError
-        assert execution(outcome.error) is Execution.ANSWERED
+        if first == "refused":
+            # Proven not run by the refusal, and sent once: the stop is the outcome, recorded as answered.
+            assert type(outcome.error) is ClientClosedError
+            assert isinstance(outcome.error.__cause__, HTTPGatewayError)
+            assert outcome.error.__cause__.http_status == 429  # noqa: PLR2004
+            assert execution(outcome.error) is Execution.ANSWERED
+        else:
+            # The lost send may have run: unknown, named after it, with the stop and then the lost send as causes.
+            assert type(outcome.error) is AmbiguousExecutionError
+            stop = outcome.error.__cause__
+            assert type(stop) is ClientClosedError
+            assert stop.__cause__ is lost
+            assert execution(outcome.error) is Execution.POSSIBLY_RUN

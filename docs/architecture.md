@@ -135,8 +135,10 @@ outcome.
   a command still carried when the last attempt is spent ends as the attempt budget stops it), and
   still sends the others when the window or a held method stops some, unless it is fail-fast, which is
   sent whole or not at all. A hold that appears during the wait is met at the permit and stops the whole round
-  when it outlasts the window; a stop before a round's send ends each of its commands with the
-  failure that command followed as the cause. The REST 3.0 isolation of an unresolved `SAFE` envelope is
+  when it outlasts the window. A stop before a replay round's send, by the budget or by any other
+  failure (a closed client), ends each command that followed its envelope's failure with that stop,
+  caused by the failure it followed, in both dialects (`_stopped_after`); a command its own entry or
+  element answered keeps that answer. The REST 3.0 isolation of an unresolved `SAFE` envelope is
   a replay round of its group like its one envelope retry: planned whole by `plan_replay` and waited out
   by `replay_after` (the longer of the backoff and the coordinator's hold, within the attempt budget,
   the retry window and the deadline), then its commands are sent one at a time, inside the dispatch

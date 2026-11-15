@@ -180,7 +180,7 @@ CONSTRUCTIONS = Counter(
         ("batch/engine.py", "BatchExecutor._split_held", "BudgetExceededError(_HOLD_REFUSAL)"): 1,
         # A command the plan of its replay round stopped, for a refusal made above: by time (``time_left``), or
         # while time is left.
-        ("batch/engine.py", "_Lineup._stop", "BudgetExceededError(refusal)"): 1,
+        ("batch/engine.py", "BatchExecutor._next_round", "BudgetExceededError(_retry_refusal(plan))"): 2,
         ("batch/v3.py", "_V3Resolution._not_run", "BudgetExceededError(stop)"): 1,
         # Cleanup overruns: a cleanup step outlasted its window; it refused no work and records no refusal.
         (CONTEXT, "AsyncIteratorController.aclose", "CleanupOverrunError(self._cleanup_error)"): 1,

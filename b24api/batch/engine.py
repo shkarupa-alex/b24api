@@ -14,6 +14,7 @@ from b24api.batch.correlation import (
     _command_failure,
     _command_success,
     _shared_failure,
+    _stopped_after,
     _withheld,
 )
 from b24api.batch.outcome import (
@@ -171,9 +172,9 @@ class _Lineup:
         """Record what a round gave its commands; return those that may run again, carried ones included.
 
         A round proves nothing new about a command when it was stopped before its send, or when its envelope was
-        refused as a whole after the command's own entry answered it: the command stays as it was. A budget that
-        stops a round before its send stops each command it holds as ``stop`` does, whichever command's failure
-        asked for that round.
+        refused as a whole after the command's own entry answered it: the command stays as it was. A failure that
+        stops a round before its send, the budget's or any other (a closed client), stops each command it holds
+        as ``_stop`` does, whichever command's failure asked for that round.
         """
         again = {command.index for command in sent.replay}
         for command, outcome in zip(commands, sent.outcomes, strict=True):
@@ -186,8 +187,8 @@ class _Lineup:
                 self.waiting[command.index] = _Waiting(before.state, before.lineage.after(sent.send))
             elif command.index in again:
                 self.waiting[command.index] = _Waiting(_state(outcome, sent), before.lineage.after(sent.send))
-            elif not sent.dispatched and isinstance(sent.failure, BudgetExceededError):
-                self._stop(command, before, str(sent.failure))
+            elif not sent.dispatched and sent.failure is not None:
+                self._stop(command, before, sent.failure)
             else:
                 self._settle(outcome, before.lineage)
         candidates, self.carried = (*sent.replay, *self.carried), ()
@@ -200,19 +201,17 @@ class _Lineup:
         else:
             self._settle(outcome, _Lineage())
 
-    def stop(self, commands: tuple[_Command, ...], refusal: str) -> None:
+    def stop(self, commands: tuple[_Command, ...], refusal: BudgetExceededError) -> None:
         """End the commands the budget keeps from being sent again, for ``refusal``."""
         for command in commands:
             self._stop(command, self.waiting.pop(command.index), refusal)
 
-    def _stop(self, command: _Command, waiting: _Waiting, refusal: str) -> None:
-        """End a command the budget keeps from being sent again: its entry's answer, or the budget it caused."""
+    def _stop(self, command: _Command, waiting: _Waiting, stop: B24ApiError) -> None:
+        """End a command ``stop`` keeps from being sent again (``_stopped_after``): its entry's answer, or the stop."""
         if isinstance(waiting.state, _Answered):
             self._settle(waiting.state.outcome, waiting.lineage)
             return
-        error = BudgetExceededError(refusal)
-        error.__cause__ = waiting.state.failure
-        waiting.lineage.record_unsent(error)
+        error = _stopped_after(stop, waiting.state.failure, waiting.lineage)
         self._settle(_shared_failure(command, error), waiting.lineage)
 
     def _settle(self, outcome: BatchOutcome, lineage: _Lineage) -> None:
@@ -395,17 +394,17 @@ class BatchExecutor:
                 whole=options.halt,
             )
         except BudgetExceededError as refusal:
-            lineup.stop(candidates, str(refusal))
+            lineup.stop(candidates, refusal)
             return ()
         if plan is None:
-            lineup.stop(candidates, _retry_refusal(plan))
+            lineup.stop(candidates, BudgetExceededError(_retry_refusal(plan)))
             return ()
         sending, carried, refused = (
             tuple(candidates[index] for index in plan.sends(each))
             for each in (_SendPlan.SEND, _SendPlan.CARRY, _SendPlan.REFUSE)
         )
         lineup.carried = carried
-        lineup.stop(refused, _retry_refusal(plan))
+        lineup.stop(refused, BudgetExceededError(_retry_refusal(plan)))
         if sending:
             await self.executor.replay_after(context, attempts=attempts, pause=plan.pause)
         return sending

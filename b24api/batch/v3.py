@@ -18,6 +18,7 @@ from b24api.batch.correlation import (
     _command_failure,
     _command_success,
     _shared_failure,
+    _stopped_after,
 )
 from b24api.batch.outcome import BatchCommandEvidence, BatchFailure
 from b24api.contracts.json import FrozenMapping, _freeze_json
@@ -75,8 +76,9 @@ class _V3Resolution:
         """Send the group's envelopes until every command has its one settled outcome."""
         safe = all(command.request.replay_safety is ReplaySafety.SAFE for command in commands)
         pending = commands
-        # The refusal of the whole envelope that the pending commands are sent again after; ``None`` after any other.
-        refusal: B24ApiError | None = None
+        # The failure of the whole envelope that the pending commands are sent again after; ``None`` after their own
+        # elements answered them.
+        followed: B24ApiError | None = None
         while pending:
             attempt = await self.executor._execute_physical_batch_attempt(  # noqa: SLF001 - batch-owned physical port
                 _envelope(pending),
@@ -84,7 +86,7 @@ class _V3Resolution:
                 attempts=self.attempts,
                 methods=frozenset(command.request.method for command in pending),
             )
-            pending, refusal = await self._classify(pending, attempt, safe=safe, refusal=refusal)
+            pending, followed = await self._classify(pending, attempt, safe=safe, followed=followed)
         return tuple(self.settled[command.index] for command in commands)
 
     async def _classify(
@@ -93,9 +95,9 @@ class _V3Resolution:
         attempt: PhysicalAttemptOutcome,
         *,
         safe: bool,
-        refusal: B24ApiError | None,
+        followed: B24ApiError | None,
     ) -> tuple[tuple[_Command, ...], B24ApiError | None]:
-        """Classify one physical attempt; return the commands sent again, and the envelope refusal they follow."""
+        """Classify one physical attempt; return the commands sent again, and the envelope failure they follow."""
         if attempt.kind == "cancelled":
             # Cancellation after dispatch: nothing is replayed and nothing is guessed; it propagates.
             raise attempt.error if isinstance(attempt.error, BaseException) else asyncio.CancelledError
@@ -107,16 +109,18 @@ class _V3Resolution:
                 "REST v3 batch result is not a complete array of command responses",
                 evidence=attempt.response.evidence,
             )
-            return await self._unresolved(pending, malformed, safe=safe), None
+            replay = await self._unresolved(pending, malformed, safe=safe)
+            return replay, malformed if replay else None
         error = attempt.error
         if not isinstance(error, B24ApiError):
             raise TypeError("physical batch attempt failed without a typed error")
         if not attempt.dispatch_started:
-            return self._stop(pending, error, refusal=refusal), None
+            return self._stop(pending, error, followed=followed), None
         if attempt.transport_proves_not_accepted or _unstructured_refusal(error, self.context):
             replay = await self._not_run(pending, error, safe=safe)
-            return replay, error if replay else None
-        return await self._unresolved(pending, error, safe=safe), None
+        else:
+            replay = await self._unresolved(pending, error, safe=safe)
+        return replay, error if replay else None
 
     async def _attributed(
         self, pending: tuple[_Command, ...], elements: list[JsonValue], response: Response
@@ -187,9 +191,7 @@ class _V3Resolution:
             if stop is None:
                 return pending
             # As a lone request and a classic batch end: with the budget that stopped the retry, caused by the refusal.
-            stopped = BudgetExceededError(stop)
-            stopped.__cause__ = error
-            self.attempts.record(stopped, self.context.policy)
+            stopped = _stopped_after(BudgetExceededError(stop), error, self.attempts.lineage)
             for command in pending:
                 self.last[command.index] = _shared_failure(command, stopped)
         self._settle(pending)
@@ -221,20 +223,19 @@ class _V3Resolution:
         return ()
 
     def _stop(
-        self, pending: tuple[_Command, ...], error: B24ApiError, *, refusal: B24ApiError | None
+        self, pending: tuple[_Command, ...], error: B24ApiError, *, followed: B24ApiError | None
     ) -> tuple[_Command, ...]:
-        """A round stopped before dispatch leaves each command the outcome it last received.
+        """End the commands of a round that ``error`` stopped before its send, as a classic batch ends its own.
 
-        Sent again after a refusal of the whole envelope and stopped by the budget before the send (at the permit,
-        or at the send for too little window after the wait), the commands end as a classic batch's and a lone
-        request's do: with that stop, caused by the refusal.
+        Sent again after a failure of the whole envelope and stopped before the send, by the budget (at the permit,
+        or at the send for too little window after the wait) or by any other failure (a closed client), each ends
+        with that stop, caused by the failure it followed (``_stopped_after``). Commands their own elements
+        answered keep that answer; those of a first send end with the stop.
         """
-        if refusal is not None and isinstance(error, BudgetExceededError):
-            if error.__cause__ is None:
-                error.__cause__ = refusal
-            self.attempts.record_unsent(error)
+        if followed is not None:
+            ended = _stopped_after(error, followed, self.attempts.lineage)
             for command in pending:
-                self.last[command.index] = _shared_failure(command, error)
+                self.last[command.index] = _shared_failure(command, ended)
         for command in pending:
             self.last.setdefault(command.index, _shared_failure(command, error))
         self._settle(pending)
