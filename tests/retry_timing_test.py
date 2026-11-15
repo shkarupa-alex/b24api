@@ -2054,3 +2054,71 @@ async def test_a_stopped_retry_is_explained_by_the_send_it_followed_whatever_sto
             assert followed is replies[-1]
             assert ambiguity.reason is AmbiguityReason.DEADLINE_AFTER_DISPATCH
         assert ambiguity.evidence == followed.evidence
+
+
+_BAD_GATEWAY = 502
+# A host hint far longer than the operation's time: the retry it asks for cannot fit.
+_OUTLASTING_HINT = (("retry-after", "60"),)
+_PLAN_REFUSALS = {
+    # No attempt is left for the retry.
+    "attempts": (ExecutionPolicy(retry=RetryPolicy(initial_delay=0, jitter=0), max_attempts_per_request=1), ()),
+    # The host hint outlasts what is left of the operation.
+    "hint": (ExecutionPolicy(retry=RetryPolicy(initial_delay=0, jitter=0), max_elapsed=5.0), _OUTLASTING_HINT),
+}
+
+
+def _assert_explained_by_the_502(error: B24ApiError) -> None:
+    """The retry plan refused the retry of a send answered 502: unknown for that send, never for the refusal."""
+    stop = error.__cause__ if type(error) is AmbiguousExecutionError else error
+    assert type(stop) is BudgetExceededError
+    assert stopped_before_send(stop)
+    assert isinstance(stop.__cause__, HTTPGatewayError)
+    assert stop.__cause__.http_status == _BAD_GATEWAY
+    assert execution(error) is Execution.POSSIBLY_RUN
+    ambiguity = (
+        error
+        if type(error) is AmbiguousExecutionError
+        else ambiguity_of(error, request_summary=None, declared_unsafe=False)
+    )
+    assert isinstance(ambiguity, AmbiguousExecutionError)
+    assert ambiguity.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    assert ambiguity.evidence is not None
+    assert ambiguity.evidence.http_status == _BAD_GATEWAY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", sorted(_PLAN_REFUSALS))
+async def test_a_fanned_out_retry_the_plan_refuses_is_unknown_for_the_send_it_followed(refusal: str) -> None:
+    # A SAFE command answered 502 may have run; its retry plan refuses the retry while time is left (no attempt
+    # left, or a host hint that outlasts the operation). The command is unknown for that send.
+    policy, hint = _PLAN_REFUSALS[refusal]
+    transport = ResponderTransport(always(WireResponse(_BAD_GATEWAY, hint, b"bad gateway")))
+    command = Command(Request("crm.item.get", {"id": 0}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
+    async with (
+        client_for(transport, policy=policy) as client,
+        client.fan_out_outcomes([command], dispatch=DirectDispatch(concurrency=1)) as stream,
+    ):
+        outcomes = [outcome async for outcome in stream]
+
+    assert len(transport.requests) == 1
+    (outcome,) = outcomes
+    assert isinstance(outcome, CommandOutcomeUnknown)
+    _assert_explained_by_the_502(outcome.error)
+    assert stream.report is not None
+    assert stream.report.physical_requests == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", sorted(_PLAN_REFUSALS))
+async def test_a_bytes_retry_the_plan_refuses_raises_the_refusal_explained_by_its_send(
+    refusal: str,
+) -> None:
+    # The same for a lone request read as bytes: it raises the refusal, whose facts name the send answered 502.
+    policy, hint = _PLAN_REFUSALS[refusal]
+    transport = ResponderTransport(always(WireResponse(_BAD_GATEWAY, hint, b"bad gateway")))
+    async with client_for(transport, policy=policy) as client:
+        with pytest.raises(BudgetExceededError) as raised:
+            await client.call_bytes(Request("crm.item.get", {"id": 0}, ReplaySafety.SAFE, route=RouteKind.BARE))
+
+    assert len(transport.requests) == 1
+    _assert_explained_by_the_502(raised.value)

@@ -31,6 +31,7 @@ from b24api.contracts.v3_codes import RATE_LIMIT_ERROR_CODE
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
+    B24ApiError,
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
@@ -1542,3 +1543,99 @@ async def test_a21_isolation_refused_at_the_operation_deadline_is_recorded_and_e
     assert len(portal.sent) == 1
     for identifier in portal.sent[0][0]:
         _ends_with_the_refusal_caused_by_the_abort(errors[identifier], str(ended))
+
+
+_TRANSIENT_ENVELOPE_FAILURES = {
+    # An answer with an ambiguous status: the envelope may have run.
+    "502": lambda: WireResponse(502, (), b"bad gateway"),
+    # A lost answer.
+    "lost": lambda: TransportError("reset", phase=FailurePhase.DISPATCH_STARTED),
+    # The portal too busy, top-level: it proves nothing about an envelope's commands.
+    "busy": lambda: WireResponse(503, JSON_HEADERS, json.dumps({"error": "QUERY_LIMIT_EXCEEDED"}).encode()),
+    # A transient abort of the envelope.
+    "abort": lambda: WireResponse(503, JSON_HEADERS, json.dumps(_abort("QUERY_LIMIT_EXCEEDED")).encode()),
+}
+# The retry window and the backoff of a SAFE envelope retry; the envelope's answer takes most of the window.
+_REFUSED_RETRY_WINDOW = 1.0
+_REFUSED_RETRY_BACKOFF = 0.5
+_ENVELOPE_TAKES = 0.8
+
+
+class _OneEnvelope(ScriptedTransport):
+    """Answer the first v3 envelope with ``failure``; any further send, whole or alone, fails the test.
+
+    The answer takes ``takes`` seconds, or brings a host hold of ``hold`` seconds.
+    """
+
+    def __init__(self, failure: WireResponse | TransportError, clock: _Clock, *, takes: float, hold: float) -> None:
+        super().__init__(())
+        self.failure = failure
+        self.clock = clock
+        self.takes = takes
+        self.hold = hold
+        self.coordinator: RateCoordinator | None = None
+        self.sends = 0
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        self.sends += 1
+        assert request.array_body is not None, "no command is sent alone"
+        assert self.sends == 1, "the envelope is not sent again"
+        self.clock.now += self.takes
+        if self.hold:
+            assert self.coordinator is not None
+            await self.coordinator.observe_throttle(self.hold, reason="test")
+        if isinstance(self.failure, TransportError):
+            raise self.failure
+        return self.failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["window", "hold"])
+@pytest.mark.parametrize("failure", sorted(_TRANSIENT_ENVELOPE_FAILURES))
+async def test_a21_lineage_an_envelope_retry_the_budget_refused_is_not_followed_by_an_isolation(
+    failure: str, refusal: str
+) -> None:
+    """A SAFE envelope's one retry the budget refused ends each command, sending none of them alone.
+
+    The isolation would be refused by the same budget: the window left is shorter than the retry's backoff, or the
+    host holds the methods longer than the operation's time left. Each command is unknown, ended by the refusal
+    caused by the envelope's failure.
+    """
+    clock = _Clock()
+    envelope_failure = _TRANSIENT_ENVELOPE_FAILURES[failure]()
+    transport = _OneEnvelope(
+        envelope_failure,
+        clock,
+        takes=_ENVELOPE_TAKES if refusal == "window" else 0.0,
+        hold=30.0 if refusal == "hold" else 0.0,
+    )
+    executor = _timed_executor(transport, clock)
+    transport.coordinator = executor.coordinator
+    retry = RetryPolicy(initial_delay=_REFUSED_RETRY_BACKOFF, maximum_delay=_REFUSED_RETRY_BACKOFF, jitter=0)
+    policy = (
+        ExecutionPolicy(retry=retry, max_elapsed=100.0, max_retry_elapsed_per_request=_REFUSED_RETRY_WINDOW)
+        if refusal == "window"
+        else ExecutionPolicy(retry=retry, max_elapsed=5.0)
+    )
+    context = executor.context(policy)
+    requests = (_v3(1), _v3(2))
+
+    outcomes = await BatchExecutor(executor).execute_requests(requests, context=context)
+    await executor.coordinator.close()
+
+    assert transport.sends == 1
+    snapshot = await context.snapshot()
+    assert snapshot.counters.physical_requests == 1
+    assert snapshot.batch_isolation_requests == 0
+    for outcome in outcomes:
+        assert isinstance(outcome, BatchFailure)
+        assert isinstance(outcome.error, AmbiguousExecutionError)
+        stop = outcome.error.__cause__
+        assert type(stop) is BudgetExceededError
+        followed = stop.__cause__
+        if isinstance(envelope_failure, TransportError):
+            assert followed is envelope_failure
+        else:
+            assert isinstance(followed, B24ApiError)
+            assert followed.http_status == envelope_failure.status_code
