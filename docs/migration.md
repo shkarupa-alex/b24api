@@ -129,7 +129,11 @@
   carries one `cleanup_failure` violation "stream cleanup failed (X)", nothing else; behind an
   earlier failure, that failure stays the terminal reason and the close adds a `cleanup_failure`
   "stream cleanup also failed (X)". X is `InputSourceError` for a close that raised (next item) and
-  `CleanupOverrunError` for one that overran its window. Code that matched the old strings must
+  `CleanupOverrunError` for one that overran its window. The earlier failure's violation comes first
+  and the close's after it (`batch()` and `fan_out()` listed the close first). `iter_list_keyset()` on its
+  fast path reports a failed close the same way: an early close whose cleanup failed has the terminal
+  reason "stream cleanup failed" (it was "stream closed before exhaustion"), and a failure it ends with
+  no longer carries "stream cleanup also failed (X)" as a note. Code that matched the old strings must
   match these. A library error raised behind an earlier failure no longer carries that line as a note
   (only `batch_outcomes()` added one); read it from the report the error carries (`error.report`). Your
   own exception raised inside `async with stream`, which a failed close does not replace, carries one

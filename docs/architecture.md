@@ -288,9 +288,10 @@ outcome.
   keeps what its own admission (`accept`) raised, so a batch tells an item it refused from the source's
   own failure without a private exception class.
 - A failed close is reported by one rule, built by `OperationRunner` (`cleanup_failure` and
-  `cleanup_failure_violation`), for every family: "stream cleanup failed (X)" as the terminal failure
-  when nothing failed before it, "stream cleanup also failed (X)" as a secondary otherwise, recorded in
-  the report. A library error never carries it as a note: it carries the report (`error.report`). The
+  `cleanup_failure_violation`), for every family and every kernel stream, the fast keyset one
+  (`KeysetFastStream`) included: "stream cleanup failed (X)" as the terminal failure when nothing failed
+  before it, "stream cleanup also failed (X)" as a secondary otherwise, recorded in the report. The
+  failure is primary: `finalize_failure` puts its violation ahead of the cleanup failures behind it. A library error never carries it as a note: it carries the report (`error.report`). The
   caller's own exception raised inside `async with stream`, which the failed close does not replace,
   carries one note: the report's `cleanup_failure` violation, word for word (`__aexit__` reads it from
   the published report). A close while a read is in flight is an
