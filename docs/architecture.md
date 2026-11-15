@@ -294,7 +294,10 @@ outcome.
   the reader's cancellation it is secondary too (`cancellation_outranks`): the reader gets the
   cancellation and the stream is cancelled whenever the cancellation landed, and `OperationStream`
   demotes its own cleanup failure behind a cancelled source the same way
-  (`with_cleanup_failure_behind`). An interrupt (`is_interrupt`: neither an `Exception` nor a
+  (`with_cleanup_failure_behind`). It does so behind an interrupt as well (`closed_behind_its_end`): a
+  source it closes records a failed close as what failed it, not knowing that an interrupt ended the
+  operation first, so a close failing behind an interrupt reads the same whether the interrupt came in
+  a read or between reads. An interrupt (`is_interrupt`: neither an `Exception` nor a
   cancellation) is never secondary, and one piece of state carries it: each operation has one
   `InterruptLatch`, the isolated runner's, which its pull and cleanup tasks publish through `INTERRUPTS`
   so the tasks they start inherit it (an inline kernel uses the latch of the runner it serves). Every
