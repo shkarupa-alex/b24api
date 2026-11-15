@@ -1348,9 +1348,7 @@ def test_an_interrupt_latched_between_reads_goes_to_the_event_loop_at_once(
         assert after == [StopAsyncIteration, "closed"]
         cancelled_cleanup = []
     else:
-        with pytest.raises(interrupt) as raised:
-            asyncio.run(main())
-        error = raised.value
+        error = raised_by_asyncio_run(main)
         cancelled_cleanup = [("cleanup_failure", "stream cleanup also failed (CancelledError)")]
     gc.collect()
     assert error is transport.raised[0]
