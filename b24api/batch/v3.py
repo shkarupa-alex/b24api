@@ -55,7 +55,6 @@ if TYPE_CHECKING:
     from b24api.execution.executor import PhysicalAttemptOutcome
 
 _OPERATION_TIME_LIMIT = "operation_time_limit"
-_ISOLATION_REFUSAL = "execution time budget exhausted before isolating the batch's commands"
 
 
 @dataclass(slots=True)
@@ -206,17 +205,18 @@ class _V3Resolution:
         await self._observe_abort_throttle(pending, error)
         for command in pending:
             self.last[command.index] = _shared_failure(command, error)
-        if (
-            safe
-            and not self.envelope_retry_used
-            and _is_retryable(error, safety=ReplaySafety.SAFE, policy=self.context.policy)
-        ):
-            self.envelope_retry_used = True
-            if await self._pause(pending) is None:
-                return pending
-        if safe and self._isolation_allowed():
-            for command, outcome in zip(pending, await self._isolate(pending), strict=True):
-                self.last[command.index] = outcome
+        if safe:
+            # The one envelope retry of a transient failure, else the isolation of each command: either is a replay
+            # of the group, planned and paced as one. A replay the budget refuses leaves each command the
+            # envelope's failure.
+            retry = not self.envelope_retry_used and _is_retryable(
+                error, safety=ReplaySafety.SAFE, policy=self.context.policy
+            )
+            if (retry or self.context.policy.retry.isolate_safe_batch_abort) and await self._pause(pending) is None:
+                if retry:
+                    self.envelope_retry_used = True
+                    return pending
+                await self._isolate(pending)
         self._settle(pending)
         return ()
 
@@ -252,9 +252,12 @@ class _V3Resolution:
             await self.context.coordinator.observe_api_throttle(method, error.normalized_code)
 
     async def _pause(self, commands: tuple[_Command, ...]) -> str | None:
-        """Wait before sending ``commands`` again; return why the group's budget forbids another envelope, if it does.
+        """Wait before sending ``commands`` again; return why the group's budget forbids it, if it does.
 
-        A group carries one safety class and travels in one envelope, so its replay is admitted or refused whole.
+        A group carries one safety class and travels in one envelope, so its replay, another envelope or the isolation
+        of its commands, is admitted or refused whole: by the attempt budget, the retry window, the operation's
+        deadline (recorded) or a wait, the longer of the backoff and the coordinator's hold, that the window cannot
+        carry.
         """
         safety = envelope_safety(command.request.replay_safety for command in commands)
         methods = frozenset(command.request.method for command in commands)
@@ -267,36 +270,15 @@ class _V3Resolution:
         await self.executor.replay_after(self.context, attempts=self.attempts, pause=plan.pause)
         return None
 
-    def _isolation_allowed(self) -> bool:
-        """One bounded attribution phase, only within the inherited attempt and retry-time budgets.
+    async def _isolate(self, pending: tuple[_Command, ...]) -> None:
+        """Send each unresolved SAFE command alone, never packed into a batch again, after the group's replay wait.
 
-        With no time left, the phase is refused by time as any work is (``ExecutionContext.time_left``): by the
-        operation's deadline, recorded, or by the group's retry window alone.
+        The commands go one at a time: the isolation stays within the dispatch slot its envelope held, one request
+        in flight. Each send is an ordinary request on the command's copy of the group lineage, which the executor
+        admits at its permit and paces through its own retries.
         """
-        policy = self.context.policy
-        started = self.attempts.started
-        if (
-            not policy.retry.isolate_safe_batch_abort
-            or started is None
-            or self.attempts.used >= policy.max_attempts_per_request
-        ):
-            return False
-        try:
-            self.context.time_left(_ISOLATION_REFUSAL, retry_started=started)
-        except BudgetExceededError:
-            return False
-        return True
-
-    async def _isolate(self, pending: tuple[_Command, ...]) -> tuple[BatchOutcome, ...]:
-        """Send each unresolved SAFE command individually; they are never packed into a batch again."""
-        tasks = [asyncio.ensure_future(self._isolate_one(command)) for command in pending]
-        try:
-            return tuple(await asyncio.gather(*tasks))
-        except BaseException:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
+        for command in pending:
+            self.last[command.index] = await self._isolate_one(command)
 
     async def _isolate_one(self, command: _Command) -> BatchOutcome:
         # A per-command snapshot of the group lineage: started, used and possible-execution flags carry over.

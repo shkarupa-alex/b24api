@@ -347,7 +347,9 @@ async with client.batch_outcomes(v3_commands) as stream:
 REST 3.0 does not roll a batch back. When a whole envelope fails after it may have run, `SAFE`
 commands of a transient failure get one envelope retry within their attempt budget, and commands
 still unresolved are sent individually (`RetryPolicy.isolate_safe_batch_abort`, enabled by default)
-under the same attempt lineage; `UNSAFE` and `UNKNOWN` commands arrive
+under the same attempt lineage. That isolation waits and is admitted as a retry is (backoff, throttle
+hint, attempts, retry window, deadline), then sends one command at a time, so it stays within the
+dispatch's concurrency; `UNSAFE` and `UNKNOWN` commands arrive
 as `CommandOutcomeUnknown` without a resend. The report counts `ambiguous_physical_attempts` and
 `batch_isolation_requests`. Fail-fast `batch()` finishes resolving the envelope it already sent and
 then raises without reading further input.

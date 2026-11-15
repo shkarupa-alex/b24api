@@ -1,5 +1,21 @@
 # Migration guide
 
+## The retry path
+
+- **A REST 3.0 isolation waits and is admitted as a retry is, and sends one command at a time.** When
+  a REST 3.0 envelope of `SAFE` commands failed after it may have run and its one envelope retry was
+  used (or its failure is not retried), its commands were sent alone all at once, without the retry's
+  backoff or the host's throttle hint, and beyond the `BatchDispatch` concurrency (bounded only by the
+  client limit). The isolation is now a replay of the envelope's commands, planned as their envelope
+  retry is: it waits the longer of the backoff and the host's hint, within the attempt budget, the
+  retry window and the deadline, and then sends the commands one at a time, so a `BatchDispatch` never
+  has more requests in flight than its `concurrency`. An isolation refused because the operation's
+  deadline has passed now fails with "execution time budget exhausted before the retry", as any retry
+  does, and still ends the stream with `BudgetExceededError`. One refused for its own request alone (no
+  attempt left, its retry window closed, or a wait longer than the window left) sends nothing, records
+  nothing, and leaves each command unknown, explained by the envelope's failure, as before. An envelope
+  retry the budget refused is no longer followed by an isolation, which the same budget would refuse.
+
 ## The end of `max_elapsed` is not a cleanup failure
 
 - **Cleanup gets a grace past the budget.** Every stream but `iter_list()` waited for its source's
@@ -380,8 +396,8 @@ send meets a method pause, have changed.
   `max_direct_concurrency`, `max_active_references` and the client limit at once; a `BatchDispatch`
   keeps at most the smallest of its `concurrency`, `max_active_references` and the client limit of
   physical batches in flight, and `max_direct_concurrency` does not limit it. The isolation of a REST
-  3.0 envelope of `SAFE` commands that may have run sends its unresolved commands one by one, all at
-  once, bounded only by the client limit. In `fan_out()` and `fan_out_outcomes()`, a `BatchDispatch`
+  3.0 envelope of `SAFE` commands that may have run sends its unresolved commands one at a time, within
+  the batch it isolates (see "The retry path"). In `fan_out()` and `fan_out_outcomes()`, a `BatchDispatch`
   keeps as many batches in flight as these limits allow, whatever its `batch_size`: see "A fan-out's
   row share follows its concurrency" under "Results beyond the row budget". Raise the client limit
   only as far as the portal's rate limits allow.
