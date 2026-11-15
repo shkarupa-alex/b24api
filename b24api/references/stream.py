@@ -32,6 +32,7 @@ from b24api.references.dispatch import (
     ReferenceRequestSource,
     ReferenceStreamItem,
 )
+from b24api.references.dispatch_plan import bound_dispatch
 from b24api.references.outcome import KernelReferenceItem, ReferenceRequest
 from b24api.references.scheduler import ReferenceScheduler
 from b24api.traversal import PaginationDriver
@@ -274,15 +275,16 @@ def iter_references(  # noqa: PLR0913
         not isinstance(_page_cap_hint, int) or isinstance(_page_cap_hint, bool) or _page_cap_hint < 1
     ):
         raise ValueError("page cap hint must be a positive integer")
+    policy = policy or ExecutionPolicy()
     scheduler = ReferenceScheduler(
         executor,
         plan=plan,
-        dispatch=dispatch,
+        dispatch=bound_dispatch(dispatch, policy),
         selector=selector,
         identity=identity,
         output_order=output_order,
         tolerant=tolerant,
-        policy=policy or ExecutionPolicy(),
+        policy=policy,
         whole_result=_whole_result,
         emit_complete=_emit_complete,
         emit_response=_emit_response,

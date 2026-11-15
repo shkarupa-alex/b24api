@@ -148,8 +148,7 @@ def _whole_result_share(dispatch: DispatchPlan, policy: ExecutionPolicy) -> int:
     budget = policy.max_buffered_rows
     results = min(dispatch.results_in_flight, policy.max_active_references)
     if isinstance(dispatch, KernelBatchDispatch):
-        one_batch = min(dispatch.batch_size, policy.max_active_references)
-        results = min(results, max(one_batch, budget // PORTAL_PAGE_ROWS))
+        results = min(results, max(dispatch.batch_size, budget // PORTAL_PAGE_ROWS))
     return max(1, budget // results)
 
 

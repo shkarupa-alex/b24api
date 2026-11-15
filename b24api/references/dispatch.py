@@ -874,8 +874,7 @@ class _DirectPageDispatcher:
     ) -> None:
         self.executor = executor
         self.context = context
-        concurrency = min(plan.concurrency, context.policy.max_direct_concurrency)
-        self._semaphore = asyncio.Semaphore(concurrency)
+        self._semaphore = asyncio.Semaphore(plan.concurrency)
         self.batch_requests = 0
         self.batch_commands = 0
 
@@ -929,9 +928,8 @@ class _BatchPageDispatcher:
         self._queue: asyncio.Queue[_PendingBatch] = asyncio.Queue(
             maxsize=context.policy.max_active_references,
         )
-        concurrency = min(self.plan.concurrency, self.context.policy.max_active_references)
-        self._send_queue: asyncio.Queue[list[_PendingBatch]] = asyncio.Queue(maxsize=concurrency)
-        self._send_slots = asyncio.Semaphore(concurrency)
+        self._send_queue: asyncio.Queue[list[_PendingBatch]] = asyncio.Queue(maxsize=plan.concurrency)
+        self._send_slots = asyncio.Semaphore(plan.concurrency)
         self._producer_state = producer_state
         self._buffer = buffer
         self._page_cap = page_cap
@@ -1023,9 +1021,8 @@ class _BatchPageDispatcher:
     def _ensure_workers(self) -> None:
         if self._assembler is not None:
             return
-        concurrency = min(self.plan.concurrency, self.context.policy.max_active_references)
         self._assembler = asyncio.create_task(self._run())
-        senders = tuple(asyncio.create_task(self._send_run()) for _index in range(concurrency))
+        senders = tuple(asyncio.create_task(self._send_run()) for _index in range(self.plan.concurrency))
         self._workers = (self._assembler, *senders)
 
     async def _run(self) -> None:  # noqa: C901, PLR0912, PLR0915
