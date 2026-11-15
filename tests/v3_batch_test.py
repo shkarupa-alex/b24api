@@ -50,7 +50,7 @@ from b24api.references.dispatch import _KernelFanOutSuccess
 from b24api.references.fanout import kernel_fanout_stream
 from b24api.references.outcome import KernelReferenceFailure
 from b24api.testing import ScriptedCall, ScriptedExchange, ScriptedTransport, ScriptedV3Command
-from b24api.transport import HttpxTransport, TransportCapabilities, WireRequest, WireResponse
+from b24api.transport import HttpxTransport, Transport, TransportCapabilities, WireRequest, WireResponse
 from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, drain_to_failure
 
 if TYPE_CHECKING:
@@ -102,7 +102,7 @@ def _direct(request: Request, payload: object, *, status: int = 200) -> Scripted
 
 
 async def _run(
-    transport: ScriptedTransport | ResponderTransport,
+    transport: Transport,
     requests: Sequence[Request],
     *,
     policy: ExecutionPolicy | None = None,
@@ -208,7 +208,7 @@ async def test_a21_wire_httpx_posts_a_root_array_to_the_v3_batch_route_once_per_
     transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
     requests = [_v3(1), _v3(2), _v3(3, method="x.item.update", safety=UNSAFE)]
     try:
-        outcomes, report = await _run(transport, requests)  # type: ignore[arg-type]
+        outcomes, report = await _run(transport, requests)
     finally:
         await transport.aclose()
         await client.aclose()
@@ -710,7 +710,7 @@ async def test_a21_presponse_size_overflow_after_dispatch_is_unknown_without_res
     transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
     try:
         outcomes, report = await _run(
-            transport,  # type: ignore[arg-type]
+            transport,
             [_v3(1, method="x.item.add", safety=UNKNOWN)],
             policy=_policy(max_response_bytes=64),
         )
