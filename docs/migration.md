@@ -60,13 +60,14 @@
 - **A keyset traversal the budget ends reports the budget, not a failed command or a protocol violation.**
   When `max_requests` refused a wave or the final confirmation of `iter_list_keyset()` under
   `RangeKeysetExecution`, `PartitionedKeysetExecution` or an automatic choice (sequential or
-  partitioned), the report recorded a `command_failure` for each command the budget refused, and an
-  automatic sequential or partitioned run could record the protocol violations
-  `completion_rejection_before_settlement` and `completion_invalid_binding_terminal` instead (rarely,
-  the same when `max_elapsed` ran out). Such a run now ends as an explicit `SequentialKeysetExecution`
-  ends on its budget: the report is `incomplete`, with `BudgetExceededError` as its terminal reason and
-  `budget_exhausted` as its only violation. `iter_list_keyset()` still raises `IncompleteTraversalError`
-  whose cause is the `BudgetExceededError`. Keyset bindings of the reference streams
+  partitioned), the report recorded a `command_failure` for each command the budget refused, or, beside
+  `budget_exhausted`, the protocol violations `completion_rejection_before_settlement` and
+  `completion_invalid_binding_terminal`: explicit range and partitioned runs recorded them as automatic
+  ones did, under `max_requests` and under `max_elapsed`. Such a run now ends as an explicit
+  `SequentialKeysetExecution` ends on its budget: the report is `incomplete`, with
+  `BudgetExceededError` as its terminal reason and `budget_exhausted` as its only violation.
+  `iter_list_keyset()` still raises `IncompleteTraversalError` whose cause is the `BudgetExceededError`.
+  Keyset bindings of the reference streams
   (`iter_references()`, `iter_reference_outcomes()` and the reference source streams) under the same
   strategies changed the same way, under `max_requests` and under `max_elapsed`: a wave or final
   confirmation the budget refused no longer records a `command_failure`, so the report holds
@@ -76,6 +77,14 @@
   still fails as a command. A fast keyset wave whose batch answer was ambiguous (a command's answer
   missing or repeated) no longer records `completion_unknown_binding_claimed_known`: its binding
   closes as unknown.
+- **A range, partitioned or automatic keyset run that ends while a page is unsettled records no protocol
+  violation.** When the final confirmation of `iter_list_keyset()` under these strategies failed (an
+  error answer, a lost answer), or the caller cancelled the stream while a wave was in flight, the report
+  recorded `completion_rejection_before_settlement` and `completion_invalid_binding_terminal` beside the
+  failure. Such a page now settles from the facts of the failure that ended the run: not executed when it
+  was never sent, unknown when it may have run. A wave cancelled after it was sent, also while it waits to
+  send a command again, settles unknown, as a reference binding's wave already did; its binding closes as
+  unknown.
 - **A counted tail page larger than its share is an answered failure.** When a tail page of
   `iter_list_counted()` decoded to more rows than `max_buffered_rows` left it, the traversal raised
   `IncompleteTraversalError` caused by `BudgetExceededError` ("buffered row budget exhausted"), and the

@@ -40,9 +40,11 @@ The application still owns facts that a generic REST client cannot infer:
 
 Whether a command may have run is one execution fact, recorded on its failure by the code that sent or
 withheld it: the executor for its own sends, the classic and REST v3 batch dialects for the commands of
-an envelope they decode, and the batch page dispatcher of references and list traversal for a page
-cancelled after its wave was sent. A page whose fetch ended before its wave left, cancelled or past its
-admission deadline, is never sent, so it stays proven not run. `b24api.execution.facts` holds the one
+an envelope they decode, the classic batch engine for the commands of an envelope cancelled after it was
+sent (between its rounds or before a replay's send, which the executor alone does not see), and the batch
+page dispatcher of references and list traversal for a page cancelled after its wave was sent. A page
+whose fetch ended before its wave left, cancelled or past its admission deadline, is never sent, so it
+stays proven not run. `b24api.execution.facts` holds the one
 mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
 (`Execution.settlement`), and `b24api.traversal.page_failure` maps it to a failed page's trace: unknown
 only when it may have run, otherwise rejected. Classic and REST v3 batch, `call()`, direct and batch
