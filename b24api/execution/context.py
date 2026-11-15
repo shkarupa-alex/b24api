@@ -739,7 +739,6 @@ async def await_cleanup_resistant(
             return CleanupResult(cancellation, None)
         return CleanupResult(None, error)
     except BaseException as error:  # noqa: BLE001 - cleanup failure is returned with cancellation
-        latch_interrupt(error)
         return CleanupResult(cancellation, error)
     return CleanupResult(cancellation, None)
 

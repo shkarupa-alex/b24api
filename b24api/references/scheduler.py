@@ -246,7 +246,6 @@ class ReferenceScheduler:
         try:
             await iterator.aclose(self.context)
         except BaseException as error:  # noqa: BLE001 - every owned resource is closed before the first failure
-            latch_interrupt(error)
             if error is not primary_error:
                 cleanup_errors.append(error)
         if cleanup_errors:
@@ -267,13 +266,11 @@ class ReferenceScheduler:
         try:
             await self.buffer.close()
         except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
-            latch_interrupt(error)
             if error is not primary_error:
                 cleanup_errors.append(error)
         try:
             await self.dispatcher.aclose()
         except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
-            latch_interrupt(error)
             if error is not primary_error:
                 cleanup_errors.append(error)
         pending, task_errors = await _wait_for_cleanup_tasks(
@@ -410,8 +407,8 @@ class ReferenceScheduler:
         except BaseException as error:  # noqa: BLE001 - per-reference tolerant outcome boundary, an interrupt's too
             # The binding fails with what its failed page reports, and its command's replay disposition, if any. An
             # interrupt (``is_interrupt``) is the operation's latch's too: the runner raises it.
+            latch_interrupt(error)
             failed = _failed_page(error)
-            latch_interrupt(failed.error)
             event = self._failure_event(run, failed.error)
             if failed.failure is not None:
                 event = replace(event, replay_disposition=failed.failure.replay_disposition)
