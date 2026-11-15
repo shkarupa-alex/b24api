@@ -236,25 +236,31 @@ def _within_row_budget(
     fitted: list[BatchSuccess | BatchFailure] = []
     for position, outcome in enumerate(outcomes):
         room = left - (len(outcomes) - position - 1)
+        kept = outcome
         if isinstance(outcome, BatchSuccess) and _batch_outcome_row_weight(outcome) > room:
-            request = outcome.request
-            outcome = BatchFailure(  # noqa: PLW2901 - the dropped result replaces the success it was
-                outcome.command_index,
-                outcome.stable_key,
-                request,
-                dropped_result(
-                    rows=outcome.decoded_rows,
-                    limit=room,
-                    request_summary=request.summary,
-                    evidence=None if outcome.response is None else outcome.response.evidence,
-                ),
-                replay_safety=request.replay_safety,
-                correlation=outcome.correlation,
-                evidence=outcome.evidence,
-            )
-        left -= _batch_outcome_row_weight(outcome)
-        fitted.append(outcome)
+            kept = _dropped(outcome, room)
+        left -= _batch_outcome_row_weight(kept)
+        fitted.append(kept)
     return tuple(fitted)
+
+
+def _dropped(outcome: BatchSuccess, limit: int) -> BatchFailure:
+    """Return the failure that replaces a success whose result does not fit the ``limit`` rows left to it."""
+    request = outcome.request
+    return BatchFailure(
+        outcome.command_index,
+        outcome.stable_key,
+        request,
+        dropped_result(
+            rows=outcome.decoded_rows,
+            limit=limit,
+            request_summary=request.summary,
+            evidence=None if outcome.response is None else outcome.response.evidence,
+        ),
+        replay_safety=request.replay_safety,
+        correlation=outcome.correlation,
+        evidence=outcome.evidence,
+    )
 
 
 def _failure_report(cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
