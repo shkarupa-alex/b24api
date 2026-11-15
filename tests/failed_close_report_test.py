@@ -411,3 +411,52 @@ async def test_a_cancellation_outranks_reference_work_that_outlasts_the_cleanup_
     assert report.state is TerminalState.CANCELLED
     assert report.terminal_reason == "iteration cancelled"
     assert _violations(report) == [("cleanup_failure", "stream cleanup also failed (CleanupOverrunError)")]
+
+
+# How many loop turns after a send is answered its reader's cancellation may land: enough to reach past the turn in
+# which the read hands its item over, in every family.
+HANDOVER_TURNS = 40
+
+
+async def _cancelled_turns_after_an_answer(family: str, turns: int) -> tuple[int, int]:
+    """Cancel the reader ``turns`` loop turns after the first send that follows its first item is answered."""
+    loop = asyncio.get_running_loop()
+    received: list[object] = []
+    armed = False
+
+    def cancel_after(left: int) -> None:
+        if left:
+            loop.call_soon(cancel_after, left - 1)
+        else:
+            consumer.cancel()
+
+    def answer(request: Request) -> object:
+        nonlocal armed
+        if armed:
+            armed = False
+            loop.call_soon(cancel_after, turns)
+        return _answer(request)
+
+    async def consume(stream: OperationStream[Any]) -> None:
+        nonlocal armed
+        async for item in stream:
+            received.append(item)
+            armed = True
+
+    async with client_for(ResponderTransport(answer), policy=POLICIES["returns"]) as client:
+        stream = _stream(client, family, _Source(family, "returns"))
+        consumer = asyncio.create_task(consume(stream))
+        await _settled(consumer)
+        await stream.aclose()
+    report = stream.report
+    assert report is not None
+    return report.emitted, len(received)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_an_item_counts_as_emitted_only_once_its_reader_has_it(family: str) -> None:
+    # At some turn the read has produced its item but the reader, cancelled, never takes it: no item was emitted.
+    for turns in range(HANDOVER_TURNS):
+        emitted, received = await _cancelled_turns_after_an_answer(family, turns)
+        assert emitted == received, f"cancelled {turns} turns after an answer"

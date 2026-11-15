@@ -131,6 +131,7 @@ class MappedOperationStream[S, T]:
                 cleanup=self._source.aclose,
                 propagate=self._propagate,
                 cleanup_budget=self._cleanup_window,
+                delivered=self._delivered,
             ),
             works_between_reads=source.works_between_reads,
         )
@@ -189,7 +190,6 @@ class MappedOperationStream[S, T]:
             item = await _resolve(self._mapper(source_item))
             if self._count_admitted is None or self._count_admitted(item):
                 self._admitted += 1
-            self._emitted += 1
             self._record_variant(item)
             yield item
 
@@ -238,6 +238,9 @@ class MappedOperationStream[S, T]:
 
     def _propagate(self, error: BaseException, report: OperationReport) -> BaseException:
         return self._error_mapper(error, report) if self._error_mapper is not None else error
+
+    def _delivered(self) -> None:
+        self._emitted += 1
 
     def _record_variant(self, item: T) -> None:
         variant = self._classify(item) if self._classify is not None else "success"

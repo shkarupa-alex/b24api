@@ -83,6 +83,9 @@ class LifecycleHooks[R]:
     # close and its cleanup defer a caller's cancellation. ``None`` defers it until cleanup ends, for a runner
     # driven by an outer one.
     cleanup_budget: Callable[[], float] | None = None
+    # Counts an item once its reader has it. The body counts what it reads; a reader cancelled as a read hands its
+    # item over never gets that item, so only this counts what the stream delivered.
+    delivered: Callable[[], None] | None = None
 
 
 def kernel_terminal(cause: TerminalCause, reason: str | None) -> tuple[KernelState, str]:
@@ -373,6 +376,8 @@ class OperationRunner[T, R]:
         self._pull = None
         if self._phase is _Phase.PULLING:
             self._phase = _Phase.NEW
+        if self._hooks.delivered is not None:
+            self._hooks.delivered()
         return item
 
     def _closed_read_error(self, error: BaseException) -> BaseException:
