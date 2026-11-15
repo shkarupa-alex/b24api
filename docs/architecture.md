@@ -211,8 +211,8 @@ outcome.
   Whether an error is the operation's refusal, which ends it, is told by its mark, not by its text or its type:
   the mark is a value unique to the context, so it survives a copy or a pickle round trip of the error, and
   the context marks every error it raises as such (`operation_refusal`, from `_refuse`, `admit_request`,
-  `raise_if_refused` and the source pull; a replay round's stopped commands carry the mark of the refusal
-  that stopped them, `stopped_by`), and `ExecutionContext.ended_by` is the one check, used by the
+  `raise_if_refused` and the source pull; a replay round's stopped commands end with that refusal or a copy
+  of it, which keeps its mark), and `ExecutionContext.ended_by` is the one check, used by the
   reference scheduler's source pull, the batch window's pull, the counted tail and the fast keyset
   commands. Every later work the budget refuses names its own work but is that same end; a request's own
   refusal or a dropped result is not marked and fails its work alone.

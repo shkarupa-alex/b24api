@@ -34,20 +34,6 @@ _ENDS_OPERATION = "_b24api_ends_operation"
 CLEANUP_GRACE_SECONDS = 0.1
 
 
-def stopped_by(refusal: BudgetExceededError) -> BudgetExceededError:
-    """Return the failure of a command a budget refusal kept from being sent again: the operation's end iff it was.
-
-    A replay round stops each command with its own error, caused by its own last failure; it carries the mark of
-    the refusal it restates (``ExecutionContext.ended_by``), and none for a request's own refusal. Only the refusal
-    itself is taken, never its message, so no caller can drop the mark.
-    """
-    error = BudgetExceededError(str(refusal))
-    mark = getattr(refusal, _ENDS_OPERATION, None)
-    if mark is not None:
-        error.__dict__[_ENDS_OPERATION] = mark
-    return error
-
-
 @dataclass(frozen=True, slots=True)
 class ExecutionSnapshot:
     """Operation-local attempt, retry, and cooldown counters."""

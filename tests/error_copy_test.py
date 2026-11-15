@@ -60,7 +60,7 @@ from b24api.errors import (
     ValidationIssue,
 )
 from b24api.execution import RateCoordinator
-from b24api.execution.context import ExecutionContext, stopped_by
+from b24api.execution.context import ExecutionContext
 from b24api.redaction import SafeText
 
 if TYPE_CHECKING:
@@ -198,12 +198,11 @@ def test_exported_error_survives_pickle_and_copy_with_its_attributes(name: str, 
 
 @pytest.mark.parametrize("copier", sorted(_COPIERS))
 def test_an_operation_refusal_stays_its_operations_end_through_pickle_and_copy(copier: str) -> None:
-    # A refusal that ends an operation keeps its mark, and what restates it (a stopped command's failure) too.
+    # A refusal that ends an operation keeps its mark, as a replay round's copy of it for each command it stops.
     context = ExecutionContext(ExecutionPolicy(), RateCoordinator())
     refusal = context.operation_refusal("physical request budget exhausted")
 
     restored = _COPIERS[copier](refusal)
 
     assert context.ended_by(restored)
-    assert context.ended_by(stopped_by(restored))
     assert not ExecutionContext(ExecutionPolicy(), RateCoordinator()).ended_by(restored)

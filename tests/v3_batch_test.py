@@ -26,7 +26,6 @@ from b24api.contracts import (
     ResultErrorSpec,
     ResultSelector,
 )
-from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import OperationReport, TerminalState
 from b24api.contracts.v3_codes import RATE_LIMIT_ERROR_CODE
