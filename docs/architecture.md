@@ -295,9 +295,17 @@ outcome.
   cancellation and the stream is cancelled whenever the cancellation landed, and `OperationStream`
   demotes its own cleanup failure behind a cancelled source the same way
   (`with_cleanup_failure_behind`). An interrupt (`is_interrupt`: neither an `Exception` nor a
-  cancellation) is never secondary: `_terminate` records it as the close's failure and raises it,
-  outranking whatever ended the stream, and `close_owned_resources` and the reference scheduler's close
-  raise an interrupt among their cleanup errors ahead of the others. The
+  cancellation) is never secondary, and one piece of state carries it: each operation has one
+  `InterruptLatch`, the isolated runner's, which its pull and cleanup tasks publish through `INTERRUPTS`
+  so the tasks they start inherit it (an inline kernel uses the latch of the runner it serves). Every
+  place that catches a `BaseException` in a library task (`settle`, `await_cleanup_resistant`, the
+  reference scheduler's binding tasks and close, the dispatcher's senders) latches the first interrupt
+  and goes on as it would; latching cancels the owner's read in flight. `OperationRunner._terminate` is
+  the one raise point: after the report is published (`with_interrupt`: failed, `INTERRUPTED_REASON`,
+  the earlier violations kept, one `interrupted` violation last) it raises the latched interrupt,
+  whatever ended the stream; `close_owned_resources` does the same for the client's close with a latch
+  of its own. A task that outlasts the cleanup window and raises an interrupt after it is not waited
+  for, so that interrupt is not raised. The
   failure is primary: `finalize_failure` puts its violation ahead of the cleanup failures behind it.
   A library error never carries it as a note, a failed finalization's error included: it carries the
   report (`error.report`). The caller's own

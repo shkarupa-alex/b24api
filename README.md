@@ -958,10 +958,15 @@ cleanup failed (X)", where X is `InputSourceError` or `CleanupOverrunError`. Beh
 that failure stays the terminal reason and the close adds "stream cleanup also failed (X)". So does a
 close that fails behind the reader's cancellation: the reader gets its `CancelledError`, the stream is
 `cancelled` with the terminal reason "iteration cancelled", whether the cancellation landed while a
-read waited or between reads. An interrupt is the exception: a `KeyboardInterrupt` or `SystemExit` a
-close raises is never behind anything. It is what the stream raises, whatever ended the stream before
-it, also to a read the close ended, and the report records it as the close's failure (X is
-`KeyboardInterrupt` or `SystemExit`; "also failed" behind an earlier failure). A library
+read waited or between reads. That `CancelledError` carries the close's failure as its `__cause__`
+(`InputSourceError`, whose own `__cause__` is your source's exception) and the report as `.report`. An
+interrupt is the exception: a `KeyboardInterrupt` or `SystemExit` raised anywhere in the operation (by
+a close, a pull, or your transport inside one of the library's own tasks) is never behind anything. It
+is what the stream raises, whatever ended the stream before it (its end, a failure, the reader's
+cancellation, a timeout, a close from another task), and the report has one shape for it: `failed`
+with the terminal reason "operation interrupted", every violation recorded before it kept (an earlier
+failure's first), and one `interrupted` violation last, "operation interrupted (X)", where X is
+`KeyboardInterrupt` or `SystemExit`. A library
 error carries this in its report (`error.report`), not as a note; your own exception raised inside
 `async with stream` stays what is raised and carries one note, the report's `cleanup_failure` violation
 word for word. The source

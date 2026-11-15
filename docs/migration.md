@@ -140,9 +140,12 @@
   note: the report's `cleanup_failure` violation word for word (it was "stream cleanup also failed (X)",
   with X the raised class, `BatchFailed` for `batch()` and `fan_out()`; it is now "stream cleanup
   failed (InputSourceError)" or "stream cleanup failed (CleanupOverrunError)"). A `KeyboardInterrupt` or
-  `SystemExit` a close raises is never behind anything: it is what the stream raises, whatever ended the
-  stream before it (a failure, the reader's cancellation), also to a read the close ended, and the
-  report records it as the close's failure, with its class as X.
+  `SystemExit`, from a close or anywhere else in the operation, is never behind anything: it is what the
+  stream raises, whatever ended the stream before it (a failure, the reader's cancellation, a timeout, a
+  close from another task), and the report is `failed` with the terminal reason "operation interrupted":
+  the violations recorded before it stay (an earlier failure's first) and one `interrupted` violation,
+  "operation interrupted (X)" with its class as X, comes last. A close's interrupt is no longer recorded
+  as the close's failure.
 - **Breaking: a close that raises is the source failing.** A source's close that raised, from its
   `aclose()`, its `close()` or a generator's `finally`, surfaced as the raw exception on `break` from a
   synchronous source and wrapped from an asynchronous one. Every family now raises it as it raises a
@@ -269,8 +272,8 @@
   a `failed` one when it landed while a read waited. In every family, the fast `iter_list_keyset()`
   included, and whenever the cancellation lands, it now receives its `CancelledError`; the report is
   `cancelled` with the terminal reason "iteration cancelled", and the close's failure is a
-  `cleanup_failure` "stream cleanup also failed (X)". An interrupt a close raises is the exception
-  (first item). This holds only for a cancellation that ended the stream: a consumer cancelled after the
+  `cleanup_failure` "stream cleanup also failed (X)"; the `CancelledError` carries that failure as its
+  `__cause__` and the report as `.report`. An interrupt is the exception (first item). This holds only for a cancellation that ended the stream: a consumer cancelled after the
   budget (or a failure) ended it, while its cleanup waits, receives that error with an `incomplete` (or
   `failed`) report, and the cancellation is delivered at its next `await`.
 - **A cleanup overrun has its own public error and is reported as a failed close.** A close that
