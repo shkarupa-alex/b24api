@@ -40,6 +40,8 @@ class CountedItemStream:
 
     # Every page is read inside a read; nothing runs between reads.
     works_between_reads = False
+    # Its pages close inside the traversal, so a failed close is a failure of the traversal, never its end alone.
+    cleanup_failure: BaseException | None = None
 
     def __init__(  # noqa: PLR0913
         self,

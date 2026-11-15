@@ -187,6 +187,11 @@ class LogicalBatchKernelStream[C]:
         return self._context
 
     @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure this stream raised as its end (``OperationRunner.cleanup_failure``)."""
+        return self._runner.cleanup_failure
+
+    @property
     def completion_gate(self) -> object:
         """Expose the live logical-command completion gate."""
         return self._completion.gate

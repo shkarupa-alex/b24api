@@ -8,8 +8,6 @@ from typing import TYPE_CHECKING
 from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, qualified_closure
 from b24api.contracts.completion import BindingClosure
 from b24api.contracts.dispatch import PORTAL_PAGE_ROWS
-from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
-from b24api.execution.failure import report_reason
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     DispatchPlan,
@@ -24,6 +22,7 @@ from b24api.traversal.plans import (
 if TYPE_CHECKING:
     from b24api.completion.reference_recorder import ReferenceCompletionRecorder
     from b24api.contracts.policy import ExecutionPolicy
+    from b24api.contracts.report import PageRecord
     from b24api.references.dispatch import _DoneEvent, _Event
     from b24api.traversal.driver import PaginationDriver
 
@@ -66,17 +65,6 @@ def _new_page_records(driver: PaginationDriver, previous_count: int) -> tuple[Pa
     if driver.page_trace_count != previous_count + 1 or driver.last_page_record is None:
         raise RuntimeError("one logical fetch must produce at most one page record")
     return (driver.last_page_record,)
-
-
-def _record_cleanup_failure(violations: list[Violation], error: BaseException) -> None:
-    """Retain a bounded safe indication of reference cleanup failure."""
-    violations.append(
-        Violation(
-            severity=ViolationSeverity.BLOCKING,
-            code="cleanup_failure",
-            message=f"reference cleanup also failed ({report_reason(error)})",
-        )
-    )
 
 
 async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Event) -> None:

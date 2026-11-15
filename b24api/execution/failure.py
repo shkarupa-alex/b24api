@@ -106,23 +106,22 @@ def public_cause(error: BaseException) -> BaseException:
     return cause if isinstance(cause, BaseException) else error
 
 
-def cleanup_failure_violation(error: BaseException, *, secondary: bool, subject: str = "batch") -> Violation:
-    """Record a cleanup failure; ``secondary`` marks one that follows an earlier primary failure."""
-    outcome = "also failed" if secondary else "failed"
-    message = f"{subject} cleanup {outcome} ({report_reason(error)})"
-    return Violation(ViolationSeverity.BLOCKING, "cleanup_failure", message)
-
-
 CLEANUP_FAILED_REASON = "stream cleanup failed"
 
 
-def with_cleanup_failure(
-    report: KernelReport,
-    error: BaseException,
-    *,
-    terminal: bool,
-    subject: str = "batch",
-) -> KernelReport:
+def cleanup_failure_violation(error: BaseException, *, secondary: bool) -> Violation:
+    """Record a failed close or cleanup, in one shape for every stream.
+
+    ``secondary`` marks one behind an earlier failure ("stream cleanup also failed (X)"); without one the close is
+    what failed ("stream cleanup failed (X)", the report's terminal reason ``CLEANUP_FAILED_REASON``).
+    """
+    outcome = "also failed" if secondary else "failed"
+    return Violation(
+        ViolationSeverity.BLOCKING, "cleanup_failure", f"stream cleanup {outcome} ({report_reason(error)})"
+    )
+
+
+def with_cleanup_failure(report: KernelReport, error: BaseException, *, terminal: bool) -> KernelReport:
     """Return the kernel report with one cleanup-failure violation.
 
     A terminal cleanup failure (no earlier primary failure) also turns the report FAILED with
@@ -130,7 +129,7 @@ def with_cleanup_failure(
     """
     violations = report.violations
     if not (terminal and any(item.code == "cleanup_failure" for item in violations)):
-        violations = (*violations, cleanup_failure_violation(error, secondary=not terminal, subject=subject))
+        violations = (*violations, cleanup_failure_violation(error, secondary=not terminal))
     if not terminal:
         return replace(report, violations=violations)
     return replace(report, state=KernelState.FAILED, terminal_reason=CLEANUP_FAILED_REASON, violations=violations)

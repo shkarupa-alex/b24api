@@ -49,6 +49,11 @@ class _ClosableIterator[T](Protocol):
         """Return the operation context."""
         ...
 
+    @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure the source raised as its end (``OperationRunner.cleanup_failure``)."""
+        ...
+
     def __aiter__(self) -> Self:
         """Return this iterator."""
         ...
@@ -196,7 +201,8 @@ class MappedOperationStream[S, T]:
             return self._publish(forced_state=TerminalState.EARLY_CLOSED)
         if cause is TerminalCause.CANCELLED:
             return self._publish(forced_state=TerminalState.CANCELLED)
-        if cause is TerminalCause.EXHAUSTED or error is None:
+        if cause is TerminalCause.EXHAUSTED or error is None or error is self._source.cleanup_failure:
+            # A failed close of a source read to its end is in the source's report already: the close is what failed.
             return self._publish()
         if self._error_items is not None:
             for item in self._error_items(error):
@@ -213,9 +219,7 @@ class MappedOperationStream[S, T]:
         self._cleanup = (cause, attempt)
         if self._report is not None:
             return self._report
-        failed = with_fallback_cleanup(
-            KernelReport(state=KernelState.FAILED, terminal_reason=reason), cause, attempt, subject="stream"
-        )
+        failed = with_fallback_cleanup(KernelReport(state=KernelState.FAILED, terminal_reason=reason), cause, attempt)
         facts = self._facts(failed, forced_state=TerminalState.FAILED)
         facts = replace(
             facts,
@@ -294,7 +298,7 @@ class MappedOperationStream[S, T]:
         if self._cleanup is None or any(violation.code == "cleanup_failure" for violation in report.violations):
             return report
         cause, attempt = self._cleanup
-        return with_cleanup_attempt(report, cause, attempt, subject="stream")
+        return with_cleanup_attempt(report, cause, attempt)
 
     def _terminated(self) -> None:
         if self._deregister is not None:

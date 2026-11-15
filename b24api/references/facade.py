@@ -103,6 +103,11 @@ class ReferenceKernelStream(Protocol):
         """Return the operation context."""
         ...
 
+    @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure the stream raised as its end."""
+        ...
+
     def __aiter__(self) -> Self:
         """Return this iterator."""
         ...

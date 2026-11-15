@@ -22,6 +22,7 @@ from b24api.execution.context import CancellationMark, await_cleanup_resistant, 
 from b24api.execution.failure import (
     EARLY_CLOSE_REASON,
     attach_report,
+    cleanup_failure_violation,
     public_cause,
     report_reason,
     with_cleanup_failure,
@@ -94,13 +95,7 @@ def kernel_terminal(cause: TerminalCause, reason: str | None) -> tuple[KernelSta
     return KernelState.FAILED, reason or "stream failed"
 
 
-def with_cleanup_attempt(
-    report: KernelReport,
-    cause: TerminalCause,
-    attempt: CleanupAttempt,
-    *,
-    subject: str = "batch",
-) -> KernelReport:
+def with_cleanup_attempt(report: KernelReport, cause: TerminalCause, attempt: CleanupAttempt) -> KernelReport:
     """Record a cleanup result on a kernel report by the §3.1 table.
 
     Without a primary failure a cleanup failure turns the report FAILED ("stream cleanup failed"); a
@@ -109,14 +104,14 @@ def with_cleanup_attempt(
     its window behind a caller's cancellation (``cancellation_outranks``).
     """
     if cancellation_outranks(cause, attempt):
-        return with_cleanup_failure(report, cast("BaseException", attempt.error), terminal=False, subject=subject)
+        return with_cleanup_failure(report, cast("BaseException", attempt.error), terminal=False)
     if cause is not TerminalCause.FAILED:
         if attempt.error is None:
             return report
-        return with_cleanup_failure(report, attempt.error, terminal=True, subject=subject)
+        return with_cleanup_failure(report, attempt.error, terminal=True)
     for failure in (attempt.error, attempt.cancellation):
         if failure is not None:
-            report = with_cleanup_failure(report, failure, terminal=False, subject=subject)
+            report = with_cleanup_failure(report, failure, terminal=False)
     return report
 
 
@@ -134,28 +129,16 @@ def cleanup_failed(cause: TerminalCause, attempt: CleanupAttempt) -> bool:
     return attempt.error is not None or (cause is TerminalCause.FAILED and attempt.cancellation is not None)
 
 
-def with_fallback_cleanup(
-    report: KernelReport,
-    cause: TerminalCause,
-    attempt: CleanupAttempt,
-    *,
-    subject: str = "batch",
-) -> KernelReport:
+def with_fallback_cleanup(report: KernelReport, cause: TerminalCause, attempt: CleanupAttempt) -> KernelReport:
     """Keep a cleanup result on a fallback report; the finalization failure stays its terminal reason."""
     cancellation = attempt.cancellation if cause is TerminalCause.FAILED else None
     for failure in (attempt.error, cancellation):
         if failure is not None:
-            report = with_cleanup_failure(report, failure, terminal=False, subject=subject)
+            report = with_cleanup_failure(report, failure, terminal=False)
     return report
 
 
-def failed_kernel_report(
-    cause: TerminalCause,
-    reason: str,
-    attempt: CleanupAttempt,
-    *,
-    subject: str = "batch",
-) -> KernelReport:
+def failed_kernel_report(cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
     """Return the minimal FAILED kernel report published when a family's finalizer raised."""
     report = KernelReport(
         state=KernelState.FAILED,
@@ -164,7 +147,7 @@ def failed_kernel_report(
             Violation(ViolationSeverity.BLOCKING, "report_finalize_failure", "stream report finalization failed"),
         ),
     )
-    return with_fallback_cleanup(report, cause, attempt, subject=subject)
+    return with_fallback_cleanup(report, cause, attempt)
 
 
 class _Phase(Enum):
@@ -218,6 +201,7 @@ class OperationRunner[T, R]:
         self._report: R | None = None
         self._primary: BaseException | None = None
         self._finalize_error: BaseException | None = None
+        self._cleanup_failure: BaseException | None = None
         self._work_token = object()
         # The one cleanup, kept even when a deadline stopped waiting for it, so it lives until it ends.
         self._cleanup_task: asyncio.Future[None] | None = None
@@ -231,6 +215,15 @@ class OperationRunner[T, R]:
     def primary_error(self) -> BaseException | None:
         """Return the body failure or cancellation being finalized, for the family's report hook."""
         return self._primary
+
+    @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure this stream raised as its end, ``None`` when anything else ended it.
+
+        A runner driven by an outer one raises it from the read or close that ended it; the outer runner reads it as
+        that close's failure, not as a failure of the work it read, so every stream reports a failed close alike.
+        """
+        return self._cleanup_failure
 
     @property
     def terminated(self) -> bool:
@@ -278,7 +271,7 @@ class OperationRunner[T, R]:
         except Exception as close_error:
             if exc is None:
                 raise
-            exc.add_note(f"stream cleanup also failed ({report_reason(close_error)})")
+            exc.add_note(cleanup_failure_violation(close_error, secondary=True).message)
 
     async def __anext__(self) -> T:
         """Read one item; the read that ends the body publishes the report and raises by §3.1."""
@@ -475,7 +468,7 @@ class OperationRunner[T, R]:
             self._raise_failed(primary, report, attempt, finalize_failed=finalize_failed)
         if finalize_failed and self._finalize_error is not None and primary is None:
             if attempt.error is not None:
-                self._finalize_error.add_note(f"stream cleanup also failed ({report_reason(attempt.error)})")
+                self._finalize_error.add_note(cleanup_failure_violation(attempt.error, secondary=True).message)
             # The finalization failure leaves in place of a cancellation cleanup absorbed, so it is replayed.
             rearm_cancellation(attempt.cancellation)
             raise self._finalize_error
@@ -491,7 +484,7 @@ class OperationRunner[T, R]:
     ) -> NoReturn:
         """Raise a FAILED primary; cleanup and finalization failures only annotate it."""
         if attempt.error is not None:
-            primary.add_note(f"stream cleanup also failed ({report_reason(attempt.error)})")
+            primary.add_note(cleanup_failure_violation(attempt.error, secondary=True).message)
         if finalize_failed and self._finalize_error is not None:
             primary.add_note(f"stream report finalization failed ({type(self._finalize_error).__name__})")
         propagated = self._hooks.propagate(primary, report) if self._hooks.propagate is not None else primary
@@ -512,7 +505,7 @@ class OperationRunner[T, R]:
         """Raise by the exhausted, early-close and cancelled rows; an early close returns quietly."""
         raised: BaseException | None = None
         if attempt.error is not None and not cancellation_outranks(cause, attempt):
-            raised = self._public_error(attempt.error, report)
+            raised = self._cleanup_failure = self._public_error(attempt.error, report)
             primary_cancellation = primary if isinstance(primary, asyncio.CancelledError) else None
             rearm_cancellation(attempt.cancellation or primary_cancellation)
         elif attempt.cancellation is not None:

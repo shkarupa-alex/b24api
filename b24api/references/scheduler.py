@@ -16,12 +16,6 @@ from b24api.contracts.request import ReplaySafety, Request, ResultSelector, Trav
 from b24api.contracts.response import result_snapshot
 from b24api.contracts.violation import retain_violations
 from b24api.errors import BudgetExceededError, CapabilityError, CleanupOverrunError
-from b24api.execution import (
-    AsyncIteratorController,
-    Executor,
-    await_cleanup_resistant,
-    rearm_cancellation,
-)
 from b24api.execution.facts import dropped_result
 from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
@@ -60,7 +54,6 @@ from b24api.references.support import (
     _finish_task,
     _new_page_records,
     _page_cap,
-    _record_cleanup_failure,
     _wait_for_admission,
     _wait_for_cleanup_tasks,
     _wait_for_event,
@@ -81,6 +74,7 @@ if TYPE_CHECKING:
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.report import KeysetSelectionSummary
     from b24api.contracts.response import Response
+    from b24api.execution import AsyncIteratorController, Executor
     from b24api.references.dispatch import _Reservation
     from b24api.traversal.identity import _Page
 
@@ -186,21 +180,25 @@ class ReferenceScheduler:
         self.page_trace: list[PageRecord] = []
         self.page_trace_truncated = False
         self._delivery_uniqueness: dict[int, tuple[KernelReferenceItem, bool]] = {}
-        self._source_controller: AsyncIteratorController[ReferenceRequest] | None = None
         self.active_references_high_water = 0
         self._next_page_sequence = 0
         # Lease decisions read the admitted set, whether the source has ended (read out, or closed by the spent
         # request budget: no binding follows either way) and the fast bindings holding or awaiting a lease; a
         # change of either wakes lease waiters only while one is waiting.
         self._admission: _AdmissionState | None = None
+        self._producer: asyncio.Task[None] | None = None
         self._source_ended = False
         self._fast_active: set[int] = set()
         self._fast_waiting = 0
 
-    async def outcomes(  # noqa: C901, PLR0912
+    async def outcomes(
         self, iterator: AsyncIteratorController[ReferenceRequest]
     ) -> AsyncGenerator[ReferenceStreamItem]:
-        """Yield correlated operation outcomes, reading bindings through ``iterator``, which this closes."""
+        """Yield correlated operation outcomes, reading bindings through ``iterator``.
+
+        Only reads: the stream that owns this scheduler stops its work and closes ``iterator`` with ``aclose()``, as
+        the cleanup step of its lifecycle, however the outcomes ended.
+        """
         if self.default_program is not None:
             PaginationDriver.validate_contract(
                 self.default_program.plan,
@@ -208,7 +206,6 @@ class ReferenceScheduler:
                 self.context.policy,
             )
         await self.context.start()
-        self._source_controller = iterator
         admission = _AdmissionState(
             tasks={},
             queues={},
@@ -217,68 +214,51 @@ class ReferenceScheduler:
             changed=asyncio.Event(),
         )
         self._admission = admission
-        producer = asyncio.create_task(self._produce(iterator, admission))
-        primary_error: BaseException | None = None
-        pending_cancellation: asyncio.CancelledError | None = None
+        producer = self._producer = asyncio.create_task(self._produce(iterator, admission))
+        if self.output_order is ReferenceOutputOrder.READY:
+            async for outcome in self._ready(admission, producer):
+                yield outcome
+        else:
+            async for outcome in self._input(admission, producer):
+                yield outcome
 
-        try:
-            if self.output_order is ReferenceOutputOrder.READY:
-                async for outcome in self._ready(admission, producer):
-                    yield outcome
-            else:
-                async for outcome in self._input(admission, producer):
-                    yield outcome
-        except BaseException as error:
-            primary_error = error
-            raise
-        finally:
-            cleanup = await await_cleanup_resistant(self._cleanup(iterator, admission, producer, primary_error))
-            # A caller's cancellation outranks a cleanup that overran its window, the bound the cancellation
-            # waited by (``cancellation_outranks``): the cancellation leaves, the overrun recorded behind it.
-            outranked = isinstance(primary_error, asyncio.CancelledError) and isinstance(
-                cleanup.error, CleanupOverrunError
-            )
-            if cleanup.error is not None and outranked:
-                _record_cleanup_failure(self.violations, cleanup.error)
-            elif cleanup.error is not None:
-                cleanup_error = cleanup.error
-                if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                    _record_cleanup_failure(self.violations, cleanup_error)
-                    pending = cleanup.cancellation
-                    if pending is None and isinstance(primary_error, asyncio.CancelledError):
-                        pending = primary_error
-                    rearm_cancellation(pending)
-                    raise cleanup_error
-                _record_cleanup_failure(self.violations, cleanup_error)
-                if isinstance(cleanup_error, asyncio.CancelledError):
-                    pending_cancellation = cleanup_error
-                if cleanup.cancellation is not None:
-                    pending_cancellation = cleanup.cancellation
-            elif cleanup.cancellation is not None and primary_error is None:
-                raise cleanup.cancellation
-            elif cleanup.cancellation is not None and not isinstance(
-                primary_error,
-                asyncio.CancelledError | GeneratorExit,
-            ):
-                # Re-armed behind the failure, the cancellation lands in the stream's own cleanup, which records
-                # it (``with_cleanup_attempt``), as it does behind a cleanup failure above: recorded once.
-                pending_cancellation = cleanup.cancellation
-            if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                rearm_cancellation(pending_cancellation)
-
-    async def _cleanup(
+    async def aclose(
         self,
         iterator: AsyncIteratorController[ReferenceRequest],
+        primary_error: BaseException | None,
+    ) -> None:
+        """Stop the producer and every binding, then close the source; raise the first cleanup failure.
+
+        Each wait is bounded by the operation's cleanup window. The source is closed even when a task outlived its
+        window: its controller cancels a pull still running and closes the source once that pull ends. A failure
+        that is ``primary_error`` itself (a binding task ending in the failure that ended the stream) is no cleanup
+        failure.
+        """
+        cleanup_errors: list[BaseException] = []
+        admission, producer = self._admission, self._producer
+        if admission is not None and producer is not None:
+            await self._stop_work(admission, producer, primary_error, cleanup_errors)
+        self._delivery_uniqueness.clear()
+        try:
+            await iterator.aclose(self.context)
+        except BaseException as error:  # noqa: BLE001 - every owned resource is closed before the first failure
+            if error is not primary_error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise cleanup_errors[0]
+
+    async def _stop_work(
+        self,
         admission: _AdmissionState,
         producer: asyncio.Task[None],
         primary_error: BaseException | None,
+        cleanup_errors: list[BaseException],
     ) -> None:
         self.producer_state.closing = True
         self.producer_state.touch()
         producer.cancel()
         for task in admission.tasks.values():
             task.cancel()
-        cleanup_errors: list[BaseException] = []
         try:
             await self.buffer.close()
         except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
@@ -296,15 +276,6 @@ class ReferenceScheduler:
         cleanup_errors.extend(error for error in task_errors if error is not primary_error)
         if pending:
             cleanup_errors.append(CleanupOverrunError("reference task cleanup exceeded operation time budget"))
-        else:
-            try:
-                await iterator.aclose(self.context)
-            except BaseException as error:  # noqa: BLE001 - attach at the stream boundary
-                if error is not primary_error:
-                    cleanup_errors.append(error)
-        self._delivery_uniqueness.clear()
-        if cleanup_errors:
-            raise cleanup_errors[0]
 
     async def _produce(
         self,

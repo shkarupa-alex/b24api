@@ -1700,12 +1700,10 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
     assert observed == [("reference close boom", 1), ("external-caller", 1)]
     assert independent_transport.requests == []
     assert stream.report.state is KernelState.FAILED
-    # The source close failure and the caller cancellation that arrived during cleanup are both
-    # secondary to the raised failure, as in every stream family (§3.1).
-    assert [violation.message for violation in stream.report.violations] == [
-        "reference cleanup also failed (RuntimeError)",
-        "reference cleanup also failed (CancelledError)",
-    ]
+    # Nothing failed before the close, so the close is what failed, as in every stream family (§3.1): its failure
+    # is raised and recorded alone, and the caller's cancellation is re-armed behind it, not recorded.
+    assert stream.report.terminal_reason == "stream cleanup failed"
+    assert [violation.message for violation in stream.report.violations] == ["stream cleanup failed (RuntimeError)"]
 
 
 @pytest.mark.asyncio

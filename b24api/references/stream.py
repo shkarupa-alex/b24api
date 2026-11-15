@@ -100,6 +100,11 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
         return self._scheduler.context
 
     @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure this stream raised as its end (``OperationRunner.cleanup_failure``)."""
+        return self._runner.cleanup_failure
+
+    @property
     def completion_gate(self) -> object:
         """Expose the reference scheduler's correlated completion gate."""
         return self._scheduler.completion.gate
@@ -140,13 +145,11 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             yield outcome
 
     async def _cleanup(self) -> None:
-        # Closing the scheduler cancels and awaits in-flight reference work and closes the source,
-        # all before the terminal event is emitted.
+        # Closing the scheduler cancels and awaits in-flight reference work and closes the source, all before the
+        # terminal event is emitted; a stream closed before its first pull has only its source to close.
         if self._outcomes is not None:
             await self._outcomes.aclose()
-            return
-        # Closed before the first pull: the scheduler never took the source, so the stream closes it itself.
-        await self._controller.aclose(self._scheduler.context)
+        await self._scheduler.aclose(self._controller, self._runner.primary_error)
 
     async def _finalize(self, cause: TerminalCause, failure: str | None, attempt: CleanupAttempt) -> KernelReport:
         if self._outcomes is None:
@@ -210,7 +213,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
             if state is KernelState.CANCELLED
             else StreamClosure.EARLY_CLOSE,
         )
-        self.report = with_cleanup_attempt(self.report, cause, attempt, subject="reference")
+        self.report = with_cleanup_attempt(self.report, cause, attempt)
         failed = cleanup_failed(cause, attempt)
         self._scheduler.completion.cleanup(CleanupState.FAILURE if failed else CleanupState.SUCCESS)
         return self.report
@@ -218,7 +221,7 @@ class ReferenceStream(AsyncIterator[ReferenceStreamItem]):
     def _failure_report(self, cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
         # The finalizer raised: publish the fallback as this kernel's report and close its completion gate,
         # so a public adapter over it can still publish its one FAILED report.
-        self.report = failed_kernel_report(cause, reason, attempt, subject="reference")
+        self.report = failed_kernel_report(cause, reason, attempt)
         self._scheduler.completion.gate.close_after_failure(
             CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS
         )

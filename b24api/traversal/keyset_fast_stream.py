@@ -17,12 +17,9 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     SnapshotState,
 )
-from b24api.contracts.report import (
-    Violation,
-    ViolationSeverity,
-)
 from b24api.errors import B24ApiError, BudgetExceededError, IncompleteTraversalError, PaginationError
 from b24api.execution.context import await_cancellation_resistant, await_cleanup_resistant, rearm_cancellation
+from b24api.execution.failure import CLEANUP_FAILED_REASON, cleanup_failure_violation
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 
@@ -48,6 +45,8 @@ class KeysetFastStream:
         self._buffer: deque[FrozenJson] = deque()
         self._closed = False
         self.report = KernelReport()
+        # The cleanup failure this stream raised as its end: nothing failed before its close.
+        self.cleanup_failure: BaseException | None = None
 
     def __aiter__(self) -> Self:
         """Return this single-use async iterator."""
@@ -116,17 +115,16 @@ class KeysetFastStream:
         outcome = await await_cleanup_resistant(self._runtime.aclose())
         cleanup = outcome.error
         if cleanup is not None:
-            self._runtime.violations.append(
-                Violation(ViolationSeverity.BLOCKING, "cleanup_failure", type(cleanup).__name__),
-            )
+            self._runtime.violations.append(cleanup_failure_violation(cleanup, secondary=primary is not None))
         if cleanup is not None and state is KernelState.COMPLETED:
-            state, reason = KernelState.FAILED, "fast keyset cleanup failed"
+            state, reason = KernelState.FAILED, CLEANUP_FAILED_REASON
         finalize_cancellation = await await_cancellation_resistant(self._finalize(state, reason))
         cancellation = finalize_cancellation or outcome.cancellation
         self._closed = self._runtime.closed
         if cleanup is not None and primary is not None:
-            primary.add_note(f"fast keyset cleanup also failed ({type(cleanup).__name__})")
+            primary.add_note(cleanup_failure_violation(cleanup, secondary=True).message)
         if cleanup is not None and primary is None:
+            self.cleanup_failure = cleanup
             _attach_report(cleanup, self.report)
             rearm_cancellation(cancellation)
             raise cleanup
