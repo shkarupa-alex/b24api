@@ -1293,7 +1293,11 @@ async def test_reference_fail_fast_classifies_underlying_pagination_failure() ->
     assert any(item.code == "pagination_invariant" for item in captured.value.report.violations)
     assert captured.value.report.terminal_reason == "PaginationError"
     assert "_ReferenceWindowError" not in repr(captured.value.report)
-    assert "_PageRejectionError" not in repr(captured.value.report)
+    # The failure chains to a public error, which names the page check that rejected the page.
+    cause = captured.value.__cause__
+    assert type(cause) is PaginationError
+    assert cause.rejection_code is PageRejectionCode.DUPLICATE_IDENTITY
+    assert cause.to_safe_dict()["type"] == "PaginationError"
 
 
 @pytest.mark.asyncio

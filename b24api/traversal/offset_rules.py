@@ -8,7 +8,6 @@ from b24api.contracts.policy import ConfirmationPolicy, DuplicatePolicy, Identit
 from b24api.contracts.report import PageRejectionCode
 from b24api.contracts.traversal import OffsetContinuation, OffsetSpec, ShortPageTermination, TotalTermination
 from b24api.errors import CapabilityError, PaginationError
-from b24api.traversal.identity import _PageRejectionError
 from b24api.traversal.plans import OffsetSequentialPlan, OffsetTerminalRule
 
 _EMPTY_PAGE_TERMINAL = "empty page confirmed terminal"
@@ -163,15 +162,15 @@ def declared_short_page_terminal(
         raise PaginationError("response exceeded the declared page cap")
     if rows == width:
         if response.next is not None and response.next != offset + plan.fixed_step:
-            raise _PageRejectionError(
+            raise PaginationError(
                 "declared short-page traversal observed a continuation that contradicts its fixed step",
-                PageRejectionCode.RANGE_CONTRADICTION,
+                rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
             )
         return None
     if response.next is not None:
-        raise _PageRejectionError(
+        raise PaginationError(
             "declared short-page traversal observed a continuation after a short or empty page",
-            PageRejectionCode.RANGE_CONTRADICTION,
+            rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
         )
     return _EMPTY_PAGE_TERMINAL if rows == 0 else DECLARED_SHORT_PAGE_REACHED
 

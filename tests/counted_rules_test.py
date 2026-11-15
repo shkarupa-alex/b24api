@@ -85,7 +85,7 @@ TABLE_R = (
         "short_incomplete",
         {0: (1, 3, None), 1: (0, 3, None), 2: (0, 3, None)},
         "CapabilityError: page length contradicts the planned exact range",
-        "_PageRejectionError: ended before its exact total",
+        "PaginationError: ended before its exact total",
     ),
     Row("two_full_pages", {0: (2, 4, 2), 2: (2, 4, None)}, "completed:4", "completed:4"),
     Row("missing_next", {0: (2, 4, None), 2: (2, 4, None)}, "completed:4", "completed:4"),

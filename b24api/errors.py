@@ -11,6 +11,7 @@ from b24api.contracts.error_base import B24ApiError, BudgetExceededError
 from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.keyset_capability import KeysetCapabilityReport, KeysetCapabilityVerdict, KeysetInconclusiveReason
 from b24api.contracts.policy import AmbiguityReason, IdentityCoercion, ReplayDisposition
+from b24api.contracts.report import PageRejectionCode
 from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.v3_codes import render_code
 from b24api.redaction import DEFAULT_REDACTOR, Redactor, SafeText
@@ -219,9 +220,27 @@ class CapabilityError(B24ApiError):
 
 
 class PaginationError(B24ApiError):
-    """Pagination invariant violation."""
+    """Pagination invariant violation.
+
+    ``rejection_code`` names the page check that rejected a page, when the error is one (for example
+    ``PageRejectionCode.DUPLICATE_IDENTITY``); the rejected page's ``PageRecord`` carries the same code.
+    """
 
     default_origin = ErrorOrigin.PAGINATION
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rejection_code: PageRejectionCode | None = None,
+        request_summary: RequestSummary | None = None,
+        redactor: Redactor = DEFAULT_REDACTOR,
+    ) -> None:
+        """Build the error; ``rejection_code`` is ``None`` unless a page check rejected a page."""
+        if rejection_code is not None and not isinstance(rejection_code, PageRejectionCode):
+            raise TypeError("rejection_code must be a PageRejectionCode")
+        self.rejection_code = rejection_code
+        super().__init__(message, request_summary=request_summary, redactor=redactor)
 
 
 class ContinuationError(PaginationError):
