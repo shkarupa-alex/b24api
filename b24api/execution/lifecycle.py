@@ -148,6 +148,15 @@ def cancellation_outranks(cause: TerminalCause, attempt: CleanupAttempt) -> bool
     return cause is TerminalCause.CANCELLED and attempt.error is not None
 
 
+def closed_behind_its_end(cause: TerminalCause, attempt: CleanupAttempt) -> bool:
+    """Whether the stream's close failed behind what ended it first: its reader's cancellation, or an interrupt.
+
+    A source the stream closes records a failed close as what failed it, not knowing what came first; behind either
+    end the close is "stream cleanup also failed", however the end reached the close (in a read or between reads).
+    """
+    return cancellation_outranks(cause, attempt) or (cause is TerminalCause.INTERRUPTED and attempt.error is not None)
+
+
 def cleanup_failed(cause: TerminalCause, attempt: CleanupAttempt) -> bool:
     """Whether the gate must record ``CleanupState.FAILURE`` for this attempt."""
     return attempt.error is not None or (cause in _FAILING and attempt.cancellation is not None)
@@ -751,6 +760,7 @@ __all__ = [
     "TerminalCause",
     "cancellation_outranks",
     "cleanup_failed",
+    "closed_behind_its_end",
     "failed_kernel_report",
     "kernel_terminal",
     "with_cleanup_attempt",

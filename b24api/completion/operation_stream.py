@@ -28,8 +28,8 @@ from b24api.execution.lifecycle import (
     LifecycleHooks,
     OperationRunner,
     TerminalCause,
-    cancellation_outranks,
     cleanup_failed,
+    closed_behind_its_end,
     with_cleanup_attempt,
     with_fallback_cleanup,
 )
@@ -315,14 +315,14 @@ class MappedOperationStream[S, T]:
     def _source_report(self) -> KernelReport:
         """Return the source's report with this stream's own cleanup result when the source lacks one.
 
-        Closed early by this stream after its reader's cancellation, the source records its failed close as what
-        failed; here the cancellation came first (``cancellation_outranks``), so the close is recorded behind it.
+        Closed early by this stream after its reader's cancellation or an interrupt, the source records its failed close
+        as what failed; here that end came first (``closed_behind_its_end``), so the close is recorded behind it.
         """
         report = self._source.report
         if self._cleanup is None:
             return report
         cause, attempt = self._cleanup
-        if cancellation_outranks(cause, attempt):
+        if closed_behind_its_end(cause, attempt):
             return with_cleanup_failure_behind(report, cast("BaseException", attempt.error))
         if any(violation.code == "cleanup_failure" for violation in report.violations):
             return report
