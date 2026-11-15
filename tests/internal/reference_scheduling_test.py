@@ -480,6 +480,23 @@ async def test_an_input_tail_keeps_room_for_the_pages_it_puts_in_flight_at_once(
 
 
 @pytest.mark.asyncio
+async def test_a_binding_charged_to_its_lease_keeps_no_room_behind_it() -> None:
+    """Once a fast keyset binding charges its pages to its lease, the pages behind it keep no room for them."""
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    state = _producers(0, 1, 2)
+    buffer = _RowBuffer(10, context, head_reserve=2, producer_state=state, ordered=True)
+    held = await buffer.reserve(0, 2)
+    # Eight rows free: r1 keeps room for one page of two rows.
+    assert not buffer.can_reserve(2, 8)
+    state.charge_to_lease("r1")
+    assert buffer.can_reserve(2, 8)
+    await buffer.abort(held)
+    await buffer.close()
+
+
+@pytest.mark.asyncio
 async def test_an_input_consumer_draining_a_queued_page_wakes_the_dispatcher_with_no_fact_changed() -> None:
     """The drain projection counts a queued page's rows already: the consumer freeing them changes no fact it reads."""
     executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
