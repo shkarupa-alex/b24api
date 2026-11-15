@@ -2786,14 +2786,15 @@ def _batches(transport: ResponderTransport) -> int:
     return sum(sent.method == "batch" for sent in transport.requests)
 
 
-@pytest.mark.parametrize("wave", [1, 2, 3])
+@pytest.mark.parametrize("send", [1, 2, 3, "finish"])
 @pytest.mark.parametrize("end", ["cancel", "interrupt", "budget", "transport"])
-def test_a_traversal_ended_while_a_wave_is_on_the_wire_settles_every_page_before_rejecting_it(
-    monkeypatch: pytest.MonkeyPatch, end: str, wave: int
+def test_a_traversal_ended_while_a_page_is_on_the_wire_settles_every_page_before_rejecting_it(
+    monkeypatch: pytest.MonkeyPatch, end: str, send: int | str
 ) -> None:
-    # The first wave is the boundary wave, the later ones are range waves. Whatever ends the traversal while one is
-    # on the wire (its reader's cancellation, an interrupt, the elapsed budget, a transport failure), every page is
-    # settled before the ledger rejects it, and the pages that may have run make the binding's closure unknown.
+    # The first send is the boundary wave, the next ones are range waves, and the last a direct finish page.
+    # Whatever ends the traversal while one is on the wire (its reader's cancellation, an interrupt, the elapsed
+    # budget, a transport failure), every page is settled before the ledger rejects it, and the pages that may
+    # have run make the binding's closure unknown.
     events: list[object] = []
     emit = CompletionGate.emit
 
@@ -2806,7 +2807,7 @@ def test_a_traversal_ended_while_a_wave_is_on_the_wire_settles_every_page_before
     on_the_wire = asyncio.Event()
 
     async def respond(request: Request) -> object:
-        if len(transport.requests) == wave:
+        if len(transport.requests) == send or (send == "finish" and request.method != "batch"):
             on_the_wire.set()
             if end == "interrupt":
                 raise KeyboardInterrupt
@@ -2816,7 +2817,8 @@ def test_a_traversal_ended_while_a_wave_is_on_the_wire_settles_every_page_before
         return await keyset.send(request, attempt_timeout=1.0, max_response_bytes=1 << 20)
 
     transport = ResponderTransport(respond, host=keyset.host)
-    policy = ExecutionPolicy(max_elapsed=0.2) if end == "budget" else None
+    # The budget is long enough for every page before the held one to be sent within it.
+    policy = ExecutionPolicy(max_elapsed=1.0) if end == "budget" else None
     stream = _stream(transport, RangeKeysetExecution(StableIntegerKeysetContract()), policy=policy)
 
     async def main() -> None:
@@ -2832,6 +2834,7 @@ def test_a_traversal_ended_while_a_wave_is_on_the_wire_settles_every_page_before
     else:
         asyncio.run(main())
 
+    assert on_the_wire.is_set()
     assert stream.report is not None
     assert not [violation.code for violation in stream.report.violations if violation.code.startswith("completion")]
     scheduled = sum(isinstance(event, PageScheduled) for event in events)

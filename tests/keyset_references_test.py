@@ -39,6 +39,7 @@ from b24api import (
     StableIntegerKeysetContract,
     TerminalState,
 )
+from b24api.completion import CompletionGate
 from b24api.contracts import (
     DeliveryOrder,
     KeysetExecutionKind,
@@ -50,6 +51,7 @@ from b24api.contracts import (
     ReferenceNotExecuted,
     ReferenceSource,
 )
+from b24api.contracts.completion import CommandSettlement, PageCommandOutcome, PageScheduled
 from b24api.contracts.page_stop import ContinuePage
 from b24api.contracts.policy import RetryPolicy
 from b24api.contracts.request import RouteKind
@@ -67,6 +69,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
     from b24api.contracts import KeysetExecutionReport, ReferenceOutcome
+    from b24api.contracts.completion import CompletionEvidence
     from b24api.contracts.report import OperationReport
     from b24api.contracts.stream import OperationStream
     from b24api.traversal.keyset_context import KeysetContext
@@ -368,6 +371,46 @@ async def test_a_row_breaking_its_identity_fails_its_binding_with_identity_contr
     cause = broken.error.__cause__
     assert isinstance(cause, IdentityContractError)
     assert (cause.path, cause.observed_type) == (("id",), "string")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wave", [1, 2])
+async def test_a_binding_cancelled_while_its_wave_is_on_the_wire_settles_each_page_of_it_as_unknown(
+    monkeypatch: pytest.MonkeyPatch, wave: int
+) -> None:
+    # The shared engine settles each page of a wave its binding's cancellation interrupts, by its command id, from
+    # what its command did: on the wire, it may have run. The first wave is the boundary wave, the next a range one.
+    events: list[object] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    started = asyncio.Event()
+    serve = _answer({"p0": tuple(range(1, 400))})
+
+    async def answer(method: str, query: Query) -> Envelope:
+        if len(portal.waves) == wave:
+            started.set()
+            await asyncio.Future[None]()
+        return serve(method, query)
+
+    portal = BatchPortal(answer)
+    async with client_for(portal) as client:
+        stream = client.iter_reference_outcomes(_base(), [_parent("p0")], traversal=_traversal(_range()))
+        pull = asyncio.create_task(_drain(stream))
+        await asyncio.wait_for(started.wait(), 5)
+        settled_before = sum(isinstance(event, PageCommandOutcome) for event in events)
+        unsettled = sum(isinstance(event, PageScheduled) for event in events) - settled_before
+        pull.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pull
+
+    settled = [event.outcome for event in events if isinstance(event, PageCommandOutcome)][settled_before:]
+    assert unsettled == portal.waves[-1]
+    assert settled == [CommandSettlement.UNKNOWN] * unsettled
 
 
 @pytest.mark.asyncio
