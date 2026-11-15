@@ -299,6 +299,28 @@ async def test_a_source_raising_a_library_error_of_its_own_is_its_failure(
     assert "budget_exhausted" not in {code for code, _message in _violations(report)}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["async", "sync"])
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_a_foreign_item_fails_the_source_with_public_errors_down_to_its_type_error(
+    family: str, kind: str
+) -> None:
+    # The item is not what the family reads: every family refuses it with the same ``TypeError``, on a chain of
+    # public errors only.
+    async def foreign_async() -> AsyncIterator[str]:
+        yield "not an item"
+
+    source: Iterable[Any] | AsyncIterator[Any] = ["not an item"] if kind == "sync" else foreign_async()
+    async with client_for(ResponderTransport(_answer), policy=POLICIES["returns"]) as client:
+        stream = _stream(client, family, source)
+        with pytest.raises(SOURCE_FAILURE[family]) as caught:
+            await asyncio.wait_for(_end(stream, "read_to_end"), timeout=HANG_BOUND)
+
+    chain = _chain(caught.value)
+    assert chain[-2:] == [InputSourceError, TypeError]
+    assert [link.__name__ for link in chain if link.__name__.startswith("_")] == []
+
+
 class _Blocks:
     """Answer the first ``answered`` sends; block each later one until released.
 

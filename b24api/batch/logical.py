@@ -60,13 +60,9 @@ if TYPE_CHECKING:
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
 
 
-class _CommandLocalValidationError(TypeError):
-    """A yielded source item is not a public Command value."""
-
-
 def _accept_command(command: object, _index: int) -> _BatchItem:
     if not isinstance(command, Command):
-        raise _CommandLocalValidationError("batch source must yield Command values")
+        raise TypeError("batch source must yield Command values")
     return _BatchInput(command.request, command.correlation)
 
 
@@ -257,7 +253,7 @@ class LogicalBatchKernelStream[C]:
             if (failure := chunk.source_error) is not None:
                 reason = (
                     NotExecutedReason.LOCAL_VALIDATION_FAILED
-                    if isinstance(failure.__cause__, _CommandLocalValidationError)
+                    if failure.__cause__ is not None and failure.__cause__ is self._source.rejected
                     else NotExecutedReason.SOURCE_FAILED
                 )
                 pending = tuple(

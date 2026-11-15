@@ -135,6 +135,8 @@ class OwnedSource[T](AsyncIterator[T]):
         self._observe = observe
         self._failure = failure
         self._admitted = 0
+        # What ``accept`` raised for an item the source yielded, when that refusal is how the source ended.
+        self.rejected: Exception | None = None
         self._violations: tuple[Violation, ...] = ()
         self._close: asyncio.Future[Settled[None]] | None = None
 
@@ -177,12 +179,16 @@ class OwnedSource[T](AsyncIterator[T]):
 
     async def next(self) -> T | Exhausted:
         """Pull and admit one item, or return :data:`EXHAUSTED`."""
+        admitting = False
         try:
             raw = await self._pull()
             if raw is EXHAUSTED:
                 return EXHAUSTED
+            admitting = True
             item = self._accept(raw, self._admitted)
         except Exception as error:
+            if admitting:
+                self.rejected = error
             if self._failure is None:
                 raise
             raise self._failure(error) from error
