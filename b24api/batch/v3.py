@@ -246,14 +246,13 @@ class _V3Resolution:
         Sent again after a failure of the whole envelope (``followed``) and stopped before the send, by the budget
         or by any other failure (a closed client), each ends with that stop, which the executor chained to the
         failure it followed, and possibly run only when a send it was in may have run. Commands their own elements
-        answered keep that answer; those of a first send end with the stop.
+        answered keep that answer; those of a first send end with the stop, which carries no facts: nothing was sent.
         """
-        if followed:
-            self.attempts.record_open(error)
-            for command in pending:
-                self.last[command.index] = _shared_failure(command, error)
+        # The stop carries what the group's sends left open, nothing before its first send, as every stop does.
+        self.attempts.record_open(error)
         for command in pending:
-            self.last.setdefault(command.index, _shared_failure(command, error))
+            if followed or command.index not in self.last:
+                self.last[command.index] = _shared_failure(command, error)
         self._settle(pending)
         return ()
 
