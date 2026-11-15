@@ -808,6 +808,7 @@ class _BetweenReads:
     def __init__(self) -> None:
         self.interrupt = KeyboardInterrupt("between reads")
         self.go = asyncio.Event()
+        self.cleaning = asyncio.Event()
         self.release = asyncio.Event()
         self.after_latch: list[Callable[[], Awaitable[None]]] = []
         self.runner: OperationRunner[int, KernelReport] = OperationRunner(
@@ -830,6 +831,7 @@ class _BetweenReads:
             await step()
 
     async def _cleanup(self) -> None:
+        self.cleaning.set()
         await self.release.wait()
 
     async def read_one(self) -> None:
@@ -905,6 +907,35 @@ def test_a_close_runs_the_end_whose_own_task_was_cancelled_before_it_ran() -> No
     assert report is not None
     assert report.terminal_reason == "operation interrupted"
     assert getattr(error, "report", None) is report
+
+
+def test_a_close_cancelled_while_it_runs_the_end_raises_its_cancellation_once_the_end_is_over() -> None:
+    # The close runs the end nobody began (its task was cancelled before its first step) and is cancelled while the
+    # cleanup waits: the end still finishes and publishes, the cancellation recorded as cleanup's, and the close
+    # raises that cancellation rather than return as if nobody had cancelled it.
+    operation = _BetweenReads()
+    got: list[object] = []
+
+    async def cancel_the_end() -> None:
+        _ending(operation.runner).cancel()
+
+    async def close_cancelled() -> None:
+        closing = asyncio.create_task(operation.runner.aclose())
+        await operation.cleaning.wait()
+        closing.cancel()
+        await asyncio.sleep(0)
+        operation.release.set()
+        got.extend(await asyncio.gather(closing, return_exceptions=True))
+        got.append(operation.runner.report)
+
+    operation.after_latch.append(cancel_the_end)
+    error = raised_driving_the_loop(operation.read_one, close_cancelled)
+    assert error is operation.interrupt
+    report = operation.runner.report
+    assert report is not None
+    assert [type(item) for item in got] == [asyncio.CancelledError, KernelReport]
+    assert got[1] is report
+    assert report.terminal_reason == "operation interrupted"
 
 
 def test_the_operations_own_work_cannot_close_it_once_an_interrupt_ended_it_between_reads() -> None:
