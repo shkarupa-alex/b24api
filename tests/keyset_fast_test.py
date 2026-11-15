@@ -2939,8 +2939,56 @@ async def test_fast_failure_keeps_a_failed_cleanup_in_its_report_not_in_a_note(m
     assert report.state is TerminalState.INCOMPLETE
     # The failure is primary: its violation comes first, the failed cleanup behind it last.
     assert [(item.code, item.message) for item in report.violations[-2:]] == [
-        ("budget_exhausted", "IncompleteTraversalError (BudgetExceededError)"),
+        ("budget_exhausted", "iter_list_keyset failed (BudgetExceededError)"),
         ("cleanup_failure", "stream cleanup also failed (RuntimeError)"),
     ]
     assert raised.value.report is report
     assert not hasattr(raised.value, "__notes__")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["between_reads", "during_a_read"])
+async def test_fast_cancelled_reader_whose_cleanup_then_fails_is_cancelled_whenever_the_cancellation_lands(
+    monkeypatch: pytest.MonkeyPatch, timing: str
+) -> None:
+    # As in every family: the reader's cancellation came first, so the failed cleanup is behind it.
+    transport = KeysetTransport(tuple(range(1, 80)))
+    stream = _stream(transport, RangeKeysetExecution(StableIntegerKeysetContract()))
+    _fail_runtime_cleanup(monkeypatch, stream)
+    sending = asyncio.Event()
+    if timing == "during_a_read":
+
+        async def blocked(request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            del request, attempt_timeout, max_response_bytes
+            sending.set()
+            await asyncio.Event().wait()
+            raise AssertionError("never answered")
+
+        monkeypatch.setattr(transport, "send", blocked)
+    raised: list[BaseException] = []
+
+    async def read() -> None:
+        try:
+            async for _row in stream:
+                if timing == "between_reads":
+                    task = asyncio.current_task()
+                    assert task is not None
+                    task.cancel()
+        except BaseException as error:  # noqa: BLE001 - the test inspects what the reader got
+            raised.append(error)
+
+    reader = asyncio.create_task(read())
+    if timing == "during_a_read":
+        await sending.wait()
+        reader.cancel()
+    await reader
+
+    assert [type(error) for error in raised] == [asyncio.CancelledError]
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.CANCELLED
+    assert report.terminal_reason == "iteration cancelled"
+    # The cleanup the test breaks stops before it settles a page in flight, which the gate records besides.
+    assert [item.message for item in report.violations if item.code == "cleanup_failure"] == [
+        "stream cleanup also failed (RuntimeError)"
+    ]

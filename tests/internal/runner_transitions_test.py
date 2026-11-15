@@ -351,28 +351,18 @@ async def test_cancelled_read_with_clean_cleanup_raises_the_cancellation(family:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
-async def test_cancelled_read_with_failing_cleanup_raises_it_and_rearms_the_cancellation(
+async def test_cancelled_read_with_failing_cleanup_raises_the_cancellation_and_reports_the_cleanup(
     family: Family,
     client: Bitrix24,
 ) -> None:
+    # The cancellation came first, so it outranks the cleanup failure: the read raises it, the report records both.
     harness = _harness(family, client, body="block", cleanup="fail")
-    seen: list[BaseException] = []
-
-    async def consume() -> None:
-        try:
-            await _drain(harness.stream)
-        except _CleanupFailedError as error:
-            seen.append(error)
-        await asyncio.sleep(0)
-        pytest.fail("the deferred cancellation was not re-armed")
-
-    task = asyncio.create_task(consume())
+    task = asyncio.create_task(_drain(harness.stream))
     await _cancel_blocked_read(harness, task)
     error = await _outcome(task)
 
     assert isinstance(error, asyncio.CancelledError)
-    assert len(seen) == 1
-    harness.assert_published_once(seen[0])
+    harness.assert_published_once(error)
     assert "cleanup_failure" in harness.codes()
 
 
@@ -633,6 +623,8 @@ async def test_failing_finalizer_keeps_a_simultaneous_cleanup_failure(
 
     if body == "exhaust":
         assert isinstance(error, _FinalizeFailedError)
+        # A library error carries the cleanup failure in its report, never as a note.
+        assert getattr(error, "__notes__", []) == []
     else:
         assert _is_body_failure(error)
     assert (harness.finalize_calls, harness.fallback_calls) == (1, 1)

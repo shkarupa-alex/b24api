@@ -16,7 +16,7 @@ from b24api.contracts.request import ReplaySafety, Request, ResultSelector, Trav
 from b24api.contracts.response import result_snapshot
 from b24api.contracts.violation import retain_violations
 from b24api.errors import BudgetExceededError, CapabilityError, CleanupOverrunError
-from b24api.execution.context import spawn_settled
+from b24api.execution.context import is_interrupt, spawn_settled
 from b24api.execution.facts import dropped_result
 from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
@@ -249,7 +249,8 @@ class ReferenceScheduler:
             if error is not primary_error:
                 cleanup_errors.append(error)
         if cleanup_errors:
-            raise cleanup_errors[0]
+            # The first failure, unless an interrupt came later: an interrupt is never behind another.
+            raise next((error for error in cleanup_errors if is_interrupt(error)), cleanup_errors[0])
 
     async def _stop_work(
         self,
@@ -357,10 +358,11 @@ class ReferenceScheduler:
         # Under INPUT a binding's queue holds the pages it read ahead; the row pool bounds them.
         queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue[_Event]()
         admission.queues[work.index] = queue
+        # A binding's task runs caller code (a transport, a page stop): it returns how it ended (``Settled``).
         if work.reference.not_executed_reason is not None:
-            task = asyncio.create_task(self._emit_local_non_execution(work, queue))
+            task = spawn_settled(self._emit_local_non_execution(work, queue))
         else:
-            task = asyncio.create_task(self._run_reference(work, queue))
+            task = spawn_settled(self._run_reference(work, queue))
             # A task cancelled before it reaches its own retirement leaves its producer to this callback.
             task.add_done_callback(functools.partial(self._retire_ended_producer, _producer_key(work.index)))
         admission.tasks[work.index] = task
@@ -403,8 +405,9 @@ class ReferenceScheduler:
                 await self._drive(run, pages)
         except asyncio.CancelledError:
             raise
-        except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
-            # The binding fails with what its failed page reports, and its command's replay disposition, if any.
+        except BaseException as error:  # noqa: BLE001 - per-reference tolerant outcome boundary, an interrupt's too
+            # The binding fails with what its failed page reports, and its command's replay disposition, if any. An
+            # interrupt (``is_interrupt``) is published as the binding's end too, so its consumer raises it.
             failed = _failed_page(error)
             event = self._failure_event(run, failed.error)
             if failed.failure is not None:
@@ -490,7 +493,7 @@ class ReferenceScheduler:
         self.context.close_reference(run.producer_key)
         self.producer_state.retire(run.producer_key)
 
-    def _retire_ended_producer(self, key: str, _task: asyncio.Task[None]) -> None:
+    def _retire_ended_producer(self, key: str, _task: asyncio.Task[Settled[None]]) -> None:
         """Retire a producer registered at its pull whose task ended without retiring it."""
         self.producer_state.retire(key)
 
@@ -917,6 +920,9 @@ class ReferenceScheduler:
                     event.keyset_execution,
                 )
             return
+        if is_interrupt(event.error):
+            # Never an outcome nor a window failure: an interrupt leaves as itself, in every family.
+            raise event.error
         request = event.work.reference.request
         self.completion.terminal(
             event.work.index,

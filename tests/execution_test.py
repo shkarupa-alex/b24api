@@ -23,7 +23,6 @@ from b24api.errors import (
     ClientClosedError,
     FailurePhase,
     HTTPGatewayError,
-    InputSourceError,
     ProtocolError,
     ResponseTooLargeError,
     TransportError,
@@ -338,8 +337,8 @@ async def test_a_cancellation_a_transport_turns_into_a_failure_ends_the_batch() 
 
 
 @pytest.mark.asyncio
-async def test_a_stream_cleanup_failure_still_delivers_the_reader_cancellation() -> None:
-    """The cleanup failure is raised from the cancelled read; the cancellation lands at the next await."""
+async def test_a_stream_cleanup_failure_behind_the_reader_cancellation_raises_the_cancellation() -> None:
+    """The cancellation came first: the cancelled read raises it, and the cleanup failure is in the report."""
 
     class CloseFailedError(Exception):
         pass
@@ -357,16 +356,14 @@ async def test_a_stream_cleanup_failure_still_delivers_the_reader_cancellation()
     blocker = Blocker()
     steps: list[str] = []
     async with client_for(ResponderTransport(blocker)) as api:
+        stream = api.batch_outcomes(Source(), batch_size=2)
 
         async def reader() -> None:
-            with contextlib.suppress(InputSourceError):
-                async for _outcome in api.batch_outcomes(Source(), batch_size=2):
-                    pass
-            steps.append("cleanup failure raised")
             try:
-                await asyncio.sleep(0)
+                async for _outcome in stream:
+                    pass
             except asyncio.CancelledError:
-                steps.append("cancellation delivered")
+                steps.append("cancellation raised")
                 raise
 
         task = asyncio.create_task(reader())
@@ -375,7 +372,10 @@ async def test_a_stream_cleanup_failure_still_delivers_the_reader_cancellation()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert steps == ["cleanup failure raised", "cancellation delivered"]
+    assert steps == ["cancellation raised"]
+    report = stream.report
+    assert report is not None
+    assert [violation.message for violation in report.violations] == ["stream cleanup also failed (InputSourceError)"]
 
 
 @pytest.mark.asyncio

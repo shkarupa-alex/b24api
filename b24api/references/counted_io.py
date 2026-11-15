@@ -16,6 +16,7 @@ from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import B24ApiError, CapabilityError
+from b24api.execution.context import Settled, spawn_settled
 from b24api.references.dispatch import _BatchPageError, _failed_page, _SentPageError
 from b24api.traversal.counted_io import HeadAttempt, TailReceipt
 
@@ -175,7 +176,7 @@ class _TailSlot:
     page_id: int
     sequence: int
     reservation: _Reservation | None = None
-    task: asyncio.Task[_DispatchedPage] | None = None
+    task: asyncio.Task[Settled[_DispatchedPage]] | None = None
     error: BaseException | None = field(default=None, repr=False)
     consumed: bool = False
 
@@ -283,7 +284,8 @@ class ReferenceTailStream:
                 self._slots[ordinal] = slot
                 slot.reservation = await host.buffer.reserve(run.work.index, run.program.page_cap)
                 transit = state.depart(key, page_reserved=False)
-                slot.task = asyncio.create_task(self._fetch(slot, item.request, transit))
+                # The fetch runs the caller's transport: its task returns how it ended (``Settled``).
+                slot.task = spawn_settled(self._fetch(slot, item.request, transit))
                 transit.carried_by(slot.task)
                 self._unsent -= 1
                 self._publish_window()
@@ -337,7 +339,7 @@ class ReferenceTailStream:
             raise RuntimeError("counted tail page lacks its dispatch")
         run = self._run
         try:
-            dispatched = await task
+            dispatched = (await task).unwrap()
         except (_SentPageError, B24ApiError) as error:
             # A failed page, whatever its command did, is the page's outcome, as on the flat tail: the binding takes
             # it, and the tail's one trace site traces it by its settlement (``failed_page``), none if never sent.
@@ -397,9 +399,9 @@ def _abandoned_settlement(slot: _TailSlot) -> CommandSettlement:
     task = slot.task
     if task is None:
         return CommandSettlement.NOT_EXECUTED
-    if not task.cancelled() and task.exception() is None:
-        return CommandSettlement.SUCCESS
     error = slot.error
+    if not task.cancelled() and error is None:
+        return CommandSettlement.SUCCESS
     return CommandSettlement.NOT_EXECUTED if error is None else _failed_page(error).settlement
 
 

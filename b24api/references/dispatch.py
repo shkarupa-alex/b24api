@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from b24api.contracts.report import KeysetExecutionReport, KeysetSelectionSummary, PageRecord, Violation
     from b24api.contracts.request import Request
     from b24api.contracts.response import Response
-    from b24api.execution.context import PageReservation
+    from b24api.execution.context import PageReservation, Settled
     from b24api.traversal.plans import (
         KernelBatchDispatch,
         KernelDirectDispatch,
@@ -429,7 +429,7 @@ class _Transit:
     page_reserved: bool
     arrived: bool = False
 
-    def carried_by(self, task: asyncio.Task[_DispatchedPage]) -> None:
+    def carried_by(self, task: asyncio.Future[Settled[_DispatchedPage]]) -> None:
         """End the transit when ``task`` ends, also if it is cancelled before it first runs."""
         task.add_done_callback(self.arrive)
 
@@ -471,7 +471,7 @@ class _DispatchedPage:
 
 @dataclass(slots=True)
 class _AdmissionState:
-    tasks: dict[int, asyncio.Task[None]]
+    tasks: dict[int, asyncio.Task[Settled[None]]]
     queues: dict[int, asyncio.Queue[_Event]]
     ready: asyncio.Queue[_Event]
     slots: asyncio.Semaphore
@@ -1285,13 +1285,16 @@ class _BatchPageDispatcher:
             for item in chunk:
                 item.future.cancel()
             raise
-        except Exception as error:  # noqa: BLE001 - total chunk correlation boundary
+        except BaseException as error:  # noqa: BLE001 - total chunk correlation boundary, an interrupt's too
             # Every page fails with the chunk's error and keeps what its own command did, which the chunk's
             # progress says at the page's position, whatever failed: a sent page no longer has a deadline to end
-            # its wait.
+            # its wait. An interrupt (``is_interrupt``) reaches every page's fetch as itself: the sender never ends
+            # in it, and it is no page's outcome.
             for position, item in enumerate(chunk):
                 if not item.future.done():
-                    item.future.set_exception(_ChunkPageError(error, progress, position))
+                    item.future.set_exception(
+                        _ChunkPageError(error, progress, position) if isinstance(error, Exception) else error
+                    )
 
     @staticmethod
     def _correlate(chunk: list[_PendingBatch], outcomes: tuple[BatchOutcome, ...]) -> None:

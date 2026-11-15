@@ -453,6 +453,15 @@ class OwnedPull[T](Protocol):
         ...
 
 
+def is_interrupt(error: BaseException | None) -> bool:
+    """Whether ``error`` interrupts the program rather than fails work: neither an ``Exception`` nor a cancellation.
+
+    ``KeyboardInterrupt`` and ``SystemExit`` are the usual ones. An interrupt is never a failure to report only, nor
+    one behind another: whatever came before it, it is what leaves, and a report may record it besides.
+    """
+    return error is not None and not isinstance(error, Exception | asyncio.CancelledError)
+
+
 class Settled[T]:
     """How a library task's work ended, returned as the task's result: a value, or the failure its owner raises.
 

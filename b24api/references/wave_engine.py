@@ -16,6 +16,7 @@ from b24api.batch.outcome import settlement_of
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError
+from b24api.execution.context import Settled, spawn_settled
 from b24api.references.dispatch import _DecodeOptions, _failed_page
 from b24api.traversal.keyset_context import FailedWavePage
 
@@ -125,7 +126,7 @@ class SharedWaveEngine:
         return outcomes
 
     def _correlate(
-        self, tasks: tuple[asyncio.Task[_DispatchedPage], ...], errors: dict[int, BaseException]
+        self, tasks: tuple[asyncio.Task[Settled[_DispatchedPage]], ...], errors: dict[int, BaseException]
     ) -> tuple[BatchOutcome, ...]:
         """Return each command's outcome in order; raise a whole-envelope failure, as the flat engine raises it."""
         outcomes: list[BatchOutcome] = []
@@ -133,7 +134,7 @@ class SharedWaveEngine:
         for index, task in enumerate(tasks):
             error = errors.get(index)
             if error is None:
-                outcome = task.result().outcome
+                outcome = task.result().unwrap().outcome
                 if outcome is None:
                     error = errors[index] = CapabilityError("batch page response metadata is unavailable")
                 else:
@@ -152,7 +153,7 @@ class SharedWaveEngine:
     def _settle(
         self,
         command_ids: tuple[str, ...],
-        tasks: tuple[asyncio.Task[_DispatchedPage], ...],
+        tasks: tuple[asyncio.Task[Settled[_DispatchedPage]], ...],
         errors: dict[int, BaseException],
         raised: BaseException,
     ) -> None:
@@ -172,12 +173,15 @@ class SharedWaveEngine:
         requests: tuple[Request, ...],
         options: _DecodeOptions,
         errors: dict[int, BaseException],
-    ) -> tuple[asyncio.Task[_DispatchedPage], ...]:
-        """Start one task per command, each counted in transit until its command reaches the queue."""
-        tasks: list[asyncio.Task[_DispatchedPage]] = []
+    ) -> tuple[asyncio.Task[Settled[_DispatchedPage]], ...]:
+        """Start one task per command, each counted in transit until its command reaches the queue.
+
+        A command's task returns how its fetch ended (``Settled``): the fetch runs the caller's transport.
+        """
+        tasks: list[asyncio.Task[Settled[_DispatchedPage]]] = []
         for index, request in enumerate(requests):
             transit = self._state.depart(self._run.producer_key, page_reserved=True)
-            task = asyncio.create_task(self._fetch(index, request, options, errors, transit))
+            task = spawn_settled(self._fetch(index, request, options, errors, transit))
             transit.carried_by(task)
             tasks.append(task)
         return tuple(tasks)
@@ -209,7 +213,7 @@ class SharedWaveEngine:
         return dispatched
 
 
-def _failed_wave_page(task: asyncio.Task[_DispatchedPage], error: BaseException | None) -> FailedWavePage:
+def _failed_wave_page(task: asyncio.Task[Settled[_DispatchedPage]], error: BaseException | None) -> FailedWavePage:
     """Settle one wave command from what its dispatch proved: its failure, or its outcome (``settlement_of``).
 
     A task cancelled before it ran never handed its command to the dispatcher: it was not executed, in no batch.
@@ -217,7 +221,7 @@ def _failed_wave_page(task: asyncio.Task[_DispatchedPage], error: BaseException 
     if error is not None:
         failed = _failed_page(error)
         return FailedWavePage(failed.settlement, failed.batch_index)
-    outcome = task.result().outcome if task.done() and not task.cancelled() else None
+    outcome = task.result().unwrap().outcome if task.done() and not task.cancelled() else None
     if outcome is None:
         return FailedWavePage(CommandSettlement.NOT_EXECUTED, None)
     return FailedWavePage(settlement_of(outcome), outcome.command_index)

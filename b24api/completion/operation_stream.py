@@ -3,7 +3,7 @@
 from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import replace
-from typing import TYPE_CHECKING, Protocol, Self
+from typing import TYPE_CHECKING, Protocol, Self, cast
 
 from b24api.completion.gate import CompletionGate, CompletionReportFacts
 from b24api.contracts.completion import CleanupState
@@ -17,12 +17,13 @@ from b24api.contracts.report import (
     ViolationSeverity,
 )
 from b24api.errors import IncompleteTraversalError
-from b24api.execution.failure import CANCELLED_REASON, finalize_failure
+from b24api.execution.failure import CANCELLED_REASON, finalize_failure, with_cleanup_failure_behind
 from b24api.execution.lifecycle import (
     CleanupAttempt,
     LifecycleHooks,
     OperationRunner,
     TerminalCause,
+    cancellation_outranks,
     cleanup_failed,
     with_cleanup_attempt,
     with_fallback_cleanup,
@@ -300,11 +301,19 @@ class MappedOperationStream[S, T]:
         return self._report
 
     def _source_report(self) -> KernelReport:
-        """Return the source's report with this stream's own cleanup result when the source lacks one."""
+        """Return the source's report with this stream's own cleanup result when the source lacks one.
+
+        Closed early by this stream after its reader's cancellation, the source records its failed close as what
+        failed; here the cancellation came first (``cancellation_outranks``), so the close is recorded behind it.
+        """
         report = self._source.report
-        if self._cleanup is None or any(violation.code == "cleanup_failure" for violation in report.violations):
+        if self._cleanup is None:
             return report
         cause, attempt = self._cleanup
+        if cancellation_outranks(cause, attempt):
+            return with_cleanup_failure_behind(report, cast("BaseException", attempt.error))
+        if any(violation.code == "cleanup_failure" for violation in report.violations):
+            return report
         return with_cleanup_attempt(report, cause, attempt)
 
     def _terminated(self) -> None:

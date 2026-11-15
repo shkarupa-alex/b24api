@@ -1647,7 +1647,7 @@ async def test_source_close_failure_does_not_skip_owned_resource_cleanup() -> No
 
 
 @pytest.mark.asyncio
-async def test_reference_iteration_cancellation_propagates_source_cleanup_error() -> None:
+async def test_reference_iteration_cancellation_outranks_a_source_cleanup_error() -> None:
     pulling = asyncio.Event()
 
     class RaisingCloseSource:
@@ -1675,35 +1675,31 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
         policy=ExecutionPolicy(max_active_references=1),
     )
     assert isinstance(await anext(stream), KernelReferenceItem)
-    observed: list[tuple[str, object]] = []
+    observed: list[str] = []
     independent_transport = ResponderTransport(lambda _request: {"result": {"ok": True}})
 
     async def consume() -> None:
-        current = asyncio.current_task()
-        assert current is not None
         try:
             await anext(stream)
-        except RuntimeError as error:
-            observed.append((str(error), current.cancelling()))
-        try:
-            await Executor(independent_transport).execute(Request("independent", route=RouteKind.BARE))
         except asyncio.CancelledError as cancellation:
-            observed.append((str(cancellation), current.cancelling()))
-        while current.cancelling():
-            current.uncancel()
+            observed.append(str(cancellation))
+            raise
+        await Executor(independent_transport).execute(Request("independent", route=RouteKind.BARE))
 
     task = asyncio.create_task(consume())
     await pulling.wait()
     task.cancel("external-caller")
 
-    await task
-    assert observed == [("reference close boom", 1), ("external-caller", 1)]
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert observed == ["external-caller"]
     assert independent_transport.requests == []
-    assert stream.report.state is KernelState.FAILED
-    # Nothing failed before the close, so the close is what failed, as in every stream family (§3.1): its failure
-    # is raised and recorded alone, and the caller's cancellation is re-armed behind it, not recorded.
-    assert stream.report.terminal_reason == "stream cleanup failed"
-    assert [violation.message for violation in stream.report.violations] == ["stream cleanup failed (RuntimeError)"]
+    # The caller's cancellation came first, as in every stream family (§3.1): it is raised, and the failed close
+    # is recorded behind it.
+    assert stream.report.state is KernelState.CANCELLED
+    assert [violation.message for violation in stream.report.violations] == [
+        "stream cleanup also failed (RuntimeError)"
+    ]
 
 
 @pytest.mark.asyncio

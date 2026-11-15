@@ -130,9 +130,9 @@ def _consume_task_result(task: asyncio.Task[object]) -> None:
         task.result()
 
 
-async def _finish_task(tasks: dict[int, asyncio.Task[None]], index: int) -> None:
+async def _finish_task(tasks: dict[int, asyncio.Task[Settled[None]]], index: int) -> None:
     task = tasks.pop(index)
-    await task
+    (await task).unwrap()
 
 
 def _whole_result_share(dispatch: DispatchPlan, policy: ExecutionPolicy) -> int:

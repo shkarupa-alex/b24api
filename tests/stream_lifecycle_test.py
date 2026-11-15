@@ -323,7 +323,8 @@ async def test_source_close_failure_after_exhaustion_is_a_cleanup_failure_not_a_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
-async def test_cancelled_pull_with_failing_source_close_raises_the_cleanup_failure(family: str) -> None:
+async def test_cancelled_pull_with_failing_source_close_raises_the_cancellation(family: str) -> None:
+    # The reader's cancellation came first: it is raised, and the failed close is recorded behind it.
     portal = _Portal(block=True)
     source = _Source(close_fails=True)
     async with _client(portal) as client:
@@ -331,33 +332,18 @@ async def test_cancelled_pull_with_failing_source_close_raises_the_cleanup_failu
         pull = asyncio.ensure_future(anext(stream))
         await portal.entered.wait()
         pull.cancel()
-        with pytest.raises(CLOSE_FAILURE) as raised:
+        with pytest.raises(asyncio.CancelledError) as raised:
             await pull
-        _assert_close_failure(raised.value, family)
 
         report = stream.report
         assert report is not None
         assert _published(raised.value) is report
-        assert report.state is TerminalState.FAILED
-        assert "cleanup_failure" in _codes(report)
+        assert report.state is TerminalState.CANCELLED
+        assert report.terminal_reason == "iteration cancelled"
+        failed_close = [violation.message for violation in report.violations if violation.code == "cleanup_failure"]
+        assert failed_close == ["stream cleanup also failed (InputSourceError)"]
         await stream.aclose()
         assert stream.report is report
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("family", LOGICAL)
-async def test_logical_batch_cancel_cleanup_failure_is_a_terminal_cleanup_failure(family: str) -> None:
-    portal = _Portal(block=True)
-    async with _client(portal) as client:
-        stream = _stream(client, family, _Source(close_fails=True))
-        pull = asyncio.ensure_future(anext(stream))
-        await portal.entered.wait()
-        pull.cancel()
-        with pytest.raises(CLOSE_FAILURE) as raised:
-            await pull
-        _assert_close_failure(raised.value, family)
-    assert stream.report is not None
-    assert stream.report.terminal_reason == "stream cleanup failed"
 
 
 @pytest.mark.asyncio

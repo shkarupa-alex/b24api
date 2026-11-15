@@ -17,12 +17,12 @@ from typing import TYPE_CHECKING, NoReturn, Protocol, Self, cast
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.stream import PartialResult
-from b24api.errors import CleanupOverrunError
 from b24api.execution.context import (
     WORK_OWNERS,
     CancellationMark,
     Settled,
     await_cleanup_resistant,
+    is_interrupt,
     rearm_cancellation,
     spawn_settled,
 )
@@ -30,7 +30,6 @@ from b24api.execution.failure import (
     CANCELLED_REASON,
     EARLY_CLOSE_REASON,
     attach_report,
-    cleanup_failure_violation,
     public_cause,
     report_reason,
     with_cleanup_failure,
@@ -111,8 +110,8 @@ def with_cleanup_attempt(report: KernelReport, cause: TerminalCause, attempt: Cl
 
     Without a primary failure a cleanup failure turns the report FAILED ("stream cleanup failed"); a
     cancellation during that cleanup is raised but not recorded. Behind a FAILED primary both the
-    cleanup failure and a cleanup cancellation are secondary violations, as is a cleanup that overran
-    its window behind a caller's cancellation (``cancellation_outranks``).
+    cleanup failure and a cleanup cancellation are secondary violations, as is any cleanup failure but an
+    interrupt behind a caller's cancellation (``cancellation_outranks``).
     """
     if cancellation_outranks(cause, attempt):
         return with_cleanup_failure(report, cast("BaseException", attempt.error), terminal=False)
@@ -127,12 +126,13 @@ def with_cleanup_attempt(report: KernelReport, cause: TerminalCause, attempt: Cl
 
 
 def cancellation_outranks(cause: TerminalCause, attempt: CleanupAttempt) -> bool:
-    """Whether a caller's cancellation, not the cleanup failure, ends the stream: the cleanup overran its window.
+    """Whether a caller's cancellation, not the cleanup failure, ends the stream: the cancellation came first.
 
-    The window ended the wait the cancellation was deferred by, so the overrun is that bound, not a failure of
-    what was closed: the cancellation is raised and the stream is cancelled, the overrun a secondary violation.
+    The reader's cancellation ended the stream before its close failed or overran its window, so the cancellation
+    is raised and the stream is cancelled, the close failure a secondary violation ("stream cleanup also failed").
+    An interrupt (``is_interrupt``) is the exception: it is never behind anything.
     """
-    return cause is TerminalCause.CANCELLED and isinstance(attempt.error, CleanupOverrunError)
+    return cause is TerminalCause.CANCELLED and attempt.error is not None and not is_interrupt(attempt.error)
 
 
 def cleanup_failed(cause: TerminalCause, attempt: CleanupAttempt) -> bool:
@@ -530,15 +530,25 @@ class OperationRunner[T, R: _Report]:
         attempt = CleanupAttempt(cleanup.error, cleanup.cancellation or pending, finished=cleanup.unfinished is None)
         reason = report_reason(primary) if cause is TerminalCause.FAILED and primary is not None else None
         report, finalize_failed = await self._publish(cause, reason, attempt)
+        if is_interrupt(attempt.error):
+            self._raise_interrupt(cast("BaseException", attempt.error), report)
         if cause is TerminalCause.FAILED and primary is not None:
             self._raise_failed(primary, report, attempt, finalize_failed=finalize_failed)
         if finalize_failed and self._finalize_error is not None and primary is None:
-            if attempt.error is not None:
-                self._finalize_error.add_note(cleanup_failure_violation(attempt.error, secondary=True).message)
-            # The finalization failure leaves in place of a cancellation cleanup absorbed, so it is replayed.
+            # A cleanup failure behind it is in the fallback report it carries, not a note on it. The finalization
+            # failure leaves in place of a cancellation cleanup absorbed, so it is replayed.
             rearm_cancellation(attempt.cancellation)
             raise self._finalize_error
         self._raise_terminal(cause, primary, report, attempt)
+
+    def _raise_interrupt(self, interrupt: BaseException, report: R) -> NoReturn:
+        """Raise an interrupt the cleanup ended in, ahead of any earlier failure or cancellation (``is_interrupt``).
+
+        The report records it as the cleanup's failure; a runner driving this one reads it as that close's failure.
+        """
+        self._cleanup_failure = interrupt
+        self._hooks.attach(interrupt, report)
+        raise interrupt
 
     def _raise_failed(
         self,

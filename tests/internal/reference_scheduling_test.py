@@ -41,7 +41,7 @@ from b24api.contracts.completion import CommandSettlement, PageAcknowledged, Pag
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError
 from b24api.execution import Executor, RateCoordinator
-from b24api.execution.context import CleanupResult, ExecutionContext
+from b24api.execution.context import CleanupResult, ExecutionContext, spawn_settled
 from b24api.execution.facts import Execution, execution, settlement
 from b24api.references.counted_io import ReferenceTailStream
 from b24api.references.dispatch import (
@@ -226,7 +226,7 @@ async def test_a_page_on_its_way_to_the_queue_is_potential_until_it_arrives() ->
         raise AssertionError("cancelled before its first step")
 
     cancelled = state.depart("r1", page_reserved=False)
-    task = asyncio.create_task(never_started())
+    task = spawn_settled(never_started())
     cancelled.carried_by(task)
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)

@@ -137,6 +137,16 @@ def with_cleanup_failure(report: KernelReport, error: BaseException, *, terminal
     return replace(report, state=KernelState.FAILED, terminal_reason=CLEANUP_FAILED_REASON, violations=violations)
 
 
+def with_cleanup_failure_behind(report: KernelReport, error: BaseException) -> KernelReport:
+    """Return the report with one cleanup-failure violation for ``error``, behind what ended the stream first.
+
+    A source its stream closed early records the failed close as what failed it; when the stream ended by something
+    that came first (its reader's cancellation), that close is recorded once, as "stream cleanup also failed (X)".
+    """
+    violations = tuple(item for item in report.violations if item.code != "cleanup_failure")
+    return replace(report, violations=(*violations, cleanup_failure_violation(error, secondary=True)))
+
+
 def attach_report(error: BaseException, report: object) -> None:
     """Attach immutable report evidence without replacing the primary error."""
     with contextlib.suppress(AttributeError, TypeError):
@@ -218,4 +228,5 @@ __all__ = [
     "finalize_failure",
     "report_reason",
     "with_cleanup_failure",
+    "with_cleanup_failure_behind",
 ]
