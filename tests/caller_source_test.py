@@ -1259,6 +1259,196 @@ def test_an_interrupt_on_any_route_ends_the_operation_and_leaves_asyncio_run(
     ]
 
 
+class _InterruptsBetweenReads:
+    """Answer the first binding; the second binding's send raises ``KeyboardInterrupt`` once the reader has an item."""
+
+    def __init__(self) -> None:
+        self.between = asyncio.Event()
+        self.interrupted = asyncio.Event()
+
+    async def __call__(self, request: Request) -> object:
+        parameters = request.copy_parameters()
+        owner_filter = parameters.get("filter")
+        owner = parameters.get("id", owner_filter.get("OWNER") if isinstance(owner_filter, dict) else None)
+        if owner == 1:
+            await reached(self.between)
+            self.interrupted.set()
+            raise KeyboardInterrupt
+        return _answer(request)
+
+
+@pytest.mark.parametrize("family", REFERENCE_FAMILIES)
+def test_an_interrupt_latched_between_reads_ends_the_next_read_at_once(family: str) -> None:
+    # The reader holds an item while another binding's send raises the interrupt: no read is in flight for it to
+    # end, so the next read raises it at once, before anything else the stream would give, the report in its shape.
+    reported: list[str] = []
+    pending: list[str] = []
+    got: list[object] = []
+    streams: list[OperationStream[Any]] = []
+    transport = _InterruptsBetweenReads()
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        try:
+            async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
+                stream = _stream(client, family, _items(family), DirectDispatch(concurrency=2))
+                streams.append(stream)
+
+                async def read() -> None:
+                    try:
+                        async with stream:
+                            await anext(stream)
+                            transport.between.set()
+                            await reached(transport.interrupted)
+                            for _turn in range(HANDOVER_TURNS):
+                                await asyncio.sleep(0)
+                            got.append(await anext(stream))
+                    except BaseException as error:  # noqa: BLE001 - the test inspects what the reader got
+                        got.append(error)
+
+                await asyncio.create_task(read())
+        finally:
+            pending.extend(_others())
+        if isinstance(got[-1], BaseException):
+            raise got[-1]
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(main())
+    gc.collect()
+    assert [type(item) for item in got] == [KeyboardInterrupt]
+    assert reported == []
+    assert pending == []
+    report = streams[0].report
+    assert report is not None
+    assert report.state is TerminalState.FAILED
+    assert report.terminal_reason == "operation interrupted"
+    assert _violations(report) == [("interrupted", "operation interrupted (KeyboardInterrupt)")]
+
+
+@pytest.mark.parametrize("family", REFERENCE_FAMILIES)
+def test_a_close_that_fails_after_an_interrupt_ended_the_read_is_behind_it(family: str) -> None:
+    # The interrupt ends the read in flight (it cancels that read) and so the stream, before its close: the close
+    # that then fails is behind it ("stream cleanup also failed"), as behind any end that came first, and the
+    # interrupt's violation comes last.
+    pending: list[str] = []
+    got: list[BaseException] = []
+    streams: list[OperationStream[Any]] = []
+    transport = _Interrupting("queued")
+
+    async def main() -> None:
+        try:
+            async with client_for(ResponderTransport(transport), policy=POLICIES["raises"]) as client:
+                stream = _stream(client, family, _Source(family, "raises"), DirectDispatch(concurrency=2))
+                streams.append(stream)
+
+                async def read() -> None:
+                    try:
+                        await _end(stream, "read_to_end")
+                    except BaseException as error:  # noqa: BLE001 - the test inspects what the reader got
+                        got.append(error)
+
+                await asyncio.create_task(read())
+        finally:
+            pending.extend(_others())
+        raise got[0]
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(main())
+    gc.collect()
+    assert pending == []
+    report = streams[0].report
+    assert report is not None
+    assert report.state is TerminalState.FAILED
+    assert report.terminal_reason == "operation interrupted"
+    assert _violations(report) == [
+        ("cleanup_failure", "stream cleanup also failed (InputSourceError)"),
+        ("interrupted", "operation interrupted (KeyboardInterrupt)"),
+    ]
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_an_interrupt_the_clients_close_raises_leaves_ahead_of_the_body_exception(
+    interrupt: type[BaseException],
+) -> None:
+    # The client's exit closes a stream still open, whose source's close raises an interrupt: it leaves ahead of the
+    # exception the body raised, which is not put in front of it.
+    reported: list[str] = []
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        async with client_for(ResponderTransport(_answer), policy=POLICIES["returns"]) as client:
+            stream = _stream(client, "fan_out", _AsyncClosesInterrupted("fan_out", interrupt, fail_pull=False))
+            await anext(stream)
+            raise _OwnError
+
+    with pytest.raises(interrupt):
+        asyncio.run(main())
+    gc.collect()
+    assert reported == []
+
+
+class _PullInterruptedInItsThread:
+    """A synchronous source whose second pull, in its worker thread, waits for ``release`` and then is interrupted."""
+
+    def __init__(self, family: str) -> None:
+        self._items = iter(_items(family))
+        self._pulled = 0
+        self.pulling = threading.Event()
+        self.release = threading.Event()
+
+    def __iter__(self) -> _PullInterruptedInItsThread:
+        return self
+
+    def __next__(self) -> Any:  # noqa: ANN401 - commands, bindings or reference sources
+        self._pulled += 1
+        if self._pulled == ITEMS:
+            self.pulling.set()
+            self.release.wait(HANG_BOUND)
+            raise KeyboardInterrupt
+        return next(self._items)
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_an_interrupt_a_pull_cancelled_in_its_thread_ends_in_reaches_the_reader(family: str) -> None:
+    # The reader is cancelled while a synchronous pull runs in its worker thread, which the cancellation waits for:
+    # the pull then ends in an interrupt, which is not dropped with the cancelled pull's result but ends the operation.
+    reported: list[str] = []
+    pending: list[str] = []
+    got: list[BaseException] = []
+    source = _PullInterruptedInItsThread(family)
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        try:
+            async with client_for(ResponderTransport(_answer), policy=POLICIES["returns"]) as client:
+                stream = _stream(client, family, source)
+
+                async def read() -> None:
+                    try:
+                        await _end(stream, "read_to_end")
+                    except BaseException as error:  # noqa: BLE001 - the test inspects what the reader got
+                        got.append(error)
+
+                reader = asyncio.create_task(read())
+                while not source.pulling.is_set():  # noqa: ASYNC110 - the pull waits in a worker thread
+                    await asyncio.sleep(0.001)
+                reader.cancel()
+                await asyncio.sleep(0)
+                source.release.set()
+                await reader
+        finally:
+            source.release.set()
+            pending.extend(_others())
+        raise got[0]
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(main())
+    gc.collect()
+    assert [type(error) for error in got] == [KeyboardInterrupt]
+    assert reported == []
+    assert pending == []
+
+
 class _OwnError(Exception):
     """The caller's own code failed inside ``async with stream``."""
 

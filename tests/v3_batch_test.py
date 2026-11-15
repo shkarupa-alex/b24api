@@ -52,7 +52,7 @@ from b24api.references.fanout import kernel_fanout_stream
 from b24api.references.outcome import KernelReferenceFailure
 from b24api.testing import ScriptedCall, ScriptedExchange, ScriptedTransport, ScriptedV3Command
 from b24api.transport import HttpxTransport, Transport, TransportCapabilities, WireRequest, WireResponse
-from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, drain_to_failure
+from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, drain_to_failure, reached
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Sequence
@@ -1855,5 +1855,58 @@ def test_an_interrupt_an_isolated_send_raises_leaves_the_loop_with_no_task_behin
     gc.collect()
     # The interrupt reached the caller's own task, not a cancellation from a loop it stopped.
     assert reached == [KeyboardInterrupt]
+    assert reported == []
+    assert pending == []
+
+
+def test_an_interrupt_isolated_sends_raise_as_their_reader_is_cancelled_leaves_the_loop_with_no_task_behind() -> None:
+    # The reader is cancelled while an isolated send waits: the cancellation that ends the send ends it in an
+    # interrupt instead. The operation ends with it, out of asyncio.run, with no library task ending in it or left
+    # behind.
+    reported: list[str] = []
+    got: list[BaseException] = []
+    pending: list[str] = []
+    requests = (_v3(1), _v3(2), _v3(3))
+    transport = ScriptedTransport((_poisoned(requests),))
+    send = transport.send
+    sent = 0
+    isolating = asyncio.Event()
+
+    async def interrupting(request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        nonlocal sent
+        sent += 1
+        if sent == 1:
+            return await send(request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
+        isolating.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise KeyboardInterrupt from None
+        raise AssertionError("never answered")
+
+    transport.send = interrupting  # type: ignore[method-assign]
+
+    async def read() -> None:
+        try:
+            await _run(transport, requests)
+        except BaseException as error:  # noqa: BLE001 - the test inspects what the reader got
+            got.append(error)
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        try:
+            reader = asyncio.create_task(read())
+            await reached(isolating)
+            reader.cancel()
+            await reader
+        finally:
+            current = asyncio.current_task()
+            pending.extend(task.get_name() for task in asyncio.all_tasks() if task is not current)
+        raise got[0]
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(main())
+    gc.collect()
+    assert [type(error) for error in got] == [KeyboardInterrupt]
     assert reported == []
     assert pending == []
