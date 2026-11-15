@@ -20,6 +20,7 @@ import asyncio
 import json
 from collections import Counter
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -27,10 +28,13 @@ from b24api import ExecutionPolicy, ReplaySafety, Request, RetryPolicy, RouteKin
 from b24api.batch.correlation import _Command
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure
-from b24api.errors import B24ApiError, BudgetExceededError
+from b24api.errors import B24ApiError, BudgetExceededError, FailurePhase, TransportError
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse, WorkClass
 from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
 from tests.scripting import DEADLINE_BUDGET, HANG_BOUND, ResponderTransport, always
+
+if TYPE_CHECKING:
+    from b24api.execution.rate import _Permit
 
 PACKAGE = Path(__file__).resolve().parents[2] / "b24api"
 CONTEXT = "execution/context.py"
@@ -534,6 +538,50 @@ async def test_a_deadline_passing_while_a_send_waits_for_its_permit_ends_the_ope
     assert str(refused.value) == "permit wait exhausted execution time budget"
     assert context.refusal == "permit wait exhausted execution time budget"
     assert transport.requests == []
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_a_retry_whose_permit_wait_the_deadline_ends_is_caused_by_the_send_it_follows() -> None:
+    # The first send's answer is lost; while it is answered, another holder queues for the client's one permit and
+    # the deadline comes within reach. The retry's permit wait is refused by time and recorded, and its cause is the
+    # lost send it follows, not the wait's own timeout; nothing more is sent.
+    clock = _Clock()
+    lost = TransportError("lost", phase=FailurePhase.DISPATCH_STARTED)
+    policy = ExecutionPolicy(
+        max_elapsed=10.0,
+        max_retry_elapsed_per_request=1000.0,
+        retry=RetryPolicy(initial_delay=0.0, maximum_delay=0.0, jitter=0.0),
+    )
+    coordinator = RateCoordinator(max_concurrency=1, clock=clock)
+    held: list[_Permit] = []
+    takers: list[asyncio.Future[None]] = []
+
+    async def take_the_permit() -> None:
+        held.append(await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.list"})))
+
+    async def respond(_request: Request) -> object:
+        takers.append(asyncio.ensure_future(take_the_permit()))
+        await asyncio.sleep(0)  # the other holder queues for the permit this send still holds
+        clock.now = policy.max_elapsed - DEADLINE_BUDGET
+        return lost
+
+    transport = ResponderTransport(respond)
+    executor = Executor(transport, coordinator=coordinator, clock=clock)
+    context = await _started(executor, policy)
+    try:
+        async with asyncio.timeout(HANG_BOUND):
+            with pytest.raises(BudgetExceededError) as refused:
+                await executor.execute(_get(), context=context)
+    finally:
+        await asyncio.gather(*takers)
+        for permit in held:
+            await permit.release()
+
+    assert str(refused.value) == "permit wait exhausted execution time budget"
+    assert refused.value.__cause__ is lost
+    assert context.refusal == "permit wait exhausted execution time budget"
+    assert len(transport.requests) == 1
     await coordinator.close()
 
 

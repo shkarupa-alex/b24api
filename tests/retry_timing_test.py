@@ -327,13 +327,51 @@ async def test_an_unsafe_retry_whose_wait_overran_is_stopped_before_its_send() -
     transport = ResponderTransport(replies(_refused(), _OK))
     executor = _executor(transport, time)
     policy = ExecutionPolicy(max_retry_elapsed_per_request=3.0, retry=RetryPolicy(initial_delay=1.0, jitter=0))
+    context = executor.context(policy)
 
     with pytest.raises(BudgetExceededError, match="shorter than the wait") as raised:
-        await executor.execute(_request(ReplaySafety.UNSAFE), policy=policy)
+        await executor.execute(_request(ReplaySafety.UNSAFE), context=context)
+    snapshot = await context.snapshot()
     await executor.coordinator.close()
 
     _assert_refused_without_a_send_into_the_rest(raised.value, len(transport.requests))
     assert time.sleeps == [1.0]
+    # Refused at its admission, before its attempt is reserved: only the first send is counted.
+    assert snapshot.counters.physical_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_a_retry_granted_its_permit_past_the_deadline_is_stopped_before_it_is_counted() -> None:
+    # The lost send's retry waits its 0.5-second backoff, then gets its permit 0.9 seconds later, past the 1-second
+    # deadline: the deadline refuses it at its admission, before its attempt is reserved, recorded, and caused by
+    # the lost send it follows. Only the first send is counted.
+    time = _Time()
+    lost = _lost()
+    transport = ResponderTransport(replies(lost, _OK))
+    executor = _executor(transport, time)
+    acquire = executor.coordinator.acquire
+
+    async def acquire_late(
+        work_class: WorkClass, *, methods: frozenset[str], budget: DeadlineBudget | None = None
+    ) -> _Permit:
+        permit = await acquire(work_class, methods=methods, budget=budget)
+        if transport.requests:  # the retry's permit is granted late
+            time.now += 0.9
+        return permit
+
+    executor.coordinator.acquire = acquire_late  # type: ignore[method-assign]
+    context = executor.context(ExecutionPolicy(max_elapsed=1.0, retry=RetryPolicy(initial_delay=0.5, jitter=0)))
+
+    with pytest.raises(BudgetExceededError) as raised:
+        await executor.execute(_request(ReplaySafety.SAFE, "crm.item.get"), context=context)
+    snapshot = await context.snapshot()
+    await executor.coordinator.close()
+
+    assert str(raised.value) == "execution time budget exhausted before dispatch"
+    assert raised.value.__cause__ is lost
+    assert context.refusal == "execution time budget exhausted before dispatch"
+    assert len(transport.requests) == 1
+    assert snapshot.counters.physical_requests == 1
 
 
 @pytest.mark.asyncio

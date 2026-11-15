@@ -644,3 +644,35 @@ def test_an_owned_dispatch_joins_its_secrets_to_the_registered_ones_once(monkeyp
             logger.info("owned record %s", "synthetic-other-secret-1")
         assert len(searched) == built
     assert _messages(handler) == ["owned record [REDACTED]"] * 4
+
+
+def test_a_registered_token_inside_another_one_leaves_no_part_of_the_outer() -> None:
+    _assert_shield_idle()
+    outer = "synthetic-outer-secret-TAIL42"
+    with _registered(outer, "outer"), _capture() as handler:
+        logging.getLogger("httpx").info("foreign record https://x.invalid/rest/1/%s/profile", outer)
+    assert _messages(handler) == ["foreign record https://x.invalid/rest/1/[REDACTED]/profile"]
+
+
+def test_registered_tokens_that_touch_are_one_redacted_stretch() -> None:
+    _assert_shield_idle()
+    with _registered("abcd", "efgh"), _capture() as handler:
+        logging.getLogger("httpx").info("foreign record %s", "xabcdefghy")
+    assert _messages(handler) == ["foreign record x[REDACTED]y"]
+
+
+def test_a_token_registered_during_an_owned_dispatch_is_scrubbed_from_its_later_records() -> None:
+    # The owned webhook is not registered, so each record joins it to the registered secrets: a registration
+    # during the dispatch changes those, and the next record is scrubbed with the new ones.
+    _assert_shield_idle()
+    later = httpx.Client()
+    logger = logging.getLogger("httpx")
+    try:
+        with _registered("abcd"), _capture() as handler, HTTPX_LOG_SHIELD.request(webhook=_OWNED_WEBHOOK):
+            logger.info("owned record %s", "abcd")
+            HTTPX_LOG_SHIELD.register_transport(webhook=Webhook(_ADDRESS, "wxyz"), client=later)
+            logger.info("owned record %s", "wxyz")
+    finally:
+        HTTPX_LOG_SHIELD.release_transport()
+        later.close()
+    assert _messages(handler) == ["owned record [REDACTED]"] * 2
