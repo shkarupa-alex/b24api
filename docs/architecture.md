@@ -51,10 +51,13 @@ never sent was not sent. Until the chunk ends, a command without a final outcome
 replay it waits for), so a page cancelled meanwhile may have run; a REST v3 group keeps its state to
 itself, so its commands in progress may have run. A fast keyset wave engine, flat or shared by reference
 bindings, settles each page it was handed by its command id from what that command did, also when its call
-raises; the page ledger (`FastPageLedger`) settles a page never handed to an engine as not executed before
-it rejects it, the one rule on every path. A page answered with a success settles as a success on every
+raises; the page ledger (`FastPageLedger`) settles a page never handed to an engine as not executed, which
+retires it, the one rule on every path. A page answered with a success settles as a success on every
 path: the facts recorded on a cancelled reference page keep that its command succeeded
-(`facts.settlement`). `b24api.execution.facts` holds the one
+(`facts.settlement`). One rule, `facts.settled_as`, gives a command's settlement from what it is known to have
+done and whether it succeeded; its callers only read those two facts from what they hold: a failure's recorded
+facts (`facts.settlement`), a final batch outcome (`batch.outcome.settlement_of`), a command of a running chunk
+(`BatchProgress.settlement`) and a shared wave's dispatch task. `b24api.execution.facts` holds the one
 mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
 (`Execution.settlement`), and `b24api.traversal.page_failure` maps it to a failed page's trace: unknown
 only when it may have run, otherwise rejected. Classic and REST v3 batch, `call()`, direct and batch
@@ -205,7 +208,8 @@ outcome.
   through `asyncio`, every `BudgetExceededError` constructed), which a site written otherwise passes. The refusals of one request while time is left, for a
   coordinator hold or a retry delay its window cannot carry, or a send that may not be repeated left
   less window than its wait, record nothing. `ExecutionContext.refusal` keeps the first recorded refusal's message.
-  Whether an error is the operation's refusal, which ends it, is told by identity, not by its text or its type:
+  Whether an error is the operation's refusal, which ends it, is told by its mark, not by its text or its type:
+  the mark is a value unique to the context, so it survives a copy or a pickle round trip of the error, and
   the context marks every error it raises as such (`operation_refusal`, from `_refuse`, `admit_request`,
   `raise_if_refused` and the source pull; a replay round's stopped commands carry the mark of the refusal
   that stopped them, `stopped_by`), and `ExecutionContext.ended_by` is the one check, used by the

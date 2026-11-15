@@ -12,6 +12,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
+from b24api.batch.outcome import settlement_of
 from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
@@ -358,9 +359,7 @@ class ReferenceTailStream:
     def settle(self, receipt: TailReceipt) -> None:
         """Record the activated page's physical command outcome."""
         failure = receipt.failure
-        self._run.completion.settled(
-            CommandSettlement.SUCCESS if failure is None else _failed_settlement(_BatchPageError(failure))
-        )
+        self._run.completion.settled(CommandSettlement.SUCCESS if failure is None else settlement_of(failure))
 
     def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
         """Return the binding failure carrying the command's replay disposition."""

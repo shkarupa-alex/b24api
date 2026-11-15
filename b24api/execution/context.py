@@ -6,6 +6,7 @@ import contextlib
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, TypeGuard
+from uuid import uuid4
 
 from b24api.contracts.policy import BudgetCounters, ExecutionPolicy
 from b24api.errors import BudgetExceededError, CleanupOverrunError
@@ -113,8 +114,9 @@ class ExecutionContext:
         # The first refusal of work by the request budget or the operation's deadline (a send, a page, an admission
         # or a pull), which ends the operation: neither budget comes back, so no later work can be admitted either.
         self._refusal: str | None = None
-        # Marks the errors this context raises as that refusal, so a refusal is told by identity, not by its text.
-        self._refusal_mark = object()
+        # Marks the errors this context raises as that refusal, so a refusal is told by its mark, not by its text. The
+        # mark is a value unique to this context, so it survives a copy or a pickle round trip of the error with it.
+        self._refusal_mark = f"operation-refusal-{uuid4().hex}"
         self._logical_pages = 0
         self._buffered_rows = 0
         self._buffered_rows_high_water = 0
@@ -222,7 +224,7 @@ class ExecutionContext:
         Any other budget error, such as a request's own retry window closing or a result the row budget dropped,
         fails its work alone, also once the operation has recorded a refusal.
         """
-        return isinstance(error, BudgetExceededError) and getattr(error, _ENDS_OPERATION, None) is self._refusal_mark
+        return isinstance(error, BudgetExceededError) and getattr(error, _ENDS_OPERATION, None) == self._refusal_mark
 
     def _refuse(self, refusal: str, retry_started: float | None) -> BudgetExceededError:
         start = self._start

@@ -96,8 +96,8 @@ class WaveEngine(Protocol):
         """Return one correlated outcome per scheduled page of ``pages``, keyed by command id, in its order.
 
         When the call raises, the engine settles every page first, by its command id, from what its own command
-        is known to have done: the page ledger can then reject them, and it settles a page never handed to an
-        engine as not executed (``FastPageLedger.close``).
+        is known to have done: the page ledger can then reject the successful ones, and it settles a page never
+        handed to an engine as not executed (``FastPageLedger.close``).
         """
         ...
 

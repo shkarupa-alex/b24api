@@ -103,9 +103,10 @@ def record_withheld(error: BaseException) -> None:
 def record_execution(error: BaseException, known: Execution, *, succeeded: bool = False) -> None:
     """Record on ``error`` what is ``known`` about its command from elsewhere, such as a batch it was a command of.
 
-    ``succeeded`` is set for a command answered with a success, whose page ended before it took the answer.
+    ``succeeded`` is set for a command answered with a success (``ANSWERED``), whose page ended before it took the
+    answer.
     """
-    error.__dict__[_FACTS] = _ExecutionFacts(known, succeeded=succeeded and known is Execution.ANSWERED)
+    error.__dict__[_FACTS] = _ExecutionFacts(known, succeeded=succeeded)
 
 
 def settled_as(known: Execution, *, succeeded: bool) -> CommandSettlement:

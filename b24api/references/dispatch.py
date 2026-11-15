@@ -12,7 +12,7 @@ from itertools import accumulate
 from typing import TYPE_CHECKING, cast
 
 from b24api.batch.engine import BatchExecutor, BatchProgress
-from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.batch.outcome import BatchFailure, BatchSuccess, settlement_of
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.report import PageDispatch
 from b24api.errors import B24ApiError, BudgetExceededError, CapabilityError, CleanupOverrunError
@@ -21,7 +21,7 @@ from b24api.execution import (
     Executor,
     WorkClass,
 )
-from b24api.execution.facts import Execution, execution, record_dispatch, record_execution, settlement
+from b24api.execution.facts import Execution, execution, record_dispatch, settlement
 from b24api.references.outcome import (
     KernelReferenceFailure,
     KernelReferenceItem,
@@ -255,38 +255,37 @@ class _PendingBatch:
     future: asyncio.Future[_DispatchedPage]
     admitted: asyncio.Future[None]
     settled: asyncio.Future[None]
-    dispatch_started: bool = False
     options: _DecodeOptions = _PLAIN_DECODING
     # The operation deadline of the page's admission; the send of its wave lifts it.
     admission: asyncio.Timeout | None = None
-    # Where the page's command stands in the chunk its wave sends, and its index there.
+    # Once its wave was handed to its send: where the page's command stands in that chunk, and its index there.
     progress: BatchProgress | None = None
     position: int = 0
 
     def record(self, error: BaseException) -> None:
-        """Record on the page's ``error`` what its command is known to have done once its wave was sent.
+        """Record on the page's ``error`` what its command is known to have done, if its wave was handed to its send.
 
         Its outcome in the chunk says, once final or once the chunk has ended; until then the chunk, which runs on
-        for the other pages, may still send it, so it may run (``BatchProgress``).
+        for the other pages, may still send it, so it may run (``BatchProgress``). A page never handed to a send
+        records nothing: it stays proven not executed.
         """
-        if self.progress is None:
-            record_execution(error, Execution.POSSIBLY_RUN)
-        else:
+        if self.progress is not None:
             self.progress.record(error, self.position)
 
-    def mark_sent(self) -> bool:
-        """Hand the page to its wave's send, lifting its admission deadline; ``False`` when it was abandoned.
+    def mark_sent(self, progress: BatchProgress, position: int) -> bool:
+        """Hand the page to its wave's send as command ``position`` of its chunk; ``False`` when it was abandoned.
 
-        A page whose fetch has ended (every way out of the fetch completes or cancels its future) or whose deadline
-        has expired is abandoned: no one waits for it, so it is not sent and stays proven not executed. The check
-        and the hand-over happen in one step of the event loop, so the fetch cannot end in between.
+        The hand-over lifts its admission deadline. A page whose fetch has ended (every way out of the fetch
+        completes or cancels its future) or whose deadline has expired is abandoned: no one waits for it, so it is
+        not sent and stays proven not executed. The check and the hand-over happen in one step of the event loop,
+        so the fetch cannot end in between.
         """
         admission = self.admission
         if self.future.done() or (admission is not None and admission.expired()):
             return False
         if admission is not None:
             admission.reschedule(None)
-        self.dispatch_started = True
+        self.progress, self.position = progress, position
         return True
 
 
@@ -491,8 +490,8 @@ def _failed_execution(error: BaseException) -> Execution:
 
 
 def _failed_settlement(error: BaseException) -> CommandSettlement:
-    """Settle a page whose dispatch raised from its execution facts: succeeded, possibly run, failed, or never sent."""
-    return settlement(error.failure.error if isinstance(error, _BatchPageError) else error)
+    """Settle a page whose dispatch raised: from its command's outcome in its batch, or from its failure's facts."""
+    return settlement_of(error.failure) if isinstance(error, _BatchPageError) else settlement(error)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1005,9 +1004,8 @@ class _BatchPageDispatcher:
         except asyncio.CancelledError as error:
             future.cancel()
             self._abandon(pending, reservation)
-            if pending.dispatch_started:
-                # A page cancelled after its wave was sent may have executed: what its command did says how.
-                pending.record(error)
+            # A page cancelled after its wave was sent may have executed: what its command did says how.
+            pending.record(error)
             raise
         except BaseException:
             # A refusal by the deadline included: a page whose wave was sent no longer has one, so it was never sent.
@@ -1232,11 +1230,8 @@ class _BatchPageDispatcher:
         """Count one physical batch envelope the chunk sends in its first round."""
         self.batch_requests += 1
 
-    async def _send(self, chunk: list[_PendingBatch]) -> None:
+    async def _send(self, chunk: list[_PendingBatch], progress: BatchProgress) -> None:
         requests = tuple(item.request for item in chunk)
-        progress = BatchProgress()
-        for position, item in enumerate(chunk):
-            item.progress, item.position = progress, position
         self.batch_commands += len(chunk)
         options = chunk[0].options
         try:
@@ -1302,9 +1297,12 @@ class _BatchPageDispatcher:
                 self._producer_state.touch()
             try:
                 # Only pages whose fetch still waits are sent; an abandoned one was never sent and settles so.
-                live = [item for item in chunk if item.mark_sent()]
+                progress, live = BatchProgress(), list[_PendingBatch]()
+                for item in chunk:
+                    if item.mark_sent(progress, len(live)):
+                        live.append(item)
                 if live:
-                    await self._send(live)
+                    await self._send(live, progress)
                     self._settling_waves += 1
                     settlement_worker = asyncio.create_task(self._wait_for_settlement(live))
                     self._settlement_workers.add(settlement_worker)

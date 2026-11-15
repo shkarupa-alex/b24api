@@ -22,6 +22,7 @@ from b24api.batch.outcome import (
     BatchFailure,
     BatchOutcome,
     BatchSuccess,
+    settlement_of,
 )
 from b24api.batch.v3 import _V3Resolution
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
@@ -56,7 +57,7 @@ from b24api.execution.executor import (
     _SendPlan,
     _Settled,
 )
-from b24api.execution.facts import Execution, execution, record_execution, settled_as
+from b24api.execution.facts import Execution, execution, record_execution
 
 if TYPE_CHECKING:
     from b24api.contracts.completion import CommandSettlement
@@ -273,7 +274,11 @@ class BatchProgress:
         self._lineup, self._attempts, self._opaque = lineup, attempts, frozenset()
 
     def track_round(self, commands: tuple[_Command, ...]) -> None:
-        """Mark the commands of the classic round being sent; none once its outcomes are in the lineup."""
+        """Mark the commands of the latest classic round, whose sends ``execution`` adds to each one's lineage.
+
+        Once the round's outcomes are in the lineup, a waiting command's lineage holds its sends and the attempts
+        start the next round (``_RequestAttempts.start_round``), which adds nothing, so the mark stays until then.
+        """
         self._round = frozenset(command.index for command in commands)
 
     def track_opaque(self, commands: tuple[_Command, ...]) -> None:
@@ -282,8 +287,9 @@ class BatchProgress:
         self._opaque = frozenset(command.index for command in commands)
 
     def settlement(self, index: int) -> CommandSettlement:
-        """Return how command ``index`` settles from what it did so far (``settled_as``)."""
-        return settled_as(self.execution(index), succeeded=self._succeeded(index))
+        """Return how command ``index`` settles from what it did so far: its final outcome, once it has one."""
+        outcome = self._outcome(index)
+        return self.execution(index).settlement if outcome is None else settlement_of(outcome)
 
     def record(self, error: BaseException, index: int) -> None:
         """Record on ``error``, its page's failure, what command ``index`` did so far, a success included."""
@@ -471,7 +477,6 @@ class BatchExecutor:
                 # the outcome this round gave them. ``attempts`` covers the next round from here on.
                 candidates = lineup.after_round(sent, pending)
                 attempts.start_round()
-                progress.track_round(())
                 pending = await self._next_round(
                     candidates, lineup, context=context, attempts=attempts, options=options
                 )

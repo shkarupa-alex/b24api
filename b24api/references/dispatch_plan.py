@@ -35,13 +35,12 @@ def bound_dispatch(plan: DispatchPlan, policy: ExecutionPolicy) -> DispatchPlan:
     """Bound a plan by the operation policy: the concurrency and batch size the operation can really use.
 
     ``ReferenceScheduler`` passes every reference operation's plan here once, so the dispatchers take its limits as
-    they are.
+    they are. A direct plan needs no ``max_active_references`` bound of its own: a direct reference sends one
+    request at a time, so the scheduler's active references bound its requests in flight. A batch carries the pages
+    of many references, a fast keyset binding several of its own at once, so the batches in flight are bounded here.
     """
     if isinstance(plan, KernelDirectDispatch):
-        return replace(
-            plan,
-            concurrency=min(plan.concurrency, policy.max_direct_concurrency, policy.max_active_references),
-        )
+        return replace(plan, concurrency=min(plan.concurrency, policy.max_direct_concurrency))
     return replace(
         plan,
         batch_size=min(plan.batch_size, policy.max_buffered_commands),

@@ -3,8 +3,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, NoReturn
 
-from b24api.batch.outcome import BatchSuccess
-from b24api.contracts.completion import CommandSettlement
+from b24api.batch.outcome import BatchSuccess, settlement_of
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
 from b24api.errors import (
@@ -134,7 +133,7 @@ def _record_wave_dispatch(
 ) -> None:
     """Settle every command and count the physical request before any receipt is validated."""
     for plan, outcome in zip(plans, outcomes, strict=True):
-        host.completion_recorder.settle(plan.command_id, _settlement(outcome))
+        host.completion_recorder.settle(plan.command_id, settlement_of(outcome))
     host.transactions.boundary_totals = boundary_totals(plans, outcomes)
     host.batch_requests += 1
     host.batch_commands += len(plans)
@@ -230,13 +229,6 @@ def _abort_wave(
     if rejection is None:
         raise PaginationError("fast keyset wave validation failed")
     _raise_rejection(host, rejection)
-
-
-def _settlement(outcome: BatchOutcome) -> CommandSettlement:
-    """Settle one correlated command from its execution facts."""
-    if isinstance(outcome, BatchSuccess):
-        return CommandSettlement.SUCCESS
-    return execution(outcome.error).settlement
 
 
 def _budget_end(host: KeysetTransactionHost, error: BaseException | None) -> bool:
@@ -468,7 +460,7 @@ def _record_finish_dispatch(
     dispatch: PageDispatch,
 ) -> None:
     """Settle the finish command before its receipt is validated; a batched page counts as a one-command wave."""
-    host.completion_recorder.settle(plan.command_id, _settlement(outcome))
+    host.completion_recorder.settle(plan.command_id, settlement_of(outcome))
     if dispatch is PageDispatch.BATCH:
         host.batch_requests += 1
         host.batch_commands += 1

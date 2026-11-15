@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Protocol
 
+from b24api.batch.outcome import settlement_of
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError
@@ -106,14 +107,25 @@ class SharedWaveEngine:
         tasks = self._start(tuple(pages.values()), options, errors)
         try:
             await asyncio.wait(tasks)
+            # Each command's error is already recorded in ``errors``; retrieve it so it is not logged as lost.
+            await asyncio.gather(*tasks, return_exceptions=True)
+            outcomes = self._correlate(tasks, errors)
         except BaseException:
+            # A wave that ends early, or whose envelope failed as a whole, settles each of its pages first.
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self._settle(tuple(pages), tasks, errors)
             raise
-        # Each command's error is already recorded in ``errors``; retrieve it so it is not logged as lost.
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Only a wave the runtime receives may lead to another: a whole-envelope failure ends the binding.
+        self._state.runnable.add(key)
+        self._state.touch()
+        return outcomes
+
+    def _correlate(
+        self, tasks: tuple[asyncio.Task[_DispatchedPage], ...], errors: dict[int, BaseException]
+    ) -> tuple[BatchOutcome, ...]:
+        """Return each command's outcome in order; raise a whole-envelope failure, as the flat engine raises it."""
         outcomes: list[BatchOutcome] = []
         failure: BaseException | None = None
         for index, task in enumerate(tasks):
@@ -131,12 +143,7 @@ class SharedWaveEngine:
                 continue
             failure = failure or error
         if failure is not None:
-            # A whole-envelope failure is raised, as the flat engine raises it; every command settles first.
-            self._settle(tuple(pages), tasks, errors)
             raise failure
-        # Only a wave the runtime receives may lead to another: a whole-envelope failure ends the binding.
-        self._state.runnable.add(key)
-        self._state.touch()
         return tuple(outcomes)
 
     def _settle(
@@ -192,12 +199,14 @@ class SharedWaveEngine:
 
 
 def _settlement(task: asyncio.Task[_DispatchedPage], error: BaseException | None) -> CommandSettlement:
-    """Classify one wave command from what its dispatch proved."""
+    """Settle one wave command from what its dispatch proved: its failure, or its outcome (``settlement_of``).
+
+    A task cancelled before it ran never handed its command to the dispatcher: it was not executed.
+    """
     if error is not None:
         return _failed_settlement(error)
-    if task.done() and not task.cancelled():
-        return CommandSettlement.SUCCESS
-    return CommandSettlement.NOT_EXECUTED
+    outcome = task.result().outcome if task.done() and not task.cancelled() else None
+    return CommandSettlement.NOT_EXECUTED if outcome is None else settlement_of(outcome)
 
 
 __all__ = ["SharedWaveEngine", "WaveHost"]
