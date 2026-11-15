@@ -25,6 +25,7 @@ from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
 )
+from b24api.execution.facts import execution
 from b24api.traversal.counted_io import DirectCountedWaveIO
 from b24api.traversal.counted_rules import (
     CountedHeadFacts,
@@ -185,10 +186,12 @@ class CountedBatchStrategy:
             failed = io.head_failure(error)
             if recorder is not None:
                 recorder.settled(failed.settlement)
-            if failed.dispatch_started:
+            if failed.execution.dispatched:
                 report_error = failed.error if failed.error is not None else error
                 ctx.set_page_dispatch(dispatch=failed.dispatch, batch_index=failed.batch_index)
-                ctx.record_failed_page(dispatch=failed.dispatch, batch_index=failed.batch_index, error=report_error)
+                ctx.record_failed_page(
+                    dispatch=failed.dispatch, batch_index=failed.batch_index, error=report_error, known=failed.execution
+                )
             raise
         if recorder is not None:
             recorder.settled(attempt.settlement)
@@ -317,7 +320,9 @@ class CountedBatchStrategy:
             recorded = (
                 error if isinstance(error, BaseException) else CapabilityError("parallel counted batch command failed")
             )
-            ctx.record_failed_page(dispatch=PageDispatch.BATCH, batch_index=receipt.batch_index, error=recorded)
+            ctx.record_failed_page(
+                dispatch=PageDispatch.BATCH, batch_index=receipt.batch_index, error=recorded, known=execution(recorded)
+            )
             raise tail.failure(receipt, failure)
         response, total, stride = receipt.response, self._total, self._stride
         if response is None:

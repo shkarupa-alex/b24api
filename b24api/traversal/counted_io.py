@@ -17,7 +17,7 @@ from b24api.batch.stream import _BatchOutcomeStream
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
-from b24api.execution.facts import execution, settlement
+from b24api.execution.facts import Execution, execution, settlement
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -40,7 +40,8 @@ class HeadAttempt:
     error: BaseException | None = field(repr=False)
     dispatch: PageDispatch
     batch_index: int | None
-    dispatch_started: bool
+    # What the head's command did: its trace follows it, and only a head that may have left is traced.
+    execution: Execution
     settlement: CommandSettlement
 
 
@@ -248,7 +249,7 @@ class DirectCountedWaveIO:
             None,
             PageDispatch.DIRECT,
             None,
-            dispatch_started=True,
+            execution=Execution.ANSWERED,
             settlement=CommandSettlement.SUCCESS,
         )
 
@@ -259,7 +260,7 @@ class DirectCountedWaveIO:
             error,
             PageDispatch.DIRECT,
             None,
-            dispatch_started=execution(error).dispatched,
+            execution=execution(error),
             settlement=settlement(error),
         )
 

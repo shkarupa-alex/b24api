@@ -61,7 +61,8 @@ facts (`facts.settlement`), a final batch outcome (`batch.outcome.settlement_of`
 (`BatchProgress.settlement`) and a shared wave's dispatch task. `b24api.execution.facts` holds the one
 mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
 (`Execution.settlement`), and `b24api.traversal.page_failure` maps it to a failed page's trace: unknown
-only when it may have run, otherwise rejected. Classic and REST v3 batch, `call()`, direct and batch
+only when it may have run, otherwise rejected. A page's trace and its settlement read the same fact, the
+page's own: for a page of a chunk that failed as a whole, its command's in the chunk's `BatchProgress`. Classic and REST v3 batch, `call()`, direct and batch
 fan-out, references and list traversal all use them, and none of them chooses from the exception type,
 which names the cause of a failure and never proves that a command did not run. A sent command is
 unknown unless a listed refusal proves it did not run or a conclusive answer settles it. A conclusive

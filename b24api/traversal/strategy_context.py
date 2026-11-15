@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
     from b24api.contracts.response import Response
     from b24api.execution import ExecutionContext, Executor
+    from b24api.execution.facts import Execution
     from b24api.execution.snapshot import KernelReport
     from b24api.traversal.identity import PageFetch, _Page
     from b24api.traversal.page_adaptation import _SourcePageState
@@ -72,8 +73,10 @@ class StrategyContext(Protocol):
         """Attach physical dispatch provenance without changing the logical cursor."""
         ...
 
-    def record_failed_page(self, *, dispatch: PageDispatch, batch_index: int | None, error: BaseException) -> None:
-        """Record a dispatched page whose command failed, traced from its execution facts."""
+    def record_failed_page(
+        self, *, dispatch: PageDispatch, batch_index: int | None, error: BaseException, known: Execution
+    ) -> None:
+        """Record a dispatched page whose command failed, traced from what its command did (``known``)."""
         ...
 
     def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:

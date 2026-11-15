@@ -47,6 +47,8 @@ from b24api.contracts import (
     KeysetExecutionKind,
     KeysetSelectionReason,
     KeysetSelectionSummary,
+    PageOutcome,
+    PageRejectionCode,
     ReferenceComplete,
     ReferenceFailure,
     ReferenceItem,
@@ -535,6 +537,63 @@ async def test_a_wave_whose_replay_fails_settles_each_page_from_its_own_command(
         *[CommandSettlement.SUCCESS] * (len(wave) - 1),
     ]
     assert isinstance(outcomes[-1], outcome)
+
+
+@pytest.mark.asyncio
+async def test_sequential_pages_of_a_chunk_whose_replay_fails_settle_and_trace_from_their_own_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two bindings' first pages share one chunk. The server answers one and refuses the other
+    # (QUERY_LIMIT_EXCEEDED); the send that replays the refused one cannot be decoded, a failure that is not the
+    # client's own, and the chunk fails as a whole. Each page settles and is traced from what its own command did:
+    # the answered one succeeded and is rejected with its chunk, the replayed one may have run.
+    events: list[object] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    portal = BatchPortal(_answer({"p0": tuple(range(1, 2000)), "p1": tuple(range(1, 2000))}))
+
+    async def respond(request: Request) -> WireResponse:
+        sent = len(portal.waves)
+        if sent == 1:  # the replay of the refused command
+            portal.waves.append(1)
+            return WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        first = next(iter(commands))
+        body = json.loads(answer.body)
+        del body["result"]["result"][first]
+        body["result"]["result_error"] = {first: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        return WireResponse(200, answer.headers, json.dumps(body).encode())
+
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        outcomes, report = await _drain(
+            client.iter_reference_outcomes(
+                _base(), [_parent("p0"), _parent("p1")], traversal=_traversal(SequentialKeysetExecution())
+            )
+        )
+
+    assert portal.waves == [2, 1]
+    # The first command of the chunk (the first binding's page) is the refused one.
+    settled = {event.binding_id: event.outcome for event in events if isinstance(event, PageCommandOutcome)}
+    assert settled == {0: CommandSettlement.UNKNOWN, 1: CommandSettlement.SUCCESS}
+    traced = sorted(
+        (record.outcome, record.rejection_code)
+        for record in report.page_trace
+        if record.outcome is not PageOutcome.COMMITTED
+    )
+    assert traced == sorted(
+        [
+            (PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE),
+            (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION),
+        ]
+    )
+    assert [type(outcome) for outcome in outcomes] == [ReferenceFailure, ReferenceFailure]
 
 
 @pytest.mark.asyncio

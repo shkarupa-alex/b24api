@@ -4,17 +4,17 @@ from __future__ import annotations
 
 from b24api.contracts.report import PageOutcome, PageRejectionCode
 from b24api.errors import ProtocolError
-from b24api.execution.facts import Execution, execution
+from b24api.execution.facts import Execution
 
 
-def failed_page(error: object) -> tuple[PageOutcome, PageRejectionCode]:
+def failed_page(error: object, known: Execution) -> tuple[PageOutcome, PageRejectionCode]:
     """Return how a page whose command failed is traced.
 
     The outcome follows the command's execution facts, as its settlement does: unknown only when it may have run,
     otherwise rejected. The code names why, from the failure that explains it: the physical batch envelope's own
     protocol failure, or the command's.
     """
-    if execution(error) is Execution.POSSIBLY_RUN:
+    if known is Execution.POSSIBLY_RUN:
         if _batch_envelope_failure(getattr(error, "__cause__", None)):
             return PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE
         return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION

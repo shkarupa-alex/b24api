@@ -17,6 +17,7 @@ from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError
+from b24api.execution.facts import Execution
 from b24api.references.dispatch import _BatchPageError, _failed_dispatch, _failed_execution, _failed_settlement
 from b24api.traversal.counted_io import HeadAttempt, TailReceipt
 
@@ -124,7 +125,7 @@ class SharedCountedWaveIO:
             None,
             dispatched.dispatch,
             dispatched.batch_index,
-            dispatch_started=True,
+            execution=Execution.ANSWERED,
             settlement=CommandSettlement.SUCCESS,
         )
 
@@ -133,10 +134,10 @@ class SharedCountedWaveIO:
         failed = _failed_dispatch(self._host.page_dispatch, error)
         return HeadAttempt(
             None,
-            failed.error or error,
+            failed.error,
             failed.dispatch,
             failed.batch_index,
-            dispatch_started=_failed_execution(error).dispatched,
+            execution=_failed_execution(error),
             settlement=_failed_settlement(error),
         )
 

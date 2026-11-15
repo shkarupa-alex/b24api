@@ -660,13 +660,12 @@ class ReferenceScheduler:
         except BaseException as error:
             run.completion.settled(_failed_settlement(error))
             await self.abandon_page(run)
-            if _failed_execution(error).dispatched:
+            known = _failed_execution(error)
+            if known.dispatched:
                 failed = _failed_dispatch(self.page_dispatch, error)
                 run.driver.set_page_dispatch(dispatch=failed.dispatch, batch_index=failed.batch_index)
                 run.driver.record_failed_page(
-                    dispatch=failed.dispatch,
-                    batch_index=failed.batch_index,
-                    error=failed.error or error,
+                    dispatch=failed.dispatch, batch_index=failed.batch_index, error=failed.error, known=known
                 )
             raise
         run.driver.set_page_dispatch(dispatch=dispatched.dispatch, batch_index=dispatched.batch_index)

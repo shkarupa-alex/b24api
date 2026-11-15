@@ -90,8 +90,9 @@
   it now keeps that answer, a success settling as a success as on a flat traversal, and is unknown only
   while its wave may still send it. So does each page of a batch that failed as a whole with an error
   that is not the client's own (an answer nested too deep to decode, for example): every page of it was
-  unknown, also one its command's answer in an earlier round settled; it now settles from what its own
-  command did. The binding's outcome and its error are unchanged.
+  unknown, also one its command's answer in an earlier round settled; it now settles, and its failed page
+  is traced in the report's `page_trace`, from what its own command did: such a page is rejected, not
+  unknown. The binding's outcome and its error are unchanged.
 - **A counted tail page larger than its share is an answered failure.** When a tail page of
   `iter_list_counted()` decoded to more rows than `max_buffered_rows` left it, the traversal raised
   `IncompleteTraversalError` caused by `BudgetExceededError` ("buffered row budget exhausted"), and the

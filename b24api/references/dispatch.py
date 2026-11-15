@@ -528,7 +528,7 @@ def _failed_settlement(error: BaseException) -> CommandSettlement:
 class _FailedDispatch:
     dispatch: PageDispatch
     batch_index: int | None
-    error: BaseException | None
+    error: BaseException
 
 
 def _failed_dispatch(dispatch: PageDispatch, error: BaseException) -> _FailedDispatch:
@@ -536,11 +536,9 @@ def _failed_dispatch(dispatch: PageDispatch, error: BaseException) -> _FailedDis
     if isinstance(error, _BatchPageError):
         cause = error.failure.error
         return _FailedDispatch(
-            dispatch, error.failure.command_index, cause if isinstance(cause, BaseException) else None
+            dispatch, error.failure.command_index, cause if isinstance(cause, BaseException) else error
         )
-    if isinstance(error, _ChunkPageError):
-        return _FailedDispatch(dispatch, None, error.error)
-    return _FailedDispatch(dispatch, None, None)
+    return _FailedDispatch(dispatch, None, _page_error(error))
 
 
 class _RowBuffer:

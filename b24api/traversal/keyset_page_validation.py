@@ -19,6 +19,7 @@ from b24api.errors import (
     PageAdaptationError,
     PaginationError,
 )
+from b24api.execution.facts import execution
 from b24api.traversal.keyset_geometry import closure_witness
 from b24api.traversal.page_adaptation import PageTokens, adapt_page
 from b24api.traversal.page_failure import failed_page
@@ -114,7 +115,7 @@ def classify_rejection(outcome: BatchOutcome, receipt: ReceiptRejection) -> tupl
         return PageOutcome.REJECTED, PageRejectionCode.IDENTITY_CONTRACT
     if not isinstance(outcome, BatchFailure):
         return PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION
-    return failed_page(outcome.error)
+    return failed_page(outcome.error, execution(outcome.error))
 
 
 def validate_lane_receipt(  # noqa: PLR0913
