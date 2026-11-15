@@ -38,12 +38,13 @@ from b24api.batch.engine import BatchExecutor
 from b24api.contracts import Binding, DeliveryOrder, ParameterUpdate, ReferenceItem, ReferenceSource
 from b24api.contracts.command import Command
 from b24api.contracts.completion import CommandSettlement, PageAcknowledged, PageDelivered
+from b24api.contracts.policy import AmbiguityReason
 from b24api.contracts.request import RouteKind
-from b24api.errors import BudgetExceededError
+from b24api.errors import AmbiguousExecutionError, BudgetExceededError
 from b24api.execution import Executor, RateCoordinator
 from b24api.execution.context import CleanupResult, ExecutionContext, spawn_settled
 from b24api.execution.facts import Execution, execution, settlement
-from b24api.references.counted_io import ReferenceTailStream
+from b24api.references.counted_io import ReferenceTailStream, _abandoned_settlement, _TailSlot
 from b24api.references.dispatch import (
     _BatchPageDispatcher,
     _ChunkPageError,
@@ -1371,6 +1372,46 @@ async def test_an_input_page_read_ahead_is_acknowledged_only_once_its_consumer_h
     assert decision.pages_scheduled > pages
     assert len(acknowledged) == decision.pages_acknowledged == 1
     assert set(acknowledged) <= delivered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fetch", "settlement"),
+    [
+        ("never_spawned", CommandSettlement.NOT_EXECUTED),
+        ("cancelled_before_it_ran", CommandSettlement.NOT_EXECUTED),
+        ("answered", CommandSettlement.SUCCESS),
+        ("failed_possibly_run", CommandSettlement.UNKNOWN),
+    ],
+)
+async def test_an_abandoned_tail_page_settles_from_how_its_fetch_ended(
+    fetch: str, settlement: CommandSettlement
+) -> None:
+    # The fetch task returns how it ended (``Settled``), so it never ends in its failure: an abandoned page is
+    # settled from the failure its fetch recorded, a page the send may have run as unknown, never as a success.
+    slot = _TailSlot(ordinal=0, page_id=1, sequence=0)
+
+    async def dispatch() -> _DispatchedPage:
+        if fetch == "failed_possibly_run":
+            raise AmbiguousExecutionError(
+                "lost", reason=AmbiguityReason.CONNECTION_LOST_AFTER_DISPATCH, declared_unsafe=False
+            )
+        return cast("_DispatchedPage", None)
+
+    async def page() -> _DispatchedPage:
+        # As ``ReferenceTailStream._fetch`` does: the slot records whatever the dispatch raised.
+        try:
+            return await dispatch()
+        except BaseException as error:
+            slot.error = error
+            raise
+
+    if fetch != "never_spawned":
+        slot.task = spawn_settled(page())
+        if fetch == "cancelled_before_it_ran":
+            slot.task.cancel()
+        await asyncio.gather(slot.task, return_exceptions=True)
+    assert _abandoned_settlement(slot) is settlement
 
 
 class _BlockedWire(ResponderTransport):
