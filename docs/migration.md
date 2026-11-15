@@ -130,7 +130,7 @@
   earlier failure, that failure stays the terminal reason and the close adds a `cleanup_failure`
   "stream cleanup also failed (X)". X is `InputSourceError` for a close that raised (next item) and
   `CleanupOverrunError` for one that overran its window. The earlier failure's violation comes first
-  and the close's after it (`batch()` and `fan_out()` listed the close first). `iter_list_keyset()` on its
+  and the close's after it (a family that stops at the first failure listed the close first). `iter_list_keyset()` on its
   fast path reports a failed close the same way: an early close whose cleanup failed has the terminal
   reason "stream cleanup failed" (it was "stream closed before exhaustion"), and a failure it ends with
   no longer carries "stream cleanup also failed (X)" as a note. Code that matched the old strings must
