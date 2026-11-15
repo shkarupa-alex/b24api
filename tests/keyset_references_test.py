@@ -824,7 +824,8 @@ async def test_keyset_bindings_the_deadline_ends_record_no_failed_command(
         stream = client.iter_reference_outcomes(
             _base(), [_parent(name) for name in data], traversal=_traversal(_range()), dispatch=BatchDispatch()
         )
-        with pytest.raises(BudgetExceededError, match="exceeded operation time budget"):
+        # Which work the deadline refuses first (an admission, a page's rows, a send) depends on the interleaving.
+        with pytest.raises(BudgetExceededError):
             async with stream:
                 _ = [outcome async for outcome in stream]
 
