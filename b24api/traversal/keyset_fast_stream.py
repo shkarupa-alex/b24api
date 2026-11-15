@@ -144,10 +144,10 @@ class KeysetFastStream:
         counters = self._runtime.counters
         cleanup = CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS
         closure, qualified_witnesses = self._runtime.completion_closure()
-        # A traversal read to its end whose close failed did not complete; any other end keeps its own closure.
-        completed_but_failed = state is KernelState.COMPLETED and cleanup is CleanupState.FAILURE
+        # As in every family, the gate gets how the traversal ended before its cleanup and the cleanup's outcome
+        # apart: a traversal read to its end whose close failed is a natural end the failed cleanup leaves incomplete.
         self._recorder.terminal(
-            KernelState.FAILED if completed_but_failed else state,
+            state,
             rows_emitted=counters.emitted_rows,
             rows_admitted=counters.admitted_rows,
             cleanup=cleanup,
