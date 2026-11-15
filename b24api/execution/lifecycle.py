@@ -19,7 +19,7 @@ from b24api.contracts.policy import KernelState
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.stream import PartialResult
 from b24api.errors import CleanupOverrunError
-from b24api.execution.context import CancellationMark, await_cleanup_resistant, rearm_cancellation
+from b24api.execution.context import WORK_OWNERS, CancellationMark, await_cleanup_resistant, rearm_cancellation
 from b24api.execution.failure import (
     EARLY_CLOSE_REASON,
     attach_report,
@@ -161,12 +161,6 @@ class _Phase(Enum):
     CLOSED = "closed"
 
 
-# The work tokens of the runners whose isolated pull or cleanup owns the current task. Each runs in its
-# own task, and every task started while it runs copies its context, so the marker reaches all work done
-# on its behalf: a family's workers and the caller code they run (a page-stop callback, a source, a
-# transport). A token, not the runner, so a task that outlives the stream never keeps it alive.
-_WORK_OWNERS: ContextVar[tuple[object, ...]] = ContextVar("b24api_work_owners", default=())
-
 _SELF_CLOSE = (
     "a stream cannot be closed from inside its own pull or cleanup (a page_stop callback, a command, "
     "binding or reference source, a transport, or a task one of them started): the close would wait for itself"
@@ -291,7 +285,7 @@ class OperationRunner[T, R]:
         while one ran. A close waits for such work while the pull or cleanup task is running, and for a
         body that works between reads as long as it is open; otherwise it waits for none.
         """
-        if not any(token is self._work_token for token in _WORK_OWNERS.get()):
+        if not any(token is self._work_token for token in WORK_OWNERS.get()):
             return False
         running = self._pull if self._phase is _Phase.PULLING else self._cleanup_task
         if running is not None and not running.done():
@@ -457,7 +451,7 @@ class OperationRunner[T, R]:
 
     def _mark_own_work(self) -> None:
         # Called first in the pull or cleanup task, whose context is its own copy, so it needs no reset.
-        _WORK_OWNERS.set((*_WORK_OWNERS.get(), self._work_token))
+        WORK_OWNERS.set((*WORK_OWNERS.get(), self._work_token))
 
     async def _pull_next(self, read: _Read) -> T | _ReadFailure:
         self._mark_own_work()

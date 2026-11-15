@@ -1,19 +1,21 @@
 """One owner for caller item sources: lazy pulls, item admission, bounded observation and close.
 
 Every stream family adapts its caller source here instead of keeping its own sync and async
-iterator wrappers. A synchronous iterator is pulled and closed in a worker thread, and a pull
-that is cancelled still finishes before the cancellation propagates. Its pulls and its close all
-run in one ``contextvars.Context``, copied when the source is adapted, as a generator iterated in
-one place runs: a context variable it sets before a ``yield`` is still set, and its token still
-resettable, when it resumes. They run one at a time, serialized by a lock taken in the worker
-thread: a close that the operation's end starts while an abandoned pull still runs (its deadline
-passed, or the loop cancelled every task as it shut down) waits there for that pull to return, so
-the iterator is never closed while it runs and the context is never entered twice at once. The
-wait is bounded on the event loop by the operation's cleanup window; past it the close finishes in
-the background. ``accept`` maps each raw item to the
+iterator wrappers. A source's pulls and its close all run in one ``contextvars.Context``, copied
+when the source is adapted, as a generator iterated in one place runs: a context variable it sets
+before a ``yield`` is still set, and its token still resettable, when it resumes. An asynchronous
+iterator's steps are driven by the task that reads or closes it, each resumption entering that
+context. A synchronous iterator is pulled and closed in a worker thread, and a pull that is
+cancelled still finishes before the cancellation propagates. Its steps run one at a time,
+serialized by a lock taken in the worker thread: a close that the operation's end starts while an
+abandoned pull still runs (its deadline passed, or the loop cancelled every task as it shut down)
+waits there for that pull to return, so the iterator is never closed while it runs and the context
+is never entered twice at once. The wait is bounded on the event loop by the operation's cleanup
+window; past it the close finishes in the background. ``accept`` maps each raw item to the
 family's item and raises for a foreign one, ``observe`` records a bounded violation per admitted
-item, and ``failure`` maps a pull, admission or close failure onto the family's carrier. ``aclose``
-never raises: it returns the cleanup outcome and the lifecycle owner decides what to report.
+item, and ``failure`` maps a pull, admission or close failure onto the family's carrier.
+``aclose`` never raises: it returns the cleanup outcome and the lifecycle owner decides what to
+report.
 """
 
 from __future__ import annotations
@@ -22,12 +24,13 @@ import contextlib
 import contextvars
 import functools
 import threading
-from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Iterator
+import types
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Generator, Iterable, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 from b24api.contracts.violation import retain_violations
-from b24api.execution.context import CleanupResult, await_cleanup_resistant
+from b24api.execution.context import WORK_OWNERS, CleanupResult, await_cleanup_resistant
 
 if TYPE_CHECKING:
     from b24api.contracts.report import Violation
@@ -63,6 +66,34 @@ EXHAUSTED = Exhausted.EXHAUSTED
 def _next_or_exhausted(iterator: Iterator[object]) -> object:
     # StopIteration cannot cross a future, so exhaustion comes back as a value.
     return next(iterator, EXHAUSTED)
+
+
+class _InContext[R](Generator[object, object, R]):
+    """The steps of an awaitable, each resumption run in one context, driven by the task that awaits them.
+
+    As ``yield from`` delegates each send, throw and close to it, the awaitable runs as if awaited directly (no task of
+    its own, no extra loop turn, the same current task) except that every resumption enters ``context``.
+    """
+
+    __slots__ = ("_context", "_steps")
+
+    def __init__(self, step: Awaitable[R], context: contextvars.Context) -> None:
+        self._steps = step.__await__()
+        self._context = context
+
+    def send(self, value: object, /) -> object:
+        return self._context.run(self._steps.send, value)
+
+    def throw(self, error: BaseException, /, *_: object) -> object:  # type: ignore[override]
+        return self._context.run(self._steps.throw, error)
+
+    def close(self) -> None:
+        self._context.run(self._steps.close)
+
+
+@types.coroutine
+def _in_context[R](step: Awaitable[R], context: contextvars.Context) -> Generator[object, object, R]:
+    return (yield from _InContext(step, context))
 
 
 async def _finish_in_thread[R](call: Callable[[], R]) -> R:
@@ -159,10 +190,7 @@ class OwnedSource[T](AsyncIterator[T]):
     async def _pull(self) -> object:
         iterator = self._iterator
         if isinstance(iterator, AsyncIterator):
-            try:
-                return await anext(iterator)
-            except StopAsyncIteration:
-                return EXHAUSTED
+            return await self._run_step(anext(iterator, EXHAUSTED))
         if self._inline:
             return _next_or_exhausted(iterator)
         return await _finish_in_thread(functools.partial(self._run_in_context, _next_or_exhausted, iterator))
@@ -178,7 +206,7 @@ class OwnedSource[T](AsyncIterator[T]):
         try:
             if isinstance(iterator, AsyncIterator):
                 if isinstance(iterator, AsyncClosable):
-                    await iterator.aclose()
+                    await self._run_step(iterator.aclose())
             elif isinstance(iterator, SyncClosable):
                 await _finish_in_thread(functools.partial(self._run_in_context, iterator.close))
         except Exception as error:
@@ -186,6 +214,15 @@ class OwnedSource[T](AsyncIterator[T]):
             if self._failure is None:
                 raise
             raise self._failure(error) from error
+
+    async def _run_step[R](self, step: Awaitable[R]) -> R:
+        """Run one step of an asynchronous source, a pull or its close, in the source's context.
+
+        The task driving the step drives it, and the context is given that task's work marker (``WORK_OWNERS``), so
+        a close the source requests of its own stream is still refused as it would be in the driving task.
+        """
+        self._context.run(WORK_OWNERS.set, WORK_OWNERS.get())
+        return await _in_context(step, self._context)
 
     def _run_in_context[R](self, call: Callable[..., R], *args: object) -> R:
         """Run ``call`` in the source's context in a worker thread, after any call still running there returns."""

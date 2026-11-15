@@ -183,6 +183,39 @@ async def test_sync_source_keeps_one_context_across_its_pulls_and_close() -> Non
     assert _TENANT.get() == "caller"
 
 
+async def _tenant_scoped_async(seen: list[tuple[str, str]]) -> AsyncIterator[int]:
+    """The asynchronous scoped generator: a token set before each yield is reset after it."""
+    for index in range(3):
+        token = _TENANT.set(f"tenant-{index}")
+        try:
+            yield index
+            seen.append(("resumed", _TENANT.get()))
+        finally:
+            _TENANT.reset(token)
+            seen.append(("reset", _TENANT.get()))
+
+
+@pytest.mark.asyncio
+async def test_async_source_keeps_one_context_across_its_pulls_and_close() -> None:
+    # Each pull ran in the task that drove it, a fresh copy of the caller's context per pull, so the token set
+    # before a yield belonged to another context when the generator resumed, and resetting it raised ValueError.
+    seen: list[tuple[str, str]] = []
+    drained = OwnedSource.adapt(_tenant_scoped_async(seen), accept=_identity)
+    # Every pull in a task of its own, as the stream families pull.
+    assert [await asyncio.create_task(drained.next()) for _ in range(4)] == [0, 1, 2, EXHAUSTED]
+    assert seen == [
+        (step, value) for index in range(3) for step, value in (("resumed", f"tenant-{index}"), ("reset", "caller"))
+    ]
+    assert await drained.aclose() == CleanupResult(None, None)
+
+    seen.clear()
+    interrupted = OwnedSource.adapt(_tenant_scoped_async(seen), accept=_identity)
+    assert await asyncio.create_task(interrupted.next()) == 0
+    assert await asyncio.create_task(interrupted.aclose()) == CleanupResult(None, None)
+    assert seen == [("reset", "caller")]
+    assert _TENANT.get() == "caller"
+
+
 _PULL: contextvars.ContextVar[str] = contextvars.ContextVar("pull", default="caller")
 
 

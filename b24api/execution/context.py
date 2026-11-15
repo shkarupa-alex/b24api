@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, TypeGuard
 from uuid import uuid4
@@ -18,6 +19,13 @@ if TYPE_CHECKING:
 
     type Clock = Callable[[], float]
 
+
+# The work tokens of the stream runners whose isolated pull or cleanup owns the current task. Each runs in its
+# own task, and every task started while it runs copies its context, so the marker reaches all work done
+# on its behalf: a family's workers and the caller code they run (a page-stop callback, a transport, and a
+# source, whose own context the source owner gives the marker of each step it runs). A token, not the runner,
+# so a task that outlives the stream never keeps it alive.
+WORK_OWNERS: ContextVar[tuple[object, ...]] = ContextVar("b24api_work_owners", default=())
 
 REQUEST_BUDGET_EXHAUSTED = "physical request budget exhausted"
 # A request's own retry window closed before the operation's deadline: that request alone is refused, whatever the

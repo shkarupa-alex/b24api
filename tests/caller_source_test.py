@@ -1,4 +1,4 @@
-"""One report for a failed close, in every stream family that reads a caller's source.
+"""How every stream family that reads a caller's source treats that source, the same in all of them.
 
 A close that raised, or that overran its cleanup window (``CleanupOverrunError``), is reported the same
 way whichever family read the source and however the stream ended. A close that raised is the source
@@ -7,10 +7,14 @@ fail-fast batch family) chained to the caller's exception, as a failed pull does
 close is what failed (terminal reason "stream cleanup failed", one ``cleanup_failure`` violation
 "stream cleanup failed (X)", no other); behind an earlier failure it is that failure's secondary
 ("stream cleanup also failed (X)") and the earlier failure stays the terminal reason.
+
+A close concurrent with a read is an early close like any other; an item counts as emitted once its reader has
+it; and an asynchronous source runs every pull and its close in one context of its own.
 """
 
 from __future__ import annotations
 import asyncio
+import contextvars
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -160,7 +164,7 @@ class _Source:
             await reached(self.release)
 
 
-def _stream(client: Bitrix24, family: str, source: _Source) -> OperationStream[Any]:
+def _stream(client: Bitrix24, family: str, source: AsyncIterator[Any]) -> OperationStream[Any]:
     direct = DirectDispatch(concurrency=1)
     if family == "iter_cursors":
         return client.iter_cursors(LIST_REQUEST, source, selector=ResultSelector(()), cursor=CURSOR, dispatch=direct)
@@ -460,3 +464,45 @@ async def test_an_item_counts_as_emitted_only_once_its_reader_has_it(family: str
     for turns in range(HANDOVER_TURNS):
         emitted, received = await _cancelled_turns_after_an_answer(family, turns)
         assert emitted == received, f"cancelled {turns} turns after an answer"
+
+
+_TENANT: contextvars.ContextVar[str] = contextvars.ContextVar("tenant", default="caller")
+
+
+async def _tenant_scoped(family: str, seen: list[tuple[str, str]]) -> AsyncIterator[Any]:
+    """A caller's asynchronous generator that sets a context variable around each yield and resets it after."""
+    for index, item in enumerate(_items(family)):
+        token = _TENANT.set(f"tenant-{index}")
+        seen.append(("set", _TENANT.get()))
+        try:
+            yield item
+            seen.append(("resumed", _TENANT.get()))
+        finally:
+            _TENANT.reset(token)
+            seen.append(("reset", _TENANT.get()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["read_to_end", "break"])
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_an_asynchronous_source_keeps_one_context_across_its_pulls_and_its_close(
+    family: str, ending: str
+) -> None:
+    # A pull ran in a fresh copy of the reader's context, so a token set before a yield belonged to another
+    # context when the generator resumed or closed: resetting it raised ValueError, the source failed.
+    seen: list[tuple[str, str]] = []
+    async with client_for(ResponderTransport(_answer), policy=POLICIES["returns"]) as client:
+        stream = _stream(client, family, _tenant_scoped(family, seen))
+        await asyncio.wait_for(_end(stream, ending), timeout=HANG_BOUND)
+    report = stream.report
+    assert report is not None
+    assert report.state is (TerminalState.COMPLETED if ending == "read_to_end" else TerminalState.EARLY_CLOSED)
+    assert report.violations == ()
+    tokens = [value for step, value in seen if step == "set"]
+    assert tokens == [f"tenant-{index}" for index in range(len(tokens))]
+    # Every resumption sees its own token, and every token is reset, back to the caller's value.
+    resumed = [value for step, value in seen if step == "resumed"]
+    assert resumed == tokens[: len(resumed)]
+    assert len(resumed) >= len(tokens) - 1
+    assert [value for step, value in seen if step == "reset"] == ["caller"] * len(tokens)
+    assert _TENANT.get() == "caller"
