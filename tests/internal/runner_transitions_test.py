@@ -808,12 +808,16 @@ class _BetweenReads:
     def __init__(self) -> None:
         self.interrupt = KeyboardInterrupt("between reads")
         self.go = asyncio.Event()
+        # Set just before the interrupt is latched: a read waiting for it resumes ahead of the end's own task.
+        self.latching = asyncio.Event()
         self.cleaning = asyncio.Event()
+        self.cleanups = 0
+        self.finalized: list[TerminalCause] = []
         self.release = asyncio.Event()
         self.after_latch: list[Callable[[], Awaitable[None]]] = []
         self.runner: OperationRunner[int, KernelReport] = OperationRunner(
             self._body(),
-            LifecycleHooks(finalize=_finalized, failure_report=_fallback, cleanup=self._cleanup),
+            LifecycleHooks(finalize=self._finalize, failure_report=_fallback, cleanup=self._cleanup),
             works_between_reads=True,
         )
         self.work: list[asyncio.Future[None]] = []
@@ -826,11 +830,17 @@ class _BetweenReads:
 
     async def _latch_later(self) -> None:
         await self.go.wait()
+        self.latching.set()
         latch_interrupt(self.interrupt)
         for step in self.after_latch:
             await step()
 
+    def _finalize(self, cause: TerminalCause, reason: str | None, attempt: CleanupAttempt) -> KernelReport:
+        self.finalized.append(cause)
+        return _finalized(cause, reason, attempt)
+
     async def _cleanup(self) -> None:
+        self.cleanups += 1
         self.cleaning.set()
         await self.release.wait()
 
@@ -879,6 +889,37 @@ def test_an_interrupt_between_reads_goes_to_the_event_loop_before_its_end_is_ove
     report = operation.runner.report
     assert report is not None
     assert (report.state, report.terminal_reason) == (KernelState.FAILED, "operation interrupted")
+    assert getattr(error, "report", None) is report
+
+
+def test_a_read_that_resumes_ahead_of_the_ends_task_runs_the_end_once() -> None:
+    # The read resumes in the very turn the interrupt is latched, ahead of the end's own task, and runs the end
+    # itself; the task finds it begun and leaves it. Cleanup runs once, and the report is published once.
+    operation = _BetweenReads()
+    got: list[object] = []
+    read_over = asyncio.Event()
+
+    async def main() -> None:
+        assert await anext(operation.runner) == 1
+        operation.go.set()
+        await operation.latching.wait()
+        try:
+            await anext(operation.runner)
+        except StopAsyncIteration as error:
+            got.append(type(error))
+        read_over.set()
+
+    async def finish() -> None:
+        operation.release.set()
+        await read_over.wait()
+        await _ending(operation.runner)
+
+    error = raised_driving_the_loop(main, finish)
+    assert error is operation.interrupt
+    assert got == [StopAsyncIteration]
+    assert (operation.cleanups, operation.finalized) == (1, [TerminalCause.INTERRUPTED])
+    report = operation.runner.report
+    assert report is not None
     assert getattr(error, "report", None) is report
 
 
