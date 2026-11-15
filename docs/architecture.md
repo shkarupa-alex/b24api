@@ -298,9 +298,11 @@ outcome.
   cancellation) is never secondary, and one piece of state carries it: each operation has one
   `InterruptLatch`, the isolated runner's, which its pull and cleanup tasks publish through `INTERRUPTS`
   so the tasks they start inherit it (an inline kernel uses the latch of the runner it serves). Every
-  place that catches a `BaseException` in a library task (`settle`, `await_cleanup_resistant`, the
-  reference scheduler's binding tasks and close, the dispatcher's senders) latches the first interrupt
-  and goes on as it would; latching cancels the owner's read in flight. `OperationRunner._terminate` is
+  place where a library task first catches a caller's `BaseException` (`settle`, so every `spawn_settled`
+  task, the reference scheduler's binding tasks, the dispatcher's senders) latches the first interrupt
+  and goes on as it would, and so does the runner where it classifies a read's or a cleanup's end;
+  whatever later handles that failure (a scheduler's close, an isolation's cleanup) may drop it
+  freely. Latching cancels the owner's read in flight. `OperationRunner._terminate` is
   the one raise point: after the report is published (`with_interrupt`: failed, `INTERRUPTED_REASON`,
   the earlier violations kept, one `interrupted` violation last) it raises the latched interrupt,
   whatever ended the stream; `close_owned_resources` does the same for the client's close with a latch
@@ -324,7 +326,8 @@ outcome.
   failure, which `asyncio.run` would report at shutdown whether or not the owner
   retrieved it. That includes `KeyboardInterrupt` and `SystemExit`: a task ending in one would stop the
   loop from inside that task and leave its owner pending, so the interrupt travels to the caller's own
-  task instead, and a worker-thread call a cancellation cut raises it rather than dropping it.
+  task instead; a worker-thread call a cancellation cut is such a task too, run in the operation's context, so
+  its interrupt is latched even though the cancelled call's result is dropped.
 - The default response ceiling is enforced while streaming, before JSON decoding.
 - Exact sequential, counted, and multi-reference traversal shares one operation-wide
   `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted

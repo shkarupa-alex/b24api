@@ -966,7 +966,8 @@ is what the stream raises, whatever ended the stream before it (its end, a failu
 cancellation, a timeout, a close from another task), and the report has one shape for it: `failed`
 with the terminal reason "operation interrupted", every violation recorded before it kept (an earlier
 failure's first), and one `interrupted` violation last, "operation interrupted (X)", where X is
-`KeyboardInterrupt` or `SystemExit`. A library
+`KeyboardInterrupt` or `SystemExit`. A close that fails after an interrupt ended the stream is "stream
+cleanup also failed (X)", as behind any other end that came first. A library
 error carries this in its report (`error.report`), not as a note; your own exception raised inside
 `async with stream` stays what is raised and carries one note, the report's `cleanup_failure` violation
 word for word. The source
