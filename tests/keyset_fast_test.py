@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs
@@ -31,7 +32,10 @@ from b24api import (
 from b24api.cli import _report_json
 from b24api.completion import CompletionGate
 from b24api.contracts import (
+    BindingClosure,
+    BindingTerminal,
     ClosureWitness,
+    CommandSettlement,
     ConsistencyPolicy,
     KeysetAssuranceSource,
     KeysetExecutionKind,
@@ -40,6 +44,7 @@ from b24api.contracts import (
     KeysetSelectionReason,
     KeysetSelectionSummary,
     PageAcknowledged,
+    PageCommandOutcome,
     PageDelivered,
     PageOutcome,
     PageRejectionCode,
@@ -63,16 +68,17 @@ from b24api.errors import (
     ProtocolError,
     ResultShapeError,
 )
-from b24api.execution import WireResponse
+from b24api.execution import ExecutionContext, Executor, WireResponse
 from b24api.traversal import keyset_page_validation, keyset_plan
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
 from b24api.traversal.keyset_geometry import anchor_guesses, anchor_probe_count, estimates, partition_estimate
 from b24api.traversal.keyset_observation import FastTraceRecorder, PageObservation
-from tests.scripting import client_for
+from tests.scripting import ResponderTransport, client_for
 
 if TYPE_CHECKING:
     from b24api.contracts import JsonValue
+    from b24api.execution.executor import _Pause, _RequestAttempts
 
 PAGE_SIZE = 5
 
@@ -326,7 +332,7 @@ def _sends_no_canary(report: OperationReport | None) -> bool:
     return all(record.phase is not KeysetPhase.CANARY for record in report.page_trace)
 
 
-def _client(transport: KeysetTransport, *, policy: ExecutionPolicy | None = None) -> Bitrix24:
+def _client(transport: KeysetTransport | ResponderTransport, *, policy: ExecutionPolicy | None = None) -> Bitrix24:
     return client_for(transport, policy=policy)
 
 
@@ -335,7 +341,7 @@ def _identity() -> IdentitySpec:
 
 
 def _stream(
-    transport: KeysetTransport,
+    transport: KeysetTransport | ResponderTransport,
     execution: RangeKeysetExecution | PartitionedKeysetExecution | AutoKeysetExecution,
     *,
     direction: str = "ascending",
@@ -2585,3 +2591,119 @@ async def test_later_partition_lanes_are_not_rescheduled_while_frontier_is_open(
     assert second_rounds[frontier_ordinal] > first_rounds[frontier_ordinal]
     assert all(rounds <= second_rounds[frontier_ordinal] for rounds in second_rounds.values())
     await stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["range", "partitioned", "auto"])
+@pytest.mark.parametrize("refused_at", [2, 3, 4])
+async def test_a_wave_retry_the_deadline_refuses_ends_the_traversal_with_the_budget(
+    monkeypatch: pytest.MonkeyPatch, kind: str, refused_at: int
+) -> None:
+    # A wave is answered 429 (proven not run, so replayed) and the deadline passes while it waits. The retry window
+    # is as long as the operation, so the deadline refuses the replay round: the stopped commands are the operation's
+    # end, as the refusal they restate is, not failed commands.
+    skew = [0.0]
+
+    def context(executor: Executor, policy: ExecutionPolicy | None = None) -> ExecutionContext:
+        return ExecutionContext(
+            policy or ExecutionPolicy(), executor.coordinator, clock=lambda: time.monotonic() + skew[0]
+        )
+
+    monkeypatch.setattr(Executor, "context", context)
+    keyset = KeysetTransport(tuple(range(1, 3001)))
+
+    async def respond(request: Request) -> WireResponse:
+        if request.method == "batch" and sum(sent.method == "batch" for sent in transport.requests) == refused_at:
+            skew[0] = 10_000.0
+            return WireResponse(429, (("content-type", "text/plain"),), b"slow down")
+        return await keyset.send(request, attempt_timeout=1.0, max_response_bytes=1 << 20)
+
+    transport = ResponderTransport(respond, host=keyset.host)
+    contract = StableIntegerKeysetContract()
+    execution = {
+        "range": RangeKeysetExecution(contract),
+        "partitioned": PartitionedKeysetExecution(contract),
+        "auto": AutoKeysetExecution(contract),
+    }[kind]
+    stream = _stream(
+        transport, execution, policy=ExecutionPolicy(max_elapsed=600.0, max_retry_elapsed_per_request=600.0)
+    )
+
+    with pytest.raises(IncompleteTraversalError) as raised:
+        _ = [row async for row in stream]
+
+    assert isinstance(raised.value.__cause__, BudgetExceededError)
+    assert str(raised.value.__cause__) == "execution time budget exhausted before the retry"
+    assert stream.report is not None
+    assert stream.report.terminal_reason == "BudgetExceededError"
+    assert [item.code for item in stream.report.violations] == ["budget_exhausted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["range", "partitioned", "auto"])
+@pytest.mark.parametrize("answered_at", [2, 3])
+async def test_a_wave_cancelled_while_it_waits_for_its_replay_settles_unknown(
+    monkeypatch: pytest.MonkeyPatch, kind: str, answered_at: int
+) -> None:
+    # The wave left and was answered: one command transiently, the rest with their pages. The caller cancels while
+    # the wave waits to send that command again, so every page it had in flight may have run, none proven not run.
+    waiting = asyncio.Event()
+    replay_after = Executor.replay_after
+
+    async def observed_replay_after(
+        self: Executor, context: ExecutionContext, *, attempts: _RequestAttempts, pause: _Pause
+    ) -> None:
+        waiting.set()
+        await replay_after(self, context, attempts=attempts, pause=pause)
+
+    monkeypatch.setattr(Executor, "replay_after", observed_replay_after)
+    keyset = KeysetTransport(tuple(range(1, 3001)))
+
+    async def respond(request: Request) -> WireResponse:
+        answer = await keyset.send(request, attempt_timeout=1.0, max_response_bytes=1 << 20)
+        if request.method != "batch" or sum(sent.method == "batch" for sent in transport.requests) != answered_at:
+            return answer
+        body = json.loads(answer.body)
+        limited = min(body["result"]["result"])
+        del body["result"]["result"][limited]
+        body["result"]["result_error"] = {limited: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        return WireResponse(200, answer.headers, json.dumps(body).encode())
+
+    transport = ResponderTransport(respond, host=keyset.host)
+    contract = StableIntegerKeysetContract()
+    execution = {
+        "range": RangeKeysetExecution(contract),
+        "partitioned": PartitionedKeysetExecution(contract),
+        "auto": AutoKeysetExecution(contract),
+    }[kind]
+    stream = _stream(transport, execution)
+    gate = stream._source.completion_gate
+    events: list[object] = []
+    emit = gate.emit
+
+    def observe(event: object) -> None:
+        events.append(event)
+        emit(event)
+
+    gate.emit = observe
+
+    async def consume() -> None:
+        async for _ in stream:
+            pass
+
+    task = asyncio.create_task(consume())
+    await waiting.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert stream.report is not None
+    assert stream.report.state is TerminalState.CANCELLED
+    unsettled = [
+        event.outcome
+        for event in events
+        if isinstance(event, PageCommandOutcome) and event.outcome is not CommandSettlement.SUCCESS
+    ]
+    assert unsettled
+    assert set(unsettled) == {CommandSettlement.UNKNOWN}
+    assert [event.closure for event in events if isinstance(event, BindingTerminal)] == [BindingClosure.UNKNOWN]
