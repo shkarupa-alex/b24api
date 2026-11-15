@@ -240,8 +240,13 @@ def _settlement(outcome: BatchOutcome) -> CommandSettlement:
 
 
 def _budget_end(host: KeysetTransactionHost, error: BaseException | None) -> bool:
-    """Return whether the operation's recorded budget refusal stopped a command: its end, not a failed page."""
-    return isinstance(error, BudgetExceededError) and host.context.execution_context.refusal is not None
+    """Return whether the operation's recorded budget refusal stopped a command: its end, not a failed page.
+
+    Only that refusal is (``ExecutionContext.refusal``, recorded as its message): another budget error, such as a
+    result the row budget dropped (``ResultTooLargeError``, an answered command), stays the command's failure.
+    """
+    refusal = host.context.execution_context.refusal
+    return refusal is not None and isinstance(error, BudgetExceededError) and str(error) == refusal
 
 
 def _raise_rejection(host: KeysetTransactionHost, rejection: ReceiptRejection) -> NoReturn:

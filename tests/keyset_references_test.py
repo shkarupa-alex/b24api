@@ -51,7 +51,7 @@ from b24api.contracts import (
 )
 from b24api.contracts.page_stop import ContinuePage
 from b24api.contracts.request import RouteKind
-from b24api.errors import CapabilityError, IdentityContractError
+from b24api.errors import BudgetExceededError, CapabilityError, IdentityContractError
 from b24api.execution import ExecutionContext
 from b24api.references import wave_engine
 from b24api.references.budget_view import BindingBudgetView, RowLease
@@ -758,3 +758,36 @@ async def test_two_partitioned_sources_and_an_ordinary_one_exhaust_in_input_orde
     assert set(_completes(outcomes)) == set(data)
     assert report.state is TerminalState.COMPLETED
     assert leases.outstanding == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("execution", "distribution", "max_requests"),
+    [
+        (_range, "dense", 2),
+        (_partitioned, "dense", 7),
+        (_auto, "dense", 1),
+        (_range, "sparse", 28),
+    ],
+    ids=["range", "partitioned", "auto", "range-sparse"],
+)
+async def test_a_keyset_binding_finish_the_request_budget_refuses_ends_with_the_budget(
+    execution: Callable[[], Execution],
+    distribution: str,
+    max_requests: int,
+) -> None:
+    # The budget refuses a binding's final confirmation: the operation ends with it, not with a failed command.
+    data = {"a": DISTRIBUTIONS[distribution], "b": DISTRIBUTIONS[distribution]}
+    portal = BatchPortal(_answer(data))
+    async with client_for(portal, policy=ExecutionPolicy(max_requests=max_requests)) as client:
+        stream = client.iter_reference_outcomes(
+            _base(), [_parent("a"), _parent("b")], traversal=_traversal(execution()), dispatch=BatchDispatch()
+        )
+        with pytest.raises(BudgetExceededError, match="physical request budget exhausted"):
+            async with stream:
+                _ = [outcome async for outcome in stream]
+
+    report = stream.report
+    assert report is not None
+    assert (report.state, report.terminal_reason) == (TerminalState.INCOMPLETE, "BudgetExceededError")
+    assert {item.code for item in report.violations} == {"budget_exhausted", "reference_failure"}
