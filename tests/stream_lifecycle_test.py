@@ -9,6 +9,7 @@ private carrier exception (A14).
 
 from __future__ import annotations
 import asyncio
+import contextlib
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
     from b24api.contracts.stream import OperationStream
 
 HOST = "fixture.invalid"
+# A bound on a wait the test expects to end at once, so a regression fails the test instead of hanging it.
+HANG_BOUND = 30.0
 COMMANDS = 6
 BATCH = 2
 FAILING_COMMAND = 3
@@ -88,11 +91,20 @@ class _SourceFailedError(Exception):
 class _Source:
     """An async command source whose ``aclose`` can fail, observable by tests."""
 
-    def __init__(self, *, fail_at: int | None = None, close_fails: bool = False, failing: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_at: int | None = None,
+        close_fails: bool = False,
+        failing: bool = False,
+        close_blocks: bool = False,
+    ) -> None:
         self.produced = 0
         self.fail_at = fail_at
         self.close_fails = close_fails
         self.failing = failing
+        self.close_blocks = close_blocks
+        self.closing = asyncio.Event()
         self.closes = 0
 
     def __aiter__(self) -> _Source:
@@ -109,6 +121,9 @@ class _Source:
 
     async def aclose(self) -> None:
         self.closes += 1
+        self.closing.set()
+        if self.close_blocks:
+            await asyncio.Event().wait()
         if self.close_fails:
             raise _CloseFailedError
 
@@ -433,3 +448,27 @@ async def test_reference_binding_source_failure_is_reported_as_an_input_source_f
     assert report.terminal_reason == "InputSourceError"
     assert "source_failure" in _codes(report)
     assert _causes(raised.value) == [_SourceFailedError]
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_a_read_ended_as_the_event_loop_shuts_down_leaves_no_library_task_failed(family: str) -> None:
+    # ``asyncio.run`` cancels every task left when its coroutine returns, then reports each one that ended in an
+    # exception. It shuts down while the read that ends the stream closes its source: the consumer, the caller's own
+    # task, takes the stream's end, and no task of the library's own may end in it as well.
+    reports: list[dict[str, Any]] = []
+    source = _Source(failing=True, close_blocks=True)
+
+    async def consume(stream: OperationStream[Any]) -> None:
+        with contextlib.suppress(BaseException):
+            async for _item in stream:
+                pass
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reports.append(context))
+        consumer = asyncio.create_task(consume(_stream(_client(_Portal()), family, source)))
+        await asyncio.wait_for(source.closing.wait(), timeout=HANG_BOUND)
+        assert not consumer.done()
+
+    asyncio.run(main())
+
+    assert [(context["message"], context.get("task")) for context in reports] == []
