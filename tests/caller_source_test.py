@@ -559,6 +559,44 @@ async def test_an_asynchronous_source_keeps_one_context_across_its_pulls_and_its
     assert _TENANT.get() == "caller"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_a_source_cancelled_in_its_pull_resets_its_context_in_that_context(family: str) -> None:
+    # The cancellation enters the generator where its pull waits; its ``finally`` runs in the source's context, as
+    # every other step does, so the token resets and the stream ends cancelled, not failed by a ValueError.
+    pulling = asyncio.Event()
+    reset: list[str] = []
+
+    async def scoped() -> AsyncIterator[Any]:
+        token = _TENANT.set("tenant")
+        try:
+            first, _second = _items(family)
+            yield first
+            pulling.set()
+            await asyncio.Event().wait()
+        finally:
+            _TENANT.reset(token)
+            reset.append(_TENANT.get())
+
+    async def consume(stream: OperationStream[Any]) -> None:
+        async for _item in stream:
+            pass
+
+    async with client_for(ResponderTransport(_answer), policy=POLICIES["returns"]) as client:
+        stream = _stream(client, family, scoped())
+        reader = asyncio.create_task(consume(stream))
+        await reached(pulling)
+        reader.cancel()
+        assert isinstance(await _settled(reader), asyncio.CancelledError)
+
+    assert reset == ["caller"]
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.CANCELLED
+    assert report.terminal_reason == "iteration cancelled"
+    assert report.violations == ()
+
+
 class _Gate:
     """Where a source's second pull waits, and the release that only the event loop's shutdown gives it.
 

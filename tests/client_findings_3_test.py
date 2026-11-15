@@ -1551,3 +1551,16 @@ async def test_page_stride_accepts_an_aligned_initial_offset() -> None:
     rows = [item async for item in stream]
     assert len(rows) == PAGE_SIZE
     assert starts == [900, 900 + PAGE_SIZE]
+
+
+@pytest.mark.parametrize("code", ["duplicate_identity", 1, object()])
+def test_a_pagination_error_refuses_a_rejection_code_that_is_not_one(code: object) -> None:
+    # The code names the page check that rejected a page, as its ``PageRecord`` does: a raw value is no such name.
+    with pytest.raises(TypeError, match="rejection_code must be a PageRejectionCode"):
+        PaginationError("rejected", rejection_code=code)  # type: ignore[arg-type]
+
+
+def test_a_pagination_error_keeps_its_rejection_code() -> None:
+    assert PaginationError("rejected").rejection_code is None
+    error = PaginationError("rejected", rejection_code=PageRejectionCode.TOTAL_DRIFT)
+    assert error.rejection_code is PageRejectionCode.TOTAL_DRIFT
