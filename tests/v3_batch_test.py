@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from b24api import BatchDispatch, BatchFailed, Bitrix24, ExecutionPolicy, ReplaySafety, Request, RetryPolicy, RouteKind
+from b24api import BatchDispatch, BatchFailed, ExecutionPolicy, ReplaySafety, Request, RetryPolicy, RouteKind
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts import (
@@ -1690,32 +1690,32 @@ async def test_a21_isolation_an_isolated_send_cancelled_in_flight_is_counted() -
 
 async def _first_envelope_stopped(stop: str, how: str) -> tuple[list[CommandOutcome[int]], OperationReport]:
     """Run two SAFE REST v3 commands whose first envelope ``stop`` stops before it leaves, through ``how``."""
-    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={"result": []})))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/batch"):
+            return httpx.Response(200, json={"result": []}, request=request)
+        # An earlier direct call: its throttle hint holds the portal past the batch's whole budget.
+        return httpx.Response(429, headers={"retry-after": "600"}, json=_abort("QUERY_LIMIT_EXCEEDED"), request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
-    coordinator = RateCoordinator()
-    executor = Executor(transport, coordinator=coordinator)
-    policy = _policy()
-    if stop == "closed client":
-        await client.aclose()  # the user closed the HTTPX client it injected
-    elif stop == "closed coordinator":
-        await coordinator.close()
-    else:
-        # A hold that outlasts the operation's budget refuses the first permit at once.
-        await coordinator.observe_throttle(600.0, reason="test hold")
-        policy = _policy(max_elapsed=5.0)
-    api = Bitrix24._from_executor(executor)  # noqa: SLF001 - caller-owned executor seam, to close its coordinator
+    policy = _policy(max_elapsed=5.0)
     commands = [Command(_v3(identifier), identifier) for identifier in range(TWO)]
-    stream = (
-        api.fan_out_outcomes(commands, dispatch=BatchDispatch(concurrency=1), policy=policy)
-        if how == "batch fan-out"
-        else api.batch_outcomes(commands, policy=policy)
-    )
     try:
-        async with stream:
-            outcomes = [outcome async for outcome in stream]
+        async with client_for(transport, policy=policy) as api:
+            if stop == "closed client":
+                await client.aclose()  # the user closed the HTTPX client it injected
+            else:
+                with pytest.raises(BudgetExceededError):
+                    await api.call(Request.bare("crm.item.get", {"id": 1}))
+            stream = (
+                api.fan_out_outcomes(commands, dispatch=BatchDispatch(concurrency=1))
+                if how == "batch fan-out"
+                else api.batch_outcomes(commands)
+            )
+            async with stream:
+                outcomes = [outcome async for outcome in stream]
     finally:
-        await api.aclose()
-        await coordinator.close()
         await transport.aclose()
         await client.aclose()
     report = stream.report
@@ -1726,17 +1726,14 @@ async def _first_envelope_stopped(stop: str, how: str) -> tuple[list[CommandOutc
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("stop", "error_type"),
-    [
-        ("closed client", ClientClosedError),
-        ("closed coordinator", ClientClosedError),
-        ("budget at the first permit", BudgetExceededError),
-    ],
+    [("closed client", ClientClosedError), ("budget at the first permit", BudgetExceededError)],
 )
 @pytest.mark.parametrize("how", ["batch fan-out", "logical batch"])
 async def test_a_first_envelope_stopped_before_its_send_ends_its_commands_never_sent(
     stop: str, error_type: type[B24ApiError], how: str
 ) -> None:
     # Nothing left: no request counts, no page was sent, and each command ends with the stop, settled not executed.
+    # A closed coordinator stops it the same way (tests/internal/rate_coordinator_test.py).
     outcomes, report = await _first_envelope_stopped(stop, how)
 
     assert [type(outcome) for outcome in outcomes] == [CommandFailure, CommandFailure]
