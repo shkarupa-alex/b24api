@@ -40,9 +40,9 @@ from b24api.contracts.command import Command
 from b24api.contracts.completion import CommandSettlement, PageAcknowledged, PageDelivered
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError
-from b24api.execution import Executor
+from b24api.execution import Executor, RateCoordinator
 from b24api.execution.context import CleanupResult, ExecutionContext
-from b24api.execution.facts import Execution, execution
+from b24api.execution.facts import Execution, execution, settlement
 from b24api.references.counted_io import ReferenceTailStream
 from b24api.references.dispatch import (
     _BatchPageDispatcher,
@@ -54,6 +54,7 @@ from b24api.references.dispatch import (
     _RowBuffer,
 )
 from b24api.references.scheduler import ReferenceScheduler
+from b24api.transport import TransportCapabilities
 from b24api.traversal.counted_batch import _settle_tail_cleanup
 from b24api.traversal.plans import KernelBatchDispatch, ReferenceOutputOrder
 from tests.scripting import (
@@ -73,10 +74,10 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from b24api.contracts import TraversalSpec
-    from b24api.execution.executor import _Pause, _RequestAttempts
     from b24api.references.dispatch import _AdmissionState, _DispatchedPage, _Event, _Transit, _Work
     from b24api.references.program import FastKeysetProgram
     from b24api.references.run import _ReferenceRun
+    from b24api.transport import WireRequest, WireResponse
     from b24api.traversal.identity import _Page
     from tests.scripting import Answer, Envelope, Query
 
@@ -1368,25 +1369,39 @@ async def test_an_input_page_read_ahead_is_acknowledged_only_once_its_consumer_h
     assert set(acknowledged) <= delivered
 
 
-@pytest.mark.asyncio
-async def test_a_page_cancelled_while_its_wave_waits_for_a_replay_keeps_what_its_command_did(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A page its wave answered keeps that answer; one the wave still sends again may run.
+class _BlockedWire(ResponderTransport):
+    """Hold every send on the wire until cancelled, a REST v3 batch envelope's included."""
 
-    The wave answers one page and refuses the other (QUERY_LIMIT_EXCEEDED), then waits to send the refused one
-    again; both pages are cancelled meanwhile. The answered page was answered, not possibly run; the refused one
-    stays in the wave, which runs on, so it may still run.
-    """
-    waiting, release = asyncio.Event(), asyncio.Event()
-    replay_after = Executor.replay_after
+    capabilities = TransportCapabilities(routes=frozenset({RouteKind.BARE, RouteKind.API_V3}), json_array_body=True)
 
-    async def held(self: Executor, context: ExecutionContext, *, attempts: _RequestAttempts, pause: _Pause) -> None:
+    def __init__(self, blocker: Blocker) -> None:
+        """Block classic sends with ``blocker`` and set its ``started`` for a v3 envelope too."""
+        super().__init__(blocker)
+        self.blocker = blocker
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        """Hold the envelope on the wire."""
+        del request, attempt_timeout, max_response_bytes
+        self.blocker.started.set()
+        await asyncio.Future[None]()
+        raise AssertionError("unreachable")
+
+
+def _staged_wave(monkeypatch: pytest.MonkeyPatch, stage: str) -> tuple[BatchPortal | _BlockedWire, asyncio.Event]:
+    """Hold a two-page wave at ``stage``; the event is set once it is held there."""
+    if stage in {"on_wire", "v3_on_wire"}:
+        blocker = Blocker()
+        return _BlockedWire(blocker), blocker.started
+    waiting = asyncio.Event()
+
+    async def held(*_args: object, **_kwargs: object) -> None:
         waiting.set()
-        await release.wait()
-        await replay_after(self, context, attempts=attempts, pause=pause)
+        await asyncio.Future[None]()
 
-    monkeypatch.setattr(Executor, "replay_after", held)
+    if stage == "before_send":
+        monkeypatch.setattr(RateCoordinator, "acquire", held)
+    else:
+        monkeypatch.setattr(Executor, "replay_after", held)
     refused: list[str] = []
 
     def answer(_method: str, query: Query) -> Envelope:
@@ -1395,27 +1410,66 @@ async def test_a_page_cancelled_while_its_wave_waits_for_a_replay_keeps_what_its
             return {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}
         return {"result": [{"ID": int(query["id"])}]}
 
-    executor = Executor(BatchPortal(answer))
+    return BatchPortal(answer), waiting
+
+
+_POSSIBLY_RUN = (Execution.POSSIBLY_RUN, CommandSettlement.UNKNOWN)
+_CANCELLED_PAGES = {
+    # (stage, how the pages end): what each of the two pages' failure records, and how its page settles
+    ("before_send", "pages"): [_POSSIBLY_RUN, _POSSIBLY_RUN],
+    ("before_send", "close"): [(Execution.NOT_SENT, CommandSettlement.NOT_EXECUTED)] * 2,
+    ("on_wire", "pages"): [_POSSIBLY_RUN, _POSSIBLY_RUN],
+    ("on_wire", "close"): [_POSSIBLY_RUN, _POSSIBLY_RUN],
+    ("replay_wait", "pages"): [(Execution.ANSWERED, CommandSettlement.SUCCESS), _POSSIBLY_RUN],
+    ("replay_wait", "close"): [
+        (Execution.ANSWERED, CommandSettlement.SUCCESS),
+        (Execution.ANSWERED, CommandSettlement.FAILURE),
+    ],
+    ("v3_on_wire", "pages"): [_POSSIBLY_RUN, _POSSIBLY_RUN],
+    ("v3_on_wire", "close"): [_POSSIBLY_RUN, _POSSIBLY_RUN],
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stage", "how"), list(_CANCELLED_PAGES))
+async def test_a_page_cancelled_at_any_stage_of_its_wave_keeps_what_its_command_did(
+    monkeypatch: pytest.MonkeyPatch, stage: str, how: str
+) -> None:
+    """Each cancelled page records what its command did, and settles from it as the flat path does.
+
+    Two pages share one wave. Either the pages are cancelled, and the wave runs on for its other commands, so a
+    command not answered yet may still run; or the dispatcher closes, so the wave sends nothing more. A wave held
+    at its permit sent nothing; one on the wire, a REST v3 envelope's included, may have run every command. The
+    wave answers one page and refuses the other (QUERY_LIMIT_EXCEEDED), then waits to send the refused one
+    again: the answered page succeeded, under one encoding with the flat path, and the refused one may run while
+    the wave runs on, or is an answered failure once it sends nothing more.
+    """
+    transport, waiting = _staged_wave(monkeypatch, stage)
+    executor = Executor(transport)
     context = executor.context(ExecutionPolicy(max_pages=100, max_pages_per_reference=100))
     await context.start()
     dispatcher = _BatchPageDispatcher(
         executor, context, KernelBatchDispatch(batch_size=2, concurrency=1, coalesce_wait=UNREACHABLE_COALESCE_WAIT)
     )
-    cancellations: list[asyncio.CancelledError] = []
+    route = RouteKind.API_V3 if stage == "v3_on_wire" else RouteKind.BARE
+    failures: dict[int, BaseException] = {}
 
     async def fetch(item: int) -> None:
+        request = Request("crm.item.get", parameters={"id": item}, replay_safety=ReplaySafety.SAFE, route=route)
         try:
-            await dispatcher.fetch(Request("crm.item.get", parameters={"id": item}, route=RouteKind.BARE), f"r{item}")
-        except asyncio.CancelledError as error:
-            cancellations.append(error)
+            await dispatcher.fetch(request, f"r{item}")
+        except BaseException as error:
+            failures[item] = error
             raise
 
     pages = [asyncio.create_task(fetch(item)) for item in (1, 2)]
     await asyncio.wait_for(waiting.wait(), timeout=HANG_BOUND)
-    for page in pages:
-        page.cancel()
-    await asyncio.gather(*pages, return_exceptions=True)
-    release.set()
+    if how == "pages":
+        for page in pages:
+            page.cancel()
+        await asyncio.gather(*pages, return_exceptions=True)
     await dispatcher.aclose()
+    await asyncio.gather(*pages, return_exceptions=True)
 
-    assert [execution(error) for error in cancellations] == [Execution.ANSWERED, Execution.POSSIBLY_RUN]
+    assert all(isinstance(failures[item], asyncio.CancelledError) for item in (1, 2))
+    assert [(execution(failures[item]), settlement(failures[item])) for item in (1, 2)] == _CANCELLED_PAGES[stage, how]

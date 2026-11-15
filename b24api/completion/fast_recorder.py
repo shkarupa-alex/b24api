@@ -85,14 +85,6 @@ class FastPageLedger:
             self._unknown = self._unknown or outcome is CommandSettlement.UNKNOWN
             del self._active[command_id]
 
-    def settle_wave(self, outcomes: tuple[CommandSettlement, ...]) -> None:
-        """Settle the trailing scheduled pages of a wave whose engine call raised, in schedule order."""
-        unsettled = [command_id for command_id, page in self._active.items() if not page.settled]
-        if len(outcomes) > len(unsettled):
-            raise RuntimeError("fast wave settlement exceeds its scheduled pages")
-        for command_id, outcome in zip(unsettled[len(unsettled) - len(outcomes) :], outcomes, strict=True):
-            self.settle(command_id, outcome)
-
     def validated(self, command_id: str) -> None:
         """Mark a settled page validated until ordered admission is decided."""
         page = self._active[command_id]
@@ -149,11 +141,12 @@ class FastPageLedger:
             if page.recorded and page.remaining is None:
                 self.admit(command_id, 0)
 
-    def close(self, *, successful: bool, reason: str, unsettled: CommandSettlement) -> None:
+    def close(self, *, successful: bool, reason: str) -> None:
         """Retire every open page before the binding terminal: discarded probes, or a failed traversal.
 
-        A page whose dispatch raised before its outcome was observed is settled ``unsettled`` first, from the
-        facts of the failure that ended the traversal: only a settled page can be rejected.
+        Only a settled page can be rejected. A wave engine settles each page it was handed from what its command
+        did, also when its call raises, so a page still unsettled here was never handed to one: it settles as not
+        executed. This is the one rule for every path, flat or reference, whatever ended the traversal.
         """
         if successful:
             self.discard_unadmitted()
@@ -161,7 +154,7 @@ class FastPageLedger:
                 return
         for command_id, page in tuple(self._active.items()):
             if not page.settled:
-                self.settle(command_id, unsettled)
+                self.settle(command_id, CommandSettlement.NOT_EXECUTED)
         for command_id, page in tuple(self._active.items()):
             self._emit_page(PageRejected, page.page_id, reason=reason)
             self._negative = True
@@ -207,18 +200,13 @@ class FastCompletionRecorder(FastPageLedger):
         cleanup: CleanupState,
         closure: BindingClosure | None = None,
         qualified_witnesses: int = 0,
-        unsettled: CommandSettlement = CommandSettlement.NOT_EXECUTED,
     ) -> None:
-        """Settle the operation only after owned scheduler cleanup has finished.
-
-        ``unsettled`` settles a page whose dispatch raised: it comes from the facts of the failure that ended
-        the traversal, so a page that may have run makes the binding's closure unknown.
-        """
+        """Settle the operation only after owned scheduler cleanup has finished."""
         if self._terminal:
             return
         self._terminal = True
         successful = state is KernelState.COMPLETED and rows_emitted == rows_admitted
-        self.close(successful=successful, reason=state.value, unsettled=unsettled)
+        self.close(successful=successful, reason=state.value)
         if successful and closure not in {BindingClosure.SOURCE_EMPTY, BindingClosure.KEYSET_PLAN_COVERED}:
             closure = BindingClosure.FAILURE
             self._negative = True

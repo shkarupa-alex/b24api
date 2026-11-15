@@ -98,7 +98,7 @@ async def execute_wave(
             and getattr(getattr(host.execution, "total_hint", None), "value", None) == "request_advisory"
         )
         outcomes = await host.engine.execute_requests(
-            tuple(plan.request for plan in plans),
+            {plan.command_id: plan.request for plan in plans},
             context=host.context.execution_context,
             advisory_totals=advisory,
             strict_envelope=True,
@@ -389,7 +389,9 @@ async def execute_finish_page(
     try:
         await host.adjust_buffer(host.effective_page_cap)
         host.completion_recorder.schedule(plan.command_id)
-        outcome = await host.engine.execute_page(request, context=host.context.execution_context)
+        outcome = await host.engine.execute_page(
+            request, command_id=plan.command_id, context=host.context.execution_context
+        )
         _record_finish_dispatch(host, plan, outcome, dispatch)
         commit = host.context.commit_page if isinstance(outcome, BatchSuccess) else host.context.release_page
         commit(reservation)

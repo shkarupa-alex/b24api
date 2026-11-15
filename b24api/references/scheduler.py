@@ -316,7 +316,7 @@ class ReferenceScheduler:
     ) -> None:
         """Read and admit bindings until the source ends: read out, or closed by the budget's refusal.
 
-        A pull the operation's budget refuses (``ExecutionContext.refusal``: the request budget refused a send, or
+        A pull the operation's budget refuses (``ExecutionContext.ended_by``: the request budget refused a send, or
         the deadline passed before the pull or while it ran; once either has refused work, it refuses every later
         pull) ends the source as a read-out source ends, although the source's end was not read, so the operation
         cannot complete. The producer's own task ends without error either way, so a fail-fast window's failure
@@ -375,8 +375,8 @@ class ReferenceScheduler:
     def _raise_if_budget_refused(self) -> None:
         """End the operation with its budget once every binding read is settled, if the budget refused work.
 
-        The budget's own record (``ExecutionContext.refusal``) decides, whether the source was read out before the
-        refusal or closed by it.
+        The refusal the budget recorded (``ExecutionContext.raise_if_refused``) decides, whether the source was read
+        out before the refusal or closed by it.
         """
         self.context.raise_if_refused()
 

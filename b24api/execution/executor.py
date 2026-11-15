@@ -40,6 +40,7 @@ from b24api.errors import (
 from b24api.execution.boundary import send_transport, send_wire_envelope
 from b24api.execution.context import CancellationMark, ExecutionContext, mark_cancellation
 from b24api.execution.facts import (
+    Execution,
     ambiguous_status,
     answered_conclusively,
     http_success,
@@ -188,15 +189,25 @@ class _Lineage:
             unproven=None if explains_itself else self.unproven,
         )
 
+    def unsent(self) -> Execution:
+        """Return what these sends leave known of a command ended without a further send: the one left-open rule.
+
+        Before any send it was not sent; otherwise it may have run when one of them may have, else it was answered.
+        """
+        if self.latest is _Settled.NOTHING_SENT:
+            return Execution.NOT_SENT
+        return Execution.ANSWERED if self.left_open() is None else Execution.POSSIBLY_RUN
+
     def record_open(self, error: BaseException) -> None:
-        """Record on a failure what these sends left open, as their answers were classified; with none, nothing.
+        """Record on a failure what these sends left open, as their answers were classified (``unsent``).
 
         The failure adds nothing to them: it stopped a further send before it left, cut the latest one before its
         answer (a cancellation), or is the failure the latest send's classification already holds. A failure
         before any send keeps no facts: it was never sent, and no recorder can say otherwise.
         """
-        if self.latest is not _Settled.NOTHING_SENT:
-            record_dispatch(error, possibly_executed=self.left_open() is not None, unproven=self.unproven)
+        known = self.unsent()
+        if known is not Execution.NOT_SENT:
+            record_dispatch(error, possibly_executed=known is Execution.POSSIBLY_RUN, unproven=self.unproven)
 
     def withhold(self, error: BaseException) -> None:
         """Record a command the server halted before: proven not run by the latest send, but not by earlier ones."""

@@ -75,9 +75,11 @@ from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
 from b24api.traversal.keyset_geometry import anchor_guesses, anchor_probe_count, estimates, partition_estimate
 from b24api.traversal.keyset_observation import FastTraceRecorder, PageObservation
-from tests.scripting import ResponderTransport, client_for
+from tests.scripting import HANG_BOUND, ResponderTransport, client_for
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from b24api.contracts import JsonValue
     from b24api.contracts.completion import CompletionEvidence
     from b24api.execution.executor import _Pause, _RequestAttempts
@@ -2661,45 +2663,91 @@ async def test_a_wave_retry_the_deadline_refuses_ends_the_traversal_with_the_bud
     assert [item.code for item in stream.report.violations] == ["budget_exhausted"]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["range", "partitioned", "auto"])
-@pytest.mark.parametrize("cancelled_at", [2, 3])
-@pytest.mark.parametrize("moment", ["on_the_wire", "before_the_replay"])
-async def test_a_wave_cancelled_after_it_was_sent_settles_each_page_from_its_own_command(
-    monkeypatch: pytest.MonkeyPatch, kind: str, cancelled_at: int, moment: str
-) -> None:
-    # Cancelled while its batch is on the wire, a wave's every page may have run. Cancelled once the batch was
-    # answered, while the wave waits to send again the one command the server refused (QUERY_LIMIT_EXCEEDED), each
-    # page keeps its own answer: the answered pages succeeded, and the refused one is an answered failure, as it
-    # is when the budget ends its replay. None of them is unknown, and none is claimed never sent.
+def _refused_or_lost(body: dict[str, dict[str, dict[str, object]]], moment: str) -> None:
+    """Answer a wave's batch with one command refused (QUERY_LIMIT_EXCEEDED), so the wave waits to replay it.
+
+    ``final_answers``: the two first commands' answers are lost (each may have run) and the third is refused.
+    ``access_denied``: the second command is also answered with a final failure.
+    """
+    result = body["result"]["result"]
+    errors = body["result"]["result_error"] = {}
+    keys = sorted(result)
+    refused = keys[2] if moment == "final_answers" else keys[0]
+    for key in keys[:3] if moment == "final_answers" else (refused,):
+        del result[key]
+    errors[refused] = {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}
+    if moment == "access_denied":
+        del result[keys[1]]
+        errors[keys[1]] = {"error": "ACCESS_DENIED", "error_description": "no"}
+
+
+_CANCELLED_WAVE: dict[str, tuple[dict[CommandSettlement, int | None], BindingClosure]] = {
+    # moment: (how many pages settle so beside the wave's answered successes, ``None`` for every one; the closure)
+    "before_the_send": ({CommandSettlement.NOT_EXECUTED: None}, BindingClosure.FAILURE),
+    "on_the_wire": ({CommandSettlement.UNKNOWN: None}, BindingClosure.UNKNOWN),
+    "before_the_replay": ({CommandSettlement.FAILURE: 1}, BindingClosure.FAILURE),
+    "replay_on_the_wire": ({CommandSettlement.UNKNOWN: 1}, BindingClosure.UNKNOWN),
+    "final_answers": ({CommandSettlement.UNKNOWN: 2, CommandSettlement.FAILURE: 1}, BindingClosure.UNKNOWN),
+    "access_denied": ({CommandSettlement.FAILURE: 2}, BindingClosure.FAILURE),
+}
+
+
+def _cancellable_wave(
+    monkeypatch: pytest.MonkeyPatch, moment: str, cancelled_at: int
+) -> tuple[ResponderTransport, asyncio.Event]:
+    """Serve a keyset whose ``cancelled_at``-th batch reaches ``moment``; the event is set once it has."""
     reached = asyncio.Event()
     replay_after = Executor.replay_after
 
     async def observed_replay_after(
         self: Executor, context: ExecutionContext, *, attempts: _RequestAttempts, pause: _Pause
     ) -> None:
-        reached.set()
+        if moment not in {"before_the_send", "on_the_wire", "replay_on_the_wire"}:
+            reached.set()
         await replay_after(self, context, attempts=attempts, pause=pause)
 
     monkeypatch.setattr(Executor, "replay_after", observed_replay_after)
+    acquire = RateCoordinator.acquire
+
+    async def held_acquire(coordinator: RateCoordinator, *args: object, **kwargs: object) -> object:
+        if moment == "before_the_send" and _batches(transport) == cancelled_at - 1 and not reached.is_set():
+            reached.set()
+            await asyncio.Event().wait()
+        return await acquire(coordinator, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(RateCoordinator, "acquire", held_acquire)
     keyset = KeysetTransport(tuple(range(1, 3001)))
-    wave: list[int] = []
 
     async def respond(request: Request) -> WireResponse:
         answer = await keyset.send(request, attempt_timeout=1.0, max_response_bytes=1 << 20)
-        if request.method != "batch" or sum(sent.method == "batch" for sent in transport.requests) != cancelled_at:
-            return answer
-        body = json.loads(answer.body)
-        wave.append(len(body["result"]["result"]))
-        if moment == "on_the_wire":
+        sent = _batches(transport) if request.method == "batch" else 0
+        if (moment, sent) in {("on_the_wire", cancelled_at), ("replay_on_the_wire", cancelled_at + 1)}:
             reached.set()
             await asyncio.Event().wait()
-        limited = min(body["result"]["result"])
-        del body["result"]["result"][limited]
-        body["result"]["result_error"] = {limited: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        if sent != cancelled_at:
+            return answer
+        body = json.loads(answer.body)
+        _refused_or_lost(body, moment)
         return WireResponse(200, answer.headers, json.dumps(body).encode())
 
     transport = ResponderTransport(respond, host=keyset.host)
+    return transport, reached
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["range", "partitioned", "auto"])
+@pytest.mark.parametrize("cancelled_at", [2, 3])
+@pytest.mark.parametrize("moment", list(_CANCELLED_WAVE))
+async def test_a_wave_cancelled_at_any_stage_settles_each_page_from_its_own_command(
+    monkeypatch: pytest.MonkeyPatch, kind: str, cancelled_at: int, moment: str
+) -> None:
+    # A wave cancelled before its batch is sent ran nothing: no page is claimed answered. Cancelled while its batch
+    # is on the wire, its every page may have run. Cancelled once the batch was answered, while the wave waits to
+    # send again the one command the server refused (QUERY_LIMIT_EXCEEDED), each page keeps its own answer: the
+    # answered pages succeeded, a refused one is an answered failure, as it is when the budget ends its replay, a
+    # final failure is one, and a lost answer may have run, whatever order they settle in. Cancelled while the
+    # replay is on the wire, only the replayed page may have run. A page that may have run makes the closure unknown.
+    transport, reached = _cancellable_wave(monkeypatch, moment, cancelled_at)
     events: list[object] = []
     emit = CompletionGate.emit
 
@@ -2715,8 +2763,10 @@ async def test_a_wave_cancelled_after_it_was_sent_settles_each_page_from_its_own
             pass
 
     task = asyncio.create_task(consume())
-    await reached.wait()
+    await asyncio.wait_for(reached.wait(), HANG_BOUND)
     settled_before = sum(isinstance(event, PageCommandOutcome) for event in events)
+    # Every page of the wave is scheduled before its batch is sent and settled once the wave has its outcomes.
+    size = sum(isinstance(event, PageScheduled) for event in events) - settled_before
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -2724,12 +2774,71 @@ async def test_a_wave_cancelled_after_it_was_sent_settles_each_page_from_its_own
     assert stream.report is not None
     assert stream.report.state is TerminalState.CANCELLED
     assert not stream.report.violations
-    outcomes = [event.outcome for event in events if isinstance(event, PageCommandOutcome)][settled_before:]
-    expected = (
-        {CommandSettlement.UNKNOWN: wave[0]}
-        if moment == "on_the_wire"
-        else {CommandSettlement.SUCCESS: wave[0] - 1, CommandSettlement.FAILURE: 1}
-    )
-    assert dict(Counter(outcomes)) == expected
-    closure = BindingClosure.UNKNOWN if moment == "on_the_wire" else BindingClosure.FAILURE
+    settled = [event.outcome for event in events if isinstance(event, PageCommandOutcome)][settled_before:]
+    negative, closure = _CANCELLED_WAVE[moment]
+    expected = Counter({settlement: size if count is None else count for settlement, count in negative.items()})
+    expected[CommandSettlement.SUCCESS] = size - expected.total()
+    assert Counter(settled) == +expected
     assert [event.closure for event in events if isinstance(event, BindingTerminal)] == [closure]
+
+
+def _batches(transport: ResponderTransport) -> int:
+    return sum(sent.method == "batch" for sent in transport.requests)
+
+
+@pytest.mark.parametrize("wave", [1, 2, 3])
+@pytest.mark.parametrize("end", ["cancel", "interrupt", "budget", "transport"])
+def test_a_traversal_ended_while_a_wave_is_on_the_wire_settles_every_page_before_rejecting_it(
+    monkeypatch: pytest.MonkeyPatch, end: str, wave: int
+) -> None:
+    # The first wave is the boundary wave, the later ones are range waves. Whatever ends the traversal while one is
+    # on the wire (its reader's cancellation, an interrupt, the elapsed budget, a transport failure), every page is
+    # settled before the ledger rejects it, and the pages that may have run make the binding's closure unknown.
+    events: list[object] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    keyset = KeysetTransport(tuple(range(1, 2000)))
+    on_the_wire = asyncio.Event()
+
+    async def respond(request: Request) -> object:
+        if len(transport.requests) == wave:
+            on_the_wire.set()
+            if end == "interrupt":
+                raise KeyboardInterrupt
+            if end == "transport":
+                raise RuntimeError("transport")
+            await asyncio.Future[None]()
+        return await keyset.send(request, attempt_timeout=1.0, max_response_bytes=1 << 20)
+
+    transport = ResponderTransport(respond, host=keyset.host)
+    policy = ExecutionPolicy(max_elapsed=0.2) if end == "budget" else None
+    stream = _stream(transport, RangeKeysetExecution(StableIntegerKeysetContract()), policy=policy)
+
+    async def main() -> None:
+        reader = asyncio.create_task(_drain_rows(stream))
+        if end == "cancel":
+            await asyncio.wait_for(on_the_wire.wait(), HANG_BOUND)
+            reader.cancel()
+        await asyncio.wait_for(asyncio.gather(reader, return_exceptions=end != "interrupt"), HANG_BOUND)
+
+    if end == "interrupt":
+        with pytest.raises(KeyboardInterrupt):
+            asyncio.run(main())
+    else:
+        asyncio.run(main())
+
+    assert stream.report is not None
+    assert not [violation.code for violation in stream.report.violations if violation.code.startswith("completion")]
+    scheduled = sum(isinstance(event, PageScheduled) for event in events)
+    assert sum(isinstance(event, PageCommandOutcome) for event in events) == scheduled
+    assert [event.closure for event in events if isinstance(event, BindingTerminal)] == [BindingClosure.UNKNOWN]
+
+
+async def _drain_rows(stream: AsyncIterator[object]) -> None:
+    async for _ in stream:
+        pass

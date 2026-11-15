@@ -72,6 +72,8 @@ class _ExecutionFacts:
 
     execution: Execution
     unproven: B24ApiError | None = None
+    # Answered with a success: the failure is not the command's but its page's, ended before it took the answer.
+    succeeded: bool = False
 
 
 def record_dispatch(error: BaseException, *, possibly_executed: bool, unproven: B24ApiError | None = None) -> None:
@@ -98,12 +100,23 @@ def record_withheld(error: BaseException) -> None:
     error.__dict__[_FACTS] = _ExecutionFacts(Execution.WITHHELD)
 
 
-def record_execution(error: BaseException, known: Execution) -> None:
-    """Record on ``error`` what is ``known`` about its command from elsewhere; nothing for one never sent."""
-    if known is Execution.WITHHELD:
-        record_withheld(error)
-    elif known.dispatched:
-        record_dispatch(error, possibly_executed=known is Execution.POSSIBLY_RUN)
+def record_execution(error: BaseException, known: Execution, *, succeeded: bool = False) -> None:
+    """Record on ``error`` what is ``known`` about its command from elsewhere, such as a batch it was a command of.
+
+    ``succeeded`` is set for a command answered with a success, whose page ended before it took the answer.
+    """
+    error.__dict__[_FACTS] = _ExecutionFacts(known, succeeded=succeeded and known is Execution.ANSWERED)
+
+
+def settled_as(known: Execution, *, succeeded: bool) -> CommandSettlement:
+    """Return the completion settlement of a command known so: one answered with a success succeeded."""
+    return CommandSettlement.SUCCESS if succeeded else known.settlement
+
+
+def settlement(error: object) -> CommandSettlement:
+    """Return the completion settlement of a command whose page failed with ``error`` (``settled_as``)."""
+    facts = getattr(error, _FACTS, None)
+    return settled_as(execution(error), succeeded=isinstance(facts, _ExecutionFacts) and facts.succeeded)
 
 
 def execution(error: object) -> Execution:
@@ -247,4 +260,6 @@ __all__ = [
     "record_dispatch",
     "record_execution",
     "record_withheld",
+    "settled_as",
+    "settlement",
 ]

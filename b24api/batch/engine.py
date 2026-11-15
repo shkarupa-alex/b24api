@@ -24,7 +24,6 @@ from b24api.batch.outcome import (
     BatchSuccess,
 )
 from b24api.batch.v3 import _V3Resolution
-from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.policy import (
     ReplayDisposition,
@@ -57,9 +56,10 @@ from b24api.execution.executor import (
     _SendPlan,
     _Settled,
 )
-from b24api.execution.facts import Execution, execution
+from b24api.execution.facts import Execution, execution, record_execution, settled_as
 
 if TYPE_CHECKING:
+    from b24api.contracts.completion import CommandSettlement
     from b24api.contracts.evidence import ResponseEvidence
     from b24api.contracts.json import JsonValue
     from b24api.contracts.policy import ExecutionPolicy
@@ -282,10 +282,16 @@ class BatchProgress:
         self._opaque = frozenset(command.index for command in commands)
 
     def settlement(self, index: int) -> CommandSettlement:
-        """Return how command ``index`` settles from what it did so far: a success it was answered with succeeded."""
-        if isinstance(self._outcome(index), BatchSuccess):
-            return CommandSettlement.SUCCESS
-        return self.execution(index).settlement
+        """Return how command ``index`` settles from what it did so far (``settled_as``)."""
+        return settled_as(self.execution(index), succeeded=self._succeeded(index))
+
+    def record(self, error: BaseException, index: int) -> None:
+        """Record on ``error``, its page's failure, what command ``index`` did so far, a success included."""
+        record_execution(error, self.execution(index), succeeded=self._succeeded(index))
+
+    def _succeeded(self, index: int) -> bool:
+        """Return whether command ``index`` was answered with a success."""
+        return isinstance(self._outcome(index), BatchSuccess)
 
     def execution(self, index: int) -> Execution:
         """Return what command ``index`` is known to have done so far."""
@@ -298,9 +304,7 @@ class BatchProgress:
         lineage = _Lineage() if waiting is None else waiting.lineage
         if index in self._round and self._attempts is not None:
             lineage = lineage.after(self._attempts.lineage)
-        if lineage.latest is _Settled.NOTHING_SENT:
-            return Execution.NOT_SENT
-        return Execution.ANSWERED if lineage.left_open() is None else Execution.POSSIBLY_RUN
+        return lineage.unsent()
 
 
 @dataclass(frozen=True, slots=True)

@@ -18,6 +18,8 @@ from b24api.errors import CapabilityError
 from b24api.references.dispatch import _BatchPageError, _DecodeOptions, _failed_settlement
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from b24api.batch.outcome import BatchOutcome
     from b24api.completion.reference_recorder import ReferenceFastLedger
     from b24api.contracts.request import Request
@@ -72,10 +74,10 @@ class SharedWaveEngine:
         """Return ``BATCH``: a finish page travels as one command of a shared physical batch."""
         return PageDispatch.BATCH
 
-    async def execute_page(self, request: Request, *, context: ExecutionContext) -> BatchOutcome:
+    async def execute_page(self, request: Request, *, command_id: str, context: ExecutionContext) -> BatchOutcome:
         """Queue one finish page as a one-command wave, decoded as strictly as every wave command."""
         (outcome,) = await self.execute_requests(
-            (request,),
+            {command_id: request},
             context=context,
             strict_envelope=True,
             strict_json_members=True,
@@ -84,33 +86,31 @@ class SharedWaveEngine:
 
     async def execute_requests(
         self,
-        requests: tuple[Request, ...],
+        pages: Mapping[str, Request],
         *,
         context: ExecutionContext,
         advisory_totals: bool = False,
         strict_envelope: bool = False,
         strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
-        """Queue one atomic wave and return its correlated outcomes in request order."""
+        """Queue one atomic wave of scheduled pages, by command id, and return their outcomes in that order."""
         if context is not self._context:
             raise RuntimeError("a fast keyset wave must be charged to the shared operation context")
-        if not requests or len(requests) > self._cap:
+        if not pages or len(pages) > self._cap:
             raise ValueError("fast keyset wave must contain 1..portal_command_cap requests")
         options = _DecodeOptions(advisory_totals, strict_envelope, strict_json_members)
         errors: dict[int, BaseException] = {}
         key = self._run.producer_key
         self._state.runnable.discard(key)
         self._state.touch()
-        tasks = self._start(requests, options, errors)
+        tasks = self._start(tuple(pages.values()), options, errors)
         try:
             await asyncio.wait(tasks)
         except BaseException:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            self._ledger.settle_wave(
-                tuple(_settlement(task, errors.get(index)) for index, task in enumerate(tasks)),
-            )
+            self._settle(tuple(pages), tasks, errors)
             raise
         # Each command's error is already recorded in ``errors``; retrieve it so it is not logged as lost.
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -132,14 +132,22 @@ class SharedWaveEngine:
             failure = failure or error
         if failure is not None:
             # A whole-envelope failure is raised, as the flat engine raises it; every command settles first.
-            self._ledger.settle_wave(
-                tuple(_settlement(task, errors.get(index)) for index, task in enumerate(tasks)),
-            )
+            self._settle(tuple(pages), tasks, errors)
             raise failure
         # Only a wave the runtime receives may lead to another: a whole-envelope failure ends the binding.
         self._state.runnable.add(key)
         self._state.touch()
         return tuple(outcomes)
+
+    def _settle(
+        self,
+        command_ids: tuple[str, ...],
+        tasks: tuple[asyncio.Task[_DispatchedPage], ...],
+        errors: dict[int, BaseException],
+    ) -> None:
+        """Settle every page of a wave whose call raises, by id, from what its own command's dispatch proved."""
+        for index, (command_id, task) in enumerate(zip(command_ids, tasks, strict=True)):
+            self._ledger.settle(command_id, _settlement(task, errors.get(index)))
 
     def _start(
         self,

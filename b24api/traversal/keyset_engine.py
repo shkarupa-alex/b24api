@@ -10,8 +10,11 @@ from typing import TYPE_CHECKING
 from b24api.batch.engine import BatchExecutor, BatchProgress
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.report import PageDispatch
+from b24api.execution.facts import settlement
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from b24api.batch.outcome import BatchOutcome
     from b24api.completion.fast_recorder import FastPageLedger
     from b24api.contracts.request import Request
@@ -39,14 +42,14 @@ class FlatWaveEngine:
 
     async def execute_requests(
         self,
-        requests: tuple[Request, ...],
+        pages: Mapping[str, Request],
         *,
         context: ExecutionContext,
         advisory_totals: bool = False,
         strict_envelope: bool = False,
         strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
-        """Execute one wave as one private physical batch.
+        """Execute one wave of scheduled pages, by command id, as one private physical batch.
 
         A wave the traversal's end interrupts, its cancellation included, sends nothing more: each of its pages
         settles from what its own command is known to have done, as the shared engine settles a binding's wave.
@@ -54,7 +57,7 @@ class FlatWaveEngine:
         progress = BatchProgress()
         try:
             return await self._batches.execute_requests(
-                requests,
+                tuple(pages.values()),
                 context=context,
                 advisory_totals=advisory_totals,
                 strict_envelope=strict_envelope,
@@ -62,12 +65,17 @@ class FlatWaveEngine:
                 progress=progress,
             )
         except BaseException:
-            self._ledger.settle_wave(tuple(progress.settlement(index) for index in range(len(requests))))
+            for index, command_id in enumerate(pages):
+                self._ledger.settle(command_id, progress.settlement(index))
             raise
 
-    async def execute_page(self, request: Request, *, context: ExecutionContext) -> BatchOutcome:
-        """Execute one finish page as a direct request; its failure is raised by the executor."""
-        response = await self._executor.execute(request, context=context)
+    async def execute_page(self, request: Request, *, command_id: str, context: ExecutionContext) -> BatchOutcome:
+        """Execute one finish page as a direct request; its failure, raised by the executor, settles the page."""
+        try:
+            response = await self._executor.execute(request, context=context)
+        except BaseException as error:
+            self._ledger.settle(command_id, settlement(error))
+            raise
         return BatchSuccess(0, "finish", request, response.result, response=response)
 
 

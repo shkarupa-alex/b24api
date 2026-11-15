@@ -8,7 +8,7 @@ from collections import deque
 from typing import TYPE_CHECKING, Self
 
 from b24api.completion.fast_recorder import FastCompletionRecorder
-from b24api.contracts.completion import CleanupState, CommandSettlement
+from b24api.contracts.completion import CleanupState
 from b24api.contracts.json import FrozenJson, JsonValue, thaw_json
 from b24api.contracts.policy import (
     CompletionAssurance,
@@ -23,7 +23,6 @@ from b24api.contracts.report import (
 )
 from b24api.errors import B24ApiError, BudgetExceededError, IncompleteTraversalError, PaginationError
 from b24api.execution.context import await_cancellation_resistant, await_cleanup_resistant, rearm_cancellation
-from b24api.execution.facts import execution
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 
@@ -122,7 +121,7 @@ class KeysetFastStream:
             )
         if cleanup is not None and state is KernelState.COMPLETED:
             state, reason = KernelState.FAILED, "fast keyset cleanup failed"
-        finalize_cancellation = await await_cancellation_resistant(self._finalize(state, reason, primary))
+        finalize_cancellation = await await_cancellation_resistant(self._finalize(state, reason))
         cancellation = finalize_cancellation or outcome.cancellation
         self._closed = self._runtime.closed
         if cleanup is not None and primary is not None:
@@ -137,7 +136,7 @@ class KeysetFastStream:
         if cancellation is not None and not isinstance(primary, asyncio.CancelledError):
             rearm_cancellation(cancellation)
 
-    async def _finalize(self, state: KernelState, reason: str, primary: BaseException | None) -> None:
+    async def _finalize(self, state: KernelState, reason: str) -> None:
         if self.report.state is not KernelState.NOT_STARTED:
             return
         snapshot = await self._runtime.context.snapshot()
@@ -183,8 +182,6 @@ class KeysetFastStream:
             cleanup=cleanup,
             closure=closure,
             qualified_witnesses=qualified_witnesses,
-            # A page whose dispatch raised settles from the facts of the failure that ended the traversal.
-            unsettled=CommandSettlement.NOT_EXECUTED if primary is None else execution(primary).settlement,
         )
 
 

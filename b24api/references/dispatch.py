@@ -21,7 +21,7 @@ from b24api.execution import (
     Executor,
     WorkClass,
 )
-from b24api.execution.facts import Execution, execution, record_dispatch, record_execution
+from b24api.execution.facts import Execution, execution, record_dispatch, record_execution, settlement
 from b24api.references.outcome import (
     KernelReferenceFailure,
     KernelReferenceItem,
@@ -263,13 +263,16 @@ class _PendingBatch:
     progress: BatchProgress | None = None
     position: int = 0
 
-    def execution(self) -> Execution:
-        """Return what the page's command is known to have done once its wave was sent.
+    def record(self, error: BaseException) -> None:
+        """Record on the page's ``error`` what its command is known to have done once its wave was sent.
 
         Its outcome in the chunk says, once final or once the chunk has ended; until then the chunk, which runs on
         for the other pages, may still send it, so it may run (``BatchProgress``).
         """
-        return Execution.POSSIBLY_RUN if self.progress is None else self.progress.execution(self.position)
+        if self.progress is None:
+            record_execution(error, Execution.POSSIBLY_RUN)
+        else:
+            self.progress.record(error, self.position)
 
     def mark_sent(self) -> bool:
         """Hand the page to its wave's send, lifting its admission deadline; ``False`` when it was abandoned.
@@ -488,8 +491,8 @@ def _failed_execution(error: BaseException) -> Execution:
 
 
 def _failed_settlement(error: BaseException) -> CommandSettlement:
-    """Settle a page whose dispatch raised from its execution facts: possibly run, failed, or never sent."""
-    return _failed_execution(error).settlement
+    """Settle a page whose dispatch raised from its execution facts: succeeded, possibly run, failed, or never sent."""
+    return settlement(error.failure.error if isinstance(error, _BatchPageError) else error)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1004,7 +1007,7 @@ class _BatchPageDispatcher:
             self._abandon(pending, reservation)
             if pending.dispatch_started:
                 # A page cancelled after its wave was sent may have executed: what its command did says how.
-                record_execution(error, pending.execution())
+                pending.record(error)
             raise
         except BaseException:
             # A refusal by the deadline included: a page whose wave was sent no longer has one, so it was never sent.

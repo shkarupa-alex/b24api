@@ -49,7 +49,12 @@ command answered, by its entry or with its envelope, was answered, and one answe
 succeeded; one whose latest send, or one before it, may have run without an answer may have run; one
 never sent was not sent. Until the chunk ends, a command without a final outcome may still be sent (a
 replay it waits for), so a page cancelled meanwhile may have run; a REST v3 group keeps its state to
-itself, so its commands in progress may have run. `b24api.execution.facts` holds the one
+itself, so its commands in progress may have run. A fast keyset wave engine, flat or shared by reference
+bindings, settles each page it was handed by its command id from what that command did, also when its call
+raises; the page ledger (`FastPageLedger`) settles a page never handed to an engine as not executed before
+it rejects it, the one rule on every path. A page answered with a success settles as a success on every
+path: the facts recorded on a cancelled reference page keep that its command succeeded
+(`facts.settlement`). `b24api.execution.facts` holds the one
 mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
 (`Execution.settlement`), and `b24api.traversal.page_failure` maps it to a failed page's trace: unknown
 only when it may have run, otherwise rejected. Classic and REST v3 batch, `call()`, direct and batch

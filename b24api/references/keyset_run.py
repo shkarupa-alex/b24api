@@ -15,12 +15,11 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol
 
 from b24api.completion.reference_recorder import ReferenceFastLedger
-from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import KeysetSelectionSummary, Violation, ViolationSeverity
 from b24api.errors import PaginationError
 from b24api.references.budget_view import BindingBudgetView, RowLease
-from b24api.references.dispatch import _DoneEvent, _failed_settlement, _FailureEvent, _PageEvent
+from b24api.references.dispatch import _DoneEvent, _FailureEvent, _PageEvent
 from b24api.references.wave_engine import SharedWaveEngine, WaveHost
 from b24api.traversal.keyset_eligibility import reject_unencodable_fast_request, validate_fast_keyset
 from b24api.traversal.keyset_observation import FastTraceRecorder
@@ -113,7 +112,7 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
             await _deliver(host, run, runtime, rows)
         closure, witnesses = runtime.completion_closure()
         await runtime.aclose()
-        ledger.close(successful=True, reason=KernelState.COMPLETED.value, unsettled=CommandSettlement.NOT_EXECUTED)
+        ledger.close(successful=True, reason=KernelState.COMPLETED.value)
         closure = _witnessed(closure, ledger)
         report = runtime.report_fragment()
         await host.publish_terminal(
@@ -135,7 +134,7 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
         # The scheduler's per-reference boundary turns the error into this binding's terminal event.
         if runtime is not None and not runtime.closed:
             await runtime.aclose()
-        ledger.close(successful=False, reason=KernelState.FAILED.value, unsettled=_failed_settlement(error))
+        ledger.close(successful=False, reason=KernelState.FAILED.value)
         run.failure = _FailureEvent(
             run.work,
             error,
