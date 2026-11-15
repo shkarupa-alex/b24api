@@ -7,12 +7,13 @@ sequential finish page, which no other command could share, travels as one direc
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from b24api.batch.engine import BatchExecutor
+from b24api.batch.engine import BatchExecutor, BatchProgress
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.report import PageDispatch
 
 if TYPE_CHECKING:
     from b24api.batch.outcome import BatchOutcome
+    from b24api.completion.fast_recorder import FastPageLedger
     from b24api.contracts.request import Request
     from b24api.execution import ExecutionContext, Executor
 
@@ -20,10 +21,11 @@ if TYPE_CHECKING:
 class FlatWaveEngine:
     """``WaveEngine`` of a flat traversal: private batches for waves, a direct request per finish page."""
 
-    def __init__(self, executor: Executor) -> None:
-        """Bind the operation executor and its private batch executor."""
+    def __init__(self, executor: Executor, ledger: FastPageLedger) -> None:
+        """Bind the operation executor, its private batch executor and the traversal's page ledger."""
         self._executor = executor
         self._batches = BatchExecutor(executor)
+        self._ledger = ledger
 
     @property
     def portal_command_cap(self) -> int:
@@ -44,14 +46,24 @@ class FlatWaveEngine:
         strict_envelope: bool = False,
         strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
-        """Execute one wave as one private physical batch."""
-        return await self._batches.execute_requests(
-            requests,
-            context=context,
-            advisory_totals=advisory_totals,
-            strict_envelope=strict_envelope,
-            strict_json_members=strict_json_members,
-        )
+        """Execute one wave as one private physical batch.
+
+        A wave the traversal's end interrupts, its cancellation included, sends nothing more: each of its pages
+        settles from what its own command is known to have done, as the shared engine settles a binding's wave.
+        """
+        progress = BatchProgress()
+        try:
+            return await self._batches.execute_requests(
+                requests,
+                context=context,
+                advisory_totals=advisory_totals,
+                strict_envelope=strict_envelope,
+                strict_json_members=strict_json_members,
+                progress=progress,
+            )
+        except BaseException:
+            self._ledger.settle_wave(tuple(progress.settlement(index) for index in range(len(requests))))
+            raise
 
     async def execute_page(self, request: Request, *, context: ExecutionContext) -> BatchOutcome:
         """Execute one finish page as a direct request; its failure is raised by the executor."""

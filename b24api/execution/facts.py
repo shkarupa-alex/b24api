@@ -98,6 +98,14 @@ def record_withheld(error: BaseException) -> None:
     error.__dict__[_FACTS] = _ExecutionFacts(Execution.WITHHELD)
 
 
+def record_execution(error: BaseException, known: Execution) -> None:
+    """Record on ``error`` what is ``known`` about its command from elsewhere; nothing for one never sent."""
+    if known is Execution.WITHHELD:
+        record_withheld(error)
+    elif known.dispatched:
+        record_dispatch(error, possibly_executed=known is Execution.POSSIBLY_RUN)
+
+
 def execution(error: object) -> Execution:
     """Return what the recorded facts say about whether the command of a failure ran.
 
@@ -237,5 +245,6 @@ __all__ = [
     "http_success",
     "possible_execution",
     "record_dispatch",
+    "record_execution",
     "record_withheld",
 ]

@@ -81,10 +81,12 @@
   violation.** When the final confirmation of `iter_list_keyset()` under these strategies failed (an
   error answer, a lost answer), or the caller cancelled the stream while a wave was in flight, the report
   recorded `completion_rejection_before_settlement` and `completion_invalid_binding_terminal` beside the
-  failure. Such a page now settles from the facts of the failure that ended the run: not executed when it
-  was never sent, unknown when it may have run. A wave cancelled after it was sent, also while it waits to
-  send a command again, settles unknown, as a reference binding's wave already did; its binding closes as
-  unknown.
+  failure. Such a page now settles from what its own command did: a wave the end interrupts settles each
+  page from its command's answer (a success, an answered failure or refusal), as unknown only when the
+  command's send may have run without an answer (a cancellation while the wave is on the wire), and as
+  not executed when it was never sent; a finish page settles from the facts of its failure. A reference
+  binding's page cancelled after its wave was sent was unknown even when its command had been answered;
+  it now keeps that answer, and is unknown only while its wave may still send it.
 - **A counted tail page larger than its share is an answered failure.** When a tail page of
   `iter_list_counted()` decoded to more rows than `max_buffered_rows` left it, the traversal raised
   `IncompleteTraversalError` caused by `BudgetExceededError` ("buffered row budget exhausted"), and the

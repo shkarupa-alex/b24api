@@ -11,7 +11,7 @@ from enum import Enum
 from itertools import accumulate
 from typing import TYPE_CHECKING, cast
 
-from b24api.batch.engine import BatchExecutor
+from b24api.batch.engine import BatchExecutor, BatchProgress
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.report import PageDispatch
@@ -21,7 +21,7 @@ from b24api.execution import (
     Executor,
     WorkClass,
 )
-from b24api.execution.facts import Execution, execution, record_dispatch
+from b24api.execution.facts import Execution, execution, record_dispatch, record_execution
 from b24api.references.outcome import (
     KernelReferenceFailure,
     KernelReferenceItem,
@@ -259,6 +259,17 @@ class _PendingBatch:
     options: _DecodeOptions = _PLAIN_DECODING
     # The operation deadline of the page's admission; the send of its wave lifts it.
     admission: asyncio.Timeout | None = None
+    # Where the page's command stands in the chunk its wave sends, and its index there.
+    progress: BatchProgress | None = None
+    position: int = 0
+
+    def execution(self) -> Execution:
+        """Return what the page's command is known to have done once its wave was sent.
+
+        Its outcome in the chunk says, once final or once the chunk has ended; until then the chunk, which runs on
+        for the other pages, may still send it, so it may run (``BatchProgress``).
+        """
+        return Execution.POSSIBLY_RUN if self.progress is None else self.progress.execution(self.position)
 
     def mark_sent(self) -> bool:
         """Hand the page to its wave's send, lifting its admission deadline; ``False`` when it was abandoned.
@@ -992,8 +1003,8 @@ class _BatchPageDispatcher:
             future.cancel()
             self._abandon(pending, reservation)
             if pending.dispatch_started:
-                # A page cancelled after its wave was sent may have executed; settlement must say so.
-                record_dispatch(error, possibly_executed=True)
+                # A page cancelled after its wave was sent may have executed: what its command did says how.
+                record_execution(error, pending.execution())
             raise
         except BaseException:
             # A refusal by the deadline included: a page whose wave was sent no longer has one, so it was never sent.
@@ -1220,6 +1231,9 @@ class _BatchPageDispatcher:
 
     async def _send(self, chunk: list[_PendingBatch]) -> None:
         requests = tuple(item.request for item in chunk)
+        progress = BatchProgress()
+        for position, item in enumerate(chunk):
+            item.progress, item.position = progress, position
         self.batch_commands += len(chunk)
         options = chunk[0].options
         try:
@@ -1230,6 +1244,7 @@ class _BatchPageDispatcher:
                 strict_envelope=options.strict_envelope,
                 strict_json_members=options.strict_json_members,
                 on_envelope=self._count_batch_request,
+                progress=progress,
             )
             self._correlate(chunk, outcomes)
         except asyncio.CancelledError:

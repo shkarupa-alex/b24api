@@ -264,13 +264,5 @@ class ReferenceFastLedger(FastPageLedger):
         if outcome is CommandSettlement.UNKNOWN:
             self._binding.mark_unknown()
 
-    def settle_wave(self, outcomes: tuple[CommandSettlement, ...]) -> None:
-        """Settle the trailing scheduled pages of a wave whose engine call raised, in schedule order."""
-        unsettled = [command_id for command_id, page in self._active.items() if not page.settled]
-        if len(outcomes) > len(unsettled):
-            raise RuntimeError("fast wave settlement exceeds its scheduled pages")
-        for command_id, outcome in zip(unsettled[len(unsettled) - len(outcomes) :], outcomes, strict=True):
-            self.settle(command_id, outcome)
-
 
 __all__ = ["ReferenceBindingRecorder", "ReferenceCompletionRecorder", "ReferenceFastLedger"]

@@ -40,11 +40,16 @@ The application still owns facts that a generic REST client cannot infer:
 
 Whether a command may have run is one execution fact, recorded on its failure by the code that sent or
 withheld it: the executor for its own sends, the classic and REST v3 batch dialects for the commands of
-an envelope they decode, the classic batch engine for the commands of an envelope cancelled after it was
-sent (between its rounds or before a replay's send, which the executor alone does not see), and the batch
-page dispatcher of references and list traversal for a page cancelled after its wave was sent. A page
-whose fetch ended before its wave left, cancelled or past its admission deadline, is never sent, so it
-stays proven not run. `b24api.execution.facts` holds the one
+an envelope they decode, and the batch page dispatcher of references and list traversal for a page
+cancelled after its wave was sent. A page whose fetch ended before its wave left, cancelled or past its
+admission deadline, is never sent, so it stays proven not run. A caller whose wait for a running chunk
+ends early (a cancelled page, or a fast keyset wave the traversal's end interrupts) reads what each of
+its commands did from the chunk's `BatchProgress`, which the batch engine keeps by the same rule: a
+command answered, by its entry or with its envelope, was answered, and one answered with a success
+succeeded; one whose latest send, or one before it, may have run without an answer may have run; one
+never sent was not sent. Until the chunk ends, a command without a final outcome may still be sent (a
+replay it waits for), so a page cancelled meanwhile may have run; a REST v3 group keeps its state to
+itself, so its commands in progress may have run. `b24api.execution.facts` holds the one
 mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
 (`Execution.settlement`), and `b24api.traversal.page_failure` maps it to a failed page's trace: unknown
 only when it may have run, otherwise rejected. Classic and REST v3 batch, `call()`, direct and batch

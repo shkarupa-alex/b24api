@@ -7,6 +7,7 @@ import asyncio
 import dataclasses
 import json
 import time
+from collections import Counter
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs
@@ -2644,36 +2645,43 @@ async def test_a_wave_retry_the_deadline_refuses_ends_the_traversal_with_the_bud
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["range", "partitioned", "auto"])
-@pytest.mark.parametrize("answered_at", [2, 3])
-async def test_a_wave_cancelled_while_it_waits_for_its_replay_settles_unknown(
-    monkeypatch: pytest.MonkeyPatch, kind: str, answered_at: int
+@pytest.mark.parametrize("cancelled_at", [2, 3])
+@pytest.mark.parametrize("moment", ["on_the_wire", "before_the_replay"])
+async def test_a_wave_cancelled_after_it_was_sent_settles_each_page_from_its_own_command(
+    monkeypatch: pytest.MonkeyPatch, kind: str, cancelled_at: int, moment: str
 ) -> None:
-    # The wave left and was answered: one command transiently, the rest with their pages. The caller cancels while
-    # the wave waits to send that command again, so every page it had in flight may have run, none proven not run.
-    waiting = asyncio.Event()
+    # Cancelled while its batch is on the wire, a wave's every page may have run. Cancelled once the batch was
+    # answered, while the wave waits to send again the one command the server refused (QUERY_LIMIT_EXCEEDED), each
+    # page keeps its own answer: the answered pages succeeded, and the refused one is an answered failure, as it
+    # is when the budget ends its replay. None of them is unknown, and none is claimed never sent.
+    reached = asyncio.Event()
     replay_after = Executor.replay_after
 
     async def observed_replay_after(
         self: Executor, context: ExecutionContext, *, attempts: _RequestAttempts, pause: _Pause
     ) -> None:
-        waiting.set()
+        reached.set()
         await replay_after(self, context, attempts=attempts, pause=pause)
 
     monkeypatch.setattr(Executor, "replay_after", observed_replay_after)
     keyset = KeysetTransport(tuple(range(1, 3001)))
+    wave: list[int] = []
 
     async def respond(request: Request) -> WireResponse:
         answer = await keyset.send(request, attempt_timeout=1.0, max_response_bytes=1 << 20)
-        if request.method != "batch" or sum(sent.method == "batch" for sent in transport.requests) != answered_at:
+        if request.method != "batch" or sum(sent.method == "batch" for sent in transport.requests) != cancelled_at:
             return answer
         body = json.loads(answer.body)
+        wave.append(len(body["result"]["result"]))
+        if moment == "on_the_wire":
+            reached.set()
+            await asyncio.Event().wait()
         limited = min(body["result"]["result"])
         del body["result"]["result"][limited]
         body["result"]["result_error"] = {limited: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
         return WireResponse(200, answer.headers, json.dumps(body).encode())
 
     transport = ResponderTransport(respond, host=keyset.host)
-    execution = _fast_execution(kind)
     events: list[object] = []
     emit = CompletionGate.emit
 
@@ -2682,25 +2690,28 @@ async def test_a_wave_cancelled_while_it_waits_for_its_replay_settles_unknown(
         emit(gate, event)
 
     monkeypatch.setattr(CompletionGate, "emit", observe)
-    stream = _stream(transport, execution)
+    stream = _stream(transport, _fast_execution(kind))
 
     async def consume() -> None:
         async for _ in stream:
             pass
 
     task = asyncio.create_task(consume())
-    await waiting.wait()
+    await reached.wait()
+    settled_before = sum(isinstance(event, PageCommandOutcome) for event in events)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
     assert stream.report is not None
     assert stream.report.state is TerminalState.CANCELLED
-    unsettled = [
-        event.outcome
-        for event in events
-        if isinstance(event, PageCommandOutcome) and event.outcome is not CommandSettlement.SUCCESS
-    ]
-    assert unsettled
-    assert set(unsettled) == {CommandSettlement.UNKNOWN}
-    assert [event.closure for event in events if isinstance(event, BindingTerminal)] == [BindingClosure.UNKNOWN]
+    assert not stream.report.violations
+    outcomes = [event.outcome for event in events if isinstance(event, PageCommandOutcome)][settled_before:]
+    expected = (
+        {CommandSettlement.UNKNOWN: wave[0]}
+        if moment == "on_the_wire"
+        else {CommandSettlement.SUCCESS: wave[0] - 1, CommandSettlement.FAILURE: 1}
+    )
+    assert dict(Counter(outcomes)) == expected
+    closure = BindingClosure.UNKNOWN if moment == "on_the_wire" else BindingClosure.FAILURE
+    assert [event.closure for event in events if isinstance(event, BindingTerminal)] == [closure]
