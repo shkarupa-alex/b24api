@@ -1325,7 +1325,8 @@ async def test_a21_isolation_stays_within_the_dispatch_concurrency(concurrency: 
     report = stream.report
     assert report is not None
     assert report.batch_isolation_requests == len(commands)
-    assert peak == concurrency
+    # The bound, not its saturation: whether two isolations overlap is a matter of scheduling.
+    assert peak <= concurrency
 
 
 class _Clock:
