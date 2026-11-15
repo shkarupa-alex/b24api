@@ -303,20 +303,28 @@ outcome.
   dispatcher's senders; and `OperationRunner.__anext__` where a read ends, which is where an inline
   kernel (`batch()`, `iter_list*`, the fast keyset) first catches the interrupt its own send raised, its
   end then raising what the kernel ends with (a failed cleanup, say). Whatever later handles that
-  failure (a scheduler's close, an isolation's cleanup) may drop it freely. The latch's state is explicit
+  failure (a scheduler's close, say) may drop it freely. The latch's state is explicit
   (`LatchState`): `ARMED` while the operation runs, when the first interrupt wakes the owner; `ENDING`
   once cleanup starts, when an interrupt is latched for the end and wakes nothing (an inline kernel's
   cleanup runs in the very read a wake would cancel); `CLOSED` once the end took it. The wake ends the
   operation at once: a read in flight is cancelled and raises the interrupt (a read whose own task
   latched it and still returned an item raises it instead of the item); with no read in flight,
   between reads, the operation ends in a task of its own (`OperationRunner._end_between_reads`), which
-  cleans up, publishes and hands the interrupt to the event loop, since no reader is there to raise it
-  and the reader may never read again. That stream is ended: a later read raises
-  `StopAsyncIteration` and a close returns, neither raising the interrupt again.
-  `OperationRunner._raise_latched` is the one raise point: after the report is published it closes
-  the latch and raises its interrupt, with the report attached (`.report`), whatever ended the stream,
-  from every end of the stream (the read or close that ended it, and a read a concurrent close ended),
-  or hands it on when the operation ended between reads. The report has one shape for it, applied by
+  cleans up and publishes, since no reader is there to end it and the reader may never read again. The
+  end is one transition for every caller: the operation runs (`NEW`, `PULLING`), ends (`CLOSING`,
+  whoever began the end) and has ended (`CLOSED`, the report published). A read or close that finds it
+  ending waits for that transition (`OperationRunner._await_end`), so no reader finds the stream ended
+  before its report exists, and then raises the end's interrupt. An end between reads delivers the
+  interrupt once: to the reads and closes that waited for it, or, with none waiting, to the event loop.
+  A waiter cancelled before the end is over stops waiting; one cancelled after still raises it. Once
+  ended, a later read raises `StopAsyncIteration` and a close returns, neither raising the interrupt
+  again. `OperationRunner._raise_latched` is the one raise point: after the report is published it
+  closes the latch and raises its interrupt, with the report attached (`.report`), whatever ended the
+  stream, from every caller that sees the end (the read or close that ended it, a read a concurrent
+  close ended, a read or close that waited for it), or hands it on when nobody sees an end that began
+  between reads. The reader's own cancellation that its read absorbed before cleanup began (handed to
+  the read, which ended in its own failure, an interrupt say) is raised as the end, but never recorded
+  as a failed close: only a cancellation that arrived while cleanup ran is. The report has one shape for it, applied by
   the runner to whichever report it publishes, the family's or the fallback after a failed finalization
   (`LifecycleHooks.interrupted`, `with_interrupt`: failed, `INTERRUPTED_REASON`, the earlier violations
   kept, one `interrupted` violation last). `close_owned_resources` raises the client's close's first
@@ -334,7 +342,7 @@ outcome.
   report counts an item as emitted only once `LifecycleHooks.delivered` says the
   reader has it. Every task the library starts around caller code (a source's pull and close, the
   worker-thread hop, the reference scheduler's producer and binding tasks, a wave's or a counted tail's
-  page fetch, a batch's isolation sends, a stream's read and cleanup, the client's close) runs through
+  page fetch, a stream's read and cleanup, the client's close) runs through
   `spawn_settled`: it returns how it ended (`Settled`) and its owner raises the failure. The batch
   dispatcher's senders, which send many pages' commands at once, hand any failure, an interrupt's too,
   to those pages' futures instead, so the fetch that awaits one raises it. So no task ends in a

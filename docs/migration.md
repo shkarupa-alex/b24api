@@ -190,8 +190,8 @@
   ended (for example during the cleanup grace after the budget's end, or while a read waited in the
   source), `asyncio.run()` reported a library task that ended in the source's failure: a source's pull
   or close task, or a stream's read task. Every task the library starts around your code (a source's
-  pull and close, a reference traversal's binding tasks and page fetches, a batch's isolation sends, a
-  stream's read and cleanup, the client's close) now returns how it ended to its owner, which raises
+  pull and close, a reference traversal's binding tasks and page fetches, a stream's read and
+  cleanup, the client's close) now returns how it ended to its owner, which raises
   the failure; only your own task receives it. That includes a `KeyboardInterrupt` or `SystemExit` your
   transport raises under a reference family, which stopped the event loop from inside a library task:
   it now reaches the task that reads the stream.
