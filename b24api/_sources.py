@@ -30,7 +30,13 @@ from enum import Enum
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 from b24api.contracts.violation import retain_violations
-from b24api.execution.context import WORK_OWNERS, CleanupResult, await_cleanup_resistant
+from b24api.execution.context import (
+    WORK_OWNERS,
+    CleanupResult,
+    Settled,
+    await_cleanup_resistant,
+    spawn_settled,
+)
 
 if TYPE_CHECKING:
     from b24api.contracts.report import Violation
@@ -98,9 +104,9 @@ def _in_context[R](step: Awaitable[R], context: contextvars.Context) -> Generato
 
 async def _finish_in_thread[R](call: Callable[[], R]) -> R:
     """Run ``call`` in a worker thread that a cancellation waits for instead of abandoning."""
-    work = asyncio.create_task(asyncio.to_thread(call))
+    work = spawn_settled(asyncio.to_thread(call))
     try:
-        return await asyncio.shield(work)
+        return (await asyncio.shield(work)).unwrap()
     except asyncio.CancelledError:
         with contextlib.suppress(BaseException):
             await work
@@ -130,7 +136,7 @@ class OwnedSource[T](AsyncIterator[T]):
         self._failure = failure
         self._admitted = 0
         self._violations: tuple[Violation, ...] = ()
-        self._close: asyncio.Future[None] | None = None
+        self._close: asyncio.Future[Settled[None]] | None = None
 
     @classmethod
     def adapt(
@@ -198,7 +204,7 @@ class OwnedSource[T](AsyncIterator[T]):
     async def aclose(self) -> CleanupResult:
         """Close the caller iterator once; every call returns the same outcome and none raises."""
         if self._close is None:
-            self._close = asyncio.ensure_future(self._close_iterator())
+            self._close = spawn_settled(self._close_iterator())
         return await await_cleanup_resistant(self._close)
 
     async def _close_iterator(self) -> None:

@@ -14,7 +14,9 @@ it; and an asynchronous source runs every pull and its close in one context of i
 
 from __future__ import annotations
 import asyncio
+import contextlib
 import contextvars
+import threading
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -40,7 +42,7 @@ from b24api.errors import BatchFailed, BudgetExceededError, CleanupOverrunError,
 from tests.scripting import DEADLINE_BUDGET, HANG_BOUND, ResponderTransport, client_for, reached
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 
     from b24api import Bitrix24
     from b24api.contracts.report import OperationReport
@@ -164,7 +166,7 @@ class _Source:
             await reached(self.release)
 
 
-def _stream(client: Bitrix24, family: str, source: AsyncIterator[Any]) -> OperationStream[Any]:
+def _stream(client: Bitrix24, family: str, source: Iterable[Any] | AsyncIterator[Any]) -> OperationStream[Any]:
     direct = DirectDispatch(concurrency=1)
     if family == "iter_cursors":
         return client.iter_cursors(LIST_REQUEST, source, selector=ResultSelector(()), cursor=CURSOR, dispatch=direct)
@@ -518,3 +520,77 @@ async def test_an_asynchronous_source_keeps_one_context_across_its_pulls_and_its
     assert len(resumed) >= len(tokens) - 1
     assert [value for step, value in seen if step == "reset"] == ["caller"] * len(tokens)
     assert _TENANT.get() == "caller"
+
+
+class _Gate:
+    """Where a source's second pull waits, and the release that only the event loop's shutdown gives it.
+
+    An asynchronous source waits on the loop, so the shutdown's cancellation reaches it there. A synchronous one
+    waits in its worker thread, which no cancellation reaches: a task of the test's own releases it as the shutdown
+    cancels that task, after it has asked every task to cancel.
+    """
+
+    def __init__(self) -> None:
+        self.pulling = threading.Event()
+        self._release = threading.Event()
+
+    def sync_source(self, family: str) -> Iterator[Any]:
+        first, second = _items(family)
+        try:
+            yield first
+            self.pulling.set()
+            self._release.wait(HANG_BOUND)
+            yield second
+        finally:
+            raise RuntimeError("the caller's close failed")
+
+    async def async_source(self, family: str) -> AsyncIterator[Any]:
+        first, _second = _items(family)
+        try:
+            yield first
+            self.pulling.set()
+            await asyncio.Event().wait()
+        finally:
+            raise RuntimeError("the caller's close failed")
+
+    async def released_at_shutdown(self) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self._release.set()
+
+
+@pytest.mark.parametrize("ending", ["shutdown_in_pull", "shutdown_in_close"])
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("family", FAMILIES)
+def test_no_library_task_ends_in_a_failure_when_the_event_loop_shuts_down(family: str, kind: str, ending: str) -> None:
+    # ``asyncio.run`` cancels every task left when its coroutine returns, then reports each that ended in an
+    # exception, retrieved or not. The source fails as it is cancelled: its ``finally`` raises. Only the reader takes
+    # that failure; no task of the library's own (a pull, a close, a stream's read or cleanup) may end in it too.
+    reports: list[dict[str, Any]] = []
+    gate = _Gate()
+
+    async def consume(stream: OperationStream[Any]) -> None:
+        with contextlib.suppress(BaseException):
+            async for _item in stream:
+                pass
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reports.append(context))
+        holder = asyncio.create_task(gate.released_at_shutdown())
+        client = await contextlib.AsyncExitStack().enter_async_context(
+            client_for(ResponderTransport(_answer), policy=POLICIES["returns"])
+        )
+        source = gate.sync_source(family) if kind == "sync" else gate.async_source(family)
+        consumer = asyncio.create_task(consume(_stream(client, family, source)))
+        await asyncio.wait_for(asyncio.to_thread(gate.pulling.wait, HANG_BOUND), timeout=HANG_BOUND)
+        if ending == "shutdown_in_close":
+            # The read the reader's cancellation ends closes the source after the pull it cut: shutdown meets that.
+            consumer.cancel()
+            for _turn in range(HANDOVER_TURNS):
+                await asyncio.sleep(0)
+        assert not holder.done()
+
+    asyncio.run(main())
+
+    assert [(context["message"], context.get("task")) for context in reports] == []

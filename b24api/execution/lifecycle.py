@@ -8,7 +8,6 @@ to every raised exception and replays a cancellation that cleanup had to defer.
 
 from __future__ import annotations
 import asyncio
-import contextlib
 import inspect
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -19,7 +18,14 @@ from b24api.contracts.policy import KernelState
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.stream import PartialResult
 from b24api.errors import CleanupOverrunError
-from b24api.execution.context import WORK_OWNERS, CancellationMark, await_cleanup_resistant, rearm_cancellation
+from b24api.execution.context import (
+    WORK_OWNERS,
+    CancellationMark,
+    Settled,
+    await_cleanup_resistant,
+    rearm_cancellation,
+    spawn_settled,
+)
 from b24api.execution.failure import (
     EARLY_CLOSE_REASON,
     attach_report,
@@ -186,38 +192,17 @@ def _closed_by_owner(error: BaseException) -> bool:
     return isinstance(error, asyncio.CancelledError) and read is not None and read.closed
 
 
-class _ReadFailure:
-    """What an isolated read ended in, returned by its task so that the task itself never ends in a failure.
-
-    The reader raises it. A task left to end in it would be one more report of it, from a library-internal task, when
-    the event loop shuts down while the stream ends (``asyncio.run`` reports every task that ended in an exception).
-    """
-
-    __slots__ = ("error",)
-
-    def __init__(self, error: Exception) -> None:
-        self.error = error
-
-
-def _read_item[T](outcome: T | _ReadFailure) -> T:
-    if isinstance(outcome, _ReadFailure):
-        raise outcome.error
-    return outcome
-
-
-async def _settle(pull: asyncio.Future[object], read: _Read) -> Exception | None:
+async def _settle(pull: asyncio.Future[Settled[object]], read: _Read) -> Exception | None:
     """Wait for the read the close ended; return the failure a read the close cancelled ended in instead.
 
     The read reports its own outcome to its caller as well. Its failure is the close's: it ended while the close
     cancelled it, in its cleanup (a kernel read inline in it ends by that close, failing when its cleanup does).
     """
     await asyncio.wait((pull,))
-    if not read.closed or pull.cancelled() or pull.exception() is not None:
+    if not read.closed or pull.cancelled():
         return None
-    outcome = pull.result()
-    if isinstance(outcome, _ReadFailure) and not isinstance(outcome.error, StopAsyncIteration):
-        return outcome.error
-    return None
+    error = pull.result().error
+    return None if isinstance(error, StopAsyncIteration) else error
 
 
 class OperationRunner[T, R]:
@@ -242,7 +227,7 @@ class OperationRunner[T, R]:
         self._isolated = isolated_pulls
         self._works_between_reads = works_between_reads
         self._phase = _Phase.NEW
-        self._pull: asyncio.Future[T | _ReadFailure] | None = None
+        self._pull: asyncio.Future[Settled[T]] | None = None
         self._read = _Read()
         self._published = asyncio.Event()
         self._report: R | None = None
@@ -251,7 +236,7 @@ class OperationRunner[T, R]:
         self._cleanup_failure: BaseException | None = None
         self._work_token = object()
         # The one cleanup, kept even when a deadline stopped waiting for it, so it lives until it ends.
-        self._cleanup_task: asyncio.Future[None] | None = None
+        self._cleanup_task: asyncio.Future[Settled[None]] | None = None
 
     @property
     def report(self) -> R | None:
@@ -333,8 +318,8 @@ class OperationRunner[T, R]:
         try:
             if self._isolated:
                 self._read = _Read()
-                self._pull = asyncio.ensure_future(self._pull_next(self._read))
-                item = _read_item(await self._pull)
+                self._pull = spawn_settled(self._pull_next(self._read))
+                item = (await self._pull).unwrap()
             else:
                 item = await anext(self._body)
         except BaseException as error:
@@ -453,28 +438,20 @@ class OperationRunner[T, R]:
         # Called first in the pull or cleanup task, whose context is its own copy, so it needs no reset.
         WORK_OWNERS.set((*WORK_OWNERS.get(), self._work_token))
 
-    async def _pull_next(self, read: _Read) -> T | _ReadFailure:
+    async def _pull_next(self, read: _Read) -> T:
+        # Run as a settled task: the reader raises the failure it ends in. The reader replays the cancellation it
+        # handed over itself (``CancellationMark``), and a close that cancelled the read settles it.
         self._mark_own_work()
         _CURRENT_READ.set(read)
-        try:
-            return await anext(self._body)
-        except Exception as error:  # noqa: BLE001 - returned for the reader to raise: the task ends without it
-            failure = _ReadFailure(error)
-        # The read's cleanup may have re-armed a cancellation it absorbed on this task, which would end it cancelled
-        # and lose the failure. The reader replays the cancellation it handed over itself (``CancellationMark``), and
-        # a close that cancelled the read settles it, so this task takes the cancellation and returns the failure.
-        if (task := asyncio.current_task()) is not None and task.cancelling():
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.sleep(0)
-        return failure
+        return await anext(self._body)
 
-    async def _clean_up(self, read: asyncio.Future[T | _ReadFailure] | None) -> None:
+    async def _clean_up(self, read: asyncio.Future[Settled[T]] | None) -> None:
         # Cleanup runs caller code too (a source's ``finally``, a transport), which must not close this runner.
         self._mark_own_work()
         read_failure = None
         if read is not None:
             # A cancelled read ends before the body closes under it, even after a deadline stopped the wait.
-            read_failure = await _settle(cast("asyncio.Future[object]", read), self._read)
+            read_failure = await _settle(cast("asyncio.Future[Settled[object]]", read), self._read)
         try:
             close = getattr(self._body, "aclose", None)
             if close is not None:
@@ -516,7 +493,7 @@ class OperationRunner[T, R]:
         primary: BaseException | None,
         *,
         pending: asyncio.CancelledError | None = None,
-        read: asyncio.Future[T | _ReadFailure] | None = None,
+        read: asyncio.Future[Settled[T]] | None = None,
         deadline: float | None = None,
     ) -> None:
         """Settle a cancelled ``read``, clean up, publish once and raise by the §3.1 rows.
@@ -526,7 +503,7 @@ class OperationRunner[T, R]:
         """
         self._primary = primary
         cancelled = pending is not None or isinstance(primary, asyncio.CancelledError)
-        self._cleanup_task = asyncio.ensure_future(self._clean_up(read))
+        self._cleanup_task = spawn_settled(self._clean_up(read))
         cleanup = await await_cleanup_resistant(self._cleanup_task, deadline=deadline, cancelled=cancelled)
         attempt = CleanupAttempt(cleanup.error, cleanup.cancellation or pending, finished=cleanup.unfinished is None)
         reason = report_reason(primary) if cause is TerminalCause.FAILED and primary is not None else None

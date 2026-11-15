@@ -3,10 +3,11 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+import inspect
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, TypeGuard
+from typing import TYPE_CHECKING, Protocol, TypeGuard, cast
 from uuid import uuid4
 
 from b24api.contracts.policy import BudgetCounters, ExecutionPolicy
@@ -452,6 +453,53 @@ class OwnedPull[T](Protocol):
         ...
 
 
+class Settled[T]:
+    """How a library task's work ended, returned as the task's result: a value, or the failure its owner raises.
+
+    A task the library starts around caller code (a source's pull or close, a stream's read or cleanup) returns this
+    instead of ending in the failure. ``asyncio.run`` reports every task that its shutdown cancelled and that then
+    ended in an exception, whether or not its owner retrieves it later, so only a task that never ends in one keeps
+    the failure its owner's alone.
+    """
+
+    __slots__ = ("error", "value")
+
+    def __init__(self, value: T | None = None, *, error: Exception | None = None) -> None:
+        """Hold the work's value, or the failure it ended in."""
+        self.value = value
+        self.error = error
+
+    def unwrap(self) -> T:
+        """Return the value, or raise the failure."""
+        if self.error is not None:
+            raise self.error
+        return cast("T", self.value)
+
+
+async def settle[T](work: Awaitable[T]) -> Settled[T]:
+    """Await ``work`` and return how it ended (``Settled``); a cancellation still ends the task cancelled."""
+    try:
+        return Settled(await work)
+    except Exception as error:  # noqa: BLE001 - returned for the task's owner to raise: the task ends without it
+        settled: Settled[T] = Settled(error=error)
+    # The work's cleanup may have re-armed a cancellation it absorbed on this task, which would end it cancelled and
+    # lose the failure. Whoever cancelled it learns how it ended from its owner, so the task takes the cancellation.
+    if (task := asyncio.current_task()) is not None and task.cancelling():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(0)
+    return settled
+
+
+def spawn_settled[T](work: Awaitable[T]) -> asyncio.Task[Settled[T]]:
+    """Start ``work`` as a task that returns how it ended (``Settled``) and never ends in a failure."""
+    task = asyncio.ensure_future(settle(work))
+    if inspect.iscoroutine(work):
+        # A task cancelled before its first step never starts ``settle``, which would leave ``work`` never awaited;
+        # once the task is done, ``work`` has finished or never started, so closing it is safe.
+        task.add_done_callback(lambda _task: work.close())
+    return task
+
+
 class AsyncIteratorController[T]:
     """Own one async source pull and retain cleanup past a public deadline."""
 
@@ -466,8 +514,9 @@ class AsyncIteratorController[T]:
         self._source = source
         self._input_error = input_error
         self._cleanup_error = cleanup_error
-        self._active_pull: asyncio.Task[T] | None = None
-        self._cleanup_task: asyncio.Task[None] | None = None
+        # Both run caller code; neither ends in its failure (``spawn_settled``).
+        self._active_pull: asyncio.Task[Settled[T]] | None = None
+        self._cleanup_task: asyncio.Task[Settled[None]] | None = None
 
     async def get(self, context: ExecutionContext) -> T:
         """Pull one item within the operation's budget: its time left, and a request budget that refused nothing."""
@@ -478,10 +527,10 @@ class AsyncIteratorController[T]:
         if context.requests_refused:
             # No item pulled now could be sent: the operation ends with its request budget, as with its time budget.
             raise context.operation_refusal(REQUEST_BUDGET_EXHAUSTED)
-        pull: asyncio.Task[T] | None = None
+        pull: asyncio.Task[Settled[T]] | None = None
         try:
             async with context.deadline(self._input_error):
-                pull = asyncio.create_task(anext(self._source))
+                pull = spawn_settled(anext(self._source))
                 self._active_pull = pull
                 await asyncio.wait((pull,))
         except BaseException:
@@ -491,7 +540,7 @@ class AsyncIteratorController[T]:
                 self._retain_close_after(pull)
             raise
         try:
-            return await pull
+            return (await pull).unwrap()
         finally:
             self._active_pull = None
 
@@ -504,7 +553,7 @@ class AsyncIteratorController[T]:
         if self._cleanup_task is None:
             active = self._active_pull
             if active is None:
-                self._retain_cleanup(asyncio.create_task(self._close_source()))
+                self._cleanup_task = spawn_settled(self._close_source())
             else:
                 active.cancel()
                 self._retain_close_after(active)
@@ -513,26 +562,20 @@ class AsyncIteratorController[T]:
             return
         done, _ = await asyncio.wait((cleanup,), timeout=context.cleanup_window())
         if done:
-            await cleanup
+            (await cleanup).unwrap()
             return
         raise CleanupOverrunError(self._cleanup_error)
 
-    def _retain_close_after(self, pull: asyncio.Task[T]) -> None:
+    def _retain_close_after(self, pull: asyncio.Task[Settled[T]]) -> None:
         if self._cleanup_task is None:
-            self._retain_cleanup(asyncio.create_task(self._close_after(pull)))
+            self._cleanup_task = spawn_settled(self._close_after(pull))
 
-    def _retain_cleanup(self, cleanup: asyncio.Task[None]) -> None:
-        self._cleanup_task = cleanup
-        cleanup.add_done_callback(_observe_background_cleanup)
-
-    async def _close_after(self, pull: asyncio.Task[T]) -> None:
-        pull_error: BaseException | None = None
-        try:
-            await pull
-        except (asyncio.CancelledError, StopAsyncIteration):
-            pass
-        except Exception as error:  # noqa: BLE001 - preserve the source error through owned cleanup
-            pull_error = error
+    async def _close_after(self, pull: asyncio.Task[Settled[T]]) -> None:
+        pull_error: Exception | None = None
+        with contextlib.suppress(asyncio.CancelledError):
+            pull_error = (await pull).error
+        if isinstance(pull_error, StopAsyncIteration):
+            pull_error = None
         if self._active_pull is pull:
             self._active_pull = None
         try:
@@ -549,15 +592,15 @@ class AsyncIteratorController[T]:
         (await self._source.aclose()).raise_failure()
 
 
-def _observe_background_cleanup(task: asyncio.Future[None]) -> None:
+def _observe_background_cleanup(task: asyncio.Future[object]) -> None:
     """Retrieve late exceptions while preserving them for any later await."""
     if not task.cancelled():
         task.exception()
 
 
-async def await_cancellation_resistant(awaitable: Awaitable[None]) -> asyncio.CancelledError | None:
+async def await_cancellation_resistant(awaitable: Awaitable[object]) -> asyncio.CancelledError | None:
     """Finish an owned state transition and return the last concurrent cancellation."""
-    task: asyncio.Future[None] = asyncio.ensure_future(awaitable)
+    task = _owned_task(awaitable)
     cancellation: asyncio.CancelledError | None = None
     while not task.done():
         try:
@@ -565,12 +608,25 @@ async def await_cancellation_resistant(awaitable: Awaitable[None]) -> asyncio.Ca
         except asyncio.CancelledError as error:
             cancellation = error
     try:
-        await task
+        _ended(await task)
     except asyncio.CancelledError:
         if cancellation is not None:
             return cancellation
         raise
     return cancellation
+
+
+def _owned_task(work: Awaitable[object]) -> asyncio.Future[object]:
+    """Run ``work`` as a task of its own that never ends in its failure, unless it already is a task."""
+    if isinstance(work, asyncio.Future):
+        return work
+    return cast("asyncio.Future[object]", spawn_settled(work))
+
+
+def _ended(result: object) -> None:
+    """Raise the failure an owned task returned (``Settled``) instead of ending in it."""
+    if isinstance(result, Settled):
+        result.unwrap()
 
 
 @dataclass(frozen=True, slots=True)
@@ -580,7 +636,7 @@ class CleanupResult:
     cancellation: asyncio.CancelledError | None
     error: BaseException | None
     # Cleanup a deadline stopped waiting for, still running; its owner must keep a reference to it.
-    unfinished: asyncio.Future[None] | None = field(default=None, kw_only=True)
+    unfinished: asyncio.Future[object] | None = field(default=None, kw_only=True)
 
     def raise_failure(self) -> None:
         """Raise the deferred cancellation first, then the cleanup failure."""
@@ -591,7 +647,7 @@ class CleanupResult:
 
 
 async def await_cleanup_resistant(
-    awaitable: Awaitable[None],
+    awaitable: Awaitable[object],
     *,
     deadline: float | None = None,
     cancelled: bool = False,
@@ -603,7 +659,7 @@ async def await_cleanup_resistant(
     to finish in the background, returned as ``unfinished`` with a ``BudgetExceededError``. Without a
     cancellation, or without a deadline, cleanup is awaited to its end.
     """
-    task: asyncio.Future[None] = asyncio.ensure_future(awaitable)
+    task = _owned_task(awaitable)
     cancellation: asyncio.CancelledError | None = None
     loop = asyncio.get_running_loop()
     while not task.done():
@@ -620,7 +676,7 @@ async def await_cleanup_resistant(
             overrun = CleanupOverrunError("cleanup exceeded the operation time budget")
             return CleanupResult(cancellation, overrun, unfinished=task)
     try:
-        await task
+        _ended(await task)
     except asyncio.CancelledError as error:
         if cancellation is not None:
             return CleanupResult(cancellation, None)

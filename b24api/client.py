@@ -3,7 +3,6 @@
 # ruff: noqa: SLF001 - class-owned alternate construction
 
 from __future__ import annotations
-import asyncio
 import warnings
 import weakref
 from typing import TYPE_CHECKING, Self, cast
@@ -34,6 +33,7 @@ from b24api.execution import (
     rearm_cancellation,
 )
 from b24api.execution.cleanup import OwnedStream, close_owned_resources
+from b24api.execution.context import Settled, spawn_settled
 from b24api.redaction import Redactor, secret_values
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
@@ -45,6 +45,7 @@ from b24api.transport.protocol import ProtocolCodec
 from b24api.traversal.keyset_verifier import verify_keyset_capability as _verify_keyset_capability
 
 if TYPE_CHECKING:
+    import asyncio
     from collections.abc import AsyncIterable, Iterable
     from types import TracebackType
 
@@ -118,7 +119,7 @@ class Bitrix24(_TraversalFacade):
         self._host = host
         self._closed = False
         self._unknown_request_audit = unknown_request_audit
-        self._close_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[Settled[None]] | None = None
         self._streams: weakref.WeakSet[OwnedStream] = weakref.WeakSet()
 
     @classmethod
@@ -203,7 +204,7 @@ class Bitrix24(_TraversalFacade):
             raise RuntimeError("client cannot be closed from inside the pull or cleanup of one of its streams")
         if self._close_task is None:
             self._closed = True
-            self._close_task = asyncio.create_task(
+            self._close_task = spawn_settled(
                 close_owned_resources(tuple(self._streams), self._owned_transport, self._owned_coordinator),
             )
         cleanup = await await_cleanup_resistant(self._close_task)
