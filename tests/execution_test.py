@@ -36,7 +36,7 @@ from b24api.execution import (
     WorkClass,
     rearm_cancellation,
 )
-from b24api.execution.context import InterruptLatch, is_interrupt, settle
+from b24api.execution.context import InterruptLatch, LatchState, is_interrupt, settle
 from b24api.execution.rate import (
     CoordinatorBudgetError,
     DeadlineBudget,
@@ -1196,6 +1196,36 @@ def test_a_closed_latch_hands_each_late_interrupt_to_the_event_loop_once() -> No
         finally:
             loop.call_soon = call_soon  # type: ignore[method-assign]
         assert handed == [(late,)]
+
+    asyncio.run(main())
+
+
+def test_a_latch_wakes_its_owner_only_while_the_operation_runs() -> None:
+    # Running, the first interrupt wakes the owner, once; ending, an interrupt is latched for the end, waking nothing;
+    # an interrupt the end handed on (no reader raised it) is not handed again when a catcher records it later.
+    woken: list[bool] = []
+    handed: list[tuple[object, ...]] = []
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        call_soon = loop.call_soon
+        loop.call_soon = lambda _callback, *args, **_kwargs: handed.append(args)  # type: ignore[assignment,method-assign]
+        try:
+            running = InterruptLatch(lambda: woken.append(True))
+            first = KeyboardInterrupt("first")
+            running.record(first)
+            running.record(SystemExit("second"))
+            assert (running.first, woken) == (first, [True])
+            ending = InterruptLatch(lambda: woken.append(False))
+            ending.end()
+            ending.record(first)
+            assert (ending.first, ending.state, woken) == (first, LatchState.ENDING, [True])
+            assert ending.close() is first
+            ending.hand_on(first)
+            ending.record(first)
+        finally:
+            loop.call_soon = call_soon  # type: ignore[method-assign]
+        assert handed == [(first,)]
 
     asyncio.run(main())
 

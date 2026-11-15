@@ -16,23 +16,26 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NoReturn
 
 import pytest
 
-from b24api import Bitrix24, ReplaySafety, Request, RouteKind, Settings
+from b24api import Bitrix24, ReplaySafety, Request, RouteKind, Settings, TerminalState
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.logical import LogicalBatchKernelStream
 from b24api.batch.stream import batch_outcome_stream
 from b24api.contracts import Command
-from b24api.contracts.policy import ExecutionPolicy, IdentityCoercion
+from b24api.contracts.policy import ExecutionPolicy, IdentityCoercion, KernelState
 from b24api.contracts.request import IdentitySpec
 from b24api.execution import Executor, WireResponse
+from b24api.execution.context import latch_interrupt
+from b24api.execution.lifecycle import CleanupAttempt, LifecycleHooks, OperationRunner, TerminalCause, kernel_terminal
+from b24api.execution.snapshot import KernelReport
 from b24api.references.outcome import ReferenceRequest
 from b24api.references.stream import iter_references
 from b24api.traversal.plans import KernelDirectDispatch, SingleResponsePlan
 from b24api.traversal.stream import iter_list
+from tests.scripting import ResponderTransport, client_for
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
 
-    from b24api.execution.lifecycle import OperationRunner
 
 HOST = "fixture.invalid"
 FAMILIES = ("logical_batch", "operation_stream", "batch_outcomes", "references", "traversal")
@@ -690,6 +693,44 @@ async def test_failing_kernel_finalizer_still_publishes_one_public_fallback_repo
     assert stream.report is report
 
 
+@pytest.mark.parametrize("family", ["batch_outcomes", "fan_out_outcomes", "iter_list"])
+def test_a_failing_public_finalizer_publishes_its_fallback_in_the_interrupts_shape(family: str) -> None:
+    # The transport interrupts the operation and the public stream's own finalizer then raises: the fallback report
+    # is what is published, in the one shape of an interrupted operation, and the interrupt leaves carrying it.
+    got: list[BaseException] = []
+    streams: list[Any] = []
+
+    async def respond(_request: Request) -> object:
+        raise KeyboardInterrupt("transport")
+
+    def failing_finalize(*_args: Any) -> Any:  # noqa: ANN401
+        raise _FinalizeFailedError
+
+    async def main() -> None:
+        async with client_for(ResponderTransport(respond)) as client:
+            stream = _public(family, client)
+            streams.append(stream)
+            runner: OperationRunner[Any, Any] = stream._runner  # noqa: SLF001 - scripts the public stream's finalizer
+            runner._hooks = dataclasses.replace(runner._hooks, finalize=failing_finalize)  # noqa: SLF001
+            try:
+                async for _item in stream:
+                    pass
+            except KeyboardInterrupt as error:
+                got.append(error)
+
+    asyncio.run(main())
+    report = streams[0].report
+    assert report is not None
+    assert [type(error) for error in got] == [KeyboardInterrupt]
+    assert report.state is TerminalState.FAILED
+    assert report.terminal_reason == "operation interrupted"
+    codes = [violation.code for violation in report.violations]
+    assert "report_finalize_failure" in codes
+    assert codes[-1] == "interrupted"
+    assert report.violations[-1].message == "operation interrupted (KeyboardInterrupt)"
+    assert getattr(got[0], "report", None) is report
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
 async def test_failing_fallback_hook_still_ends_publication(family: Family, client: Bitrix24) -> None:
@@ -705,3 +746,52 @@ async def test_failing_fallback_hook_still_ends_publication(family: Family, clie
     assert error is not None
     # Publication ended with the failure, so a later close returns instead of waiting for a report.
     await asyncio.wait_for(harness.stream.aclose(), timeout=1)
+
+
+def test_a_read_whose_own_task_latched_an_interrupt_raises_it_instead_of_its_item() -> None:
+    # The read's own task caught the interrupt and went on to an item (a wake cancels no read from inside it): the
+    # read in flight is what raises it, so it ends the stream with it rather than deliver the item and hold it.
+    interrupt = KeyboardInterrupt("in the read")
+    delivered: list[bool] = []
+    causes: list[TerminalCause] = []
+    got: list[object] = []
+
+    async def body() -> AsyncIterator[int]:
+        latch_interrupt(interrupt)
+        yield 1
+
+    async def cleanup() -> None:
+        return None
+
+    def finalize(cause: TerminalCause, reason: str | None, _attempt: CleanupAttempt) -> KernelReport:
+        causes.append(cause)
+        state, terminal_reason = kernel_terminal(cause, reason)
+        return KernelReport(state=state, terminal_reason=terminal_reason)
+
+    def fallback(_cause: TerminalCause, reason: str, _attempt: CleanupAttempt) -> KernelReport:
+        return KernelReport(state=KernelState.FAILED, terminal_reason=reason)
+
+    runner: OperationRunner[int, KernelReport] = OperationRunner(
+        body(),
+        LifecycleHooks(
+            finalize=finalize, failure_report=fallback, cleanup=cleanup, delivered=lambda: delivered.append(True)
+        ),
+    )
+
+    async def main() -> None:
+        for _read in range(2):
+            try:
+                got.append(await anext(runner))
+            except StopAsyncIteration:
+                break
+            except KeyboardInterrupt as error:
+                got.append(error)
+
+    asyncio.run(main())
+    assert got == [interrupt]
+    assert delivered == []
+    assert causes == [TerminalCause.INTERRUPTED]
+    report = runner.report
+    assert report is not None
+    assert (report.state, report.terminal_reason) == (KernelState.FAILED, "operation interrupted")
+    assert getattr(interrupt, "report", None) is report

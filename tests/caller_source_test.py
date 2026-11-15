@@ -44,7 +44,7 @@ from b24api.errors import BatchFailed, BudgetExceededError, CleanupOverrunError,
 from tests.scripting import DEADLINE_BUDGET, HANG_BOUND, ResponderTransport, client_for, reached
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Iterator
 
     from b24api import Bitrix24
     from b24api.contracts.report import OperationReport
@@ -1260,11 +1260,12 @@ def test_an_interrupt_on_any_route_ends_the_operation_and_leaves_asyncio_run(
 
 
 class _InterruptsBetweenReads:
-    """Answer the first binding; the second binding's send raises ``KeyboardInterrupt`` once the reader has an item."""
+    """Answer the first binding; the second binding's send raises the interrupt once the reader has an item."""
 
-    def __init__(self) -> None:
+    def __init__(self, interrupt: type[BaseException]) -> None:
+        self.interrupt = interrupt
         self.between = asyncio.Event()
-        self.interrupted = asyncio.Event()
+        self.raised: list[BaseException] = []
 
     async def __call__(self, request: Request) -> object:
         parameters = request.copy_parameters()
@@ -1272,57 +1273,101 @@ class _InterruptsBetweenReads:
         owner = parameters.get("id", owner_filter.get("OWNER") if isinstance(owner_filter, dict) else None)
         if owner == 1:
             await reached(self.between)
-            self.interrupted.set()
-            raise KeyboardInterrupt
+            error = self.interrupt("between reads")
+            self.raised.append(error)
+            raise error
         return _answer(request)
 
 
+BETWEEN_READS = ("next", "noclose", "abandon", "runloop")
+
+
+def _raised_driving_the_loop(
+    main: Callable[[], Coroutine[Any, Any, None]], after: Callable[[], Coroutine[Any, Any, None]]
+) -> BaseException:
+    """Drive ``main`` on a loop of the test's own until the loop raises; then run ``after`` there, raising nothing.
+
+    Return what the loop raised. Running the loop again shows the interrupt was handed to it once.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        work = loop.create_task(main())
+        try:
+            loop.run_until_complete(work)
+        except BaseException as error:  # noqa: BLE001 - the test inspects what the loop raised
+            raised = error
+        else:
+            raise AssertionError("the loop raised nothing")
+        loop.run_until_complete(after())
+        work.cancel()
+        loop.run_until_complete(asyncio.gather(work, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    finally:
+        loop.close()
+    return raised
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("reader", BETWEEN_READS)
 @pytest.mark.parametrize("family", REFERENCE_FAMILIES)
-def test_an_interrupt_latched_between_reads_ends_the_next_read_at_once(family: str) -> None:
-    # The reader holds an item while another binding's send raises the interrupt: no read is in flight for it to
-    # end, so the next read raises it at once, before anything else the stream would give, the report in its shape.
+def test_an_interrupt_latched_between_reads_ends_the_operation_at_once(
+    family: str, reader: str, interrupt: type[BaseException]
+) -> None:
+    # The reader holds an item and works elsewhere while another binding's send raises the interrupt: no read is in
+    # flight to raise it, so the operation ends at once, its report in the interrupt's shape, and the event loop
+    # raises it, once, before the reader's work is over: whether the reader would read again (``next``), never reads
+    # nor closes again (``noclose``), never closes its client either (``abandon``), or drives the loop itself
+    # (``runloop``). The stream is ended: a later read finds it so, a close returns, and neither raises it again.
     reported: list[str] = []
-    pending: list[str] = []
-    got: list[object] = []
+    worked: list[bool] = []
+    after: list[object] = []
     streams: list[OperationStream[Any]] = []
-    transport = _InterruptsBetweenReads()
+    transport = _InterruptsBetweenReads(interrupt)
+
+    async def body(client: Bitrix24) -> None:
+        stream = _stream(client, family, _items(family), DirectDispatch(concurrency=2))
+        streams.append(stream)
+        await anext(stream)
+        transport.between.set()
+        await asyncio.sleep(HANG_BOUND)
+        worked.append(True)
+        if reader == "next":
+            await anext(stream)
 
     async def main() -> None:
         asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        if reader == "abandon":
+            await body(await client_for(ResponderTransport(transport), policy=POLICIES["returns"]).__aenter__())
+            return
+        async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
+            await body(client)
+
+    async def read_after() -> None:
+        stream = streams[0]
         try:
-            async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
-                stream = _stream(client, family, _items(family), DirectDispatch(concurrency=2))
-                streams.append(stream)
+            await anext(stream)
+        except StopAsyncIteration as error:
+            after.append(type(error))
+        await stream.aclose()
+        after.append("closed")
 
-                async def read() -> None:
-                    try:
-                        async with stream:
-                            await anext(stream)
-                            transport.between.set()
-                            await reached(transport.interrupted)
-                            for _turn in range(HANDOVER_TURNS):
-                                await asyncio.sleep(0)
-                            got.append(await anext(stream))
-                    except BaseException as error:  # noqa: BLE001 - the test inspects what the reader got
-                        got.append(error)
-
-                await asyncio.create_task(read())
-        finally:
-            pending.extend(_others())
-        if isinstance(got[-1], BaseException):
-            raise got[-1]
-
-    with pytest.raises(KeyboardInterrupt):
-        asyncio.run(main())
+    if reader == "runloop":
+        error = _raised_driving_the_loop(main, read_after)
+        assert after == [StopAsyncIteration, "closed"]
+    else:
+        with pytest.raises(interrupt) as raised:
+            asyncio.run(main())
+        error = raised.value
     gc.collect()
-    assert [type(item) for item in got] == [KeyboardInterrupt]
+    assert error is transport.raised[0]
+    assert worked == []
     assert reported == []
-    assert pending == []
     report = streams[0].report
     assert report is not None
     assert report.state is TerminalState.FAILED
     assert report.terminal_reason == "operation interrupted"
-    assert _violations(report) == [("interrupted", "operation interrupted (KeyboardInterrupt)")]
+    assert _violations(report) == [("interrupted", f"operation interrupted ({interrupt.__name__})")]
+    assert getattr(error, "report", None) is report
 
 
 @pytest.mark.parametrize("family", REFERENCE_FAMILIES)
