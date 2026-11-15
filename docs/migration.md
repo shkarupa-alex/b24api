@@ -88,7 +88,10 @@
   not executed when it was never sent; a finish page settles from the facts of its failure. A reference
   binding's page cancelled after its wave was sent was unknown even when its command had been answered;
   it now keeps that answer, a success settling as a success as on a flat traversal, and is unknown only
-  while its wave may still send it.
+  while its wave may still send it. So does each page of a batch that failed as a whole with an error
+  that is not the client's own (an answer nested too deep to decode, for example): every page of it was
+  unknown, also one its command's answer in an earlier round settled; it now settles from what its own
+  command did. The binding's outcome and its error are unchanged.
 - **A counted tail page larger than its share is an answered failure.** When a tail page of
   `iter_list_counted()` decoded to more rows than `max_buffered_rows` left it, the traversal raised
   `IncompleteTraversalError` caused by `BudgetExceededError` ("buffered row budget exhausted"), and the

@@ -14,6 +14,7 @@ selection, geometry and cost must match it.
 from __future__ import annotations
 import asyncio
 import dataclasses
+import json
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
@@ -39,6 +40,7 @@ from b24api import (
     StableIntegerKeysetContract,
     TerminalState,
 )
+from b24api.batch.engine import BatchExecutor
 from b24api.completion import CompletionGate
 from b24api.contracts import (
     DeliveryOrder,
@@ -49,6 +51,7 @@ from b24api.contracts import (
     ReferenceFailure,
     ReferenceItem,
     ReferenceNotExecuted,
+    ReferenceOutcomeUnknown,
     ReferenceSource,
 )
 from b24api.contracts.completion import (
@@ -61,7 +64,7 @@ from b24api.contracts.completion import (
 from b24api.contracts.page_stop import ContinuePage
 from b24api.contracts.policy import KernelState, RetryPolicy
 from b24api.contracts.request import RouteKind
-from b24api.errors import BudgetExceededError, CapabilityError, IdentityContractError
+from b24api.errors import BudgetExceededError, CapabilityError, IdentityContractError, ProtocolError
 from b24api.execution import ExecutionContext, Executor, RateCoordinator
 from b24api.references import wave_engine
 from b24api.references.budget_view import BindingBudgetView, RowLease
@@ -473,6 +476,87 @@ async def test_a_binding_cancelled_while_its_wave_waits_to_replay_settles_each_p
     negative = [CommandSettlement.FAILURE] * (2 if second == "denied" else 1)
     assert len(wave) == portal.waves[1]
     assert [settled[page] for page in wave] == [*negative, *[CommandSettlement.SUCCESS] * (len(wave) - len(negative))]
+
+
+_NESTED = 100_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("replay", "outcome"), [("transport", ReferenceOutcomeUnknown), ("undecodable", ReferenceFailure)]
+)
+async def test_a_wave_whose_replay_fails_settles_each_page_from_its_own_command(
+    monkeypatch: pytest.MonkeyPatch, replay: str, outcome: type[object]
+) -> None:
+    # The second wave is answered, but the server refuses its first command (QUERY_LIMIT_EXCEEDED); the send that
+    # replays it then fails: the transport breaks, or the answer cannot be decoded (nested too deep for the JSON
+    # parser, a failure that is not the client's own). Each page settles from what its own command did: the
+    # replayed one may have run, every other one was answered with a success, as the flat path settles them.
+    events: list[object] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    portal = BatchPortal(_answer({"p0": tuple(range(1, 2000))}))
+    wave: list[int] = []
+
+    async def respond(request: Request) -> WireResponse:
+        sent = len(portal.waves)
+        if sent == 2:  # the replay of the first range wave's refused command
+            settled = {event.page_id for event in events if isinstance(event, PageCommandOutcome)}
+            wave.extend(e.page_id for e in events if isinstance(e, PageScheduled) and e.page_id not in settled)
+            if replay == "transport":
+                raise RuntimeError("connection reset")
+            portal.waves.append(1)
+            return WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        if sent == 1:
+            commands = request.copy_parameters()["cmd"]
+            assert isinstance(commands, dict)
+            first = next(iter(commands))
+            body = json.loads(answer.body)
+            del body["result"]["result"][first]
+            body["result"]["result_error"] = {first: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+            return WireResponse(200, answer.headers, json.dumps(body).encode())
+        return answer
+
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        outcomes, _report = await _drain(
+            client.iter_reference_outcomes(_base(), [_parent("p0")], traversal=_traversal(_range()))
+        )
+
+    settled = {event.page_id: event.outcome for event in events if isinstance(event, PageCommandOutcome)}
+    assert len(wave) == portal.waves[1]
+    assert [settled[page] for page in wave] == [
+        CommandSettlement.UNKNOWN,
+        *[CommandSettlement.SUCCESS] * (len(wave) - 1),
+    ]
+    assert isinstance(outcomes[-1], outcome)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("execution", ["sequential", "range"])
+async def test_a_batch_that_fails_as_a_whole_fails_its_binding_with_the_batch_s_own_error(
+    monkeypatch: pytest.MonkeyPatch, execution: str
+) -> None:
+    # A batch the engine ends with one error for all of its commands fails each page with it, sequential pages and
+    # a fast wave alike: the binding reports that error, not a failure of its own.
+    broken = ProtocolError("the batch broke")
+
+    async def fails(_engine: BatchExecutor, _requests: tuple[Request, ...], **_options: object) -> tuple[()]:
+        raise broken
+
+    monkeypatch.setattr(BatchExecutor, "execute_requests", fails)
+    traversal = _traversal(SequentialKeysetExecution() if execution == "sequential" else _range())
+    async with client_for(BatchPortal(_answer({"p0": tuple(range(1, 2000))}))) as client:
+        outcomes, _report = await _drain(client.iter_reference_outcomes(_base(), [_parent("p0")], traversal=traversal))
+
+    (failure,) = outcomes
+    assert isinstance(failure, ReferenceFailure)
+    assert failure.error is broken
 
 
 @pytest.mark.asyncio

@@ -12,12 +12,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 from b24api.batch.engine import BatchExecutor
-from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.batch.outcome import BatchFailure, BatchSuccess, settlement_of
 from b24api.batch.stream import _BatchOutcomeStream
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
-from b24api.execution.facts import execution
+from b24api.execution.facts import execution, settlement
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -193,9 +193,7 @@ class _FlatTailStream:
         if self._recorder is not None:
             self._recorder.activate(receipt.ordinal + 1)
             failure = receipt.failure
-            self._recorder.settled(
-                CommandSettlement.SUCCESS if failure is None else execution(failure.error).settlement
-            )
+            self._recorder.settled(CommandSettlement.SUCCESS if failure is None else settlement_of(failure))
 
     def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
         del receipt
@@ -262,7 +260,7 @@ class DirectCountedWaveIO:
             PageDispatch.DIRECT,
             None,
             dispatch_started=execution(error).dispatched,
-            settlement=execution(error).settlement,
+            settlement=settlement(error),
         )
 
     async def tail_batch_size(

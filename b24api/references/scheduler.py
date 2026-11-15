@@ -29,6 +29,7 @@ from b24api.references.dispatch import (
     _AdmissionState,
     _BatchPageDispatcher,
     _BatchPageError,
+    _ChunkPageError,
     _DirectPageDispatcher,
     _DispatchedPage,
     _DoneEvent,
@@ -434,6 +435,8 @@ class ReferenceScheduler:
         except _BatchPageError as error:
             failure = self._failure_event(run, cast("BaseException", error.failure.error))
             await self.publish_terminal(run, replace(failure, replay_disposition=error.failure.replay_disposition))
+        except _ChunkPageError as error:
+            await self.publish_terminal(run, self._failure_event(run, error.error))
         except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
             await self.publish_terminal(run, self._failure_event(run, error))
         finally:

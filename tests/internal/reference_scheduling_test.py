@@ -46,9 +46,11 @@ from b24api.execution.facts import Execution, execution, settlement
 from b24api.references.counted_io import ReferenceTailStream
 from b24api.references.dispatch import (
     _BatchPageDispatcher,
+    _ChunkPageError,
     _DoneEvent,
     _failed_settlement,
     _FailureEvent,
+    _page_error,
     _PendingBatch,
     _ProducerState,
     _RowBuffer,
@@ -1127,12 +1129,14 @@ async def test_a_send_that_breaks_an_invariant_fails_its_pages_as_possibly_run(m
     context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10))
     await context.start()
     dispatcher, buffer = _three_producer_dispatcher(executor, context)
-    with pytest.raises(ValueError, match="zip") as caught:
+    with pytest.raises(_ChunkPageError) as caught:
         await asyncio.wait_for(dispatcher.fetch(_page("a"), "a"), timeout=HANG_BOUND)
     await dispatcher.aclose()
     await buffer.close()
 
-    # The page fails with the send path's own error, and it may have run.
+    # The page reports the send path's own error, and it may have run: its chunk never ended.
+    assert isinstance(_page_error(caught.value), ValueError)
+    assert "zip" in str(_page_error(caught.value))
     assert _failed_settlement(caught.value) is CommandSettlement.UNKNOWN
 
 

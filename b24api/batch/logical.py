@@ -37,7 +37,7 @@ from b24api.execution import (
     AsyncIteratorController,
     Executor,
 )
-from b24api.execution.facts import Execution, ambiguity_of, execution
+from b24api.execution.facts import Execution, ambiguity_of, execution, settlement
 from b24api.execution.lifecycle import (
     CleanupAttempt,
     LifecycleHooks,
@@ -204,7 +204,7 @@ class LogicalBatchKernelStream[C]:
         elif isinstance(outcome, CommandNotExecuted):
             binding.settled(CommandSettlement.NOT_EXECUTED)
         else:
-            binding.settled(execution(outcome.error).settlement)
+            binding.settled(settlement(outcome.error))
 
     def _finish_outcome(self, outcome: CommandOutcome[object]) -> None:
         binding = self._completion.binding(outcome.index)
