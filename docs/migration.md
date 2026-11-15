@@ -8,8 +8,9 @@
   backoff or the host's throttle hint, and beyond the `BatchDispatch` concurrency (bounded only by the
   client limit). The isolation is now a replay of the envelope's commands, planned as their envelope
   retry is: it waits the longer of the backoff and the host's hint, within the attempt budget, the
-  retry window and the deadline, and then sends the commands one at a time, so a `BatchDispatch` never
-  has more requests in flight than its `concurrency`. An isolation refused because the operation's
+  retry window and the deadline (the report's `retries` counts that wait, as it counts the envelope
+  retry's), and then sends the commands one at a time, so a `BatchDispatch` never has more requests in
+  flight than its `concurrency`. An isolation refused because the operation's
   deadline has passed now fails with "execution time budget exhausted before the retry", as any retry
   does, and still ends the stream with `BudgetExceededError`. One refused for its own request alone (no
   attempt left, its retry window closed, or a wait longer than the window left) sends nothing, records
