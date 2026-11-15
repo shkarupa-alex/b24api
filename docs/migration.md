@@ -139,7 +139,10 @@
   own exception raised inside `async with stream`, which a failed close does not replace, carries one
   note: the report's `cleanup_failure` violation word for word (it was "stream cleanup also failed (X)",
   with X the raised class, `BatchFailed` for `batch()` and `fan_out()`; it is now "stream cleanup
-  failed (InputSourceError)" or "stream cleanup failed (CleanupOverrunError)").
+  failed (InputSourceError)" or "stream cleanup failed (CleanupOverrunError)"). A `KeyboardInterrupt` or
+  `SystemExit` a close raises is never behind anything: it is what the stream raises, whatever ended the
+  stream before it (a failure, the reader's cancellation), also to a read the close ended, and the
+  report records it as the close's failure, with its class as X.
 - **Breaking: a close that raises is the source failing.** A source's close that raised, from its
   `aclose()`, its `close()` or a generator's `finally`, surfaced as the raw exception on `break` from a
   synchronous source and wrapped from an asynchronous one. Every family now raises it as it raises a
@@ -156,8 +159,11 @@
 - **The reference scheduler always closes its source.** When `fan_out()`, `fan_out_outcomes()` or a
   reference traversal ended while its own tasks were still running past the cleanup window, it left
   the caller's source unclosed. The source now gets its close in every case; the overrun is
-  recorded as "stream cleanup failed (CleanupOverrunError)", and the error's message is "reference task
-  cleanup exceeded operation time budget".
+  recorded as "stream cleanup failed (CleanupOverrunError)", and the error's message names the work that
+  overran. With `DirectDispatch` the reference tasks send the commands: "reference task cleanup exceeded
+  operation time budget". With `BatchDispatch` the dispatcher's workers send them: "batch dispatcher
+  cleanup exceeded operation time budget" (and the first message when only the reference tasks overran,
+  the workers not).
 - **A close while a read is in flight is an early close like any other.** When another task closed
   a stream while its reader waited, the read raised `CancelledError` and a failed close showed only as
   a report violation. Neither a caller's cancellation, the budget nor a failure ended the stream, so
@@ -181,8 +187,11 @@
   ended (for example during the cleanup grace after the budget's end, or while a read waited in the
   source), `asyncio.run()` reported a library task that ended in the source's failure: a source's pull
   or close task, or a stream's read task. Every task the library starts around your code (a source's
-  pull and close, a stream's read and cleanup, the client's close) now returns how it ended to its
-  owner, which raises the failure; only your own task receives it.
+  pull and close, a reference traversal's binding tasks and page fetches, a batch's isolation sends, a
+  stream's read and cleanup, the client's close) now returns how it ended to its owner, which raises
+  the failure; only your own task receives it. That includes a `KeyboardInterrupt` or `SystemExit` your
+  transport raises under a reference family, which stopped the event loop from inside a library task:
+  it now reaches the task that reads the stream.
 - **A cancelled stream gives the cancellation's reason.** A stream read to its end and cancelled
   while its source closed reported `cancelled` with the terminal reason "input exhausted" (or
   "reference input exhausted"). Every family now gives "iteration cancelled" whenever the reader's
@@ -253,13 +262,17 @@
   `BudgetExceededError`, with an `incomplete` report. A page stopped for its request alone (its
   attempts, its retry window or a retry delay longer than the time left) is still a failed page: the
   terminal reason stays `IncompleteTraversalError`.
-- **A cancellation outranks a close that overruns its window.** A consumer cancelled while its
-  stream was running, whose source close then blocked past `max_elapsed`, received
-  `BudgetExceededError` ("... cleanup exceeded operation time budget") and a `budget_exhausted`
-  report. It now receives its `CancelledError`; the report is `cancelled`, with the overrun as a
-  `cleanup_failure`. This holds only for a cancellation that ended the stream: a consumer cancelled
-  after the budget (or a failure) ended it, while its cleanup waits, receives that error with an
-  `incomplete` (or `failed`) report, and the cancellation is delivered at its next `await`.
+- **A cancellation outranks a close that fails.** A consumer cancelled while its stream was running,
+  whose source close then blocked past `max_elapsed`, received `BudgetExceededError` ("... cleanup
+  exceeded operation time budget") and a `budget_exhausted` report. One whose source close raised
+  received the close's failure, with a `cancelled` report when the cancellation landed between reads and
+  a `failed` one when it landed while a read waited. In every family, the fast `iter_list_keyset()`
+  included, and whenever the cancellation lands, it now receives its `CancelledError`; the report is
+  `cancelled` with the terminal reason "iteration cancelled", and the close's failure is a
+  `cleanup_failure` "stream cleanup also failed (X)". An interrupt a close raises is the exception
+  (first item). This holds only for a cancellation that ended the stream: a consumer cancelled after the
+  budget (or a failure) ended it, while its cleanup waits, receives that error with an `incomplete` (or
+  `failed`) report, and the cancellation is delivered at its next `await`.
 - **A cleanup overrun has its own public error and is reported as a failed close.** A close that
   overran its window raised `BudgetExceededError` from `aclose()` or the `async with` exit; on a
   stream read to its end, the report also took it for the budget's end (`incomplete`, with a
@@ -851,9 +864,10 @@ instead.
   `httpcore` DEBUG records carry the response headers, so a `Location` header that holds the token
   puts it in a record; see the HTTPX logging note in
   [Migrating to the issues architecture (2.3)](#migrating-to-the-issues-architecture-23). What is not
-  converted passes through unchanged but for its traceback: an exception that is not an `Exception`
-  (`KeyboardInterrupt`, `SystemExit`) raised by a hook, which leaves without the transport's and HTTPX's
-  frames that hold the request, and the arguments a canceller gives a cancellation. One limitation remains: over HTTP/2, HTTPX's
+  converted passes through as it is: an exception that is not an `Exception` (`KeyboardInterrupt`,
+  `SystemExit`) raised by a hook, which leaves without the transport's and HTTPX's frames that hold the
+  request and with its `__cause__` and `__context__` cleared, and the arguments a canceller gives a
+  cancellation. One limitation remains: over HTTP/2, HTTPX's
   HPACK header table keeps the request path with the token. That is connection state of HTTPX,
   reachable only by walking the client's internal objects, not by rendering an error.
 

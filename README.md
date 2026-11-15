@@ -167,8 +167,9 @@ sent, with the same consequence for `UNSAFE` and `UNKNOWN` work; the failure its
 `TransportError` that names the exception's class and any HTTP status the client received
 (`error.http_status`), without the exception, which would carry the webhook URL, on its chain. A
 cancellation is re-raised with the same arguments, without the HTTPX frames it was raised in, and an
-exception that is not an `Exception` (`KeyboardInterrupt`) passes through unchanged but for those
-frames, which hold the request. A response the
+exception that is not an `Exception` (`KeyboardInterrupt`) passes through as it is but without those
+frames, which hold the request, and without its chain (`__cause__` and `__context__` are cleared), which
+may be an HTTPX exception that holds it too. A response the
 transport refuses itself is reported as `ProtocolError` (a status outside 100-599) or
 `ResponseTooLargeError` rather than `TransportError`.
 A physical batch applies these rules to each command: after a failure, only the commands that
@@ -954,15 +955,21 @@ the family reads fails the source too, with a `TypeError` as that cause. Every f
 failed close the same way. When nothing failed before it, the close is what failed: the terminal
 reason is "stream cleanup failed" and the report carries one `cleanup_failure` violation, "stream
 cleanup failed (X)", where X is `InputSourceError` or `CleanupOverrunError`. Behind an earlier failure,
-that failure stays the terminal reason and the close adds "stream cleanup also failed (X)". A library
+that failure stays the terminal reason and the close adds "stream cleanup also failed (X)". So does a
+close that fails behind the reader's cancellation: the reader gets its `CancelledError`, the stream is
+`cancelled` with the terminal reason "iteration cancelled", whether the cancellation landed while a
+read waited or between reads. An interrupt is the exception: a `KeyboardInterrupt` or `SystemExit` a
+close raises is never behind anything. It is what the stream raises, whatever ended the stream before
+it, also to a read the close ended, and the report records it as the close's failure (X is
+`KeyboardInterrupt` or `SystemExit`; "also failed" behind an earlier failure). A library
 error carries this in its report (`error.report`), not as a note; your own exception raised inside
 `async with stream` stays what is raised and carries one note, the report's `cleanup_failure` violation
 word for word. The source
 is closed in every case, even when the stream's own tasks outlast the cleanup window. A close from
 another task while a read is in flight is an early close: the read it ends raises `CancelledError`, or
-the close's failure when the close failed, which the close raises too. A stream its reader's
-cancellation ended reports `cancelled` with the terminal reason "iteration cancelled", whatever its
-source had reached. `report.emitted` counts the items the reader got.
+the close's failure when the close failed (an interrupt included), which the close raises too. A
+stream its reader's cancellation ended reports `cancelled` with the terminal reason "iteration
+cancelled", whatever its source had reached. `report.emitted` counts the items the reader got.
 
 Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
 observed identities per operation in memory (100,000 by default). All active reference bindings

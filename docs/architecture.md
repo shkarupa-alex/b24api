@@ -290,20 +290,30 @@ outcome.
 - A failed close is reported by one rule, built by `OperationRunner` (`cleanup_failure` and
   `cleanup_failure_violation`), for every family and every kernel stream, the fast keyset one
   (`KeysetFastStream`) included: "stream cleanup failed (X)" as the terminal failure when nothing failed
-  before it, "stream cleanup also failed (X)" as a secondary otherwise, recorded in the report. The
+  before it, "stream cleanup also failed (X)" as a secondary otherwise, recorded in the report. Behind
+  the reader's cancellation it is secondary too (`cancellation_outranks`): the reader gets the
+  cancellation and the stream is cancelled whenever the cancellation landed, and `OperationStream`
+  demotes its own cleanup failure behind a cancelled source the same way
+  (`with_cleanup_failure_behind`). An interrupt (`is_interrupt`: neither an `Exception` nor a
+  cancellation) is never secondary: `_terminate` records it as the close's failure and raises it,
+  outranking whatever ended the stream, and `close_owned_resources` and the reference scheduler's close
+  raise an interrupt among their cleanup errors ahead of the others. The
   failure is primary: `finalize_failure` puts its violation ahead of the cleanup failures behind it.
-  A library error never carries it as a note: it carries the report (`error.report`). The caller's own
+  A library error never carries it as a note, a failed finalization's error included: it carries the
+  report (`error.report`). The caller's own
   exception raised inside `async with stream`, which the failed close does not replace, carries one
   note: the report's `cleanup_failure` violation, word for word (`__aexit__` reads it from the published
-  report). A close while a read is in flight is an
-  early close: the read it ends raises the close's failure, after the close has run (only an inline
-  kernel consults the closed read's marker; an isolated runner's own close is its CLOSING phase). A
+  report). A close while a read is in flight is an early close: the read it ends raises the close's
+  failure (an interrupt included), after the close has run (only an inline kernel consults the closed read's marker; an isolated runner's own close is its CLOSING phase). A
   stream its reader's cancellation ended gives `CANCELLED_REASON`, whatever its source reached. The
   report counts an item as emitted only once `LifecycleHooks.delivered` says the
   reader has it. Every task the library starts around caller code (a source's pull and close, the
-  worker-thread hop, the reference scheduler's producer, a stream's read and cleanup, the client's
-  close) runs through `spawn_settled`: it returns how it ended (`Settled`) and its owner raises the
-  failure, so none ends in one, which `asyncio.run` would report at shutdown whether or not the owner
+  worker-thread hop, the reference scheduler's producer and binding tasks, a wave's or a counted tail's
+  page fetch, a batch's isolation sends, a stream's read and cleanup, the client's close) runs through
+  `spawn_settled`: it returns how it ended (`Settled`) and its owner raises the failure. The batch
+  dispatcher's senders, which send many pages' commands at once, hand any failure, an interrupt's too,
+  to those pages' futures instead, so the fetch that awaits one raises it. So no task ends in a
+  failure, which `asyncio.run` would report at shutdown whether or not the owner
   retrieved it. That includes `KeyboardInterrupt` and `SystemExit`: a task ending in one would stop the
   loop from inside that task and leave its owner pending, so the interrupt travels to the caller's own
   task instead, and a worker-thread call a cancellation cut raises it rather than dropping it.
