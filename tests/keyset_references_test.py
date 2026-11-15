@@ -51,9 +51,15 @@ from b24api.contracts import (
     ReferenceNotExecuted,
     ReferenceSource,
 )
-from b24api.contracts.completion import CommandSettlement, PageCommandOutcome, PageScheduled
+from b24api.contracts.completion import (
+    CommandSettlement,
+    PageAcknowledged,
+    PageCommandOutcome,
+    PageRejected,
+    PageScheduled,
+)
 from b24api.contracts.page_stop import ContinuePage
-from b24api.contracts.policy import RetryPolicy
+from b24api.contracts.policy import KernelState, RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError, CapabilityError, IdentityContractError
 from b24api.execution import ExecutionContext, Executor, RateCoordinator
@@ -72,6 +78,7 @@ if TYPE_CHECKING:
     from b24api.contracts.completion import CompletionEvidence
     from b24api.contracts.report import OperationReport
     from b24api.contracts.stream import OperationStream
+    from b24api.execution.executor import _Pause, _RequestAttempts
     from b24api.traversal.keyset_context import KeysetContext
     from tests.scripting import Envelope, Query
 
@@ -411,6 +418,121 @@ async def test_a_binding_cancelled_while_its_wave_is_on_the_wire_settles_each_pa
     settled = [event.outcome for event in events if isinstance(event, PageCommandOutcome)][settled_before:]
     assert unsettled == portal.waves[-1]
     assert settled == [CommandSettlement.UNKNOWN] * unsettled
+
+
+@pytest.mark.asyncio
+async def test_a_binding_cancelled_while_its_wave_waits_to_replay_settles_each_page_from_its_own_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The second wave is answered, but the server refuses its first command (QUERY_LIMIT_EXCEEDED), and the binding
+    # is cancelled while the wave waits to send it again. The shared engine settles each page by its command id:
+    # the refused one is an answered failure, every other page succeeded.
+    events: list[object] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    waiting = asyncio.Event()
+    replay_after = Executor.replay_after
+
+    async def observed_replay_after(
+        self: Executor, context: ExecutionContext, *, attempts: _RequestAttempts, pause: _Pause
+    ) -> None:
+        waiting.set()
+        await replay_after(self, context, attempts=attempts, pause=pause)
+
+    monkeypatch.setattr(Executor, "replay_after", observed_replay_after)
+    serve = _answer({"p0": tuple(range(1, 2000))})
+    refused: list[Query] = []
+
+    def answer(method: str, query: Query) -> Envelope:
+        # The first command of the second wave, the first range wave.
+        if len(portal.waves) == 2 and not refused:
+            refused.append(query)
+            return {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}
+        return serve(method, query)
+
+    portal = BatchPortal(answer)
+    async with client_for(portal) as client:
+        stream = client.iter_reference_outcomes(_base(), [_parent("p0")], traversal=_traversal(_range()))
+        pull = asyncio.create_task(_drain(stream))
+        await asyncio.wait_for(waiting.wait(), 5)
+        settled_before = {event.page_id for event in events if isinstance(event, PageCommandOutcome)}
+        wave = [event.page_id for event in events if isinstance(event, PageScheduled)]
+        wave = [page for page in wave if page not in settled_before]
+        pull.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pull
+
+    settled = {event.page_id: event.outcome for event in events if isinstance(event, PageCommandOutcome)}
+    assert len(wave) == portal.waves[1]
+    assert [settled[page] for page in wave] == [
+        CommandSettlement.FAILURE,
+        *[CommandSettlement.SUCCESS] * (len(wave) - 1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_binding_that_fails_retires_every_page_it_scheduled() -> None:
+    # A binding whose pages contradict their ranges fails while a page it has accepted is still undelivered: it
+    # rejects that page as it fails, so each page it scheduled is acknowledged or rejected exactly once.
+    events: list[object] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+
+    portal = BatchPortal(_answer({"p0": tuple(range(1, 2000))}, ignore_bounds=frozenset({"p0"})))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(CompletionGate, "emit", observe)
+        async with client_for(portal) as client:
+            outcomes, report = await _drain(
+                client.iter_reference_outcomes(_base(), [_parent("p0")], traversal=_traversal(_range()))
+            )
+
+    assert report.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert isinstance(outcomes[-1], ReferenceFailure)
+    scheduled = [event.page_id for event in events if isinstance(event, PageScheduled)]
+    retired = [event.page_id for event in events if isinstance(event, PageAcknowledged | PageRejected)]
+    assert sorted(retired) == scheduled
+    assert KernelState.FAILED.value in {event.reason for event in events if isinstance(event, PageRejected)}
+
+
+@pytest.mark.asyncio
+async def test_fast_bindings_keep_no_more_batches_in_flight_than_the_active_references_allow() -> None:
+    # A fast keyset binding sends several pages of its own at once, so the active references alone do not bound
+    # the batches in flight: the policy's max_active_references does, below a wider dispatch concurrency.
+    active = 2
+    in_flight = {"now": 0, "most": 0}
+    data = {f"p{index}": tuple(range(1 + 1000 * index, 600 + 1000 * index)) for index in range(6)}
+    portal = BatchPortal(_answer(data), wire_turns=50)
+
+    async def respond(request: Request) -> WireResponse:
+        in_flight["now"] += 1
+        in_flight["most"] = max(in_flight["most"], in_flight["now"])
+        try:
+            return await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        finally:
+            in_flight["now"] -= 1
+
+    transport = ResponderTransport(respond, host=portal.host)
+    async with client_for(transport, policy=ExecutionPolicy(max_active_references=active)) as client:
+        outcomes, report = await _drain(
+            client.iter_reference_outcomes(
+                _base(),
+                [_parent(name) for name in data],
+                traversal=_traversal(_auto()),
+                dispatch=BatchDispatch(batch_size=16, concurrency=8, coalesce_wait=0.0),
+            )
+        )
+
+    assert report.state is TerminalState.COMPLETED
+    assert sum(isinstance(outcome, ReferenceItem) for outcome in outcomes) == sum(map(len, data.values()))
+    assert in_flight["most"] == active
 
 
 @pytest.mark.asyncio
