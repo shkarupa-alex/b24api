@@ -270,7 +270,9 @@ nearest the frontier first, and stops at the first page behind the frontier that
 every later page keeps more room free. Under `READY` delivery a page's check is a count, and a change
 wakes the waiting pages that fit in the order they came. Under both, a page is woken only for rows free
 beyond those promised to the pages already woken and not yet resumed, so a release wakes the pages its
-rows serve, not every waiting page. A counted binding reads its head and its known tail offsets as ordinary pages of
+rows serve, not every waiting page. Promised rows are the woken page's own: no page or lease asking
+later takes them, and a woken page that no longer fits when it resumes (the frontier's reserve grew)
+waits again and wakes the waiting pages its promise serves. A counted binding reads its head and its known tail offsets as ordinary pages of
 that pool and commits them in offset order. A fast or automatic keyset binding instead holds one row
 lease from activation to its
 terminal event. Its runtime plans and fits every wave against a view of the operation policy that

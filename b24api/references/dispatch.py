@@ -555,7 +555,7 @@ class _RowBuffer:
             raise BudgetExceededError("one decoded page exceeds the global row buffer")
         if self._closed:
             raise asyncio.CancelledError
-        if not self._can_reserve(index, amount):
+        if not self._can_reserve(index, amount, -self._promised):
             async with self.context.deadline("row buffer wait exceeded operation time budget"):
                 await self._wait_for_rows(index, amount)
         return self._take(index, amount, _Hold.IN_FLIGHT)
@@ -563,11 +563,14 @@ class _RowBuffer:
     async def _wait_for_rows(self, index: int, amount: int) -> None:
         """Wait until ``amount`` rows fit for binding ``index``; the caller takes them in the same step.
 
-        A page that stops waiting, by cancellation or by the elapsed budget, leaves the queue. If it was
-        woken already, the rows promised to it go back to the others and the next waiting pages that fit
-        are woken; a page never woken blocked no other, as each one's turn depends on the rows alone.
+        Rows promised to a woken page are its own until it resumes: no other page and no lease takes them. A
+        woken page that no longer fits when it resumes, as an ordered pool's rooms changed meanwhile, waits
+        again and gives its promise to the waiting pages it serves. A page that stops waiting, by
+        cancellation or by the elapsed budget, leaves the queue, and if it was woken already gives its
+        promise back the same way; a page never woken blocked no other, as each one's turn depends on the
+        rows alone.
         """
-        while not self._can_reserve(index, amount):
+        while not self._can_reserve(index, amount, -self._promised):
             waiter = _Waiter(index, amount, asyncio.get_running_loop().create_future())
             if self._ordered:
                 insort(self._waiters, waiter, key=_waiter_index)
@@ -586,6 +589,8 @@ class _RowBuffer:
             self._promised -= amount
             if self._closed:
                 raise asyncio.CancelledError
+            if not self._can_reserve(index, amount, -self._promised):
+                self._changed()
 
     def _take(self, index: int, amount: int, hold: _Hold) -> _Reservation:
         self._available -= amount
@@ -773,7 +778,8 @@ class _RowBuffer:
     async def lease(self, index: int, grant: Callable[[int], int | None]) -> _Reservation:
         """Hold one capacity until terminal, never grown; ``grant`` sizes it from the free rows or asks to wait.
 
-        ``grant`` runs with no await between its decision and the reservation, so the two are atomic. It
+        ``grant`` sees the free rows not promised to a woken page, and runs with no await between its decision
+        and the reservation, so the two are atomic. It
         may raise to refuse a lease no releaser can ever satisfy. An ordered pool asks it only once no
         earlier binding waits for a lease. A binding leaving the wait, with a lease or without one,
         wakes the others: whether it still waits decides whether a later binding may take rows.
@@ -783,13 +789,14 @@ class _RowBuffer:
             while True:
                 if self._closed:
                     raise asyncio.CancelledError
-                amount = None if self._behind_lease_waiter(index) else grant(self._available)
+                free = self._available - self._promised
+                amount = None if self._behind_lease_waiter(index) else grant(free)
                 if amount is not None:
                     break
                 wake: asyncio.Future[None] = asyncio.get_running_loop().create_future()
                 self._lease_waiters.append(wake)
                 await wake
-            if isinstance(amount, bool) or not 0 < amount <= self._available:
+            if isinstance(amount, bool) or not 0 < amount <= free:
                 raise RuntimeError("fast keyset lease exceeds the free row pool")
             return self._take(index, amount, _Hold.LEASE)
         finally:

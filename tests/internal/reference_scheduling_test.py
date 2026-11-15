@@ -437,6 +437,62 @@ async def test_a_release_wakes_only_the_waiting_pages_its_rows_serve(ordered: bo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("taker", ["page", "lease"])
+async def test_rows_promised_to_a_woken_page_are_its_own_until_it_resumes(taker: str) -> None:
+    """A page or a lease asking for rows after a release does not take those a woken page was promised.
+
+    It took them, so the woken page found its rows gone and queued again, and the page that fitted in what was
+    left stayed parked until the next change of the pool.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    buffer = _RowBuffer(5, context)
+    held = await buffer.reserve(0, 5)
+    await buffer.accept(held, 5)
+    woken = asyncio.create_task(buffer.reserve(1, 5))
+    await asyncio.sleep(0)
+
+    await buffer.release(held, 5)
+    later = asyncio.create_task(buffer.reserve(2, 1) if taker == "page" else buffer.lease(2, lambda free: free or None))
+    async with asyncio.timeout(HANG_BOUND):
+        reservation = await woken
+    assert (reservation.amount, later.done()) == (5, False)
+
+    await buffer.abort(reservation)
+    async with asyncio.timeout(HANG_BOUND):
+        assert (await later).amount == (1 if taker == "page" else 5)
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_woken_page_that_no_longer_fits_gives_its_promise_to_the_pages_it_serves() -> None:
+    """A woken page that no longer fits when it resumes waits again and wakes the waiting pages that fit.
+
+    Here the frontier's reserve grows between the wake and the resume; the page's promise went back to the pool
+    with no page woken for it, so the smaller page that fitted stayed parked.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    buffer = _RowBuffer(10, context, ordered=True)
+    held = await buffer.reserve(0, 10)
+    await buffer.accept(held, 10)
+    small_page = 2
+    large = asyncio.create_task(buffer.reserve(1, 9))
+    small = asyncio.create_task(buffer.reserve(2, small_page))
+    await asyncio.sleep(0)
+
+    await buffer.release(held, 10)
+    buffer.raise_head_reserve(5)
+    async with asyncio.timeout(HANG_BOUND):
+        assert (await small).amount == small_page
+    assert not large.done()
+    large.cancel()
+    await buffer.close()
+
+
+@pytest.mark.asyncio
 async def test_a_page_given_back_leaves_the_pool_and_no_other() -> None:
     """The pool lists each reservation as its own: giving one back removes that one, not an equal one.
 
