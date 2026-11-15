@@ -29,6 +29,7 @@ from b24api.errors import (
 )
 
 if TYPE_CHECKING:
+    from b24api.contracts.report import OperationReport
     from b24api.execution.snapshot import KernelReport
 
 R = TypeVar("R")
@@ -150,7 +151,7 @@ def with_cleanup_failure_behind(report: KernelReport, error: BaseException) -> K
 INTERRUPTED_REASON = "operation interrupted"
 
 
-def with_interrupt[R](report: R, interrupt: BaseException) -> R:
+def with_interrupt(report: OperationReport, interrupt: BaseException) -> OperationReport:
     """Return the report of an operation an interrupt (``is_interrupt``) ended, in one shape however it ended.
 
     The interrupt is what leaves, whatever came before it: the report is failed with ``INTERRUPTED_REASON``, keeps
@@ -159,16 +160,16 @@ def with_interrupt[R](report: R, interrupt: BaseException) -> R:
     """
     message = f"{INTERRUPTED_REASON} ({report_reason(interrupt)})"
     violation = Violation(ViolationSeverity.BLOCKING, "interrupted", message)
-    violations = tuple(getattr(report, "violations", ()))
+    violations = report.violations
     if not any(item.code == violation.code for item in violations):
         violations = (*violations, violation)
-    state = KernelState.FAILED if isinstance(getattr(report, "state", None), KernelState) else TerminalState.FAILED
-    changes: dict[str, object] = {"state": state, "terminal_reason": INTERRUPTED_REASON, "violations": violations}
-    if hasattr(report, "exhausted"):
-        changes["exhausted"] = False
-    if getattr(report, "empty_source_witness", None) is not None:
-        changes["empty_source_witness"] = None
-    return cast("R", replace(cast("Any", report), **changes))
+    return replace(
+        report,
+        state=TerminalState.FAILED,
+        terminal_reason=INTERRUPTED_REASON,
+        violations=violations,
+        exhausted=False,
+    )
 
 
 def attach_report(error: BaseException, report: object) -> None:

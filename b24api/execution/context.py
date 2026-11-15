@@ -456,42 +456,73 @@ class OwnedPull[T](Protocol):
 def is_interrupt(error: BaseException | None) -> bool:
     """Whether ``error`` interrupts the program rather than fails work: neither an ``Exception`` nor a cancellation.
 
-    ``KeyboardInterrupt`` and ``SystemExit`` are the usual ones.
+    ``KeyboardInterrupt`` and ``SystemExit`` are the usual ones. ``GeneratorExit`` is none: it closes a coroutine.
     """
-    return error is not None and not isinstance(error, Exception | asyncio.CancelledError)
+    return error is not None and not isinstance(error, Exception | asyncio.CancelledError | GeneratorExit)
 
 
 class InterruptLatch:
     """The first interrupt (``is_interrupt``) an operation saw, wherever its own code caught it.
 
-    Library code that catches a ``BaseException`` in an operation's work latches it (``latch_interrupt``) and goes on
-    as with any failure: turns it into a binding's end, a page's failure or a task's ``Settled`` result. The
+    Library code that first catches a ``BaseException`` in an operation's work latches it (``latch_interrupt``) and
+    goes on as with any failure: turns it into a binding's end, a page's failure or a task's ``Settled`` result. The
     operation raises the latched interrupt as its end, ahead of anything else, once its report is published, so no
-    route an interrupt takes (an event, a future, a task's result) can drop it. ``wake`` lets the operation end at
-    once instead of when it would have ended otherwise, until the operation is ending (``end``).
+    route an interrupt takes (an event, a future, a task's result) can drop it. Once the operation has ended
+    (``close``), nobody would raise it: the latch hands an interrupt caught then to the event loop, which raises it
+    out of ``asyncio.run`` as it does any task's, once, while its catchers go on as with any failure.
     """
 
-    __slots__ = ("_wake", "first")
+    __slots__ = ("_closed", "_passed", "_wake", "first")
 
     def __init__(self, wake: Callable[[], None] | None = None) -> None:
-        """Hold no interrupt yet."""
+        """Hold no interrupt yet; ``wake`` ends the operation at once when one is latched while it runs."""
         self.first: BaseException | None = None
         self._wake = wake
+        # Whether the operation has ended: it raised its interrupt, or will never raise one.
+        self._closed = False
+        # The interrupts caught after the operation ended, each handed to the event loop once.
+        self._passed: list[BaseException] = []
 
     def end(self) -> None:
         """The operation is ending: an interrupt latched from now on is raised at its end, waking nothing.
 
-        The latch outlives the operation in the context of any task its work started, so it lets go of ``wake``.
+        Its cleanup runs then, an inline kernel's in the very read ``wake`` would cancel.
         """
         self._wake = None
 
+    def close(self) -> BaseException | None:
+        """The operation raises what it ends with: return its interrupt, if any; none is latched from now on.
+
+        The latch outlives the operation in the context of any task its work started, so it lets go of ``wake``.
+        """
+        self._closed = True
+        self._wake = None
+        if self.first is not None and self.first not in self._passed:
+            # Raised by the operation itself: whoever catches it later does not hand it to the loop again.
+            self._passed.append(self.first)
+        return self.first
+
     def record(self, error: BaseException | None) -> None:
-        """Keep ``error`` when it is the operation's first interrupt; anything else is not this latch's."""
-        if self.first is not None or not is_interrupt(error):
+        """Latch ``error`` when it is the operation's first interrupt; anything else is not this latch's.
+
+        After the operation ended, the interrupt goes to the event loop instead, once however many catch it.
+        """
+        if error is None or not is_interrupt(error):
             return
-        self.first = error
-        if self._wake is not None:
-            self._wake()
+        if self._closed:
+            if error not in self._passed:
+                self._passed.append(error)
+                asyncio.get_running_loop().call_soon(_raise, error)
+            return
+        if self.first is None:
+            self.first = error
+            if self._wake is not None:
+                self._wake()
+
+
+def _raise(error: BaseException) -> None:
+    """Raise ``error`` from an event loop callback: an interrupt leaves the loop from there, out of ``asyncio.run``."""
+    raise error
 
 
 # The latch of the operation whose work runs the current code: its runner sets it in its read and cleanup tasks, and
@@ -513,7 +544,8 @@ class Settled[T]:
     ended in an exception, whether or not its owner retrieves it later, so only a task that never ends in one keeps
     the failure its owner's alone. That includes ``KeyboardInterrupt`` and ``SystemExit``: a task ending in one
     stops the event loop from inside that task, leaving the owner waiting. An interrupt is latched on the operation
-    besides (``InterruptLatch``), which raises it as its end whatever the owner does with the result.
+    besides (``InterruptLatch``), which raises it as its end whatever the owner does with the result, or hands it to
+    the event loop once the operation has ended.
     """
 
     __slots__ = ("error", "value")
@@ -531,10 +563,14 @@ class Settled[T]:
 
 
 async def settle[T](work: Awaitable[T]) -> Settled[T]:
-    """Await ``work`` and return how it ended (``Settled``); a cancellation still ends the task cancelled."""
+    """Await ``work`` and return how it ended (``Settled``); a cancellation still ends the task cancelled.
+
+    A ``GeneratorExit`` is no way the work ended: the task's coroutine is being closed (a loop that stopped leaves it
+    to the garbage collector), so it passes through.
+    """
     try:
         return Settled(await work)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, GeneratorExit):
         raise
     except BaseException as error:  # noqa: BLE001 - returned for the task's owner to raise: the task ends without it
         latch_interrupt(error)

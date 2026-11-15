@@ -403,13 +403,13 @@ class OperationRunner[T, R: _Report]:
     def _cause_of(self, error: BaseException) -> TerminalCause:
         """Classify the end of the read that ended the body; an interrupt is latched, and ends it as interrupted.
 
-        A read the latch cancelled (``_interrupted``) ends by the interrupt, not by a caller's cancellation.
+        This is where an inline kernel first catches an interrupt its read raised (a kernel's transport runs in the
+        read): its end raises what the kernel ends with, a failed cleanup say, so the latch is what keeps it.
         """
-        latch = self._latch()
-        latch.record(error)
+        self._latch().record(error)
         if isinstance(error, StopAsyncIteration):
             return TerminalCause.EXHAUSTED
-        if is_interrupt(error) or (latch.first is not None and isinstance(error, asyncio.CancelledError)):
+        if is_interrupt(error):
             return TerminalCause.INTERRUPTED
         if not self._isolated and _closed_by_owner(error):
             return TerminalCause.EARLY_CLOSED
@@ -511,13 +511,14 @@ class OperationRunner[T, R: _Report]:
             pull.cancel()
 
     def _raise_latched(self) -> None:
-        """Raise the operation's interrupt, ahead of whatever else would leave, with the published report.
+        """Close the operation's latch and raise its interrupt, ahead of whatever else would leave, with the report.
 
         Only the latch's owner raises it: a runner reading inline in its operation's read ends as it would otherwise,
-        so the operation's report keeps what ended it first, and its owner raises the interrupt.
+        so the operation's report keeps what ended it first, and its owner raises the interrupt. Once closed, the latch
+        keeps no interrupt: one caught later goes to the event loop (``InterruptLatch.record``).
         """
         latch = self._latch()
-        if latch is self._interrupts and (interrupt := latch.first) is not None:
+        if latch is self._interrupts and (interrupt := latch.close()) is not None:
             if self._report is not None:
                 self._hooks.attach(interrupt, self._report)
             raise interrupt
@@ -586,17 +587,18 @@ class OperationRunner[T, R: _Report]:
         cleanup still running then finishes in the background and is reported as failed.
         """
         self._primary = primary
-        # The operation is ending: an interrupt latched from now on is raised at its end, cancelling no read.
+        # The operation is ending: an interrupt latched from now on wakes nothing, so it cancels no read, not the one
+        # an inline kernel's cleanup runs in.
         self._latch().end()
         cancelled = pending is not None or isinstance(primary, asyncio.CancelledError)
         self._cleanup_task = spawn_settled(self._clean_up(read))
         cleanup = await await_cleanup_resistant(self._cleanup_task, deadline=deadline, cancelled=cancelled)
-        self._latch().record(cleanup.error)
-        # An interrupt is never a cleanup failure: it is latched, and leaves as the operation's end.
+        # An interrupt is never a cleanup failure: its task latched it (``settle``), and it leaves as the end.
         error = None if is_interrupt(cleanup.error) else cleanup.error
         attempt = CleanupAttempt(error, cleanup.cancellation or pending, finished=cleanup.unfinished is None)
         reason = report_reason(primary) if cause is TerminalCause.FAILED and primary is not None else None
         report, finalize_failed = await self._publish(cause, reason, attempt)
+        # The operation's end: its interrupt is raised now, ahead of anything else, or handed to the loop later.
         self._raise_latched()
         if cause is TerminalCause.FAILED and primary is not None:
             self._raise_failed(primary, report, attempt, finalize_failed=finalize_failed)
