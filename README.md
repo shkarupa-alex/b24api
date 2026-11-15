@@ -968,9 +968,13 @@ with the terminal reason "operation interrupted", every violation recorded befor
 failure's first), and one `interrupted` violation last, "operation interrupted (X)", where X is
 `KeyboardInterrupt` or `SystemExit`. The raised interrupt carries that report as `.report`, as the
 `CancelledError` does. A close that fails after an interrupt ended the stream is "stream cleanup also
-failed (X)", as behind any other end that came first. An interrupt raised after the operation ended (by a
-close or a send still running past the cleanup window) is never dropped either: it leaves the event loop
-out of `asyncio.run`, as asyncio raises any task's. A library
+failed (X)", as behind any other end that came first. An interrupt raised while no read is waiting (by a
+send the stream runs between your reads, while you work on an item) does not wait for your next read: the
+operation ends at once, its work cancelled, its source closed and its report published, and the interrupt
+leaves the event loop out of `asyncio.run`, as asyncio raises any task's. The stream is then ended: a
+later read raises `StopAsyncIteration` and a close returns, neither raising the interrupt again. An
+interrupt raised after the operation ended (by a close or a send still running past the cleanup window) is
+never dropped either: it leaves the event loop the same way. A library
 error carries this in its report (`error.report`), not as a note; your own exception raised inside
 `async with stream` stays what is raised and carries one note, the report's `cleanup_failure` violation
 word for word. The source

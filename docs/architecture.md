@@ -300,15 +300,27 @@ outcome.
   so the tasks they start inherit it (an inline kernel uses the latch of the runner it serves). Every
   place where library code first catches a caller's `BaseException` latches the first interrupt and goes
   on as it would: `settle`, so every `spawn_settled` task; the reference scheduler's binding tasks; the
-  dispatcher's senders; and `OperationRunner._cause_of`, the end of a read, which is where an inline
+  dispatcher's senders; and `OperationRunner.__anext__` where a read ends, which is where an inline
   kernel (`batch()`, `iter_list*`, the fast keyset) first catches the interrupt its own send raised, its
   end then raising what the kernel ends with (a failed cleanup, say). Whatever later handles that
-  failure (a scheduler's close, an isolation's cleanup) may drop it freely. Latching cancels the
-  owner's read in flight. `OperationRunner._terminate` is the one raise point: after the report is
-  published (`with_interrupt`: failed, `INTERRUPTED_REASON`, the earlier violations kept, one
-  `interrupted` violation last) it closes the latch and raises its interrupt, with the report attached
-  (`.report`), whatever ended the stream; `close_owned_resources` does the same for the client's close
-  with a latch of its own. A closed latch (`InterruptLatch.close`) keeps nothing: an interrupt caught
+  failure (a scheduler's close, an isolation's cleanup) may drop it freely. The latch's state is explicit
+  (`LatchState`): `ARMED` while the operation runs, when the first interrupt wakes the owner; `ENDING`
+  once cleanup starts, when an interrupt is latched for the end and wakes nothing (an inline kernel's
+  cleanup runs in the very read a wake would cancel); `CLOSED` once the end took it. The wake ends the
+  operation at once: a read in flight is cancelled and raises the interrupt (a read whose own task
+  latched it and still returned an item raises it instead of the item); with no read in flight,
+  between reads, the operation ends in a task of its own (`OperationRunner._end_between_reads`), which
+  cleans up, publishes and hands the interrupt to the event loop, since no reader is there to raise it
+  and the reader may never read again. That stream is ended: a later read raises
+  `StopAsyncIteration` and a close returns, neither raising the interrupt again.
+  `OperationRunner._raise_latched` is the one raise point: after the report is published it closes
+  the latch and raises its interrupt, with the report attached (`.report`), whatever ended the stream,
+  from every end of the stream (the read or close that ended it, and a read a concurrent close ended),
+  or hands it on when the operation ended between reads. The report has one shape for it, applied by
+  the runner to whichever report it publishes, the family's or the fallback after a failed finalization
+  (`LifecycleHooks.interrupted`, `with_interrupt`: failed, `INTERRUPTED_REASON`, the earlier violations
+  kept, one `interrupted` violation last). `close_owned_resources` raises the client's close's first
+  interrupt the same way with a latch of its own. A closed latch keeps nothing: an interrupt caught
   after the operation ended (a task outlasting the cleanup window raises it, say) is handed to the event
   loop, which raises it out of `asyncio.run` as it does any task's, once. The
   failure is primary: `finalize_failure` puts its violation ahead of the cleanup failures behind it.
