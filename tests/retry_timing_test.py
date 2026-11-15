@@ -44,7 +44,7 @@ from b24api.errors import (
 )
 from b24api.execution import Executor, RateCoordinator, WireResponse, WorkClass, throttle
 from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
-from b24api.execution.facts import Execution, ambiguity_of, execution, stopped_before_send
+from b24api.execution.facts import Execution, ambiguity_of, execution
 from b24api.references.fanout import kernel_fanout_stream
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from tests.scripting import ResponderTransport, always, client_for, drain_to_failure, on_loop, replies
@@ -2050,7 +2050,6 @@ async def test_a_stopped_retry_is_explained_by_the_send_it_followed_whatever_sto
     for error in errors:
         stop = error.__cause__ if type(error) is AmbiguousExecutionError else error
         assert type(stop) is (BudgetExceededError if closing in {"budget", "window"} else ClientClosedError)
-        assert stopped_before_send(stop)
         followed = stop.__cause__
         ambiguity = (
             error
@@ -2085,7 +2084,6 @@ def _assert_explained_by_the_502(error: B24ApiError) -> None:
     """The retry plan refused the retry of a send answered 502: unknown for that send, never for the refusal."""
     stop = error.__cause__ if type(error) is AmbiguousExecutionError else error
     assert type(stop) is BudgetExceededError
-    assert stopped_before_send(stop)
     assert isinstance(stop.__cause__, HTTPGatewayError)
     assert stop.__cause__.http_status == _BAD_GATEWAY
     assert execution(error) is Execution.POSSIBLY_RUN

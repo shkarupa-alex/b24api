@@ -229,8 +229,10 @@ class ExecutionContext:
         """Release a reserved attempt whose transport refused it before it left the process: no physical request.
 
         The send held its reservation until its transport returned, so a concurrent send the spent request budget
-        refused meanwhile stays refused.
+        refused meanwhile stays refused. With no attempt reserved there is nothing to release: that is a misuse.
         """
+        if self._physical_requests == 0:
+            raise RuntimeError("no reserved attempt to release")
         self._physical_requests -= 1
 
     async def record_retry(self) -> None:

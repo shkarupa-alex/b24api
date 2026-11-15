@@ -1640,3 +1640,46 @@ async def test_a21_lineage_an_envelope_retry_the_budget_refused_is_not_followed_
             assert isinstance(followed, B24ApiError)
             assert isinstance(envelope_failure, WireResponse)
             assert followed.http_status == envelope_failure.status_code
+
+
+@pytest.mark.asyncio
+async def test_a21_isolation_an_isolated_send_cancelled_in_flight_is_counted() -> None:
+    """An isolated send cancelled before its answer was sent: it counts as a request and as an isolation request.
+
+    A SAFE envelope aborts, so its commands are isolated; the consumer is cancelled while the first isolated send
+    waits for its answer.
+    """
+    started = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/batch"):
+            return httpx.Response(BAD_REQUEST, json=_abort("SYNTHETIC_NOT_FOUND"), request=request)
+        started.set()
+        await asyncio.Future[None]()
+        raise AssertionError("an isolated send in flight is never answered")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
+    commands = [Command(_v3(identifier), identifier) for identifier in range(TWO)]
+    try:
+        async with client_for(transport, policy=_policy()) as api:
+            stream = api.batch_outcomes(commands)
+
+            async def consume() -> None:
+                async with stream:
+                    async for _outcome in stream:
+                        pass
+
+            task = asyncio.create_task(consume())
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    finally:
+        await transport.aclose()
+        await client.aclose()
+
+    report = stream.report
+    assert report is not None
+    assert report.physical_requests == TWO
+    assert report.batch_isolation_requests == 1

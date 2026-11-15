@@ -228,7 +228,7 @@ class _V3Resolution:
         may have run.
         """
         self.attempts.chain_stop(refusal)
-        self.attempts.record_unsent(refusal)
+        self.attempts.record_open(refusal)
         for command in pending:
             self.last[command.index] = _shared_failure(command, refusal)
 
@@ -241,7 +241,7 @@ class _V3Resolution:
         answered keep that answer; those of a first send end with the stop.
         """
         if followed:
-            self.attempts.record_unsent(error)
+            self.attempts.record_open(error)
             for command in pending:
                 self.last[command.index] = _shared_failure(command, error)
         for command in pending:
@@ -303,7 +303,7 @@ class _V3Resolution:
         except B24ApiError as error:
             if lineage.used == spent:
                 # The executor records facts for its own sends; the envelope already sent this command.
-                lineage.record_unsent(error)
+                lineage.record_open(error)
             return _isolated_failure(command, error)
         finally:
             self.context.record_batch_isolation_requests(lineage.used - spent)

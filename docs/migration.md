@@ -43,7 +43,9 @@
   entry answered with a transient error (`QUERY_LIMIT_EXCEEDED`, for example), whose replay such a
   non-budget stop kept from being sent, ended with that stop (`ClientClosedError`) and now keeps its
   `BatchCommandError`, as it already did when the budget stopped its replay and as a REST 3.0 command
-  its element answered did.
+  its element answered did. The commands of a classic round a stop ended no longer share one error
+  object: each gets its own copy of the stop, with the stop's traceback and the failure that command
+  followed as its cause.
 - **A stale `Date` no longer stretches a dated throttle hint.** A `Retry-After` given as an HTTP date,
   or an `X-Bitrix-RateLimit-Reset` given as a date or an epoch, was measured against the response's
   `Date` whatever that `Date` said, so an answer whose `Date` was an hour old (from a cache or a relay,

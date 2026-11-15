@@ -45,9 +45,7 @@ from b24api.execution.facts import (
     http_success,
     possible_execution,
     record_dispatch,
-    record_stop,
     record_withheld,
-    stopped_before_send,
 )
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
@@ -190,8 +188,12 @@ class _Lineage:
             unproven=None if explains_itself else self.unproven,
         )
 
-    def record_unsent(self, error: BaseException) -> None:
-        """Record a failure before a further send left: what these sends left open stays open."""
+    def record_open(self, error: BaseException) -> None:
+        """Record on a failure what these sends left open, as their answers were classified.
+
+        The failure adds nothing to them: it stopped a further send before it left, cut the latest one before its
+        answer (a cancellation), or is the failure the latest send's classification already holds.
+        """
         record_dispatch(error, possibly_executed=self.left_open() is not None, unproven=self.unproven)
 
     def withhold(self, error: BaseException) -> None:
@@ -371,10 +373,11 @@ class _RequestAttempts:
 
         The one rule for every stop before a send, by the budget or otherwise (a closed client), whichever single
         request, batch round or isolated send it stops: what ended the send is the outcome, and what it followed is
-        its cause. The stop is recorded as one (``record_stop``), so whoever records how the request ended records
-        what the sends before it left open, never the stop as a send that may have run.
+        its cause. The stop ran nothing, so whoever records how the request ended records what the sends before it
+        left open (``record_open``), never the stop as a send that may have run.
         """
-        record_stop(error, followed=self.retry_cause)
+        if self.retry_cause is not None:
+            error.__cause__ = self.retry_cause
 
     def settle(self, error: B24ApiError, policy: ExecutionPolicy) -> None:
         """Record how the last send failed."""
@@ -395,20 +398,9 @@ class _RequestAttempts:
         """Record on the failure that ended the request, or answered one of its commands, what its sends left open."""
         self.lineage.record(error, policy)
 
-    def record_unsent(self, error: BaseException) -> None:
-        """Record a failure before a further send left: what the earlier sends left open stays open."""
-        self.lineage.record_unsent(error)
-
-    def record_end(self, error: BaseException, policy: ExecutionPolicy) -> None:
-        """Record on the failure that ended a request after its sends what they left open.
-
-        A stop before a further send (``chain_stop``) leaves open what they did, as a batch dialect records its own
-        stops; any other failure is how the latest send ended.
-        """
-        if stopped_before_send(error):
-            self.record_unsent(error)
-        else:
-            self.record(error, policy)
+    def record_open(self, error: BaseException) -> None:
+        """Record on a failure what the sends so far left open, as their answers were classified."""
+        self.lineage.record_open(error)
 
     def withhold(self, error: BaseException) -> None:
         """Record a command the server halted before: proven not run by the last send, but not by earlier ones."""
@@ -528,7 +520,9 @@ class Executor:
             )
         except BaseException as error:
             if attempts.used > spent:
-                attempts.record_end(error, context.policy)
+                # Each send's failure was classified where it ended; a failure that ends the request after them adds
+                # nothing (a stop before a further send, or a cancellation): what they left open is the lineage's.
+                attempts.record_open(error)
             raise
         try:
             response = _decode_success(wire, parsed, request_summary=request.summary)
@@ -570,7 +564,7 @@ class Executor:
             )
         except BaseException as error:
             if attempts.used:
-                attempts.record_end(error, context.policy)
+                attempts.record_open(error)
             raise
         content_type = wire.content_type
         digest = hashlib.sha256(wire.body).hexdigest() if context.policy.binary_digest else None

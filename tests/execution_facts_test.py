@@ -25,6 +25,7 @@ from b24api.contracts import (
     CommandSettlement,
     CommandSuccess,
     NotExecutedReason,
+    PageDispatch,
     PageOutcome,
     PageRejectionCode,
     ParameterPath,
@@ -54,7 +55,7 @@ from b24api.errors import (
     ProtocolError,
     TransportError,
 )
-from b24api.execution.facts import possible_execution, record_dispatch, record_stop, stopped_before_send
+from b24api.execution.facts import possible_execution, record_dispatch
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from b24api.transport import WireRequest, WireResponse
 from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, on_loop
@@ -642,8 +643,7 @@ def test_a_stop_is_explained_only_by_the_send_its_recorder_recorded_never_by_its
     # A stop ran nothing: what its recorder recorded explains it, never its type or its cause chain, whatever stopped
     # it; so a recorder that records it as a send that may have run is caught, not covered up.
     answered = HTTPGatewayError("bad gateway", evidence=ResponseEvidence(http_status=502))
-    record_stop(stop, followed=answered)
-    assert stopped_before_send(stop)
+    stop.__cause__ = answered
     record_dispatch(stop, possibly_executed=True)
 
     unexplained = possible_execution(stop, request_summary=None, declared_unsafe=False)
@@ -654,3 +654,39 @@ def test_a_stop_is_explained_only_by_the_send_its_recorder_recorded_never_by_its
     assert explained.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
     assert explained.evidence == answered.evidence
     assert explained.__cause__ is stop
+
+
+@pytest.mark.asyncio
+async def test_a_direct_page_cancelled_in_flight_is_traced_unknown() -> None:
+    # The send of a direct page left and was cut by the consumer's cancellation before its answer: it may have
+    # run, so the page is traced unknown, and the send counts.
+    started = asyncio.Event()
+
+    async def blocking(_request: Request) -> object:
+        started.set()
+        return await asyncio.Future[object]()
+
+    transport = ResponderTransport(blocking)
+    async with client_for(transport, policy=ExecutionPolicy(retry=_NO_DELAY)) as client:
+        stream = client.iter_list(Request.bare("crm.item.list", {}))
+
+        async def consume() -> None:
+            async with stream:
+                async for _row in stream:
+                    pass
+
+        task = asyncio.create_task(consume())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    report = stream.report
+    assert report is not None
+    assert report.physical_requests == 1
+    (page,) = report.page_trace
+    assert (page.dispatch, page.outcome, page.rejection_code) == (
+        PageDispatch.DIRECT,
+        PageOutcome.UNKNOWN,
+        PageRejectionCode.AMBIGUOUS_EXECUTION,
+    )

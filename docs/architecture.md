@@ -140,11 +140,11 @@ outcome.
   other failure (a closed client), is chained to the failure of the latest send in one place, where the
   executor stops it (`_RequestAttempts.chain_stop`, at the permit, at the admission and at the transport),
   for a lone request's retry, a REST 3.0 envelope retry or isolated send and a classic round alike.
-  There the stop is recorded as one (`facts.record_stop`), never told by its exception type: whoever
-  records how a command ended records what the sends before the stop left open (`record_unsent`), the
-  executor for a lone request (`_RequestAttempts.record_end`) as the batch dialects for their own, so a
-  command a stop ended is explained by the latest send that may have run (its reason and evidence),
-  whatever stopped it: the budget, a closed coordinator or a closed transport. A transport refuses a
+  Each send's failure is classified into the request's lineage where the send ended, so the failure that
+  ends a request after its sends, a stop included, is recorded with what the lineage left open
+  (`record_open`), by the executor for a lone request as by the batch dialects for their own, never told
+  by its exception type: a command a stop ended is explained by the latest send that may have run (its
+  reason and evidence), whatever stopped it: the budget, a closed coordinator or a closed transport. A transport refuses a
   send before it leaves the process with `ClientClosedError` only because it is closed (a closed
   `HttpxTransport` or injected HTTPX client, or any transport): the executor releases the attempt it
   reserved and records nothing sent (`Executor._dispatch`), so that send is no physical request and no
