@@ -279,6 +279,11 @@ async def test_a_failed_close_behind_an_earlier_failure_is_its_secondary(family:
         ("cleanup_failure", f"stream cleanup also failed ({name})"),
         ("source_failure", f"{report.operation} failed (InputSourceError)"),
     ]
+    # The report the error carries says so; no family repeats it as a note on the error or its causes.
+    link: BaseException | None = error
+    while link is not None:
+        assert getattr(link, "__notes__", []) == []
+        link = link.__cause__
 
 
 @pytest.mark.asyncio

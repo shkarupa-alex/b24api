@@ -414,7 +414,7 @@ async def test_failed_body_with_clean_cleanup_raises_the_failure(family: Family,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
-async def test_failed_body_with_failing_cleanup_keeps_the_failure_and_notes_the_cleanup(
+async def test_failed_body_with_failing_cleanup_keeps_the_failure_and_reports_the_cleanup(
     family: Family,
     client: Bitrix24,
 ) -> None:
@@ -426,7 +426,9 @@ async def test_failed_body_with_failing_cleanup_keeps_the_failure_and_notes_the_
     assert _is_body_failure(error)
     primary = error if isinstance(error, _BodyFailedError) else error.__cause__
     assert primary is not None
-    assert "stream cleanup also failed (_CleanupFailedError)" in getattr(primary, "__notes__", [])
+    # The report the error carries records the cleanup failure; no note repeats it, in any family.
+    assert getattr(primary, "__notes__", []) == []
+    assert getattr(error, "__notes__", []) == []
     harness.assert_published_once(error)
     assert "cleanup_failure" in harness.codes()
 

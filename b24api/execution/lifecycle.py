@@ -527,9 +527,11 @@ class OperationRunner[T, R]:
         *,
         finalize_failed: bool,
     ) -> NoReturn:
-        """Raise a FAILED primary; cleanup and finalization failures only annotate it."""
-        if attempt.error is not None:
-            primary.add_note(cleanup_failure_violation(attempt.error, secondary=True).message)
+        """Raise a FAILED primary; a finalization failure annotates it.
+
+        A cleanup failure behind it is no note: the report the raised error carries records it, in every family, as
+        "stream cleanup also failed (X)".
+        """
         if finalize_failed and self._finalize_error is not None:
             primary.add_note(f"stream report finalization failed ({type(self._finalize_error).__name__})")
         propagated = self._hooks.propagate(primary, report) if self._hooks.propagate is not None else primary
