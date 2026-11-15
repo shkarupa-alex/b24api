@@ -843,22 +843,6 @@ async def test_ahomo_sources_of_one_template_trace_exactly_like_the_homogeneous_
     )
 
 
-@dataclass
-class _InFlightPortal(BatchPortal):
-    """Record the most physical requests on the wire at once."""
-
-    in_flight: int = 0
-    peak: int = 0
-
-    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        self.in_flight += 1
-        self.peak = max(self.peak, self.in_flight)
-        try:
-            return await super().send(request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
-        finally:
-            self.in_flight -= 1
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api", ["references", "sources"])
 @pytest.mark.parametrize(
@@ -878,9 +862,19 @@ async def test_the_operation_policy_bounds_every_reference_operation_s_dispatch(
 ) -> None:
     # The dispatch asks for more than the policy allows: a batch holds at most max_buffered_commands, and direct
     # pages in flight are at most max_direct_concurrency, whichever API built the operation.
-    portal = _InFlightPortal(
-        lambda _method, query: {"result": [{"ID": 1}] if query.get("start", "0") == "0" else []}, wire_turns=3
-    )
+    in_flight, peak = 0, 0
+
+    async def answer(_method: str, query: Query) -> Envelope:
+        # A direct page is one request: count the pages answered at once, each held for a few loop turns.
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        for _turn in range(3):
+            await asyncio.sleep(0)
+        in_flight -= 1
+        return {"result": [{"ID": 1}] if query.get("start", "0") == "0" else []}
+
+    portal = BatchPortal(answer)
     request = Request.bare("beta.list", {}, ReplaySafety.SAFE)
     bindings = [
         Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), parent),), parent) for parent in range(40)
@@ -897,4 +891,4 @@ async def test_the_operation_policy_bounds_every_reference_operation_s_dispatch(
         outcomes = [outcome async for outcome in stream]
 
     assert len(outcomes) == len(bindings) * 2
-    assert (max(portal.waves) if measured == "batch" else portal.peak) == bound
+    assert (max(portal.waves) if measured == "batch" else peak) == bound

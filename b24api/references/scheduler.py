@@ -123,8 +123,7 @@ class ReferenceScheduler:
         """Initialize instance state; the dispatch plan is bounded here by the operation policy, once for every path."""
         self.executor = executor
         self.plan = plan
-        dispatch = bound_dispatch(dispatch, policy)
-        self.dispatch = dispatch
+        self.dispatch = dispatch = bound_dispatch(dispatch, policy)
         self.selector = selector
         self.identity = identity
         self.output_order = output_order
