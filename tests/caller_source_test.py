@@ -277,9 +277,10 @@ async def test_a_failed_close_behind_an_earlier_failure_is_its_secondary(family:
     assert _chain(error)[-2:] == [InputSourceError, ValueError]
     assert report.state is TerminalState.FAILED
     assert report.terminal_reason == "InputSourceError"
-    assert sorted(_violations(report)) == [
-        ("cleanup_failure", f"stream cleanup also failed ({name})"),
+    # The failure is primary in every family: its violation comes first, the failed close behind it.
+    assert _violations(report) == [
         ("source_failure", f"{report.operation} failed (InputSourceError)"),
+        ("cleanup_failure", f"stream cleanup also failed ({name})"),
     ]
     # The report the error carries says so; no family repeats it as a note on the error or its causes.
     link: BaseException | None = error

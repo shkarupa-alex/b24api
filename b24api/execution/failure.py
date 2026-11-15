@@ -150,7 +150,10 @@ def finalize_failure[R](
     operation: str,
     terminal_reason: str,
 ) -> tuple[R, BaseException]:
-    """Append one stable blocking violation and attach the frozen report."""
+    """Record one stable blocking violation for the failure and attach the frozen report.
+
+    The failure is primary: its violation precedes the cleanup failures behind it ("stream cleanup also failed").
+    """
     if isinstance(error, asyncio.CancelledError):
         attach_report(error, report)
         return report, error
@@ -168,15 +171,17 @@ def finalize_failure[R](
     reason = terminal_reason if terminal_reason and terminal_reason != error_name else f"{operation} failed"
     violations = tuple(getattr(report, "violations", ()))
     if not any(item.code == failure.code for item in violations):
+        primary = Violation(
+            failure.severity,
+            failure.code,
+            f"{reason} ({error_name})",
+            error=report_error if isinstance(report_error, B24ApiError) else None,
+            replay_disposition=replay_disposition,
+        )
         violations = (
-            *violations,
-            Violation(
-                failure.severity,
-                failure.code,
-                f"{reason} ({error_name})",
-                error=report_error if isinstance(report_error, B24ApiError) else None,
-                replay_disposition=replay_disposition,
-            ),
+            *(item for item in violations if item.code != "cleanup_failure"),
+            primary,
+            *(item for item in violations if item.code == "cleanup_failure"),
         )
     state: object = TerminalState.INCOMPLETE if failure.incomplete else TerminalState.FAILED
     if isinstance(getattr(report, "state", None), KernelState):
