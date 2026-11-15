@@ -739,6 +739,93 @@ async def test_a_source_sees_the_context_of_the_call_that_created_its_stream(fam
     assert seen == ["at creation"] * (ITEMS + 1)
 
 
+def _interrupting(
+    family: str, kind: str, where: str, interrupt: type[BaseException]
+) -> Iterable[Any] | AsyncIterator[Any]:
+    """A caller's generator that raises ``interrupt`` from its second pull or from its close."""
+    items = _items(family)
+
+    def sync_source() -> Iterator[Any]:
+        try:
+            for index, item in enumerate(items):
+                if where == "pull" and index == 1:
+                    raise interrupt
+                yield item
+        finally:
+            if where == "close":
+                raise interrupt
+
+    async def async_source() -> AsyncIterator[Any]:
+        try:
+            for index, item in enumerate(items):
+                await asyncio.sleep(0)
+                if where == "pull" and index == 1:
+                    raise interrupt
+                yield item
+        finally:
+            if where == "close":
+                raise interrupt
+
+    return sync_source() if kind == "sync" else async_source()
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(("where", "ending"), [("pull", "read_to_end"), ("close", "read_to_end"), ("close", "break")])
+@pytest.mark.parametrize("kind", ["async", "sync"])
+@pytest.mark.parametrize("family", FAMILIES)
+def test_an_interrupt_a_source_raises_leaves_the_loop_with_no_task_behind(
+    family: str, kind: str, where: str, ending: str, interrupt: type[BaseException]
+) -> None:
+    # The interrupt reaches the caller's own task, which raises it out of asyncio.run: no library task ends in it
+    # unretrieved, and none is left pending when the loop closes.
+    reported: list[str] = []
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        async with client_for(ResponderTransport(_answer), policy=POLICIES["returns"]) as client:
+            await _end(_stream(client, family, _interrupting(family, kind, where, interrupt)), ending)
+
+    with pytest.raises(interrupt):
+        asyncio.run(main())
+    gc.collect()
+    assert reported == []
+
+
+@pytest.mark.parametrize("kind", ["async", "sync"])
+@pytest.mark.parametrize("family", FAMILIES)
+def test_an_interrupt_from_a_close_the_client_runs_leaves_the_loop_with_no_task_behind(family: str, kind: str) -> None:
+    # A stream left open is closed by its client's close; its source's close raising an interrupt reaches the
+    # caller's own task through the client's close task, which does not end in it.
+    reported: list[str] = []
+    items = _items(family)
+
+    def sync_source() -> Iterator[Any]:
+        try:
+            while True:
+                yield from items
+        finally:
+            raise KeyboardInterrupt
+
+    async def async_source() -> AsyncIterator[Any]:
+        try:
+            while True:
+                for item in items:
+                    yield item
+        finally:
+            raise KeyboardInterrupt
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        async with client_for(ResponderTransport(_answer), policy=POLICIES["returns"]) as client:
+            stream = _stream(client, family, sync_source() if kind == "sync" else async_source())
+            await anext(stream)
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(main())
+    gc.collect()
+    assert reported == []
+
+
 class _OwnError(Exception):
     """The caller's own code failed inside ``async with stream``."""
 

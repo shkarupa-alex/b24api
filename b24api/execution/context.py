@@ -459,12 +459,13 @@ class Settled[T]:
     A task the library starts around caller code (a source's pull or close, a stream's read or cleanup) returns this
     instead of ending in the failure. ``asyncio.run`` reports every task that its shutdown cancelled and that then
     ended in an exception, whether or not its owner retrieves it later, so only a task that never ends in one keeps
-    the failure its owner's alone.
+    the failure its owner's alone. That includes ``KeyboardInterrupt`` and ``SystemExit``: a task ending in one
+    stops the event loop from inside that task, leaving the owner waiting, so the owner raises it instead.
     """
 
     __slots__ = ("error", "value")
 
-    def __init__(self, value: T | None = None, *, error: Exception | None = None) -> None:
+    def __init__(self, value: T | None = None, *, error: BaseException | None = None) -> None:
         """Hold the work's value, or the failure it ended in."""
         self.value = value
         self.error = error
@@ -480,7 +481,9 @@ async def settle[T](work: Awaitable[T]) -> Settled[T]:
     """Await ``work`` and return how it ended (``Settled``); a cancellation still ends the task cancelled."""
     try:
         return Settled(await work)
-    except Exception as error:  # noqa: BLE001 - returned for the task's owner to raise: the task ends without it
+    except asyncio.CancelledError:
+        raise
+    except BaseException as error:  # noqa: BLE001 - returned for the task's owner to raise: the task ends without it
         settled: Settled[T] = Settled(error=error)
     # The work's cleanup may have re-armed a cancellation it absorbed on this task, which would end it cancelled and
     # lose the failure. Whoever cancelled it learns how it ended from its owner, so the task takes the cancellation.
@@ -571,7 +574,7 @@ class AsyncIteratorController[T]:
             self._cleanup_task = spawn_settled(self._close_after(pull))
 
     async def _close_after(self, pull: asyncio.Task[Settled[T]]) -> None:
-        pull_error: Exception | None = None
+        pull_error: BaseException | None = None
         with contextlib.suppress(asyncio.CancelledError):
             pull_error = (await pull).error
         if isinstance(pull_error, StopAsyncIteration):

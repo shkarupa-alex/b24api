@@ -3,11 +3,12 @@
 from __future__ import annotations
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, qualified_closure
 from b24api.contracts.completion import BindingClosure
 from b24api.contracts.dispatch import PORTAL_PAGE_ROWS
+from b24api.execution.context import Settled
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     DispatchPlan,
@@ -67,9 +68,9 @@ def _new_page_records(driver: PaginationDriver, previous_count: int) -> tuple[Pa
     return (driver.last_page_record,)
 
 
-async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Event) -> None:
+async def _wait_for_admission(producer: asyncio.Task[Settled[None]], changed: asyncio.Event) -> None:
     if producer.done():
-        await producer
+        (await producer).unwrap()
         return
     waiter = asyncio.create_task(changed.wait())
     try:
@@ -78,14 +79,14 @@ async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Eve
             changed.clear()
             return
         if producer in done:
-            await producer
+            (await producer).unwrap()
     finally:
         if not waiter.done():
             waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
 
 
-async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[None]) -> _Event:
+async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[Settled[None]]) -> _Event:
     if producer.done():
         return await queue.get()
     getter = asyncio.create_task(queue.get())
@@ -99,19 +100,29 @@ async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[N
 
 
 async def _wait_for_cleanup_tasks(
-    tasks: tuple[asyncio.Task[None], ...],
+    tasks: tuple[asyncio.Task[Any], ...],
     *,
     remaining: float,
-) -> tuple[set[asyncio.Task[None]], list[BaseException]]:
+) -> tuple[set[asyncio.Task[Any]], list[BaseException]]:
     active = set(tasks)
     if not active:
         return set(), []
     done, pending = await asyncio.wait(active, timeout=remaining)
-    errors = [error for task in done if not task.cancelled() and (error := task.exception()) is not None]
+    errors = [error for task in done if (error := _failure(task)) is not None]
     for task in pending:
         task.cancel()
         task.add_done_callback(_consume_task_result)
     return pending, errors
+
+
+def _failure(task: asyncio.Task[object]) -> BaseException | None:
+    """Return what a finished task failed with: its exception, or the failure it returned (``Settled``)."""
+    if task.cancelled():
+        return None
+    if (error := task.exception()) is not None:
+        return error
+    result = task.result()
+    return result.error if isinstance(result, Settled) else None
 
 
 def _consume_task_result(task: asyncio.Task[object]) -> None:

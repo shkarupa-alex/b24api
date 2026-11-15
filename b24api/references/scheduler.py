@@ -16,6 +16,7 @@ from b24api.contracts.request import ReplaySafety, Request, ResultSelector, Trav
 from b24api.contracts.response import result_snapshot
 from b24api.contracts.violation import retain_violations
 from b24api.errors import BudgetExceededError, CapabilityError, CleanupOverrunError
+from b24api.execution.context import spawn_settled
 from b24api.execution.facts import dropped_result
 from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
@@ -75,6 +76,7 @@ if TYPE_CHECKING:
     from b24api.contracts.report import KeysetSelectionSummary
     from b24api.contracts.response import Response
     from b24api.execution import AsyncIteratorController, Executor
+    from b24api.execution.context import Settled
     from b24api.references.dispatch import _Reservation
     from b24api.traversal.identity import _Page
 
@@ -186,7 +188,7 @@ class ReferenceScheduler:
         # request budget: no binding follows either way) and the fast bindings holding or awaiting a lease; a
         # change of either wakes lease waiters only while one is waiting.
         self._admission: _AdmissionState | None = None
-        self._producer: asyncio.Task[None] | None = None
+        self._producer: asyncio.Task[Settled[None]] | None = None
         self._source_ended = False
         self._fast_active: set[int] = set()
         self._fast_waiting = 0
@@ -214,7 +216,9 @@ class ReferenceScheduler:
             changed=asyncio.Event(),
         )
         self._admission = admission
-        producer = self._producer = asyncio.create_task(self._produce(iterator, admission))
+        # The producer pulls the caller's source: like every library task around caller code, it returns how it
+        # ended (``Settled``) and its consumer raises the failure, so the task never ends in one.
+        producer = self._producer = spawn_settled(self._produce(iterator, admission))
         if self.output_order is ReferenceOutputOrder.READY:
             async for outcome in self._ready(admission, producer):
                 yield outcome
@@ -250,7 +254,7 @@ class ReferenceScheduler:
     async def _stop_work(
         self,
         admission: _AdmissionState,
-        producer: asyncio.Task[None],
+        producer: asyncio.Task[Settled[None]],
         primary_error: BaseException | None,
         cleanup_errors: list[BaseException],
     ) -> None:
@@ -781,7 +785,7 @@ class ReferenceScheduler:
     async def _ready(
         self,
         admission: _AdmissionState,
-        producer: asyncio.Task[None],
+        producer: asyncio.Task[Settled[None]],
     ) -> AsyncGenerator[ReferenceStreamItem]:
         while admission.tasks or not producer.done():
             if not admission.tasks:
@@ -798,13 +802,13 @@ class ReferenceScheduler:
             self._caps.pop(event.work.index, None)
             admission.slots.release()
             await self._wake_lease_waiters()
-        await producer
+        (await producer).unwrap()
         self._raise_if_budget_refused()
 
     async def _input(
         self,
         admission: _AdmissionState,
-        producer: asyncio.Task[None],
+        producer: asyncio.Task[Settled[None]],
     ) -> AsyncGenerator[ReferenceStreamItem]:
         while admission.tasks or not producer.done():
             if not admission.tasks:
@@ -824,7 +828,7 @@ class ReferenceScheduler:
             await self._wake_lease_waiters()
             next_head = min(admission.tasks) if admission.tasks else head + 1
             await self.buffer.advance_head(next_head, max(self._caps.values(), default=self._head_cap(next_head)))
-        await producer
+        (await producer).unwrap()
         self._raise_if_budget_refused()
 
     def _record_event_violations(self, event: _Event) -> None:

@@ -300,9 +300,12 @@ outcome.
   stream its reader's cancellation ended gives `CANCELLED_REASON`, whatever its source reached. The
   report counts an item as emitted only once `LifecycleHooks.delivered` says the
   reader has it. Every task the library starts around caller code (a source's pull and close, the
-  worker-thread hop, a stream's read and cleanup, the client's close) runs through `spawn_settled`: it
-  returns how it ended (`Settled`) and its owner raises the failure, so none ends in one, which
-  `asyncio.run` would report at shutdown whether or not the owner retrieved it.
+  worker-thread hop, the reference scheduler's producer, a stream's read and cleanup, the client's
+  close) runs through `spawn_settled`: it returns how it ended (`Settled`) and its owner raises the
+  failure, so none ends in one, which `asyncio.run` would report at shutdown whether or not the owner
+  retrieved it. That includes `KeyboardInterrupt` and `SystemExit`: a task ending in one would stop the
+  loop from inside that task and leave its owner pending, so the interrupt travels to the caller's own
+  task instead, and a worker-thread call a cancellation cut raises it rather than dropping it.
 - The default response ceiling is enforced while streaming, before JSON decoding.
 - Exact sequential, counted, and multi-reference traversal shares one operation-wide
   `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted

@@ -195,7 +195,7 @@ def _closed_by_owner(error: BaseException) -> bool:
     return isinstance(error, asyncio.CancelledError) and read is not None and read.closed
 
 
-async def _settle(pull: asyncio.Future[Settled[object]], read: _Read) -> Exception | None:
+async def _settle(pull: asyncio.Future[Settled[object]], read: _Read) -> BaseException | None:
     """Wait for the read the close ended; return the failure a read the close cancelled ended in instead.
 
     The read reports its own outcome to its caller as well. Its failure is the close's: it ended while the close

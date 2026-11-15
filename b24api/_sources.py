@@ -103,13 +103,19 @@ def _in_context[R](step: Awaitable[R], context: contextvars.Context) -> Generato
 
 
 async def _finish_in_thread[R](call: Callable[[], R]) -> R:
-    """Run ``call`` in a worker thread that a cancellation waits for instead of abandoning."""
+    """Run ``call`` in a worker thread that a cancellation waits for instead of abandoning.
+
+    The cancelled call's failure is dropped, but not an interrupt (``KeyboardInterrupt``, ``SystemExit``): it is raised.
+    """
     work = spawn_settled(asyncio.to_thread(call))
     try:
         return (await asyncio.shield(work)).unwrap()
     except asyncio.CancelledError:
-        with contextlib.suppress(BaseException):
-            await work
+        ended: Settled[R] | None = None
+        with contextlib.suppress(asyncio.CancelledError):
+            ended = await work
+        if ended is not None and isinstance(ended.error, KeyboardInterrupt | SystemExit):
+            raise ended.error from None
         raise
 
 
