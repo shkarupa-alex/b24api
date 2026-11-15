@@ -57,21 +57,25 @@
 
 ## Traversals that end with the budget, and dropped results
 
-- **A keyset traversal the request budget ends reports the budget, not a protocol violation.** When
-  `max_requests` or `max_pages` refused a wave or the final confirmation of `iter_list_keyset()` under
+- **A keyset traversal the budget ends reports the budget, not a failed command or a protocol violation.**
+  When `max_requests` refused a wave or the final confirmation of `iter_list_keyset()` under
   `RangeKeysetExecution`, `PartitionedKeysetExecution` or an automatic choice (sequential or
   partitioned), the report recorded a `command_failure` for each command the budget refused, and an
   automatic sequential or partitioned run could record the protocol violations
-  `completion_rejection_before_settlement` and `completion_invalid_binding_terminal` instead. Such a
-  run now ends as an explicit `SequentialKeysetExecution` ends on its budget: the report is
-  `incomplete`, with `BudgetExceededError` as its terminal reason and `budget_exhausted` as its only
-  violation. `iter_list_keyset()` still raises `IncompleteTraversalError` whose cause is the
-  `BudgetExceededError`. Keyset bindings of the reference streams (`iter_references()`,
-  `iter_reference_outcomes()` and the reference source streams) under the same strategies changed the
-  same way: a refused wave or final confirmation no longer records a `command_failure`, so the report
-  holds `budget_exhausted` and a `reference_failure` for each binding the budget ended. A fast keyset
-  wave whose batch answer was ambiguous (a command's answer missing or repeated) no longer records
-  `completion_unknown_binding_claimed_known`: its binding closes as unknown.
+  `completion_rejection_before_settlement` and `completion_invalid_binding_terminal` instead (rarely,
+  the same when `max_elapsed` ran out). Such a run now ends as an explicit `SequentialKeysetExecution`
+  ends on its budget: the report is `incomplete`, with `BudgetExceededError` as its terminal reason and
+  `budget_exhausted` as its only violation. `iter_list_keyset()` still raises `IncompleteTraversalError`
+  whose cause is the `BudgetExceededError`. Keyset bindings of the reference streams
+  (`iter_references()`, `iter_reference_outcomes()` and the reference source streams) under the same
+  strategies changed the same way, under `max_requests` and under `max_elapsed`: a wave or final
+  confirmation the budget refused no longer records a `command_failure`, so the report holds
+  `budget_exhausted` and a `reference_failure` for each binding the budget ended. Once the budget has
+  refused work, every later refusal by it is that same end, whatever work it names (an admission, a
+  page's rows, a send's permit); a command refused by its own limits (its attempts, its retry window)
+  still fails as a command. A fast keyset wave whose batch answer was ambiguous (a command's answer
+  missing or repeated) no longer records `completion_unknown_binding_claimed_known`: its binding
+  closes as unknown.
 - **A counted tail page larger than its share is an answered failure.** When a tail page of
   `iter_list_counted()` decoded to more rows than `max_buffered_rows` left it, the traversal raised
   `IncompleteTraversalError` caused by `BudgetExceededError` ("buffered row budget exhausted"), and the
