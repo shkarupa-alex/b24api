@@ -11,6 +11,7 @@ import importlib
 import io
 import logging
 import pkgutil
+import re
 import sys
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
@@ -20,22 +21,26 @@ import hpack
 import httpx
 import pytest
 
+from b24api import _webhook
+from b24api._webhook import Webhook, WebhookAddress, WebhookSecrets
 from b24api.contracts import Request, RouteKind
 from b24api.errors import CapabilityError
-from b24api.transport import HttpxTransport
+from b24api.transport import HttpxTransport, logging_shield
 from b24api.transport.logging_shield import HPACK_LOGGER_NAMES, HTTPX_LOG_SHIELD
 from tests.h2c_server import H2cServer
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
 
 _OWNED = "synthetic-owned-h2-secret-424242"
+_OWNED_WEBHOOK = Webhook(WebhookAddress("https", "portal.invalid", None, "1"), _OWNED)
 _HOP = "synthetic-hop-h2-secret-515151"
 _FOREIGN = "synthetic-foreign-h2-secret-636363"
 _PROBE_MARKER = "synthetic-probe-secret-000000"
 _OK = 200
 _MOVED = 301
 _SEQUENTIAL_CLIENTS = 12
+_BOUND_CLIENTS = 200
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 _FORMATTER = logging.Formatter("%(name)s %(message)s")
 
@@ -404,7 +409,7 @@ def test_foreign_record_with_an_exception_but_no_secret_keeps_every_field_object
                     logger.error("foreign %s", foreign_url, exc_info=exc_info)
                     logger.info("plain foreign %s", foreign_url)
                 else:
-                    with HTTPX_LOG_SHIELD.request(credentials=(_OWNED,)) as ownership:
+                    with HTTPX_LOG_SHIELD.request(webhook=_OWNED_WEBHOOK) as ownership:
                         ownership.claim(httpx.Request("POST", owned_url))
                         _foreign_client_log(logger, foreign_url, exc_info)
             failed, plain = (record for record in handler.records if record.msg != 'HTTP Request: %s %s "%s %d %s"')
@@ -468,7 +473,8 @@ async def test_foreign_record_carrying_a_registered_secret_is_scrubbed_with_its_
 @pytest.mark.asyncio
 async def test_secret_registry_is_deduplicated_by_value_and_tied_to_client_lifetime() -> None:
     _assert_shield_idle()
-    initial = set(HTTPX_LOG_SHIELD.registered_secrets())
+    initial = len(HTTPX_LOG_SHIELD.registered_secrets())
+    assert not HTTPX_LOG_SHIELD.registered_secrets().found_in(_OWNED)
     clients = [
         httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(_OK, request=request)))
         for _ in range(2)
@@ -477,13 +483,16 @@ async def test_secret_registry_is_deduplicated_by_value_and_tied_to_client_lifet
     for transport in transports:
         await transport.aclose()
     # Both injected clients are still open: the secret stays registered, once.
-    assert set(HTTPX_LOG_SHIELD.registered_secrets()) == {*initial, _OWNED}
+    assert HTTPX_LOG_SHIELD.registered_secrets().found_in(_OWNED)
+    assert len(HTTPX_LOG_SHIELD.registered_secrets()) == initial + 1
     await clients[0].aclose()
     assert HTTPX_LOG_SHIELD.suppresses_hpack() is True
-    assert set(HTTPX_LOG_SHIELD.registered_secrets()) == {*initial, _OWNED}
+    assert HTTPX_LOG_SHIELD.registered_secrets().found_in(_OWNED)
+    assert len(HTTPX_LOG_SHIELD.registered_secrets()) == initial + 1
     await clients[1].aclose()
     assert HTTPX_LOG_SHIELD.suppresses_hpack() is False
-    assert set(HTTPX_LOG_SHIELD.registered_secrets()) == initial
+    assert not HTTPX_LOG_SHIELD.registered_secrets().found_in(_OWNED)
+    assert len(HTTPX_LOG_SHIELD.registered_secrets()) == initial
 
 
 @pytest.mark.asyncio
@@ -506,9 +515,187 @@ async def test_registered_secret_stays_scrubbed_while_the_injected_client_outliv
     assert handler.records[-1].args == ("https://other.invalid/",)
 
     # Closing the client drops its secret at once; the next shield lifecycle event removes both filters.
-    assert _OWNED not in HTTPX_LOG_SHIELD.registered_secrets()
+    assert not HTTPX_LOG_SHIELD.registered_secrets().found_in(_OWNED)
     await HttpxTransport(f"https://portal.invalid/rest/1/{_PROBE_MARKER}/").aclose()
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
     for name in HPACK_LOGGER_NAMES:
         assert HTTPX_LOG_SHIELD._hpack_filter not in logging.getLogger(name).filters  # noqa: SLF001
     _assert_shield_idle()
+
+
+_ADDRESS = WebhookAddress("https", "portal.invalid", None, "1")
+
+
+@contextmanager
+def _registered(*tokens: str) -> Iterator[None]:
+    """Keep one open client registered with each webhook token, then release them all."""
+    clients = [httpx.Client() for _ in tokens]
+    for client, token in zip(clients, tokens, strict=True):
+        HTTPX_LOG_SHIELD.register_transport(webhook=Webhook(_ADDRESS, token), client=client)
+    try:
+        yield
+    finally:
+        for client in clients:
+            HTTPX_LOG_SHIELD.release_transport()
+            client.close()
+
+
+def _messages(handler: _Capture) -> list[str]:
+    return [record.getMessage() for record in handler.named("httpx")]
+
+
+def test_a_registered_token_another_registered_token_starts_is_scrubbed_whole() -> None:
+    _assert_shield_idle()
+    with _registered("prefixtok", "prefixtokTAILSECRET"), _capture() as handler:
+        logging.getLogger("httpx").info("foreign record %s", "https://other.invalid/prefixtokTAILSECRET/profile")
+    assert _messages(handler) == ["foreign record https://other.invalid/[REDACTED]/profile"]
+
+
+def test_overlapping_registered_tokens_leave_no_part_of_either() -> None:
+    _assert_shield_idle()
+    # Two tokens over one stretch, and one token over itself.
+    with _registered("abcd", "cdef", "abab"), _capture() as handler:
+        logging.getLogger("httpx").info("foreign record %s and %s, %s", "xabcdefy", "abcd-cdef", "zabababz")
+    assert _messages(handler) == ["foreign record x[REDACTED]y and [REDACTED]-[REDACTED], z[REDACTED]z"]
+
+
+def test_an_owned_record_scrubs_every_registered_token_with_the_owned_one() -> None:
+    _assert_shield_idle()
+    # A short registered token has no credential shape the owned scrub could find without it.
+    with _registered(_OWNED, "abcd"), _capture() as handler, HTTPX_LOG_SHIELD.request(webhook=_OWNED_WEBHOOK):
+        logging.getLogger("httpx").info("owned record %s %s", _OWNED, "abcd")
+    assert _messages(handler) == ["owned record [REDACTED] [REDACTED]"]
+
+
+def test_an_empty_token_is_no_secret() -> None:
+    _assert_shield_idle()
+    initial = len(HTTPX_LOG_SHIELD.registered_secrets())
+    with _registered(""), _capture() as handler:
+        assert len(HTTPX_LOG_SHIELD.registered_secrets()) == initial
+        logging.getLogger("httpx").info("foreign record %s", "abc")
+    assert _messages(handler) == ["foreign record abc"]
+    with pytest.raises(ValueError, match="requires the webhook credential"):
+        HTTPX_LOG_SHIELD.request(webhook=Webhook(_ADDRESS, "")).__enter__()
+
+
+def test_no_regex_keeps_a_released_token() -> None:
+    _assert_shield_idle()
+    token = "synthetic-matcher-secret-878787"  # noqa: S105 - a synthetic webhook token
+    with _registered(token), _capture() as handler:
+        logging.getLogger("httpx").info("foreign record %s", token)
+    assert _messages(handler) == ["foreign record [REDACTED]"]
+    # The next lifecycle event prunes the closed client and its secret; no regex, compiled or cached, holds it.
+    HTTPX_LOG_SHIELD.registered_secrets()
+    gc.collect()
+    matchers = [pattern for pattern in gc.get_objects() if isinstance(pattern, re.Pattern)]
+    held = (token, re.escape(token))
+    assert [pattern for pattern in matchers if any(form in str(pattern.pattern) for form in held)] == []
+
+
+def test_registering_a_client_builds_no_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Registration stays O(1) however many webhooks are registered: the registered secrets, and the tokens they
+    # search for, are built once, on the first read after a change, and reused until the next change.
+    _assert_shield_idle()
+    searched: list[int] = []
+    carriers: list[int] = []
+    distinct_tokens = _webhook._distinct_tokens  # noqa: SLF001 - counts the token sets built
+
+    def counted_tokens(webhooks: frozenset[Webhook]) -> tuple[Webhook, ...]:
+        searched.append(len(webhooks))
+        return distinct_tokens(webhooks)
+
+    class _CountedSecrets(WebhookSecrets):
+        def __init__(self, webhooks: Iterable[Webhook] = ()) -> None:
+            carriers.append(1)
+            super().__init__(webhooks)
+
+    monkeypatch.setattr(_webhook, "_distinct_tokens", counted_tokens)
+    monkeypatch.setattr(logging_shield, "WebhookSecrets", _CountedSecrets)
+    tokens = [f"synthetic-bound-secret-{index:04d}" for index in range(_BOUND_CLIENTS)]
+    with _registered(*tokens), _capture() as handler:
+        assert (len(searched), len(carriers)) == (0, 0)
+        for token in tokens[:3]:
+            logging.getLogger("httpx").info("foreign record %s", token)
+        assert (len(searched), len(carriers)) == (1, 1)
+    assert _messages(handler) == ["foreign record [REDACTED]"] * 3
+
+
+def test_an_owned_dispatch_builds_no_secrets_until_a_record_needs_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A dispatch that logs nothing searches nothing: taking ownership checks that it holds a credential without
+    # picking the tokens it searches with.
+    _assert_shield_idle()
+    searched: list[int] = []
+    distinct_tokens = _webhook._distinct_tokens  # noqa: SLF001 - counts the token sets built
+
+    def counted_tokens(webhooks: frozenset[Webhook]) -> tuple[Webhook, ...]:
+        searched.append(len(webhooks))
+        return distinct_tokens(webhooks)
+
+    monkeypatch.setattr(_webhook, "_distinct_tokens", counted_tokens)
+    with (
+        _registered("synthetic-other-secret-1"),
+        _capture() as handler,
+        HTTPX_LOG_SHIELD.request(webhook=_OWNED_WEBHOOK),
+    ):
+        assert searched == []
+        logging.getLogger("httpx").info("owned record %s", _OWNED)
+        assert searched != []
+    assert _messages(handler) == ["owned record [REDACTED]"]
+
+
+def test_an_owned_dispatch_joins_its_secrets_to_the_registered_ones_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The owned webhook is not among the registered ones (a client that cannot be registered): each record of the
+    # dispatch needs both, joined once for the registry's state, not once per record.
+    _assert_shield_idle()
+    searched: list[int] = []
+    distinct_tokens = _webhook._distinct_tokens  # noqa: SLF001 - counts the token sets built
+
+    def counted_tokens(webhooks: frozenset[Webhook]) -> tuple[Webhook, ...]:
+        searched.append(len(webhooks))
+        return distinct_tokens(webhooks)
+
+    monkeypatch.setattr(_webhook, "_distinct_tokens", counted_tokens)
+    logger = logging.getLogger("httpx")
+    with (
+        _registered("synthetic-other-secret-1"),
+        _capture() as handler,
+        HTTPX_LOG_SHIELD.request(webhook=_OWNED_WEBHOOK),
+    ):
+        logger.info("owned record %s", _OWNED)
+        built = len(searched)
+        for _ in range(3):
+            logger.info("owned record %s", "synthetic-other-secret-1")
+        assert len(searched) == built
+    assert _messages(handler) == ["owned record [REDACTED]"] * 4
+
+
+def test_a_registered_token_inside_another_one_leaves_no_part_of_the_outer() -> None:
+    _assert_shield_idle()
+    outer = "synthetic-outer-secret-TAIL42"
+    with _registered(outer, "outer"), _capture() as handler:
+        logging.getLogger("httpx").info("foreign record https://x.invalid/rest/1/%s/profile", outer)
+    assert _messages(handler) == ["foreign record https://x.invalid/rest/1/[REDACTED]/profile"]
+
+
+def test_registered_tokens_that_touch_are_one_redacted_stretch() -> None:
+    _assert_shield_idle()
+    with _registered("abcd", "efgh"), _capture() as handler:
+        logging.getLogger("httpx").info("foreign record %s", "xabcdefghy")
+    assert _messages(handler) == ["foreign record x[REDACTED]y"]
+
+
+def test_a_token_registered_during_an_owned_dispatch_is_scrubbed_from_its_later_records() -> None:
+    # The owned webhook is not registered, so each record joins it to the registered secrets: a registration
+    # during the dispatch changes those, and the next record is scrubbed with the new ones.
+    _assert_shield_idle()
+    later = httpx.Client()
+    logger = logging.getLogger("httpx")
+    try:
+        with _registered("abcd"), _capture() as handler, HTTPX_LOG_SHIELD.request(webhook=_OWNED_WEBHOOK):
+            logger.info("owned record %s", "abcd")
+            HTTPX_LOG_SHIELD.register_transport(webhook=Webhook(_ADDRESS, "wxyz"), client=later)
+            logger.info("owned record %s", "wxyz")
+    finally:
+        HTTPX_LOG_SHIELD.release_transport()
+        later.close()
+    assert _messages(handler) == ["owned record [REDACTED]"] * 2

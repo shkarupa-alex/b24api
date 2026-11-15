@@ -8,7 +8,7 @@ import json
 import math
 import random
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
@@ -30,6 +30,7 @@ from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
+    ClientClosedError,
     EnvelopeContractError,
     HTTPGatewayError,
     ProtocolError,
@@ -187,9 +188,15 @@ class _Lineage:
             unproven=None if explains_itself else self.unproven,
         )
 
-    def record_unsent(self, error: BaseException) -> None:
-        """Record a failure before a further send left: what these sends left open stays open."""
-        record_dispatch(error, possibly_executed=self.left_open() is not None, unproven=self.unproven)
+    def record_open(self, error: BaseException) -> None:
+        """Record on a failure what these sends left open, as their answers were classified; with none, nothing.
+
+        The failure adds nothing to them: it stopped a further send before it left, cut the latest one before its
+        answer (a cancellation), or is the failure the latest send's classification already holds. A failure
+        before any send keeps no facts: it was never sent, and no recorder can say otherwise.
+        """
+        if self.latest is not _Settled.NOTHING_SENT:
+            record_dispatch(error, possibly_executed=self.left_open() is not None, unproven=self.unproven)
 
     def withhold(self, error: BaseException) -> None:
         """Record a command the server halted before: proven not run by the latest send, but not by earlier ones."""
@@ -318,7 +325,7 @@ class _RequestAttempts:
     started: float | None = None
     used: int = 0
     lineage: _Lineage = _Lineage()
-    # The latest failure a send ended with: the one a budget that stops the retry it asked for reports.
+    # The latest failure a send ended with: the cause of whatever stops the next send before it leaves (``chain_stop``).
     retry_cause: B24ApiError | None = None
     # Whoever decides each send after a failure: the executor retries within one ``execute`` call, unless the
     # classic batch engine that shares these attempts decides every replay round itself and sends once per call.
@@ -363,12 +370,19 @@ class _RequestAttempts:
         self.used += 1
         self.pause = None
 
+    def chain_stop(self, error: B24ApiError) -> None:
+        """Chain a failure that stopped a send before it left to the failure of the latest send, if one failed.
+
+        The one rule for every stop before a send, by the budget or otherwise (a closed client), whichever single
+        request, batch round or isolated send it stops: what ended the send is the outcome, and what it followed is
+        its cause. The stop ran nothing, so whoever records how the request ended records what the sends before it
+        left open (``record_open``), never the stop as a send that may have run.
+        """
+        if self.retry_cause is not None:
+            error.__cause__ = self.retry_cause
+
     def settle(self, error: B24ApiError, policy: ExecutionPolicy) -> None:
-        """Record how the last send failed; a budget that stops a retry reports the failure that asked for it."""
-        if isinstance(error, BudgetExceededError):
-            if error.__cause__ is None:
-                error.__cause__ = self.retry_cause
-            return
+        """Record how the last send failed."""
         settled = _proves_not_run(error, policy) or answered_conclusively(error, policy)
         self.classified(error, may_have_run=not settled)
 
@@ -386,9 +400,9 @@ class _RequestAttempts:
         """Record on the failure that ended the request, or answered one of its commands, what its sends left open."""
         self.lineage.record(error, policy)
 
-    def record_unsent(self, error: BaseException) -> None:
-        """Record a failure before a further send left: what the earlier sends left open stays open."""
-        self.lineage.record_unsent(error)
+    def record_open(self, error: BaseException) -> None:
+        """Record on a failure what the sends so far left open, as their answers were classified; with none, nothing."""
+        self.lineage.record_open(error)
 
     def withhold(self, error: BaseException) -> None:
         """Record a command the server halted before: proven not run by the last send, but not by earlier ones."""
@@ -399,9 +413,10 @@ class _RequestAttempts:
 class PhysicalAttemptOutcome:
     """What one physical send of a batch envelope produced, before any dialect classification or retry.
 
-    ``dispatch_started`` comes from dispatch facts (an attempt was reserved and handed to the transport),
-    never from the absence of a response. ``transport_proves_not_accepted`` is set only when nothing
-    reached the server: the attempt failed before dispatch, or the transport proved it was not accepted.
+    ``dispatch_started`` comes from dispatch facts (an attempt was reserved and handed to a transport that did
+    not refuse it before it left), never from the absence of a response. ``transport_proves_not_accepted`` is set
+    only when nothing reached the server: the attempt failed before dispatch, or the transport proved it was not
+    accepted.
     """
 
     kind: Literal["response", "error", "cancelled"]
@@ -495,7 +510,6 @@ class Executor:
             raise TypeError("strict_json_members must be a boolean")
         context = context or self.context(policy)
         attempts = _attempts or _RequestAttempts()
-        spent = attempts.used
         try:
             wire, parsed = await self._execute_wire_attempts(
                 request,
@@ -506,8 +520,10 @@ class Executor:
                 shared=attempts,
             )
         except BaseException as error:
-            if attempts.used > spent:
-                attempts.record(error, context.policy)
+            # Each send's failure was classified where it ended; a failure that ends the request after them adds
+            # nothing (a stop before a further send, or a cancellation): what they left open is the lineage's, the
+            # sends of an envelope an isolated command was in included. Before any send it keeps no facts.
+            attempts.record_open(error)
             raise
         try:
             response = _decode_success(wire, parsed, request_summary=request.summary)
@@ -548,8 +564,7 @@ class Executor:
                 shared=attempts,
             )
         except BaseException as error:
-            if attempts.used:
-                attempts.record(error, context.policy)
+            attempts.record_open(error)
             raise
         content_type = wire.content_type
         digest = hashlib.sha256(wire.body).hexdigest() if context.policy.binary_digest else None
@@ -581,18 +596,21 @@ class Executor:
             )
             try:
                 async with permit:
-                    retry_started = shared.open_window(self._clock)
-                    remaining = context.time_left(_DISPATCH_REFUSAL, retry_started=retry_started)
-                    shared.admit(remaining, request.replay_safety, now=self._clock())
-                    await context.reserve_attempt(attempts_for_request=attempts)
-                    shared.dispatched()
-                    wire = await self._send_attempt(request, wire_request, context=context, remaining=remaining)
+                    remaining = await self._start_send(context, shared, request.replay_safety, spent=attempts)
+                    wire = await self._dispatch(
+                        context,
+                        shared,
+                        self._send_attempt(request, wire_request, context=context, remaining=remaining),
+                    )
             except asyncio.CancelledError:
                 raise
             except B24ApiError as error:
                 # A transport that turned a cancellation into a failure is neither retried nor reported by it.
                 if cancellation.requested():
                     raise asyncio.CancelledError from error
+                if shared.used == attempts:
+                    # Stopped before it left, and chained where it stopped: nothing was sent to retry.
+                    raise
                 await self._prepare_retry(request, error, context=context, shared=shared, methods=methods)
                 attempts += 1
                 continue
@@ -625,7 +643,10 @@ class Executor:
 
         A spent request budget, and a hold the coordinator already has on ``methods`` (a host throttle hint or a
         method cooldown) that outlasts the budget, fail at once instead of queueing for nothing or waiting the budget
-        out. Each failure reports the failure of the request's latest send, whichever call or replay round made it.
+        out. Every failure here stops a send before it leaves, by the budget or otherwise (a closed client): after
+        a failed send, it is caused by the failure of the request's latest send, whichever call or replay round
+        made it (``_RequestAttempts.chain_stop``, the one rule for single requests, batch rounds and isolated
+        sends, applied here, at the admission and at the transport).
         """
         try:
             remaining = _permit_window(context, attempts, methods)
@@ -633,10 +654,51 @@ class Executor:
                 return await context.coordinator.acquire(
                     work_class, methods=methods, budget=DeadlineBudget(self._clock() + remaining)
                 )
-        except BudgetExceededError as error:
-            if attempts.retry_cause is None:
-                raise
-            raise error from attempts.retry_cause
+        except B24ApiError as error:
+            attempts.chain_stop(error)
+            raise
+
+    async def _start_send(
+        self, context: ExecutionContext, attempts: _RequestAttempts, safety: ReplaySafety, *, spent: int
+    ) -> float:
+        """Admit and count the send a permit was granted for, and return the window left for it.
+
+        Refused here, by the deadline, the retry window or the attempt budget, the send never leaves: the refusal
+        is chained to the failure it followed, as at the permit.
+        """
+        try:
+            retry_started = attempts.open_window(self._clock)
+            remaining = context.time_left(_DISPATCH_REFUSAL, retry_started=retry_started)
+            attempts.admit(remaining, safety, now=self._clock())
+            await context.reserve_attempt(attempts_for_request=spent)
+        except B24ApiError as error:
+            attempts.chain_stop(error)
+            raise
+        return remaining
+
+    @staticmethod
+    async def _dispatch(
+        context: ExecutionContext, attempts: _RequestAttempts, send: Coroutine[object, object, WireResponse]
+    ) -> WireResponse:
+        """Hand an admitted, counted send to its transport, and record it sent unless the transport kept it.
+
+        A transport that refuses the send before it leaves the process raises ``ClientClosedError``, whichever
+        transport it is (a closed one, for example): that is a stop before the send, as at the permit. The
+        reservation is released, so it is no physical request, nothing is recorded sent, so no batch round or
+        isolated send counts it, and it is chained to the failure it followed. Any other outcome, a cancellation
+        included, is a send that may have left.
+        """
+        try:
+            wire = await send
+        except ClientClosedError as error:
+            context.release_attempt()
+            attempts.chain_stop(error)
+            raise
+        except BaseException:
+            attempts.dispatched()
+            raise
+        attempts.dispatched()
+        return wire
 
     async def _send_attempt(
         self,
@@ -676,7 +738,7 @@ class Executor:
 
         The caller classifies the outcome by its dialect before any retry: a structured error that would
         prove a single request refused does not prove that an envelope's commands did not run. Dispatch is
-        proven by the attempt reservation, never by the absence of a response.
+        proven by the send recorded (``_dispatch``), never by the absence of a response.
         """
         try:
             self.preflight_wire(envelope)
@@ -719,25 +781,9 @@ class Executor:
             context, attempts, work_class=WorkClass.BATCH if spent == 0 else WorkClass.RETRY, methods=methods
         )
         async with permit:
-            retry_started = attempts.open_window(self._clock)
-            remaining = context.time_left(_DISPATCH_REFUSAL, retry_started=retry_started)
-            attempts.admit(remaining, envelope.replay_safety, now=self._clock())
-            await context.reserve_attempt(attempts_for_request=spent)
-            attempts.dispatched()
-            try:
-                async with asyncio.timeout(remaining):
-                    return await send_wire_envelope(
-                        wire_transport,
-                        envelope,
-                        attempt_timeout=remaining,
-                        max_response_bytes=context.policy.max_response_bytes,
-                    )
-            except TimeoutError as error:
-                raise TransportError(
-                    "Transport attempt exceeded its elapsed budget",
-                    phase=FailurePhase.DISPATCH_STARTED,
-                    request_summary=envelope.summary,
-                ) from error
+            remaining = await self._start_send(context, attempts, envelope.replay_safety, spent=spent)
+            send = _send_envelope_attempt(wire_transport, envelope, context=context, remaining=remaining)
+            return await self._dispatch(context, attempts, send)
 
     async def _classify_envelope(
         self,
@@ -919,9 +965,12 @@ class Executor:
         try:
             replay = self.plan_replay(context, attempts=shared, sends=((safety, methods),))
         except BudgetExceededError as refusal:
-            raise refusal from error
+            shared.chain_stop(refusal)
+            raise
         if replay is None or replay.plans != (_SendPlan.SEND,):
-            raise BudgetExceededError(_retry_refusal(replay)) from error
+            stop = BudgetExceededError(_retry_refusal(replay))
+            shared.chain_stop(stop)
+            raise stop
         await self._wait(context, shared, replay.pause)
 
     async def _wait(self, context: ExecutionContext, attempts: _RequestAttempts, pause: _Pause) -> None:
@@ -949,6 +998,26 @@ def _possible_acceptance(error: B24ApiError, policy: ExecutionPolicy) -> str | N
     ):
         return "Request may have executed before the unstructured HTTP failure"
     return None
+
+
+async def _send_envelope_attempt(
+    wire_transport: WireTransport, envelope: WireRequest, *, context: ExecutionContext, remaining: float
+) -> WireResponse:
+    """Send one admitted, counted envelope within what is left of the retry window."""
+    try:
+        async with asyncio.timeout(remaining):
+            return await send_wire_envelope(
+                wire_transport,
+                envelope,
+                attempt_timeout=remaining,
+                max_response_bytes=context.policy.max_response_bytes,
+            )
+    except TimeoutError as error:
+        raise TransportError(
+            "Transport attempt exceeded its elapsed budget",
+            phase=FailurePhase.DISPATCH_STARTED,
+            request_summary=envelope.summary,
+        ) from error
 
 
 def _local_attempt_failure(error: B24ApiError) -> PhysicalAttemptOutcome:

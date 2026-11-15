@@ -192,7 +192,11 @@ class Transport(Protocol):
     operation deadline is only a hard public bound when the injected transport
     cooperates with cancellation or returns within ``attempt_timeout``. A send-only
     transport cannot declare routes, so the executor gives it only ``RouteKind.BARE``
-    requests; a ``WireTransport`` declares the routes it builds in its capabilities.
+    requests; a ``WireTransport`` declares the routes it builds in its capabilities. A send refused because
+    the transport is closed raises ``ClientClosedError``: it never left the process, so the executor counts no
+    physical request for it and ends it as a stop before the send. Any other failure before dispatch (a
+    credential unavailable, a connection pool timeout, a refused connection) is a ``TransportError`` of its
+    phase, and its send counts, as ``HttpxTransport`` does.
     """
 
     @property

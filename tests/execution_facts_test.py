@@ -12,9 +12,11 @@ import json
 import time
 from typing import TYPE_CHECKING, cast
 
+import httpx
 import pytest
 
 from b24api import BatchDispatch, BatchFailed, DirectDispatch, ExecutionPolicy, ReplaySafety, Request, RouteKind
+from b24api.batch.engine import BatchExecutor
 from b24api.completion import CompletionGate
 from b24api.contracts import (
     Binding,
@@ -25,6 +27,7 @@ from b24api.contracts import (
     CommandSettlement,
     CommandSuccess,
     NotExecutedReason,
+    PageDispatch,
     PageOutcome,
     PageRejectionCode,
     ParameterPath,
@@ -39,21 +42,26 @@ from b24api.contracts import (
     SequentialTraversal,
 )
 from b24api.contracts.completion import PageCommandOutcome
+from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.policy import AmbiguityReason
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
     B24ApiError,
     BatchCommandError,
+    BudgetExceededError,
+    ClientClosedError,
     EnvelopeContractError,
     FailurePhase,
     HTTPGatewayError,
     ProtocolError,
     TransportError,
 )
+from b24api.execution import Executor
+from b24api.execution.facts import Execution, _recorded_unproven, execution, possible_execution, record_dispatch
 from b24api.testing import ScriptedExchange, ScriptedTransport
-from b24api.transport import WireRequest, WireResponse
-from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, on_loop
+from b24api.transport import HttpxTransport, WireRequest, WireResponse
+from tests.scripting import HOST, UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, on_loop
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
@@ -629,3 +637,170 @@ async def test_a_failure_answered_after_the_time_budget_meets_the_ambiguity_rule
     assert raised.value.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
     assert isinstance(raised.value.__cause__, HTTPGatewayError)
     assert not isinstance(raised.value.__cause__, EnvelopeContractError)
+
+
+@pytest.mark.parametrize(
+    "stop", [BudgetExceededError("refused"), ClientClosedError("closed")], ids=["budget", "closed"]
+)
+def test_a_stop_is_explained_only_by_the_send_its_recorder_recorded_never_by_its_type(stop: B24ApiError) -> None:
+    # A stop ran nothing: what its recorder recorded explains it, never its type or its cause chain, whatever stopped
+    # it; so a recorder that records it as a send that may have run is caught, not covered up.
+    answered = HTTPGatewayError("bad gateway", evidence=ResponseEvidence(http_status=502))
+    stop.__cause__ = answered
+    record_dispatch(stop, possibly_executed=True)
+
+    unexplained = possible_execution(stop, request_summary=None, declared_unsafe=False)
+
+    assert unexplained.evidence == stop.evidence
+    record_dispatch(stop, possibly_executed=True, unproven=answered)
+    explained = possible_execution(stop, request_summary=None, declared_unsafe=False)
+    assert explained.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    assert explained.evidence == answered.evidence
+    assert explained.__cause__ is stop
+
+
+@pytest.mark.asyncio
+async def test_a_direct_page_cancelled_in_flight_is_traced_unknown() -> None:
+    # The send of a direct page left and was cut by the consumer's cancellation before its answer: it may have
+    # run, so the page is traced unknown, and the send counts.
+    started = asyncio.Event()
+
+    async def blocking(_request: Request) -> object:
+        started.set()
+        return await asyncio.Future[object]()
+
+    transport = ResponderTransport(blocking)
+    async with client_for(transport, policy=ExecutionPolicy(retry=_NO_DELAY)) as client:
+        stream = client.iter_list(Request.bare("crm.item.list", {}))
+
+        async def consume() -> None:
+            async with stream:
+                async for _row in stream:
+                    pass
+
+        task = asyncio.create_task(consume())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    report = stream.report
+    assert report is not None
+    assert report.physical_requests == 1
+    (page,) = report.page_trace
+    assert (page.dispatch, page.outcome, page.rejection_code) == (
+        PageDispatch.DIRECT,
+        PageOutcome.UNKNOWN,
+        PageRejectionCode.AMBIGUOUS_EXECUTION,
+    )
+
+
+_GATEWAY_FAILURE = 502
+_BAD_REQUEST = 400
+
+
+async def _envelope_cancelled(route: RouteKind, when: str) -> tuple[BaseException, list[str]]:
+    """Cancel one batch of two SAFE commands ``when``: before its send, in flight, or in the wait to send it again.
+
+    Return the cancellation the batch raised and the paths sent. Nothing public reads the execution facts of a
+    cancellation that ends a batch, so the engine every batch surface runs on is driven directly.
+    """
+    reached = asyncio.Event()
+    sent: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.path)
+        if when == "in flight":
+            reached.set()
+            await asyncio.Future[None]()
+        return httpx.Response(_GATEWAY_FAILURE, content=b"bad gateway")
+
+    async def sleep(_seconds: float) -> None:
+        # The wait before the second send never ends: the batch is cancelled in it.
+        reached.set()
+        await asyncio.Future[None]()
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpxTransport(f"https://{HOST}/rest/1/token/", client=client)
+    executor = Executor(transport, sleep=sleep)
+    if when == "before its send":
+        # A hold within the budget: the first send queues for its permit, and is cancelled there.
+        await executor.coordinator.observe_throttle(600.0, reason="test hold")
+    requests = tuple(Request("x.item.get", {"id": index}, ReplaySafety.SAFE, route=route) for index in range(2))
+    task = asyncio.create_task(BatchExecutor(executor).execute_requests(requests, context=executor.context()))
+    if when == "before its send":
+        for _ in range(10):
+            await asyncio.sleep(0)
+    else:
+        await reached.wait()
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await task
+    finally:
+        await executor.coordinator.close()
+        await transport.aclose()
+        await client.aclose()
+    return cancelled.value, sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3], ids=["classic", "rest v3"])
+@pytest.mark.parametrize("when", ["in flight", "in the wait after a lost answer"])
+async def test_a_batch_cancelled_after_its_envelope_left_may_have_run(route: RouteKind, when: str) -> None:
+    # As a request's: the envelope that left, cut before its answer or answered with a failure that proves nothing
+    # before the wait to send it again, may have run its commands, so the cancellation says so.
+    cancellation, sent = await _envelope_cancelled(route, when)
+
+    assert len(sent) == 1
+    assert execution(cancellation) is Execution.POSSIBLY_RUN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3], ids=["classic", "rest v3"])
+async def test_a_batch_cancelled_before_its_envelope_left_was_never_sent(route: RouteKind) -> None:
+    cancellation, sent = await _envelope_cancelled(route, "before its send")
+
+    assert sent == []
+    assert execution(cancellation) is Execution.NOT_SENT
+
+
+@pytest.mark.asyncio
+async def test_a_batch_cancelled_while_a_command_is_sent_alone_is_explained_by_that_commands_latest_send() -> None:
+    # The REST v3 envelope aborts, so its commands are sent alone; the first one's own send fails with a status that
+    # proves nothing, and the batch is cancelled in the wait to send it again. That send, not the envelope's abort,
+    # is the latest that may have run.
+    waiting = asyncio.Event()
+    sleeps: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/batch"):
+            return httpx.Response(_BAD_REQUEST, json={"error": {"code": "SYNTHETIC_NOT_FOUND", "message": "x"}})
+        return httpx.Response(_GATEWAY_FAILURE, content=b"bad gateway")
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 2:  # noqa: PLR2004 - the group's wait before isolating, then the isolated send's retry wait
+            waiting.set()
+            await asyncio.Future[None]()
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpxTransport(f"https://{HOST}/rest/1/token/", client=client)
+    executor = Executor(transport, sleep=sleep)
+    policy = ExecutionPolicy(retry=RetryPolicy(initial_delay=0.5, jitter=0))
+    requests = tuple(
+        Request("x.item.get", {"id": index}, ReplaySafety.SAFE, route=RouteKind.API_V3) for index in (0, 1)
+    )
+    task = asyncio.create_task(BatchExecutor(executor).execute_requests(requests, context=executor.context(policy)))
+    await waiting.wait()
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await task
+    finally:
+        await executor.coordinator.close()
+        await transport.aclose()
+        await client.aclose()
+
+    assert execution(cancelled.value) is Execution.POSSIBLY_RUN
+    assert isinstance(_recorded_unproven(cancelled.value), HTTPGatewayError)

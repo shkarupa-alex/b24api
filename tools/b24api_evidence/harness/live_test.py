@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
 
+    from b24api._webhook import WebhookSecrets
+
 EXPECTED_PREFLIGHT_CALLS = 2
 
 
@@ -766,7 +768,7 @@ def test_live_portal_holds_its_shield_registration_exactly_for_its_lifetime(
 
 def test_live_portal_registers_and_claims_only_the_webhook_token(monkeypatch: pytest.MonkeyPatch) -> None:
     token = "live" + "-token-" + "xyz"
-    claimed: list[tuple[str, ...]] = []
+    claimed: list[WebhookSecrets] = []
     network_client = httpx.Client
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -782,10 +784,10 @@ def test_live_portal_registers_and_claims_only_the_webhook_token(monkeypatch: py
     monkeypatch.setenv("BITRIX24_API_WEBHOOK_URL", "https://example.invalid" + "/rest/7/" + token + "/")
     with LivePortal(role="admin_full") as portal:
         registered = HTTPX_LOG_SHIELD.registered_secrets()
-        assert token in registered
-        assert "7" not in registered
+        assert registered.found_in(token)
+        assert not registered.found_in("7")
         assert portal.call_envelope("profile")["result"] == {"ID": "7"}
-    assert claimed == [(token,)]
+    assert [(len(credentials), credentials.found_in(token)) for credentials in claimed] == [(1, True)]
 
 
 def test_live_refused_shield_entry_drops_the_method_url(monkeypatch: pytest.MonkeyPatch) -> None:

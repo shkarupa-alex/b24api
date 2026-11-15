@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from b24api import BatchFailed, ExecutionPolicy, ReplaySafety, Request, RetryPolicy, RouteKind
+from b24api import BatchDispatch, BatchFailed, ExecutionPolicy, ReplaySafety, Request, RetryPolicy, RouteKind
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts import (
@@ -20,34 +20,45 @@ from b24api.contracts import (
     CommandFailure,
     CommandNotExecuted,
     CommandOutcomeUnknown,
+    CommandSettlement,
     CommandSuccess,
     NotExecutedReason,
     ResultErrorSpec,
     ResultSelector,
 )
+from b24api.contracts.policy import KernelState
 from b24api.contracts.report import OperationReport, TerminalState
 from b24api.contracts.v3_codes import RATE_LIMIT_ERROR_CODE
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
+    B24ApiError,
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
+    ClientClosedError,
     FailurePhase,
     HTTPGatewayError,
     ProtocolError,
     ResultShapeError,
     TransportError,
 )
-from b24api.execution import Executor, RateCoordinator
+from b24api.execution import Executor, RateCoordinator, WorkClass
+from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
+from b24api.execution.facts import execution
+from b24api.references.dispatch import _KernelFanOutSuccess
+from b24api.references.fanout import kernel_fanout_stream
+from b24api.references.outcome import KernelReferenceFailure
 from b24api.testing import ScriptedCall, ScriptedExchange, ScriptedTransport, ScriptedV3Command
-from b24api.transport import HttpxTransport, TransportCapabilities, WireRequest, WireResponse
-from tests.scripting import ResponderTransport, client_for, drain_to_failure
+from b24api.transport import HttpxTransport, Transport, TransportCapabilities, WireRequest, WireResponse
+from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, drain_to_failure
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
 
     from b24api.contracts import CommandOutcome, OperationStream
+    from b24api.execution.rate import DeadlineBudget, _Permit
+    from b24api.execution.snapshot import KernelReport
 
 SAFE = ReplaySafety.SAFE
 UNSAFE = ReplaySafety.UNSAFE
@@ -91,7 +102,7 @@ def _direct(request: Request, payload: object, *, status: int = 200) -> Scripted
 
 
 async def _run(
-    transport: ScriptedTransport | ResponderTransport,
+    transport: Transport,
     requests: Sequence[Request],
     *,
     policy: ExecutionPolicy | None = None,
@@ -197,7 +208,7 @@ async def test_a21_wire_httpx_posts_a_root_array_to_the_v3_batch_route_once_per_
     transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
     requests = [_v3(1), _v3(2), _v3(3, method="x.item.update", safety=UNSAFE)]
     try:
-        outcomes, report = await _run(transport, requests)  # type: ignore[arg-type]
+        outcomes, report = await _run(transport, requests)
     finally:
         await transport.aclose()
         await client.aclose()
@@ -699,7 +710,7 @@ async def test_a21_presponse_size_overflow_after_dispatch_is_unknown_without_res
     transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
     try:
         outcomes, report = await _run(
-            transport,  # type: ignore[arg-type]
+            transport,
             [_v3(1, method="x.item.add", safety=UNKNOWN)],
             policy=_policy(max_response_bytes=64),
         )
@@ -816,6 +827,44 @@ async def test_a21_throttle_structured_quota_safe_abort_is_retried_once_as_an_en
     assert report.ambiguous_physical_attempts == 1
     assert report.batch_isolation_requests == 0
     transport.assert_exhausted()
+
+
+class _LosingPortal(ScriptedTransport):
+    """Lose the answer to every v3 envelope, and answer each command sent alone with its item.
+
+    ``sent`` records each send: ``"envelope"``, or the id of the command sent alone.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(())
+        self.sent: list[object] = []
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        if request.array_body is not None:
+            self.sent.append("envelope")
+            raise TransportError("reset", phase=FailurePhase.DISPATCH_STARTED)
+        identifier = request.parameters["id"]
+        self.sent.append(identifier)
+        return WireResponse(200, JSON_HEADERS, json.dumps({"result": _item(int(str(identifier)))}).encode())
+
+
+@pytest.mark.asyncio
+async def test_a21_lineage_a_safe_envelope_is_retried_whole_once_then_its_commands_are_isolated() -> None:
+    """A SAFE envelope lost twice is sent whole once more, never again: the second loss isolates its commands.
+
+    The attempt budget would allow a third envelope; the one envelope retry is spent, not the budget.
+    """
+    requests = (_v3(1), _v3(2))
+    transport = _LosingPortal()
+
+    outcomes, report = await _run(transport, requests, policy=_policy(max_attempts_per_request=5))
+
+    assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+    assert transport.sent == ["envelope", "envelope", 1, 2]
+    assert report.physical_requests == FOUR
+    assert report.ambiguous_physical_attempts == TWO
+    assert report.batch_isolation_requests == TWO
 
 
 @pytest.mark.asyncio
@@ -1042,8 +1091,8 @@ class _AnswersAt(ScriptedTransport):
 @pytest.mark.parametrize(
     ("abort", "refusal"),
     [
-        # A SAFE abort that may have run: no attribution phase is left once the deadline has passed.
-        ("poisoned", "execution time budget exhausted before isolating the batch's commands"),
+        # A SAFE abort that may have run: its isolation, a replay of the group, is refused as any retry is.
+        ("poisoned", "execution time budget exhausted before the retry"),
         # A quota abort, which may have run: its one envelope retry is refused too.
         ("quota", "execution time budget exhausted before the retry"),
         # A refusal of the envelope, proven not run: its replay is refused, and each command ends with that refusal.
@@ -1227,3 +1276,499 @@ async def test_a21_kernel_outcomes_keep_total_correlation_for_v3_chunks() -> Non
     successes = [outcome for outcome in outcomes if isinstance(outcome, BatchSuccess)]
     assert [outcome.response.total if outcome.response else None for outcome in successes] == [None, None]
     assert [outcome.response.next if outcome.response else None for outcome in successes] == [None, None]
+
+
+# A21-ISOLATION-REPLAY: the isolation of a SAFE envelope is a planned replay of its group within the dispatch slot ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrency", [1, 2])
+async def test_a21_isolation_stays_within_the_dispatch_concurrency(concurrency: int) -> None:
+    """Every aborted envelope's isolation sends one command at a time: no more requests than ``concurrency``."""
+    in_flight = peak = 0
+    paths: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        paths.append(request.url.path)
+        try:
+            # Yield long enough for any other send the dispatch allows to start meanwhile.
+            for _turn in range(16):
+                await asyncio.sleep(0)
+            if request.url.path.endswith("/batch"):
+                return httpx.Response(400, json=_abort("SYNTHETIC_NOT_FOUND"), request=request)
+            return httpx.Response(200, json={"result": _item(json.loads(request.content)["id"])}, request=request)
+        finally:
+            in_flight -= 1
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
+    commands = [Command(_v3(identifier), identifier) for identifier in range(8)]
+    dispatch = BatchDispatch(batch_size=4, concurrency=concurrency, coalesce_wait=UNREACHABLE_COALESCE_WAIT)
+    try:
+        async with (
+            client_for(transport, policy=_policy()) as api,
+            api.fan_out_outcomes(commands, dispatch=dispatch) as stream,
+        ):
+            outcomes = [outcome async for outcome in stream]
+    finally:
+        await transport.aclose()
+        await client.aclose()
+
+    assert sorted(outcome.correlation for outcome in outcomes) == list(range(8))
+    assert all(isinstance(outcome, CommandSuccess) for outcome in outcomes)
+    envelopes = paths.count("/rest/api/1/token/batch")
+    assert envelopes >= TWO
+    assert len(paths) - envelopes == len(commands)
+    report = stream.report
+    assert report is not None
+    assert report.batch_isolation_requests == len(commands)
+    # The bound, not its saturation: whether two isolations overlap is a matter of scheduling.
+    assert peak <= concurrency
+
+
+class _Clock:
+    """A virtual clock: the executor's retry sleep advances it, and a permit waits out a hold on it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def time(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+        await asyncio.sleep(0)
+
+
+class _TimedTransport(ScriptedTransport):
+    """Record when each send leaves; an envelope is answered ``envelope_takes`` seconds after it leaves."""
+
+    def __init__(self, exchanges: tuple[ScriptedExchange, ...], clock: _Clock, *, envelope_takes: float = 0.0) -> None:
+        super().__init__(exchanges)
+        self.clock = clock
+        self.envelope_takes = envelope_takes
+        self.sent_at: list[tuple[str, float]] = []
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        envelope = request.summary.method == "batch"
+        self.sent_at.append(("batch" if envelope else "direct", self.clock.now))
+        if envelope:
+            self.clock.now += self.envelope_takes
+        return await super().send_wire(request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
+
+
+def _timed_executor(transport: ScriptedTransport, clock: _Clock) -> Executor:
+    coordinator = RateCoordinator(clock=clock.time)
+    acquire = coordinator.acquire
+
+    async def acquire_after_hold(
+        work_class: WorkClass, *, methods: frozenset[str], budget: DeadlineBudget | None = None
+    ) -> _Permit:
+        clock.now += coordinator.admission_delay(methods)
+        return await acquire(work_class, methods=methods, budget=budget)
+
+    coordinator.acquire = acquire_after_hold  # type: ignore[method-assign]
+    return Executor(transport, coordinator=coordinator, clock=clock.time, sleep=clock.sleep, random_source=lambda: 0.5)
+
+
+def _hinted_abort(requests: tuple[Request, ...], retry_after: float | None) -> ScriptedExchange:
+    """A SAFE envelope's abort, which may have run it, hinting a host cooldown of ``retry_after`` seconds."""
+    fixture = _poisoned(requests)
+    hint = () if retry_after is None else (("retry-after", str(retry_after)),)
+    return ScriptedExchange(
+        fixture.request,
+        WireResponse(BAD_REQUEST, (*JSON_HEADERS, *hint), fixture.response.body),
+        v3_wire=fixture.v3_wire,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retry_after", "sleeps", "isolated_at"),
+    [
+        # The backoff alone: the replay sleeps it before the first isolated send.
+        (None, [0.5], 0.5),
+        # A host hint longer than the backoff: the replay waits it out at the permit, never sleeping both.
+        (3.0, [], 3.0),
+    ],
+    ids=["backoff", "hint"],
+)
+async def test_a21_isolation_waits_the_planned_replay_pause_before_its_first_send(
+    retry_after: float | None, sleeps: list[float], isolated_at: float
+) -> None:
+    clock = _Clock()
+    requests = (_v3(1), _v3(2))
+    transport = _TimedTransport(
+        (_hinted_abort(requests, retry_after), *(_direct(request, {"result": _item(1)}) for request in requests)),
+        clock,
+    )
+    executor = _timed_executor(transport, clock)
+    policy = _policy(retry=RetryPolicy(initial_delay=0.5, jitter=0))
+
+    outcomes = await BatchExecutor(executor).execute_requests(requests, context=executor.context(policy))
+    await executor.coordinator.close()
+
+    assert all(isinstance(outcome, BatchSuccess) for outcome in outcomes)
+    assert clock.sleeps == sleeps
+    assert transport.sent_at == [("batch", 0.0), ("direct", isolated_at), ("direct", isolated_at)]
+    transport.assert_exhausted()
+
+
+class _V3Portal(ScriptedTransport):
+    """Answer every v3 envelope with its items, but abort the first, which takes ``abort_takes`` seconds to answer.
+
+    ``sent`` records each envelope's command ids and when it left; a direct send fails the test.
+    """
+
+    def __init__(self, clock: _Clock, *, abort_takes: float = 0.0, retry_after: float | None = None) -> None:
+        super().__init__(())
+        self.clock = clock
+        self.abort_takes = abort_takes
+        self.retry_after = retry_after
+        self.sent: list[tuple[tuple[int, ...], float]] = []
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        body = request.array_body
+        if body is None:
+            raise AssertionError("a refused isolation sends nothing")
+        identifiers = tuple(int(str(command.query["id"])) for command in body.commands)
+        first = not self.sent
+        self.sent.append((identifiers, self.clock.now))
+        if not first:
+            payload = {"result": [_item(identifier) for identifier in identifiers]}
+            return WireResponse(200, JSON_HEADERS, json.dumps(payload).encode())
+        self.clock.now += self.abort_takes
+        hint = () if self.retry_after is None else (("retry-after", str(self.retry_after)),)
+        return WireResponse(BAD_REQUEST, (*JSON_HEADERS, *hint), json.dumps(_abort("SYNTHETIC_NOT_FOUND")).encode())
+
+
+async def _isolation_fan_out(
+    portal: _V3Portal, policy: ExecutionPolicy
+) -> tuple[dict[int, object], BudgetExceededError | None, KernelReport]:
+    """Drain a tolerant fan-out of four SAFE commands; return each one's error, the budget that ended it, its report.
+
+    A command's error is ``None`` for a success.
+    """
+    executor = _timed_executor(portal, portal.clock)
+    commands = [Command(_v3(identifier), identifier) for identifier in range(FOUR)]
+    dispatch = BatchDispatch(batch_size=TWO, concurrency=1, coalesce_wait=UNREACHABLE_COALESCE_WAIT)
+    stream = kernel_fanout_stream(executor, commands, dispatch=dispatch, policy=policy, tolerant=True)
+    errors: dict[int, object] = {}
+    ended: BudgetExceededError | None = None
+    try:
+        async for outcome in stream:
+            if isinstance(outcome, KernelReferenceFailure):
+                errors[_command_id(outcome.request)] = outcome.error
+            else:
+                assert isinstance(outcome, _KernelFanOutSuccess)
+                errors[_command_id(outcome.reference.request)] = None
+    except BudgetExceededError as error:
+        ended = error
+    await executor.coordinator.close()
+    return errors, ended, stream.report
+
+
+def _command_id(request: Request) -> int:
+    identifier = request.parameters["id"]
+    assert isinstance(identifier, int)
+    return identifier
+
+
+def _ends_with_the_refusal_caused_by_the_abort(error: object, refusal: str) -> None:
+    """Assert that a command its isolation never reached is unknown, ended by the refusal, caused by the abort."""
+    assert type(error) is AmbiguousExecutionError
+    assert error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    stop = error.__cause__
+    assert type(stop) is BudgetExceededError
+    assert refusal in str(stop)
+    cause = stop.__cause__
+    assert type(cause) is ApiResponseError
+    assert cause.original_code == "SYNTHETIC_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("label", "abort_takes", "retry_after", "refusal"),
+    [
+        # The envelope's abort comes after its retry window closed, long before the operation's deadline.
+        ("window_closed", 30.0, None, RETRY_WINDOW_EXHAUSTED),
+        # The host holds the methods for longer than the window left: a wait the window cannot carry.
+        ("hold", 0.0, 60.0, "retry delay would exceed"),
+    ],
+)
+async def test_a21_isolation_refused_for_the_request_alone_ends_with_the_refusal_and_the_stream_goes_on(
+    label: str, abort_takes: float, retry_after: float | None, refusal: str
+) -> None:
+    """RS_isolation: a replay refused for the group alone sends nothing more, records nothing and ends nothing.
+
+    Each command ends as a refused retry of a lone request or a classic batch does: with the refusal, caused by
+    the envelope's abort, unknown since that envelope may have run.
+    """
+    portal = _V3Portal(_Clock(), abort_takes=abort_takes, retry_after=retry_after)
+    policy = _policy(max_elapsed=1000.0, max_retry_elapsed_per_request=10.0)
+
+    errors, ended, report = await _isolation_fan_out(portal, policy)
+
+    assert ended is None, label
+    assert sorted(errors) == list(range(FOUR))
+    aborted = set(portal.sent[0][0])
+    for identifier, error in errors.items():
+        if identifier in aborted:
+            _ends_with_the_refusal_caused_by_the_abort(error, refusal)
+        else:
+            assert error is None
+    # Each unknown command is a warning; nothing records a budget's end.
+    assert report.state is KernelState.COMPLETED
+    assert report.terminal_reason == "reference input exhausted"
+    assert {violation.code for violation in report.violations} == {"reference_failure"}
+    assert report.batch_isolation_requests == 0
+    assert portal.clock.sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_a21_isolation_refused_at_the_operation_deadline_is_recorded_and_ends_the_stream() -> None:
+    """The deadline passes as the envelope's abort is answered: its isolation is refused by time, recorded."""
+    portal = _V3Portal(_Clock(), abort_takes=30.0)
+    policy = _policy(max_elapsed=20.0, max_retry_elapsed_per_request=1000.0)
+
+    errors, ended, report = await _isolation_fan_out(portal, policy)
+
+    assert isinstance(ended, BudgetExceededError)
+    assert str(ended) == "execution time budget exhausted before the retry"
+    assert report.state is KernelState.FAILED
+    assert report.terminal_reason == BudgetExceededError.__name__
+    assert report.batch_isolation_requests == 0
+    assert len(portal.sent) == 1
+    for identifier in portal.sent[0][0]:
+        _ends_with_the_refusal_caused_by_the_abort(errors[identifier], str(ended))
+
+
+_TRANSIENT_ENVELOPE_FAILURES: dict[str, Callable[[], WireResponse | TransportError]] = {
+    # An answer with an ambiguous status: the envelope may have run.
+    "502": lambda: WireResponse(502, (), b"bad gateway"),
+    # A lost answer.
+    "lost": lambda: TransportError("reset", phase=FailurePhase.DISPATCH_STARTED),
+    # The portal too busy, top-level: it proves nothing about an envelope's commands.
+    "busy": lambda: WireResponse(503, JSON_HEADERS, json.dumps({"error": "QUERY_LIMIT_EXCEEDED"}).encode()),
+    # A transient abort of the envelope.
+    "abort": lambda: WireResponse(503, JSON_HEADERS, json.dumps(_abort("QUERY_LIMIT_EXCEEDED")).encode()),
+}
+# The retry window and the backoff of a SAFE envelope retry; the envelope's answer takes most of the window.
+_REFUSED_RETRY_WINDOW = 1.0
+_REFUSED_RETRY_BACKOFF = 0.5
+_ENVELOPE_TAKES = 0.8
+
+
+class _OneEnvelope(ScriptedTransport):
+    """Answer the first v3 envelope with ``failure``; any further send, whole or alone, fails the test.
+
+    The answer takes ``takes`` seconds, or brings a host hold of ``hold`` seconds.
+    """
+
+    def __init__(self, failure: WireResponse | TransportError, clock: _Clock, *, takes: float, hold: float) -> None:
+        super().__init__(())
+        self.failure = failure
+        self.clock = clock
+        self.takes = takes
+        self.hold = hold
+        self.coordinator: RateCoordinator | None = None
+        self.sends = 0
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        self.sends += 1
+        assert request.array_body is not None, "no command is sent alone"
+        assert self.sends == 1, "the envelope is not sent again"
+        self.clock.now += self.takes
+        if self.hold:
+            assert self.coordinator is not None
+            await self.coordinator.observe_throttle(self.hold, reason="test")
+        if isinstance(self.failure, TransportError):
+            raise self.failure
+        return self.failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["window", "hold"])
+@pytest.mark.parametrize("failure", sorted(_TRANSIENT_ENVELOPE_FAILURES))
+async def test_a21_lineage_an_envelope_retry_the_budget_refused_is_not_followed_by_an_isolation(
+    failure: str, refusal: str
+) -> None:
+    """A SAFE envelope's one retry the budget refused ends each command, sending none of them alone.
+
+    The isolation would be refused by the same budget: the window left is shorter than the retry's backoff, or the
+    host holds the methods longer than the operation's time left. Each command is unknown, ended by the refusal
+    caused by the envelope's failure.
+    """
+    clock = _Clock()
+    envelope_failure = _TRANSIENT_ENVELOPE_FAILURES[failure]()
+    transport = _OneEnvelope(
+        envelope_failure,
+        clock,
+        takes=_ENVELOPE_TAKES if refusal == "window" else 0.0,
+        hold=30.0 if refusal == "hold" else 0.0,
+    )
+    executor = _timed_executor(transport, clock)
+    transport.coordinator = executor.coordinator
+    retry = RetryPolicy(initial_delay=_REFUSED_RETRY_BACKOFF, maximum_delay=_REFUSED_RETRY_BACKOFF, jitter=0)
+    policy = (
+        ExecutionPolicy(retry=retry, max_elapsed=100.0, max_retry_elapsed_per_request=_REFUSED_RETRY_WINDOW)
+        if refusal == "window"
+        else ExecutionPolicy(retry=retry, max_elapsed=5.0)
+    )
+    context = executor.context(policy)
+    requests = (_v3(1), _v3(2))
+
+    outcomes = await BatchExecutor(executor).execute_requests(requests, context=context)
+    await executor.coordinator.close()
+
+    assert transport.sends == 1
+    snapshot = await context.snapshot()
+    assert snapshot.counters.physical_requests == 1
+    assert snapshot.batch_isolation_requests == 0
+    for outcome in outcomes:
+        assert isinstance(outcome, BatchFailure)
+        assert isinstance(outcome.error, AmbiguousExecutionError)
+        stop = outcome.error.__cause__
+        assert type(stop) is BudgetExceededError
+        followed = stop.__cause__
+        if isinstance(envelope_failure, TransportError):
+            assert followed is envelope_failure
+        else:
+            assert isinstance(followed, B24ApiError)
+            assert isinstance(envelope_failure, WireResponse)
+            assert followed.http_status == envelope_failure.status_code
+
+
+@pytest.mark.asyncio
+async def test_a21_isolation_an_isolated_send_cancelled_in_flight_is_counted() -> None:
+    """An isolated send cancelled before its answer was sent: it counts as a request and as an isolation request.
+
+    A SAFE envelope aborts, so its commands are isolated; the consumer is cancelled while the first isolated send
+    waits for its answer.
+    """
+    started = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/batch"):
+            return httpx.Response(BAD_REQUEST, json=_abort("SYNTHETIC_NOT_FOUND"), request=request)
+        started.set()
+        await asyncio.Future[None]()
+        raise AssertionError("an isolated send in flight is never answered")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
+    commands = [Command(_v3(identifier), identifier) for identifier in range(TWO)]
+    try:
+        async with client_for(transport, policy=_policy()) as api:
+            stream = api.batch_outcomes(commands)
+
+            async def consume() -> None:
+                async with stream:
+                    async for _outcome in stream:
+                        pass
+
+            task = asyncio.create_task(consume())
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    finally:
+        await transport.aclose()
+        await client.aclose()
+
+    report = stream.report
+    assert report is not None
+    assert report.physical_requests == TWO
+    assert report.batch_isolation_requests == 1
+
+
+async def _first_envelope_stopped(stop: str, how: str) -> tuple[list[CommandOutcome[int]], OperationReport]:
+    """Run two SAFE REST v3 commands whose first envelope ``stop`` stops before it leaves, through ``how``."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/batch"):
+            return httpx.Response(200, json={"result": []}, request=request)
+        # An earlier direct call: its throttle hint holds the portal past the batch's whole budget.
+        return httpx.Response(429, headers={"retry-after": "600"}, json=_abort("QUERY_LIMIT_EXCEEDED"), request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
+    policy = _policy(max_elapsed=5.0)
+    commands = [Command(_v3(identifier), identifier) for identifier in range(TWO)]
+    try:
+        async with client_for(transport, policy=policy) as api:
+            if stop == "closed client":
+                await client.aclose()  # the user closed the HTTPX client it injected
+            else:
+                with pytest.raises(BudgetExceededError):
+                    await api.call(Request.bare("crm.item.get", {"id": 1}))
+            stream = (
+                api.fan_out_outcomes(commands, dispatch=BatchDispatch(concurrency=1))
+                if how == "batch fan-out"
+                else api.batch_outcomes(commands)
+            )
+            async with stream:
+                outcomes = [outcome async for outcome in stream]
+    finally:
+        await transport.aclose()
+        await client.aclose()
+    report = stream.report
+    assert report is not None
+    return outcomes, report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop", "error_type"),
+    [("closed client", ClientClosedError), ("budget at the first permit", BudgetExceededError)],
+)
+@pytest.mark.parametrize("how", ["batch fan-out", "logical batch"])
+async def test_a_first_envelope_stopped_before_its_send_ends_its_commands_never_sent(
+    stop: str, error_type: type[B24ApiError], how: str
+) -> None:
+    # Nothing left: no request counts, no page was sent, and each command ends with the stop, settled not executed.
+    # A closed coordinator stops it the same way (tests/internal/rate_coordinator_test.py).
+    outcomes, report = await _first_envelope_stopped(stop, how)
+
+    assert [type(outcome) for outcome in outcomes] == [CommandFailure, CommandFailure]
+    for outcome in outcomes:
+        assert isinstance(outcome, CommandFailure)
+        assert isinstance(outcome.error, error_type)
+        assert execution(outcome.error).settlement is CommandSettlement.NOT_EXECUTED
+    assert report.physical_requests == 0
+    assert report.page_trace == ()
+
+
+@pytest.mark.asyncio
+async def test_a21_isolation_an_isolated_answer_that_cannot_be_decoded_explains_its_own_unknown_outcome() -> None:
+    # The envelope aborts and each command is sent alone; its own 200 answer cannot be decoded, so it may have run:
+    # the ambiguity names that answer, the latest send that may have run, not the envelope's abort.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/batch"):
+            return httpx.Response(BAD_REQUEST, json=_abort("SYNTHETIC_NOT_FOUND"), request=request)
+        return httpx.Response(200, content=b'{"result": NaN}', headers=dict(JSON_HEADERS), request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpxTransport("https://fixture.invalid/rest/1/token/", client=client)
+    try:
+        outcomes, report = await _run(transport, [_v3(identifier) for identifier in range(TWO)])
+    finally:
+        await transport.aclose()
+        await client.aclose()
+
+    assert report.batch_isolation_requests == TWO
+    for outcome in outcomes:
+        assert isinstance(outcome, CommandOutcomeUnknown)
+        ambiguity = outcome.error
+        assert isinstance(ambiguity, AmbiguousExecutionError)
+        assert ambiguity.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+        assert ambiguity.evidence is not None
+        assert ambiguity.evidence.http_status == 200  # noqa: PLR2004
+        assert isinstance(ambiguity.__cause__, ProtocolError)

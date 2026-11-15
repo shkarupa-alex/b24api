@@ -1,5 +1,60 @@
 # Migration guide
 
+## The retry path
+
+- **A REST 3.0 isolation waits and is admitted as a retry is, and sends one command at a time.** When
+  a REST 3.0 envelope of `SAFE` commands failed after it may have run and its one envelope retry was
+  used (or its failure is not retried), its commands were sent alone all at once, without the retry's
+  backoff or the host's throttle hint, and beyond the `BatchDispatch` concurrency (bounded only by the
+  client limit). The isolation is now a replay of the envelope's commands, planned as their envelope
+  retry is: it waits the longer of the backoff and the host's hint, within the attempt budget, the
+  retry window and the deadline (the report's `retries` counts that wait, as it counts the envelope
+  retry's), and then sends the commands one at a time, so a `BatchDispatch` never has more requests in
+  flight than its `concurrency`. An isolation refused because the operation's
+  deadline has passed now fails with "execution time budget exhausted before the retry", as any retry
+  does, and still ends the stream with `BudgetExceededError`. One refused for its own request alone (no
+  attempt left, its retry window closed, or a wait longer than the window left) sends nothing and records
+  nothing. Either refusal, and one of the envelope retry, now ends each command as a refused retry of a
+  classic batch does: unknown, with the refusal (`BudgetExceededError`) caused by the envelope's failure,
+  where it kept the envelope's failure alone. An envelope retry the budget refused is no longer followed
+  by an isolation, which the same budget would refuse.
+- **Breaking: a retry stopped before its send ends with that stop, caused by what it followed.** When
+  a request or a batch was sent again after a failure and that retry was stopped before its send by
+  something other than the budget (the client closed meanwhile, for example), the stop was reported
+  without the failure it followed, or not at all. A lone request raised the bare `ClientClosedError`. A
+  classic command proven not run (its envelope refused whole) ended with the bare `ClientClosedError`,
+  and one whose send may have run ended unknown (`AmbiguousExecutionError`) caused by that send's
+  failure, the stop dropped; a REST 3.0 command, after its envelope retry or isolated send was stopped,
+  ended unknown caused by the envelope's failure, the stop dropped. Every retry stopped before its send
+  now ends as a budget stop already ended it: with the stop, which is what ended it, caused by the
+  failure it followed, and reported possibly run only when a send it was in may have run (a batch
+  command then ends `AmbiguousExecutionError` whose cause is that stop; a lone request raises the stop,
+  its execution facts saying so). Its ambiguity reason and evidence name the latest send that may have
+  run, whatever stopped the retry: after a send answered `502` or cut by the timeout, a retry a closed
+  client or transport stopped reported `connection_lost_after_dispatch` without evidence, as if the stop
+  were that send. A send its transport refused because it is closed (a closed `HttpxTransport`
+  or injected HTTPX client, or any transport raising `ClientClosedError`) is such a stop too: it ended a
+  lone request with the bare `ClientClosedError` and a batch command unknown caused by that refusal, the
+  failure it followed dropped, and was counted in `physical_requests` and `batch_isolation_requests`
+  though nothing was sent. It now ends as a stop at the permit does, and is counted in neither. The same
+  holds now for a REST 3.0 envelope retry after an abort or a
+  lost answer that the budget stops at its permit, which kept the envelope's failure. A command its own
+  entry or element answered keeps that answer whatever stops its replay: a classic command its own
+  entry answered with a transient error (`QUERY_LIMIT_EXCEEDED`, for example), whose replay such a
+  non-budget stop kept from being sent, ended with that stop (`ClientClosedError`) and now keeps its
+  `BatchCommandError`, as it already did when the budget stopped its replay and as a REST 3.0 command
+  its element answered did. The commands of a classic round a stop ended no longer share one error
+  object: each gets its own copy of the stop, with the stop's traceback and the failure that command
+  followed as its cause.
+- **A stale `Date` no longer stretches a dated throttle hint.** A `Retry-After` given as an HTTP date,
+  or an `X-Bitrix-RateLimit-Reset` given as a date or an epoch, was measured against the response's
+  `Date` whatever that `Date` said, so an answer whose `Date` was an hour old (from a cache or a relay,
+  or a server clock set back) held every request to the portal for the hour cap. The `Date` is now used
+  only when it is at most a minute behind the local clock; otherwise the local clock measures the hint,
+  as it does without a `Date`. A local clock running ahead of the server by less than a minute still
+  cannot shorten a hint; one further ahead now can, which costs at worst an early retry that the server
+  throttles again. A delta in seconds is unchanged, and every hint is still capped at an hour.
+
 ## The end of `max_elapsed` is not a cleanup failure
 
 - **Cleanup gets a grace past the budget.** Every stream but `iter_list()` waited for its source's
@@ -18,7 +73,9 @@
   exceed elapsed budget"), so a tolerant stream completed with failures. When the operation's deadline
   has passed, it is now refused as every other work is ("execution time budget exhausted before the
   retry", recorded), and the stream raises `BudgetExceededError`. A retry whose delay is merely longer
-  than the time left is still refused alone, as is one whose own retry window closed first.
+  than the time left is still refused alone, as is one whose own retry window closed first: that request
+  fails with `BudgetExceededError`, nothing is recorded, and a tolerant stream goes on and completes with
+  failures (`completed_with_failures`, with no `budget_exhausted`).
 - **Which window refused a request is in the message.** A request refused because its own retry window
   (`max_retry_elapsed_per_request`) closed before the operation's deadline fails with
   "per-request retry time budget exhausted", wherever it was refused (its permit wait, its dispatch,
@@ -85,6 +142,8 @@
   recording nothing. A cleanup step bounds its wait with `ExecutionContext.cleanup_window()` instead.
 - **`ExecutionContext.reserve_attempt()` no longer takes `retry_started`.** It reserves the request
   and attempt budgets only; the time check is the send's own, made just before it with `time_left()`.
+  The new `ExecutionContext.release_attempt()` gives back an attempt reserved for a send its transport
+  then refused because it is closed: that send is no physical request. Call it only for such a send.
 - **A synchronous source is never closed during its pull.** When the operation ended while a pull of
   a synchronous source still ran in its worker thread, its close could start before the pull ended
   (for example once the loop, shutting down, cancelled the tasks left) and failed in the background
@@ -347,7 +406,9 @@ send meets a method pause, have changed.
   "transport is closed" or "HTTP client is closed" for a send after its transport or injected HTTPX
   client closed. Each now raises `b24api.errors.ClientClosedError`. It is a `TransportError` of phase
   `not_dispatched` and `retryable=False`: the attempt it stopped never left the process, and it is never
-  retried. The phase covers that attempt alone. A `SAFE` request waiting for the permit of a retry may
+  retried. A custom transport that refuses a send because it is closed raises it too: the executor then
+  counts no physical request for that send; any other failure before dispatch stays a `TransportError`
+  and its send counts. The phase covers that attempt alone. A `SAFE` request waiting for the permit of a retry may
   have run on an earlier attempt; an `UNSAFE` or `UNKNOWN` one is retried only after a failure that
   proved it did not run (a transport failure before dispatch, or a refusal listed in `AmbiguityPolicy`),
   so it stays proven not run. It also derives from `RuntimeError`, so
@@ -380,8 +441,8 @@ send meets a method pause, have changed.
   `max_direct_concurrency`, `max_active_references` and the client limit at once; a `BatchDispatch`
   keeps at most the smallest of its `concurrency`, `max_active_references` and the client limit of
   physical batches in flight, and `max_direct_concurrency` does not limit it. The isolation of a REST
-  3.0 envelope of `SAFE` commands that may have run sends its unresolved commands one by one, all at
-  once, bounded only by the client limit. In `fan_out()` and `fan_out_outcomes()`, a `BatchDispatch`
+  3.0 envelope of `SAFE` commands that may have run sends its unresolved commands one at a time, within
+  the batch it isolates (see "The retry path"). In `fan_out()` and `fan_out_outcomes()`, a `BatchDispatch`
   keeps as many batches in flight as these limits allow, whatever its `batch_size`: see "A fan-out's
   row share follows its concurrency" under "Results beyond the row budget". Raise the client limit
   only as far as the portal's rate limits allow.
@@ -403,7 +464,7 @@ Public signatures are unchanged; when a retry waits and when it is sent have cha
   its exponential backoff and the hint, and the same holds for a method paused by
   `OPERATION_TIME_LIMIT`. A hint given as a date or an epoch is measured against the response's
   `Date` header when it has one, not the local clock, so a local clock running ahead no longer
-  shortens it.
+  shortens it (unless that `Date` is more than a minute behind the local clock: see "The retry path").
 - **Breaking: a call may now wait up to `max_elapsed` for its first permit.** The retry window
   `max_retry_elapsed_per_request` (`Settings.http_timeout`, 30 s by default, for the client's default
   policy) used to start before the request queued for a permit of the client's shared limiter. A

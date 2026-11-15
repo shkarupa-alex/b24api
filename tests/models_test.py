@@ -209,6 +209,20 @@ async def test_budget_ledger_counts_attempts_pages_references_and_buffers_before
         await context.set_buffered_rows(3)
 
 
+@pytest.mark.asyncio
+async def test_releasing_an_attempt_gives_back_only_one_reserved() -> None:
+    # A send its closed transport refused gives back its reserved attempt; with none reserved, a release is a
+    # misuse, refused loudly instead of driving the count below zero.
+    context = ExecutionContext(ExecutionPolicy(), RateCoordinator())
+    await context.reserve_attempt(attempts_for_request=0)
+    context.release_attempt()
+    assert (await context.snapshot()).counters.physical_requests == 0
+
+    with pytest.raises(RuntimeError, match="no reserved attempt to release"):
+        context.release_attempt()
+    assert (await context.snapshot()).counters.physical_requests == 0
+
+
 def test_budget_counters_snapshot_is_validated_and_sorted() -> None:
     counters = BudgetCounters(logical_pages=2, pages_per_reference=(("B", 1), ("A", 1)))
     assert counters.pages_per_reference == (("A", 1), ("B", 1))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import copy
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
@@ -160,21 +161,24 @@ class _Lineup:
     which the budget that stops it reports as its cause, as a lone request's would be. Each waiting command
     keeps the lineage of the sends it was in: a SAFE command the last plan left for a later round is
     ``carried``, misses that round, and is planned again with the next round's commands, so what a round's
-    send left open is added only to the commands that were in it.
+    send left open is added only to the commands that were in it. ``sent`` is what every round sent so far left
+    open, whichever commands it carried: what ends the envelope instead of an outcome (a cancellation) carries it.
     """
 
     settled: dict[int, BatchOutcome] = field(default_factory=dict)
     waiting: dict[int, _Waiting] = field(default_factory=dict)
     carried: tuple[_Command, ...] = ()
+    sent: _Lineage = field(default_factory=_Lineage)
 
     def after_round(self, sent: _Round, commands: tuple[_Command, ...]) -> tuple[_Command, ...]:
         """Record what a round gave its commands; return those that may run again, carried ones included.
 
         A round proves nothing new about a command when it was stopped before its send, or when its envelope was
-        refused as a whole after the command's own entry answered it: the command stays as it was. A budget that
-        stops a round before its send stops each command it holds as ``stop`` does, whichever command's failure
-        asked for that round.
+        refused as a whole after the command's own entry answered it: the command stays as it was. A failure that
+        stops a round before its send, the budget's or any other (a closed client), stops each command it holds
+        as ``_stop`` does, whichever command's failure asked for that round.
         """
+        self.sent = self.sent.after(sent.send)
         again = {command.index for command in sent.replay}
         for command, outcome in zip(commands, sent.outcomes, strict=True):
             before = self.waiting.pop(command.index, None)
@@ -186,8 +190,8 @@ class _Lineup:
                 self.waiting[command.index] = _Waiting(before.state, before.lineage.after(sent.send))
             elif command.index in again:
                 self.waiting[command.index] = _Waiting(_state(outcome, sent), before.lineage.after(sent.send))
-            elif not sent.dispatched and isinstance(sent.failure, BudgetExceededError):
-                self._stop(command, before, str(sent.failure))
+            elif not sent.dispatched and sent.failure is not None:
+                self._stop(command, before, sent.failure)
             else:
                 self._settle(outcome, before.lineage)
         candidates, self.carried = (*sent.replay, *self.carried), ()
@@ -200,19 +204,25 @@ class _Lineup:
         else:
             self._settle(outcome, _Lineage())
 
-    def stop(self, commands: tuple[_Command, ...], refusal: str) -> None:
+    def stop(self, commands: tuple[_Command, ...], refusal: BudgetExceededError) -> None:
         """End the commands the budget keeps from being sent again, for ``refusal``."""
         for command in commands:
             self._stop(command, self.waiting.pop(command.index), refusal)
 
-    def _stop(self, command: _Command, waiting: _Waiting, refusal: str) -> None:
-        """End a command the budget keeps from being sent again: its entry's answer, or the budget it caused."""
+    def _stop(self, command: _Command, waiting: _Waiting, stop: B24ApiError) -> None:
+        """End a command ``stop`` keeps from being sent again: with its entry's answer, or with the stop.
+
+        The stop is what ended a command that followed its round's failure, so it is the outcome, caused by the
+        failure that command followed, possibly run only when a send it was in may have run. The executor chains a
+        stop to the batch's latest failure, but a command carried past a round followed an earlier one, so each
+        command gets its own copy of the stop, with the stop's traceback and its own cause.
+        """
         if isinstance(waiting.state, _Answered):
             self._settle(waiting.state.outcome, waiting.lineage)
             return
-        error = BudgetExceededError(refusal)
+        error = copy.copy(stop).with_traceback(stop.__traceback__)
         error.__cause__ = waiting.state.failure
-        waiting.lineage.record_unsent(error)
+        waiting.lineage.record_open(error)
         self._settle(_shared_failure(command, error), waiting.lineage)
 
     def _settle(self, outcome: BatchOutcome, lineage: _Lineage) -> None:
@@ -360,12 +370,22 @@ class BatchExecutor:
         attempts = _RequestAttempts(caller_retries=True)
         lineup = _Lineup()
         pending = eligible
-        while pending:
-            sent = await self._dispatch_round(pending, context=context, options=options, attempts=attempts)
-            # Only the commands that may run again are sent again, in a smaller physical batch; the rest keep
-            # the outcome this round gave them.
-            candidates = lineup.after_round(sent, pending)
-            pending = await self._next_round(candidates, lineup, context=context, attempts=attempts, options=options)
+        try:
+            while pending:
+                sent = await self._dispatch_round(pending, context=context, options=options, attempts=attempts)
+                # Only the commands that may run again are sent again, in a smaller physical batch; the rest keep
+                # the outcome this round gave them. ``attempts`` covers the next round from here on.
+                candidates = lineup.after_round(sent, pending)
+                attempts.start_round()
+                pending = await self._next_round(
+                    candidates, lineup, context=context, attempts=attempts, options=options
+                )
+        except BaseException as error:
+            # What ends the envelope instead of an outcome (a cancellation, in flight or in a wait) carries what its
+            # rounds left open, the one in flight included, as a request's does (``Executor.execute``); before any
+            # send, nothing.
+            lineup.sent.after(attempts.lineage).record_open(error)
+            raise
         return tuple(lineup.settled.values())
 
     async def _next_round(
@@ -395,17 +415,17 @@ class BatchExecutor:
                 whole=options.halt,
             )
         except BudgetExceededError as refusal:
-            lineup.stop(candidates, str(refusal))
+            lineup.stop(candidates, refusal)
             return ()
         if plan is None:
-            lineup.stop(candidates, _retry_refusal(plan))
+            lineup.stop(candidates, BudgetExceededError(_retry_refusal(plan)))
             return ()
         sending, carried, refused = (
             tuple(candidates[index] for index in plan.sends(each))
             for each in (_SendPlan.SEND, _SendPlan.CARRY, _SendPlan.REFUSE)
         )
         lineup.carried = carried
-        lineup.stop(refused, _retry_refusal(plan))
+        lineup.stop(refused, BudgetExceededError(_retry_refusal(plan)))
         if sending:
             await self.executor.replay_after(context, attempts=attempts, pause=plan.pause)
         return sending
@@ -425,7 +445,6 @@ class BatchExecutor:
         """
         request = _batch_request(commands, halt=options.halt)
         spent = attempts.used
-        attempts.start_round()
         # A failure of the executor carries the facts it recorded about this round's send; one of the engine's own
         # is recorded here. What each command's earlier sends left open is its own (``_Lineup``).
         failure: B24ApiError | None = None
@@ -443,9 +462,6 @@ class BatchExecutor:
             raise
         except B24ApiError as error:
             failure = error
-            if attempts.used == spent and spent:
-                # The budget stopped this round before its send: every command it holds was sent before.
-                attempts.record_unsent(error)
         else:
             try:
                 envelope = _decode_batch_envelope(

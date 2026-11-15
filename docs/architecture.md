@@ -129,15 +129,45 @@ outcome.
   engine plans each command on its own safety and its own method's hold as known when planning: a
   round waits only as long as its `UNSAFE` and `UNKNOWN` commands can afford, carries a `SAFE` command
   held longer to a later round (an attempt is spent per send of the envelope, when `_RequestAttempts`
-  records it after the attempt is reserved: a round that is sent spends one, a round stopped before its
-  send, at its permit or its admission, spends none, and a carried command spends none of its own;
+  records it once its transport returned or failed: a round that is sent spends one, a round stopped
+  before its send, at its permit, its admission or its transport, spends none, and a carried command
+  spends none of its own;
   every round that carries a command plans to send another, so the attempt budget bounds the carrying:
   a command still carried when the last attempt is spent ends as the attempt budget stops it), and
   still sends the others when the window or a held method stops some, unless it is fail-fast, which is
   sent whole or not at all. A hold that appears during the wait is met at the permit and stops the whole round
-  when it outlasts the window; a stop before a round's send ends each of its commands with the
-  failure that command followed as the cause. The REST 3.0 isolation of an unresolved `SAFE` envelope re-sends its commands one by one at once,
-  outside that planner. An envelope's first send is admitted under all its methods, so for a user's
+  when it outlasts the window. A stop before a send that follows a failure, by the budget or by any
+  other failure (a closed client), is chained to the failure of the latest send in one place, where the
+  executor stops it (`_RequestAttempts.chain_stop`, at the permit, at the admission and at the transport),
+  for a lone request's retry, a REST 3.0 envelope retry or isolated send and a classic round alike.
+  Each send's failure is classified into the request's lineage where the send ended, so the failure that
+  ends a request after its sends, a stop or a cancellation included, is recorded with what the lineage left
+  open (`record_open`), by the executor for a lone request as by the batch dialects for their own (a REST 3.0
+  group's envelopes, and the isolated sends of the command sent alone when it ended; a classic envelope's
+  rounds), never told by its exception type: a command a stop ended is explained by the latest send that may
+  have run (its reason and evidence), whatever stopped it: the budget, a closed coordinator or a closed
+  transport. With nothing sent, `record_open` records nothing, so a failure before the first send, a stop or a
+  cancellation, stays proven not run. A transport refuses a
+  send before it leaves the process with `ClientClosedError` only because it is closed (a closed
+  `HttpxTransport` or injected HTTPX client, or any transport): the executor releases the attempt it
+  reserved and records nothing sent (`Executor._dispatch`), so that send is no physical request and no
+  isolated send, and stops it as the permit does. Until its transport returns, a send holds its
+  reservation, so a concurrent send the spent request budget refused meanwhile stays refused even when
+  that reservation is then released. Any other failure before dispatch (a credential unavailable, a
+  connection pool timeout, a refused connection) is a `TransportError` and its send counts. A batch command
+  that followed its envelope's failure ends with that stop; a classic round may carry a command past a
+  round, so its engine gives each command a copy of the stop caused by the failure that command
+  followed. A command its own entry or element answered keeps that answer, whatever stops its replay.
+  The REST 3.0 isolation of an unresolved `SAFE` envelope is
+  a replay round of its group like its one envelope retry: planned whole by `plan_replay` and waited out
+  by `replay_after` (the longer of the backoff and the coordinator's hold, within the attempt budget,
+  the retry window and the deadline), then its commands are sent one at a time, inside the dispatch
+  slot the envelope held, so a `BatchDispatch` never has more requests in flight than its concurrency.
+  Each isolated send is an ordinary request on its command's copy of the lineage, which the executor
+  admits at its permit and paces through its own retries. A replay its plan refuses, by the deadline
+  (recorded) or while time is left by the attempts, the window or a wait it cannot carry, sends nothing
+  more and ends each command with that refusal caused by the envelope's failure, in both dialects, as a
+  lone request's refused retry ends. An envelope's first send is admitted under all its methods, so for a user's
   logical batch (`batch()`, `batch_outcomes()`) `Executor.plan_first_send` weighs its commands with
   the same `_Pause.admits` and `_plan_round`, with no backoff, by how much longer each command's own
   method is held than the host, against the window its send opens or what the operation has left after
@@ -150,7 +180,7 @@ outcome.
   refusal (`requests_refused`), after which no send can be admitted. Time refuses work only through
   `ExecutionContext.time_left`, which returns the time left or refuses when none is, and
   `ExecutionContext.deadline`, which waits under it (a send's permit and its dispatch,
-  the plan of a retry, a batch replay round or an envelope's first send, a batch's isolation phase, a
+  the plan of a retry, a batch replay round (a REST 3.0 isolation included) or an envelope's first send, a
   page reservation, a row-capacity wait, a dispatcher admission, a fast keyset lease, a source pull).
   Both record the refusal when the operation's deadline is what closed, and record nothing when a
   request's own retry window closed first, which refuses that request alone with "per-request retry
@@ -278,10 +308,11 @@ advanced request representations require an advertised `WireTransport` capabilit
 I/O otherwise. No ordinary wire value can name an absolute destination. Native REST 3.0 batch commands travel as
 an internal JSON-array envelope that the transport must advertise; one physical-attempt classifier
 decides, before any retry, whether an envelope failure proves non-execution, attributes per-command
-results, or leaves the envelope unresolved for bounded `SAFE` isolation. Isolation sends each `SAFE`
-command alone and returns its success; a failure stays unknown, because the envelope may have run the
-command, and is explained by that envelope like any other earlier send that may have run, also when
-the budget leaves no isolated send.
+results, or leaves the envelope unresolved for bounded `SAFE` isolation. Isolation, a planned replay of
+the envelope's group, sends each `SAFE` command alone, one at a time, and returns its success; a failure stays unknown, because the envelope may have run the
+command, and is explained by that envelope like any other earlier send that may have run. When the
+budget leaves no isolated send, the command ends unknown with that refusal, caused by the envelope's
+failure.
 
 Traversal contracts separately declare progression (`server next`, observed width, or fixed step),
 completion (empty confirmation or caller-qualified exact total), collection shape, and identity.

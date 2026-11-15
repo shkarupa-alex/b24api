@@ -1468,7 +1468,7 @@ def test_a_round_refused_at_its_send_leaves_its_commands_following_the_envelope_
     unsent = _Round((BatchFailure(0, command.stable_key, command.request, withheld),), _Lineage(), (command,), withheld)
 
     candidates = lineup.after_round(unsent, (command,))
-    lineup.stop(candidates, "per-request attempt budget exhausted")
+    lineup.stop(candidates, BudgetExceededError("per-request attempt budget exhausted"))
 
     (outcome,) = lineup.settled.values()
     assert isinstance(outcome, BatchFailure)

@@ -15,9 +15,13 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 import httpx
 from pydantic import HttpUrl, TypeAdapter, ValidationError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 _DEFAULT_PORTS = MappingProxyType({"http": 80, "https": 443})
 # Percent-encoded characters are refused rather than decoded, so the path HTTPX sends is the classic base
@@ -99,6 +103,94 @@ class Webhook:
     def api_v3_url(self) -> str:
         """The REST 3.0 base of the same webhook."""
         return self.address.api_v3_url(self.token)
+
+
+class WebhookSecrets:
+    """The tokens of some webhooks, found and replaced in a text without ever being handed out.
+
+    Whoever keeps webhook secrets to scrub (the HTTPX log shield and its filter) holds this carrier, not the
+    tokens, so neither a frame local nor an attribute a traceback renders shows one: its ``repr`` names only
+    how many it holds, and it is not iterable. An empty token is no secret and is not held. Tokens are found by
+    plain string search, so nothing outside the carrier (no regex cache) ever keeps one; the one webhook per
+    distinct token it searches with is picked on first use, not when the carrier is built.
+    """
+
+    __slots__ = ("_distinct", "_union", "_webhooks")
+
+    def __init__(self, webhooks: Iterable[Webhook] = ()) -> None:
+        """Hold the tokens of ``webhooks``, ignoring an empty one."""
+        self._webhooks = frozenset(webhook for webhook in webhooks if webhook.token)
+        self._distinct: tuple[Webhook, ...] | None = None
+        # The carrier last joined to this one and the union, so joining the same two again builds nothing.
+        self._union: tuple[WebhookSecrets, WebhookSecrets] | None = None
+
+    def __repr__(self) -> str:
+        """Name the number of tokens held, never one of them."""
+        return f"<WebhookSecrets: {len(self)} hidden>"
+
+    def __bool__(self) -> bool:
+        """Report whether any token is held, without picking the webhooks it searches with."""
+        return bool(self._webhooks)
+
+    def __len__(self) -> int:
+        """Count the distinct tokens held."""
+        return len(self._searched())
+
+    def __or__(self, other: WebhookSecrets) -> WebhookSecrets:
+        """Hold the tokens of both."""
+        if other._webhooks <= self._webhooks:
+            return self
+        if self._webhooks <= other._webhooks:
+            return other
+        union = self._union
+        if union is None or union[0] is not other:
+            union = (other, WebhookSecrets(self._webhooks | other._webhooks))
+            self._union = union
+        return union[1]
+
+    def found_in(self, text: str) -> bool:
+        """Report whether any token held occurs in ``text``."""
+        return any(webhook.token in text for webhook in self._searched())
+
+    def replaced_in(self, text: str, replacement: str) -> str:
+        """Return ``text`` with every stretch any token held covers replaced, once, by ``replacement``.
+
+        Every occurrence of every token is found, overlapping ones too, and occurrences that overlap or touch
+        form one stretch, so no part of any token survives: ``abcd`` and ``cdef`` over ``abcdef`` leave nothing.
+        """
+        spans: list[tuple[int, int]] = []
+        for webhook in self._searched():
+            start = text.find(webhook.token)
+            while start != -1:
+                spans.append((start, start + len(webhook.token)))
+                # Searched again one past this occurrence, not after it, so an overlapping one is found too.
+                start = text.find(webhook.token, start + 1)
+        if not spans:
+            return text
+        spans.sort()
+        pieces: list[str] = []
+        kept = 0
+        stretch_start, stretch_end = spans[0]
+        for start, end in spans[1:]:
+            if start <= stretch_end:
+                stretch_end = max(stretch_end, end)
+                continue
+            pieces += (text[kept:stretch_start], replacement)
+            kept = stretch_end
+            stretch_start, stretch_end = start, end
+        pieces += (text[kept:stretch_start], replacement, text[stretch_end:])
+        return "".join(pieces)
+
+    def _searched(self) -> tuple[Webhook, ...]:
+        if self._distinct is None:
+            # Racing threads pick the same webhooks; either result is kept.
+            self._distinct = _distinct_tokens(self._webhooks)
+        return self._distinct
+
+
+def _distinct_tokens(webhooks: frozenset[Webhook]) -> tuple[Webhook, ...]:
+    """One webhook per distinct token, so a token two webhooks share is searched for once."""
+    return tuple({webhook.token: webhook for webhook in webhooks}.values())
 
 
 def parse_webhook(url: object) -> Webhook | WebhookRefusal:

@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 
 _RETRY_AFTER_CAP_SECONDS = 3_600.0
 _EPOCH_SECONDS_MINIMUM = 1e9
+# How far a response's ``Date`` may lag the local clock and still measure a dated hint (``_hint_now``).
+_DATE_LAG_TOLERANCE_SECONDS = 60.0
 
 
 def _retry_delay(
@@ -37,11 +39,11 @@ def _retry_delay(
 def _retry_after_seconds(wire: WireResponse) -> float | None:
     """Return the bounded host cooldown hinted by a response; ``Retry-After`` has priority.
 
-    A hint given as a date or an epoch is measured against the response's own ``Date``, the server's clock that
-    set it, so a local clock running ahead cannot shrink it; the local wall clock stands in only without one.
+    A hint given as a date or an epoch is measured from ``_hint_now``: the response's own ``Date`` when plausible,
+    else the local wall clock.
     """
     headers = wire.header_map
-    wall_now = _server_now(headers.get("date"))
+    wall_now = _hint_now(headers.get("date"))
     retry_after = headers.get("retry-after")
     if retry_after:
         return parse_retry_after(retry_after, now=wall_now, cap=_RETRY_AFTER_CAP_SECONDS)
@@ -91,10 +93,21 @@ def parse_rate_limit_reset(raw: str, *, wall_now: float, cap: float) -> float | 
     return min(value, cap)
 
 
-def _server_now(date: str | None) -> float:
-    """Return the epoch time of a response's ``Date`` header, or the local wall clock without a usable one."""
-    parsed = _http_date(date) if date else None
-    return time.time() if parsed is None else parsed
+def _hint_now(date: str | None) -> float:
+    """Return the epoch time a dated hint is measured from: the response's ``Date`` if plausible, else the local clock.
+
+    The server's clock set the hint, so its ``Date`` keeps a local clock running ahead from shortening the wait. A
+    ``Date`` more than a minute behind the local clock is not plausible: a stale answer (from a cache or a relay) or a
+    server clock set back would lengthen the wait by as much, up to the cap, while the hint holds the whole host. The
+    local clock then measures the hint, as it does without a usable ``Date``. A ``Date`` ahead of the local clock only
+    shortens the wait. So a dated hint never waits more than a minute longer than the local clock measures, and
+    never longer than the cap.
+    """
+    local = time.time()
+    server = _http_date(date) if date else None
+    if server is None or server < local - _DATE_LAG_TOLERANCE_SECONDS:
+        return local
+    return server
 
 
 def _http_date(raw: str) -> float | None:

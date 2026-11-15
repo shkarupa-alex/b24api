@@ -18,6 +18,8 @@ from b24api.redaction import Redactor
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from b24api._webhook import WebhookSecrets
+
 _REPLACEMENT = "[REDACTED]"
 # Fields logging itself sets; everything else on a record arrived through ``extra``.
 _STANDARD_RECORD_FIELDS = frozenset(
@@ -33,22 +35,18 @@ _TRACEBACK_FORMATTER = logging.Formatter()
 _UNRENDERABLE_TRACEBACK = "[traceback unavailable]"
 
 
-def redact_registered_value(value: object, credentials: tuple[str, ...]) -> object:
+def redact_registered_value(value: object, secrets: WebhookSecrets) -> object:
     """Remove only the registered secret from a foreign record field, leaving it otherwise untouched."""
     rendered = str(value)
-    if not any(credential in rendered for credential in credentials):
+    if not secrets.found_in(rendered):
         return value
-    for credential in credentials:
-        rendered = rendered.replace(credential, _REPLACEMENT)
-    return rendered
+    return secrets.replaced_in(rendered, _REPLACEMENT)
 
 
-def redact_owned_value(value: object, credentials: tuple[str, ...]) -> object:
+def redact_owned_value(value: object, secrets: WebhookSecrets) -> object:
     """Scrub one field of an owned record, keeping its original type when nothing is secret."""
     rendered = str(value)
-    scrubbed = rendered
-    for credential in credentials:
-        scrubbed = scrubbed.replace(credential, _REPLACEMENT)
+    scrubbed = secrets.replaced_in(rendered, _REPLACEMENT)
     scrubbed = _HOP_CREDENTIAL.sub(lambda match: match.group("prefix") + _REPLACEMENT, scrubbed)
     scrubbed = _RECORD_REDACTOR.redact_text(scrubbed)
     return value if scrubbed == rendered else scrubbed

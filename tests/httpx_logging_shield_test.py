@@ -15,6 +15,7 @@ from packaging.requirements import Requirement
 from packaging.version import Version
 
 from b24api import Request, RouteKind
+from b24api._webhook import Webhook, WebhookAddress
 from b24api.contracts import BodyEncoding
 from b24api.errors import TransportError
 from b24api.transport import HttpxTransport
@@ -66,7 +67,9 @@ async def _assert_shield_released(logger: logging.Logger) -> None:
     A client closed after its transport leaves the filter inert, holding no secret, until the next shield
     lifecycle event removes it; a throwaway transport provides that event.
     """
-    assert not {_OWNED_MARKER, _FOREIGN_MARKER} & set(HTTPX_LOG_SHIELD.registered_secrets())
+    registered = HTTPX_LOG_SHIELD.registered_secrets()
+    assert not registered.found_in(_OWNED_MARKER)
+    assert not registered.found_in(_FOREIGN_MARKER)
     await HttpxTransport(f"https://portal.invalid/rest/1/{_PROBE_MARKER}/").aclose()
     assert HTTPX_LOG_SHIELD._filter not in logger.filters  # noqa: SLF001 - final cleanup control
 
@@ -867,14 +870,17 @@ async def test_owned_and_foreign_extra_value_matrix() -> None:
     await _assert_shield_released(logger)
 
 
-@pytest.mark.parametrize("credentials", [(), ("",)], ids=["none", "empty"])
-def test_a_dispatch_without_a_credential_does_not_leave_the_filter_in_flight(credentials: tuple[str, ...]) -> None:
+def _webhook(token: str) -> Webhook:
+    return Webhook(WebhookAddress("https", "portal.invalid", None, "1"), token)
+
+
+def test_a_dispatch_without_a_credential_does_not_leave_the_filter_in_flight() -> None:
     logger = logging.getLogger("httpx")
     HTTPX_LOG_SHIELD.register_transport()
     try:
         with (
             pytest.raises(ValueError, match="webhook credential of the owned request"),
-            HTTPX_LOG_SHIELD.request(credentials=credentials),
+            HTTPX_LOG_SHIELD.request(webhook=_webhook("")),
         ):
             pass
         assert HTTPX_LOG_SHIELD._in_flight == 0  # noqa: SLF001 - in-flight accounting control
@@ -891,7 +897,7 @@ def test_record_without_an_emitting_httpx_request_is_scrubbed_conservatively() -
     logger.setLevel(logging.INFO)
     HTTPX_LOG_SHIELD.register_transport()
     try:
-        with HTTPX_LOG_SHIELD.request(credentials=(_OWNED_MARKER,)):
+        with HTTPX_LOG_SHIELD.request(webhook=_webhook(_OWNED_MARKER)):
             logger.info("hop %s", f"https://redirect.invalid/rest/1/{_SECOND_MARKER}/profile")
         assert len(handler.records) == 1
         assert _SECOND_MARKER not in handler.records[0].getMessage()

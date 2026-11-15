@@ -200,12 +200,15 @@ def _recorded_unproven(error: BaseException) -> B24ApiError | None:
 
 
 def _explained_by(error: B24ApiError) -> B24ApiError:
-    """Return the failure of the send that may have run: recorded, or behind an ambiguity or a stopped retry."""
+    """Return the failure of the send that may have run: recorded, or behind an ambiguity.
+
+    A stop before a send is explained only by what its recorder recorded, never by its type or its cause.
+    """
     recorded = _recorded_unproven(error)
     if recorded is not None:
         return recorded
     cause = error.__cause__
-    if isinstance(error, AmbiguousExecutionError | BudgetExceededError) and isinstance(cause, B24ApiError):
+    if isinstance(error, AmbiguousExecutionError) and isinstance(cause, B24ApiError):
         return _explained_by(cause)
     return error
 

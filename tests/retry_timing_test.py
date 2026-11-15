@@ -6,12 +6,17 @@ it, so no test waits on the wall clock or asserts one.
 
 from __future__ import annotations
 import asyncio
+import contextlib
+import dataclasses
 import email.utils
 import json
 import os
 import random
+import traceback
 from collections.abc import Mapping
+from pathlib import Path
 from time import gmtime, strftime, tzset
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -21,20 +26,25 @@ from b24api.batch.correlation import _Command
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchOutcome, BatchSuccess
 from b24api.batch.stream import batch_outcome_stream
-from b24api.contracts import Command, CommandSuccess, ResultErrorSpec, ResultSelector
-from b24api.contracts.policy import ExecutionPolicy, KernelState, ReplayDisposition, RetryPolicy
+from b24api.contracts import Command, CommandOutcomeUnknown, CommandSuccess, ResultErrorSpec, ResultSelector
+from b24api.contracts.policy import AmbiguityReason, ExecutionPolicy, KernelState, ReplayDisposition, RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
     ApiResponseError,
+    B24ApiError,
     BatchCommandError,
     BudgetExceededError,
+    ClientClosedError,
+    FailurePhase,
     HTTPGatewayError,
     InputSourceError,
+    ProtocolError,
+    TransportError,
 )
-from b24api.execution import Executor, RateCoordinator, WireResponse, WorkClass
+from b24api.execution import Executor, RateCoordinator, WireResponse, WorkClass, throttle
 from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
-from b24api.execution.facts import Execution, execution
+from b24api.execution.facts import Execution, ambiguity_of, execution
 from b24api.references.fanout import kernel_fanout_stream
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from tests.scripting import ResponderTransport, always, client_for, drain_to_failure, on_loop, replies
@@ -43,7 +53,9 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
 
     from b24api import Transport
+    from b24api.execution.context import ExecutionSnapshot
     from b24api.execution.rate import DeadlineBudget, _Permit
+    from b24api.transport import WireRequest
 
 _JSON = (("content-type", "application/json"),)
 # The response's own clock, years behind the local one: a hint measured locally would have passed long ago.
@@ -168,19 +180,48 @@ def east_of_utc() -> Iterator[None]:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("east_of_utc")
+@pytest.mark.parametrize(
+    # How far the local clock runs ahead of the response's Date, how long after that Date the hint ends, and the
+    # cooldown the hint holds the host for.
+    "clocks",
+    [
+        # The local clock runs half a minute ahead of the server's: the hint is measured against the server's Date.
+        (30.0, 10, 10.0),
+        # The local clock runs an hour behind: the Date is measured against, and the hint is not an hour longer.
+        (-3_600.0, 10, 10.0),
+        # A Date up to a minute older than the local clock is plausible and still measures the hint.
+        (59.0, 10, 10.0),
+        (60.0, 10, 10.0),
+        # A Date more than a minute older is stale, an old answer or a server clock set back: the local clock
+        # measures the hint, ten seconds after that Date, which has passed, so nothing holds the host.
+        (61.0, 10, None),
+        (90.0, 10, None),
+        (3_600.0, 10, None),
+        # Half an hour stale with an hour's hint: half an hour is left by the local clock, not the whole hour.
+        (1_800.0, 3_600, 1_800.0),
+    ],
+    ids=["local-ahead", "local-behind", "lag-59", "lag-60", "lag-61", "lag-90", "lag-hour", "lag-half-hour"],
+)
 @pytest.mark.parametrize("date_form", sorted(_DATE_FORMS))
 @pytest.mark.parametrize(
     "hint",
     [
-        *(("retry-after", form(_SERVER_NOW + 10)) for form in _DATE_FORMS.values()),
-        ("x-bitrix-ratelimit-reset", str(int(_SERVER_NOW) + 10)),
+        *((lambda moment, form=form: ("retry-after", form(moment))) for form in _DATE_FORMS.values()),
+        lambda moment: ("x-bitrix-ratelimit-reset", str(int(moment))),
     ],
     ids=[*(f"retry-after-{name}" for name in _DATE_FORMS), "reset-epoch"],
 )
-async def test_a_dated_hint_is_measured_against_the_response_date(hint: tuple[str, str], date_form: str) -> None:
+async def test_a_dated_hint_is_measured_against_a_plausible_response_date(
+    monkeypatch: pytest.MonkeyPatch,
+    hint: Callable[[float], tuple[str, str]],
+    date_form: str,
+    clocks: tuple[float, int, float | None],
+) -> None:
+    local_offset, after, cooldown = clocks
+    monkeypatch.setattr(throttle, "time", SimpleNamespace(time=lambda: _SERVER_NOW + local_offset))
     time = _Time()
     date = ("date", _DATE_FORMS[date_form](_SERVER_NOW))
-    transport = ResponderTransport(always(WireResponse(429, (date, hint), b"")))
+    transport = ResponderTransport(always(WireResponse(429, (date, hint(_SERVER_NOW + after)), b"")))
     executor = _executor(transport, time)
 
     with pytest.raises(BudgetExceededError, match="attempt budget"):
@@ -190,9 +231,9 @@ async def test_a_dated_hint_is_measured_against_the_response_date(hint: tuple[st
     snapshot = await executor.coordinator.snapshot()
     await executor.coordinator.close()
 
-    # Ten seconds after the server's own Date, however far the local clock runs ahead of it, and whichever HTTP
-    # date form either header uses: a date without a zone is GMT, not local time.
-    assert snapshot.cooldown_until == 10.0  # noqa: PLR2004
+    # The hint is measured from the server's own Date unless that Date is more than a minute older than the local
+    # clock, whichever HTTP date form either header uses: a date without a zone is GMT, not local time.
+    assert snapshot.cooldown_until == cooldown
 
 
 @pytest.mark.asyncio
@@ -290,13 +331,51 @@ async def test_an_unsafe_retry_whose_wait_overran_is_stopped_before_its_send() -
     transport = ResponderTransport(replies(_refused(), _OK))
     executor = _executor(transport, time)
     policy = ExecutionPolicy(max_retry_elapsed_per_request=3.0, retry=RetryPolicy(initial_delay=1.0, jitter=0))
+    context = executor.context(policy)
 
     with pytest.raises(BudgetExceededError, match="shorter than the wait") as raised:
-        await executor.execute(_request(ReplaySafety.UNSAFE), policy=policy)
+        await executor.execute(_request(ReplaySafety.UNSAFE), context=context)
+    snapshot = await context.snapshot()
     await executor.coordinator.close()
 
     _assert_refused_without_a_send_into_the_rest(raised.value, len(transport.requests))
     assert time.sleeps == [1.0]
+    # Refused at its admission, before its attempt is reserved: only the first send is counted.
+    assert snapshot.counters.physical_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_a_retry_granted_its_permit_past_the_deadline_is_stopped_before_it_is_counted() -> None:
+    # The lost send's retry waits its 0.5-second backoff, then gets its permit 0.9 seconds later, past the 1-second
+    # deadline: the deadline refuses it at its admission, before its attempt is reserved, recorded, and caused by
+    # the lost send it follows. Only the first send is counted.
+    time = _Time()
+    lost = _lost()
+    transport = ResponderTransport(replies(lost, _OK))
+    executor = _executor(transport, time)
+    acquire = executor.coordinator.acquire
+
+    async def acquire_late(
+        work_class: WorkClass, *, methods: frozenset[str], budget: DeadlineBudget | None = None
+    ) -> _Permit:
+        permit = await acquire(work_class, methods=methods, budget=budget)
+        if transport.requests:  # the retry's permit is granted late
+            time.now += 0.9
+        return permit
+
+    executor.coordinator.acquire = acquire_late  # type: ignore[method-assign]
+    context = executor.context(ExecutionPolicy(max_elapsed=1.0, retry=RetryPolicy(initial_delay=0.5, jitter=0)))
+
+    with pytest.raises(BudgetExceededError) as raised:
+        await executor.execute(_request(ReplaySafety.SAFE, "crm.item.get"), context=context)
+    snapshot = await context.snapshot()
+    await executor.coordinator.close()
+
+    assert str(raised.value) == "execution time budget exhausted before dispatch"
+    assert raised.value.__cause__ is lost
+    assert context.refusal == "execution time budget exhausted before dispatch"
+    assert len(transport.requests) == 1
+    assert snapshot.counters.physical_requests == 1
 
 
 @pytest.mark.asyncio
@@ -840,7 +919,8 @@ async def test_a_carried_command_stopped_at_its_permit_reports_the_failure_it_fo
 @pytest.mark.asyncio
 async def test_a_command_carried_past_an_unknown_round_and_then_stopped_ends_as_proven_not_run() -> None:
     # The get was sent once, in the refused first send. The third round's 1.2-second backoff exceeds the window,
-    # so the budget stops the list and the get: the list may have run in the second send, the get never did.
+    # so the budget stops the list and the get: the list may have run in the second send, the get never did. The
+    # one stop of their round ends each of them caused by the failure that command followed, which differ.
     time = _Time()
     transport, executor, requests = _carried_past_an_unknown_round(time, None)
     policy = ExecutionPolicy(
@@ -864,6 +944,16 @@ async def test_a_command_carried_past_an_unknown_round_and_then_stopped_ends_as_
         assert isinstance(unknown, BatchFailure)
         assert isinstance(unknown.error, AmbiguousExecutionError)
         assert execution(unknown.error) is Execution.POSSIBLY_RUN
+    assert isinstance(listed, BatchFailure)
+    assert isinstance(listed.error, AmbiguousExecutionError)
+    stop = listed.error.__cause__
+    assert isinstance(stop, BudgetExceededError)
+    assert "retry delay" in str(stop)
+    assert stop is not get.error
+    # The list follows the second round's failure, unknown after the bare 500; the get, the first round's 429.
+    assert isinstance(stop.__cause__, AmbiguousExecutionError)
+    assert isinstance(stop.__cause__.__cause__, HTTPGatewayError)
+    assert stop.__cause__.__cause__.http_status == 500  # noqa: PLR2004
 
 
 @pytest.mark.asyncio
@@ -1690,3 +1780,357 @@ async def test_a_replay_refused_while_time_is_left_fails_alone_and_the_stream_co
     assert errors == [refusal, ""]
     assert stream.report.state is KernelState.COMPLETED
     transport.assert_exhausted()
+
+
+_NO_DELAY = ExecutionPolicy(retry=RetryPolicy(initial_delay=0, maximum_delay=0, jitter=0))
+
+
+class _ClosingTransport(ScriptedTransport):
+    """Answer each send with the next of ``replies``, closing the client during the last one first.
+
+    ``closing`` names what closes: the client's ``coordinator``, so no send after the last reply gets a permit, or
+    the ``transport`` itself, which then refuses every send before it leaves, as any transport may: with the
+    ``ClientClosedError`` that says it never left. Either way the replay asked for is stopped, not by a budget.
+    Nothing closes for a ``budget`` that stops it instead; the last reply spends the retry ``window``.
+    """
+
+    def __init__(self, replies: tuple[WireResponse | TransportError, ...], *, closing: str) -> None:
+        super().__init__(())
+        self.replies = list(replies)
+        self.closing = closing
+        self.executor: Executor | None = None
+        self.time: _Time | None = None
+        self.sends = 0
+        self.refused = 0
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del request, attempt_timeout, max_response_bytes
+        if not self.replies:
+            assert self.closing == "transport", "no send leaves after the last reply"
+            self.refused += 1
+            raise ClientClosedError("transport is closed")
+        self.sends += 1
+        reply = self.replies.pop(0)
+        if not self.replies and self.closing == "coordinator":
+            assert self.executor is not None
+            await self.executor.coordinator.close()
+        if not self.replies and self.closing == "window":
+            assert self.time is not None
+            self.time.now += _SPENT_WINDOW
+        if isinstance(reply, TransportError):
+            raise reply
+        return reply
+
+
+def _assert_raised_where_refused(stop: BaseException, closing: str) -> None:
+    """Each command's copy of the stop keeps the stop's own traceback, down to the refusal of what closed."""
+    frames = traceback.extract_tb(stop.__traceback__)
+    assert frames
+    refused_at = ("rate.py", "acquire") if closing == "coordinator" else (Path(__file__).name, "send_wire")
+    assert (Path(frames[-1].filename).name, frames[-1].name) == refused_at
+
+
+def _answered_by_each_command(dialect: str) -> WireResponse:
+    """Each of two commands answered by its own entry or element with a transient, replayable quota error."""
+    transient = {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow down"}
+    if dialect == "classic":
+        payload: object = {"result": {"result": [], "result_error": {f"c{index:012d}": transient for index in (0, 1)}}}
+    else:
+        payload = {"result": [{"error": {"code": "QUERY_LIMIT_EXCEEDED", "message": "slow down"}}] * 2}
+    return WireResponse(200, _JSON, json.dumps(payload).encode())
+
+
+def _lost() -> TransportError:
+    return TransportError("reset", phase=FailurePhase.DISPATCH_STARTED)
+
+
+# A v3 abort no envelope retry repeats: its SAFE commands are isolated, each sent alone.
+_V3_ABORT = WireResponse(
+    400, _JSON, json.dumps({"error": {"code": "SYNTHETIC_NOT_FOUND", "message": "not found"}}).encode()
+)
+# A v3 envelope of two commands answered with one element: it attributes nothing, the envelope may have run, and
+# its commands are isolated, as no retry of the whole envelope can make it attribute them.
+_SHORT_ARRAY = WireResponse(200, _JSON, json.dumps({"result": [{"item": {"id": 0}}]}).encode())
+# The portal too busy to take the request, which proves a lone request or a classic envelope not run.
+_BUSY = WireResponse(
+    503, _JSON, json.dumps({"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow down"}).encode()
+)
+
+
+def _stopped_replies(dialect: str, first: str) -> tuple[WireResponse | TransportError, ...]:
+    """The answers to the sends before the stopped one."""
+    if first == "refused":
+        return (WireResponse(429, (), b""),)
+    if first == "busy":
+        return (_BUSY,)
+    if first == "answered":
+        return (_answered_by_each_command(dialect),)
+    if first == "aborted":
+        return (_V3_ABORT,)
+    if first == "short":
+        return (_SHORT_ARRAY,)
+    # Lost twice: the second loss, of the one envelope retry, isolates the commands.
+    return (_lost(), _lost()) if dialect == "v3-isolation" else (_lost(),)
+
+
+async def _stopped_errors(
+    dialect: str, transport: _ClosingTransport, policy: ExecutionPolicy = _NO_DELAY
+) -> tuple[list[B24ApiError], ExecutionSnapshot]:
+    """Run two SAFE commands, or one lone request, and return the error each ended with and the budget."""
+    time = _Time()
+    executor = _executor(transport, time)
+    transport.executor, transport.time = executor, time
+    context = executor.context(policy)
+    if dialect == "lone":
+        with pytest.raises(B24ApiError) as raised:
+            await executor.execute(_request(ReplaySafety.SAFE, "crm.item.get"), context=context)
+        return [raised.value], await context.snapshot()
+    route = RouteKind.BARE if dialect == "classic" else RouteKind.API_V3
+    error_spec = ResultErrorSpec(ResultSelector(("error",)), ("code",), ("message",))
+    requests = tuple(
+        Request(
+            method,
+            {"id": index},
+            ReplaySafety.SAFE,
+            route=route,
+            result_error=None if route is RouteKind.BARE else error_spec,
+        )
+        for index, method in enumerate(("crm.item.get", "crm.item.list"))
+    )
+    outcomes = await BatchExecutor(executor).execute_requests(requests, context=context)
+    errors: list[B24ApiError] = []
+    for outcome in outcomes:
+        assert isinstance(outcome, BatchFailure)
+        assert isinstance(outcome.error, B24ApiError)
+        errors.append(outcome.error)
+    return errors, await context.snapshot()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closing", ["coordinator", "transport"])
+@pytest.mark.parametrize(
+    ("dialect", "first"),
+    [
+        *((dialect, first) for dialect in ("classic", "v3") for first in ("refused", "busy", "lost", "answered")),
+        ("v3", "short"),
+        ("v3-isolation", "aborted"),
+        ("v3-isolation", "lost"),
+        *(("lone", first) for first in ("refused", "busy", "lost")),
+    ],
+)
+async def test_a_replay_stopped_before_its_send_by_a_closed_client_ends_with_the_stop_caused_by_what_it_followed(
+    dialect: str, first: str, closing: str
+) -> None:
+    # The last send before the stop is refused as a whole (proven not run), its answer is lost or it is aborted
+    # (it may have run), or each command's own entry or element answers it with a transient error; the client is
+    # closed meanwhile, so the SAFE replay (a batch round, a v3 envelope retry or isolated send, or a lone
+    # request's retry) is stopped before it leaves, not by a budget: at its permit by the closed coordinator, or
+    # by the closed transport it was handed to. What followed a failure ends with that stop, which is what ended
+    # it, caused by the failure it followed; a command its own answer replayed keeps it. A send the transport
+    # refused never left: it is no physical request, nor an isolated send.
+    replies = _stopped_replies(dialect, first)
+    transport = _ClosingTransport(replies, closing=closing)
+
+    errors, budget = await _stopped_errors(dialect, transport)
+
+    assert transport.sends == len(replies)
+    # The commands an unresolved envelope leaves are sent alone after it, never in it again, when nothing retries
+    # it whole: after its one retry was lost too, or after an answer that attributes nothing (a short array).
+    isolated = dialect == "v3-isolation" or first == "short"
+    assert transport.refused == (0 if closing == "coordinator" else 2 if isolated else 1)
+    assert budget.counters.physical_requests == len(replies)
+    assert budget.batch_isolation_requests == 0
+    for error in errors:
+        if first == "answered":
+            # Its own answer is what the portal said about it: the stop of its replay does not replace it.
+            assert type(error) is BatchCommandError
+            assert error.normalized_code == "query_limit_exceeded"
+            assert execution(error) is Execution.ANSWERED
+            continue
+        # A batch command whose send may have run is unknown, named after it, with the stop as its cause; a lone
+        # request raises the stop itself.
+        stop = error.__cause__ if type(error) is AmbiguousExecutionError else error
+        assert type(stop) is ClientClosedError
+        _assert_raised_where_refused(stop, closing)
+        followed = stop.__cause__
+        if first == "refused" or (first == "busy" and dialect != "v3"):
+            # Proven not run by the refusal: the stop is the outcome, recorded as answered.
+            assert stop is error
+            if first == "busy":
+                assert isinstance(followed, ApiResponseError)
+                assert followed.normalized_code == "query_limit_exceeded"
+            else:
+                assert isinstance(followed, HTTPGatewayError)
+                assert followed.http_status == 429  # noqa: PLR2004
+            assert execution(error) is Execution.ANSWERED
+            continue
+        assert type(error) is (ClientClosedError if dialect == "lone" else AmbiguousExecutionError)
+        if first in {"aborted", "busy"}:
+            # A v3 envelope's own error does not prove its commands not run.
+            assert isinstance(followed, ApiResponseError)
+            assert followed.original_code == ("SYNTHETIC_NOT_FOUND" if first == "aborted" else "QUERY_LIMIT_EXCEEDED")
+        elif first == "short":
+            # An answer that attributes nothing: the envelope may have run.
+            assert isinstance(followed, ProtocolError)
+            assert followed.http_status == 200  # noqa: PLR2004
+        else:
+            assert followed is replies[-1]
+        assert execution(error) is Execution.POSSIBLY_RUN
+
+
+# Longer than the retry window of a ``window`` stop, within the operation's.
+_SPENT_WINDOW = 11.0
+
+
+def _timed_out() -> TransportError:
+    """A send cut by its timeout after it left: it may have run."""
+    error = TransportError("attempt timed out", phase=FailurePhase.DISPATCH_STARTED)
+    error.__cause__ = TimeoutError()
+    return error
+
+
+def _may_have_run(failure: str) -> WireResponse | TransportError:
+    """A send that may have run and was not lost: answered by an ambiguous status, or cut by its timeout."""
+    return WireResponse(502, (), b"bad gateway") if failure == "502" else _timed_out()
+
+
+async def _fan_out_errors(transport: _ClosingTransport, policy: ExecutionPolicy) -> tuple[list[B24ApiError], int]:
+    """Run one SAFE command through the public direct fan-out; return its error and the physical requests."""
+    command = Command(Request("crm.item.get", {"id": 0}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
+    errors: list[B24ApiError] = []
+    async with client_for(transport, policy=policy) as client:
+        stream = client.fan_out_outcomes([command], dispatch=DirectDispatch(concurrency=1))
+        with contextlib.suppress(BudgetExceededError):
+            async with stream:
+                async for outcome in stream:
+                    assert isinstance(outcome, CommandOutcomeUnknown)
+                    errors.append(outcome.error)
+    assert stream.report is not None
+    return errors, stream.report.physical_requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["502", "timeout"])
+@pytest.mark.parametrize(
+    ("dialect", "closing"),
+    [
+        *(
+            (dialect, closing)
+            for dialect in ("lone", "classic", "v3", "v3-isolation")
+            for closing in ("budget", "window", "coordinator", "transport")
+        ),
+        # The public client closes its coordinator only with its streams.
+        ("fan-out", "budget"),
+        ("fan-out", "transport"),
+    ],
+)
+async def test_a_stopped_retry_is_explained_by_the_send_it_followed_whatever_stopped_it(
+    dialect: str, failure: str, closing: str
+) -> None:
+    # The send before the stop may have run and was not lost: its answer had an ambiguous status (502) or its
+    # timeout cut it. Its retry (a lone or fanned-out request's, a batch round, a v3 envelope retry or the first
+    # isolated send of each command) is stopped before it leaves: by the request budget, the retry window that
+    # send spent, the closed coordinator or the closed transport. Each command is unknown for that send, which
+    # names the reason and the evidence, never for the stop, which ran nothing.
+    replies = (_may_have_run(failure),) * (2 if dialect == "v3-isolation" else 1)
+    transport = _ClosingTransport(replies, closing=closing)
+    policy = {
+        "budget": dataclasses.replace(_NO_DELAY, max_requests=len(replies)),
+        "window": dataclasses.replace(_NO_DELAY, max_retry_elapsed_per_request=_SPENT_WINDOW - 1),
+    }.get(closing, _NO_DELAY)
+    if dialect == "fan-out":
+        errors, physical = await _fan_out_errors(transport, policy)
+    else:
+        errors, budget = await _stopped_errors(dialect, transport, policy)
+        physical = budget.counters.physical_requests
+
+    assert transport.sends == len(replies)
+    assert physical == len(replies)
+    assert errors
+    for error in errors:
+        stop = error.__cause__ if type(error) is AmbiguousExecutionError else error
+        assert type(stop) is (BudgetExceededError if closing in {"budget", "window"} else ClientClosedError)
+        followed = stop.__cause__
+        ambiguity = (
+            error
+            if type(error) is AmbiguousExecutionError
+            else ambiguity_of(error, request_summary=None, declared_unsafe=False)
+        )
+        assert isinstance(ambiguity, AmbiguousExecutionError)
+        if failure == "502":
+            assert isinstance(followed, HTTPGatewayError)
+            assert followed.http_status == 502  # noqa: PLR2004
+            assert ambiguity.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+            assert ambiguity.evidence is not None
+            assert ambiguity.evidence.http_status == 502  # noqa: PLR2004
+        else:
+            assert followed is replies[-1]
+            assert ambiguity.reason is AmbiguityReason.DEADLINE_AFTER_DISPATCH
+        assert ambiguity.evidence == followed.evidence
+
+
+_BAD_GATEWAY = 502
+# A host hint far longer than the operation's time: the retry it asks for cannot fit.
+_OUTLASTING_HINT = (("retry-after", "60"),)
+_PLAN_REFUSALS = {
+    # No attempt is left for the retry.
+    "attempts": (ExecutionPolicy(retry=RetryPolicy(initial_delay=0, jitter=0), max_attempts_per_request=1), ()),
+    # The host hint outlasts what is left of the operation.
+    "hint": (ExecutionPolicy(retry=RetryPolicy(initial_delay=0, jitter=0), max_elapsed=5.0), _OUTLASTING_HINT),
+}
+
+
+def _assert_explained_by_the_502(error: B24ApiError) -> None:
+    """The retry plan refused the retry of a send answered 502: unknown for that send, never for the refusal."""
+    stop = error.__cause__ if type(error) is AmbiguousExecutionError else error
+    assert type(stop) is BudgetExceededError
+    assert isinstance(stop.__cause__, HTTPGatewayError)
+    assert stop.__cause__.http_status == _BAD_GATEWAY
+    assert execution(error) is Execution.POSSIBLY_RUN
+    ambiguity = (
+        error
+        if type(error) is AmbiguousExecutionError
+        else ambiguity_of(error, request_summary=None, declared_unsafe=False)
+    )
+    assert isinstance(ambiguity, AmbiguousExecutionError)
+    assert ambiguity.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
+    assert ambiguity.evidence is not None
+    assert ambiguity.evidence.http_status == _BAD_GATEWAY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", sorted(_PLAN_REFUSALS))
+async def test_a_fanned_out_retry_the_plan_refuses_is_unknown_for_the_send_it_followed(refusal: str) -> None:
+    # A SAFE command answered 502 may have run; its retry plan refuses the retry while time is left (no attempt
+    # left, or a host hint that outlasts the operation). The command is unknown for that send.
+    policy, hint = _PLAN_REFUSALS[refusal]
+    transport = ResponderTransport(always(WireResponse(_BAD_GATEWAY, hint, b"bad gateway")))
+    command = Command(Request("crm.item.get", {"id": 0}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
+    async with (
+        client_for(transport, policy=policy) as client,
+        client.fan_out_outcomes([command], dispatch=DirectDispatch(concurrency=1)) as stream,
+    ):
+        outcomes = [outcome async for outcome in stream]
+
+    assert len(transport.requests) == 1
+    (outcome,) = outcomes
+    assert isinstance(outcome, CommandOutcomeUnknown)
+    _assert_explained_by_the_502(outcome.error)
+    assert stream.report is not None
+    assert stream.report.physical_requests == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", sorted(_PLAN_REFUSALS))
+async def test_a_bytes_retry_the_plan_refuses_raises_the_refusal_explained_by_its_send(
+    refusal: str,
+) -> None:
+    # The same for a lone request read as bytes: it raises the refusal, whose facts name the send answered 502.
+    policy, hint = _PLAN_REFUSALS[refusal]
+    transport = ResponderTransport(always(WireResponse(_BAD_GATEWAY, hint, b"bad gateway")))
+    async with client_for(transport, policy=policy) as client:
+        with pytest.raises(BudgetExceededError) as raised:
+            await client.call_bytes(Request("crm.item.get", {"id": 0}, ReplaySafety.SAFE, route=RouteKind.BARE))
+
+    assert len(transport.requests) == 1
+    _assert_explained_by_the_502(raised.value)

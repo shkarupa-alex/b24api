@@ -130,7 +130,7 @@ class HttpxTransport:
         self._shield_finalizer = shield_finalizer
         # Keyed by the client, not this transport: an injected client's connections outlive the transport.
         # A client that cannot be weakly registered gets its HTTP/2 sends refused by ``admit_send``.
-        HTTPX_LOG_SHIELD.bind_client(self._client, credentials=(webhook.token,))
+        HTTPX_LOG_SHIELD.bind_client(self._client, webhook=webhook)
 
     @property
     def host(self) -> str:
@@ -226,7 +226,7 @@ class HttpxTransport:
         tracker = _PhaseTracker()
         http_request: httpx.Request | None = None
         outcome: WireResponse | BaseException
-        with HTTPX_LOG_SHIELD.request(credentials=(webhook.token,)) as ownership:
+        with HTTPX_LOG_SHIELD.request(webhook=webhook) as ownership:
             try:
                 # HTTPX refuses some values only while building, a header it cannot encode for example. The
                 # method URL carries the token, so no local of this frame holds it.
