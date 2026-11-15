@@ -408,6 +408,57 @@ async def test_an_ordered_pool_page_that_stops_waiting_once_woken_hands_its_rows
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ordered", [False, True], ids=["ready", "input"])
+async def test_a_release_wakes_only_the_waiting_pages_its_rows_serve(ordered: bool) -> None:  # noqa: FBT001
+    """Rows coming back wake the waiting pages they serve and no others, so the wake-ups stay linear.
+
+    Every page woken takes its rows once its task resumes; until then they are promised to it, and a page
+    woken for the same rows would only queue again.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    pages, page = 5, 2
+    buffer = _RowBuffer(pages * page, context, producer_state=_producers(0, 1) if ordered else None, ordered=ordered)
+    held = await buffer.reserve(0, pages * page)
+    await buffer.accept(held, pages * page)
+    tasks = [asyncio.create_task(buffer.reserve(1, page)) for _page in range(pages)]
+    await asyncio.sleep(0)
+    waiters = list(buffer._waiters)  # noqa: SLF001
+    assert len(waiters) == pages
+
+    for served in range(1, pages + 1):
+        await buffer.release(held, page)
+        assert sum(waiter.woken.done() for waiter in waiters) == served
+        async with asyncio.timeout(HANG_BOUND):
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        tasks = [task for task in tasks if not task.done()]
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_page_given_back_leaves_the_pool_and_no_other() -> None:
+    """The pool lists each reservation as its own: giving one back removes that one, not an equal one.
+
+    A page charged to a lease holds no pool rows; once an aborted page's rows were zeroed, the pool removed
+    that lease page in its place and kept the aborted page as one that may still return rows.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    buffer = _RowBuffer(10, context)
+    lease_page = await buffer.reserve(0, 0)
+    page = await buffer.reserve(0, 7)
+
+    await buffer.abort(page)
+
+    assert not buffer.releasable_elsewhere(1)
+    await buffer.accept(lease_page, 0)
+    assert buffer._reservations == []  # noqa: SLF001
+    await buffer.close()
+
+
+@pytest.mark.asyncio
 async def test_an_input_tail_keeps_room_for_the_pages_it_puts_in_flight_at_once() -> None:
     """A counted tail sends up to its window of pages at once: the pages behind it leave room for all of them."""
     executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))

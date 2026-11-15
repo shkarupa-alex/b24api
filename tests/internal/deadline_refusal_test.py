@@ -125,7 +125,7 @@ CONSTRUCTIONS = Counter(
         (
             "execution/facts.py",
             "dropped_result",
-            "ResultTooLargeError(rows=rows, limit=limit, request_summary=request_summary)",
+            "ResultTooLargeError(rows=rows, limit=limit, request_summary=request_summary, evidence=evidence)",
         ): 1,
         (
             "references/budget_view.py",

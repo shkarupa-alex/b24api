@@ -76,8 +76,10 @@ class _Hold(Enum):
     SETTLED_LEASE = "settled_lease"
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class _Reservation:
+    """Rows one binding holds in the pool; each is its own: the pool lists and removes it by identity."""
+
     index: int
     amount: int
     hold: _Hold = _Hold.IN_FLIGHT
@@ -501,8 +503,8 @@ class _RowBuffer:
 
     The rows each binding holds are counted per binding, and so are the rows of its accepted pages that
     wait for the consumer, so no check scans the reservations. A page that cannot reserve waits until a
-    change of the pool wakes it; an ordered pool wakes only the waiting pages that fit, nearest the
-    frontier first (``_serve``).
+    change of the pool wakes it; the pool wakes only the waiting pages that fit, an ordered pool nearest
+    the frontier first (``_serve``).
     """
 
     def __init__(
@@ -589,7 +591,9 @@ class _RowBuffer:
         self._available -= amount
         self._held[index] += amount
         reservation = _Reservation(index, amount, hold)
-        self._reservations.append(reservation)
+        if amount:
+            # Only a reservation holding rows is listed: a page charged to a lease holds none to give back.
+            self._reservations.append(reservation)
         return reservation
 
     def _give_back(self, reservation: _Reservation) -> int:
@@ -606,22 +610,21 @@ class _RowBuffer:
     def _serve(self) -> None:
         """Wake the waiting pages that may take their rows now; each checks again once its task resumes.
 
-        An unordered pool wakes every page, in the order they came: each check is a count, and the pages
-        a READY consumer receives depend on which of them takes the rows first. An ordered pool keeps
-        free the room of the producers nearer the frontier, which costs more to check, so it wakes only
-        the pages whose rows are free beyond those the pages already woken will take, in binding order. A
-        page behind the frontier that does not fit ends the pass: a later page keeps free the room of
-        every producer between the frontier and it, that page's room included, which covers that page's
-        rows, so it does not fit either.
+        A page is woken only for rows free beyond those the pages already woken will take, so a release
+        wakes no page that would find its rows gone. An unordered pool wakes the pages that fit in the
+        order they came. An ordered pool keeps free the room of the producers nearer the frontier, in
+        binding order: a page behind the frontier that does not fit ends the pass, as a later page keeps
+        free the room of every producer between the frontier and it, that page's room included, which
+        covers that page's rows, so it does not fit either.
         """
         position, stop_after = 0, None
-        while position < len(self._waiters):
+        while position < len(self._waiters) and self._available > self._promised:
             waiter = self._waiters[position]
             if stop_after is not None and waiter.index > stop_after:
                 return
             if waiter.woken.done():
                 del self._waiters[position]
-            elif not self._ordered or self._can_reserve(waiter.index, waiter.amount, -self._promised):
+            elif self._can_reserve(waiter.index, waiter.amount, -self._promised):
                 del self._waiters[position]
                 self._promised += waiter.amount
                 waiter.woken.set_result(None)
@@ -730,7 +733,7 @@ class _RowBuffer:
         _reduce(self._held, reservation.index, unused)
         if actual:
             self._queued[reservation.index] += actual
-        else:
+        elif unused:
             self._reservations.remove(reservation)
         self._changed()
         self._touch()
