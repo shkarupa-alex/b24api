@@ -40,7 +40,7 @@ from b24api.errors import BatchFailed, BudgetExceededError, CleanupOverrunError,
 from tests.scripting import DEADLINE_BUDGET, HANG_BOUND, ResponderTransport, client_for, reached
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
     from b24api import Bitrix24
     from b24api.contracts.report import OperationReport
@@ -332,15 +332,27 @@ async def test_a_close_while_a_read_is_in_flight_is_an_early_close_like_any_othe
     assert _violations(report) == [("cleanup_failure", f"stream cleanup failed ({CLOSE_FAILURES[close]})")]
 
 
-def _commands(source_closed: asyncio.Event) -> AsyncIterator[Command[int]]:
-    async def commands() -> AsyncIterator[Command[int]]:
-        try:
-            for item in _items("fan_out"):
-                yield item
-        finally:
-            source_closed.set()
+class _Commands:
+    """Two commands, then the end: a source the stream reads out while the work it fed still runs.
 
-    return commands()
+    Its end runs no cleanup, as a generator's would: ``closed`` records that its ``aclose()`` ran, which only the
+    stream's cleanup calls, once no pull is left to close it after.
+    """
+
+    def __init__(self) -> None:
+        self._items: Iterator[Command[int]] = iter(_items("fan_out"))
+        self.closed = False
+
+    def __aiter__(self) -> _Commands:
+        return self
+
+    async def __anext__(self) -> Command[int]:
+        for item in self._items:
+            return item
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 @pytest.mark.asyncio
@@ -361,9 +373,9 @@ async def test_reference_work_that_outlasts_the_cleanup_window_fails_the_close_a
     # fan-out sends only while it is read, so its first command is in flight when another task closes the stream.
     direct = isinstance(dispatch, DirectDispatch)
     transport = _Blocks(answered=1 if direct else 0, resists=True)
-    source_closed = asyncio.Event()
+    source = _Commands()
     async with client_for(ResponderTransport(transport), policy=POLICIES["overruns"]) as client:
-        stream = client.fan_out_outcomes(_commands(source_closed), dispatch=dispatch)
+        stream = client.fan_out_outcomes(source, dispatch=dispatch)
         read = None
         try:
             if direct:
@@ -381,7 +393,7 @@ async def test_reference_work_that_outlasts_the_cleanup_window_fails_the_close_a
     assert type(closed) is CleanupOverrunError
     assert str(closed) == overrun
     # The source is closed although the work it fed was still running when the window ended.
-    assert source_closed.is_set()
+    assert source.closed
     report = stream.report
     assert report is not None
     assert report.state is TerminalState.EARLY_CLOSED
@@ -397,9 +409,9 @@ async def test_a_cancellation_outranks_reference_work_that_outlasts_the_cleanup_
     dispatch: DirectDispatch | BatchDispatch,
 ) -> None:
     transport = _Blocks(resists=True)
-    source_closed = asyncio.Event()
+    source = _Commands()
     async with client_for(ResponderTransport(transport), policy=POLICIES["overruns"]) as client:
-        stream = client.fan_out_outcomes(_commands(source_closed), dispatch=dispatch)
+        stream = client.fan_out_outcomes(source, dispatch=dispatch)
         read = asyncio.create_task(anext(stream))
         try:
             await reached(transport.started)
@@ -409,7 +421,7 @@ async def test_a_cancellation_outranks_reference_work_that_outlasts_the_cleanup_
             transport.release.set()
 
     assert isinstance(read_end, asyncio.CancelledError)
-    assert source_closed.is_set()
+    assert source.closed
     report = stream.report
     assert report is not None
     assert report.state is TerminalState.CANCELLED
