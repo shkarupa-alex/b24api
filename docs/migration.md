@@ -194,7 +194,11 @@
   cleanup, the client's close) now returns how it ended to its owner, which raises
   the failure; only your own task receives it. That includes a `KeyboardInterrupt` or `SystemExit` your
   transport raises under a reference family, which stopped the event loop from inside a library task:
-  it now reaches the task that reads the stream.
+  it now reaches the read in flight, which raises it with the report. Raised between your reads, it
+  leaves the event loop at once, as before, and the stream's end follows: a later read raises
+  `StopAsyncIteration` and a close returns, the report attached to the interrupt as `.report`. A loop
+  shutting down meanwhile may cancel that end ("stream cleanup also failed (CancelledError)") or stop
+  before it began, leaving no report.
 - **A cancelled stream gives the cancellation's reason.** A stream read to its end and cancelled
   while its source closed reported `cancelled` with the terminal reason "input exhausted" (or
   "reference input exhausted"). Every family now gives "iteration cancelled" whenever the reader's

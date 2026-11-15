@@ -309,23 +309,31 @@ outcome.
   failure (a scheduler's close, say) may drop it freely. The latch's state is explicit
   (`LatchState`): `ARMED` while the operation runs, when the first interrupt wakes the owner; `ENDING`
   once cleanup starts, when an interrupt is latched for the end and wakes nothing (an inline kernel's
-  cleanup runs in the very read a wake would cancel); `CLOSED` once the end took it. The wake ends the
-  operation at once: a read in flight is cancelled and raises the interrupt (a read whose own task
-  latched it and still returned an item raises it instead of the item); with no read in flight,
-  between reads, the operation ends in a task of its own (`OperationRunner._end_between_reads`), which
-  cleans up and publishes, since no reader is there to end it and the reader may never read again. The
-  end is one transition for every caller: the operation runs (`NEW`, `PULLING`), ends (`CLOSING`,
-  whoever began the end) and has ended (`CLOSED`, the report published). A read or close that finds it
-  ending waits for that transition (`OperationRunner._await_end`), so no reader finds the stream ended
-  before its report exists, and then raises the end's interrupt. An end between reads delivers the
-  interrupt once: to the reads and closes that waited for it, or, with none waiting, to the event loop.
-  A waiter cancelled before the end is over stops waiting; one cancelled after still raises it. Once
-  ended, a later read raises `StopAsyncIteration` and a close returns, neither raising the interrupt
-  again. `OperationRunner._raise_latched` is the one raise point: after the report is published it
-  closes the latch and raises its interrupt, with the report attached (`.report`), whatever ended the
-  stream, from every caller that sees the end (the read or close that ended it, a read a concurrent
-  close ended, a read or close that waited for it), or hands it on when nobody sees an end that began
-  between reads. The reader's own cancellation that its read absorbed before cleanup began (handed to
+  cleanup runs in the very read a wake would cancel); `CLOSED` once the interrupt is out. The wake
+  (`OperationRunner._interrupted`) decides delivery at once. A read in flight is cancelled and raises
+  the interrupt (a read whose own task latched it and still returned an item raises it instead of the
+  item). With no read in flight, between reads, the wake closes the latch and hands the interrupt to
+  the event loop then and there (`InterruptLatch.hand_on`, the path of a late interrupt): nothing
+  later has to run for it to leave, and the loop raises it before any reader resumes. The operation's
+  end (cleanup and publication) is decoupled from that delivery: the phase turns `INTERRUPTED` (ended,
+  its end not begun) and whoever comes first runs the end (`OperationRunner._end_between_reads`): the
+  task the wake starts, spawned before the interrupt is handed on so its first step comes first, or a
+  read or close, which never waits for a task that might never run (a loop's shutdown may cancel it
+  before its first step). The end raises no interrupt, whoever runs it; it attaches the report to the
+  interrupt (`.report`). A read or close that finds an end some other caller runs (`CLOSING`) waits for
+  the phase to turn `CLOSED` (`_published`): such an end has begun in a caller that runs it to its
+  publication, and a read in flight that a concurrent close ended waits the same way. The operation's
+  own work cannot close it from the wake on (`inside_own_work`): that close would run or wait for an
+  end that waits for the work. Once ended, a read raises `StopAsyncIteration` and a close returns. If
+  the loop's shutdown cancels that end's cleanup, the report is what that cleanup produced ("stream
+  cleanup also failed (CancelledError)" when it was cancelled before it closed anything); if the loop
+  stops before the end begins, there is no report. The interrupt leaves `asyncio.run` either way.
+  `OperationRunner._raise_latched` is the one raise point of an interrupt a read or close sees: after
+  the report is published it closes the latch and raises its interrupt, with the report attached,
+  whatever ended the stream, from every caller that sees the end (the read or close that ended it, a
+  read a concurrent close ended); an interrupt handed to the event loop between reads is not raised
+  again, since no read or close ends that operation.
+  The reader's own cancellation that its read absorbed before cleanup began (handed to
   the read, which ended in its own failure, an interrupt say) is raised as the end, but never recorded
   as a failed close: only a cancellation that arrived while cleanup ran is. The report has one shape for it, applied by
   the runner to whichever report it publishes, the family's or the fallback after a failed finalization

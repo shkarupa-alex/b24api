@@ -969,12 +969,14 @@ failure's first), and one `interrupted` violation last, "operation interrupted (
 `KeyboardInterrupt` or `SystemExit`. The raised interrupt carries that report as `.report`, as the
 `CancelledError` does. A close that fails after an interrupt ended the stream is "stream cleanup also
 failed (X)", as behind any other end that came first. An interrupt raised while no read is waiting (by a
-send the stream runs between your reads, while you work on an item) does not wait for your next read: the
-operation ends at once, its work cancelled, its source closed and its report published, and the interrupt
-leaves the event loop out of `asyncio.run`, as asyncio raises any task's. A read or close you start while
-that end still runs waits for it and raises the interrupt itself, with the report, instead of the event
-loop; it never finds the stream ended before the report exists. The stream is then ended: a later read
-raises `StopAsyncIteration` and a close returns, neither raising the interrupt again. An
+send the stream runs between your reads, while you work on an item) does not wait for your next read: it
+leaves the event loop at once, out of `asyncio.run`, as asyncio raises any task's, and the operation's end
+follows: its work cancelled, its source closed and its report published, attached to the interrupt as
+`.report`. A read or close you start before that end is over runs it or waits for it, then finds the stream
+ended (a read raises `StopAsyncIteration`, a close returns); neither raises the interrupt, which the loop
+has. If `asyncio.run` shuts down meanwhile, the report is what the end got to: its shutdown cancels the
+end's cleanup ("stream cleanup also failed (CancelledError)"), or stops the loop before the end began,
+leaving no report; the interrupt still leaves `asyncio.run`. An
 interrupt raised after the operation ended (by a close or a send still running past the cleanup window) is
 never dropped either: it leaves the event loop the same way. A library
 error carries this in its report (`error.report`), not as a note; your own exception raised inside
