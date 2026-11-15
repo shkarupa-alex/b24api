@@ -79,6 +79,7 @@ from tests.scripting import HANG_BOUND, ResponderTransport, client_for, json_res
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from typing import Any
 
     from b24api.contracts import JsonValue
     from b24api.contracts.completion import CompletionEvidence
@@ -2897,7 +2898,7 @@ def _fail_runtime_cleanup(monkeypatch: pytest.MonkeyPatch, stream: object) -> No
     def fail() -> None:
         raise RuntimeError("runtime cleanup failed")
 
-    monkeypatch.setattr(stream._source._runtime.admission, "discard_unadmitted_raw", fail)
+    monkeypatch.setattr(cast("Any", stream)._source._runtime.admission, "discard_unadmitted_raw", fail)
 
 
 @pytest.mark.asyncio
@@ -2917,7 +2918,7 @@ async def test_fast_early_close_whose_cleanup_fails_reports_that_failure_only(mo
     assert [(item.code, item.message) for item in report.violations] == [
         ("cleanup_failure", "stream cleanup failed (RuntimeError)")
     ]
-    assert raised.value.report is report
+    assert getattr(raised.value, "report", None) is report
     assert not hasattr(raised.value, "__notes__")
 
 
@@ -2935,11 +2936,11 @@ async def test_fast_failure_keeps_a_failed_cleanup_in_its_report_not_in_a_note(m
 
     report = stream.report
     assert report is not None
-    assert raised.value.report is report
     assert report.state is TerminalState.INCOMPLETE
     # The failure is primary: its violation comes first, the failed cleanup behind it last.
     assert [(item.code, item.message) for item in report.violations[-2:]] == [
         ("budget_exhausted", "IncompleteTraversalError (BudgetExceededError)"),
         ("cleanup_failure", "stream cleanup also failed (RuntimeError)"),
     ]
+    assert raised.value.report is report
     assert not hasattr(raised.value, "__notes__")
