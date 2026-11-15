@@ -16,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import gc
 import threading
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -606,6 +608,19 @@ async def test_an_item_counts_as_emitted_only_once_its_reader_has_it(family: str
     for turns in range(HANDOVER_TURNS):
         emitted, received = await _cancelled_turns_after_an_answer(family, turns)
         assert emitted == received, f"cancelled {turns} turns after an answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", FAMILIES)
+async def test_a_pull_cancelled_before_it_starts_leaves_no_coroutine_unawaited(family: str) -> None:
+    # Some of these cancellations land before a pull's task has started: its never-run coroutine is closed, not
+    # left for the collector to report as never awaited.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for turns in range(HANDOVER_TURNS):
+            await _cancelled_turns_after_an_answer(family, turns)
+        gc.collect()
+    assert [str(warning.message) for warning in caught if "never awaited" in str(warning.message)] == []
 
 
 _TENANT: contextvars.ContextVar[str] = contextvars.ContextVar("tenant", default="caller")
