@@ -745,7 +745,7 @@ async def test_only_the_operation_s_own_refusal_ends_it() -> None:
     with pytest.raises(BudgetExceededError) as foreign:
         other.time_left("the send")
     assert not context.ended_by(BudgetExceededError("the send"))
-    assert not context.ended_by(stopped_by("per-request attempt budget exhausted"))
+    assert not context.ended_by(stopped_by(BudgetExceededError("per-request attempt budget exhausted")))
     assert not context.ended_by(dropped_result(rows=2, limit=1, request_summary=None, evidence=None))
     assert not context.ended_by(foreign.value)
     assert not context.ended_by(None)

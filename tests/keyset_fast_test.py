@@ -55,7 +55,7 @@ from b24api.contracts import (
     TraceClass,
 )
 from b24api.contracts.page import AdaptedPage, PageView
-from b24api.contracts.policy import IdentityRequirement, OrderSemantics, TotalSemantics
+from b24api.contracts.policy import IdentityRequirement, OrderSemantics, RetryPolicy, TotalSemantics
 from b24api.contracts.report import OperationReport, PageDispatch
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
@@ -69,7 +69,7 @@ from b24api.errors import (
     ProtocolError,
     ResultShapeError,
 )
-from b24api.execution import ExecutionContext, Executor, WireResponse
+from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse
 from b24api.traversal import keyset_page_validation, keyset_plan
 from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected, SelectorInputs, finalize, preselect
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
@@ -2605,13 +2605,16 @@ def _fast_execution(kind: str) -> RangeKeysetExecution | PartitionedKeysetExecut
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["range", "partitioned", "auto"])
 @pytest.mark.parametrize("refused_at", [2, 3, 4])
+@pytest.mark.parametrize("refused", ["at_its_plan", "at_its_send"])
 async def test_a_wave_retry_the_deadline_refuses_ends_the_traversal_with_the_budget(
-    monkeypatch: pytest.MonkeyPatch, kind: str, refused_at: int
+    monkeypatch: pytest.MonkeyPatch, kind: str, refused_at: int, refused: str
 ) -> None:
-    # A wave is answered 429 (proven not run, so replayed) and the deadline passes while it waits. The retry window
-    # is as long as the operation, so the deadline refuses the replay round: the stopped commands are the operation's
-    # end, as the refusal they restate is, not failed commands.
+    # A wave is answered 429 (proven not run, so replayed) and the deadline passes: while the replay round is
+    # planned, or once it is planned, as its send is granted its permit. The retry window is as long as the
+    # operation, so the operation's deadline refuses the round: the stopped commands are the operation's end, as
+    # the refusal they restate is, not failed commands.
     skew = [0.0]
+    armed = [False]
 
     def context(executor: Executor, policy: ExecutionPolicy | None = None) -> ExecutionContext:
         return ExecutionContext(
@@ -2619,25 +2622,40 @@ async def test_a_wave_retry_the_deadline_refuses_ends_the_traversal_with_the_bud
         )
 
     monkeypatch.setattr(Executor, "context", context)
+    acquire = RateCoordinator.acquire
+
+    async def late_grant(coordinator: RateCoordinator, *args: object, **kwargs: object) -> object:
+        permit = await acquire(coordinator, *args, **kwargs)  # type: ignore[arg-type]
+        if armed[0]:
+            skew[0] = 10_000.0
+        return permit
+
+    monkeypatch.setattr(RateCoordinator, "acquire", late_grant)
     keyset = KeysetTransport(tuple(range(1, 3001)))
 
     async def respond(request: Request) -> WireResponse:
         if request.method == "batch" and sum(sent.method == "batch" for sent in transport.requests) == refused_at:
-            skew[0] = 10_000.0
+            if refused == "at_its_plan":
+                skew[0] = 10_000.0
+            armed[0] = True
             return WireResponse(429, (("content-type", "text/plain"),), b"slow down")
         return await keyset.send(request, attempt_timeout=1.0, max_response_bytes=1 << 20)
 
     transport = ResponderTransport(respond, host=keyset.host)
-    execution = _fast_execution(kind)
-    stream = _stream(
-        transport, execution, policy=ExecutionPolicy(max_elapsed=600.0, max_retry_elapsed_per_request=600.0)
+    policy = ExecutionPolicy(
+        max_elapsed=600.0,
+        max_retry_elapsed_per_request=600.0,
+        retry=RetryPolicy(initial_delay=0.001, maximum_delay=0.001, jitter=0),
     )
+    stream = _stream(transport, _fast_execution(kind), policy=policy)
 
     with pytest.raises(IncompleteTraversalError) as raised:
         _ = [row async for row in stream]
 
     assert isinstance(raised.value.__cause__, BudgetExceededError)
-    assert str(raised.value.__cause__) == "execution time budget exhausted before the retry"
+    if refused == "at_its_plan":
+        assert str(raised.value.__cause__) == "execution time budget exhausted before the retry"
+    assert sum(sent.method == "batch" for sent in transport.requests) == refused_at
     assert stream.report is not None
     assert stream.report.terminal_reason == "BudgetExceededError"
     assert [item.code for item in stream.report.violations] == ["budget_exhausted"]

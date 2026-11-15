@@ -51,9 +51,10 @@ from b24api.contracts import (
     ReferenceSource,
 )
 from b24api.contracts.page_stop import ContinuePage
+from b24api.contracts.policy import RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError, CapabilityError, IdentityContractError
-from b24api.execution import ExecutionContext, Executor
+from b24api.execution import ExecutionContext, Executor, RateCoordinator
 from b24api.references import wave_engine
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _RowBuffer
@@ -825,6 +826,60 @@ async def test_keyset_bindings_the_deadline_ends_record_no_failed_command(
             _base(), [_parent(name) for name in data], traversal=_traversal(_range()), dispatch=BatchDispatch()
         )
         # Which work the deadline refuses first (an admission, a page's rows, a send) depends on the interleaving.
+        with pytest.raises(BudgetExceededError):
+            async with stream:
+                _ = [outcome async for outcome in stream]
+
+    report = stream.report
+    assert report is not None
+    assert (report.state, report.terminal_reason) == (TerminalState.INCOMPLETE, "BudgetExceededError")
+    assert {item.code for item in report.violations} == {"budget_exhausted", "reference_failure"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refused_at", [1, 2, 3])
+async def test_a_keyset_wave_replay_the_deadline_refuses_at_its_send_records_no_failed_command(
+    monkeypatch: pytest.MonkeyPatch, refused_at: int
+) -> None:
+    # A binding's wave is answered 429 as a whole and its replay is planned; the replay's send is granted its permit
+    # as the deadline passes, so the operation's refusal stops each command it held: the operation's end, not a
+    # failed command.
+    skew = [0.0]
+    armed = [False]
+
+    def context(executor: Executor, policy: ExecutionPolicy | None = None) -> ExecutionContext:
+        return ExecutionContext(
+            policy or ExecutionPolicy(), executor.coordinator, clock=lambda: time.monotonic() + skew[0]
+        )
+
+    monkeypatch.setattr(Executor, "context", context)
+    acquire = RateCoordinator.acquire
+
+    async def late_grant(coordinator: RateCoordinator, *args: object, **kwargs: object) -> object:
+        permit = await acquire(coordinator, *args, **kwargs)  # type: ignore[arg-type]
+        if armed[0]:
+            skew[0] = 10_000.0
+        return permit
+
+    monkeypatch.setattr(RateCoordinator, "acquire", late_grant)
+    portal = BatchPortal(_answer({"a": DISTRIBUTIONS["dense"]}))
+
+    async def respond(request: Request) -> WireResponse:
+        if request.method == "batch" and sum(sent.method == "batch" for sent in transport.requests) == refused_at:
+            armed[0] = True
+            return WireResponse(429, (("content-type", "text/plain"),), b"slow down")
+        return await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 20)
+
+    transport = ResponderTransport(respond)
+    policy = ExecutionPolicy(
+        max_elapsed=600.0,
+        max_retry_elapsed_per_request=600.0,
+        retry=RetryPolicy(initial_delay=0.001, maximum_delay=0.001, jitter=0),
+    )
+    async with client_for(transport, policy=policy) as client:
+        stream = client.iter_reference_outcomes(
+            _base(), [_parent("a")], traversal=_traversal(_range()), dispatch=BatchDispatch()
+        )
         with pytest.raises(BudgetExceededError):
             async with stream:
                 _ = [outcome async for outcome in stream]
