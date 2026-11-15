@@ -42,6 +42,7 @@ from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError
 from b24api.execution import Executor
 from b24api.execution.context import CleanupResult, ExecutionContext
+from b24api.execution.facts import Execution, execution
 from b24api.references.counted_io import ReferenceTailStream
 from b24api.references.dispatch import (
     _BatchPageDispatcher,
@@ -72,6 +73,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from b24api.contracts import TraversalSpec
+    from b24api.execution.executor import _Pause, _RequestAttempts
     from b24api.references.dispatch import _AdmissionState, _DispatchedPage, _Event, _Transit, _Work
     from b24api.references.program import FastKeysetProgram
     from b24api.references.run import _ReferenceRun
@@ -1364,3 +1366,56 @@ async def test_an_input_page_read_ahead_is_acknowledged_only_once_its_consumer_h
     assert decision.pages_scheduled > pages
     assert len(acknowledged) == decision.pages_acknowledged == 1
     assert set(acknowledged) <= delivered
+
+
+@pytest.mark.asyncio
+async def test_a_page_cancelled_while_its_wave_waits_for_a_replay_keeps_what_its_command_did(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page its wave answered keeps that answer; one the wave still sends again may run.
+
+    The wave answers one page and refuses the other (QUERY_LIMIT_EXCEEDED), then waits to send the refused one
+    again; both pages are cancelled meanwhile. The answered page was answered, not possibly run; the refused one
+    stays in the wave, which runs on, so it may still run.
+    """
+    waiting, release = asyncio.Event(), asyncio.Event()
+    replay_after = Executor.replay_after
+
+    async def held(self: Executor, context: ExecutionContext, *, attempts: _RequestAttempts, pause: _Pause) -> None:
+        waiting.set()
+        await release.wait()
+        await replay_after(self, context, attempts=attempts, pause=pause)
+
+    monkeypatch.setattr(Executor, "replay_after", held)
+    refused: list[str] = []
+
+    def answer(_method: str, query: Query) -> Envelope:
+        if query["id"] == "2" and not refused:
+            refused.append(query["id"])
+            return {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}
+        return {"result": [{"ID": int(query["id"])}]}
+
+    executor = Executor(BatchPortal(answer))
+    context = executor.context(ExecutionPolicy(max_pages=100, max_pages_per_reference=100))
+    await context.start()
+    dispatcher = _BatchPageDispatcher(
+        executor, context, KernelBatchDispatch(batch_size=2, concurrency=1, coalesce_wait=UNREACHABLE_COALESCE_WAIT)
+    )
+    cancellations: list[asyncio.CancelledError] = []
+
+    async def fetch(item: int) -> None:
+        try:
+            await dispatcher.fetch(Request("crm.item.get", parameters={"id": item}, route=RouteKind.BARE), f"r{item}")
+        except asyncio.CancelledError as error:
+            cancellations.append(error)
+            raise
+
+    pages = [asyncio.create_task(fetch(item)) for item in (1, 2)]
+    await asyncio.wait_for(waiting.wait(), timeout=HANG_BOUND)
+    for page in pages:
+        page.cancel()
+    await asyncio.gather(*pages, return_exceptions=True)
+    release.set()
+    await dispatcher.aclose()
+
+    assert [execution(error) for error in cancellations] == [Execution.ANSWERED, Execution.POSSIBLY_RUN]
