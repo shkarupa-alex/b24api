@@ -983,8 +983,10 @@ in another task raises `CancelledError`. One delivered to a read or a close neve
 exception handler and is never left in a task whose exception nobody retrieves; one the library could no
 longer deliver to a read or a close (raised by work that outlived the stream's cleanup window, or a second
 one behind what the close already raises) is reported to the loop's exception handler, once, with the
-stream's report as `report`. What the report says about it, and how it ranks behind other ends, is not
-promised.
+stream's report as `report`. So is one of a stream nothing ever ends (left open when `asyncio.run` shuts
+down, or dropped): as asyncio reports a task's exception nobody retrieved, it is reported once the
+stream's work is collected, on a closed loop too. What the report says about it, and how it ranks behind
+other ends, is not promised.
 
 An interrupt raised while no read is waiting (by a send the stream runs between your reads, while you work
 on an item) does not wait for your next read: it leaves the event loop at once, out of `asyncio.run`, as
