@@ -989,6 +989,36 @@ def test_a_read_from_the_operations_own_work_once_an_interrupt_ended_it_between_
     assert (operation.cleanups, operation.finalized) == (1, [TerminalCause.INTERRUPTED])
 
 
+def test_a_close_waiting_for_an_end_whose_fallback_report_fails_still_returns() -> None:
+    # The end of an operation an interrupt ended between reads fails to build any report: its finalizer and its
+    # fallback both fail. Publication still ends, so a close that waits for it while the cleanup runs returns.
+    operation = _BetweenReads()
+
+    def failing(*_args: object) -> NoReturn:
+        raise _FinalizeFailedError
+
+    operation.runner._hooks = dataclasses.replace(  # noqa: SLF001 - both report hooks fail
+        operation.runner._hooks,  # noqa: SLF001
+        finalize=failing,
+        failure_report=failing,
+    )
+    closed: list[object] = []
+
+    async def close_while_the_end_cleans_up() -> None:
+        await operation.cleaning.wait()
+        closing = asyncio.ensure_future(operation.runner.aclose())
+        await asyncio.sleep(0)
+        operation.release.set()
+        async with asyncio.timeout(HANG_BOUND):
+            closed.extend(await asyncio.gather(closing, return_exceptions=True))
+        await asyncio.gather(_ending(operation.runner), return_exceptions=True)
+
+    error = raised_driving_the_loop(operation.read_one, close_while_the_end_cleans_up)
+    assert error is operation.interrupt
+    assert closed == [None]
+    assert operation.cleanups == 1
+
+
 def test_a_close_runs_the_end_whose_own_task_was_cancelled_before_it_ran() -> None:
     # The task the interrupt started for the operation's end is cancelled before its first step, as a loop's shutdown
     # may cancel it: the end never began, so the close that comes next runs it, and the report is published all the
