@@ -54,6 +54,7 @@ from b24api.errors import (
     ReferenceFailed,
 )
 from b24api.execution.facts import ambiguity_of
+from b24api.execution.failure import outcome_error
 from b24api.references.binding import BindingSource, _BindingContext, _BindingSourceError, binding_source
 from b24api.references.compatibility import source_incompatibility
 from b24api.references.dispatch import (
@@ -294,7 +295,7 @@ class _ReferenceEventMapper:
         self._item_indexes.pop(context.index, None)
         if event.not_executed_reason is not None:
             return ReferenceNotExecuted(context.index, context.correlation, event.not_executed_reason)
-        error = event.typed_error("reference failed")
+        error = outcome_error(event.error, "reference failed")
         # The variant follows the execution facts of the page that failed, as for a fan-out command.
         ambiguity = ambiguity_of(
             error,

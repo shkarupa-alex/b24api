@@ -137,7 +137,7 @@ class BatchFailure:
     command_index: int
     stable_key: str
     request: Request = field(repr=False)
-    error: object = field(repr=False)
+    error: Exception = field(repr=False)
     replay_safety: ReplaySafety = ReplaySafety.UNKNOWN
     replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
     correlation: object = field(default=None, repr=False)

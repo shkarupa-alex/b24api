@@ -160,16 +160,27 @@ def with_interrupt(report: OperationReport, interrupt: BaseException) -> Operati
     """
     message = f"{INTERRUPTED_REASON} ({report_reason(interrupt)})"
     violation = Violation(ViolationSeverity.BLOCKING, "interrupted", message)
-    violations = report.violations
-    if not any(item.code == violation.code for item in violations):
-        violations = (*violations, violation)
     return replace(
         report,
         state=TerminalState.FAILED,
         terminal_reason=INTERRUPTED_REASON,
-        violations=violations,
+        violations=(*report.violations, violation),
         exhausted=False,
     )
+
+
+def outcome_error(error: Exception, message: str) -> B24ApiError:
+    """Return the error a failure outcome carries, by one rule for every family that yields outcomes.
+
+    The library's own error is carried as it is; any other ``Exception`` (caller code's: a page stop, a hook) as a
+    ``CapabilityError(message)`` whose ``__cause__`` it is. Only an ``Exception`` is a failure: anything else ends the
+    operation as it is, so it never reaches an outcome.
+    """
+    if isinstance(error, B24ApiError):
+        return error
+    carried = CapabilityError(message)
+    carried.__cause__ = error
+    return carried
 
 
 def attach_report(error: BaseException, report: object) -> None:

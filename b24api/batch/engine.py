@@ -663,7 +663,7 @@ class BatchExecutor:
                 outcome = self._decode_command(
                     command, envelope, context=context, advisory_totals=options.advisory_totals
                 )
-                if isinstance(outcome, BatchFailure) and isinstance(outcome.error, BaseException):
+                if isinstance(outcome, BatchFailure):
                     attempts.record(outcome.error, context.policy)
             outcomes.append(outcome)
             halted = halted or (options.halt and key in envelope.errors and key not in envelope.contradictory)

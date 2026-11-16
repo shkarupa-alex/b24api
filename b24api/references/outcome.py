@@ -7,7 +7,6 @@ from b24api.contracts.command import NotExecutedReason
 from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _is_plain_int, thaw_json
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ReplaySafety, Request
-from b24api.errors import B24ApiError, CapabilityError
 from b24api.references.program import SourceProgram
 
 STABLE_KEY_MAXIMUM = 100
@@ -90,7 +89,7 @@ class KernelReferenceFailure:
 
     reference_key: str = field(repr=False)
     request: Request = field(repr=False)
-    error: object = field(repr=False)
+    error: Exception = field(repr=False)
     _cursor: FrozenJson = field(repr=False)
     page_state: int = 0
     partial_rows: int = 0
@@ -103,7 +102,7 @@ class KernelReferenceFailure:
         self,
         reference_key: str,
         request: Request,
-        error: object,
+        error: Exception,
         cursor: object = None,
         page_state: int = 0,
         partial_rows: int = 0,
@@ -142,12 +141,3 @@ class KernelReferenceFailure:
     def cursor(self) -> JsonValue:
         """Return the cursor."""
         return thaw_json(self._cursor)
-
-    def typed_error(self, message: str) -> B24ApiError:
-        """Return the library's error as it is; a failure from outside the library as ``message``, it the cause."""
-        if isinstance(self.error, B24ApiError):
-            return self.error
-        error = CapabilityError(message)
-        if isinstance(self.error, BaseException):
-            error.__cause__ = self.error
-        return error

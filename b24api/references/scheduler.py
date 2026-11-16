@@ -5,7 +5,7 @@ import asyncio
 import functools
 from dataclasses import replace
 from inspect import isawaitable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from b24api.completion.reference_recorder import ReferenceCompletionRecorder
 from b24api.contracts.completion import BindingClosure, CommandSettlement
@@ -16,7 +16,7 @@ from b24api.contracts.request import ReplaySafety, Request, ResultSelector, Trav
 from b24api.contracts.response import result_snapshot
 from b24api.contracts.violation import retain_violations
 from b24api.errors import BudgetExceededError, CapabilityError, CleanupOverrunError
-from b24api.execution.context import latch_interrupt, spawn_settled
+from b24api.execution.context import is_interrupt, spawn_settled
 from b24api.execution.facts import dropped_result
 from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
@@ -26,6 +26,7 @@ from b24api.references.dispatch import (
     _DirectPageDispatcher,
     _DispatchedPage,
     _DoneEvent,
+    _EndedEvent,
     _Event,
     _failed_page,
     _FailureEvent,
@@ -277,7 +278,8 @@ class ReferenceScheduler:
             (producer, *admission.tasks.values()),
             remaining=self.context.cleanup_window(),
         )
-        cleanup_errors.extend(error for error in task_errors if error is not primary_error)
+        # An interrupt a task ended in is the latch's (``settle``), not a failure of the cleanup.
+        cleanup_errors.extend(error for error in task_errors if error is not primary_error and not is_interrupt(error))
         if pending:
             cleanup_errors.append(CleanupOverrunError("reference task cleanup exceeded operation time budget"))
 
@@ -402,19 +404,23 @@ class ReferenceScheduler:
                 await run_fast_keyset(self, run, program.fast)
             elif pages is not None:
                 await self._drive(run, pages)
-        except (asyncio.CancelledError, GeneratorExit):
-            # A cancellation ends the task cancelled; a GeneratorExit closes its coroutine (``settle``): neither is
-            # how the reference ended.
-            raise
-        except BaseException as error:  # noqa: BLE001 - per-reference tolerant outcome boundary, an interrupt's too
-            # The binding fails with what its failed page reports, and its command's replay disposition, if any. An
-            # interrupt (``is_interrupt``) is the operation's latch's too: the runner raises it.
-            latch_interrupt(error)
+        except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
+            # The binding fails with what its failed page reports, and its command's replay disposition, if any: a
+            # failure's page reports a failure.
             failed = _failed_page(error)
-            event = self._failure_event(run, failed.error)
+            event = self._failure_event(run, cast("Exception", failed.error))
             if failed.failure is not None:
                 event = replace(event, replay_disposition=failed.failure.replay_disposition)
             await self.publish_terminal(run, event)
+        except asyncio.CancelledError:
+            # How the operation stops its bindings (``_stop_work``): nobody reads their queues any more.
+            raise
+        except BaseException:
+            # Only a failure is a binding's outcome: anything else ends the operation as it is, where the binding's
+            # outcome would have ended it. Its queue has room: under INPUT it is unbounded; under READY the binding
+            # waits for the consumer to take each page before its next step.
+            run.output.put_nowait(_EndedEvent(work))
+            raise
         finally:
             try:
                 if pages is not None:
@@ -756,7 +762,7 @@ class ReferenceScheduler:
             run.scheduled_sequences,
         )
 
-    def _failure_event(self, run: _ReferenceRun, error: BaseException) -> _FailureEvent:
+    def _failure_event(self, run: _ReferenceRun, error: Exception) -> _FailureEvent:
         """Build the terminal failure event with the partial progress the reference reached."""
         if run.failure is not None:
             return run.failure  # a fast keyset binding prepared its own evidence before re-raising
@@ -906,6 +912,8 @@ class ReferenceScheduler:
             binding.acknowledged(event.page_id)
 
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
+        if isinstance(event, _EndedEvent):
+            return  # no outcome: the binding's task ends the operation (``_finish_task``)
         if isinstance(event, _PageEvent):
             async for outcome in self._consume_page(event):
                 yield outcome

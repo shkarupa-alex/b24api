@@ -193,7 +193,7 @@ class _DoneEvent:
 @dataclass(frozen=True, slots=True)
 class _FailureEvent:
     work: _Work
-    error: BaseException
+    error: Exception
     cursor: JsonValue | IdentityValue
     page_state: int
     partial_rows: int
@@ -203,7 +203,20 @@ class _FailureEvent:
     not_executed_reason: NotExecutedReason | None = None
 
 
-type _Event = _PageEvent | _DoneEvent | _FailureEvent
+@dataclass(frozen=True, slots=True)
+class _EndedEvent:
+    """A binding's task ended in no outcome: in an exception that is no failure (``ReferenceScheduler._run_reference``).
+
+    It takes the binding's place in the order its outcome would have: the reader then raises what the task ended in
+    as it is (``_finish_task``). The operation ends with it, so it carries no evidence of its own.
+    """
+
+    work: _Work
+    violations: tuple[Violation, ...] = ()
+    page_records: tuple[PageRecord, ...] = ()
+
+
+type _Event = _PageEvent | _DoneEvent | _FailureEvent | _EndedEvent
 
 
 @dataclass(frozen=True, slots=True)
