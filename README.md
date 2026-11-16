@@ -947,7 +947,7 @@ that creates the stream is made and driven by the task that reads it, so a conte
 before a `yield` is still set when it resumes. A context variable the caller sets after that call (a tracing
 span around the `async for` loop, say) is not seen by the source: set it before creating the stream.
 
-Every exception a source raises, from a pull or from its close, is its failure: the stream raises
+Every `Exception` a source raises, from a pull or from its close, is its failure: the stream raises
 `InputSourceError` (`batch()` and `fan_out()`: `BatchFailed`, whose `__cause__` is that
 `InputSourceError`) with the source's exception as its `__cause__`, whether the source is synchronous
 or asynchronous and even when that exception is a library error of its own. An item that is not what
@@ -968,10 +968,12 @@ with the terminal reason "operation interrupted", every violation recorded befor
 failure's first), and one `interrupted` violation last, "operation interrupted (X)", where X is
 `KeyboardInterrupt` or `SystemExit`. The raised interrupt carries that report as `.report`, as the
 `CancelledError` does. A close that fails after an interrupt ended the stream is "stream cleanup also
-failed (X)", as behind any other end that came first. Any other `BaseException` is no interrupt but a
-failure like any other: the stream raises it to its reader as it raises any failure (`BatchFailed` or
-`ReferenceFailed`, with it as `__cause__`), or an outcome family yields a failure outcome for that item,
-whose `CapabilityError` has it as `__cause__`; it never goes to the event loop, which would only log it.
+failed (X)", as behind any other end that came first. Any other `BaseException` (neither an interrupt
+nor a cancellation), whether your source's pull or close, your transport or a callback raised it, is no
+failure either: no family wraps it in its error or makes it a failure outcome. It ends the stream, whose
+source is closed once, and reaches your read or close as it is, with the report `failed`: "<family> failed
+(X)", or "stream cleanup failed (X)" when the source's close raised it. It never goes to the event loop,
+which would only log it.
 An interrupt raised while no read is waiting (by a send the stream runs between your reads, while you work
 on an item) does not wait for your next read: it leaves the event loop at once, out of `asyncio.run`, as
 asyncio raises any task's, and the operation's end follows: its work cancelled, its source closed and its

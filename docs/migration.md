@@ -152,12 +152,12 @@
   failed pull: `InputSourceError` (`batch()` and `fan_out()`: `BatchFailed`, whose `__cause__` is that
   `InputSourceError`), with the exception the close raised as its `__cause__`. Catch
   `InputSourceError` (or `BatchFailed`) where you caught your own close's exception, and read it from
-  `__cause__`. A close that overran its window still raises `CleanupOverrunError`, and a cancellation
-  is not wrapped.
+  `__cause__`. A close that overran its window still raises `CleanupOverrunError`; a cancellation, an
+  interrupt or any other `BaseException` that is not an `Exception` is not wrapped.
 - **Breaking: anything a batch source raises is a source failure.** A source of `batch()` or
   `batch_outcomes()` that raised a library error of its own (for example a `BudgetExceededError` it
   caught elsewhere and let through) ended the stream as if that error were the operation's; the
-  reference families already wrapped it. Every exception a source raises, from a pull or from its
+  reference families already wrapped it. Every `Exception` a source raises, from a pull or from its
   close, is now `InputSourceError` chained to it in every family.
 - **The reference scheduler always closes its source.** When `fan_out()`, `fan_out_outcomes()` or a
   reference traversal ended while its own tasks were still running past the cleanup window, it left
@@ -202,15 +202,21 @@
   source and reports the interrupt. A read or close cancelled while it runs the end still lets it publish
   ("stream cleanup also failed (CancelledError)"). With nothing to close the stream (you never close it
   nor its client, or `asyncio.run` was already shutting down when the interrupt was raised) it gets no
-  end: its source stays open and there is no report. Any other `BaseException` from your transport is no
-  longer treated as an interrupt, which asyncio's loop only logged and dropped between reads: it is a
-  failure like any other, which the stream raises to its reader (`BatchFailed` or `ReferenceFailed`,
-  with it as `__cause__`) or an outcome family yields as that item's failure.
-- **An outcome's failure from outside the library keeps its cause.** In `fan_out_outcomes()` and the
-  `iter_*_outcomes()` families, a failure that is not the library's error (one your transport raises
-  that is not an `Exception`, say) became a `CapabilityError` ("fan-out command failed", "reference
-  failed") that dropped it. That `CapabilityError` now carries it as `__cause__`, as `BatchFailed` and
-  `ReferenceFailed` do in the fail-fast families.
+  end: its source stays open and there is no report. Any other `BaseException` (neither an interrupt nor a
+  cancellation) is no longer treated as an interrupt, which asyncio's loop only logged and dropped between
+  reads, nor as a failure: in every family, whether your transport, your source's pull or its close raised
+  it, it ends the stream, the source is closed once, and it reaches your read or close as it is, with the
+  report `failed` ("<family> failed (X)", or "stream cleanup failed (X)" from the close). Code that caught
+  it as the `__cause__` of `BatchFailed`, `ReferenceFailed` or `InputSourceError`, or read it from a
+  failure outcome, catches it directly.
+- **An outcome's failure from outside the library keeps its cause, by one rule.** In the outcome
+  families, a failure that is not the library's error (an `Exception` from your code, such as a
+  `page_stop` callback) became an error that dropped it: a `CapabilityError` ("fan-out command failed",
+  "reference failed") in `fan_out_outcomes()` and the `iter_*_outcomes()` families, a `ProtocolError`
+  ("batch command failed without a typed safe error") in `batch_outcomes()`. Every outcome family now
+  carries it as a `CapabilityError` (`batch_outcomes()`: "batch command failed") whose `__cause__` it is,
+  as `BatchFailed` and `ReferenceFailed` do in the fail-fast families. Catch `CapabilityError` where
+  `batch_outcomes()` code caught that `ProtocolError`.
 - **A cancelled stream gives the cancellation's reason.** A stream read to its end and cancelled
   while its source closed reported `cancelled` with the terminal reason "input exhausted" (or
   "reference input exhausted"). Every family now gives "iteration cancelled" whenever the reader's
