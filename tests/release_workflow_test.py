@@ -515,6 +515,17 @@ def test_blocking_jobs_run_the_specified_checks() -> None:
     assert "import-untyped" in _runs("wheel-typing")
 
 
+def test_the_type_checks_run_as_the_oldest_supported_python_on_every_interpreter() -> None:
+    # The mypy count over tests/ follows the stubs of the Python it checks against, so the ratchet holds only when
+    # that Python is fixed, whatever interpreter runs mypy: the oldest one the project supports, as in CI's types job.
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    oldest = pyproject["project"]["requires-python"].removeprefix(">=")
+    setup = next(step for step in _ci_jobs()["types"]["steps"] if "setup-uv" in step.get("uses", ""))
+
+    assert pyproject["tool"]["mypy"]["python_version"] == oldest
+    assert setup["with"]["python-version"] == oldest
+
+
 def test_wheel_typing_passes_every_canonical_import_and_flags_an_old_root_import() -> None:
     runs = _runs("wheel-typing")
 

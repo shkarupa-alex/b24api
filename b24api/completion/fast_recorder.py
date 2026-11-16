@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from b24api.completion.gate import CompletionGate
+from b24api.completion.page_failure import unconsumed_rejection
 from b24api.contracts.completion import (
     BindingAdmitted,
     BindingClosure,
@@ -140,12 +141,14 @@ class FastPageLedger:
             if page.recorded and page.remaining is None:
                 self.admit(command_id, 0)
 
-    def close(self, *, successful: bool, reason: str) -> None:
+    def close(self, *, successful: bool) -> None:
         """Retire every open page before the binding terminal: discarded probes, or a failed traversal.
 
         Only a settled page can be rejected. A wave engine settles each page it was handed from what its command
         did, also when its call raises, so a page still unsettled here was never handed to one: it settles as not
-        executed. This is the one rule for every path, flat or reference, whatever ended the traversal.
+        executed. Every page still open then succeeded and was read but never consumed: it is rejected as aborted
+        with the traversal (``unconsumed_rejection``), as the counted and reference ledgers reject one. This is the
+        one rule for every path, flat or reference, whatever ended the traversal.
         """
         if successful:
             self.discard_unadmitted()
@@ -155,7 +158,7 @@ class FastPageLedger:
             if not page.settled:
                 self.settle(command_id, CommandSettlement.NOT_EXECUTED)
         for command_id, page in tuple(self._active.items()):
-            self._emit_page(PageRejected, page.page_id, reason=reason)
+            self._emit_page(PageRejected, page.page_id, reason=unconsumed_rejection(CommandSettlement.SUCCESS))
             self._negative = True
             del self._active[command_id]
 
@@ -205,7 +208,7 @@ class FastCompletionRecorder(FastPageLedger):
             return
         self._terminal = True
         successful = state is KernelState.COMPLETED and rows_emitted == rows_admitted
-        self.close(successful=successful, reason=state.value)
+        self.close(successful=successful)
         if successful and closure not in {BindingClosure.SOURCE_EMPTY, BindingClosure.KEYSET_PLAN_COVERED}:
             closure = BindingClosure.FAILURE
             self._negative = True

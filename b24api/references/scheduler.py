@@ -468,6 +468,7 @@ class ReferenceScheduler:
                     break
         except BaseException as error:
             primary_error = error
+            latch_escape(error)  # Latched before the await, so no cancellation of it can ever replace it.
             raise
         finally:
             # Cleanup comes before the terminal event: the pages a stopped binding abandons are cancelled

@@ -91,9 +91,12 @@ def test_every_fixture_has_a_baseline_and_every_delta_names_a_fixture() -> None:
     assert {fixture for fixture, _field in _DECLARED} <= set(_BASELINE)
 
 
+@pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fixture", fixture_names())
 async def test_public_projection_matches_baseline_or_declared_delta(fixture: str) -> None:
+    # Batched fixtures coalesce by loop turns (``coalescing``), and the scenarios that read which commands share a
+    # physical batch feed their input on the loop, so a loaded machine splits no batch the baseline holds whole.
     baseline = dict(flatten(_stable_projection(fixture, _BASELINE[fixture])))
     current = dict(flatten(_stable_projection(fixture, await capture(fixture))))
     declared = {field: values for (name, field), values in _DECLARED.items() if name == fixture}

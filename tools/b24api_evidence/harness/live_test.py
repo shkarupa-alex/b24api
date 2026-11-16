@@ -6,10 +6,12 @@ import gc
 import gzip
 import json
 import logging
+import traceback
 import tracemalloc
 import weakref
 import zlib
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 import httpx
 import pytest
@@ -31,7 +33,6 @@ from .live import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from pathlib import Path
 
     from b24api._webhook import WebhookSecrets
 
@@ -159,6 +160,40 @@ def test_live_non_httpx_client_failure_drops_credentialed_request_text_and_local
 
     # The text, the chain and every local of the harness frames are checked, which capture_locals renders.
     _assert_live_error_redacted(captured.value, sensitive_fragment)
+
+
+def _refuse_connection(request: httpx.Request) -> None:
+    raise httpx.ConnectError("synthetic", request=request)
+
+
+@pytest.mark.parametrize("chain", ["none", "context", "cause"])
+@pytest.mark.parametrize("escape", [KeyboardInterrupt, SystemExit])
+def test_live_interrupt_leaves_without_credentialed_frames_or_locals(
+    monkeypatch: pytest.MonkeyPatch,
+    escape: type[BaseException],
+    chain: Literal["none", "context", "cause"],
+) -> None:
+    # An interrupt raised inside the HTTP client is no failure to classify: it leaves as it is, but without the
+    # frames it was raised through, whose locals held the credential-bearing request, and without its chain,
+    # which may be HTTPX's own error holding that request, implicitly or as the cause.
+    sensitive_fragment = "not-a-secret"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if chain == "none":
+            raise escape("synthetic interrupt")
+        try:
+            _refuse_connection(request)
+        except httpx.ConnectError as interrupted:
+            if chain == "cause":
+                raise escape("synthetic interrupt") from interrupted
+            raise escape("synthetic interrupt")  # noqa: B904 - the implicit context is what is under test
+
+    with _portal(monkeypatch, handler) as portal, pytest.raises(escape) as captured:
+        portal.call("scope")
+
+    _assert_live_error_redacted(captured.value, sensitive_fragment)
+    frames = traceback.extract_tb(captured.value.__traceback__)
+    assert {Path(frame.filename).name for frame in frames} <= {"live.py", Path(__file__).name}
 
 
 @pytest.mark.parametrize("configuration_case", ["fingerprint", "webhook"])

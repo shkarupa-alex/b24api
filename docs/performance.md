@@ -87,10 +87,15 @@ harness-produced observations for that portal cell, not general latency promises
   traversal, also after the anchor probes), or traverses sequentially.
 - Auto's choices rest on estimates extrapolated from the boundary pages. Under a `max_pages` or
   `max_requests` set close to the need, it can end with `IncompleteTraversalError` on the exhausted
-  budget where a different choice would have fitted (631 of 44,682 tight-budget points, against
-  4,065 that failed before and now finish; no point of the measured grid at the default budgets, which
-  are budgets like any other for a selection whose need comes close to them). For a predictable need
-  under a tight budget, pass `SequentialKeysetExecution()` or `RangeKeysetExecution` explicitly.
+  budget where a different choice would have fitted. The measured grid covers selections of 2,000,
+  8,000 and 20,000 rows over eight identity distributions (dense, sparse, random, clustered and
+  skewed), pages of 10 and 50 rows and row buffers of 600 to 10,000 rows. Over 44,682 tight-budget
+  points of it, 631 fail this way, while 4,065 that failed before now finish. No point of the grid
+  fails at the default budgets, but they are budgets like any other: a selection whose need comes
+  close to them can fail the same way. For example, 495,000 rows at page 50 with a sparse first and
+  last 200 identities take 9,927 pages with 20 probes and run out of the default 10,000 `max_pages`
+  with finer lanes. For a predictable need under a tight budget, pass `SequentialKeysetExecution()`
+  or `RangeKeysetExecution` explicitly.
 - A returned `total` is advisory only and may raise an auto cost estimate. It never closes a lane or
   strengthens correctness evidence. Normal range/partition reports use caller-asserted bounds
   (`assurance_source=CALLER_ASSERTED_BOUNDS`); explicit verification is a separate operation,

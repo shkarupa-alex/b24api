@@ -8,7 +8,7 @@ import dataclasses
 import json
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 from urllib.parse import parse_qs
 
 import pytest
@@ -53,6 +53,7 @@ from b24api.contracts import (
     TotalHintMode,
     TraceClass,
 )
+from b24api.contracts.json import FrozenMapping
 from b24api.contracts.page import AdaptedPage, PageView
 from b24api.contracts.policy import IdentityRequirement, OrderSemantics, RetryPolicy, TotalSemantics
 from b24api.contracts.report import OperationReport, PageDispatch
@@ -75,6 +76,7 @@ from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
 from b24api.traversal.keyset_geometry import anchor_guesses, anchor_probe_count, estimates, partition_estimate
 from b24api.traversal.keyset_observation import FastTraceRecorder, PageObservation
+from b24api.traversal.keyset_ordered_admission import OrderedAdmissionState
 from tests.scripting import HANG_BOUND, ResponderTransport, client_for, json_response
 
 if TYPE_CHECKING:
@@ -1921,6 +1923,42 @@ async def test_boundary_direction_contradiction_fails_before_emission() -> None:
     assert stream._source._runtime.transactions.boundary_totals == {}
 
 
+class _AscendingViewHidesTheLeast(KeysetTransport):
+    """Serve a selection whose ascending view lacks the identities below ``hidden_below``, which descending has."""
+
+    def __init__(self, identities: tuple[int, ...], *, hidden_below: int) -> None:
+        super().__init__(identities)
+        self.hidden_below = hidden_below
+
+    def _rows(self, parameters: dict[str, JsonValue]) -> list[dict[str, int]]:
+        order = parameters.get("order", {})
+        if isinstance(order, dict) and order.get("id") == "DESC":
+            return super()._rows(parameters)
+        visible = self.identities
+        self.identities = tuple(value for value in visible if value >= self.hidden_below)
+        try:
+            return super()._rows(parameters)
+        finally:
+            self.identities = visible
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["ascending", "descending"])
+async def test_a_descending_boundary_below_the_ascending_head_fails_before_emission(direction: str) -> None:
+    # The ascending boundary page starts at the selection's least identity, 5, and ends short, so it holds the whole
+    # selection; the descending one holds 4 too. Both maxima agree, but one selection cannot have both pages: the
+    # boundary refuses them, whichever way the traversal runs, before a row is delivered or a further page is sent.
+    transport = _AscendingViewHidesTheLeast(tuple(range(1, 9)), hidden_below=5)
+    stream = _stream(transport, AutoKeysetExecution(StableIntegerKeysetContract()), direction=direction)
+
+    with pytest.raises(IncompleteTraversalError, match="descending boundary passes head"):
+        await anext(stream)
+
+    assert stream.report is not None
+    assert stream.report.emitted == 0
+    assert len(transport.requests) == 1  # the boundary wave alone
+
+
 @pytest.mark.asyncio
 async def test_internal_lane_validation_error_is_not_reclassified(
     monkeypatch: pytest.MonkeyPatch,
@@ -2992,3 +3030,27 @@ async def test_fast_cancelled_reader_whose_cleanup_then_fails_is_cancelled_whene
     assert [item.message for item in report.violations if item.code == "cleanup_failure"] == [
         "stream cleanup also failed (RuntimeError)"
     ]
+
+
+@pytest.mark.parametrize(("direction", "admitted", "behind"), [("asc", (3, 4), (5, 3)), ("desc", (4, 3), (2, 4))])
+def test_the_ordered_admission_refuses_a_receipt_that_does_not_advance_past_what_it_admitted(
+    direction: Literal["asc", "desc"],
+    admitted: tuple[int, ...],
+    behind: tuple[int, ...],
+) -> None:
+    # The page checks upstream refuse such a receipt first today; the one owner of the global order still refuses
+    # it on its own, and admits nothing of it.
+    state = OrderedAdmissionState(
+        direction=direction,
+        identity=IdentitySpec(("id",), "ID", "id", IdentityCoercion.EXACT_INTEGER),
+    )
+
+    def receipt(identities: tuple[int, ...]) -> keyset_page_validation.LaneReceipt:
+        rows = tuple(FrozenMapping({"id": value}) for value in identities)
+        return keyset_page_validation.LaneReceipt(0, "lane", rows, identities, None, ())
+
+    assert state.validate_and_commit(receipt(admitted)).identities == admitted
+    with pytest.raises(PaginationError, match="global order did not advance"):
+        state.validate_and_commit(receipt(behind))
+    assert state.has_seen(admitted[-1])
+    assert not state.has_seen(behind[0])

@@ -500,10 +500,10 @@ class OperationLatch:
     raise, and any caught once it is out, go to the event loop (``hand_on``), once each. The operation raises one
     interrupt at most: one caught after an end that raised none is raised out of ``asyncio.run`` as any task's is,
     and every other escape, a second interrupt included, goes to the loop's exception handler, with the operation's
-    report. An operation nothing
-    ends (a stream left unclosed when ``asyncio.run`` shuts down, or dropped) reports every escape still undelivered
-    to that handler as the latch is collected, as asyncio reports a task's exception nobody retrieved. So no route an
-    escape takes (an event, a future, a task's result, a cancelled pull) loses it silently.
+    report. An operation nothing ends (a stream left unclosed when ``asyncio.run`` shuts down, or dropped) reports
+    every escape still undelivered to that handler as the latch is collected, as asyncio reports a task's exception
+    nobody retrieved. So no route an escape takes (an event, a future, a task's result, a cancelled pull) loses it
+    silently.
     """
 
     __slots__ = ("_loop", "_out", "_undelivered", "_wake", "first", "report", "state")
@@ -548,12 +548,13 @@ class OperationLatch:
         return raised
 
     def close_to_loop(self) -> None:
-        """The operation's end with no read or close to raise to: what ``close`` returns leaves the event loop instead.
+        """The operation's end on its interrupt with no read or close to raise to: the interrupt leaves the event loop.
 
-        An interrupt is raised out of ``asyncio.run`` from a callback, anything else is reported to its handler.
+        Only the wake calls it, once ``record`` latched the interrupt (``first``), which ``close`` returns; it is raised
+        out of ``asyncio.run`` from a callback.
         """
-        if (raised := self.close()) is not None:
-            self._deliver(raised, raise_it=is_interrupt(raised))
+        if (interrupt := self.close()) is not None:
+            asyncio.get_running_loop().call_soon(_raise, interrupt)
 
     def record(self, error: BaseException | None) -> None:
         """Latch ``error`` when it is an escape; anything else is not this latch's.
@@ -591,7 +592,10 @@ class OperationLatch:
         """Report every escape no end raised to its loop's exception handler: nothing ended the operation.
 
         As asyncio reports a task's exception nobody retrieved, it reports and never raises, an interrupt included,
-        on a closed loop too.
+        on a closed loop too. The interrupt that ends the operation (``first``) is not among them: its wake delivers
+        it at once (a read in flight raises it, or the event loop, ``close_to_loop``), one latched while the operation
+        ends is raised by that end, and it also leaves on its own through an inline kernel's read that ends in it, so
+        reporting it here could deliver it twice.
         """
         if self._loop is not None:
             for error in self._undelivered:

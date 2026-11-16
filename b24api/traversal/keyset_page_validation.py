@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from b24api.batch.outcome import BatchFailure, BatchSuccess, settlement_of
+from b24api.completion.page_failure import failed_page
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import ReplayDisposition
@@ -21,7 +22,6 @@ from b24api.errors import (
 )
 from b24api.traversal.keyset_geometry import closure_witness
 from b24api.traversal.page_adaptation import PageTokens, adapt_page
-from b24api.traversal.page_failure import failed_page
 from b24api.traversal.values import _response_items, _row_identity, _validate_order
 
 if TYPE_CHECKING:
@@ -220,7 +220,11 @@ def validate_boundary_direction(
     ascending: LaneReceipt,
     descending: LaneReceipt,
 ) -> ReceiptRejection | None:
-    """Reject an ignored descending direction before boundary admission."""
+    """Reject boundary pages whose directions contradict each other before boundary admission.
+
+    Each direction's first page starts at its end of one selection: the ascending page at its least identity, the
+    descending page at its greatest. Neither may then hold an identity beyond the other's end.
+    """
     if bool(ascending.identities) != bool(descending.identities):
         return ReceiptRejection(
             descending.lane_ordinal,
@@ -247,6 +251,13 @@ def validate_boundary_direction(
             descending.command_id,
             Violation(ViolationSeverity.BLOCKING, "direction_contradiction", "descending boundary precedes head"),
             "descending boundary precedes head",
+        )
+    if ascending.identities and descending.identities and min(descending.identities) < min(ascending.identities):
+        return ReceiptRejection(
+            descending.lane_ordinal,
+            descending.command_id,
+            Violation(ViolationSeverity.BLOCKING, "direction_contradiction", "descending boundary passes head"),
+            "descending boundary passes head",
         )
     return None
 

@@ -402,6 +402,7 @@ _AFTER_A_MEMBER_REFUSED = [
     pytest.param(_GZIP + b"\x00\x00" + _SECOND_MEMBER[:-1], id="padded-member-cut"),
     pytest.param(_GZIP + b"trailing garbage", id="garbage"),
     pytest.param(_GZIP + b"\x00\x00trailing garbage", id="garbage-after-padding"),
+    pytest.param(_GZIP + b"\r\n", id="line-break"),
 ]
 
 
@@ -455,6 +456,76 @@ def test_the_ceiling_spans_every_gzip_member() -> None:
     over = _BoundedDecoder.for_encoding("gzip", limit=2 * len(_PAYLOAD) - 1)
     with pytest.raises(_DecodedBodyTooLargeError):
         over.feed(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(gzip.compress(bytes(_LIMIT + _BOMB_SIZE)), id="in-the-same-member"),
+        pytest.param(gzip.compress(bytes(_LIMIT)) + gzip.compress(bytes(_BOMB_SIZE)), id="in-the-next-member"),
+    ],
+)
+def test_a_bomb_behind_an_exactly_filled_ceiling_is_never_inflated(raw: bytes) -> None:
+    # Once the decoded body fills the ceiling exactly, zlib is asked for one byte more, the byte that proves the
+    # body too large, never for all it can inflate.
+    decoder = _BoundedDecoder.for_encoding("gzip", limit=_LIMIT)
+    tracemalloc.start()
+    try:
+        with pytest.raises(_DecodedBodyTooLargeError):
+            decoder.feed(raw)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 2 * _LIMIT + _MEGABYTE
+
+
+class _OfferedInput:
+    """A decompressor that records how many raw bytes each call offers zlib."""
+
+    def __init__(self, inner: zlib._Decompress, offered: list[int]) -> None:
+        self._inner = inner
+        self._offered = offered
+
+    def decompress(self, data: bytes, max_length: int = 0) -> bytes:
+        self._offered.append(len(data))
+        return self._inner.decompress(data, max_length)
+
+    @property
+    def eof(self) -> bool:
+        return self._inner.eof
+
+    @property
+    def unused_data(self) -> bytes:
+        return self._inner.unused_data
+
+    @property
+    def unconsumed_tail(self) -> bytes:
+        return self._inner.unconsumed_tail
+
+
+_DECOMPRESSOBJ = zlib.decompressobj
+
+
+def _offered_for_empty_members(monkeypatch: pytest.MonkeyPatch, members: int) -> int:
+    """Decode ``members`` empty gzip members fed as one chunk; return the raw bytes all calls offered zlib."""
+    offered: list[int] = []
+    decompressobj = _DECOMPRESSOBJ
+    monkeypatch.setattr(zlib, "decompressobj", lambda *args: _OfferedInput(decompressobj(*args), offered))
+    decoder = _BoundedDecoder.for_encoding("gzip", limit=_LIMIT)
+    assert decoder.feed(gzip.compress(b"", mtime=0) * members) == b""
+    decoder.finish()
+    assert len(offered) == members
+    return sum(offered)
+
+
+def test_many_empty_gzip_members_cost_work_linear_in_their_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each member is offered a bounded slice of what follows, not the whole rest of the chunk, which zlib copies
+    # out past the member's end: twice the members are twice the work, not four times.
+    members = 4_000
+    single = _offered_for_empty_members(monkeypatch, members)
+    double = _offered_for_empty_members(monkeypatch, 2 * members)
+
+    assert double < 3 * single
 
 
 @pytest.mark.asyncio
