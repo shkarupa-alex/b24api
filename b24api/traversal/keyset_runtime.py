@@ -25,6 +25,7 @@ from b24api.traversal.keyset_plan import FastKeysetPlan, KeysetPlanner
 from b24api.traversal.keyset_reporting import build_keyset_report
 from b24api.traversal.keyset_transaction_contract import KeysetTransactionState
 from b24api.traversal.keyset_transactions import execute_body_wave, execute_finish_page, execute_wave
+from b24api.traversal.page_failure import rejection_reason
 
 if TYPE_CHECKING:
     from b24api.completion.fast_recorder import FastPageLedger
@@ -196,7 +197,7 @@ class KeysetRuntime:
             ),
         )
         self._observation_ordinal += 1
-        self.completion_recorder.recorded(plan.command_id, outcome)
+        self.completion_recorder.recorded(plan.command_id, rejection_reason(outcome, rejection))
         if outcome is PageOutcome.COMMITTED and selected == 0:
             self.completion_recorder.admit(plan.command_id, 0)
 

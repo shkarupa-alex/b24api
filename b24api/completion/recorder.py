@@ -1,7 +1,7 @@
 """One-binding event adapter for direct sequential traversal mechanics."""
 
 from __future__ import annotations
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 from b24api.completion.closure import qualified_closure
@@ -23,6 +23,10 @@ from b24api.contracts.completion import (
     StreamTerminal,
 )
 from b24api.contracts.policy import KernelState
+from b24api.contracts.report import PageRejectionCode
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class CompletionSink(Protocol):
@@ -124,7 +128,10 @@ class CompletionRecorder:
 
     def rejected(self, reason: str) -> None:
         """Retire one settled but unadmitted page."""
-        page_id = self._require_page()
+        self._reject(self._require_page(), reason)
+        self._current = None
+
+    def _reject(self, page_id: int, reason: str) -> None:
         self.gate.emit(
             PageRejected(
                 operation_id=self.gate.operation_id,
@@ -134,7 +141,6 @@ class CompletionRecorder:
                 reason=reason,
             )
         )
-        self._current = None
 
     def delivered(self) -> None:
         """Mark the complete validated page delivered to the consumer."""
@@ -265,14 +271,20 @@ class CountedCompletionRecorder(CompletionRecorder):
         self._reserved.add(page_id)
         return page_id
 
-    def settle_unobserved(self) -> None:
-        """Retire scheduled tail pages whose dispatch outcome was not observed.
+    def settle_unobserved(self, settlement: Callable[[int], CommandSettlement]) -> None:
+        """Retire the scheduled pages the traversal will not consume, each as its dispatch proved (``settlement``).
 
-        The page being delivered, if any, stays active: its outcome is known, and the binding's terminal
-        releases it when the stream ends before the consumer accepted it.
+        ``settlement`` gives a page's settlement by page id from its command's execution facts: a page answered
+        with a success settles as a success and is rejected as aborted with the traversal, one never sent was
+        not executed, and only one that may have run is unknown. The page being delivered, if any, stays
+        active: its outcome is known, and the binding's terminal releases it when the stream ends before the
+        consumer accepted it.
         """
         for page_id in sorted(self._reserved - {self._current}):
-            self._settle(page_id, CommandSettlement.UNKNOWN)
+            outcome = settlement(page_id)
+            self._settle(page_id, outcome)
+            if outcome is CommandSettlement.SUCCESS:
+                self._reject(page_id, PageRejectionCode.TRANSACTION_ABORTED.value)
             self._reserved.discard(page_id)
 
     def activate(self, page_id: int) -> None:

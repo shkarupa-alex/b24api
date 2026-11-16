@@ -56,8 +56,10 @@ from b24api.execution.executor import (
     _SendPlan,
     _Settled,
 )
+from b24api.execution.facts import Execution, execution, record_execution, settled_as
 
 if TYPE_CHECKING:
+    from b24api.contracts.completion import CommandSettlement
     from b24api.contracts.evidence import ResponseEvidence
     from b24api.contracts.json import JsonValue
     from b24api.contracts.policy import ExecutionPolicy
@@ -230,6 +232,85 @@ class _Lineup:
         self.settled[outcome.command_index] = _by_facts(outcome, lineage.left_open())
 
 
+class BatchProgress:
+    """Where each command of one running chunk stands, by command index, for a caller whose wait for it ends early.
+
+    The engine keeps it as the chunk runs: the final outcomes of its envelope groups, a classic envelope's lineup
+    (each waiting command's latest answer and the lineage of its sends) and the round being sent. ``execution``
+    reads it by the rule a command's own failure follows: a command whose latest send may have run without an
+    answer, or one before it, may have run; one answered, by its entry or with its envelope, was answered
+    (it ran, or was refused, as its answer says); one never sent was not sent. Until the chunk has ended, a
+    command without a final outcome may still be sent, so it may run; a REST v3 group in progress keeps its state
+    to itself, so its commands may have run.
+    """
+
+    def __init__(self) -> None:
+        """Start with nothing sent."""
+        self._final: Mapping[int, BatchOutcome] = {}
+        self._lineup: _Lineup | None = None
+        self._attempts: _RequestAttempts | None = None
+        self._round: frozenset[int] = frozenset()
+        self._opaque: frozenset[int] = frozenset()
+        self._ended = False
+
+    def end(self) -> None:
+        """Record that the chunk has ended: nothing more of it is sent."""
+        self._ended = True
+
+    def _outcome(self, index: int) -> BatchOutcome | None:
+        """Return the final outcome of command ``index``, or ``None`` while it has none."""
+        outcome = self._final.get(index)
+        if outcome is None and self._lineup is not None:
+            outcome = self._lineup.settled.get(index)
+        return outcome
+
+    def track_groups(self, settled: Mapping[int, BatchOutcome]) -> None:
+        """Read the chunk's final outcomes from ``settled``, which the engine fills as each group ends."""
+        self._final = settled
+
+    def track_bare(self, lineup: _Lineup, attempts: _RequestAttempts) -> None:
+        """Read a classic envelope's commands from its lineup and the attempts its rounds share."""
+        self._lineup, self._attempts, self._opaque = lineup, attempts, frozenset()
+
+    def track_round(self, commands: tuple[_Command, ...]) -> None:
+        """Mark the commands of the latest classic round, whose sends ``execution`` adds to each one's lineage.
+
+        Once the round's outcomes are in the lineup, a waiting command's lineage holds its sends and the attempts
+        start the next round (``_RequestAttempts.start_round``), which adds nothing, so the mark stays until then.
+        """
+        self._round = frozenset(command.index for command in commands)
+
+    def track_opaque(self, commands: tuple[_Command, ...]) -> None:
+        """Mark the commands of a REST v3 group in progress."""
+        self._lineup, self._attempts, self._round = None, None, frozenset()
+        self._opaque = frozenset(command.index for command in commands)
+
+    def settlement(self, index: int) -> CommandSettlement:
+        """Return how command ``index`` settles from what it did so far, by the one rule (``settled_as``)."""
+        return settled_as(self.execution(index), succeeded=self._succeeded(index))
+
+    def record(self, error: BaseException, index: int) -> None:
+        """Record on ``error``, its page's failure, what command ``index`` did so far, a success included."""
+        record_execution(error, self.execution(index), succeeded=self._succeeded(index))
+
+    def _succeeded(self, index: int) -> bool:
+        """Return whether command ``index`` was answered with a success."""
+        return isinstance(self._outcome(index), BatchSuccess)
+
+    def execution(self, index: int) -> Execution:
+        """Return what command ``index`` is known to have done so far."""
+        outcome = self._outcome(index)
+        if outcome is not None:
+            return Execution.ANSWERED if isinstance(outcome, BatchSuccess) else execution(outcome.error)
+        if not self._ended or index in self._opaque:
+            return Execution.POSSIBLY_RUN
+        waiting = None if self._lineup is None else self._lineup.waiting.get(index)
+        lineage = _Lineage() if waiting is None else waiting.lineage
+        if index in self._round and self._attempts is not None:
+            lineage = lineage.after(self._attempts.lineage)
+        return lineage.unsent()
+
+
 @dataclass(frozen=True, slots=True)
 class _BatchEnvelope:
     results: Mapping[str, object]
@@ -267,6 +348,7 @@ class BatchExecutor:
         strict_json_members: bool = False,
         on_envelope: Callable[[], None] | None = None,
         split_held: bool = False,
+        progress: BatchProgress | None = None,
     ) -> tuple[BatchOutcome, ...]:
         """Execute one admitted chunk: classic BARE and native v3 commands never share an envelope.
 
@@ -280,6 +362,9 @@ class BatchExecutor:
         fails them all, so the envelope goes whole to its permit, which waits within the operation's budget or
         refuses at once a hold that outlasts it. Pages of a traversal, and the commands a dispatcher batches, are not
         split either: they wait at the permit, as they would sent one by one.
+
+        ``progress``, when given, is kept on where each command stands while the chunk runs (``BatchProgress``), for
+        a caller whose wait for the chunk a cancellation or another failure ends.
         """
         eligible, rejected = self._partition_capabilities(commands)
         settled: Mapping[int, BatchOutcome] = {}
@@ -296,7 +381,14 @@ class BatchExecutor:
             options = _RoundOptions(
                 halt, advisory_totals, strict_envelope, strict_json_members, split_held and not halt
             )
-            settled = await self._execute_groups(eligible, context=context, options=options, on_envelope=on_envelope)
+            progress = BatchProgress() if progress is None else progress
+            try:
+                settled = await self._execute_groups(
+                    eligible, context=context, options=options, on_envelope=on_envelope, progress=progress
+                )
+            finally:
+                # Whichever way the groups end, nothing more of the chunk is sent.
+                progress.end()
         # Every outcome of the chunk leaves the engine through the one mapping from execution facts.
         return tuple(_by_facts(outcome) for outcome in _merge_outcomes(commands, tuple(settled.values()), rejected))
 
@@ -307,8 +399,10 @@ class BatchExecutor:
         context: ExecutionContext,
         options: _RoundOptions,
         on_envelope: Callable[[], None] | None,
+        progress: BatchProgress,
     ) -> dict[int, BatchOutcome]:
         settled: dict[int, BatchOutcome] = {}
+        progress.track_groups(settled)
         for group in _envelope_groups(eligible):
             if options.halt and any(not isinstance(outcome, BatchSuccess) for outcome in settled.values()):
                 # Fail-fast: a later envelope of the accepted chunk is not sent after a failed one.
@@ -324,9 +418,10 @@ class BatchExecutor:
             if not sending:
                 continue
             if sending[0].request.route is RouteKind.API_V3:
+                progress.track_opaque(sending)
                 outcomes = await _V3Resolution(self.executor, context).run(sending)
             else:
-                outcomes = await self._execute_bare(sending, context=context, options=options)
+                outcomes = await self._execute_bare(sending, context=context, options=options, progress=progress)
             settled.update((outcome.command_index, outcome) for outcome in outcomes)
         return settled
 
@@ -362,16 +457,19 @@ class BatchExecutor:
         *,
         context: ExecutionContext,
         options: _RoundOptions,
+        progress: BatchProgress,
     ) -> tuple[BatchOutcome, ...]:
-        """Run one classic batch envelope and its replay rounds."""
+        """Run one classic batch envelope and its replay rounds, keeping ``progress`` on where each command stands."""
         # The rounds share one attempt count, one retry window and one wait; each command keeps the lineage of the
         # rounds it was in (``_Lineup``). The engine alone decides every round after the first, whether the
         # envelope failed as a whole or its entries answered: the executor sends each round once.
         attempts = _RequestAttempts(caller_retries=True)
         lineup = _Lineup()
         pending = eligible
+        progress.track_bare(lineup, attempts)
         try:
             while pending:
+                progress.track_round(pending)
                 sent = await self._dispatch_round(pending, context=context, options=options, attempts=attempts)
                 # Only the commands that may run again are sent again, in a smaller physical batch; the rest keep
                 # the outcome this round gave them. ``attempts`` covers the next round from here on.
@@ -651,8 +749,9 @@ class BatchExecutor:
         strict_envelope: bool = False,
         strict_json_members: bool = False,
         on_envelope: Callable[[], None] | None = None,
+        progress: BatchProgress | None = None,
     ) -> tuple[BatchOutcome, ...]:
-        """Execute one scheduler-owned chunk with total per-command correlation."""
+        """Execute one scheduler-owned chunk with total per-command correlation; ``progress`` as ``execute_chunk``."""
         if not requests or len(requests) > self.portal_command_cap:
             raise ValueError("scheduler batch chunk must contain 1..portal_command_cap requests")
         commands = tuple(
@@ -672,6 +771,7 @@ class BatchExecutor:
             strict_envelope=strict_envelope,
             strict_json_members=strict_json_members,
             on_envelope=on_envelope,
+            progress=progress,
         )
 
     def _command_error(
@@ -969,7 +1069,8 @@ def _raise_source_error(error: Exception) -> None:
 
 
 def _batch_outcome_row_weight(outcome: BatchOutcome) -> int:
-    return outcome.decoded_rows if isinstance(outcome, BatchSuccess) else 1
+    """Return the rows an outcome holds in the row budget: its result's rows, and at least its own one."""
+    return max(outcome.decoded_rows, 1) if isinstance(outcome, BatchSuccess) else 1
 
 
 __all__: list[str] = []

@@ -16,6 +16,7 @@ from b24api.batch.outcome import (
     BatchSuccess,
 )
 from b24api.batch.stream import _BatchOutcomeStream, batch_outcome_stream
+from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import (
     AmbiguityReason,
     ConsistencyPolicy,
@@ -33,9 +34,11 @@ from b24api.errors import (
     CapabilityError,
     FailurePhase,
     ProtocolError,
+    ResultTooLargeError,
     TransportError,
 )
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse
+from b24api.execution.facts import Execution, execution
 from tests.ledger_hold import LedgerHold
 from tests.scripting import (
     DEADLINE_BUDGET,
@@ -256,18 +259,21 @@ async def test_batch_list_result_uses_nested_decoded_row_weight() -> None:
         ).encode()
         return WireResponse(200, (("content-type", "application/json"),), body)
 
+    # The command ran: its result, longer than the row budget, is dropped as an answered failure, never lost.
     rejected = batch_outcome_stream(
         BatchExecutor(Executor(ResponderTransport(list_result))),
         [Request("profile", route=RouteKind.BARE)],
         batch_size=1,
         policy=ExecutionPolicy(max_buffered_rows=1),
     )
-    with pytest.raises(BudgetExceededError, match="buffer") as captured:
-        await anext(rejected)
-    assert attached_report(captured.value) is rejected.report
-    assert rejected.report.state is KernelState.FAILED
-    assert rejected.report.emitted_rows == 0
-    assert rejected.report.buffered_rows_high_water == 0
+    dropped = await anext(rejected)
+    assert isinstance(dropped, BatchFailure)
+    assert isinstance(dropped.error, ResultTooLargeError)
+    assert (dropped.error.rows, dropped.error.limit) == (NESTED_ROW_COUNT, 1)
+    assert execution(dropped.error) is Execution.ANSWERED
+    assert [item async for item in rejected] == []
+    assert rejected.report.state is KernelState.COMPLETED
+    assert rejected.report.buffered_rows_high_water == 1
 
     admitted = batch_outcome_stream(
         BatchExecutor(Executor(ResponderTransport(list_result))),
@@ -680,6 +686,32 @@ async def test_shared_batch_page_reservations_roll_back_when_admission_is_cancel
     assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.CANCELLED
     assert context._page_reservations == {}
+    # The chunk was read but never handed to a send: its commands, and any never read into it, were not executed.
+    assert [stream.settlement(index) for index in range(3)] == [CommandSettlement.NOT_EXECUTED] * 3
+
+
+@pytest.mark.asyncio
+async def test_a_batch_outcome_stream_settles_its_latest_chunk_from_its_outcomes_and_refuses_an_earlier_one() -> None:
+    # Two chunks of two commands, both answered and yielded: the latest chunk's commands settle from their outcomes,
+    # a command past it never joined a chunk, and one of the earlier chunk was already yielded with its outcome.
+    stream = _BatchOutcomeStream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))),
+        [Request(name, route=RouteKind.BARE) for name in ("one", "two", "three", "four")],
+        batch_size=2,
+        policy=ExecutionPolicy(),
+    )
+    async with stream:
+        outcomes = [outcome async for outcome in stream]
+
+    assert [outcome.command_index for outcome in outcomes] == [0, 1, 2, 3]
+    assert stream.chunk_start == 2  # noqa: PLR2004
+    assert [stream.settlement(index) for index in (2, 3, 4)] == [
+        CommandSettlement.SUCCESS,
+        CommandSettlement.SUCCESS,
+        CommandSettlement.NOT_EXECUTED,
+    ]
+    with pytest.raises(RuntimeError, match="earlier chunk"):
+        stream.settlement(1)
 
 
 @pytest.mark.asyncio

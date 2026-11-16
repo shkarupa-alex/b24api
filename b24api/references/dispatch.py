@@ -11,17 +11,17 @@ from enum import Enum
 from itertools import accumulate
 from typing import TYPE_CHECKING, cast
 
-from b24api.batch.engine import BatchExecutor
-from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.batch.engine import BatchExecutor, BatchProgress
+from b24api.batch.outcome import BatchFailure, BatchSuccess, settlement_of
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.report import PageDispatch
-from b24api.errors import B24ApiError, BudgetExceededError, CapabilityError, CleanupOverrunError
+from b24api.errors import BudgetExceededError, CapabilityError, CleanupOverrunError
 from b24api.execution import (
     ExecutionContext,
     Executor,
     WorkClass,
 )
-from b24api.execution.facts import Execution, execution, record_dispatch
+from b24api.execution.facts import settlement
 from b24api.references.outcome import (
     KernelReferenceFailure,
     KernelReferenceItem,
@@ -76,8 +76,10 @@ class _Hold(Enum):
     SETTLED_LEASE = "settled_lease"
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class _Reservation:
+    """Rows one binding holds in the pool; each is its own: the pool lists and removes it by identity."""
+
     index: int
     amount: int
     hold: _Hold = _Hold.IN_FLIGHT
@@ -253,24 +255,37 @@ class _PendingBatch:
     future: asyncio.Future[_DispatchedPage]
     admitted: asyncio.Future[None]
     settled: asyncio.Future[None]
-    dispatch_started: bool = False
     options: _DecodeOptions = _PLAIN_DECODING
     # The operation deadline of the page's admission; the send of its wave lifts it.
     admission: asyncio.Timeout | None = None
+    # Once its wave was handed to its send: where the page's command stands in that chunk, and its index there.
+    progress: BatchProgress | None = None
+    position: int = 0
 
-    def mark_sent(self) -> bool:
-        """Hand the page to its wave's send, lifting its admission deadline; ``False`` when it was abandoned.
+    def record(self, error: BaseException) -> None:
+        """Record on the page's ``error`` what its command is known to have done, if its wave was handed to its send.
 
-        A page whose fetch has ended (every way out of the fetch completes or cancels its future) or whose deadline
-        has expired is abandoned: no one waits for it, so it is not sent and stays proven not executed. The check
-        and the hand-over happen in one step of the event loop, so the fetch cannot end in between.
+        Its outcome in the chunk says, once final or once the chunk has ended; until then the chunk, which runs on
+        for the other pages, may still send it, so it may run (``BatchProgress``). A page never handed to a send
+        records nothing: it stays proven not executed.
+        """
+        if self.progress is not None:
+            self.progress.record(error, self.position)
+
+    def mark_sent(self, progress: BatchProgress, position: int) -> bool:
+        """Hand the page to its wave's send as command ``position`` of its chunk; ``False`` when it was abandoned.
+
+        The hand-over lifts its admission deadline. A page whose fetch has ended (every way out of the fetch
+        completes or cancels its future) or whose deadline has expired is abandoned: no one waits for it, so it is
+        not sent and stays proven not executed. The check and the hand-over happen in one step of the event loop,
+        so the fetch cannot end in between.
         """
         admission = self.admission
         if self.future.done() or (admission is not None and admission.expired()):
             return False
         if admission is not None:
             admission.reschedule(None)
-        self.dispatch_started = True
+        self.progress, self.position = progress, position
         return True
 
 
@@ -463,37 +478,72 @@ class _AdmissionState:
     changed: asyncio.Event
 
 
-class _BatchPageError(Exception):
-    def __init__(self, failure: BatchFailure) -> None:
-        self.failure = failure
-        super().__init__("batch page command failed")
-
-
-def _failed_execution(error: BaseException) -> Execution:
-    """Return what the facts say about a page whose dispatch raised, a batch page's from its command outcome."""
-    return execution(error.failure.error if isinstance(error, _BatchPageError) else error)
-
-
-def _failed_settlement(error: BaseException) -> CommandSettlement:
-    """Settle a page whose dispatch raised from its execution facts: possibly run, failed, or never sent."""
-    return _failed_execution(error).settlement
-
-
 @dataclass(frozen=True, slots=True)
-class _FailedDispatch:
-    dispatch: PageDispatch
-    batch_index: int | None
-    error: BaseException | None
+class _FailedPage:
+    """What a page whose dispatch raised reports, and how it settles, from what its command did.
+
+    Every reader of a failed page reads it through ``_failed_page``: the binding's failure and its replay
+    disposition, the page's settlement and trace, and a command failure that a wave or a tail takes as an outcome.
+    The settlement is the one fact of what the command did, and the trace's one input (``failed_page``): a page
+    that never executed, never sent, is not traced, and the settlement decides the code of every other page.
+    """
+
+    error: BaseException
+    settlement: CommandSettlement
+    # The command's own final outcome, when the batch answered or ended it: a failure of that command alone.
+    failure: BatchFailure | None = None
+    # The command's index in the physical batch it was handed to: its own outcome's, or its position in a chunk
+    # that failed as a whole; none for a page the dispatcher never handed to a batch.
+    batch_index: int | None = None
 
 
-def _failed_dispatch(dispatch: PageDispatch, error: BaseException) -> _FailedDispatch:
-    """Return the dispatch provenance and the reportable error of a page whose dispatch raised."""
-    if isinstance(error, _BatchPageError):
-        cause = error.failure.error
-        return _FailedDispatch(
-            dispatch, error.failure.command_index, cause if isinstance(cause, BaseException) else None
+class _SentPageError(Exception):
+    """The failure the batch dispatcher gives a page it handed to a batch: it carries the page's own facts."""
+
+    def __init__(self, message: str, page: _FailedPage) -> None:
+        self.page = page
+        super().__init__(message)
+
+
+class _BatchPageError(_SentPageError):
+    """A page whose command the batch answered, or ended, with its own failure (``failure``)."""
+
+    def __init__(self, failure: BatchFailure) -> None:
+        cause = failure.error
+        super().__init__(
+            "batch page command failed",
+            _FailedPage(
+                cause if isinstance(cause, BaseException) else self,
+                settlement_of(failure),
+                failure,
+                failure.command_index,
+            ),
         )
-    return _FailedDispatch(dispatch, None, None)
+
+
+class _ChunkPageError(_SentPageError):
+    """A page of a chunk that failed as a whole: it reports the chunk's ``error``, and keeps what its own command did.
+
+    The error is the chunk's, the same for every page of it; what each command did is its own, read where the chunk
+    stands when it fails (``BatchProgress``), as a page cancelled meanwhile records it.
+    """
+
+    def __init__(self, error: Exception, progress: BatchProgress, position: int) -> None:
+        super().__init__(
+            "batch page failed with its chunk",
+            _FailedPage(error, progress.settlement(position), batch_index=position),
+        )
+
+
+def _failed_page(error: BaseException) -> _FailedPage:
+    """Return a failed page's facts: those the dispatcher gave it, or those recorded on its failure.
+
+    A page the dispatcher handed to a batch carries its own; any other failure (a page cancelled after its wave
+    left, an admission refusal) has them recorded on it.
+    """
+    if isinstance(error, _SentPageError):
+        return error.page
+    return _FailedPage(error, settlement(error))
 
 
 class _RowBuffer:
@@ -501,8 +551,8 @@ class _RowBuffer:
 
     The rows each binding holds are counted per binding, and so are the rows of its accepted pages that
     wait for the consumer, so no check scans the reservations. A page that cannot reserve waits until a
-    change of the pool wakes it; an ordered pool wakes only the waiting pages that fit, nearest the
-    frontier first (``_serve``).
+    change of the pool wakes it; the pool wakes only the waiting pages that fit, an ordered pool nearest
+    the frontier first (``_serve``).
     """
 
     def __init__(
@@ -553,7 +603,7 @@ class _RowBuffer:
             raise BudgetExceededError("one decoded page exceeds the global row buffer")
         if self._closed:
             raise asyncio.CancelledError
-        if not self._can_reserve(index, amount):
+        if not self._can_reserve(index, amount, -self._promised):
             async with self.context.deadline("row buffer wait exceeded operation time budget"):
                 await self._wait_for_rows(index, amount)
         return self._take(index, amount, _Hold.IN_FLIGHT)
@@ -561,11 +611,14 @@ class _RowBuffer:
     async def _wait_for_rows(self, index: int, amount: int) -> None:
         """Wait until ``amount`` rows fit for binding ``index``; the caller takes them in the same step.
 
-        A page that stops waiting, by cancellation or by the elapsed budget, leaves the queue. If it was
-        woken already, the rows promised to it go back to the others and the next waiting pages that fit
-        are woken; a page never woken blocked no other, as each one's turn depends on the rows alone.
+        Rows promised to a woken page are its own until it resumes: no other page and no lease takes them. A
+        woken page that no longer fits when it resumes, as an ordered pool's rooms changed meanwhile, waits
+        again and gives its promise to the waiting pages it serves. A page that stops waiting, by
+        cancellation or by the elapsed budget, leaves the queue, and if it was woken already gives its
+        promise back the same way; a page never woken blocked no other, as each one's turn depends on the
+        rows alone.
         """
-        while not self._can_reserve(index, amount):
+        while not self._can_reserve(index, amount, -self._promised):
             waiter = _Waiter(index, amount, asyncio.get_running_loop().create_future())
             if self._ordered:
                 insort(self._waiters, waiter, key=_waiter_index)
@@ -584,12 +637,16 @@ class _RowBuffer:
             self._promised -= amount
             if self._closed:
                 raise asyncio.CancelledError
+            if not self._can_reserve(index, amount, -self._promised):
+                self._changed()
 
     def _take(self, index: int, amount: int, hold: _Hold) -> _Reservation:
         self._available -= amount
         self._held[index] += amount
         reservation = _Reservation(index, amount, hold)
-        self._reservations.append(reservation)
+        if amount:
+            # Only a reservation holding rows is listed: a page charged to a lease holds none to give back.
+            self._reservations.append(reservation)
         return reservation
 
     def _give_back(self, reservation: _Reservation) -> int:
@@ -606,22 +663,21 @@ class _RowBuffer:
     def _serve(self) -> None:
         """Wake the waiting pages that may take their rows now; each checks again once its task resumes.
 
-        An unordered pool wakes every page, in the order they came: each check is a count, and the pages
-        a READY consumer receives depend on which of them takes the rows first. An ordered pool keeps
-        free the room of the producers nearer the frontier, which costs more to check, so it wakes only
-        the pages whose rows are free beyond those the pages already woken will take, in binding order. A
-        page behind the frontier that does not fit ends the pass: a later page keeps free the room of
-        every producer between the frontier and it, that page's room included, which covers that page's
-        rows, so it does not fit either.
+        A page is woken only for rows free beyond those the pages already woken will take, so a release
+        wakes no page that would find its rows gone. An unordered pool wakes the pages that fit in the
+        order they came. An ordered pool keeps free the room of the producers nearer the frontier, in
+        binding order: a page behind the frontier that does not fit ends the pass, as a later page keeps
+        free the room of every producer between the frontier and it, that page's room included, which
+        covers that page's rows, so it does not fit either.
         """
         position, stop_after = 0, None
-        while position < len(self._waiters):
+        while position < len(self._waiters) and self._available > self._promised:
             waiter = self._waiters[position]
             if stop_after is not None and waiter.index > stop_after:
                 return
             if waiter.woken.done():
                 del self._waiters[position]
-            elif not self._ordered or self._can_reserve(waiter.index, waiter.amount, -self._promised):
+            elif self._can_reserve(waiter.index, waiter.amount, -self._promised):
                 del self._waiters[position]
                 self._promised += waiter.amount
                 waiter.woken.set_result(None)
@@ -730,7 +786,7 @@ class _RowBuffer:
         _reduce(self._held, reservation.index, unused)
         if actual:
             self._queued[reservation.index] += actual
-        else:
+        elif unused:
             self._reservations.remove(reservation)
         self._changed()
         self._touch()
@@ -751,7 +807,8 @@ class _RowBuffer:
             self._reservations.remove(reservation)
         self._changed()
         if self._ordered and reservation.hold is _Hold.QUEUED and self._producer_state is not None:
-            # The drain projection counts these rows already, whether queued or free.
+            # Freed rows wake the producers and waves waiting for room; the drain projection counts a queued page's
+            # rows already, so this wakes them without a fact change that would make a coalescing wave project again.
             self._producer_state.progress()
         else:
             self._touch()
@@ -770,7 +827,8 @@ class _RowBuffer:
     async def lease(self, index: int, grant: Callable[[int], int | None]) -> _Reservation:
         """Hold one capacity until terminal, never grown; ``grant`` sizes it from the free rows or asks to wait.
 
-        ``grant`` runs with no await between its decision and the reservation, so the two are atomic. It
+        ``grant`` sees the free rows not promised to a woken page, and runs with no await between its decision
+        and the reservation, so the two are atomic. It
         may raise to refuse a lease no releaser can ever satisfy. An ordered pool asks it only once no
         earlier binding waits for a lease. A binding leaving the wait, with a lease or without one,
         wakes the others: whether it still waits decides whether a later binding may take rows.
@@ -780,13 +838,14 @@ class _RowBuffer:
             while True:
                 if self._closed:
                     raise asyncio.CancelledError
-                amount = None if self._behind_lease_waiter(index) else grant(self._available)
+                free = self._available - self._promised
+                amount = None if self._behind_lease_waiter(index) else grant(free)
                 if amount is not None:
                     break
                 wake: asyncio.Future[None] = asyncio.get_running_loop().create_future()
                 self._lease_waiters.append(wake)
                 await wake
-            if isinstance(amount, bool) or not 0 < amount <= self._available:
+            if isinstance(amount, bool) or not 0 < amount <= free:
                 raise RuntimeError("fast keyset lease exceeds the free row pool")
             return self._take(index, amount, _Hold.LEASE)
         finally:
@@ -874,8 +933,7 @@ class _DirectPageDispatcher:
     ) -> None:
         self.executor = executor
         self.context = context
-        concurrency = min(plan.concurrency, context.policy.max_direct_concurrency)
-        self._semaphore = asyncio.Semaphore(concurrency)
+        self._semaphore = asyncio.Semaphore(plan.concurrency)
         self.batch_requests = 0
         self.batch_commands = 0
 
@@ -929,9 +987,8 @@ class _BatchPageDispatcher:
         self._queue: asyncio.Queue[_PendingBatch] = asyncio.Queue(
             maxsize=context.policy.max_active_references,
         )
-        concurrency = min(self.plan.concurrency, self.context.policy.max_active_references)
-        self._send_queue: asyncio.Queue[list[_PendingBatch]] = asyncio.Queue(maxsize=concurrency)
-        self._send_slots = asyncio.Semaphore(concurrency)
+        self._send_queue: asyncio.Queue[list[_PendingBatch]] = asyncio.Queue(maxsize=plan.concurrency)
+        self._send_slots = asyncio.Semaphore(plan.concurrency)
         self._producer_state = producer_state
         self._buffer = buffer
         self._page_cap = page_cap
@@ -983,9 +1040,8 @@ class _BatchPageDispatcher:
         except asyncio.CancelledError as error:
             future.cancel()
             self._abandon(pending, reservation)
-            if pending.dispatch_started:
-                # A page cancelled after its wave was sent may have executed; settlement must say so.
-                record_dispatch(error, possibly_executed=True)
+            # A page cancelled after its wave was sent may have executed: what its command did says how.
+            pending.record(error)
             raise
         except BaseException:
             # A refusal by the deadline included: a page whose wave was sent no longer has one, so it was never sent.
@@ -1023,9 +1079,8 @@ class _BatchPageDispatcher:
     def _ensure_workers(self) -> None:
         if self._assembler is not None:
             return
-        concurrency = min(self.plan.concurrency, self.context.policy.max_active_references)
         self._assembler = asyncio.create_task(self._run())
-        senders = tuple(asyncio.create_task(self._send_run()) for _index in range(concurrency))
+        senders = tuple(asyncio.create_task(self._send_run()) for _index in range(self.plan.concurrency))
         self._workers = (self._assembler, *senders)
 
     async def _run(self) -> None:  # noqa: C901, PLR0912, PLR0915
@@ -1211,7 +1266,7 @@ class _BatchPageDispatcher:
         """Count one physical batch envelope the chunk sends in its first round."""
         self.batch_requests += 1
 
-    async def _send(self, chunk: list[_PendingBatch]) -> None:
+    async def _send(self, chunk: list[_PendingBatch], progress: BatchProgress) -> None:
         requests = tuple(item.request for item in chunk)
         self.batch_commands += len(chunk)
         options = chunk[0].options
@@ -1223,6 +1278,7 @@ class _BatchPageDispatcher:
                 strict_envelope=options.strict_envelope,
                 strict_json_members=options.strict_json_members,
                 on_envelope=self._count_batch_request,
+                progress=progress,
             )
             self._correlate(chunk, outcomes)
         except asyncio.CancelledError:
@@ -1230,13 +1286,12 @@ class _BatchPageDispatcher:
                 item.future.cancel()
             raise
         except Exception as error:  # noqa: BLE001 - total chunk correlation boundary
-            if not isinstance(error, B24ApiError):
-                # A failure the engine did not classify may come after the wave left: a sent page no longer has a
-                # deadline to end its wait, so it fails with this error as possibly run.
-                record_dispatch(error, possibly_executed=True)
-            for item in chunk:
+            # Every page fails with the chunk's error and keeps what its own command did, which the chunk's
+            # progress says at the page's position, whatever failed: a sent page no longer has a deadline to end
+            # its wait.
+            for position, item in enumerate(chunk):
                 if not item.future.done():
-                    item.future.set_exception(error)
+                    item.future.set_exception(_ChunkPageError(error, progress, position))
 
     @staticmethod
     def _correlate(chunk: list[_PendingBatch], outcomes: tuple[BatchOutcome, ...]) -> None:
@@ -1277,9 +1332,12 @@ class _BatchPageDispatcher:
                 self._producer_state.touch()
             try:
                 # Only pages whose fetch still waits are sent; an abandoned one was never sent and settles so.
-                live = [item for item in chunk if item.mark_sent()]
+                progress, live = BatchProgress(), list[_PendingBatch]()
+                for item in chunk:
+                    if item.mark_sent(progress, len(live)):
+                        live.append(item)
                 if live:
-                    await self._send(live)
+                    await self._send(live, progress)
                     self._settling_waves += 1
                     settlement_worker = asyncio.create_task(self._wait_for_settlement(live))
                     self._settlement_workers.add(settlement_worker)

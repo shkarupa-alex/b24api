@@ -692,8 +692,9 @@ async def test_input_order_rejects_oversized_whole_result_behind_blocked_head() 
         ),
     )
     first = asyncio.create_task(anext(stream))
-    await head_started.wait()
-    await later_started.wait()
+    async with asyncio.timeout(HANG_BOUND):
+        await head_started.wait()
+        await later_started.wait()
     for _ in range(10):
         await asyncio.sleep(0)
     snapshot = await stream._scheduler.context.snapshot()  # noqa: SLF001 - bounded retention regression
@@ -701,12 +702,14 @@ async def test_input_order_rejects_oversized_whole_result_behind_blocked_head() 
     assert snapshot.counters.buffered_rows_high_water == 0
 
     release_head.set()
-    head = await first
+    async with asyncio.timeout(HANG_BOUND):
+        head = await first
     assert isinstance(head, KernelReferenceItem)
     assert head.reference_key == "head"
 
     with pytest.raises(ResultTooLargeError, match="decoded result of 10 rows") as captured:
-        await anext(stream)
+        async with asyncio.timeout(HANG_BOUND):
+            await anext(stream)
     assert execution(captured.value) is Execution.ANSWERED
     assert stream.report.buffered_rows_high_water == 1
 

@@ -8,7 +8,7 @@ from b24api._sources import OwnedSource
 from b24api.batch.engine import BatchExecutor, _batch_outcome_row_weight, _BatchInput, _BatchItem, _Chunk
 from b24api.batch.outcome import BatchFailure as KernelFailure
 from b24api.batch.outcome import BatchSuccess as KernelSuccess
-from b24api.batch.stream import _next_chunk
+from b24api.batch.stream import _next_chunk, _within_row_budget
 from b24api.completion.reference_recorder import ReferenceCompletionRecorder
 from b24api.contracts.command import (
     Command,
@@ -37,7 +37,7 @@ from b24api.execution import (
     AsyncIteratorController,
     Executor,
 )
-from b24api.execution.facts import Execution, ambiguity_of, dropped_result, execution
+from b24api.execution.facts import Execution, ambiguity_of, execution, settlement
 from b24api.execution.lifecycle import (
     CleanupAttempt,
     LifecycleHooks,
@@ -98,40 +98,6 @@ class _BatchWindowError(Exception):
             carried.__cause__ = source_error
         self.report_cause: BaseException = carried if carried is not None else self
         super().__init__("logical batch physical window failed")
-
-
-def _within_row_budget(
-    outcomes: tuple[KernelSuccess | KernelFailure, ...], max_rows: int
-) -> tuple[KernelSuccess | KernelFailure, ...]:
-    """Fit a window's decoded results into the row budget; a result that does not fit is dropped, never delivered.
-
-    The window has run when its rows are known, so the budget can no longer refuse to send it; it bounds what the
-    stream holds. Each outcome holds one row (a window never has more commands than the budget has rows), and a
-    success also holds the rest of its result's rows while they fit what the budget has left, in window order. A
-    success whose rows do not fit becomes a failure that keeps the execution facts: the command ran and was
-    answered (``dropped_result``), so it is neither a success, nor proven not run, nor replayed.
-    """
-    left = max_rows - len(outcomes)
-    fitted: list[KernelSuccess | KernelFailure] = []
-    for outcome in outcomes:
-        extra = _batch_outcome_row_weight(outcome) - 1
-        if not isinstance(outcome, KernelSuccess) or extra <= left:
-            left -= max(extra, 0)
-            fitted.append(outcome)
-            continue
-        request = outcome.request
-        fitted.append(
-            KernelFailure(
-                outcome.command_index,
-                outcome.stable_key,
-                request,
-                dropped_result(rows=outcome.decoded_rows, limit=left + 1, request_summary=request.summary),
-                replay_safety=request.replay_safety,
-                correlation=outcome.correlation,
-                evidence=outcome.evidence,
-            )
-        )
-    return tuple(fitted)
 
 
 def _public_outcomes(outcomes: tuple[KernelSuccess | KernelFailure, ...]) -> tuple[CommandOutcome[object], ...]:
@@ -238,7 +204,7 @@ class LogicalBatchKernelStream[C]:
         elif isinstance(outcome, CommandNotExecuted):
             binding.settled(CommandSettlement.NOT_EXECUTED)
         else:
-            binding.settled(execution(outcome.error).settlement)
+            binding.settled(settlement(outcome.error))
 
     def _finish_outcome(self, outcome: CommandOutcome[object]) -> None:
         binding = self._completion.binding(outcome.index)

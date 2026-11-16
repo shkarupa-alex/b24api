@@ -42,21 +42,78 @@ Whether a command may have run is one execution fact, recorded on its failure by
 withheld it: the executor for its own sends, the classic and REST v3 batch dialects for the commands of
 an envelope they decode, and the batch page dispatcher of references and list traversal for a page
 cancelled after its wave was sent. A page whose fetch ended before its wave left, cancelled or past its
-admission deadline, is never sent, so it stays proven not run. `b24api.execution.facts` holds the one
+admission deadline, is never sent, so it stays proven not run. A caller whose wait for a running chunk
+ends early (a cancelled page, or a fast keyset wave the traversal's end interrupts), and every page of a
+chunk that fails as a whole (it reports the chunk's error), reads what each of its commands did from the chunk's `BatchProgress`, which the batch engine keeps by the same rule: a
+command answered, by its entry or with its envelope, was answered, and one answered with a success
+succeeded; one whose latest send, or one before it, may have run without an answer may have run; one
+never sent was not sent. Until the chunk ends, a command without a final outcome may still be sent (a replay
+it waits for), so a page cancelled meanwhile may have run; a REST v3 group keeps its state to itself, so its
+commands in progress may have run. A fast keyset wave engine, flat or shared by reference bindings, settles
+each page it was handed by its command id from what that command did, also when its call raises; the page
+ledger (`FastPageLedger`) settles a page never handed to an engine as not executed, which retires it, the one
+rule on every path. A page answered with a success settles as a success on every path, a page the traversal
+stops before included: the facts recorded on a cancelled reference page keep that its command succeeded
+(`facts.settlement`), and a counted tail, reference or flat, settles each page it read but will not consume
+from what its command did, the flat one from the state of the batch it joined
+(`_BatchOutcomeStream.settlement`): its outcome once answered, its `BatchProgress` while sent, not executed
+while only read, and not executed when its pull was cut short before it joined one: answered with a success, a
+success, rejected as `transaction_aborted`; never sent, not executed; unknown only when it may have run. One
+rule, `facts.settled_as`, gives a command's settlement from what it is known to have done and whether it
+succeeded; its callers only read those two facts from what they hold: a failure's recorded facts
+(`facts.settlement`), a final batch outcome (`batch.outcome.settlement_of`), a command of a running chunk
+(`BatchProgress.settlement`) and a shared wave's dispatch task. `b24api.execution.facts` holds the one
 mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
-(`Execution.settlement`), and `b24api.traversal.page_failure` maps it to a failed page's trace: unknown
-only when it may have run, otherwise rejected. Classic and REST v3 batch, `call()`, direct and batch
-fan-out, references and list traversal all use them, and none of them chooses from the exception type,
-which names the cause of a failure and never proves that a command did not run. A sent command is
-unknown unless a listed refusal proves it did not run or a conclusive answer settles it. A conclusive
-answer is a structured Bitrix error, top-level or found in the result by the command's own contract, or
-any status outside 2xx that the ambiguity policy does not hold ambiguous, whatever its body, so a
-malformed error body on such a status is conclusive too. A REST v3 batch envelope is the one exception:
-a top-level structured error on it is an abort, which may come after some of its commands ran, so it
-settles none of them; a command is answered only by its own element or its own isolated send, or proven
-not run by a transport failure that proves the envelope was not accepted or a listed refusal status of
-the envelope. A 2xx answer the client cannot decode settles nothing, whichever part is malformed: the
-envelope, a command's paging metadata or its embedded error.
+(`Execution.settlement`), and `b24api.traversal.page_failure` holds the one rule of a failed page's
+trace, from its settlement alone: a page that never executed because it was never sent (traversals never
+halt a batch, so no sent command is withheld) leaves no request to record and is not traced, whatever kept
+it from its send (the budget, a closed client, a cancellation); the settlement decides the code of every
+other failed page the traversal records. That page is unknown only when it may have run, otherwise
+rejected; a page whose own command succeeded is rejected as `transaction_aborted`, the code of a page
+dropped with the unit around it, not as a `command_failure`, and its completion record retires it with the same
+code (`PageRejected`), as it retires a page the traversal read but never consumed. One function couples the
+two (`page_failure.rejection_reason`): the driver and the keyset runtime both retire a page they trace as
+rejected with the trace's code. Whatever ended the page
+decides nothing: a page cancelled on the wire may have run and is traced unknown, as one whose answer was lost.
+A traversal records the failed page it stops
+at, not every page its failure leaves behind: a counted tail stops at a binding's first failed page in
+offset order, and the binding's later pages, sent or not, are settled and released without a trace record.
+A page's trace and its settlement read the same fact, the page's own: for a page of a chunk that failed as
+a whole, its command's in the chunk's `BatchProgress`. Every failure the batch page dispatcher gives a page
+it handed to a batch carries those facts (`_FailedPage`: what it reports, how it settles, and the command's
+own failure when the batch answered or ended it), and every caller reads a failed page through one function
+(`_failed_page`), which falls back to the facts recorded on any other failure: the binding's failure, a page's
+settlement and trace, and a wave or a counted tail that takes a command's own failure as its outcome.
+`page_failure.failed_page` alone decides whether a failed page is traced and how, for `record_failed_page` and
+for keyset's `classify_rejection`. Both counted tails, reference and flat, hand the tail's one trace site a
+receipt for every failed page they reach, sent or never sent, with its command's own failure or its whole
+chunk's, and that site traces it by `failed_page` alone. A page sent with a chunk that failed as a whole (its
+batch failed, or its answer could not be decoded) is traced as its settlement says, with its position in that
+chunk as its `batch_index`, on every path that sends one: the reference dispatcher's `_FailedPage`, the flat
+tail's stream (`failed_chunk`: the traversal stops at that chunk's first page, the one it traces) and a keyset
+engine whose wave or finish call failed (`failed_pages`: each page's settlement and index, which the keyset
+transaction traces by `failed_page`, a direct finish page with no index). Each of them remembers every call
+that raised, a cancelled one included, and none filters by the exception's type. A reference binding's trace
+reaches the operation's report only through the events its consumer reads: when the consumer is cancelled, it
+reads no more, so a reference binding's pages, settled as their commands did, are not traced, whatever path
+they took (sequential, counted or keyset). A page's `batch_index` is
+its command's index in the physical batch it was submitted with (sent with, or handed to), as its command's
+outcome carries it, on every path: a keyset wave or finish page of a reference binding shares that batch with
+other bindings' commands, so its index in its own binding's wave is not one. The index is also the command's
+key in that batch's envelope, which every replay send of the command keeps: a page replayed alone, or with
+fewer commands, keeps the index of the batch it was first submitted with, whichever send's answer settled it.
+A page with no batch command to point to, such as a direct page, has none. Classic and REST v3 batch,
+`call()`, direct and batch fan-out, references and list traversal all use them, and none of them chooses from
+the exception type, which names the cause of a failure and never proves that a command did not run. A sent
+command is unknown unless a listed refusal proves it did not run or a conclusive answer settles it. A
+conclusive answer is a structured Bitrix error, top-level or found in the result by the command's own
+contract, or any status outside 2xx that the ambiguity policy does not hold ambiguous, whatever its body, so a
+malformed error body on such a status is conclusive too. A REST v3 batch envelope is the one exception: a
+top-level structured error on it is an abort, which may come after some of its commands ran, so it settles
+none of them; a command is answered only by its own element or its own isolated send, or proven not run by a
+transport failure that proves the envelope was not accepted or a listed refusal status of the envelope. A 2xx
+answer the client cannot decode settles nothing, whichever part is malformed: the envelope, a command's paging
+metadata or its embedded error.
 
 A command keeps one send lineage across executor retries, classic batch replay rounds and REST v3
 isolation: what the sends it was in left open. The commands a REST v3 envelope group still resolves are
@@ -101,9 +158,9 @@ outcome.
   client-wide ceiling: the permits of the client's shared rate coordinator,
   `Settings.max_concurrent_requests`. An operation's limits only narrow it.
 - The row budget bounds what an operation holds, not what it sends: a result's rows are known only
-  after its command ran. A logical batch fits a window's results into `max_buffered_rows` in input
-  order (`_within_row_budget`), and the reference scheduler fits each page into the rows reserved for
-  it before the page is accepted. A result that does not fit is dropped, and its command fails with
+  after its command ran. A logical batch and a counted traversal's tail fit a window's results into
+  `max_buffered_rows` in input order (`_within_row_budget`), and the reference scheduler fits each
+  page into the rows reserved for it before the page is accepted. A result that does not fit is dropped, and its command fails with
   `ResultTooLargeError`, recorded answered by `b24api.execution.facts.dropped_result`: a failure that
   ran, never one proven not run. A page's wait for row capacity (`_RowBuffer.reserve`) is bounded by
   the operation's elapsed budget, as every other dispatch wait is. A binding's wait for the consumer is
@@ -193,6 +250,14 @@ outcome.
   through `asyncio`, every `BudgetExceededError` constructed), which a site written otherwise passes. The refusals of one request while time is left, for a
   coordinator hold or a retry delay its window cannot carry, or a send that may not be repeated left
   less window than its wait, record nothing. `ExecutionContext.refusal` keeps the first recorded refusal's message.
+  Whether an error is the operation's refusal, which ends it, is told by its mark, not by its text or its type:
+  the mark is a value unique to the context, so it survives a copy or a pickle round trip of the error, and
+  the context marks every error it raises as such (`operation_refusal`, from `_refuse`, `admit_request`,
+  `raise_if_refused` and the source pull; a replay round's stopped commands end with that refusal or a copy
+  of it, which keeps its mark), and `ExecutionContext.ended_by` is the one check, used by the
+  reference scheduler's source pull, the batch window's pull, the counted tail and the fast keyset
+  commands. Every later work the budget refuses names its own work but is that same end; a request's own
+  refusal or a dropped result is not marked and fails its work alone.
   `AsyncIteratorController.get`, the one source pull of the batch streams, refuses further input once
   a send was refused or the deadline has passed, so the operation ends with `BudgetExceededError`; the
   commands a batch window read before such a pull are sent as any window is, the budget refusing each,
@@ -267,8 +332,12 @@ consumer drains. The pool counts the rows each binding holds, and those of its q
 binding, and sums the producers' rooms in binding order, so a check scans no reservation. A page that
 cannot reserve waits in binding order; a change of the pool wakes only the waiting pages that fit,
 nearest the frontier first, and stops at the first page behind the frontier that does not fit, since
-every later page keeps more room free. Under `READY` delivery a change wakes every waiting page, whose
-check is a count. A counted binding reads its head and its known tail offsets as ordinary pages of
+every later page keeps more room free. Under `READY` delivery a page's check is a count, and a change
+wakes the waiting pages that fit in the order they came. Under both, a page is woken only for rows free
+beyond those promised to the pages already woken and not yet resumed, so a release wakes the pages its
+rows serve, not every waiting page. Promised rows are the woken page's own: no page or lease asking
+later takes them, and a woken page that no longer fits when it resumes (the frontier's reserve grew)
+waits again and wakes the waiting pages its promise serves. A counted binding reads its head and its known tail offsets as ordinary pages of
 that pool and commits them in offset order. A fast or automatic keyset binding instead holds one row
 lease from activation to its
 terminal event. Its runtime plans and fits every wave against a view of the operation policy that

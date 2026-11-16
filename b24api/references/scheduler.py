@@ -5,7 +5,7 @@ import asyncio
 import functools
 from dataclasses import replace
 from inspect import isawaitable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from b24api.completion.reference_recorder import ReferenceCompletionRecorder
 from b24api.contracts.completion import BindingClosure, CommandSettlement
@@ -28,14 +28,11 @@ from b24api.references.dispatch import (
     ReferenceStreamItem,
     _AdmissionState,
     _BatchPageDispatcher,
-    _BatchPageError,
     _DirectPageDispatcher,
     _DispatchedPage,
     _DoneEvent,
     _Event,
-    _failed_dispatch,
-    _failed_execution,
-    _failed_settlement,
+    _failed_page,
     _FailureEvent,
     _Hold,
     _KernelFanOutSuccess,
@@ -46,6 +43,7 @@ from b24api.references.dispatch import (
     _RowBuffer,
     _Work,
 )
+from b24api.references.dispatch_plan import bound_dispatch
 from b24api.references.keyset_run import run_fast_keyset
 from b24api.references.outcome import (
     KernelReferenceFailure,
@@ -119,10 +117,10 @@ class ReferenceScheduler:
         fast: FastKeysetProgram | None = None,
         keyset_selection: KeysetSelectionSummary | None = None,
     ) -> None:
-        """Initialize instance state."""
+        """Initialize instance state; the dispatch plan is bounded here by the operation policy, once for every path."""
         self.executor = executor
         self.plan = plan
-        self.dispatch = dispatch
+        self.dispatch = dispatch = bound_dispatch(dispatch, policy)
         self.selector = selector
         self.identity = identity
         self.output_order = output_order
@@ -315,7 +313,7 @@ class ReferenceScheduler:
     ) -> None:
         """Read and admit bindings until the source ends: read out, or closed by the budget's refusal.
 
-        A pull the operation's budget refuses (``ExecutionContext.refusal``: the request budget refused a send, or
+        A pull the operation's budget refuses (``ExecutionContext.ended_by``: the request budget refused a send, or
         the deadline passed before the pull or while it ran; once either has refused work, it refuses every later
         pull) ends the source as a read-out source ends, although the source's end was not read, so the operation
         cannot complete. The producer's own task ends without error either way, so a fail-fast window's failure
@@ -337,7 +335,7 @@ class ReferenceScheduler:
                     await self._end_source(admission)
                     return
                 except BaseException as error:
-                    if isinstance(error, BudgetExceededError) and self.context.refusal is not None:
+                    if self.context.ended_by(error):
                         await self._end_source(admission)
                         return
                     self._clear_pending_pull()
@@ -374,8 +372,8 @@ class ReferenceScheduler:
     def _raise_if_budget_refused(self) -> None:
         """End the operation with its budget once every binding read is settled, if the budget refused work.
 
-        The budget's own record (``ExecutionContext.refusal``) decides, whether the source was read out before the
-        refusal or closed by it.
+        The refusal the budget recorded (``ExecutionContext.raise_if_refused``) decides, whether the source was read
+        out before the refusal or closed by it.
         """
         self.context.raise_if_refused()
 
@@ -430,11 +428,13 @@ class ReferenceScheduler:
                 await self._drive(run, pages)
         except asyncio.CancelledError:
             raise
-        except _BatchPageError as error:
-            failure = self._failure_event(run, cast("BaseException", error.failure.error))
-            await self.publish_terminal(run, replace(failure, replay_disposition=error.failure.replay_disposition))
         except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
-            await self.publish_terminal(run, self._failure_event(run, error))
+            # The binding fails with what its failed page reports, and its command's replay disposition, if any.
+            failed = _failed_page(error)
+            event = self._failure_event(run, failed.error)
+            if failed.failure is not None:
+                event = replace(event, replay_disposition=failed.failure.replay_disposition)
+            await self.publish_terminal(run, event)
         finally:
             try:
                 if pages is not None:
@@ -654,16 +654,15 @@ class ReferenceScheduler:
         try:
             dispatched = await self.dispatch_page(run, request)
         except BaseException as error:
-            run.completion.settled(_failed_settlement(error))
+            failed = _failed_page(error)
+            run.completion.settled(failed.settlement)
             await self.abandon_page(run)
-            if _failed_execution(error).dispatched:
-                failed = _failed_dispatch(self.page_dispatch, error)
-                run.driver.set_page_dispatch(dispatch=failed.dispatch, batch_index=failed.batch_index)
-                run.driver.record_failed_page(
-                    dispatch=failed.dispatch,
-                    batch_index=failed.batch_index,
-                    error=failed.error or error,
-                )
+            run.driver.record_failed_page(
+                dispatch=self.page_dispatch,
+                batch_index=failed.batch_index,
+                error=failed.error,
+                settled=failed.settlement,
+            )
             raise
         run.driver.set_page_dispatch(dispatch=dispatched.dispatch, batch_index=dispatched.batch_index)
         run.completion.settled(CommandSettlement.SUCCESS)
@@ -682,6 +681,7 @@ class ReferenceScheduler:
                     rows=page.retained_rows,
                     limit=run.reservation.amount,
                     request_summary=run.work.reference.request.summary,
+                    evidence=page.response.evidence,
                 )
             await self.buffer.accept(run.reservation, page.retained_rows)
 

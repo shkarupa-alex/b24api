@@ -50,12 +50,13 @@ class BatchDispatch:
     ``concurrency`` is a ceiling of this operation alone: the batches in flight are also bounded by the policy's
     ``max_active_references`` and by ``Settings.max_concurrent_requests``, which the client's operations share;
     the smallest applies. ``ExecutionPolicy.max_direct_concurrency`` does not limit them. The commands a REST 3.0
-    isolation re-sends one by one are not batches: only ``Settings.max_concurrent_requests`` bounds them. A fan-out
-    divides ``max_buffered_rows`` among the commands of every batch it may keep in flight (``batch_size`` times that
-    smallest limit, at most ``max_active_references``), so a wider ``concurrency`` gives each command a smaller
-    result limit: 312 rows under ``batch_size=1, concurrency=8``. While the budget holds a full 50-row portal page
-    per command of one batch, the limit never drops below a page: the row budget then holds back the batches beyond
-    it, so the defaults, ``concurrency=2`` and ``batch_size=20, concurrency=4`` all keep 50 rows.
+    isolation re-sends one by one are not batches: only ``Settings.max_concurrent_requests`` bounds them. A batch
+    holds at most ``batch_size`` commands and at most the policy's ``max_buffered_commands``: the smaller applies. A
+    fan-out divides ``max_buffered_rows`` among the commands of every batch it may keep in flight (that batch size
+    times the smallest concurrency limit, at most ``max_active_references``), so a wider ``concurrency`` gives each
+    command a smaller result limit: 312 rows under ``batch_size=1, concurrency=8``. While the budget holds a full
+    50-row portal page per command of one batch, the limit never drops below a page: the row budget then holds back
+    the batches beyond it, so the defaults, ``concurrency=2`` and ``batch_size=20, concurrency=4`` all keep 50 rows.
     """
 
     batch_size: int = PORTAL_BATCH_CAP

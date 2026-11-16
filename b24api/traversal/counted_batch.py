@@ -185,10 +185,12 @@ class CountedBatchStrategy:
             failed = io.head_failure(error)
             if recorder is not None:
                 recorder.settled(failed.settlement)
-            if failed.dispatch_started:
-                report_error = failed.error if failed.error is not None else error
-                ctx.set_page_dispatch(dispatch=failed.dispatch, batch_index=failed.batch_index)
-                ctx.record_failed_page(dispatch=failed.dispatch, batch_index=failed.batch_index, error=report_error)
+            ctx.record_failed_page(
+                dispatch=failed.dispatch,
+                batch_index=failed.batch_index,
+                error=failed.error if failed.error is not None else error,
+                settled=failed.settlement,
+            )
             raise
         if recorder is not None:
             recorder.settled(attempt.settlement)
@@ -264,9 +266,14 @@ class CountedBatchStrategy:
             async for page in continuation:
                 yield page
 
+    @property
+    def _tail_starts(self) -> range:
+        """Return the offset of every tail page: the requests, their count and each receipt's offset come from it."""
+        return range(self._stride, self._total, self._stride)
+
     def _tail_requests(self, ctx: StrategyContext) -> Iterator[_BatchInput]:
         recorder = ctx.completion_recorder
-        for start in range(self._stride, self._total, self._stride):
+        for start in self._tail_starts:
             if isinstance(recorder, CountedCompletionRecorder):
                 recorder.reserve()
             yield _BatchInput(self._page_request(ctx, start))
@@ -275,7 +282,7 @@ class CountedBatchStrategy:
         """Stream the dense tail and close it, keeping the primary failure over a cleanup failure."""
         tail = io.open_tail(
             self._tail_requests(ctx),
-            pages=len(range(self._stride, self._total, self._stride)),
+            pages=len(self._tail_starts),
             batch_size=batch_size,
             policy=ctx.context.policy,
             context=ctx.context,
@@ -303,17 +310,17 @@ class CountedBatchStrategy:
         receipt: TailReceipt,
     ) -> tuple[Response, tuple[FrozenJson, ...], bool]:
         """Validate one tail page against the planned exact range, or record its rejection."""
-        failure = receipt.failure
         tail.settle(receipt)
-        start = self._stride * (receipt.ordinal + 1)
+        start = self._tail_starts[receipt.ordinal]
         ctx.schedule_page(offset=start, dispatch=PageDispatch.BATCH, batch_index=receipt.batch_index)
-        if failure is not None:
-            error = failure.error
-            recorded = (
-                error if isinstance(error, BaseException) else CapabilityError("parallel counted batch command failed")
+        if receipt.error is not None:
+            ctx.record_failed_page(
+                dispatch=PageDispatch.BATCH,
+                batch_index=receipt.batch_index,
+                error=receipt.error,
+                settled=receipt.settlement,
             )
-            ctx.record_failed_page(dispatch=PageDispatch.BATCH, batch_index=receipt.batch_index, error=recorded)
-            raise tail.failure(receipt, failure)
+            raise tail.failure(receipt)
         response, total, stride = receipt.response, self._total, self._stride
         if response is None:
             raise CapabilityError("parallel counted batch outcome lacks correlated response evidence")

@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from b24api import BatchDispatch, BatchFailed, ExecutionPolicy, ReplaySafety, Request, RetryPolicy, RouteKind
-from b24api.batch.engine import BatchExecutor
+from b24api.batch.engine import BatchExecutor, BatchProgress
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts import (
     AmbiguityReason,
@@ -45,7 +45,7 @@ from b24api.errors import (
 )
 from b24api.execution import Executor, RateCoordinator, WorkClass
 from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
-from b24api.execution.facts import execution
+from b24api.execution.facts import Execution, execution
 from b24api.references.dispatch import _KernelFanOutSuccess
 from b24api.references.fanout import kernel_fanout_stream
 from b24api.references.outcome import KernelReferenceFailure
@@ -763,6 +763,43 @@ async def test_a21_presponse_cancellation_before_response_propagates_without_res
     snapshot = await context.snapshot()
     assert sends == 1
     assert snapshot.counters.physical_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_a_chunk_cancelled_in_its_classic_group_keeps_what_its_v3_group_did() -> None:
+    """A mixed chunk's v3 group was answered when its classic group, on the wire, is cancelled.
+
+    Each command keeps what its own envelope group did: the v3 command succeeded, the classic one may have run.
+    """
+    started = asyncio.Event()
+
+    class _ClassicBlocked(ScriptedTransport):
+        async def send_wire(
+            self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int
+        ) -> WireResponse:
+            if request.array_body is not None:
+                return await super().send_wire(
+                    request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes
+                )
+            started.set()
+            await asyncio.Future[None]()
+            raise AssertionError("unreachable")
+
+    engine = BatchExecutor(Executor(_ClassicBlocked((ScriptedExchange.v3_batch((_v3(1),), (_item(1),)),))))
+    classic = Request("x.item.get", {"id": 2}, SAFE, route=RouteKind.BARE)
+    progress = BatchProgress()
+    task = asyncio.create_task(
+        engine.execute_requests((_v3(1), classic), context=engine.executor.context(_policy()), progress=progress)
+    )
+    await asyncio.wait_for(started.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [(progress.execution(index), progress.settlement(index)) for index in (0, 1)] == [
+        (Execution.ANSWERED, CommandSettlement.SUCCESS),
+        (Execution.POSSIBLY_RUN, CommandSettlement.UNKNOWN),
+    ]
 
 
 # A21-REFUSAL -----------------------------------------------------------------------------------------------

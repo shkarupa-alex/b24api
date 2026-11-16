@@ -537,6 +537,50 @@ async def test_a_counted_tail_page_stopped_for_its_request_alone_is_an_incomplet
     assert report.terminal_reason == IncompleteTraversalError.__name__
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["max_requests", "max_elapsed"])
+async def test_a_counted_tail_replay_the_budget_refuses_at_its_send_ends_with_the_budget(
+    monkeypatch: pytest.MonkeyPatch, budget: str
+) -> None:
+    # The tail's batch is refused for quota as a whole and its replay is planned; the operation's budget then
+    # refuses the replay at its own send (no request left, or its permit granted as the deadline passes). Each
+    # command the replay held is stopped by that refusal, so the operation ends with its budget.
+    clock = _OperationClock(monkeypatch)
+    acquire = RateCoordinator.acquire
+    grants = 0
+
+    async def late_replay_grant(coordinator: RateCoordinator, *args: object, **kwargs: object) -> object:
+        nonlocal grants
+        permit = await acquire(coordinator, *args, **kwargs)  # type: ignore[arg-type]
+        grants += 1
+        if budget == "max_elapsed" and grants == 3:  # noqa: PLR2004 - the head, the tail, then the tail's replay
+            clock.spend()
+        return permit
+
+    monkeypatch.setattr(RateCoordinator, "acquire", late_replay_grant)
+    batches = 0
+
+    def respond(request: Request) -> object:
+        nonlocal batches
+        if request.method == "batch":
+            batches += 1
+            return _QUOTA_REFUSAL
+        return _counted_rows(request.method, {"start": str(request.copy_parameters().get("start", 0))})
+
+    policy = (
+        ExecutionPolicy(max_requests=2)
+        if budget == "max_requests"
+        else ExecutionPolicy(max_elapsed=60.0, retry=RetryPolicy(initial_delay=0.01, maximum_delay=0.01, jitter=0))
+    )
+    async with client_for(ResponderTransport(respond), policy=policy) as client:
+        error = await asyncio.wait_for(_drain(client.iter_list_counted(LIST_REQUEST, page_size=2)), timeout=HANG_BOUND)
+
+    report = _assert_ended_by_the_budget(error, IncompleteTraversalError)
+    assert isinstance(error.__cause__, BudgetExceededError)
+    assert _blocking(report) == ["budget_exhausted"]
+    assert batches == 1
+
+
 def _v3_command(index: int) -> Command[int]:
     return Command(Request("x.item.get", {"id": index}, ReplaySafety.SAFE, route=RouteKind.API_V3), index)
 

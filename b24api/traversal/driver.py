@@ -42,7 +42,7 @@ from b24api.errors import (
     ResultShapeError,
 )
 from b24api.execution import WorkClass
-from b24api.execution.facts import execution
+from b24api.execution.facts import settlement
 from b24api.traversal.continuation import ContinuationStrategy
 from b24api.traversal.control_preflight import preflight_controls
 from b24api.traversal.counted_batch import CountedBatchStrategy, empty_source_head_eligible
@@ -63,7 +63,7 @@ from b24api.traversal.identity import (
 from b24api.traversal.inclusive_window import InclusiveWindowStrategy
 from b24api.traversal.keyset import KeysetStrategy
 from b24api.traversal.page_adaptation import PageTokens, _SourcePageState, adapt_page
-from b24api.traversal.page_failure import failed_page
+from b24api.traversal.page_failure import failed_page, rejection_reason
 from b24api.traversal.plans import (
     ContinuationPlan,
     CountedOffsetPlan,
@@ -299,16 +299,15 @@ class PaginationDriver:
                 recorder.settled(CommandSettlement.SUCCESS)
         except BaseException as error:
             if recorder is not None:
-                recorder.settled(execution(error).settlement)
+                recorder.settled(settlement(error))
             if reservation is not None:
                 self.context.release_page(reservation)
-            if execution(error).dispatched:
-                self.set_page_dispatch(dispatch=PageDispatch.DIRECT)
-                self.record_failed_page(
-                    dispatch=PageDispatch.DIRECT,
-                    batch_index=None,
-                    error=error,
-                )
+            self.record_failed_page(
+                dispatch=PageDispatch.DIRECT,
+                batch_index=None,
+                error=error,
+                settled=settlement(error),
+            )
             raise
         return response
 
@@ -683,9 +682,18 @@ class PaginationDriver:
         dispatch: PageDispatch,
         batch_index: int | None,
         error: BaseException,
+        settled: CommandSettlement,
     ) -> None:
-        """Record a dispatched page whose command failed, traced from its execution facts as it settles."""
-        outcome, code = failed_page(error)
+        """Record a page whose command failed, by the one rule of ``failed_page``: its settlement (``settled``).
+
+        A page that never executed, because it was never sent, is not traced; the settlement decides the code of
+        every other page. A page whose own command succeeded is still the active page of its completion record;
+        it is retired with the trace's code, as a page the traversal reads but never consumes is.
+        """
+        traced = failed_page(error, settled)
+        if traced is None:
+            return
+        outcome, code = traced
         self._append_page_record(
             PageRecord(
                 sequence=0,
@@ -700,6 +708,14 @@ class PaginationDriver:
                 rejection_code=code,
             ),
         )
+        if settled is CommandSettlement.SUCCESS:
+            self._retire_rejected(outcome, code)
+
+    def _retire_rejected(self, outcome: PageOutcome, code: PageRejectionCode) -> None:
+        """Retire the active page in its completion record with the reason its trace gives (``rejection_reason``)."""
+        reason = rejection_reason(outcome, code)
+        if reason is not None and self.completion_recorder is not None:
+            self.completion_recorder.rejected(reason)
 
     def _record_rejected_page(
         self,
@@ -731,8 +747,7 @@ class PaginationDriver:
                 rejection_code=code,
             ),
         )
-        if self.completion_recorder is not None:
-            self.completion_recorder.rejected(code.value)
+        self._retire_rejected(PageOutcome.REJECTED, code)
 
     def extract_identities(self, items: tuple[FrozenJson, ...]) -> list[IdentityValue]:
         """Return the identities of the page's items."""

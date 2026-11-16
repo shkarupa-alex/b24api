@@ -7,6 +7,7 @@ queue; a reference binding's head and dense tail ride the shared dispatcher and 
 
 from __future__ import annotations
 import asyncio
+import json
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
@@ -25,25 +26,37 @@ from b24api import (
     ReplaySafety,
     Request,
     RetryPolicy,
+    SequentialTraversal,
     Settings,
     TerminalState,
     TotalTermination,
 )
+from b24api.completion import CompletionGate
 from b24api.contracts import (
     ConsistencyPolicy,
     DeliveryOrder,
     PageDispatch,
     PageOutcome,
+    PageRejectionCode,
     ReferenceComplete,
     ReferenceFailure,
     ReferenceItem,
     ReferenceOutcomeUnknown,
     TraversalAssurance,
 )
-from b24api.contracts.completion import BindingClosure
-from b24api.contracts.policy import ConfirmationPolicy, SnapshotRequirement
-from b24api.errors import BudgetExceededError
+from b24api.contracts.completion import (
+    BindingClosure,
+    BindingTerminal,
+    CommandSettlement,
+    CompletionEvidence,
+    PageCommandOutcome,
+    PageRejected,
+    PageScheduled,
+)
+from b24api.contracts.policy import ConfirmationPolicy, ReplayDisposition, SnapshotRequirement
+from b24api.errors import BatchCommandError, BudgetExceededError, IncompleteTraversalError
 from b24api.execution import ExecutionContext
+from b24api.transport import WireResponse
 from tests.scripting import (
     DEADLINE_BUDGET,
     HANG_BOUND,
@@ -51,8 +64,10 @@ from tests.scripting import (
     BatchPortal,
     Envelope,
     Query,
+    ResponderTransport,
     VirtualClock,
     assert_fired_near_deadline,
+    client_for,
     deadline_started,
     on_loop,
     reached,
@@ -593,6 +608,8 @@ async def test_aflat_flat_counted_keeps_its_direct_head_wire_and_counter_sequenc
     assert resets[:2] == [WIDTH, 0]
     report = _report(stream)
     assert [record.dispatch for record in report.page_trace] == [PageDispatch.DIRECT] + [PageDispatch.BATCH] * 20
+    # Each tail page keeps its command's index in its own batch of ten, not its ordinal in the tail.
+    assert [record.batch_index for record in report.page_trace] == [None, *range(10), *range(10)]
     assert report.state is TerminalState.COMPLETED
 
 
@@ -662,3 +679,782 @@ async def test_ax_cancelling_the_consumer_keeps_the_primary_cancellation() -> No
         with pytest.raises(asyncio.CancelledError):
             await task
     assert _report(stream).state is TerminalState.CANCELLED
+
+
+# --- What a failed or abandoned page reports and how it settles ------------------------------------
+
+
+def _observed(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    events: list[object] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stage", "refused_at"), [("heads", 1), ("tail", 2)])
+async def test_counted_bindings_cancelled_while_a_replay_is_on_the_wire_settle_each_page_from_what_its_command_did(
+    monkeypatch: pytest.MonkeyPatch, stage: str, refused_at: int
+) -> None:
+    # Two counted bindings share the dispatcher. One batch (the heads' or a tail chunk) answers every command with a
+    # success but its first, which it refuses (QUERY_LIMIT_EXCEEDED); the reader is cancelled while that command's
+    # replay is on the wire. Each page settles from what its own command did: one answered with a success
+    # succeeded, the replayed one may have run, and one never sent was not executed.
+    events = _observed(monkeypatch)
+    portal = BatchPortal(_dense(301))
+    sends = [0]
+    refused: list[object] = []
+    answered = [0]
+    replaying = asyncio.Event()
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        if refused and refused[0] in commands.values():
+            replaying.set()
+            await asyncio.Future()
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        if sends[0] != refused_at:
+            answered[0] += len(commands)
+            return answer
+        first = next(iter(commands))
+        refused.append(commands[first])
+        answered[0] += len(commands) - 1
+        body = json.loads(answer.body)
+        result = body["result"]
+        del result["result"][first]
+        for key in ("result_total", "result_next"):
+            if isinstance(result.get(key), dict):
+                result[key].pop(first, None)
+        result["result_error"] = {first: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        return WireResponse(200, answer.headers, json.dumps(body).encode())
+
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        stream = client.iter_reference_outcomes(
+            _request(),
+            _bindings(1, 2),
+            traversal=CountedTraversal(page_size=WIDTH),
+            dispatch=BatchDispatch(batch_size=4),
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        reader = asyncio.create_task(drain())
+        await asyncio.wait_for(replaying.wait(), HANG_BOUND)
+        reader.cancel()
+        done, _pending = await asyncio.wait({reader}, timeout=HANG_BOUND)
+        assert done == {reader}
+
+    scheduled = sum(isinstance(event, PageScheduled) for event in events)
+    settled = Counter(event.outcome for event in events if isinstance(event, PageCommandOutcome))
+    assert answered[0] > 0
+    expected = {CommandSettlement.SUCCESS: answered[0], CommandSettlement.UNKNOWN: 1}
+    if scheduled > answered[0] + 1:
+        expected[CommandSettlement.NOT_EXECUTED] = scheduled - answered[0] - 1
+    assert settled == expected
+    # Only the tail case has pages never sent: the heads are both sent in the one batch.
+    assert (CommandSettlement.NOT_EXECUTED in settled) is (stage == "tail")
+
+
+_TRAVERSALS: dict[str, CountedTraversal | SequentialTraversal] = {
+    "counted": CountedTraversal(page_size=WIDTH),
+    "sequential": SequentialTraversal(page_size=WIDTH),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_send", [1, 2], ids=["first-pages", "second-pages"])
+@pytest.mark.parametrize("traversal", list(_TRAVERSALS))
+@pytest.mark.parametrize(
+    ("status", "body", "outcome", "variant"),
+    [
+        # 200 with no Bitrix envelope: each page may have run.
+        (200, b'{"foo": 1}', PageOutcome.UNKNOWN, ReferenceOutcomeUnknown),
+        # 400 whose error object is malformed: the batch was answered and refused.
+        (400, b'{"error": [1]}', PageOutcome.REJECTED, ReferenceFailure),
+    ],
+)
+async def test_a_reference_batch_whose_envelope_fails_traces_each_page_by_its_envelope_failure(  # noqa: PLR0913
+    failing_send: int, traversal: str, status: int, body: bytes, outcome: PageOutcome, variant: type[object]
+) -> None:
+    # A batch answer is one the batch envelope's own protocol failure explains, which each page's trace reports: the
+    # first pages' batch (a counted head, or a plain sequential page), or the second's (a counted tail page, or the
+    # next sequential page). Unknown when the page may have run, rejected when the batch was answered.
+    portal = BatchPortal(_dense(301))
+    sends = [0]
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        if sends[0] != failing_send:
+            return answer
+        return WireResponse(status, (("content-type", "application/json"),), body)
+
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        stream = client.iter_reference_outcomes(
+            _request(), _bindings(1, 2), traversal=_TRAVERSALS[traversal], dispatch=BatchDispatch()
+        )
+        async with stream:
+            outcomes = [event async for event in stream]
+
+    traced = sorted(
+        (record.reference_index, record.offset, record.outcome, record.rejection_code)
+        for record in _report(stream).page_trace
+        if record.outcome is not PageOutcome.COMMITTED
+    )
+    offset = (failing_send - 1) * WIDTH
+    assert traced == [(index, offset, outcome, PageRejectionCode.BATCH_ENVELOPE) for index in (0, 1)]
+    assert [type(event) for event in outcomes if not isinstance(event, ReferenceItem)] == [variant, variant]
+
+
+_NESTED = 100_000
+_TAIL_PAGES = 6  # the tail pages of a 301-row binding in 50-row pages
+_TAIL_CHUNK, _REPLAY = 2, 3  # the sends of the first tail chunk and of its refused command's replay
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["undecodable", "refuse_first"])
+async def test_a_counted_tail_page_that_fails_with_its_chunk_is_traced_the_way_it_settles(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    # The first tail chunk, which carries both bindings' tail pages, fails as a whole: its answer cannot be
+    # decoded, or its first command is refused (QUERY_LIMIT_EXCEEDED) and the answer of that command's replay
+    # cannot be decoded. Each binding fails at its first tail page, which is traced the way it settles: one that may
+    # have run is unknown, one whose own command succeeded is rejected with the chunk (``transaction_aborted``). Each
+    # page settles the same way, on the completion events.
+    events = _observed(monkeypatch)
+    portal = BatchPortal(_dense(301))
+    undecodable = WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
+    sends = [0]
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        if sends[0] == (_TAIL_CHUNK if mode == "undecodable" else _REPLAY):
+            return undecodable
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        if sends[0] != _TAIL_CHUNK:
+            return answer
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        first = next(iter(commands))
+        body = json.loads(answer.body)
+        result = body["result"]
+        del result["result"][first]
+        for key in ("result_total", "result_next"):
+            if isinstance(result.get(key), dict):
+                result[key].pop(first, None)
+        result["result_error"] = {first: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        return WireResponse(200, answer.headers, json.dumps(body).encode())
+
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        stream = client.iter_reference_outcomes(
+            _request(), _bindings(1, 2), traversal=CountedTraversal(page_size=WIDTH), dispatch=BatchDispatch()
+        )
+        async with stream:
+            outcomes = [event async for event in stream]
+
+    traced = sorted(
+        (record.reference_index, record.offset, record.batch_index, record.outcome, record.rejection_code)
+        for record in _report(stream).page_trace
+        if record.outcome is not PageOutcome.COMMITTED
+    )
+    unknown = (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
+    second = unknown if mode == "undecodable" else (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED)
+    # Each page keeps its command's index in the chunk, the first binding's six tail pages ahead of the second's.
+    assert traced == [(0, WIDTH, 0, *unknown), (1, WIDTH, _TAIL_PAGES, *second)]
+    assert [event.correlation for event in outcomes if isinstance(event, ReferenceFailure)] == [1, 2]
+    # The tail pages: every one may have run when the chunk's answer is lost; otherwise only the refused command's,
+    # whose replay's answer is lost, and the rest of the chunk, its commands answered with successes, succeeded.
+    settled = Counter((event.binding_id, event.outcome) for event in events if isinstance(event, PageCommandOutcome))
+    tail = _TAIL_PAGES
+    if mode == "undecodable":
+        assert settled == {
+            (0, CommandSettlement.SUCCESS): 1,
+            (0, CommandSettlement.UNKNOWN): tail,
+            (1, CommandSettlement.SUCCESS): 1,
+            (1, CommandSettlement.UNKNOWN): tail,
+        }
+    else:
+        assert settled == {
+            (0, CommandSettlement.SUCCESS): tail,
+            (0, CommandSettlement.UNKNOWN): 1,
+            (1, CommandSettlement.SUCCESS): 1 + tail,
+        }
+    # Every tail page whose command succeeded is rejected as aborted: the second binding's first one, where it
+    # stops, as its trace says, and each it never consumes.
+    aborted = Counter(
+        event.binding_id
+        for event in events
+        if isinstance(event, PageRejected) and event.reason == PageRejectionCode.TRANSACTION_ABORTED.value
+    )
+    assert aborted == ({} if mode == "undecodable" else {0: tail - 1, 1: tail})
+    assert not any(isinstance(event, ReferenceComplete) for event in outcomes)
+
+
+@pytest.mark.asyncio
+async def test_a_counted_tail_page_answered_with_a_failure_is_traced_as_rejected_by_its_command() -> None:
+    # A tail page whose command the batch answers with a failure ends its binding, and is traced: rejected, by its
+    # command's failure, at its own offset.
+    def answer(method: str, query: Query) -> Envelope:
+        if query["PARENT"] == "1" and query.get("start") == str(2 * WIDTH):
+            return {"error": "ACCESS_DENIED", "error_description": "denied"}
+        return _dense(ROWS)(method, query)
+
+    events, report = await _outcomes(BatchPortal(answer), (1, 2))
+
+    failed = [
+        (record.offset, record.outcome, record.rejection_code)
+        for record in report.page_trace
+        if record.outcome is not PageOutcome.COMMITTED
+    ]
+    assert failed == [(2 * WIDTH, PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE)]
+    # It keeps its command's index in its batch: the next after the binding's first tail page, in the same batch.
+    by_offset = {record.offset: record.batch_index for record in report.page_trace if record.reference_index == 0}
+    first = by_offset[WIDTH]
+    assert first is not None
+    assert by_offset[2 * WIDTH] == first + 1
+    assert [event.correlation for event in events if isinstance(event, ReferenceFailure)] == [1]
+    assert _completes(events)[2].row_count == ROWS
+
+
+def _refuse_once(refused: tuple[int, int]) -> Callable[[str, Query], Envelope]:
+    """Serve 301 rows per parent, refusing the page at ``refused`` (parent, offset) once (QUERY_LIMIT_EXCEEDED)."""
+    seen: set[tuple[int, int]] = set()
+    dense = _dense(301)
+
+    def answer(method: str, query: Query) -> Envelope:
+        page = (int(query["PARENT"]), int(query.get("start", "0")))
+        if page == refused and page not in seen:
+            seen.add(page)
+            return {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}
+        return dense(method, query)
+
+    return answer
+
+
+async def _budgeted(
+    portal: BatchPortal, max_requests: int
+) -> tuple[list[ReferenceOutcome[int]], OperationReport, BaseException | None]:
+    retry = RetryPolicy(initial_delay=0.001, maximum_delay=0.002, jitter=0.0)
+    outcomes: list[ReferenceOutcome[int]] = []
+    raised: BaseException | None = None
+    async with _client(portal) as api:
+        stream = api.iter_reference_outcomes(
+            _request(),
+            _bindings(1, 2),
+            traversal=CountedTraversal(page_size=WIDTH),
+            dispatch=_WAVES,
+            policy=ExecutionPolicy(retry=retry, max_requests=max_requests),
+        )
+        try:
+            async with stream:
+                async for event in stream:
+                    if not isinstance(event, ReferenceItem):
+                        outcomes.append(event)  # noqa: PERF401 - the stream raises: keep what it yielded first
+        except BudgetExceededError as error:
+            raised = error
+    return outcomes, _report(stream), raised
+
+
+def _failed_trace(report: OperationReport) -> list[tuple[object, ...]]:
+    return [
+        (
+            record.reference_index,
+            record.offset,
+            record.dispatch,
+            record.batch_index,
+            record.outcome,
+            record.rejection_code,
+        )
+        for record in report.page_trace
+        if record.outcome is not PageOutcome.COMMITTED
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_counted_tail_page_refused_and_kept_from_its_replay_by_the_budget_fails_eligible_for_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The tail batch refuses the first binding's first tail page (QUERY_LIMIT_EXCEEDED), and the budget (two
+    # requests) keeps it from its replay. The binding fails with the refusal, which a replay may still retry; its
+    # page was sent and answered, so it is traced, rejected by its command, and settles as a failure. The other
+    # binding, answered in full by the same batch, completes.
+    events = _observed(monkeypatch)
+    portal = BatchPortal(_refuse_once((1, WIDTH)))
+
+    outcomes, report, raised = await _budgeted(portal, max_requests=2)
+
+    assert isinstance(raised, BudgetExceededError)
+    failure, complete = outcomes
+    assert isinstance(failure, ReferenceFailure)
+    assert failure.correlation == 1
+    assert isinstance(failure.error, BatchCommandError)
+    assert failure.error.normalized_code == "query_limit_exceeded"
+    assert failure.replay_disposition is ReplayDisposition.ELIGIBLE
+    assert isinstance(complete, ReferenceComplete)
+    assert (complete.correlation, complete.row_count) == (2, 301)
+    assert _failed_trace(report) == [
+        (0, WIDTH, PageDispatch.BATCH, 0, PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE)
+    ]
+    settled = Counter((event.binding_id, event.outcome) for event in events if isinstance(event, PageCommandOutcome))
+    assert settled == {
+        (0, CommandSettlement.SUCCESS): _TAIL_PAGES,
+        (0, CommandSettlement.FAILURE): 1,
+        (1, CommandSettlement.SUCCESS): 1 + _TAIL_PAGES,
+    }
+
+
+@pytest.mark.asyncio
+async def test_counted_tail_pages_the_budget_keeps_from_their_send_are_not_traced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The budget (one request) is spent on the heads' batch, so the tail batch is never sent. Its pages left no
+    # request to record: neither is traced, and each settles as not executed; both bindings fail with the budget.
+    events = _observed(monkeypatch)
+    portal = BatchPortal(_refuse_once((1, WIDTH)))
+
+    outcomes, report, raised = await _budgeted(portal, max_requests=1)
+
+    assert isinstance(raised, BudgetExceededError)
+    assert portal.waves == [2]
+    assert [(type(event), event.correlation) for event in outcomes] == [(ReferenceFailure, 1), (ReferenceFailure, 2)]
+    assert all(
+        isinstance(event.error, BudgetExceededError) for event in outcomes if isinstance(event, ReferenceFailure)
+    )
+    assert _failed_trace(report) == []
+    settled = Counter((event.binding_id, event.outcome) for event in events if isinstance(event, PageCommandOutcome))
+    assert settled == {
+        (binding, outcome): count
+        for binding in (0, 1)
+        for outcome, count in ((CommandSettlement.SUCCESS, 1), (CommandSettlement.NOT_EXECUTED, _TAIL_PAGES))
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "outcome"),
+    [(200, b'{"foo": 1}', PageOutcome.UNKNOWN), (400, b'{"error": [1]}', PageOutcome.REJECTED)],
+)
+async def test_a_flat_counted_tail_batch_whose_envelope_fails_traces_its_first_page_by_the_envelope_failure(
+    status: int, body: bytes, outcome: PageOutcome
+) -> None:
+    # The flat counted head is direct; its tail batch is answered with a failure its envelope explains. The tail's
+    # first page is traced by it, with its command's index in the batch.
+    portal = BatchPortal(_dense(301))
+    sends = [0]
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        if sends[0] == 1:
+            return answer
+        return WireResponse(status, (("content-type", "application/json"),), body)
+
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        stream = client.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE), page_size=WIDTH
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        with pytest.raises(IncompleteTraversalError):
+            await drain()
+
+    assert sends[0] == 2  # noqa: PLR2004
+    assert _failed_trace(_report(stream)) == [
+        (None, WIDTH, PageDispatch.BATCH, 0, outcome, PageRejectionCode.BATCH_ENVELOPE)
+    ]
+
+
+def _flat_settlement(events: list[object]) -> tuple[dict[int, CommandSettlement], list[int], BindingClosure]:
+    """Return the flat binding's settlement by page id, the pages rejected as aborted, and its closure."""
+    settled = {event.page_id: event.outcome for event in events if isinstance(event, PageCommandOutcome)}
+    aborted = [
+        event.page_id
+        for event in events
+        if isinstance(event, PageRejected) and event.reason == PageRejectionCode.TRANSACTION_ABORTED.value
+    ]
+    (closure,) = [event.closure for event in events if isinstance(event, BindingTerminal)]
+    return settled, aborted, closure
+
+
+@pytest.mark.asyncio
+async def test_flat_counted_tail_pages_the_budget_keeps_from_their_send_are_not_traced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The budget (three requests) covers the direct head and both tail batches as planned, but the first tail
+    # batch refuses its first page (QUERY_LIMIT_EXCEEDED) and that page's replay spends the third request. The
+    # second tail batch is never sent: the traversal ends with the budget, and its first page, which no request
+    # carried, is not traced. Each of its pages, the two the traversal never reached included, settles as not
+    # executed, so the binding failed rather than ended unknown.
+    events = _observed(monkeypatch)
+    retry = RetryPolicy(initial_delay=0.001, maximum_delay=0.002, jitter=0.0)
+    portal = BatchPortal(_refuse_once((3, WIDTH)))
+    async with _client(portal) as api:
+        stream = api.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE),
+            page_size=WIDTH,
+            batch_size=3,
+            policy=ExecutionPolicy(retry=retry, max_requests=3),
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        with pytest.raises(IncompleteTraversalError) as raised:
+            await drain()
+
+    assert isinstance(raised.value.__cause__, BudgetExceededError)
+    assert portal.waves == [1, 3, 1]
+    report = _report(stream)
+    assert _failed_trace(report) == []
+    assert [record.offset for record in report.page_trace] == [0, WIDTH, 2 * WIDTH, 3 * WIDTH]
+    settled, aborted, closure = _flat_settlement(events)
+    assert settled == dict.fromkeys(range(4), CommandSettlement.SUCCESS) | dict.fromkeys(
+        range(4, 7), CommandSettlement.NOT_EXECUTED
+    )
+    assert aborted == []
+    assert closure is BindingClosure.FAILURE
+
+
+@pytest.mark.asyncio
+async def test_a_flat_counted_tail_page_answered_with_a_failure_keeps_its_index_in_its_own_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The second tail batch (three pages each) answers its first page with a failure. That page is traced rejected by
+    # its command, with its index in its own batch, as every committed tail page is. The batch answered its two
+    # later pages with a success: the traversal stops before them, so each settles as a success and is rejected as
+    # aborted with the traversal, and the binding failed rather than ended unknown.
+    events = _observed(monkeypatch)
+
+    def answer(method: str, query: Query) -> Envelope:
+        if query.get("start") == str(4 * WIDTH):
+            return {"error": "ACCESS_DENIED", "error_description": "denied"}
+        return _dense(301)(method, query)
+
+    portal = BatchPortal(answer)
+    async with _client(portal) as api:
+        stream = api.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE), page_size=WIDTH, batch_size=3
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        with pytest.raises(IncompleteTraversalError):
+            await drain()
+
+    report = _report(stream)
+    assert _failed_trace(report) == [
+        (None, 4 * WIDTH, PageDispatch.BATCH, 0, PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE)
+    ]
+    committed = [
+        (record.offset, record.batch_index) for record in report.page_trace if record.outcome is PageOutcome.COMMITTED
+    ]
+    assert committed == [(0, None), (WIDTH, 0), (2 * WIDTH, 1), (3 * WIDTH, 2)]
+    settled, aborted, closure = _flat_settlement(events)
+    assert settled == dict.fromkeys(range(7), CommandSettlement.SUCCESS) | {4: CommandSettlement.FAILURE}
+    assert aborted == [5, 6]
+    assert closure is BindingClosure.FAILURE
+
+
+@pytest.mark.asyncio
+async def test_flat_counted_tail_pages_cancelled_while_a_replay_is_on_the_wire_settle_from_what_each_command_did(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The first tail batch (three pages) answers its last two pages with a success and refuses its first
+    # (QUERY_LIMIT_EXCEEDED); the reader is cancelled while that page's replay is on the wire, before the traversal
+    # reached any of the three. Each settles from where its command stood: the two answered with a success
+    # succeeded and are rejected as aborted, the replayed one may have run, so the binding ended unknown.
+    events = _observed(monkeypatch)
+    portal = BatchPortal(_dense(301))
+    sends = [0]
+    replaying = asyncio.Event()
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        if sends[0] == 3:  # noqa: PLR2004 - the refused page's replay
+            replaying.set()
+            await asyncio.Future()
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        if sends[0] == 1:
+            return answer
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        first = next(iter(commands))
+        body = json.loads(answer.body)
+        result = body["result"]
+        del result["result"][first]
+        for key in ("result_total", "result_next"):
+            if isinstance(result.get(key), dict):
+                result[key].pop(first, None)
+        result["result_error"] = {first: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        return WireResponse(200, answer.headers, json.dumps(body).encode())
+
+    retry = RetryPolicy(initial_delay=0.001, maximum_delay=0.002, jitter=0.0)
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        stream = client.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE),
+            page_size=WIDTH,
+            batch_size=3,
+            policy=ExecutionPolicy(retry=retry),
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        reader = asyncio.create_task(drain())
+        await asyncio.wait_for(replaying.wait(), HANG_BOUND)
+        reader.cancel()
+        done, _pending = await asyncio.wait({reader}, timeout=HANG_BOUND)
+        assert done == {reader}
+
+    settled, aborted, closure = _flat_settlement(events)
+    assert settled == {
+        0: CommandSettlement.SUCCESS,
+        1: CommandSettlement.UNKNOWN,
+        2: CommandSettlement.SUCCESS,
+        3: CommandSettlement.SUCCESS,
+    }
+    assert aborted == [2, 3]
+    assert closure is BindingClosure.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_a_flat_counted_tail_page_whose_result_was_dropped_settles_as_its_outcome_did(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The row budget (101 rows) fits two pages per tail batch. The last batch answers its first page with a failure,
+    # where the traversal stops, and its second with more rows than the budget has left, which the stream drops as
+    # answered: that page, never reached, settles as its outcome did, a failure, not as the success its command was
+    # answered with.
+    events = _observed(monkeypatch)
+
+    def answer(method: str, query: Query) -> Envelope:
+        start = int(query.get("start", "0"))
+        if start == 5 * WIDTH:
+            return {"error": "ACCESS_DENIED", "error_description": "denied"}
+        if start == 6 * WIDTH:
+            return {"result": [{"ID": 600_000 + row} for row in range(120)], "total": 301}
+        return _dense(301)(method, query)
+
+    portal = BatchPortal(answer)
+    async with _client(portal) as api:
+        stream = api.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE),
+            page_size=WIDTH,
+            batch_size=3,
+            policy=ExecutionPolicy(max_buffered_rows=101),
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        with pytest.raises(IncompleteTraversalError):
+            await drain()
+
+    assert portal.waves == [1, 2, 2, 2]
+    settled, aborted, closure = _flat_settlement(events)
+    assert settled == dict.fromkeys(range(5), CommandSettlement.SUCCESS) | dict.fromkeys(
+        (5, 6), CommandSettlement.FAILURE
+    )
+    assert aborted == []
+    assert closure is BindingClosure.FAILURE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cancel_at", "waves", "answered"),
+    [
+        # The tail is cut short as it pulls its first batch's requests: nothing of the tail is sent.
+        (1, [1], 1),
+        (2, [1], 1),
+        # The first batch was answered and consumed; the second is cut short while it fills.
+        (4, [1, 3], 4),
+        (5, [1, 3], 4),
+    ],
+    ids=["first-batch-first-pull", "first-batch-second-pull", "second-batch-first-pull", "second-batch-second-pull"],
+)
+async def test_flat_counted_tail_pages_cancelled_while_their_batch_fills_settle_as_never_sent(
+    monkeypatch: pytest.MonkeyPatch, cancel_at: int, waves: list[int], answered: int
+) -> None:
+    # The reader is cancelled the moment the tail schedules page ``cancel_at`` as it pulls that page's request into
+    # a batch being filled. The pages of that batch never joined a send: each settles as not executed, so the
+    # binding failed rather than ended unknown.
+    events: list[object] = []
+    emit = CompletionGate.emit
+    reader: list[asyncio.Task[None]] = []
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+        if isinstance(event, PageScheduled) and event.page_id == cancel_at and reader:
+            reader[0].cancel()
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    portal = BatchPortal(_dense(ROWS))
+    async with _client(portal) as api:
+        stream = api.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE), page_size=WIDTH, batch_size=3
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        reader.append(asyncio.create_task(drain()))
+        done, _pending = await asyncio.wait(reader, timeout=HANG_BOUND)
+        assert done == set(reader)
+        assert reader[0].cancelled()
+
+    assert portal.waves == waves
+    assert [event.page_id for event in events if isinstance(event, PageScheduled)] == list(range(cancel_at + 1))
+    settled = dict.fromkeys(range(answered), CommandSettlement.SUCCESS) | dict.fromkeys(
+        range(answered, cancel_at + 1), CommandSettlement.NOT_EXECUTED
+    )
+    assert _flat_settlement(events) == (settled, [], BindingClosure.FAILURE)
+
+
+# The physical request that carries the second tail batch of a flat counted traversal: after the head and the first.
+_SECOND_FLAT_TAIL = 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["undecodable", "refuse_second"])
+async def test_a_flat_counted_tail_batch_that_fails_as_a_whole_traces_the_page_it_stops_at(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    # The second tail batch fails as a whole, with no outcome per page: its answer cannot be decoded, or its second
+    # command is refused (QUERY_LIMIT_EXCEEDED) and the answer of that command's replay cannot be decoded. The
+    # traversal stops at the batch's first page, which is traced the way it settles, with its index in its batch,
+    # as a reference tail page failing with its chunk is: it may have run, or its own command succeeded and it is
+    # rejected with the batch (``transaction_aborted``).
+    events = _observed(monkeypatch)
+    portal = BatchPortal(_dense(301))
+    undecodable = WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
+    sends = [0]
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        if sends[0] == (_SECOND_FLAT_TAIL if mode == "undecodable" else _SECOND_FLAT_TAIL + 1):
+            return undecodable
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        if sends[0] != _SECOND_FLAT_TAIL:
+            return answer
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        second = list(commands)[1]
+        body = json.loads(answer.body)
+        result = body["result"]
+        del result["result"][second]
+        for key in ("result_total", "result_next"):
+            if isinstance(result.get(key), dict):
+                result[key].pop(second, None)
+        result["result_error"] = {second: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        return WireResponse(200, answer.headers, json.dumps(body).encode())
+
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        stream = client.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE), page_size=WIDTH, batch_size=3
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        with pytest.raises(IncompleteTraversalError) as raised:
+            await drain()
+
+    assert isinstance(raised.value.__cause__, RecursionError)
+    first = (
+        (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
+        if mode == "undecodable"
+        else (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED)
+    )
+    assert _failed_trace(_report(stream)) == [(None, 4 * WIDTH, PageDispatch.BATCH, 0, *first)]
+    settled, aborted, closure = _flat_settlement(events)
+    batch = (
+        [CommandSettlement.UNKNOWN] * 3
+        if mode == "undecodable"
+        else [CommandSettlement.SUCCESS, CommandSettlement.UNKNOWN, CommandSettlement.SUCCESS]
+    )
+    assert settled == dict.fromkeys(range(4), CommandSettlement.SUCCESS) | dict(zip(range(4, 7), batch, strict=True))
+    # A page whose command succeeded is rejected as aborted: the page the traversal stops at, as its trace says,
+    # and the one past the stop it never consumes.
+    assert aborted == ([] if mode == "undecodable" else [4, 6])
+    assert closure is BindingClosure.UNKNOWN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["flat", "reference"])
+async def test_a_counted_tail_batch_its_cancellation_interrupts_on_the_wire_settles_as_possibly_run(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    # The reader is cancelled while the first tail batch is on the wire: every page of it may have run, whatever
+    # ended the batch, and settles as unknown. The flat traversal traces the page it stops at by that settlement,
+    # unknown at its index in the batch. A reference binding's trace reaches the report only through the events
+    # its consumer reads, and the cancelled consumer reads none: no page is traced.
+    events = _observed(monkeypatch)
+    portal = BatchPortal(_dense(301))
+    on_wire = asyncio.Event()
+    sends = [0]
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        if sends[0] == _TAIL_CHUNK:  # the head went first
+            on_wire.set()
+            await asyncio.Future[None]()
+        return await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+
+    async with client_for(
+        ResponderTransport(respond, host=portal.host), policy=ExecutionPolicy(page_trace_limit=1024)
+    ) as client:
+        stream = (
+            client.iter_list_counted(
+                Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE), page_size=WIDTH, batch_size=3
+            )
+            if path == "flat"
+            else client.iter_reference_outcomes(
+                _request(), _bindings(1), traversal=CountedTraversal(page_size=WIDTH), dispatch=BatchDispatch()
+            )
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        reader = asyncio.create_task(drain())
+        await asyncio.wait_for(on_wire.wait(), HANG_BOUND)
+        reader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reader
+
+    settled = [event.outcome for event in events if isinstance(event, PageCommandOutcome)]
+    tail = 3 if path == "flat" else _TAIL_PAGES
+    assert settled == [CommandSettlement.SUCCESS, *[CommandSettlement.UNKNOWN] * tail]
+    unknown = (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
+    traced = [(None, WIDTH, PageDispatch.BATCH, 0, *unknown)] if path == "flat" else []
+    assert _failed_trace(_report(stream)) == traced

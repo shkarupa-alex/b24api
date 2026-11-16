@@ -55,6 +55,68 @@
   cannot shorten a hint; one further ahead now can, which costs at worst an early retry that the server
   throttles again. A delta in seconds is unchanged, and every hint is still capped at an hour.
 
+## Traversals that end with the budget, and dropped results
+
+- **Breaking: a keyset traversal the budget ends reports the budget, not a failed command or a protocol
+  violation.**
+  When `max_requests` refused a wave or the final confirmation of `iter_list_keyset()` under
+  `RangeKeysetExecution`, `PartitionedKeysetExecution` or an automatic choice (sequential or
+  partitioned), the report recorded a `command_failure` for each command the budget refused, or, beside
+  `budget_exhausted`, the protocol violations `completion_rejection_before_settlement` and
+  `completion_invalid_binding_terminal`: explicit range and partitioned runs recorded them as automatic
+  ones did, under `max_requests` and under `max_elapsed`. Such a run now ends as an explicit
+  `SequentialKeysetExecution` ends on its budget: the report is `incomplete`, with
+  `BudgetExceededError` as its terminal reason and `budget_exhausted` as its only violation.
+  `iter_list_keyset()` still raises `IncompleteTraversalError` whose cause is the `BudgetExceededError`.
+  Keyset bindings of the reference streams
+  (`iter_references()`, `iter_reference_outcomes()` and the reference source streams) under the same
+  strategies changed the same way, under `max_requests` and under `max_elapsed`: a wave or final
+  confirmation the budget refused no longer records a `command_failure`, so the report holds
+  `budget_exhausted` and a `reference_failure` for each binding the budget ended. Once the budget has
+  refused work, every later refusal by it is that same end, whatever work it names (an admission, a
+  page's rows, a send's permit); a command refused by its own limits (its attempts, its retry window)
+  still fails as a command. A fast keyset wave whose batch answer was ambiguous (a command's answer
+  missing or repeated) no longer records `completion_unknown_binding_claimed_known`: its binding
+  closes as unknown.
+- **A page the budget kept from its send is not traced.** A page of a counted traversal's batch tail
+  (`iter_list_counted()` and counted reference bindings), and a fast keyset wave or final confirmation,
+  that the budget kept from its send was traced in `page_trace` as `REJECTED` with `COMMAND_FAILURE`,
+  though no request carried it. A page that never executed because it was never sent (traversals never
+  halt a batch) now leaves no trace record on every path, as a direct or batch fan-out page the budget
+  refused already did. The binding's outcome, its settlement and the report's violations are unchanged.
+- **A range, partitioned or automatic keyset run that ends while a page is unsettled records no protocol
+  violation.** When the final confirmation of `iter_list_keyset()` under these strategies failed (an
+  error answer, a lost answer), or the caller cancelled the stream while a wave was in flight, the report
+  recorded `completion_rejection_before_settlement` and `completion_invalid_binding_terminal` beside the
+  failure, and so did an interrupt; the end of the elapsed budget or a transport failure while a wave was
+  in flight recorded `completion_unknown_binding_claimed_known`. Such a page now settles from what its own command did: a wave the end interrupts settles each
+  page from its command's answer (a success, an answered failure or refusal), as unknown only when the
+  command's send may have run without an answer (a cancellation while the wave is on the wire), and as
+  not executed when it was never sent; a finish page settles from the facts of its failure. A reference
+  binding's page cancelled after its wave was sent was unknown even when its command had been answered;
+  it now keeps that answer, a success settling as a success as on a flat traversal, and is unknown only
+  while its wave may still send it. So does each page of a batch that failed as a whole with an error
+  that is not the client's own (an answer nested too deep to decode, for example): every page of it was
+  unknown, also one its command's answer in an earlier round settled; it now settles, and its failed page
+  is traced in the report's `page_trace`, from what its own command did: one whose command was answered
+  is rejected, not unknown, as `transaction_aborted` when that answer was a success. The binding's outcome
+  and its error are unchanged.
+- **A counted tail page larger than its share is an answered failure.** When a tail page of
+  `iter_list_counted()` decoded to more rows than `max_buffered_rows` left it, the traversal raised
+  `IncompleteTraversalError` caused by `BudgetExceededError` ("buffered row budget exhausted"), and the
+  pages of that window that did fit were lost: neither yielded nor in the page trace, though they had
+  run. The tail window is now fitted as a `batch()` window is: the pages before the oversized one are
+  yielded and committed, and that page is rejected with `ResultTooLargeError`, recorded as answered. The
+  stream still raises `IncompleteTraversalError`, now caused by that `ResultTooLargeError` (still a
+  `BudgetExceededError`), and the report's terminal reason is `IncompleteTraversalError`.
+- **`ResultTooLargeError` keeps the answer's evidence.** Its `http_status` and `request_id` were
+  `None`, although the command it reports was answered. They are now those of the response whose result
+  was dropped.
+- **An empty batch result counts its one row.** `batch()` and `batch_outcomes()` already fitted every
+  outcome as at least one row of `max_buffered_rows`, but an empty list result was then charged no
+  row, so the report's `buffered_rows_high_water` could stay below what the window held. It now counts one row,
+  as it was fitted.
+
 ## The end of `max_elapsed` is not a cleanup failure
 
 - **Cleanup gets a grace past the budget.** Every stream but `iter_list()` waited for its source's
@@ -800,6 +862,43 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   `COMMAND_FAILURE`, as fast keyset waves record it. Before, every such page was `UNKNOWN`, and its code
   was `COMMAND_FAILURE` unless the failure was an `AmbiguousExecutionError`, so a page of a sequential
   or counted traversal that lost its answer was `COMMAND_FAILURE` too.
+- **A flat counted tail page's `batch_index` is its index in its own batch.** In the report of
+  `iter_list_counted()`, a tail page's `PageRecord.batch_index` was its ordinal in the whole tail (the
+  fourth tail page was 3 whatever the batch size), unlike every other batch page, whose index is its
+  command's in the batch it was sent with. It is now that index, as on the reference path.
+- **A keyset reference page's `batch_index` is its index in the shared batch.** In the report of
+  `iter_reference_outcomes()` with a fast keyset traversal, a wave page's `PageRecord.batch_index` was
+  its index in its own binding's wave and a finish page's was `None`, though both are commands of a
+  physical batch shared with other bindings' commands. Each is now its command's index in that batch.
+  A page replayed alone keeps the index of the batch it was first sent with: it is the command's key
+  in every send of it.
+- **A page sent with a batch that failed as a whole is traced.** When a physical batch fails as a whole,
+  each page sent with it is traced the way it settles, with its index in that batch: a fast keyset wave or
+  finish page, of `iter_list_keyset()` or of a reference binding, and the counted tail page the traversal
+  stops at, flat or reference. Before, only an envelope failure (a structured error on the envelope, or a
+  lost answer) was traced; a batch whose answer could not be decoded left no trace, nor did a reference
+  counted tail page whose replay's answer could not be decoded, and the flat counted tail traced its page with its
+  index in the whole tail. A direct keyset finish request that fails is traced too, with no `batch_index`.
+  The errors raised are unchanged.
+- **A cancelled request's pages are traced as possibly run.** When `iter_list_counted()` is cancelled while
+  a tail batch is on the wire, the page the traversal stops at, the batch's first, is traced `UNKNOWN` with
+  `AMBIGUOUS_EXECUTION`; when `iter_list_keyset()` is cancelled while a keyset wave or its direct finish
+  request is on the wire, each page of it is, as a direct page cancelled on the wire already was. Before,
+  they were not traced. A reference operation's report still holds no page of a binding its cancelled
+  consumer did not read.
+- **A rejected page is retired with its trace's code.** In the completion evidence of a list or reference
+  traversal, a page whose own command succeeded but which the traversal rejects is `PageRejected` with the
+  code its trace records (`transaction_aborted`, `identity_contract`, ...), on every path. Before, a counted
+  tail page the traversal stopped at, when the batch around it failed, had no `PageRejected`; a fast keyset
+  page was `PageRejected` with the reason `rejected` whatever its code, the pages of a flat keyset wave that
+  failed as a whole with `failed`, and those of a reference binding's wave that failed as a whole were not
+  rejected at all.
+- **A flat counted tail page the traversal stops before settles as its command did.** In the
+  completion evidence of `iter_list_counted()`, every tail page read but not reached when the traversal
+  stopped (at a failed page, at the budget, cancelled, or when the consumer broke out of the loop)
+  settled as unknown, so the binding closed `UNKNOWN`. Each now settles from what its command did: one answered with a success as a success,
+  rejected as aborted; one never sent as not executed; only one that may have run as unknown. The
+  binding closes `FAILURE` unless one of its pages may have run.
 - **An abandoned batch page is not sent.** A reference page fetched with `BatchDispatch` whose fetch was
   cancelled, or whose admission deadline passed, while its wave was being assembled was still sent with
   that wave and its answer discarded. Its wave now leaves without it, and a wave left with no page is

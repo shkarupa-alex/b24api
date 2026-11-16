@@ -26,6 +26,7 @@ from b24api.errors import (
 )
 
 if TYPE_CHECKING:
+    from b24api.contracts.evidence import ResponseEvidence
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.request_summary import RequestSummary
 
@@ -71,6 +72,8 @@ class _ExecutionFacts:
 
     execution: Execution
     unproven: B24ApiError | None = None
+    # Answered with a success: the failure is not the command's but its page's, ended before it took the answer.
+    succeeded: bool = False
 
 
 def record_dispatch(error: BaseException, *, possibly_executed: bool, unproven: B24ApiError | None = None) -> None:
@@ -79,12 +82,15 @@ def record_dispatch(error: BaseException, *, possibly_executed: bool, unproven: 
     error.__dict__[_FACTS] = _ExecutionFacts(execution, None if unproven is error else unproven)
 
 
-def dropped_result(*, rows: int, limit: int, request_summary: RequestSummary | None) -> ResultTooLargeError:
+def dropped_result(
+    *, rows: int, limit: int, request_summary: RequestSummary | None, evidence: ResponseEvidence | None
+) -> ResultTooLargeError:
     """Return the failure of a command that ran and was answered, but whose result the row budget drops.
 
-    It is recorded answered: the command's outcome is a failure settled as failed, never one proven not run.
+    It is recorded answered: the command's outcome is a failure settled as failed, never one proven not run, and
+    it keeps the answer's ``evidence``.
     """
-    error = ResultTooLargeError(rows=rows, limit=limit, request_summary=request_summary)
+    error = ResultTooLargeError(rows=rows, limit=limit, request_summary=request_summary, evidence=evidence)
     record_dispatch(error, possibly_executed=False)
     return error
 
@@ -92,6 +98,26 @@ def dropped_result(*, rows: int, limit: int, request_summary: RequestSummary | N
 def record_withheld(error: BaseException) -> None:
     """Record that the command of ``error`` was proven not sent because the server or fail-fast stopped it."""
     error.__dict__[_FACTS] = _ExecutionFacts(Execution.WITHHELD)
+
+
+def record_execution(error: BaseException, known: Execution, *, succeeded: bool = False) -> None:
+    """Record on ``error`` what is ``known`` about its command from elsewhere, such as a batch it was a command of.
+
+    ``succeeded`` is set for a command answered with a success (``ANSWERED``), whose page ended before it took the
+    answer.
+    """
+    error.__dict__[_FACTS] = _ExecutionFacts(known, succeeded=succeeded)
+
+
+def settled_as(known: Execution, *, succeeded: bool) -> CommandSettlement:
+    """Return the completion settlement of a command known so: one answered with a success succeeded."""
+    return CommandSettlement.SUCCESS if succeeded else known.settlement
+
+
+def settlement(error: object) -> CommandSettlement:
+    """Return the completion settlement of a command whose page failed with ``error`` (``settled_as``)."""
+    facts = getattr(error, _FACTS, None)
+    return settled_as(execution(error), succeeded=isinstance(facts, _ExecutionFacts) and facts.succeeded)
 
 
 def execution(error: object) -> Execution:
@@ -233,5 +259,8 @@ __all__ = [
     "http_success",
     "possible_execution",
     "record_dispatch",
+    "record_execution",
     "record_withheld",
+    "settled_as",
+    "settlement",
 ]

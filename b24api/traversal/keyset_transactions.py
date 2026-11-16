@@ -3,8 +3,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, NoReturn
 
-from b24api.batch.outcome import BatchSuccess
-from b24api.contracts.completion import CommandSettlement
+from b24api.batch.outcome import BatchSuccess, settlement_of
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
 from b24api.errors import (
@@ -42,6 +41,7 @@ from b24api.traversal.keyset_transaction_contract import (
     build_controlled_request,
     build_lane_plan,
 )
+from b24api.traversal.page_failure import failed_page
 
 if TYPE_CHECKING:
     from b24api.batch.outcome import BatchOutcome
@@ -97,25 +97,29 @@ async def execute_wave(
             all(plan.phase is KeysetPhase.BOUNDARY for plan in plans)
             and getattr(getattr(host.execution, "total_hint", None), "value", None) == "request_advisory"
         )
-        outcomes = await host.engine.execute_requests(
-            tuple(plan.request for plan in plans),
-            context=host.context.execution_context,
-            advisory_totals=advisory,
-            strict_envelope=True,
-            strict_json_members=True,
-        )
+        try:
+            outcomes = await host.engine.execute_requests(
+                {plan.command_id: plan.request for plan in plans},
+                context=host.context.execution_context,
+                advisory_totals=advisory,
+                strict_envelope=True,
+                strict_json_members=True,
+            )
+        except BaseException as error:
+            _trace_failed_call(host, plans, error, PageDispatch.BATCH)
+            raise
         _record_wave_dispatch(host, plans, outcomes)
-        receipts, rejections, selected_rows = _validate_wave(host, plans, outcomes, reservations)
+        receipts, rejections = _validate_wave(host, plans, outcomes, reservations)
         if rejections:
-            _abort_wave(host, plans, receipts, rejections, selected_rows)
+            _abort_wave(host, plans, outcomes, receipts, rejections)
         stage_semantics = any(plan.phase is KeysetPhase.BOUNDARY for plan in plans)
-        for index, (plan, receipt, outcome) in enumerate(zip(plans, receipts, outcomes, strict=True)):
+        for plan, receipt, outcome in zip(plans, receipts, outcomes, strict=True):
             stage_or_record_observation(
                 host.transactions.staged_observations,
                 host.record_page,
                 stage=stage_semantics,
                 plan=plan,
-                index=index,
+                index=outcome.command_index,
                 rows=len(receipt.rows),
                 response=outcome.response if isinstance(outcome, BatchSuccess) else None,
                 witness=receipt.witness,
@@ -134,7 +138,7 @@ def _record_wave_dispatch(
 ) -> None:
     """Settle every command and count the physical request before any receipt is validated."""
     for plan, outcome in zip(plans, outcomes, strict=True):
-        host.completion_recorder.settle(plan.command_id, _settlement(outcome))
+        host.completion_recorder.settle(plan.command_id, settlement_of(outcome))
     host.transactions.boundary_totals = boundary_totals(plans, outcomes)
     host.batch_requests += 1
     host.batch_commands += len(plans)
@@ -150,12 +154,11 @@ def _validate_wave(
     plans: tuple[LaneCommandPlan, ...],
     outcomes: tuple[BatchOutcome, ...],
     reservations: tuple[PageReservation, ...],
-) -> tuple[list[LaneReceipt], list[ReceiptRejection], int]:
+) -> tuple[list[LaneReceipt], list[ReceiptRejection]]:
     """Charge each page, validate its receipt, and record every rejected command's page."""
     receipts: list[LaneReceipt] = []
     rejections: list[ReceiptRejection] = []
-    selected_rows = 0
-    for index, (plan, outcome, reservation) in enumerate(zip(plans, outcomes, reservations, strict=True)):
+    for plan, outcome, reservation in zip(plans, outcomes, reservations, strict=True):
         commit = host.context.commit_page if isinstance(outcome, BatchSuccess) else host.context.release_page
         commit(reservation)
         lane = lane_for_command(
@@ -177,32 +180,34 @@ def _validate_wave(
             page_adapter=host.page_adapter,
         )
         if not isinstance(receipt, ReceiptRejection):
-            selected_rows += len(receipt.rows)
             host.completion_recorder.validated(plan.command_id)
             receipts.append(receipt)
             continue
-        selected_rows += receipt.selected_rows
         rejections.append(receipt)
-        host.violations.append(receipt.violation)
-        page_outcome, rejection_code = classify_rejection(outcome, receipt)
+        if not _budget_end(host, receipt.error):
+            host.violations.append(receipt.violation)
+        traced = classify_rejection(outcome, receipt)
+        if traced is None:
+            continue  # never sent: not traced
+        page_outcome, rejection_code = traced
         host.record_page(
             plan,
-            index=index,
+            index=outcome.command_index,
             selected=receipt.selected_rows,
             admitted=0,
             outcome=page_outcome,
             rejection=rejection_code,
             violation=receipt.violation,
         )
-    return receipts, rejections, selected_rows
+    return receipts, rejections
 
 
 def _abort_wave(
     host: KeysetTransactionHost,
     plans: tuple[LaneCommandPlan, ...],
+    outcomes: tuple[BatchOutcome, ...],
     receipts: list[LaneReceipt],
     rejections: list[ReceiptRejection],
-    selected_rows: int,
 ) -> NoReturn:
     """Reject the valid pages of a failed wave too, discard its rows, and raise its cause.
 
@@ -210,16 +215,17 @@ def _abort_wave(
     have executed, the binding's outcome is unknown, not failed.
     """
     successful = {receipt.command_id: receipt for receipt in receipts}
-    for index, plan in enumerate(plans):
+    for plan, outcome in zip(plans, outcomes, strict=True):
         if plan.command_id in successful:
             host.record_page(
                 plan,
-                index=index,
+                index=outcome.command_index,
                 selected=len(successful[plan.command_id].rows),
                 admitted=0,
                 outcome=PageOutcome.REJECTED,
                 rejection=PageRejectionCode.TRANSACTION_ABORTED,
             )
+    selected_rows = sum(len(receipt.rows) for receipt in receipts) + sum(r.selected_rows for r in rejections)
     host.admission.record_raw(selected_rows, discarded=True)
     causes = [receipt for receipt in rejections if receipt.error is not None]
     rejection = next(
@@ -228,25 +234,82 @@ def _abort_wave(
     )
     if rejection is None:
         raise PaginationError("fast keyset wave validation failed")
-    _raise_rejection(rejection)
+    _raise_rejection(host, rejection)
 
 
-def _settlement(outcome: BatchOutcome) -> CommandSettlement:
-    """Settle one correlated command from its execution facts."""
-    if isinstance(outcome, BatchSuccess):
-        return CommandSettlement.SUCCESS
-    return execution(outcome.error).settlement
+async def _execute_finish_command(
+    host: KeysetTransactionHost, plan: LaneCommandPlan, request: Request, dispatch: PageDispatch
+) -> BatchOutcome:
+    """Send the finish page through the engine; a call that fails as a whole traces the page before it raises."""
+    try:
+        return await host.engine.execute_page(
+            request, command_id=plan.command_id, context=host.context.execution_context
+        )
+    except BaseException as error:
+        _trace_failed_call(host, (plan,), error, dispatch)
+        raise
 
 
-def _raise_rejection(rejection: ReceiptRejection) -> NoReturn:
+def _trace_failed_call(
+    host: KeysetTransactionHost,
+    plans: tuple[LaneCommandPlan, ...],
+    error: BaseException,
+    dispatch: PageDispatch,
+) -> None:
+    """Trace each page of an engine call that failed as a whole the way it settles (``failed_page``).
+
+    The call left no outcome per command to validate; the engine settled each page from what its command did
+    (``WaveEngine.failed_pages``), and the trace reads that same fact, with the command's index in its physical
+    batch: a page never sent is not traced, and whatever ended the call, a cancellation included, decides nothing.
+    """
+    pages = host.engine.failed_pages(error)
+    if pages is None:
+        return
+    for plan, page in zip(plans, pages, strict=True):
+        traced = failed_page(error, page.settlement)
+        if traced is None:
+            continue
+        page_outcome, rejection_code = traced
+        host.record_page(
+            plan,
+            index=page.batch_index,
+            selected=0,
+            admitted=0,
+            outcome=page_outcome,
+            rejection=rejection_code,
+            dispatch=dispatch,
+        )
+
+
+def _finish_index(outcome: BatchOutcome, dispatch: PageDispatch) -> int | None:
+    """Return a finish page's index in the physical batch it was sent with, as a wave page takes it.
+
+    A batch finish page's command outcome carries it, as every wave command's does; a direct finish page has none.
+    """
+    return outcome.command_index if dispatch is PageDispatch.BATCH else None
+
+
+def _budget_end(host: KeysetTransactionHost, error: BaseException | None) -> bool:
+    """Return whether the operation's budget refusal stopped a command: its end, not a failed page.
+
+    Only that refusal is (``ExecutionContext.ended_by``): another budget error, such as a request's own retry window
+    or a result the row budget dropped (``ResultTooLargeError``, an answered command), stays the command's failure.
+    """
+    return host.context.execution_context.ended_by(error)
+
+
+def _raise_rejection(host: KeysetTransactionHost, rejection: ReceiptRejection) -> NoReturn:
     """Raise a rejected command's cause; a failed command ends the traversal incomplete, with its replay.
 
     An ambiguous command is raised as is, as a direct page's is: whether it executed is unknown, so
-    the binding's outcome is unknown rather than failed.
+    the binding's outcome is unknown rather than failed. A command the operation's budget refused is
+    raised as is too: the refusal ends the operation, as it ends a direct page.
     """
     cause = rejection.error
     if cause is None:
         raise PaginationError(rejection.detail)
+    if _budget_end(host, cause):
+        raise cause
     if (
         isinstance(cause, B24ApiError)
         and execution(cause) is not Execution.POSSIBLY_RUN
@@ -376,7 +439,7 @@ async def execute_finish_page(
     try:
         await host.adjust_buffer(host.effective_page_cap)
         host.completion_recorder.schedule(plan.command_id)
-        outcome = await host.engine.execute_page(request, context=host.context.execution_context)
+        outcome = await _execute_finish_command(host, plan, request, dispatch)
         _record_finish_dispatch(host, plan, outcome, dispatch)
         commit = host.context.commit_page if isinstance(outcome, BatchSuccess) else host.context.release_page
         commit(reservation)
@@ -402,10 +465,10 @@ async def execute_finish_page(
         try:
             admitted = host.admission.validate_and_commit(receipt)
         except PaginationError:
-            host.admission.record_discarded(len(receipt.rows))
+            # The refused rows stay raw: the runtime's cleanup counts them discarded with every row it did not admit.
             host.record_page(
                 plan,
-                index=None,
+                index=_finish_index(outcome, dispatch),
                 selected=len(receipt.rows),
                 admitted=0,
                 outcome=PageOutcome.REJECTED,
@@ -417,7 +480,7 @@ async def execute_finish_page(
             raise
         host.record_page(
             plan,
-            index=None,
+            index=_finish_index(outcome, dispatch),
             selected=len(receipt.rows),
             admitted=len(admitted.rows),
             response=response,
@@ -453,7 +516,7 @@ def _record_finish_dispatch(
     dispatch: PageDispatch,
 ) -> None:
     """Settle the finish command before its receipt is validated; a batched page counts as a one-command wave."""
-    host.completion_recorder.settle(plan.command_id, _settlement(outcome))
+    host.completion_recorder.settle(plan.command_id, settlement_of(outcome))
     if dispatch is PageDispatch.BATCH:
         host.batch_requests += 1
         host.batch_commands += 1
@@ -480,20 +543,23 @@ def _reject_finish_receipt(
     dispatch: PageDispatch,
 ) -> NoReturn:
     """Record a rejected finish page as a rejected wave command is recorded, discard its rows, and raise."""
-    host.violations.append(receipt.violation)
+    if not _budget_end(host, receipt.error):
+        host.violations.append(receipt.violation)
     host.admission.record_raw(receipt.selected_rows, discarded=True)
-    page_outcome, rejection_code = classify_rejection(outcome, receipt)
-    host.record_page(
-        plan,
-        index=None,
-        selected=receipt.selected_rows,
-        admitted=0,
-        outcome=page_outcome,
-        rejection=rejection_code,
-        violation=receipt.violation,
-        dispatch=dispatch,
-    )
-    _raise_rejection(receipt)
+    traced = classify_rejection(outcome, receipt)
+    if traced is not None:  # a finish page never sent is not traced
+        page_outcome, rejection_code = traced
+        host.record_page(
+            plan,
+            index=_finish_index(outcome, dispatch),
+            selected=receipt.selected_rows,
+            admitted=0,
+            outcome=page_outcome,
+            rejection=rejection_code,
+            violation=receipt.violation,
+            dispatch=dispatch,
+        )
+    _raise_rejection(host, receipt)
 
 
 __all__ = [

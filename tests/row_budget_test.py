@@ -8,6 +8,7 @@ by the operation's elapsed budget.
 
 from __future__ import annotations
 import asyncio
+import json
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -26,14 +27,17 @@ from b24api.contracts import (
     Request,
     TerminalState,
 )
+from b24api.contracts.report import PageOutcome
 from b24api.contracts.request import RouteKind
-from b24api.errors import BatchFailed, BudgetExceededError, ResultTooLargeError
+from b24api.errors import BatchFailed, BudgetExceededError, IncompleteTraversalError, ResultTooLargeError
+from b24api.execution import WireResponse
 from b24api.execution.facts import Execution, execution
 from b24api.references.dispatch import _RowBuffer
 from tests.scripting import (
     DEADLINE_BUDGET,
     DEADLINE_SLACK,
     UNREACHABLE_COALESCE_WAIT,
+    BatchPortal,
     ResponderTransport,
     assert_fired_near_deadline,
     client_for,
@@ -46,6 +50,7 @@ from tests.scripting import (
 if TYPE_CHECKING:
     from b24api.contracts import CommandOutcome
     from b24api.references.dispatch import _Reservation
+    from tests.scripting import Envelope, Query
 
 _ADDS = 5
 _LISTS = 25
@@ -119,6 +124,32 @@ async def test_a_window_whose_results_outgrow_the_row_budget_keeps_every_outcome
     assert report.buffered_rows_high_water <= _DEFAULT_ROWS
 
 
+def _empty_lists_then_three_rows(request: Request) -> object:
+    """Answer every command of a classic batch with an empty list, but the last with three rows."""
+    commands = request.copy_parameters()["cmd"]
+    assert isinstance(commands, dict)
+    keys = list(commands)
+    return {"result": {"result": {key: [1, 2, 3] if key == keys[-1] else [] for key in keys}, "result_error": []}}
+
+
+@pytest.mark.asyncio
+async def test_an_empty_result_holds_the_one_row_it_was_fitted_with() -> None:
+    # Two empty results and a three-row one under a budget of three rows: every outcome holds a row, so the
+    # three rows do not fit what the two empty results leave, and the stream holds the three outcomes' rows.
+    lists = [Command(Request("crm.deal.list", {"start": index}, route=RouteKind.BARE), index) for index in range(3)]
+    async with client_for(
+        ResponderTransport(_empty_lists_then_three_rows), policy=ExecutionPolicy(max_buffered_rows=3)
+    ) as client:
+        stream = client.batch_outcomes(lists)
+        outcomes = [outcome async for outcome in stream]
+
+    assert [isinstance(outcome, CommandSuccess) for outcome in outcomes] == [True, True, False]
+    _assert_dropped(outcomes[2], rows=3, limit=1)
+    report = stream.report
+    assert report is not None
+    assert report.buffered_rows_high_water == len(lists)
+
+
 def _three_rows(request: Request) -> object:
     commands = request.copy_parameters()["cmd"]
     assert isinstance(commands, dict)
@@ -128,6 +159,20 @@ def _three_rows(request: Request) -> object:
 _WRITE = Command(
     Request("crm.item.add", {"fields": {"TITLE": "x"}}, ReplaySafety.UNSAFE, route=RouteKind.BARE), "write"
 )
+
+
+@pytest.mark.asyncio
+async def test_a_result_exactly_the_rows_the_budget_leaves_is_delivered() -> None:
+    # Three rows under a budget of three: the result fits to the last row, so it is a success.
+    transport = ResponderTransport(_three_rows)
+    async with client_for(transport, policy=ExecutionPolicy(max_buffered_rows=3)) as client:
+        stream = client.batch_outcomes([_WRITE])
+        (outcome,) = [outcome async for outcome in stream]
+
+    assert isinstance(outcome, CommandSuccess)
+    report = stream.report
+    assert report is not None
+    assert report.buffered_rows_high_water == 3  # noqa: PLR2004 - the whole budget
 
 
 @pytest.mark.asyncio
@@ -155,6 +200,83 @@ async def test_a_fail_fast_batch_carries_the_dropped_result_in_its_failure() -> 
     (failed,) = error.outcomes
     _assert_dropped(failed, rows=3, limit=2)
     assert [violation.code for violation in error.report.violations] == ["budget_exhausted"]
+
+
+_REQUEST_ID = "request-7"
+
+
+def _three_rows_with_a_request_id(request: Request) -> WireResponse:
+    """Answer a direct request, or each command of a classic batch, with three rows, under a request id."""
+    commands = request.copy_parameters().get("cmd")
+    rows = [1, 2, 3]
+    body = (
+        {"result": {"result": dict.fromkeys(commands, rows), "result_error": []}}
+        if isinstance(commands, dict)
+        else {"result": rows}
+    )
+    headers = (("content-type", "application/json"), ("x-request-id", _REQUEST_ID))
+    return WireResponse(200, headers, json.dumps(body).encode())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["batch", "fan-out-batch", "fan-out-direct"])
+async def test_a_dropped_result_keeps_the_evidence_of_the_answer_it_dropped(operation: str) -> None:
+    # The command was answered: its failure names the HTTP status and the request id of that answer.
+    command = Command(Request("crm.item.list", {}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
+    transport = ResponderTransport(_three_rows_with_a_request_id)
+    async with client_for(transport, policy=ExecutionPolicy(max_buffered_rows=2)) as client:
+        stream = (
+            client.batch_outcomes([command])
+            if operation == "batch"
+            else client.fan_out_outcomes(
+                [command], dispatch=BatchDispatch() if operation == "fan-out-batch" else DirectDispatch()
+            )
+        )
+        (outcome,) = [outcome async for outcome in stream]
+
+    assert isinstance(outcome, CommandFailure)
+    assert isinstance(outcome.error, ResultTooLargeError)
+    assert (outcome.error.http_status, outcome.error.evidence.request_id) == (200, _REQUEST_ID)
+
+
+_COUNTED_ROWS = 300
+_COUNTED_PAGE = 50
+_OVER_CAP_OFFSET = 100
+
+
+def _counted_with_a_page_over_its_cap(method: str, query: Query) -> Envelope:
+    """Serve ``_COUNTED_ROWS`` rows with an exact total; the page at ``_OVER_CAP_OFFSET`` holds one row too many."""
+    del method
+    offset = int(query.get("start", "0"))
+    width = _COUNTED_PAGE + (offset == _OVER_CAP_OFFSET)
+    envelope: Envelope = {"result": [{"ID": row} for row in range(offset, offset + width)], "total": _COUNTED_ROWS}
+    if offset + _COUNTED_PAGE < _COUNTED_ROWS:
+        envelope["next"] = offset + _COUNTED_PAGE
+    return envelope
+
+
+@pytest.mark.asyncio
+async def test_a_counted_tail_page_over_its_cap_is_reported_as_answered() -> None:
+    # The tail window of two pages fills the row budget; the second page came back a row longer. Both pages
+    # ran: the first is delivered, the second's result is dropped as answered, never left out of the report.
+    portal = BatchPortal(_counted_with_a_page_over_its_cap)
+    async with client_for(portal, policy=ExecutionPolicy(max_buffered_rows=2 * _COUNTED_PAGE)) as client:
+        stream = client.iter_list_counted(Request.bare("crm.item.list", {}, ReplaySafety.SAFE), page_size=_COUNTED_PAGE)
+        rows, error = await drain_to_failure(stream, IncompleteTraversalError)
+
+    assert portal.waves == [1, 2]
+    assert len(rows) == 2 * _COUNTED_PAGE
+    cause = error.__cause__
+    assert isinstance(cause, ResultTooLargeError)
+    assert (cause.rows, cause.limit) == (_COUNTED_PAGE + 1, _COUNTED_PAGE)
+    assert execution(cause) is Execution.ANSWERED
+    report = stream.report
+    assert report is not None
+    assert [(record.offset, record.outcome) for record in report.page_trace] == [
+        (0, PageOutcome.COMMITTED),
+        (_COUNTED_PAGE, PageOutcome.COMMITTED),
+        (_OVER_CAP_OFFSET, PageOutcome.REJECTED),
+    ]
 
 
 def _rows(count: int) -> ResponderTransport:
@@ -214,6 +336,19 @@ async def test_a_fan_out_result_exactly_its_share_of_the_row_budget_is_delivered
     report = stream.report
     assert report is not None
     assert report.buffered_rows_high_water == share
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("dispatch", "policy", "share"), _SHARES[:2], ids=_SHARE_IDS[:2])
+async def test_a_fan_out_result_far_longer_than_its_share_names_the_share_as_its_limit(
+    dispatch: BatchDispatch | DirectDispatch, policy: ExecutionPolicy | None, share: int
+) -> None:
+    # The limit is the rows the share left the result, however far the result outgrew it.
+    command = Command(Request("crm.item.list", {}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
+    async with client_for(_rows(share * 2), policy=policy) as client:
+        (outcome,) = [outcome async for outcome in client.fan_out_outcomes([command], dispatch=dispatch)]
+
+    _assert_dropped(outcome, rows=share * 2, limit=share)
 
 
 @pytest.mark.asyncio

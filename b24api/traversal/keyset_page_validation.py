@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.batch.outcome import BatchFailure, BatchSuccess, settlement_of
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import ReplayDisposition
@@ -106,15 +106,20 @@ def select_rows(*, outcome: BatchSuccess, selector: ResultSelector) -> tuple[Fro
     return tuple(_response_items(outcome.response, selector))
 
 
-def classify_rejection(outcome: BatchOutcome, receipt: ReceiptRejection) -> tuple[PageOutcome, PageRejectionCode]:
-    """Classify one rejected receipt without inspecting unsafe values: its own contract failure first."""
+def classify_rejection(
+    outcome: BatchOutcome, receipt: ReceiptRejection
+) -> tuple[PageOutcome, PageRejectionCode] | None:
+    """Classify one rejected receipt without inspecting unsafe values: its own contract failure first.
+
+    A failed command is traced by ``failed_page``'s one rule: ``None`` for a command that never executed.
+    """
     if isinstance(receipt.error, PageAdaptationError):
         return PageOutcome.REJECTED, PageRejectionCode.PAGE_ADAPTATION
     if isinstance(receipt.error, IdentityContractError):
         return PageOutcome.REJECTED, PageRejectionCode.IDENTITY_CONTRACT
     if not isinstance(outcome, BatchFailure):
         return PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION
-    return failed_page(outcome.error)
+    return failed_page(outcome.error, settlement_of(outcome))
 
 
 def validate_lane_receipt(  # noqa: PLR0913

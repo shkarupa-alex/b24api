@@ -17,6 +17,7 @@ only its behavioural test catches it.
 from __future__ import annotations
 import ast
 import asyncio
+import copy
 import json
 from collections import Counter
 from pathlib import Path
@@ -31,6 +32,7 @@ from b24api.batch.outcome import BatchFailure
 from b24api.errors import B24ApiError, BudgetExceededError, FailurePhase, TransportError
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WireResponse, WorkClass
 from b24api.execution.context import RETRY_WINDOW_EXHAUSTED
+from b24api.execution.facts import dropped_result
 from tests.scripting import DEADLINE_BUDGET, HANG_BOUND, ResponderTransport, always
 
 if TYPE_CHECKING:
@@ -100,14 +102,12 @@ ARMING = {"timeout", "timeout_at", "wait_for", "Timeout"}
 # Every construction of a ``BudgetExceededError`` or a subclass: (module, owner, call) -> calls.
 CONSTRUCTIONS = Counter(
     {
-        # The deadline's own refusal: by the operation's deadline, or by a request's retry window first; and the
-        # recorded refusal raised again to end the operation with it.
-        (CONTEXT, f"{LEDGER}._refuse", "BudgetExceededError(refusal)"): 1,
+        # The operation's refusal, marked as its end (``REFUSALS`` lists who builds one); a replay round stops its
+        # commands with that refusal or a copy of it, which keeps its mark.
+        (CONTEXT, f"{LEDGER}.operation_refusal", "BudgetExceededError(message)"): 1,
+        # A request's retry window closing before the operation's deadline: that request alone.
         (CONTEXT, f"{LEDGER}._refuse", "BudgetExceededError(RETRY_WINDOW_EXHAUSTED)"): 1,
-        (CONTEXT, f"{LEDGER}.raise_if_refused", "BudgetExceededError(self._refusal)"): 1,
-        # Count budgets: the request budget and the attempt, page, row and identity ceilings, which time does not move.
-        (CONTEXT, f"{LEDGER}.admit_request", "BudgetExceededError(REQUEST_BUDGET_EXHAUSTED)"): 1,
-        (CONTEXT, "AsyncIteratorController.get", "BudgetExceededError(REQUEST_BUDGET_EXHAUSTED)"): 1,
+        # Count budgets: the attempt, page, row and identity ceilings, which time does not move.
         (CONTEXT, f"{LEDGER}.reserve_attempt", "BudgetExceededError('per-request attempt budget exhausted')"): 1,
         (
             CONTEXT,
@@ -125,7 +125,7 @@ CONSTRUCTIONS = Counter(
         (
             "execution/facts.py",
             "dropped_result",
-            "ResultTooLargeError(rows=rows, limit=limit, request_summary=request_summary)",
+            "ResultTooLargeError(rows=rows, limit=limit, request_summary=request_summary, evidence=evidence)",
         ): 1,
         (
             "references/budget_view.py",
@@ -325,6 +325,32 @@ def test_every_budget_error_constructed_is_listed() -> None:
             elif isinstance(node, ast.Raise) and node.exc is not None and _name(node.exc) in errors:
                 constructed[module, owners[id(node)], ast.unparse(node.exc)] += 1
     assert constructed == CONSTRUCTIONS, "refuse work by time through ExecutionContext.time_left or deadline"
+
+
+# Who builds the operation's refusal, the one error that ends the operation (``ExecutionContext.ended_by``): the
+# deadline (``_refuse``, for ``time_left`` and ``deadline``), the request budget at a send and at a source pull, and the
+# recorded refusal raised again. A replay round stops its commands with the refusal or a copy, which keeps the mark.
+REFUSALS = Counter(
+    {
+        (CONTEXT, f"{LEDGER}._refuse", "operation_refusal"): 1,
+        (CONTEXT, f"{LEDGER}.admit_request", "operation_refusal"): 1,
+        (CONTEXT, f"{LEDGER}.raise_if_refused", "operation_refusal"): 1,
+        (CONTEXT, "AsyncIteratorController.get", "operation_refusal"): 1,
+    }
+)
+
+
+def test_only_the_listed_sites_build_the_operation_s_refusal() -> None:
+    built = Counter(
+        (module, owners[id(node)], name)
+        for module, tree in _modules()
+        for owners in [_owners(tree)]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for name in [_name(node.func)]
+        if name == "operation_refusal"
+    )
+    assert built == REFUSALS, "only a refusal by the operation's budget ends the operation"
 
 
 def test_every_budget_error_class_is_seen() -> None:
@@ -693,3 +719,28 @@ async def test_a_deadline_passing_while_the_first_send_is_planned_is_recorded_if
         refused = error
     assert context.refusal == (None if refused is None else str(refused))
     await executor.coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_only_the_operation_s_own_refusal_ends_it() -> None:
+    """The refusal is told by the mark its context put on it, never by its text or its type."""
+    clock = _Clock()
+    context, other = await _context(clock), await _context(clock)
+    clock.now = 20.0
+    with pytest.raises(BudgetExceededError) as refused:
+        context.time_left("the send")
+    refusal = refused.value
+    assert context.refusal == "the send"
+
+    assert context.ended_by(refusal)
+    assert context.ended_by(copy.copy(refusal))
+    with pytest.raises(BudgetExceededError) as again:
+        context.raise_if_refused()
+    assert context.ended_by(again.value)
+    # The same text, a dropped result and another operation's refusal end nothing.
+    with pytest.raises(BudgetExceededError) as foreign:
+        other.time_left("the send")
+    assert not context.ended_by(BudgetExceededError("the send"))
+    assert not context.ended_by(dropped_result(rows=2, limit=1, request_summary=None, evidence=None))
+    assert not context.ended_by(foreign.value)
+    assert not context.ended_by(None)

@@ -40,19 +40,22 @@ from b24api.contracts.command import Command
 from b24api.contracts.completion import CommandSettlement, PageAcknowledged, PageDelivered
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError
-from b24api.execution import Executor
+from b24api.execution import Executor, RateCoordinator
 from b24api.execution.context import CleanupResult, ExecutionContext
+from b24api.execution.facts import Execution, execution, settlement
 from b24api.references.counted_io import ReferenceTailStream
 from b24api.references.dispatch import (
     _BatchPageDispatcher,
+    _ChunkPageError,
     _DoneEvent,
-    _failed_settlement,
+    _failed_page,
     _FailureEvent,
     _PendingBatch,
     _ProducerState,
     _RowBuffer,
 )
 from b24api.references.scheduler import ReferenceScheduler
+from b24api.transport import TransportCapabilities
 from b24api.traversal.counted_batch import _settle_tail_cleanup
 from b24api.traversal.plans import KernelBatchDispatch, ReferenceOutputOrder
 from tests.scripting import (
@@ -75,6 +78,7 @@ if TYPE_CHECKING:
     from b24api.references.dispatch import _AdmissionState, _DispatchedPage, _Event, _Transit, _Work
     from b24api.references.program import FastKeysetProgram
     from b24api.references.run import _ReferenceRun
+    from b24api.transport import WireRequest, WireResponse
     from b24api.traversal.identity import _Page
     from tests.scripting import Answer, Envelope, Query
 
@@ -408,6 +412,118 @@ async def test_an_ordered_pool_page_that_stops_waiting_once_woken_hands_its_rows
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ordered", [False, True], ids=["ready", "input"])
+async def test_a_release_wakes_only_the_waiting_pages_its_rows_serve(ordered: bool) -> None:  # noqa: FBT001
+    """Rows coming back wake the waiting pages they serve and no others, so the wake-ups stay linear.
+
+    Every page woken takes its rows once its task resumes; until then they are promised to it, and a page
+    woken for the same rows would only queue again.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    pages, page = 5, 2
+    buffer = _RowBuffer(pages * page, context, producer_state=_producers(0, 1) if ordered else None, ordered=ordered)
+    held = await buffer.reserve(0, pages * page)
+    await buffer.accept(held, pages * page)
+    tasks = [asyncio.create_task(buffer.reserve(1, page)) for _page in range(pages)]
+    await asyncio.sleep(0)
+    waiters = list(buffer._waiters)  # noqa: SLF001
+    assert len(waiters) == pages
+
+    for served in range(1, pages + 1):
+        await buffer.release(held, page)
+        assert sum(waiter.woken.done() for waiter in waiters) == served
+        async with asyncio.timeout(HANG_BOUND):
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        tasks = [task for task in tasks if not task.done()]
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("taker", ["page", "lease"])
+async def test_rows_promised_to_a_woken_page_are_its_own_until_it_resumes(taker: str) -> None:
+    """A page or a lease asking for rows after a release does not take those a woken page was promised.
+
+    It took them, so the woken page found its rows gone and queued again, and the page that fitted in what was
+    left stayed parked until the next change of the pool.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    buffer = _RowBuffer(5, context)
+    held = await buffer.reserve(0, 5)
+    await buffer.accept(held, 5)
+    woken = asyncio.create_task(buffer.reserve(1, 5))
+    await asyncio.sleep(0)
+
+    await buffer.release(held, 5)
+    # Eager, so the later request asks before the woken page resumes, as one already running would.
+    later = asyncio.eager_task_factory(
+        asyncio.get_running_loop(),
+        buffer.reserve(2, 1) if taker == "page" else buffer.lease(2, lambda free: free or None),
+    )
+    assert not later.done()
+    async with asyncio.timeout(HANG_BOUND):
+        reservation = await woken
+    assert (reservation.amount, later.done()) == (5, False)
+
+    await buffer.abort(reservation)
+    async with asyncio.timeout(HANG_BOUND):
+        assert (await later).amount == (1 if taker == "page" else 5)
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_woken_page_that_no_longer_fits_gives_its_promise_to_the_pages_it_serves() -> None:
+    """A woken page that no longer fits when it resumes waits again and wakes the waiting pages that fit.
+
+    Here the frontier's reserve grows between the wake and the resume; the page's promise went back to the pool
+    with no page woken for it, so the smaller page that fitted stayed parked.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    buffer = _RowBuffer(10, context, ordered=True)
+    held = await buffer.reserve(0, 10)
+    await buffer.accept(held, 10)
+    small_page = 2
+    large = asyncio.create_task(buffer.reserve(1, 9))
+    small = asyncio.create_task(buffer.reserve(2, small_page))
+    await asyncio.sleep(0)
+
+    await buffer.release(held, 10)
+    buffer.raise_head_reserve(5)
+    async with asyncio.timeout(HANG_BOUND):
+        assert (await small).amount == small_page
+    assert not large.done()
+    large.cancel()
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_page_given_back_leaves_the_pool_and_no_other() -> None:
+    """The pool lists each reservation as its own: giving one back removes that one, not an equal one.
+
+    A page charged to a lease holds no pool rows; once an aborted page's rows were zeroed, the pool removed
+    that lease page in its place and kept the aborted page as one that may still return rows.
+    """
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    buffer = _RowBuffer(10, context)
+    lease_page = await buffer.reserve(0, 0)
+    page = await buffer.reserve(0, 7)
+
+    await buffer.abort(page)
+
+    assert not buffer.releasable_elsewhere(1)
+    await buffer.accept(lease_page, 0)
+    assert buffer._reservations == []  # noqa: SLF001
+    await buffer.close()
+
+
+@pytest.mark.asyncio
 async def test_an_input_tail_keeps_room_for_the_pages_it_puts_in_flight_at_once() -> None:
     """A counted tail sends up to its window of pages at once: the pages behind it leave room for all of them."""
     executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
@@ -423,6 +539,23 @@ async def test_an_input_tail_keeps_room_for_the_pages_it_puts_in_flight_at_once(
     assert buffer.can_reserve(2, 2)
     # Its last page sent, the tail keeps no room.
     state.set_window("r1", 0)
+    assert buffer.can_reserve(2, 8)
+    await buffer.abort(held)
+    await buffer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_binding_charged_to_its_lease_keeps_no_room_behind_it() -> None:
+    """Once a fast keyset binding charges its pages to its lease, the pages behind it keep no room for them."""
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    state = _producers(0, 1, 2)
+    buffer = _RowBuffer(10, context, head_reserve=2, producer_state=state, ordered=True)
+    held = await buffer.reserve(0, 2)
+    # Eight rows free: r1 keeps room for one page of two rows.
+    assert not buffer.can_reserve(2, 8)
+    state.charge_to_lease("r1")
     assert buffer.can_reserve(2, 8)
     await buffer.abort(held)
     await buffer.close()
@@ -905,7 +1038,7 @@ async def test_a_page_whose_wave_was_sent_when_the_deadline_passed_settles_unkno
     assert not isinstance(results[0], BudgetExceededError)
     assert isinstance(results[1], BudgetExceededError)
     assert "admission" in str(results[1])
-    assert [_failed_settlement(cast("BaseException", result)) for result in results] == [
+    assert [_failed_page(cast("BaseException", result)).settlement for result in results] == [
         CommandSettlement.UNKNOWN,
         CommandSettlement.NOT_EXECUTED,
     ]
@@ -951,7 +1084,7 @@ async def test_a_page_cancelled_after_its_wave_was_sent_settles_unknown() -> Non
 
     # The wave left with the page, so the page may have run.
     (error,) = cancelled
-    assert _failed_settlement(error) is CommandSettlement.UNKNOWN
+    assert _failed_page(error).settlement is CommandSettlement.UNKNOWN
 
 
 @pytest.mark.asyncio
@@ -995,13 +1128,16 @@ async def test_a_send_that_breaks_an_invariant_fails_its_pages_as_possibly_run(m
     context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10))
     await context.start()
     dispatcher, buffer = _three_producer_dispatcher(executor, context)
-    with pytest.raises(ValueError, match="zip") as caught:
+    with pytest.raises(_ChunkPageError) as caught:
         await asyncio.wait_for(dispatcher.fetch(_page("a"), "a"), timeout=HANG_BOUND)
     await dispatcher.aclose()
     await buffer.close()
 
-    # The page fails with the send path's own error, and it may have run.
-    assert _failed_settlement(caught.value) is CommandSettlement.UNKNOWN
+    # The page reports the send path's own error, and it may have run: its chunk never ended.
+    failed = _failed_page(caught.value)
+    assert isinstance(failed.error, ValueError)
+    assert "zip" in str(failed.error)
+    assert failed.settlement is CommandSettlement.UNKNOWN
 
 
 class _EndlessReferences:
@@ -1235,3 +1371,109 @@ async def test_an_input_page_read_ahead_is_acknowledged_only_once_its_consumer_h
     assert decision.pages_scheduled > pages
     assert len(acknowledged) == decision.pages_acknowledged == 1
     assert set(acknowledged) <= delivered
+
+
+class _BlockedWire(ResponderTransport):
+    """Hold every send on the wire until cancelled, a REST v3 batch envelope's included."""
+
+    capabilities = TransportCapabilities(routes=frozenset({RouteKind.BARE, RouteKind.API_V3}), json_array_body=True)
+
+    def __init__(self, blocker: Blocker) -> None:
+        """Block classic sends with ``blocker`` and set its ``started`` for a v3 envelope too."""
+        super().__init__(blocker)
+        self.blocker = blocker
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        """Hold the envelope on the wire."""
+        del request, attempt_timeout, max_response_bytes
+        self.blocker.started.set()
+        await asyncio.Future[None]()
+        raise AssertionError("unreachable")
+
+
+def _staged_wave(monkeypatch: pytest.MonkeyPatch, stage: str) -> tuple[BatchPortal | _BlockedWire, asyncio.Event]:
+    """Hold a two-page wave at ``stage``; the event is set once it is held there."""
+    if stage in {"on_wire", "v3_on_wire"}:
+        blocker = Blocker()
+        return _BlockedWire(blocker), blocker.started
+    waiting = asyncio.Event()
+
+    async def held(*_args: object, **_kwargs: object) -> None:
+        waiting.set()
+        await asyncio.Future[None]()
+
+    if stage == "before_send":
+        monkeypatch.setattr(RateCoordinator, "acquire", held)
+    else:
+        monkeypatch.setattr(Executor, "replay_after", held)
+    refused: list[str] = []
+
+    def answer(_method: str, query: Query) -> Envelope:
+        if query["id"] == "2" and not refused:
+            refused.append(query["id"])
+            return {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}
+        return {"result": [{"ID": int(query["id"])}]}
+
+    return BatchPortal(answer), waiting
+
+
+_POSSIBLY_RUN = (Execution.POSSIBLY_RUN, CommandSettlement.UNKNOWN)
+_CANCELLED_PAGES = {
+    # (stage, how the pages end): what each of the two pages' failure records, and how its page settles
+    ("before_send", "pages"): [_POSSIBLY_RUN, _POSSIBLY_RUN],
+    ("before_send", "close"): [(Execution.NOT_SENT, CommandSettlement.NOT_EXECUTED)] * 2,
+    ("on_wire", "pages"): [_POSSIBLY_RUN, _POSSIBLY_RUN],
+    ("on_wire", "close"): [_POSSIBLY_RUN, _POSSIBLY_RUN],
+    ("replay_wait", "pages"): [(Execution.ANSWERED, CommandSettlement.SUCCESS), _POSSIBLY_RUN],
+    ("replay_wait", "close"): [
+        (Execution.ANSWERED, CommandSettlement.SUCCESS),
+        (Execution.ANSWERED, CommandSettlement.FAILURE),
+    ],
+    ("v3_on_wire", "pages"): [_POSSIBLY_RUN, _POSSIBLY_RUN],
+    ("v3_on_wire", "close"): [_POSSIBLY_RUN, _POSSIBLY_RUN],
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stage", "how"), list(_CANCELLED_PAGES))
+async def test_a_page_cancelled_at_any_stage_of_its_wave_keeps_what_its_command_did(
+    monkeypatch: pytest.MonkeyPatch, stage: str, how: str
+) -> None:
+    """Each cancelled page records what its command did, and settles from it as the flat path does.
+
+    Two pages share one wave. Either the pages are cancelled, and the wave runs on for its other commands, so a
+    command not answered yet may still run; or the dispatcher closes, so the wave sends nothing more. A wave held
+    at its permit sent nothing; one on the wire, a REST v3 envelope's included, may have run every command. The
+    wave answers one page and refuses the other (QUERY_LIMIT_EXCEEDED), then waits to send the refused one
+    again: the answered page succeeded, under one encoding with the flat path, and the refused one may run while
+    the wave runs on, or is an answered failure once it sends nothing more.
+    """
+    transport, waiting = _staged_wave(monkeypatch, stage)
+    executor = Executor(transport)
+    context = executor.context(ExecutionPolicy(max_pages=100, max_pages_per_reference=100))
+    await context.start()
+    dispatcher = _BatchPageDispatcher(
+        executor, context, KernelBatchDispatch(batch_size=2, concurrency=1, coalesce_wait=UNREACHABLE_COALESCE_WAIT)
+    )
+    route = RouteKind.API_V3 if stage == "v3_on_wire" else RouteKind.BARE
+    failures: dict[int, BaseException] = {}
+
+    async def fetch(item: int) -> None:
+        request = Request("crm.item.get", parameters={"id": item}, replay_safety=ReplaySafety.SAFE, route=route)
+        try:
+            await dispatcher.fetch(request, f"r{item}")
+        except BaseException as error:
+            failures[item] = error
+            raise
+
+    pages = [asyncio.create_task(fetch(item)) for item in (1, 2)]
+    await asyncio.wait_for(waiting.wait(), timeout=HANG_BOUND)
+    if how == "pages":
+        for page in pages:
+            page.cancel()
+        await asyncio.gather(*pages, return_exceptions=True)
+    await dispatcher.aclose()
+    await asyncio.gather(*pages, return_exceptions=True)
+
+    assert all(isinstance(failures[item], asyncio.CancelledError) for item in (1, 2))
+    assert [(execution(failures[item]), settlement(failures[item])) for item in (1, 2)] == _CANCELLED_PAGES[stage, how]

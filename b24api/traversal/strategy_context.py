@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from b24api.completion.recorder import CompletionSink
+    from b24api.contracts.completion import CommandSettlement
     from b24api.contracts.json import FrozenJson, JsonValue
     from b24api.contracts.policy import ConfirmationPolicy
     from b24api.contracts.report import PageDispatch
@@ -72,8 +73,15 @@ class StrategyContext(Protocol):
         """Attach physical dispatch provenance without changing the logical cursor."""
         ...
 
-    def record_failed_page(self, *, dispatch: PageDispatch, batch_index: int | None, error: BaseException) -> None:
-        """Record a dispatched page whose command failed, traced from its execution facts."""
+    def record_failed_page(
+        self,
+        *,
+        dispatch: PageDispatch,
+        batch_index: int | None,
+        error: BaseException,
+        settled: CommandSettlement,
+    ) -> None:
+        """Record a failed page by its settlement (``settled``): none for a page never sent, else the trace's code."""
         ...
 
     def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:

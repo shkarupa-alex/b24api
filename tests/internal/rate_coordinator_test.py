@@ -11,7 +11,7 @@ from b24api import BatchDispatch, Bitrix24, ReplaySafety, Request, Settings
 from b24api.contracts import Command, CommandFailure, CommandSettlement
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import RouteKind
-from b24api.errors import BudgetExceededError, ClientClosedError
+from b24api.errors import BudgetExceededError, ClientClosedError, IncompleteTraversalError
 from b24api.execution import CoordinatorState, Executor, RateCoordinator, WireResponse, WorkClass
 from b24api.execution.cleanup import close_owned_resources
 from b24api.execution.facts import execution
@@ -125,6 +125,38 @@ async def test_a_closed_coordinator_stops_a_rest_v3_first_envelope_whose_command
         assert isinstance(outcome, CommandFailure)
         assert isinstance(outcome.error, ClientClosedError)
         assert execution(outcome.error).settlement is CommandSettlement.NOT_EXECUTED
+    report = stream.report
+    assert report is not None
+    assert report.physical_requests == 0
+    assert report.page_trace == ()
+
+
+@pytest.mark.asyncio
+async def test_a_closed_coordinator_stops_a_flat_counted_head_which_is_not_traced() -> None:
+    # The caller closed the coordinator of the executor it injected: the direct head of a flat counted traversal stops
+    # at its permit. No request carried it, so it is not traced.
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={"result": []})))
+    transport = HttpxTransport(f"https://{HOST}/rest/1/token/", client=http)
+    coordinator = RateCoordinator()
+    executor = Executor(transport, coordinator=coordinator)
+    await coordinator.close()
+    client = Bitrix24._from_executor(executor)  # noqa: SLF001 - caller-owned executor seam, to close its coordinator
+    stream = client.iter_list_counted(Request.bare("crm.item.list", {}, ReplaySafety.SAFE), page_size=50)
+
+    async def drain() -> None:
+        async with stream:
+            async for _ in stream:
+                pass
+
+    try:
+        with pytest.raises(IncompleteTraversalError) as raised:
+            await drain()
+    finally:
+        await client.aclose()
+        await transport.aclose()
+        await http.aclose()
+
+    assert isinstance(raised.value.__cause__, ClientClosedError)
     report = stream.report
     assert report is not None
     assert report.physical_requests == 0

@@ -15,15 +15,14 @@ from typing import TYPE_CHECKING, Protocol
 from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
-from b24api.errors import CapabilityError
-from b24api.references.dispatch import _BatchPageError, _failed_dispatch, _failed_execution, _failed_settlement
+from b24api.errors import B24ApiError, CapabilityError
+from b24api.references.dispatch import _BatchPageError, _failed_page, _SentPageError
 from b24api.traversal.counted_io import HeadAttempt, TailReceipt
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
     from b24api.batch.engine import _BatchInput
-    from b24api.batch.outcome import BatchFailure
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.request import Request
     from b24api.execution import ExecutionContext
@@ -123,20 +122,18 @@ class SharedCountedWaveIO:
             None,
             dispatched.dispatch,
             dispatched.batch_index,
-            dispatch_started=True,
             settlement=CommandSettlement.SUCCESS,
         )
 
     def head_failure(self, error: BaseException) -> HeadAttempt:
         """Return the actual batch provenance of a failed head and its settlement."""
-        failed = _failed_dispatch(self._host.page_dispatch, error)
+        failed = _failed_page(error)
         return HeadAttempt(
             None,
-            failed.error or error,
-            failed.dispatch,
+            failed.error,
+            self._host.page_dispatch,
             failed.batch_index,
-            dispatch_started=_failed_execution(error).dispatched,
-            settlement=_failed_settlement(error),
+            settlement=failed.settlement,
         )
 
     async def tail_batch_size(
@@ -341,12 +338,17 @@ class ReferenceTailStream:
         run = self._run
         try:
             dispatched = await task
-        except _BatchPageError as error:
+        except (_SentPageError, B24ApiError) as error:
+            # A failed page, whatever its command did, is the page's outcome, as on the flat tail: the binding takes
+            # it, and the tail's one trace site traces it by its settlement (``failed_page``), none if never sent.
+            failed = _failed_page(error)
             self._take(slot)
-            return TailReceipt(slot.ordinal, None, error.failure, error.failure.command_index)
+            return TailReceipt(
+                slot.ordinal, None, failed.batch_index, failed.settlement, error=failed.error, failure=failed.failure
+            )
         self._take(slot)
         run.page_state += 1
-        return TailReceipt(slot.ordinal, dispatched.response, None, dispatched.batch_index)
+        return TailReceipt(slot.ordinal, dispatched.response, dispatched.batch_index, CommandSettlement.SUCCESS)
 
     def _take(self, slot: _TailSlot) -> None:
         run = self._run
@@ -357,15 +359,15 @@ class ReferenceTailStream:
 
     def settle(self, receipt: TailReceipt) -> None:
         """Record the activated page's physical command outcome."""
-        failure = receipt.failure
-        self._run.completion.settled(
-            CommandSettlement.SUCCESS if failure is None else _failed_settlement(_BatchPageError(failure))
-        )
+        self._run.completion.settled(receipt.settlement)
 
-    def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
-        """Return the binding failure carrying the command's replay disposition."""
-        del receipt
-        return _BatchPageError(outcome)
+    def failure(self, receipt: TailReceipt) -> BaseException:
+        """Return the binding failure: its command's own, which carries the replay disposition, or its chunk's."""
+        if receipt.failure is not None:
+            return _BatchPageError(receipt.failure)
+        if receipt.error is None:
+            raise RuntimeError("counted tail failure lacks its error")
+        return receipt.error
 
     async def aclose(self) -> None:
         """Stop planning, then settle and release every page the binding will not commit, once."""
@@ -398,7 +400,7 @@ def _abandoned_settlement(slot: _TailSlot) -> CommandSettlement:
     if not task.cancelled() and task.exception() is None:
         return CommandSettlement.SUCCESS
     error = slot.error
-    return CommandSettlement.NOT_EXECUTED if error is None else _failed_settlement(error)
+    return CommandSettlement.NOT_EXECUTED if error is None else _failed_page(error).settlement
 
 
 __all__ = ["LeaseCountedRowAccount", "ReferenceTailStream", "SharedCountedWaveIO"]

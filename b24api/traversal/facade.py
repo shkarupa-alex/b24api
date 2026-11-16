@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, TypedDict, Unpack, cast
 
 from b24api.batch.facade import resolve_batch_size
+from b24api.completion.fast_recorder import FastCompletionRecorder
 from b24api.completion.operation_stream import MappedOperationStream, _ClosableIterator
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
@@ -192,6 +193,7 @@ def keyset_stream(  # noqa: PLR0913
         reject_unencodable_fast_request(canonical)
         context = executor.context(policy)
         trace = FastTraceRecorder(policy.page_trace_limit)
+        ledger = FastCompletionRecorder()
         runtime = KeysetRuntime(
             request=canonical,
             identity=identity,
@@ -202,9 +204,10 @@ def keyset_stream(  # noqa: PLR0913
             effective_page_cap=effective_cap,
             execution=execution,
             context=context,
-            engine=FlatWaveEngine(executor),
+            engine=FlatWaveEngine(executor, ledger),
             trace=trace,
             page_adapter=page_adapter,
+            completion_recorder=ledger,
         )
         return _mapped_stream(
             KeysetFastStream(runtime),

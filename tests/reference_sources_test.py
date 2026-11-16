@@ -841,3 +841,58 @@ async def test_ahomo_sources_of_one_template_trace_exactly_like_the_homogeneous_
         expected_report.logical_pages,
         expected_report.state,
     )
+
+
+@pytest.mark.usefixtures("coalescing")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["references", "sources"])
+@pytest.mark.parametrize(
+    ("dispatch", "policy", "measured", "bound"),
+    [
+        (BatchDispatch(batch_size=50, concurrency=4), ExecutionPolicy(max_buffered_commands=5), "batch", 5),
+        (DirectDispatch(concurrency=8), ExecutionPolicy(max_direct_concurrency=2), "in_flight", 2),
+    ],
+    ids=["max_buffered_commands", "max_direct_concurrency"],
+)
+async def test_the_operation_policy_bounds_every_reference_operation_s_dispatch(
+    api: str,
+    dispatch: BatchDispatch | DirectDispatch,
+    policy: ExecutionPolicy,
+    measured: str,
+    bound: int,
+) -> None:
+    # The dispatch asks for more than the policy allows: a batch holds at most max_buffered_commands, and direct
+    # pages in flight are at most max_direct_concurrency, whichever API built the operation. The bindings arrive on
+    # the loop and a wave coalesces by loop turns (``VirtualClock``), so the dispatch reaches the bound by
+    # construction, on any machine: the policy, not a slow source, is what holds it there.
+    in_flight, peak = 0, 0
+
+    async def answer(_method: str, query: Query) -> Envelope:
+        # A direct page is one request: count the pages answered at once, each held long enough, in loop turns,
+        # for every page the dispatch would allow to be sent meanwhile (8 without the policy's bound).
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        for _turn in range(50):
+            await asyncio.sleep(0)
+        in_flight -= 1
+        return {"result": [{"ID": 1}] if query.get("start", "0") == "0" else []}
+
+    portal = BatchPortal(answer)
+    request = Request.bare("beta.list", {}, ReplaySafety.SAFE)
+    bindings = [
+        Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), parent),), parent) for parent in range(40)
+    ]
+    client = Bitrix24(Settings(webhook_url="https://fixture.invalid/rest/1/token/"), transport=portal, policy=policy)
+    async with client:
+        stream = (
+            client.iter_reference_outcomes(request, on_loop(bindings), traversal=BETA, dispatch=dispatch)
+            if api == "references"
+            else client.iter_reference_source_outcomes(
+                on_loop([ReferenceSource(request, BETA, binding) for binding in bindings]), dispatch=dispatch
+            )
+        )
+        outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == len(bindings) * 2
+    assert (max(portal.waves) if measured == "batch" else peak) == bound
