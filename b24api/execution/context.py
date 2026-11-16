@@ -455,11 +455,12 @@ class OwnedPull[T](Protocol):
 
 
 def is_interrupt(error: BaseException | None) -> bool:
-    """Whether ``error`` interrupts the program rather than fails work: neither an ``Exception`` nor a cancellation.
+    """Whether ``error`` interrupts the program rather than fails work: a ``KeyboardInterrupt`` or ``SystemExit``.
 
-    ``KeyboardInterrupt`` and ``SystemExit`` are the usual ones. ``GeneratorExit`` is none: it closes a coroutine.
+    These are what the event loop raises out of ``asyncio.run`` from a callback; it logs and drops any other
+    exception there. Any other ``BaseException`` is a failure like any other, its reader's to receive.
     """
-    return error is not None and not isinstance(error, Exception | asyncio.CancelledError | GeneratorExit)
+    return isinstance(error, KeyboardInterrupt | SystemExit)
 
 
 class LatchState(Enum):
