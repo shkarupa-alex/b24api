@@ -404,23 +404,8 @@ class ReferenceScheduler:
                 await run_fast_keyset(self, run, program.fast)
             elif pages is not None:
                 await self._drive(run, pages)
-        except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
-            # The binding fails with what its failed page reports, and its command's replay disposition, if any: a
-            # failure's page reports a failure.
-            failed = _failed_page(error)
-            event = self._failure_event(run, cast("Exception", failed.error))
-            if failed.failure is not None:
-                event = replace(event, replay_disposition=failed.failure.replay_disposition)
-            await self.publish_terminal(run, event)
-        except asyncio.CancelledError:
-            # How the operation stops its bindings (``_stop_work``): nobody reads their queues any more.
-            raise
-        except BaseException:
-            # Only a failure is a binding's outcome: anything else ends the operation as it is, where the binding's
-            # outcome would have ended it. Its queue has room: under INPUT it is unbounded; under READY the binding
-            # waits for the consumer to take each page before its next step.
-            run.output.put_nowait(_EndedEvent(work))
-            raise
+        except BaseException as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
+            await self._end_binding(run, error)
         finally:
             try:
                 if pages is not None:
@@ -432,6 +417,28 @@ class ReferenceScheduler:
                     await self.buffer.abort(run.reservation)
         if run.deferred_cleanup_error is not None:
             raise run.deferred_cleanup_error
+
+    async def _end_binding(self, run: _ReferenceRun, error: BaseException) -> None:
+        """End a binding by what its run raised: its terminal event, unless that is no way a binding ends.
+
+        A failure (an ``Exception``) is its failure event. A cancellation (how the operation stops its bindings,
+        ``_stop_work``), a closed coroutine and an interrupt (the operation's latch takes it, ``settle``) go on as
+        they are. Anything else is no failure, so no outcome, yet ends the binding as a failure would: the reader
+        raises it as it is where the binding's outcome would be, and a close that comes first drops it with the rest
+        of what nobody read.
+        """
+        if isinstance(error, Exception):
+            # The binding fails with what its failed page reports, and its command's replay disposition, if any: a
+            # failure's page reports a failure.
+            failed = _failed_page(error)
+            event = self._failure_event(run, cast("Exception", failed.error))
+            if failed.failure is not None:
+                event = replace(event, replay_disposition=failed.failure.replay_disposition)
+            await self.publish_terminal(run, event)
+        elif isinstance(error, asyncio.CancelledError | GeneratorExit) or is_interrupt(error):
+            raise error
+        else:
+            await self.publish_terminal(run, _EndedEvent(run.work, error))
 
     def _driven_pages(self, run: _ReferenceRun) -> AsyncGenerator[_Page]:
         """Build the binding's pagination driver and return its page stream."""
@@ -485,7 +492,7 @@ class ReferenceScheduler:
             ),
         )
 
-    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent) -> None:
+    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent | _EndedEvent) -> None:
         """Publish the binding's terminal event once it has cleaned up; it adds no command any more.
 
         It stops counting as a producer first, so no wave waits for it while the event waits for room,
@@ -913,7 +920,7 @@ class ReferenceScheduler:
 
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
         if isinstance(event, _EndedEvent):
-            return  # no outcome: the binding's task ends the operation (``_finish_task``)
+            raise event.error  # no outcome: what ended the binding ends the operation, as it is
         if isinstance(event, _PageEvent):
             async for outcome in self._consume_page(event):
                 yield outcome
