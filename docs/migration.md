@@ -208,8 +208,8 @@
   reads, nor as a failure: no family wraps it, makes it an outcome or ranks it. It propagates as Python
   propagates it: you get it as it is from your read, whether your transport raised it in that read or
   between reads, or your source's pull or close did; raised by your source's close it replaces whatever
-  ended the stream, as from a `finally`. Your source is closed once, nothing hangs and nothing reaches the
-  event loop. Its report and its rank behind other ends are not promised. Code that caught it as the
+  ended the stream, as from a `finally`. It is never lost: what no read got, the close raises, once. Your
+  source is closed once, nothing hangs and nothing reaches the event loop. Its report and its rank behind other ends are not promised. Code that caught it as the
   `__cause__` of `InputSourceError`, `BatchFailed` or `ReferenceFailed`, or read it from a failure outcome,
   catches it directly.
 - **An outcome's failure from outside the library keeps its cause.** In the `iter_*_outcomes()` families,

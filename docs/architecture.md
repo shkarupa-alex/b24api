@@ -304,12 +304,16 @@ outcome.
   site that decides a failure catches `Exception`. Any other `BaseException` but an interrupt or a
   cancellation is no failure and nothing classifies, wraps or ranks it; it propagates as Python propagates
   it. The library only delivers it: to the reader as it is, from a read, from work between reads or from
-  the source's pull or close, the source closed once, no hang and nothing for the event loop. A cleanup
-  that raises it replaces whatever ended the stream, as a `finally` does (`OperationRunner._terminate`; the
-  cleanup collectors pass any `BaseException` on to their owner). A reference binding that ends in one
-  publishes `_EndedEvent` as its terminal event (`ReferenceScheduler._end_binding`), only so that the reader
-  raises it where the binding's end would be instead of waiting for an end that never comes; a coroutine
-  closed by hand or at collection (`GeneratorExit`) publishes nothing. One piece of state carries an
+  the source's pull or close, the source closed once, no hang and nothing for the event loop, and it is
+  never lost: what no read raised, the close raises. The task it ends returns it (`Settled`), and the cleanup
+  collectors pass any `BaseException` on to their owner, so a cleanup ends in it; that replaces whatever
+  ended the stream, as a `finally` does (`OperationRunner._terminate`). A reference binding that ends in one
+  ends its task in it and puts `_EndedEvent` in its queue (`ReferenceScheduler._end_binding`), only so that a
+  read reaches the binding's place instead of waiting for an end that never comes; it raises the task's end
+  there (`_finish_task`), and a close that comes first raises it from the tasks it collects. A read a
+  concurrent close ended never raises it (that close does, from the read it settles): the read ends as the
+  close's cancellation of it would. A coroutine closed by hand or at collection (`GeneratorExit`) ends no
+  binding. One piece of state carries an
   interrupt: each operation has one
   `InterruptLatch`, the isolated runner's, which its pull and cleanup tasks publish through `INTERRUPTS`
   so the tasks they start inherit it (an inline kernel uses the latch of the runner it serves). Every

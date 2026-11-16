@@ -977,8 +977,10 @@ stream, as an exception raised in a `finally` does, and under `async with` it re
 which becomes its `__context__`. The library guarantees only this, in every family: it reaches you as it
 is, whether your transport raised it in your read or between your reads (in the stream's background work),
 or your source's pull or close did; the source is closed once; nothing hangs waiting for an end it took
-the place of; and nothing reaches the event loop's exception handler or is left in a task whose exception
-nobody retrieves. What the report says about it, and how it ranks behind other ends, is not promised.
+the place of; nothing reaches the event loop's exception handler or is left in a task whose exception
+nobody retrieves; and it is never lost: when no read got it (you closed the stream between reads, or the
+close cancelled the send that raised it), the close raises it, once. A read the close ends in another task
+raises `CancelledError`. What the report says about it, and how it ranks behind other ends, is not promised.
 
 An interrupt raised while no read is waiting (by a send the stream runs between your reads, while you work
 on an item) does not wait for your next read: it leaves the event loop at once, out of `asyncio.run`, as
