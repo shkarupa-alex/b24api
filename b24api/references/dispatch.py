@@ -501,7 +501,7 @@ class _FailedPage:
 
 
 class _SentPageError(Exception):
-    """The failure the batch dispatcher gives a page whose command it sent: it carries the page's own facts."""
+    """The failure the batch dispatcher gives a page it handed to a batch: it carries the page's own facts."""
 
     def __init__(self, message: str, page: _FailedPage) -> None:
         self.page = page

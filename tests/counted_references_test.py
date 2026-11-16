@@ -1063,3 +1063,34 @@ async def test_a_flat_counted_tail_batch_whose_envelope_fails_traces_its_first_p
     assert _failed_trace(_report(stream)) == [
         (None, WIDTH, PageDispatch.BATCH, 0, outcome, PageRejectionCode.BATCH_ENVELOPE)
     ]
+
+
+@pytest.mark.asyncio
+async def test_flat_counted_tail_pages_the_budget_keeps_from_their_send_are_not_traced() -> None:
+    # The budget (three requests) covers the direct head and both tail batches as planned, but the first tail
+    # batch refuses its first page (QUERY_LIMIT_EXCEEDED) and that page's replay spends the third request. The
+    # second tail batch is never sent: the traversal ends with the budget, and its first page, which no request
+    # carried, is not traced.
+    retry = RetryPolicy(initial_delay=0.001, maximum_delay=0.002, jitter=0.0)
+    portal = BatchPortal(_refuse_once((3, WIDTH)))
+    async with _client(portal) as api:
+        stream = api.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE),
+            page_size=WIDTH,
+            batch_size=3,
+            policy=ExecutionPolicy(retry=retry, max_requests=3),
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        with pytest.raises(IncompleteTraversalError) as raised:
+            await drain()
+
+    assert isinstance(raised.value.__cause__, BudgetExceededError)
+    assert portal.waves == [1, 3, 1]
+    report = _report(stream)
+    assert _failed_trace(report) == []
+    assert [record.offset for record in report.page_trace] == [0, WIDTH, 2 * WIDTH, 3 * WIDTH]
