@@ -47,16 +47,20 @@ ends early (a cancelled page, or a fast keyset wave the traversal's end interrup
 chunk that fails as a whole (it reports the chunk's error), reads what each of its commands did from the chunk's `BatchProgress`, which the batch engine keeps by the same rule: a
 command answered, by its entry or with its envelope, was answered, and one answered with a success
 succeeded; one whose latest send, or one before it, may have run without an answer may have run; one
-never sent was not sent. Until the chunk ends, a command without a final outcome may still be sent (a
-replay it waits for), so a page cancelled meanwhile may have run; a REST v3 group keeps its state to
-itself, so its commands in progress may have run. A fast keyset wave engine, flat or shared by reference
-bindings, settles each page it was handed by its command id from what that command did, also when its call
-raises; the page ledger (`FastPageLedger`) settles a page never handed to an engine as not executed, which
-retires it, the one rule on every path. A page answered with a success settles as a success on every
-path: the facts recorded on a cancelled reference page keep that its command succeeded
-(`facts.settlement`). One rule, `facts.settled_as`, gives a command's settlement from what it is known to have
-done and whether it succeeded; its callers only read those two facts from what they hold: a failure's recorded
-facts (`facts.settlement`), a final batch outcome (`batch.outcome.settlement_of`), a command of a running chunk
+never sent was not sent. Until the chunk ends, a command without a final outcome may still be sent (a replay
+it waits for), so a page cancelled meanwhile may have run; a REST v3 group keeps its state to itself, so its
+commands in progress may have run. A fast keyset wave engine, flat or shared by reference bindings, settles
+each page it was handed by its command id from what that command did, also when its call raises; the page
+ledger (`FastPageLedger`) settles a page never handed to an engine as not executed, which retires it, the one
+rule on every path. A page answered with a success settles as a success on every path, a page the traversal
+stops before included: the facts recorded on a cancelled reference page keep that its command succeeded
+(`facts.settlement`), and a counted tail, reference or flat, settles each page it read but will not consume
+from what its command did, the flat one from its batch's outcome or, when the batch's run ended early, its
+`BatchProgress` (`_BatchOutcomeStream.settlement`): answered with a success, a success, rejected as
+`transaction_aborted`; never sent, not executed; unknown only when it may have run. One rule,
+`facts.settled_as`, gives a command's settlement from what it is known to have done and whether it succeeded;
+its callers only read those two facts from what they hold: a failure's recorded facts (`facts.settlement`), a
+final batch outcome (`batch.outcome.settlement_of`), a command of a running chunk
 (`BatchProgress.settlement`) and a shared wave's dispatch task. `b24api.execution.facts` holds the one
 mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
 (`Execution.settlement`), and `b24api.traversal.page_failure` holds the one rule of a failed page's
@@ -72,25 +76,29 @@ A page's trace and its settlement read the same fact, the page's own: for a page
 a whole, its command's in the chunk's `BatchProgress`. Every failure the batch page dispatcher gives a page
 it handed to a batch carries those facts (`_FailedPage`: what it reports, how it settles, and the command's
 own failure when the batch answered or ended it), and every caller reads a failed page through one function
-(`_failed_page`), which falls back to the facts recorded on any other failure: the binding's failure, a
-page's settlement and trace, and a wave or a counted tail that takes a command's own failure as its outcome.
-`page_failure.failed_page` alone decides whether a failed page is traced and how, for `record_failed_page`
-and for keyset's `classify_rejection`. Both counted tails, reference and flat, hand the tail's one trace
-site a receipt for every failed page they reach, sent or never sent, with its command's own failure or (on the
+(`_failed_page`), which falls back to the facts recorded on any other failure: the binding's failure, a page's
+settlement and trace, and a wave or a counted tail that takes a command's own failure as its outcome.
+`page_failure.failed_page` alone decides whether a failed page is traced and how, for `record_failed_page` and
+for keyset's `classify_rejection`. Both counted tails, reference and flat, hand the tail's one trace site a
+receipt for every failed page they reach, sent or never sent, with its command's own failure or (on the
 reference path) its whole chunk's, and that site traces it by `failed_page` alone. A page's `batch_index` is
-its command's index in its batch (the one it was sent with, or handed to), on every path; a page with no
-batch command to point to, such as a direct page, has none. Classic and REST v3 batch, `call()`, direct and
-batch fan-out, references and list traversal all use them, and none of them chooses from the exception type,
-which names the cause of a failure and never proves that a command did not run. A sent command is
-unknown unless a listed refusal proves it did not run or a conclusive answer settles it. A conclusive
-answer is a structured Bitrix error, top-level or found in the result by the command's own contract, or
-any status outside 2xx that the ambiguity policy does not hold ambiguous, whatever its body, so a
-malformed error body on such a status is conclusive too. A REST v3 batch envelope is the one exception:
-a top-level structured error on it is an abort, which may come after some of its commands ran, so it
-settles none of them; a command is answered only by its own element or its own isolated send, or proven
-not run by a transport failure that proves the envelope was not accepted or a listed refusal status of
-the envelope. A 2xx answer the client cannot decode settles nothing, whichever part is malformed: the
-envelope, a command's paging metadata or its embedded error.
+its command's index in the physical batch it was submitted with (sent with, or handed to), as its command's
+outcome carries it, on every path: a keyset wave or finish page of a reference binding shares that batch with
+other bindings' commands, so its index in its own binding's wave is not one. The index is also the command's
+key in that batch's envelope, which every replay send of the command keeps: a page replayed alone, or with
+fewer commands, keeps the index of the batch it was first submitted with, whichever send's answer settled it.
+A page with no batch command to point to, such as a direct page, has none. Classic and REST v3 batch,
+`call()`, direct and batch fan-out, references and list traversal all use them, and none of them chooses from
+the exception type, which names the cause of a failure and never proves that a command did not run. A sent
+command is unknown unless a listed refusal proves it did not run or a conclusive answer settles it. A
+conclusive answer is a structured Bitrix error, top-level or found in the result by the command's own
+contract, or any status outside 2xx that the ambiguity policy does not hold ambiguous, whatever its body, so a
+malformed error body on such a status is conclusive too. A REST v3 batch envelope is the one exception: a
+top-level structured error on it is an abort, which may come after some of its commands ran, so it settles
+none of them; a command is answered only by its own element or its own isolated send, or proven not run by a
+transport failure that proves the envelope was not accepted or a listed refusal status of the envelope. A 2xx
+answer the client cannot decode settles nothing, whichever part is malformed: the envelope, a command's paging
+metadata or its embedded error.
 
 A command keeps one send lineage across executor retries, classic batch replay rounds and REST v3
 isolation: what the sends it was in left open. The commands a REST v3 envelope group still resolves are

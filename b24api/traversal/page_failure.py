@@ -14,10 +14,10 @@ def failed_page(error: object, settled: CommandSettlement) -> tuple[PageOutcome,
     so no command is withheld by the server once its envelope is sent. It left no request to record and is not
     traced, wherever it was stopped (by the operation's budget, a closed client, a cancellation) and on every path,
     direct or batched. Every other page is traced the way it settles (``settled``): unknown only when it may have
-    run, otherwise rejected. The
-    code names why, from the failure that explains it: the physical batch envelope's own protocol failure, or the
-    command's; a page whose own command succeeded was dropped with the batch that failed around it, as a page of an
-    aborted keyset transaction is (``TRANSACTION_ABORTED``), not by a failure of its command.
+    run, otherwise rejected. The code names why, from the failure that explains it: the physical batch envelope's
+    own protocol failure, or the command's; a page whose own command succeeded was dropped with the batch that
+    failed around it, as a page of an aborted keyset transaction is (``TRANSACTION_ABORTED``), not by a failure of
+    its command.
     """
     if settled is CommandSettlement.NOT_EXECUTED:
         return None

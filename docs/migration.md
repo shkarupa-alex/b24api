@@ -866,6 +866,18 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   `iter_list_counted()`, a tail page's `PageRecord.batch_index` was its ordinal in the whole tail (the
   fourth tail page was 3 whatever the batch size), unlike every other batch page, whose index is its
   command's in the batch it was sent with. It is now that index, as on the reference path.
+- **A keyset reference page's `batch_index` is its index in the shared batch.** In the report of
+  `iter_reference_outcomes()` with a fast keyset traversal, a wave page's `PageRecord.batch_index` was
+  its index in its own binding's wave and a finish page's was `None`, though both are commands of a
+  physical batch shared with other bindings' commands. Each is now its command's index in that batch.
+  A page replayed alone keeps the index of the batch it was first sent with: it is the command's key
+  in every send of it.
+- **A flat counted tail page the traversal stops before settles as its command did.** In the
+  completion evidence of `iter_list_counted()`, every tail page read but not reached when the traversal
+  stopped (at a failed page, at the budget, or cancelled) settled as unknown, so the binding closed
+  `UNKNOWN`. Each now settles from what its command did: one answered with a success as a success,
+  rejected as aborted; one never sent as not executed; only one that may have run as unknown. The
+  binding closes `FAILURE` unless one of its pages may have run.
 - **An abandoned batch page is not sent.** A reference page fetched with `BatchDispatch` whose fetch was
   cancelled, or whose admission deadline passed, while its wave was being assembled was still sent with
   that wave and its answer discarded. Its wave now leaves without it, and a wave left with no page is

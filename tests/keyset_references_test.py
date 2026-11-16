@@ -35,6 +35,7 @@ from b24api import (
     ParameterUpdate,
     PartitionedKeysetExecution,
     RangeKeysetExecution,
+    ReplaySafety,
     Request,
     ResultSelector,
     SequentialKeysetExecution,
@@ -1357,3 +1358,109 @@ async def test_a_keyset_command_its_own_budget_stops_fails_also_once_the_operati
     failures = [item for item in report.violations if item.code == "command_failure"]
     assert failures
     assert report.terminal_reason == "BudgetExceededError"
+
+
+# --- A keyset page's batch index ---------------------------------------------------------------------
+
+
+async def _indexed(
+    portal: BatchPortal, execution: Execution, parents: int, policy: ExecutionPolicy | None = None
+) -> list[tuple[int | None, str | None, int | None]]:
+    """Run ``parents`` bindings through one dispatcher; return each page's binding, phase and batch index."""
+    request = Request(
+        "item.list", {"filter": {"STATUS": "open"}}, route=RouteKind.BARE, replay_safety=ReplaySafety.SAFE
+    )
+    async with client_for(portal, policy=policy or ExecutionPolicy(page_trace_limit=1024)) as client:
+        stream = client.iter_reference_outcomes(
+            request,
+            [_parent(f"p{index}") for index in range(parents)],
+            traversal=_traversal(execution),
+            dispatch=BatchDispatch(),
+        )
+        outcomes, report = await _drain(stream)
+    assert not any(isinstance(outcome, ReferenceFailure | ReferenceOutcomeUnknown) for outcome in outcomes)
+    assert all(record.outcome is PageOutcome.COMMITTED for record in report.page_trace)
+    return [
+        (record.reference_index, None if record.phase is None else record.phase.value, record.batch_index)
+        for record in report.page_trace
+    ]
+
+
+def _wire(portal: BatchPortal) -> list[list[tuple[str, str | None]]]:
+    """Return each physical batch's commands as (parent, lower bound), in their order in the batch."""
+    sends: list[list[tuple[str, str | None]]] = []
+    start = 0
+    for count in portal.waves:
+        sends.append([(query["filter[=parent]"], query.get("filter[>ID]")) for query in portal.queries[start:][:count]])
+        start += count
+    return sends
+
+
+@pytest.mark.asyncio
+async def test_a_keyset_reference_page_records_its_index_in_the_shared_batch_it_was_sent_with() -> None:
+    # Four one-row parents: the first batch carries three parents' boundary probes (ascending, descending), the
+    # second the fourth parent's probes after the first three parents' finish pages, the third its finish page.
+    # Every page records its command's index in that shared batch, a finish page too, not its index in its own
+    # binding's wave.
+    portal = BatchPortal(_answer({f"p{index}": (1,) for index in range(4)}))
+
+    pages = await _indexed(portal, AutoKeysetExecution(_CONTRACT), 4)
+
+    assert _wire(portal) == [
+        [("p0", None), ("p0", None), ("p1", None), ("p1", None), ("p2", None), ("p2", None)],
+        [("p3", None), ("p3", None), ("p0", "1"), ("p1", "1"), ("p2", "1")],
+        [("p3", "1")],
+    ]
+    assert pages == [
+        (0, "boundary", 0),
+        (0, "boundary", 1),
+        (0, "finish", 2),
+        (1, "boundary", 2),
+        (1, "boundary", 3),
+        (1, "finish", 3),
+        (2, "boundary", 4),
+        (2, "boundary", 5),
+        (2, "finish", 4),
+        (3, "boundary", 0),
+        (3, "boundary", 1),
+        (3, "finish", 0),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_range_keyset_reference_body_page_records_its_index_in_the_shared_batch() -> None:
+    # Three 40-row parents share a body batch of three range pages each: each body page records its index in it.
+    portal = BatchPortal(_answer({f"p{index}": tuple(range(1, 41)) for index in range(3)}))
+
+    pages = await _indexed(portal, _range(), 3)
+
+    assert [len(send) for send in _wire(portal)] == [6, 9, 3]
+    body = [(binding, index) for binding, phase, index in pages if phase == "body"]
+    assert body == [(binding, binding * 3 + offset) for binding in range(3) for offset in range(3)]
+    finish = [(binding, index) for binding, phase, index in pages if phase == "finish"]
+    assert finish == [(0, 0), (1, 1), (2, 2)]
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_keyset_reference_page_keeps_the_index_of_the_batch_it_was_first_sent_with() -> None:
+    # The first batch refuses the second parent's descending boundary probe (QUERY_LIMIT_EXCEEDED) at index 3; its
+    # replay goes alone under the same envelope key. The page records index 3, the command's key in every send.
+    refused: list[str] = []
+    answer = _answer({f"p{index}": (1,) for index in range(3)})
+
+    def refuse_once(method: str, query: Query) -> Envelope:
+        if query.get("filter[=parent]") == "p1" and query.get("order[id]") == "DESC" and not refused:
+            refused.append(method)
+            return {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}
+        return answer(method, query)
+
+    portal = BatchPortal(refuse_once)
+    retry = RetryPolicy(initial_delay=0.001, maximum_delay=0.002, jitter=0.0)
+
+    pages = await _indexed(
+        portal, AutoKeysetExecution(_CONTRACT), 3, ExecutionPolicy(page_trace_limit=1024, retry=retry)
+    )
+
+    assert [len(send) for send in _wire(portal)][:2] == [6, 1]
+    boundaries = [(binding, index) for binding, phase, index in pages if phase == "boundary"]
+    assert boundaries == [(0, 0), (0, 1), (1, 2), (1, 3), (2, 4), (2, 5)]

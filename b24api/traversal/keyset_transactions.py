@@ -104,17 +104,17 @@ async def execute_wave(
             strict_json_members=True,
         )
         _record_wave_dispatch(host, plans, outcomes)
-        receipts, rejections, selected_rows = _validate_wave(host, plans, outcomes, reservations)
+        receipts, rejections = _validate_wave(host, plans, outcomes, reservations)
         if rejections:
-            _abort_wave(host, plans, receipts, rejections, selected_rows)
+            _abort_wave(host, plans, outcomes, receipts, rejections)
         stage_semantics = any(plan.phase is KeysetPhase.BOUNDARY for plan in plans)
-        for index, (plan, receipt, outcome) in enumerate(zip(plans, receipts, outcomes, strict=True)):
+        for plan, receipt, outcome in zip(plans, receipts, outcomes, strict=True):
             stage_or_record_observation(
                 host.transactions.staged_observations,
                 host.record_page,
                 stage=stage_semantics,
                 plan=plan,
-                index=index,
+                index=outcome.command_index,
                 rows=len(receipt.rows),
                 response=outcome.response if isinstance(outcome, BatchSuccess) else None,
                 witness=receipt.witness,
@@ -149,12 +149,11 @@ def _validate_wave(
     plans: tuple[LaneCommandPlan, ...],
     outcomes: tuple[BatchOutcome, ...],
     reservations: tuple[PageReservation, ...],
-) -> tuple[list[LaneReceipt], list[ReceiptRejection], int]:
+) -> tuple[list[LaneReceipt], list[ReceiptRejection]]:
     """Charge each page, validate its receipt, and record every rejected command's page."""
     receipts: list[LaneReceipt] = []
     rejections: list[ReceiptRejection] = []
-    selected_rows = 0
-    for index, (plan, outcome, reservation) in enumerate(zip(plans, outcomes, reservations, strict=True)):
+    for plan, outcome, reservation in zip(plans, outcomes, reservations, strict=True):
         commit = host.context.commit_page if isinstance(outcome, BatchSuccess) else host.context.release_page
         commit(reservation)
         lane = lane_for_command(
@@ -176,11 +175,9 @@ def _validate_wave(
             page_adapter=host.page_adapter,
         )
         if not isinstance(receipt, ReceiptRejection):
-            selected_rows += len(receipt.rows)
             host.completion_recorder.validated(plan.command_id)
             receipts.append(receipt)
             continue
-        selected_rows += receipt.selected_rows
         rejections.append(receipt)
         if not _budget_end(host, receipt.error):
             host.violations.append(receipt.violation)
@@ -190,22 +187,22 @@ def _validate_wave(
         page_outcome, rejection_code = traced
         host.record_page(
             plan,
-            index=index,
+            index=outcome.command_index,
             selected=receipt.selected_rows,
             admitted=0,
             outcome=page_outcome,
             rejection=rejection_code,
             violation=receipt.violation,
         )
-    return receipts, rejections, selected_rows
+    return receipts, rejections
 
 
 def _abort_wave(
     host: KeysetTransactionHost,
     plans: tuple[LaneCommandPlan, ...],
+    outcomes: tuple[BatchOutcome, ...],
     receipts: list[LaneReceipt],
     rejections: list[ReceiptRejection],
-    selected_rows: int,
 ) -> NoReturn:
     """Reject the valid pages of a failed wave too, discard its rows, and raise its cause.
 
@@ -213,16 +210,17 @@ def _abort_wave(
     have executed, the binding's outcome is unknown, not failed.
     """
     successful = {receipt.command_id: receipt for receipt in receipts}
-    for index, plan in enumerate(plans):
+    for plan, outcome in zip(plans, outcomes, strict=True):
         if plan.command_id in successful:
             host.record_page(
                 plan,
-                index=index,
+                index=outcome.command_index,
                 selected=len(successful[plan.command_id].rows),
                 admitted=0,
                 outcome=PageOutcome.REJECTED,
                 rejection=PageRejectionCode.TRANSACTION_ABORTED,
             )
+    selected_rows = sum(len(receipt.rows) for receipt in receipts) + sum(r.selected_rows for r in rejections)
     host.admission.record_raw(selected_rows, discarded=True)
     causes = [receipt for receipt in rejections if receipt.error is not None]
     rejection = next(
@@ -232,6 +230,14 @@ def _abort_wave(
     if rejection is None:
         raise PaginationError("fast keyset wave validation failed")
     _raise_rejection(host, rejection)
+
+
+def _finish_index(outcome: BatchOutcome, dispatch: PageDispatch) -> int | None:
+    """Return a finish page's index in the physical batch it was sent with, as a wave page takes it.
+
+    A batch finish page's command outcome carries it, as every wave command's does; a direct finish page has none.
+    """
+    return outcome.command_index if dispatch is PageDispatch.BATCH else None
 
 
 def _budget_end(host: KeysetTransactionHost, error: BaseException | None) -> bool:
@@ -415,7 +421,7 @@ async def execute_finish_page(
             host.admission.record_discarded(len(receipt.rows))
             host.record_page(
                 plan,
-                index=None,
+                index=_finish_index(outcome, dispatch),
                 selected=len(receipt.rows),
                 admitted=0,
                 outcome=PageOutcome.REJECTED,
@@ -427,7 +433,7 @@ async def execute_finish_page(
             raise
         host.record_page(
             plan,
-            index=None,
+            index=_finish_index(outcome, dispatch),
             selected=len(receipt.rows),
             admitted=len(admitted.rows),
             response=response,
@@ -498,7 +504,7 @@ def _reject_finish_receipt(
         page_outcome, rejection_code = traced
         host.record_page(
             plan,
-            index=None,
+            index=_finish_index(outcome, dispatch),
             selected=receipt.selected_rows,
             admitted=0,
             outcome=page_outcome,

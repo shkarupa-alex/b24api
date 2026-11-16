@@ -234,7 +234,13 @@ class _FlatTailStream:
         return error if isinstance(error, BaseException) else CapabilityError("parallel counted batch command failed")
 
     async def aclose(self) -> None:
-        await self._outcomes.aclose()
+        try:
+            await self._outcomes.aclose()
+        finally:
+            # Once the stream has stopped, each page it read but the traversal did not consume settles from its
+            # command's execution facts, as on the reference tail; a tail page's id follows the head's.
+            if self._recorder is not None:
+                self._recorder.settle_unobserved(lambda page_id: self._outcomes.settlement(page_id - 1))
 
 
 class DirectCountedWaveIO:

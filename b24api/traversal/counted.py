@@ -179,7 +179,6 @@ class CountedItemStream:
     async def _finalize(self, state: KernelState, reason: str) -> None:
         if self.report.state is not KernelState.NOT_STARTED:
             return
-        self._completion.settle_unobserved()
         snapshot = await self._context.snapshot()
         batch = self._driver.batch_report
         snapshot_state = (

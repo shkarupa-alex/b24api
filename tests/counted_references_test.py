@@ -46,9 +46,11 @@ from b24api.contracts import (
 )
 from b24api.contracts.completion import (
     BindingClosure,
+    BindingTerminal,
     CommandSettlement,
     CompletionEvidence,
     PageCommandOutcome,
+    PageRejected,
     PageScheduled,
 )
 from b24api.contracts.policy import ConfirmationPolicy, ReplayDisposition, SnapshotRequirement
@@ -1067,12 +1069,28 @@ async def test_a_flat_counted_tail_batch_whose_envelope_fails_traces_its_first_p
     ]
 
 
+def _flat_settlement(events: list[object]) -> tuple[dict[int, CommandSettlement], list[int], BindingClosure]:
+    """Return the flat binding's settlement by page id, the pages rejected as aborted, and its closure."""
+    settled = {event.page_id: event.outcome for event in events if isinstance(event, PageCommandOutcome)}
+    aborted = [
+        event.page_id
+        for event in events
+        if isinstance(event, PageRejected) and event.reason == PageRejectionCode.TRANSACTION_ABORTED.value
+    ]
+    (closure,) = [event.closure for event in events if isinstance(event, BindingTerminal)]
+    return settled, aborted, closure
+
+
 @pytest.mark.asyncio
-async def test_flat_counted_tail_pages_the_budget_keeps_from_their_send_are_not_traced() -> None:
+async def test_flat_counted_tail_pages_the_budget_keeps_from_their_send_are_not_traced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # The budget (three requests) covers the direct head and both tail batches as planned, but the first tail
     # batch refuses its first page (QUERY_LIMIT_EXCEEDED) and that page's replay spends the third request. The
     # second tail batch is never sent: the traversal ends with the budget, and its first page, which no request
-    # carried, is not traced.
+    # carried, is not traced. Each of its pages, the two the traversal never reached included, settles as not
+    # executed, so the binding failed rather than ended unknown.
+    events = _observed(monkeypatch)
     retry = RetryPolicy(initial_delay=0.001, maximum_delay=0.002, jitter=0.0)
     portal = BatchPortal(_refuse_once((3, WIDTH)))
     async with _client(portal) as api:
@@ -1096,12 +1114,24 @@ async def test_flat_counted_tail_pages_the_budget_keeps_from_their_send_are_not_
     report = _report(stream)
     assert _failed_trace(report) == []
     assert [record.offset for record in report.page_trace] == [0, WIDTH, 2 * WIDTH, 3 * WIDTH]
+    settled, aborted, closure = _flat_settlement(events)
+    assert settled == dict.fromkeys(range(4), CommandSettlement.SUCCESS) | dict.fromkeys(
+        range(4, 7), CommandSettlement.NOT_EXECUTED
+    )
+    assert aborted == []
+    assert closure is BindingClosure.FAILURE
 
 
 @pytest.mark.asyncio
-async def test_a_flat_counted_tail_page_answered_with_a_failure_keeps_its_index_in_its_own_batch() -> None:
+async def test_a_flat_counted_tail_page_answered_with_a_failure_keeps_its_index_in_its_own_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # The second tail batch (three pages each) answers its first page with a failure. That page is traced rejected by
-    # its command, with its index in its own batch, as every committed tail page is.
+    # its command, with its index in its own batch, as every committed tail page is. The batch answered its two
+    # later pages with a success: the traversal stops before them, so each settles as a success and is rejected as
+    # aborted with the traversal, and the binding failed rather than ended unknown.
+    events = _observed(monkeypatch)
+
     def answer(method: str, query: Query) -> Envelope:
         if query.get("start") == str(4 * WIDTH):
             return {"error": "ACCESS_DENIED", "error_description": "denied"}
@@ -1129,3 +1159,71 @@ async def test_a_flat_counted_tail_page_answered_with_a_failure_keeps_its_index_
         (record.offset, record.batch_index) for record in report.page_trace if record.outcome is PageOutcome.COMMITTED
     ]
     assert committed == [(0, None), (WIDTH, 0), (2 * WIDTH, 1), (3 * WIDTH, 2)]
+    settled, aborted, closure = _flat_settlement(events)
+    assert settled == dict.fromkeys(range(7), CommandSettlement.SUCCESS) | {4: CommandSettlement.FAILURE}
+    assert aborted == [5, 6]
+    assert closure is BindingClosure.FAILURE
+
+
+@pytest.mark.asyncio
+async def test_flat_counted_tail_pages_cancelled_while_a_replay_is_on_the_wire_settle_from_what_each_command_did(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The first tail batch (three pages) answers its last two pages with a success and refuses its first
+    # (QUERY_LIMIT_EXCEEDED); the reader is cancelled while that page's replay is on the wire, before the traversal
+    # reached any of the three. Each settles from where its command stood: the two answered with a success
+    # succeeded and are rejected as aborted, the replayed one may have run, so the binding ended unknown.
+    events = _observed(monkeypatch)
+    portal = BatchPortal(_dense(301))
+    sends = [0]
+    replaying = asyncio.Event()
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        if sends[0] == 3:  # noqa: PLR2004 - the refused page's replay
+            replaying.set()
+            await asyncio.Future()
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        if sends[0] == 1:
+            return answer
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        first = next(iter(commands))
+        body = json.loads(answer.body)
+        result = body["result"]
+        del result["result"][first]
+        for key in ("result_total", "result_next"):
+            if isinstance(result.get(key), dict):
+                result[key].pop(first, None)
+        result["result_error"] = {first: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        return WireResponse(200, answer.headers, json.dumps(body).encode())
+
+    retry = RetryPolicy(initial_delay=0.001, maximum_delay=0.002, jitter=0.0)
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        stream = client.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE),
+            page_size=WIDTH,
+            batch_size=3,
+            policy=ExecutionPolicy(retry=retry),
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        reader = asyncio.create_task(drain())
+        await asyncio.wait_for(replaying.wait(), HANG_BOUND)
+        reader.cancel()
+        done, _pending = await asyncio.wait({reader}, timeout=HANG_BOUND)
+        assert done == {reader}
+
+    settled, aborted, closure = _flat_settlement(events)
+    assert settled == {
+        0: CommandSettlement.SUCCESS,
+        1: CommandSettlement.UNKNOWN,
+        2: CommandSettlement.SUCCESS,
+        3: CommandSettlement.SUCCESS,
+    }
+    assert aborted == [2, 3]
+    assert closure is BindingClosure.UNKNOWN
