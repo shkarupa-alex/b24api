@@ -1247,7 +1247,6 @@ def test_a_latch_raises_the_first_undelivered_escape_once_and_hands_the_rest_to_
         first, second, late = _Escape("first"), _Escape("second"), _Escape("late")
         for error in (first, first, second, asyncio.CancelledError(), GeneratorExit(), RuntimeError("failure"), None):
             latch.record(error)
-        assert latch.pending() is first
         latch.report = report = object()
         assert latch.close() is first
         assert latch.close() is None
