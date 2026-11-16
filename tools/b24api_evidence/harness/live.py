@@ -232,34 +232,44 @@ class LivePortal:
         # The same shield as HttpxTransport: HTTPX logs the full method URL at INFO, and attribution by
         # the sync client's ``_send_handling_auth`` root tells this request's records from foreign ones.
         # The request is built inside it, and no local of this frame holds the method URL.
-        with HTTPX_LOG_SHIELD.request(webhook=webhook) as ownership:
-            try:
-                request = self._client.build_request(
-                    "POST",
-                    urljoin(webhook.url, method),
-                    json=parameters or {},
-                    headers={"accept-encoding": BOUNDED_ACCEPT_ENCODING},
-                )
-                ownership.claim(request)
-                response = self._client.send(request, stream=True)
-                request = None
+        try:
+            with HTTPX_LOG_SHIELD.request(webhook=webhook) as ownership:
                 try:
-                    status_code = response.status_code
+                    request = self._client.build_request(
+                        "POST",
+                        urljoin(webhook.url, method),
+                        json=parameters or {},
+                        headers={"accept-encoding": BOUNDED_ACCEPT_ENCODING},
+                    )
+                    ownership.claim(request)
+                    response = self._client.send(request, stream=True)
+                    request = None
                     try:
-                        payload = _bounded_response_payload(response, method=method)
-                    except LiveCorrectnessError as error:
-                        bounded_failure = str(error)
-                finally:
-                    response.close()
-            except httpx.DecodingError:
-                decoding_failed = True
-            except httpx.HTTPError:
-                transport_failed = True
-            except Exception as error:  # noqa: BLE001 - classified by its class only, as HttpxTransport does
-                # A hook, auth flow or mounted transport may raise anything. Neither the exception nor its text,
-                # which may quote the method URL, leaves this frame, and the locals holding that URL are
-                # cleared below before the failure is raised.
-                client_failure = type(error).__name__
+                        status_code = response.status_code
+                        try:
+                            payload = _bounded_response_payload(response, method=method)
+                        except LiveCorrectnessError as error:
+                            bounded_failure = str(error)
+                    finally:
+                        response.close()
+                except httpx.DecodingError:
+                    decoding_failed = True
+                except httpx.HTTPError:
+                    transport_failed = True
+                except Exception as error:  # noqa: BLE001 - classified by its class only, as HttpxTransport does
+                    # A hook, auth flow or mounted transport may raise anything. Neither the exception nor its text,
+                    # which may quote the method URL, leaves this frame, and the locals holding that URL are
+                    # cleared below before the failure is raised.
+                    client_failure = type(error).__name__
+        except BaseException as escaped:
+            # What no handler classifies (an interrupt, an exit) leaves as it is, as from HttpxTransport, but without
+            # the frames it was raised through, HTTPX's and this one, whose locals hold the credential-bearing request,
+            # and without the exception it interrupted, which may be HTTPX's own.
+            request = response = None
+            del webhook
+            escaped.__traceback__ = escaped.__context__ = escaped.__cause__ = None
+            raise
+        del webhook
         request = None
         response = None
         if client_failure is not None:
