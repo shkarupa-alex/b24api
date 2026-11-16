@@ -55,12 +55,13 @@ ledger (`FastPageLedger`) settles a page never handed to an engine as not execut
 rule on every path. A page answered with a success settles as a success on every path, a page the traversal
 stops before included: the facts recorded on a cancelled reference page keep that its command succeeded
 (`facts.settlement`), and a counted tail, reference or flat, settles each page it read but will not consume
-from what its command did, the flat one from its batch's outcome or, when the batch's run ended early, its
-`BatchProgress` (`_BatchOutcomeStream.settlement`): answered with a success, a success, rejected as
-`transaction_aborted`; never sent, not executed; unknown only when it may have run. One rule,
-`facts.settled_as`, gives a command's settlement from what it is known to have done and whether it succeeded;
-its callers only read those two facts from what they hold: a failure's recorded facts (`facts.settlement`), a
-final batch outcome (`batch.outcome.settlement_of`), a command of a running chunk
+from what its command did, the flat one from the state of the batch it joined
+(`_BatchOutcomeStream.settlement`): its outcome once answered, its `BatchProgress` while sent, not executed
+while only read, and not executed when its pull was cut short before it joined one: answered with a success, a
+success, rejected as `transaction_aborted`; never sent, not executed; unknown only when it may have run. One
+rule, `facts.settled_as`, gives a command's settlement from what it is known to have done and whether it
+succeeded; its callers only read those two facts from what they hold: a failure's recorded facts
+(`facts.settlement`), a final batch outcome (`batch.outcome.settlement_of`), a command of a running chunk
 (`BatchProgress.settlement`) and a shared wave's dispatch task. `b24api.execution.facts` holds the one
 mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
 (`Execution.settlement`), and `b24api.traversal.page_failure` holds the one rule of a failed page's

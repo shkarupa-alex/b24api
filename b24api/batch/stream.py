@@ -1,7 +1,8 @@
 """Bounded fail-fast and total-outcome Bitrix batch execution."""
 
 from __future__ import annotations
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self, cast
 
 from b24api._sources import OwnedSource
@@ -48,6 +49,45 @@ if TYPE_CHECKING:
     from types import TracebackType
 
 
+@dataclass(frozen=True, slots=True)
+class _ChunkRead:
+    """A chunk read from the source and not handed to a send: none of its commands was sent."""
+
+    commands: range
+
+    def settlement(self, index: int) -> CommandSettlement:
+        """Return ``NOT_EXECUTED``: the command never left."""
+        del index
+        return CommandSettlement.NOT_EXECUTED
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkSending:
+    """A chunk handed to a send: where each command stands is its ``BatchProgress``, ended when the send ends."""
+
+    commands: range
+    progress: BatchProgress
+
+    def settlement(self, index: int) -> CommandSettlement:
+        """Return how the command settles from what it did so far."""
+        return self.progress.settlement(index)
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkAnswered:
+    """A chunk whose send ended with an outcome per command, as the stream yields it."""
+
+    commands: range
+    outcomes: Mapping[int, BatchStreamItem]
+
+    def settlement(self, index: int) -> CommandSettlement:
+        """Return how the command's outcome settles."""
+        return settlement_of(self.outcomes[index])
+
+
+type _ChunkState = _ChunkRead | _ChunkSending | _ChunkAnswered
+
+
 class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
     """Internal lazy outcome stream used by exact counted traversal."""
 
@@ -79,10 +119,8 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         self._batch_requests = 0
         self._batch_commands = 0
         self._emitted = 0
-        # The latest chunk read: its commands' stream indexes, where they stand while it runs, and its outcomes.
-        self._chunk = range(0)
-        self._progress: BatchProgress | None = None
-        self._chunk_outcomes: dict[int, BatchStreamItem] = {}
+        # The latest chunk read and how far it went: read, handed to a send, or answered.
+        self._chunk: _ChunkState = _ChunkRead(range(0))
         self.report = KernelReport()
         self._runner = OperationRunner(
             self._run(),
@@ -100,21 +138,22 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
 
         An outcome's ``command_index`` counts the whole stream; less this, it is the command's index in its batch.
         """
-        return self._chunk.start
+        return self._chunk.commands.start
 
     def settlement(self, index: int) -> CommandSettlement:
-        """Return how the command at stream index ``index`` settles from what it is known to have done.
+        """Return how the command at stream index ``index`` settles from the state of the chunk it joined.
 
-        Its outcome once its chunk has run; where it stood (``BatchProgress``) when its chunk's run ended early; a
-        command the stream read but never handed to a send was not executed. Only the latest chunk read can hold
-        such a command, since every earlier chunk was yielded whole, and each chunk starts with no progress.
+        A command past the latest chunk never joined one: the source handed it to a pull that was cut short (a
+        cancellation while the chunk filled), so it was not executed. A command of the latest chunk settles as that
+        chunk's state says (``_ChunkState``). The stream reads a chunk only once it has yielded the one before whole,
+        so a command of an earlier chunk has already been yielded with its outcome and is not asked for.
         """
-        outcome = self._chunk_outcomes.get(index)
-        if outcome is not None:
-            return settlement_of(outcome)
-        if self._progress is not None:
-            return self._progress.settlement(index)
-        return CommandSettlement.NOT_EXECUTED
+        chunk = self._chunk
+        if index >= chunk.commands.stop:
+            return CommandSettlement.NOT_EXECUTED
+        if index < chunk.commands.start:
+            raise RuntimeError("a command of an earlier chunk was yielded with its outcome")
+        return chunk.settlement(index)
 
     async def __anext__(self) -> BatchStreamItem:
         """Return the next asynchronous item."""
@@ -155,15 +194,14 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             )
             if not chunk.commands:
                 break
-            self._chunk = range(next_index, next_index + len(chunk.commands))
-            self._progress, self._chunk_outcomes = None, {}
+            self._chunk = _ChunkRead(range(next_index, next_index + len(chunk.commands)))
             next_index += len(chunk.commands)
             if chunk.source_error is not None:
                 _raise_source_error(chunk.source_error)
             self._batch_commands += len(chunk.commands)
             # The window has run: a result its rows leave no room for is dropped as answered, never lost unsent.
             outcomes = _within_row_budget(await self._execute(chunk.commands), self._context.policy.max_buffered_rows)
-            self._chunk_outcomes = {outcome.command_index: outcome for outcome in outcomes}
+            self._chunk = _ChunkAnswered(self._chunk.commands, {outcome.command_index: outcome for outcome in outcomes})
             buffered_rows = sum(_batch_outcome_row_weight(outcome) for outcome in outcomes)
             await self._context.set_buffered_rows(buffered_rows)
             for outcome in outcomes:
@@ -187,13 +225,14 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
                 for _ in commands:
                     reservation = await self._context.reserve_page()
                     reservations.append(reservation)
-            self._progress = BatchProgress()
+            progress = BatchProgress()
+            self._chunk = _ChunkSending(self._chunk.commands, progress)
             outcomes = await self._executor.execute_chunk(
                 commands,
                 context=self._context,
                 halt=False,
                 on_envelope=self._count_batch_request,
-                progress=self._progress,
+                progress=progress,
             )
         except BaseException:
             for reservation in reservations:

@@ -16,6 +16,7 @@ from b24api.batch.outcome import (
     BatchSuccess,
 )
 from b24api.batch.stream import _BatchOutcomeStream, batch_outcome_stream
+from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import (
     AmbiguityReason,
     ConsistencyPolicy,
@@ -685,6 +686,32 @@ async def test_shared_batch_page_reservations_roll_back_when_admission_is_cancel
     assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.CANCELLED
     assert context._page_reservations == {}
+    # The chunk was read but never handed to a send: its commands, and any never read into it, were not executed.
+    assert [stream.settlement(index) for index in range(3)] == [CommandSettlement.NOT_EXECUTED] * 3
+
+
+@pytest.mark.asyncio
+async def test_a_batch_outcome_stream_settles_its_latest_chunk_from_its_outcomes_and_refuses_an_earlier_one() -> None:
+    # Two chunks of two commands, both answered and yielded: the latest chunk's commands settle from their outcomes,
+    # a command past it never joined a chunk, and one of the earlier chunk was already yielded with its outcome.
+    stream = _BatchOutcomeStream(
+        BatchExecutor(Executor(ResponderTransport(_echo_batch))),
+        [Request(name, route=RouteKind.BARE) for name in ("one", "two", "three", "four")],
+        batch_size=2,
+        policy=ExecutionPolicy(),
+    )
+    async with stream:
+        outcomes = [outcome async for outcome in stream]
+
+    assert [outcome.command_index for outcome in outcomes] == [0, 1, 2, 3]
+    assert stream.chunk_start == 2  # noqa: PLR2004
+    assert [stream.settlement(index) for index in (2, 3, 4)] == [
+        CommandSettlement.SUCCESS,
+        CommandSettlement.SUCCESS,
+        CommandSettlement.NOT_EXECUTED,
+    ]
+    with pytest.raises(RuntimeError, match="earlier chunk"):
+        stream.settlement(1)
 
 
 @pytest.mark.asyncio

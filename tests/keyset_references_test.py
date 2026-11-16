@@ -69,7 +69,14 @@ from b24api.contracts.completion import (
 from b24api.contracts.page_stop import ContinuePage
 from b24api.contracts.policy import KernelState, RetryPolicy
 from b24api.contracts.request import RouteKind
-from b24api.errors import BudgetExceededError, CapabilityError, IdentityContractError, ProtocolError
+from b24api.errors import (
+    BudgetExceededError,
+    CapabilityError,
+    IdentityContractError,
+    IncompleteTraversalError,
+    PaginationError,
+    ProtocolError,
+)
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WorkClass
 from b24api.references import wave_engine
 from b24api.references.budget_view import BindingBudgetView, RowLease
@@ -1561,4 +1568,96 @@ async def test_a_flat_keyset_finish_page_sent_directly_records_no_batch_index() 
         ("boundary", PageDispatch.BATCH, 0),
         ("boundary", PageDispatch.BATCH, 1),
         ("finish", PageDispatch.DIRECT, None),
+    ]
+
+
+# --- A descending finish page the admission frontier refuses ------------------------------------------
+
+
+def _hides_low_rows_ascending(parents: frozenset[str]) -> Callable[..., Envelope]:
+    """Serve rows 1..12 per parent; a listed parent's ascending view hides the rows below 5."""
+
+    def answer(method: str, query: Query) -> Envelope:
+        del method
+        parent = query.get("filter[=parent]", "")
+        ids = tuple(range(1, 13))
+        if parent in parents and query.get("order[id]") != "DESC":
+            ids = tuple(value for value in ids if value >= 5)
+        return {"result": _rows(ids, query)}
+
+    return answer
+
+
+def _descending(execution: Execution) -> KeysetTraversal:
+    return KeysetTraversal(
+        selector=ResultSelector.root(),
+        identity=_identity(),
+        page_size=PAGE,
+        keyset=KeysetSpec(limit_path=ParameterPath(("limit",)), direction="descending"),
+        execution=execution,
+    )
+
+
+def _finish_rejection(report: OperationReport) -> list[tuple[object, ...]]:
+    return [
+        (record.reference_index, record.dispatch, record.batch_index, record.outcome, record.rejection_code)
+        for record in report.page_trace
+        if record.phase is not None and record.phase.value == "finish" and record.outcome is not PageOutcome.COMMITTED
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_flat_descending_finish_page_the_admission_frontier_refuses_is_traced_as_a_range_contradiction() -> (
+    None
+):
+    # The boundary probes overlap ([5..12] ascending, [12..3] descending), so the traversal finishes below the
+    # ascending probe's lowest row, 5, while the descending head already admitted down to 3. The finish page
+    # answers [4, 3, 2, 1]: inside its lane, but behind the admitted frontier. The traversal fails with that
+    # contradiction, and the direct finish page is traced as one.
+    portal = BatchPortal(_hides_low_rows_ascending(frozenset({""})))
+    async with client_for(portal, policy=ExecutionPolicy(page_trace_limit=1024)) as client:
+        stream = client.iter_list_keyset(
+            _base(),
+            selector=ResultSelector.root(),
+            identity=_identity(),
+            page_size=PAGE,
+            keyset=KeysetSpec(limit_path=ParameterPath(("limit",)), direction="descending"),
+            execution=AutoKeysetExecution(_CONTRACT),
+        )
+        with pytest.raises(IncompleteTraversalError) as raised:
+            await _drain(stream)
+
+    assert isinstance(raised.value.__cause__, PaginationError)
+    assert "did not advance" in str(raised.value.__cause__)
+    assert portal.waves == [2, 1]
+    report = stream.report
+    assert report is not None
+    assert _finish_rejection(report) == [
+        (None, PageDispatch.DIRECT, None, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_reference_descending_finish_page_the_admission_frontier_refuses_fails_its_binding_alone() -> None:
+    # The same contradiction for the second of three parents: its binding fails with it, the others complete, and
+    # its finish page, first in the shared second batch, is traced as a range contradiction at index 0.
+    portal = BatchPortal(_hides_low_rows_ascending(frozenset({"p1"})))
+    async with client_for(portal, policy=ExecutionPolicy(page_trace_limit=1024)) as client:
+        stream = client.iter_reference_outcomes(
+            _base(),
+            [_parent(f"p{index}") for index in range(3)],
+            traversal=_descending(AutoKeysetExecution(_CONTRACT)),
+            dispatch=BatchDispatch(),
+        )
+        outcomes, report = await _drain(stream)
+
+    failures = [outcome for outcome in outcomes if isinstance(outcome, ReferenceFailure)]
+    assert [failure.correlation for failure in failures] == ["p1"]
+    assert isinstance(failures[0].error, IncompleteTraversalError)
+    assert isinstance(failures[0].error.__cause__, PaginationError)
+    assert "did not advance" in str(failures[0].error.__cause__)
+    assert set(_completes(outcomes)) == {"p0", "p2"}
+    assert portal.waves == [6, 3]
+    assert _finish_rejection(report) == [
+        (1, PageDispatch.BATCH, 0, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION)
     ]

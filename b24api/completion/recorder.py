@@ -128,7 +128,10 @@ class CompletionRecorder:
 
     def rejected(self, reason: str) -> None:
         """Retire one settled but unadmitted page."""
-        page_id = self._require_page()
+        self._reject(self._require_page(), reason)
+        self._current = None
+
+    def _reject(self, page_id: int, reason: str) -> None:
         self.gate.emit(
             PageRejected(
                 operation_id=self.gate.operation_id,
@@ -138,7 +141,6 @@ class CompletionRecorder:
                 reason=reason,
             )
         )
-        self._current = None
 
     def delivered(self) -> None:
         """Mark the complete validated page delivered to the consumer."""
@@ -282,15 +284,7 @@ class CountedCompletionRecorder(CompletionRecorder):
             outcome = settlement(page_id)
             self._settle(page_id, outcome)
             if outcome is CommandSettlement.SUCCESS:
-                self.gate.emit(
-                    PageRejected(
-                        operation_id=self.gate.operation_id,
-                        sequence=self._take(),
-                        binding_id=0,
-                        page_id=page_id,
-                        reason=PageRejectionCode.TRANSACTION_ABORTED.value,
-                    )
-                )
+                self._reject(page_id, PageRejectionCode.TRANSACTION_ABORTED.value)
             self._reserved.discard(page_id)
 
     def activate(self, page_id: int) -> None:

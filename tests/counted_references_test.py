@@ -1271,3 +1271,57 @@ async def test_a_flat_counted_tail_page_whose_result_was_dropped_settles_as_its_
     )
     assert aborted == []
     assert closure is BindingClosure.FAILURE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cancel_at", "waves", "answered"),
+    [
+        # The tail is cut short as it pulls its first batch's requests: nothing of the tail is sent.
+        (1, [1], 1),
+        (2, [1], 1),
+        # The first batch was answered and consumed; the second is cut short while it fills.
+        (4, [1, 3], 4),
+        (5, [1, 3], 4),
+    ],
+    ids=["first-batch-first-pull", "first-batch-second-pull", "second-batch-first-pull", "second-batch-second-pull"],
+)
+async def test_flat_counted_tail_pages_cancelled_while_their_batch_fills_settle_as_never_sent(
+    monkeypatch: pytest.MonkeyPatch, cancel_at: int, waves: list[int], answered: int
+) -> None:
+    # The reader is cancelled the moment the tail schedules page ``cancel_at`` as it pulls that page's request into
+    # a batch being filled. The pages of that batch never joined a send: each settles as not executed, so the
+    # binding failed rather than ended unknown.
+    events: list[object] = []
+    emit = CompletionGate.emit
+    reader: list[asyncio.Task[None]] = []
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+        if isinstance(event, PageScheduled) and event.page_id == cancel_at and reader:
+            reader[0].cancel()
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    portal = BatchPortal(_dense(ROWS))
+    async with _client(portal) as api:
+        stream = api.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE), page_size=WIDTH, batch_size=3
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        reader.append(asyncio.create_task(drain()))
+        done, _pending = await asyncio.wait(reader, timeout=HANG_BOUND)
+        assert done == set(reader)
+        assert reader[0].cancelled()
+
+    assert portal.waves == waves
+    assert [event.page_id for event in events if isinstance(event, PageScheduled)] == list(range(cancel_at + 1))
+    settled = dict.fromkeys(range(answered), CommandSettlement.SUCCESS) | dict.fromkeys(
+        range(answered, cancel_at + 1), CommandSettlement.NOT_EXECUTED
+    )
+    assert _flat_settlement(events) == (settled, [], BindingClosure.FAILURE)

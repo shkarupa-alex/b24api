@@ -176,3 +176,38 @@ def test_counted_recorder_settles_each_unobserved_page_as_its_dispatch_proved(mo
     decision = recorder.gate.decision()
     assert decision.violations == ()
     assert decision.pages_scheduled == RESERVED_PAGE_COUNT
+
+
+def test_a_recorder_rejection_retires_its_page_with_the_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The rejected page leaves a PageRejected with its reason, for the plain and the counted recorder alike.
+    events: list[CompletionEvidence] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    plain = CompletionRecorder()
+    plain.scheduled()
+    plain.settled(CommandSettlement.SUCCESS)
+    plain.rejected("range_contradiction")
+    counted = CountedCompletionRecorder()
+    counted.activate(counted.reserve())
+    counted.settled(CommandSettlement.SUCCESS)
+    counted.rejected("command_failure")
+
+    rejected = [
+        (event.operation_id, event.page_id, event.reason) for event in events if isinstance(event, PageRejected)
+    ]
+    assert rejected == [
+        (plain.gate.operation_id, 0, "range_contradiction"),
+        (counted.gate.operation_id, 0, "command_failure"),
+    ]
+    # Each rejected page is retired: the next page becomes the active one, and the counted page leaves its ledger.
+    plain.scheduled()
+    plain.settled(CommandSettlement.NOT_EXECUTED)
+    counted.activate(counted.reserve())
+    counted.settled(CommandSettlement.NOT_EXECUTED)
+    with pytest.raises(RuntimeError, match="lacks a scheduled page"):
+        counted.activate(0)

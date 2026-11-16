@@ -874,8 +874,8 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   in every send of it.
 - **A flat counted tail page the traversal stops before settles as its command did.** In the
   completion evidence of `iter_list_counted()`, every tail page read but not reached when the traversal
-  stopped (at a failed page, at the budget, or cancelled) settled as unknown, so the binding closed
-  `UNKNOWN`. Each now settles from what its command did: one answered with a success as a success,
+  stopped (at a failed page, at the budget, cancelled, or when the consumer broke out of the loop)
+  settled as unknown, so the binding closed `UNKNOWN`. Each now settles from what its command did: one answered with a success as a success,
   rejected as aborted; one never sent as not executed; only one that may have run as unknown. The
   binding closes `FAILURE` unless one of its pages may have run.
 - **An abandoned batch page is not sent.** A reference page fetched with `BatchDispatch` whose fetch was
