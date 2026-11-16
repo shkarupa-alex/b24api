@@ -201,6 +201,14 @@ class _Source:
             await reached(self.release)
 
 
+class _HeldSource(_Source):
+    """``_Source`` whose items start at ``HELD_FIRST``: a stream held open beside the one under test."""
+
+    def __init__(self, family: str) -> None:
+        super().__init__(family, "returns")
+        self._items = iter(_items(family, HELD_FIRST + ITEMS)[HELD_FIRST:])
+
+
 class _SyncSource:
     """``_Source`` as a synchronous iterator: pulled and closed in worker threads, its close blocking there."""
 
@@ -1176,8 +1184,8 @@ def _others() -> list[str]:
 
 
 REFERENCE_FAMILIES = tuple(family for family in FAMILIES if family not in {"batch", "batch_outcomes"})
-# Loop turns that let an operation's end and everything it hands to the event loop run out.
-TURNS_TO_SETTLE = 10
+# The first item of a stream held open beside the one under test, whose sends the scripted transport answers.
+HELD_FIRST = 100
 
 
 class _Interrupting:
@@ -1251,8 +1259,9 @@ def test_an_interrupt_on_any_route_ends_the_operation_and_leaves_asyncio_run(
 ) -> None:
     # Wherever the interrupt is caught (a binding's end waiting in its queue, a task the cleanup cancels, a failure
     # that ended the stream first), it is latched and the operation raises it: the reader gets it, whatever ends its
-    # read (its cancellation, a timeout, another task's close), the loop reports nothing and no task is left.
-    reported: list[str] = []
+    # read (its cancellation, a timeout, another task's close), and no task is left. The loop reports nothing but
+    # another interrupt (``converted`` turns each send's cancellation into one), never the one the reader got.
+    reported: list[BaseException] = []
     pending: list[str] = []
     transport = _Interrupting(scenario)
     plan = DirectDispatch(concurrency=2) if dispatch == "direct" else BatchDispatch(batch_size=1, concurrency=2)
@@ -1260,7 +1269,7 @@ def test_an_interrupt_on_any_route_ends_the_operation_and_leaves_asyncio_run(
     streams: list[OperationStream[Any]] = []
 
     async def main() -> None:
-        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["exception"]))
         try:
             async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
                 stream = _stream(client, family, _items(family), plan)
@@ -1295,7 +1304,10 @@ def test_an_interrupt_on_any_route_ends_the_operation_and_leaves_asyncio_run(
         asyncio.run(main())
     gc.collect()
     assert [type(error) for error in got] == [KeyboardInterrupt]
-    assert reported == []
+    if scenario == "converted":
+        assert all(type(error) is KeyboardInterrupt and error is not got[0] for error in reported)
+    else:
+        assert reported == []
     assert pending == []
     report = streams[0].report
     assert report is not None
@@ -2346,18 +2358,28 @@ def test_a_close_that_fails_after_an_interrupt_ended_the_read_is_behind_it(famil
 
 
 @pytest.mark.parametrize("family", REFERENCE_FAMILIES)
-def test_an_interrupt_a_close_raises_behind_the_one_that_ended_the_read_leaves_the_loop_after_it(family: str) -> None:
-    # The interrupt ends the read, and the source's close then raises a second one (``SystemExit``): the read raises
-    # the first, and the event loop raises the second from a callback, once, raw (before the first leaves ``main``,
-    # which still closes its client); neither reaches the exception handler, and the source is closed once.
-    reported: list[object] = []
+def test_an_interrupt_a_close_raises_behind_the_one_that_ended_the_read_is_reported_not_raised(family: str) -> None:
+    # The interrupt ends the read, and the source's close then raises a second one (``SystemExit``): the stream raises
+    # the first, out of ``asyncio.run``, and reports the second to the loop's exception handler, once, raw. Raised
+    # from the loop, it would stop it again before the client's close ran: that close still closes the client's other
+    # open stream, and the source is closed once.
+    reported: list[BaseException] = []
     got: list[BaseException] = []
-    raised: list[BaseException] = []
     source = _Source(family, "exits")
+    other = _HeldSource(family)
+    interrupting = _Interrupting("queued")
+
+    async def transport(request: Request) -> object:
+        owner = _owner(request)
+        if isinstance(owner, int) and owner >= HELD_FIRST:
+            return _answer(request)
+        return await interrupting(request)
 
     async def main() -> None:
-        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context))
-        async with client_for(ResponderTransport(_Interrupting("queued")), policy=POLICIES["raises"]) as client:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["exception"]))
+        async with client_for(ResponderTransport(transport), policy=POLICIES["raises"]) as client:
+            held = _stream(client, family, other, DirectDispatch(concurrency=1))
+            await anext(held)
             stream = _stream(client, family, source, DirectDispatch(concurrency=2))
 
             async def read() -> None:
@@ -2369,21 +2391,12 @@ def test_an_interrupt_a_close_raises_behind_the_one_that_ended_the_read_leaves_t
             await asyncio.create_task(read())
         raise got[0]
 
-    loop = asyncio.new_event_loop()
-    try:
-        work = loop.create_task(main())
-        for _turn in range(TURNS_TO_SETTLE):
-            try:
-                loop.run_until_complete(work if not work.done() else asyncio.sleep(0))
-            except BaseException as error:  # noqa: BLE001 - the test inspects what the loop raised
-                raised.append(error)
-    finally:
-        loop.close()
-    assert len(got) == 1
-    assert isinstance(got[0], KeyboardInterrupt)
-    assert sorted(map(id, raised)) == sorted([id(got[0]), id(source.exit)])
-    assert reported == []
-    assert source.closes == 1
+    with pytest.raises(KeyboardInterrupt) as raised:
+        asyncio.run(main())
+    gc.collect()
+    assert raised.value is got[0]
+    assert reported == [source.exit]
+    assert (source.closes, other.closes) == (1, 1)
 
 
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])

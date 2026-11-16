@@ -494,15 +494,15 @@ class OperationLatch:
     ``settle`` hands on whatever a library task ends in, so every task the library starts around caller code is
     such a site.
 
-    The first interrupt ends the operation: latched while it runs, it wakes its owner. Any other escape stays
-    undelivered until a read or close raises it. The operation's end (``close``) raises the interrupt, ahead of
-    anything else, or else the first undelivered escape, once, as from a ``finally``. The escapes it does not raise,
-    and any caught once it is out, go to the event loop (``hand_on``), once each: an interrupt is raised out of
-    ``asyncio.run`` as any task's is, and any other escape goes to the loop's exception handler, with the operation's
-    report. An operation nothing ends (a stream left unclosed when ``asyncio.run`` shuts down, or dropped) reports
-    every escape still undelivered to that handler as the latch is collected, as asyncio reports a task's exception
-    nobody retrieved. So no route an escape takes (an event, a future, a task's result, a cancelled pull) loses it
-    silently.
+    The first interrupt ends the operation: latched while it runs, it wakes its owner. Any other escape, a second
+    interrupt included, stays undelivered until a read or close raises it. The operation's end (``close``) raises the
+    interrupt, ahead of anything else, or else the first undelivered escape, once, as from a ``finally``. The escapes
+    it does not raise, and any caught once it is out, go to the event loop (``hand_on``), once each: the operation's
+    one interrupt (an interrupt caught after an end that raised none) is raised out of ``asyncio.run`` as any task's
+    is, and every other escape goes to the loop's exception handler, with the operation's report. An operation nothing
+    ends (a stream left unclosed when ``asyncio.run`` shuts down, or dropped) reports every escape still undelivered
+    to that handler as the latch is collected, as asyncio reports a task's exception nobody retrieved. So no route an
+    escape takes (an event, a future, a task's result, a cancelled pull) loses it silently.
     """
 
     __slots__ = ("_loop", "_out", "_undelivered", "_wake", "first", "report", "state")
@@ -564,27 +564,41 @@ class OperationLatch:
             self._undelivered.append(error)
 
     def hand_on(self, error: BaseException) -> None:
-        """Hand ``error`` to the event loop, once: no read or close of the operation will raise it."""
-        self._hand_on(error, asyncio.get_running_loop())
+        """Hand ``error`` to the event loop, once: no read or close of the operation will raise it.
+
+        The operation raises one interrupt at most, its first: the loop raises that one out of ``asyncio.run`` from a
+        callback (``first`` once the end is out, when that end raised none). Raising another would stop the loop again
+        while the caller unwinds from the first (its client's close, say), so every other escape, a second interrupt
+        included, is reported to the loop's exception handler.
+        """
+        if self._is_out(error):
+            return
+        if is_interrupt(error) and self.first in (None, error):
+            self.first = error
+            asyncio.get_running_loop().call_soon(_raise, error)
+            return
+        self._report(error, asyncio.get_running_loop())
 
     def __del__(self) -> None:
-        """Hand every escape no end raised to its loop's exception handler: nothing ended the operation."""
-        if self._undelivered and self._loop is not None:
-            for error in self._undelivered:
-                self._hand_on(error, self._loop)
+        """Report every escape no end raised to its loop's exception handler: nothing ended the operation.
 
-    def _hand_on(self, error: BaseException, loop: asyncio.AbstractEventLoop) -> None:
-        """Hand ``error`` to ``loop`` unless it is out already: an interrupt is raised there, any other is reported.
-
-        A loop that is closed reports it still, through its exception handler.
+        As asyncio reports a task's exception nobody retrieved, it reports and never raises, an interrupt included,
+        on a closed loop too.
         """
+        if self._loop is not None:
+            for error in self._undelivered:
+                if not self._is_out(error):
+                    self._report(error, self._loop)
+
+    def _is_out(self, error: BaseException) -> bool:
+        """Mark ``error`` out, returning whether it was out already (raised by an end, or handed on)."""
         if any(out is error for out in self._out):
-            return
+            return True
         self._out.append(error)
-        if is_interrupt(error):
-            # The loop raises it out of ``asyncio.run`` from a callback.
-            loop.call_soon(_raise, error)
-            return
+        return False
+
+    def _report(self, error: BaseException, loop: asyncio.AbstractEventLoop) -> None:
+        """Report ``error`` to ``loop``'s exception handler, with the operation's report."""
         context: dict[str, object] = {
             "message": "b24api: an operation could no longer deliver this exception to a read or a close",
             "exception": error,

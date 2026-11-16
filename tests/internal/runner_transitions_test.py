@@ -1101,16 +1101,18 @@ def test_the_operations_own_work_cannot_close_it_once_an_interrupt_ended_it_betw
     assert report.terminal_reason == "operation interrupted"
 
 
-def test_a_second_interrupt_latched_in_the_ends_cleanup_goes_to_the_event_loop_after_the_first() -> None:
+def test_a_second_interrupt_latched_in_the_ends_cleanup_is_reported_after_the_first() -> None:
     # The end that follows an interrupt between reads begins once the event loop raised it. Its cleanup latches
-    # another interrupt, twice, and the first again: nobody reads to raise them, so the event loop raises the other
-    # one, once, as it raised the first; the first is never raised again.
+    # another interrupt, twice, and the first again: nobody reads to raise them, and the operation raised its one
+    # interrupt already, so the other goes to the loop's exception handler, once; the first is never raised again.
     operation = _BetweenReads()
     second = SystemExit("in cleanup")
     operation.latched_in_cleanup.extend([second, second, operation.interrupt])
     operation.release.set()
     raised: list[BaseException] = []
+    reported: list[object] = []
     loop = asyncio.new_event_loop()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context["exception"]))
     try:
         work = loop.create_task(operation.read_one())
         for step in (lambda: work, lambda: _ending(operation.runner)):
@@ -1123,7 +1125,7 @@ def test_a_second_interrupt_latched_in_the_ends_cleanup_goes_to_the_event_loop_a
         loop.run_until_complete(asyncio.gather(work, return_exceptions=True))
     finally:
         loop.close()
-    assert raised == [operation.interrupt, second]
+    assert (raised, reported) == ([operation.interrupt], [second])
     assert (operation.cleanups, operation.finalized) == (1, [TerminalCause.INTERRUPTED])
     report = operation.runner.report
     assert report is not None

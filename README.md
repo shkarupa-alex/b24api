@@ -1002,7 +1002,9 @@ there is no report, only when nothing closes it: you never close the stream nor 
 `asyncio.run` was already shutting down (your main coroutine had returned) when the interrupt was raised.
 The interrupt leaves `asyncio.run` in every case. An
 interrupt raised after the operation ended (by a close or a send still running past the cleanup window) is
-never dropped either: it leaves the event loop the same way. A library
+never dropped either: it leaves the event loop the same way, unless the stream already raised one. A stream
+raises one interrupt at most; a second one is reported to the loop's exception handler, like any escape the
+stream could no longer deliver, so it never stops the loop again while you unwind from the first. A library
 error carries this in its report (`error.report`), not as a note; your own exception raised inside
 `async with stream` stays what is raised and carries one note, the report's `cleanup_failure` violation
 word for word. Once the

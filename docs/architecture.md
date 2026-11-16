@@ -333,12 +333,15 @@ outcome.
   consumer to acknowledge each page before its next step and its terminal event is its last. A coroutine
   closed by hand or at collection (`GeneratorExit`) ends no binding. What an end does not raise (a second
   escape, or one behind the interrupt) and whatever is latched once the end is out (work that outlived the
-  cleanup window) goes to the event loop (`OperationLatch.hand_on`), once each: an interrupt is raised out
-  of `asyncio.run`, any other escape goes to the loop's exception handler with the operation's report. An
+  cleanup window) goes to the event loop (`OperationLatch.hand_on`), once each. An operation raises one
+  interrupt at most, its first: one caught after an end that raised none is raised out of `asyncio.run`
+  from a callback. Every other escape, a second interrupt included, goes to the loop's exception handler
+  with the operation's report: raising another interrupt would stop the loop again while the caller
+  unwinds from the first, before its client's close could run. An
   operation nothing ends (a stream left open when `asyncio.run` shuts down, or dropped while the loop runs
   on) reports every escape still undelivered to its loop's exception handler, once each, as its latch is
-  collected (`OperationLatch.__del__`), the way asyncio reports a task's exception nobody retrieved; a
-  closed loop reports it still, through its handler. An escape delivered to a read or a close never
+  collected (`OperationLatch.__del__`), the way asyncio reports a task's exception nobody retrieved,
+  interrupts included, never raising; a closed loop reports it still, through its handler. An escape delivered to a read or a close never
   reaches the loop. The latch's state is explicit
   (`LatchState`): `ARMED` while the operation runs, when the first interrupt wakes the owner; `ENDING`
   once cleanup starts, when an interrupt is latched for the end and wakes nothing (an inline kernel's
