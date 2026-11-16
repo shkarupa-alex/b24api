@@ -8,7 +8,7 @@ import dataclasses
 import json
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 from urllib.parse import parse_qs
 
 import pytest
@@ -53,6 +53,7 @@ from b24api.contracts import (
     TotalHintMode,
     TraceClass,
 )
+from b24api.contracts.json import FrozenMapping
 from b24api.contracts.page import AdaptedPage, PageView
 from b24api.contracts.policy import IdentityRequirement, OrderSemantics, RetryPolicy, TotalSemantics
 from b24api.contracts.report import OperationReport, PageDispatch
@@ -75,6 +76,7 @@ from b24api.traversal.keyset_auto import AnchorFacts, BoundaryFacts, Preselected
 from b24api.traversal.keyset_fast_plan import plan_lanes_from_anchors, plan_windows
 from b24api.traversal.keyset_geometry import anchor_guesses, anchor_probe_count, estimates, partition_estimate
 from b24api.traversal.keyset_observation import FastTraceRecorder, PageObservation
+from b24api.traversal.keyset_ordered_admission import OrderedAdmissionState
 from tests.scripting import HANG_BOUND, ResponderTransport, client_for, json_response
 
 if TYPE_CHECKING:
@@ -3028,3 +3030,27 @@ async def test_fast_cancelled_reader_whose_cleanup_then_fails_is_cancelled_whene
     assert [item.message for item in report.violations if item.code == "cleanup_failure"] == [
         "stream cleanup also failed (RuntimeError)"
     ]
+
+
+@pytest.mark.parametrize(("direction", "admitted", "behind"), [("asc", (3, 4), (5, 3)), ("desc", (4, 3), (2, 4))])
+def test_the_ordered_admission_refuses_a_receipt_that_does_not_advance_past_what_it_admitted(
+    direction: Literal["asc", "desc"],
+    admitted: tuple[int, ...],
+    behind: tuple[int, ...],
+) -> None:
+    # The page checks upstream refuse such a receipt first today; the one owner of the global order still refuses
+    # it on its own, and admits nothing of it.
+    state = OrderedAdmissionState(
+        direction=direction,
+        identity=IdentitySpec(("id",), "ID", "id", IdentityCoercion.EXACT_INTEGER),
+    )
+
+    def receipt(identities: tuple[int, ...]) -> keyset_page_validation.LaneReceipt:
+        rows = tuple(FrozenMapping({"id": value}) for value in identities)
+        return keyset_page_validation.LaneReceipt(0, "lane", rows, identities, None, ())
+
+    assert state.validate_and_commit(receipt(admitted)).identities == admitted
+    with pytest.raises(PaginationError, match="global order did not advance"):
+        state.validate_and_commit(receipt(behind))
+    assert state.has_seen(admitted[-1])
+    assert not state.has_seen(behind[0])

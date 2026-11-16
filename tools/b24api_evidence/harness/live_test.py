@@ -11,7 +11,7 @@ import tracemalloc
 import weakref
 import zlib
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import httpx
 import pytest
@@ -162,17 +162,31 @@ def test_live_non_httpx_client_failure_drops_credentialed_request_text_and_local
     _assert_live_error_redacted(captured.value, sensitive_fragment)
 
 
+def _refuse_connection(request: httpx.Request) -> None:
+    raise httpx.ConnectError("synthetic", request=request)
+
+
+@pytest.mark.parametrize("chain", ["none", "context", "cause"])
 @pytest.mark.parametrize("escape", [KeyboardInterrupt, SystemExit])
 def test_live_interrupt_leaves_without_credentialed_frames_or_locals(
     monkeypatch: pytest.MonkeyPatch,
     escape: type[BaseException],
+    chain: Literal["none", "context", "cause"],
 ) -> None:
     # An interrupt raised inside the HTTP client is no failure to classify: it leaves as it is, but without the
-    # frames it was raised through, whose locals held the credential-bearing request, and without its chain.
+    # frames it was raised through, whose locals held the credential-bearing request, and without its chain,
+    # which may be HTTPX's own error holding that request, implicitly or as the cause.
     sensitive_fragment = "not-a-secret"
 
-    def handler(_request: httpx.Request) -> httpx.Response:
-        raise escape("synthetic interrupt")
+    def handler(request: httpx.Request) -> httpx.Response:
+        if chain == "none":
+            raise escape("synthetic interrupt")
+        try:
+            _refuse_connection(request)
+        except httpx.ConnectError as interrupted:
+            if chain == "cause":
+                raise escape("synthetic interrupt") from interrupted
+            raise escape("synthetic interrupt")  # noqa: B904 - the implicit context is what is under test
 
     with _portal(monkeypatch, handler) as portal, pytest.raises(escape) as captured:
         portal.call("scope")

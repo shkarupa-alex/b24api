@@ -851,7 +851,7 @@ unknown (`AmbiguousExecutionError`), and a fail-fast stream may end on that ambi
     hosts `Settings` refused; it refuses them now.
   - `Settings.webhook_url` stores the canonical base the transport sends: the scheme and host lower
     case, the host IDNA-encoded and an IPv6 address in pydantic's hexadecimal form (`::ffff:1.2.3.4`
-    is `::ffff:102:304`), the default port (under any scheme case: `HTTPS://portal:443/...`) and an
+    is `::ffff:102:304`), the default port (under any scheme case: `HTTPS://portal:443/...`) and
     an empty userinfo dropped, `.` and `..` segments resolved, and the trailing slash added.
     The canonical base parses back to itself.
   - `HttpxTransport.host` and `Bitrix24.host` are the host the rule yields: `xn--fa-hia.de`, where the
