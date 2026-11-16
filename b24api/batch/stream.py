@@ -106,12 +106,13 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         """Return how the command at stream index ``index`` settles from what it is known to have done.
 
         Its outcome once its chunk has run; where it stood (``BatchProgress``) when its chunk's run ended early; a
-        command the stream read but never handed to a send was not executed. Every earlier chunk was yielded whole.
+        command the stream read but never handed to a send was not executed. Only the latest chunk read can hold
+        such a command, since every earlier chunk was yielded whole, and each chunk starts with no progress.
         """
         outcome = self._chunk_outcomes.get(index)
         if outcome is not None:
             return settlement_of(outcome)
-        if self._progress is not None and index in self._chunk:
+        if self._progress is not None:
             return self._progress.settlement(index)
         return CommandSettlement.NOT_EXECUTED
 
