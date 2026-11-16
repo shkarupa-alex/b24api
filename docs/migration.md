@@ -872,12 +872,23 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   physical batch shared with other bindings' commands. Each is now its command's index in that batch.
   A page replayed alone keeps the index of the batch it was first sent with: it is the command's key
   in every send of it.
-- **A page sent with a batch that failed as a whole is traced.** When a physical batch fails as a whole
-  (its answer cannot be decoded, for example), each page sent with it is traced the way it settles, with
-  its index in that batch: a fast keyset wave or finish page, of `iter_list_keyset()` or of a reference
-  binding, and the page a flat counted tail stops at in `iter_list_counted()`. Before, none of them was
-  traced, and a reference counted tail page was traced with no `batch_index`. A direct keyset finish
-  request that fails is traced too, with no `batch_index`. The errors raised are unchanged.
+- **A page sent with a batch that failed as a whole is traced.** When a physical batch fails as a whole,
+  each page sent with it is traced the way it settles, with its index in that batch: a fast keyset wave or
+  finish page, of `iter_list_keyset()` or of a reference binding, and the counted tail page the traversal
+  stops at, flat or reference. Before, only an envelope failure (a structured error on the envelope, or a
+  lost answer) was traced; a batch whose answer could not be decoded left no trace, nor did a reference
+  counted tail page whose replay's answer was lost, and the flat counted tail traced its page with its
+  index in the whole tail. A direct keyset finish request that fails is traced too, with no `batch_index`.
+  The errors raised are unchanged.
+- **A cancelled request's pages are traced as possibly run.** When `iter_list_counted()` or
+  `iter_list_keyset()` is cancelled while a tail batch, a keyset wave or a direct keyset finish request is
+  on the wire, its pages are traced `UNKNOWN` with `AMBIGUOUS_EXECUTION`, as a direct page cancelled on
+  the wire already was. Before, they were not traced. A reference operation's report still holds no page
+  of a binding its cancelled consumer did not read.
+- **A failed page whose command succeeded is retired as aborted.** In the completion evidence of a list or
+  reference traversal, the page it stops at, when its own command succeeded and the batch around it failed
+  (a counted tail page, for example), is now `PageRejected` with `transaction_aborted`, as its trace records
+  it. Before, it had no `PageRejected`.
 - **A flat counted tail page the traversal stops before settles as its command did.** In the
   completion evidence of `iter_list_counted()`, every tail page read but not reached when the traversal
   stopped (at a failed page, at the budget, cancelled, or when the consumer broke out of the loop)

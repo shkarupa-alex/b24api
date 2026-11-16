@@ -465,7 +465,7 @@ async def execute_finish_page(
         try:
             admitted = host.admission.validate_and_commit(receipt)
         except PaginationError:
-            host.admission.record_discarded(len(receipt.rows))
+            # The refused rows stay raw: the runtime's cleanup counts them discarded with every row it did not admit.
             host.record_page(
                 plan,
                 index=_finish_index(outcome, dispatch),

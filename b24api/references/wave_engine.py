@@ -154,14 +154,13 @@ class SharedWaveEngine:
         command_ids: tuple[str, ...],
         tasks: tuple[asyncio.Task[_DispatchedPage], ...],
         errors: dict[int, BaseException],
-        raised: BaseException | None,
+        raised: BaseException,
     ) -> None:
         """Settle every page of a wave whose call raises, by id, from what its own command's dispatch proved."""
         failed = tuple(_failed_wave_page(task, errors.get(index)) for index, task in enumerate(tasks))
         for command_id, page in zip(command_ids, failed, strict=True):
             self._ledger.settle(command_id, page.settlement)
-        # A cancellation is no failure of the wave's pages.
-        self._failed = (raised, failed) if isinstance(raised, Exception) else None
+        self._failed = (raised, failed)
 
     def failed_pages(self, error: BaseException) -> tuple[FailedWavePage, ...] | None:
         """Return the pages of the latest call that ``error`` failed, as the engine settled them."""

@@ -889,6 +889,14 @@ async def test_a_counted_tail_page_that_fails_with_its_chunk_is_traced_the_way_i
             (0, CommandSettlement.UNKNOWN): 1,
             (1, CommandSettlement.SUCCESS): 1 + tail,
         }
+    # Every tail page whose command succeeded is rejected as aborted: the second binding's first one, where it
+    # stops, as its trace says, and each it never consumes.
+    aborted = Counter(
+        event.binding_id
+        for event in events
+        if isinstance(event, PageRejected) and event.reason == PageRejectionCode.TRANSACTION_ABORTED.value
+    )
+    assert aborted == ({} if mode == "undecodable" else {0: tail - 1, 1: tail})
     assert not any(isinstance(event, ReferenceComplete) for event in outcomes)
 
 
@@ -1393,6 +1401,60 @@ async def test_a_flat_counted_tail_batch_that_fails_as_a_whole_traces_the_page_i
         else [CommandSettlement.SUCCESS, CommandSettlement.UNKNOWN, CommandSettlement.SUCCESS]
     )
     assert settled == dict.fromkeys(range(4), CommandSettlement.SUCCESS) | dict(zip(range(4, 7), batch, strict=True))
-    # A page past the stop whose command succeeded is rejected as aborted, as the stop leaves it.
-    assert aborted == ([] if mode == "undecodable" else [6])
+    # A page whose command succeeded is rejected as aborted: the page the traversal stops at, as its trace says,
+    # and the one past the stop it never consumes.
+    assert aborted == ([] if mode == "undecodable" else [4, 6])
     assert closure is BindingClosure.UNKNOWN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["flat", "reference"])
+async def test_a_counted_tail_batch_its_cancellation_interrupts_on_the_wire_settles_as_possibly_run(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    # The reader is cancelled while the first tail batch is on the wire: every page of it may have run, whatever
+    # ended the batch, and settles as unknown. The flat traversal traces the page it stops at by that settlement,
+    # unknown at its index in the batch. A reference binding's trace reaches the report only through the events
+    # its consumer reads, and the cancelled consumer reads none: no page is traced.
+    events = _observed(monkeypatch)
+    portal = BatchPortal(_dense(301))
+    on_wire = asyncio.Event()
+    sends = [0]
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        if sends[0] == _TAIL_CHUNK:  # the head went first
+            on_wire.set()
+            await asyncio.Future[None]()
+        return await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+
+    async with client_for(
+        ResponderTransport(respond, host=portal.host), policy=ExecutionPolicy(page_trace_limit=1024)
+    ) as client:
+        stream = (
+            client.iter_list_counted(
+                Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE), page_size=WIDTH, batch_size=3
+            )
+            if path == "flat"
+            else client.iter_reference_outcomes(
+                _request(), _bindings(1), traversal=CountedTraversal(page_size=WIDTH), dispatch=BatchDispatch()
+            )
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        reader = asyncio.create_task(drain())
+        await asyncio.wait_for(on_wire.wait(), HANG_BOUND)
+        reader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reader
+
+    settled = [event.outcome for event in events if isinstance(event, PageCommandOutcome)]
+    tail = 3 if path == "flat" else _TAIL_PAGES
+    assert settled == [CommandSettlement.SUCCESS, *[CommandSettlement.UNKNOWN] * tail]
+    unknown = (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
+    traced = [(None, WIDTH, PageDispatch.BATCH, 0, *unknown)] if path == "flat" else []
+    assert _failed_trace(_report(stream)) == traced

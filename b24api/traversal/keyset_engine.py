@@ -70,7 +70,7 @@ class FlatWaveEngine:
             failed = tuple(FailedWavePage(progress.settlement(index), index) for index in range(len(pages)))
             for command_id, page in zip(pages, failed, strict=True):
                 self._ledger.settle(command_id, page.settlement)
-            self._remember(error, failed)
+            self._failed = (error, failed)
             raise
 
     async def execute_page(self, request: Request, *, command_id: str, context: ExecutionContext) -> BatchOutcome:
@@ -80,7 +80,7 @@ class FlatWaveEngine:
         except BaseException as error:
             page = FailedWavePage(settlement(error), None)
             self._ledger.settle(command_id, page.settlement)
-            self._remember(error, (page,))
+            self._failed = (error, (page,))
             raise
         return BatchSuccess(0, "finish", request, response.result, response=response)
 
@@ -88,10 +88,6 @@ class FlatWaveEngine:
         """Return the pages of the latest call that ``error`` failed, as the engine settled them."""
         failed = self._failed
         return failed[1] if failed is not None and failed[0] is error else None
-
-    def _remember(self, error: BaseException, pages: tuple[FailedWavePage, ...]) -> None:
-        """Keep how the pages of a call that failed settled; a cancellation is no failure of its pages."""
-        self._failed = (error, pages) if isinstance(error, Exception) else None
 
 
 __all__ = ["FlatWaveEngine"]

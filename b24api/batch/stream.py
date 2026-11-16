@@ -79,7 +79,7 @@ class _ChunkFailed:
 
     commands: range
     progress: BatchProgress
-    error: Exception
+    error: BaseException
 
     def settlement(self, index: int) -> CommandSettlement:
         """Return how the command settles from what it did before the chunk failed."""
@@ -260,7 +260,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             for reservation in reservations:
                 self._context.release_page(reservation)
             sending = self._chunk
-            if isinstance(sending, _ChunkSending) and isinstance(error, Exception):
+            if isinstance(sending, _ChunkSending):
                 self._chunk = _ChunkFailed(sending.commands, sending.progress, error)
             raise
         if reservations:

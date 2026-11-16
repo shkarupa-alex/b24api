@@ -70,7 +70,10 @@ halt a batch, so no sent command is withheld) leaves no request to record and is
 it from its send (the budget, a closed client, a cancellation); the settlement decides the code of every
 other failed page the traversal records. That page is unknown only when it may have run, otherwise
 rejected; a page whose own command succeeded is rejected as `transaction_aborted`, the code of a page
-dropped with the unit around it, not as a `command_failure`. A traversal records the failed page it stops
+dropped with the unit around it, not as a `command_failure`, and its completion record retires it with the same
+code (`PageRejected`), as it retires a page the traversal read but never consumed. Whatever ended the page
+decides nothing: a page cancelled on the wire may have run and is traced unknown, as one whose answer was lost.
+A traversal records the failed page it stops
 at, not every page its failure leaves behind: a counted tail stops at a binding's first failed page in
 offset order, and the binding's later pages, sent or not, are settled and released without a trace record.
 A page's trace and its settlement read the same fact, the page's own: for a page of a chunk that failed as
@@ -87,9 +90,11 @@ batch failed, or its answer could not be decoded) is traced as its settlement sa
 chunk as its `batch_index`, on every path that sends one: the reference dispatcher's `_FailedPage`, the flat
 tail's stream (`failed_chunk`: the traversal stops at that chunk's first page, the one it traces) and a keyset
 engine whose wave or finish call failed (`failed_pages`: each page's settlement and index, which the keyset
-transaction traces by `failed_page`, a direct finish page with no index). A chunk ended by cancellation is not
-such a failure: its pages are settled from its progress, and the operation ends without a failed page to
-trace. A page's `batch_index` is
+transaction traces by `failed_page`, a direct finish page with no index). Each of them remembers every call
+that raised, a cancelled one included, and none filters by the exception's type. A reference binding's trace
+reaches the operation's report only through the events its consumer reads: when the consumer is cancelled, it
+reads no more, so a reference binding's pages, settled as their commands did, are not traced, whatever path
+they took (sequential, counted or keyset). A page's `batch_index` is
 its command's index in the physical batch it was submitted with (sent with, or handed to), as its command's
 outcome carries it, on every path: a keyset wave or finish page of a reference binding shares that batch with
 other bindings' commands, so its index in its own binding's wave is not one. The index is also the command's

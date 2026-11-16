@@ -687,7 +687,8 @@ class PaginationDriver:
         """Record a page whose command failed, by the one rule of ``failed_page``: its settlement (``settled``).
 
         A page that never executed, because it was never sent, is not traced; the settlement decides the code of
-        every other page.
+        every other page. A page whose own command succeeded is still the active page of its completion record;
+        it is retired with the trace's code, as a page the traversal reads but never consumes is.
         """
         traced = failed_page(error, settled)
         if traced is None:
@@ -707,6 +708,8 @@ class PaginationDriver:
                 rejection_code=code,
             ),
         )
+        if settled is CommandSettlement.SUCCESS and code is not None and self.completion_recorder is not None:
+            self.completion_recorder.rejected(code.value)
 
     def _record_rejected_page(
         self,
