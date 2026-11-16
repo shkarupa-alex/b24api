@@ -297,8 +297,10 @@ outcome.
   (`with_cleanup_failure_behind`). It does so behind an interrupt as well (`closed_behind_its_end`): a
   source it closes records a failed close as what failed it, not knowing that an interrupt ended the
   operation first, so a close failing behind an interrupt reads the same whether the interrupt came in
-  a read or between reads. An interrupt (`is_interrupt`: neither an `Exception` nor a
-  cancellation) is never secondary, and one piece of state carries it: each operation has one
+  a read or between reads. An interrupt (`is_interrupt`: a `KeyboardInterrupt` or `SystemExit`, what
+  the event loop raises out of `asyncio.run` from a callback, where it only logs and drops anything else)
+  is never secondary; any other `BaseException` is a failure like any other, its reader's to receive,
+  never handed to the event loop. One piece of state carries an interrupt: each operation has one
   `InterruptLatch`, the isolated runner's, which its pull and cleanup tasks publish through `INTERRUPTS`
   so the tasks they start inherit it (an inline kernel uses the latch of the runner it serves). Every
   place where library code first catches a caller's `BaseException` latches the first interrupt and goes
@@ -314,20 +316,31 @@ outcome.
   the interrupt (a read whose own task latched it and still returned an item raises it instead of the
   item). With no read in flight, between reads, the wake closes the latch and hands the interrupt to
   the event loop then and there (`InterruptLatch.hand_on`, the path of a late interrupt): nothing
-  later has to run for it to leave, and the loop raises it before any reader resumes. The operation's
+  later has to run for it to leave. The loop raises it once the callbacks already due in that loop turn
+  have run: a reader those wake (one waiting on what the interrupted work did, say) resumes first, and a
+  read or close it makes then finds the operation ended and runs its end; every other reader resumes
+  after the raise. The operation's
   end (cleanup and publication) is decoupled from that delivery: the phase turns `INTERRUPTED` (ended,
-  its end not begun) and whoever comes first runs the end (`OperationRunner._end_between_reads`): the
-  task the wake starts, spawned before the interrupt is handed on so its first step comes first, or a
-  read or close, which never waits for a task that might never run (a loop's shutdown may cancel it
-  before its first step). The end raises no interrupt, whoever runs it; it attaches the report to the
+  its end not begun) and whoever comes first runs the end (`OperationRunner._end_between_reads`): a
+  read or close, or the task the wake starts once the interrupt is handed on, which a read or close
+  never waits for. The end raises no interrupt, whoever runs it; it attaches the report to the
   interrupt (`.report`). A read or close that finds an end some other caller runs (`CLOSING`) waits for
   the phase to turn `CLOSED` (`_published`): such an end has begun in a caller that runs it to its
   publication, and a read in flight that a concurrent close ended waits the same way. The operation's
   own work cannot close it from the wake on (`inside_own_work`): that close would run or wait for an
-  end that waits for the work. Once ended, a read raises `StopAsyncIteration` and a close returns. If
-  the loop's shutdown cancels that end's cleanup, the report is what that cleanup produced ("stream
-  cleanup also failed (CancelledError)" when it was cancelled before it closed anything); if the loop
-  stops before the end begins, there is no report. The interrupt leaves `asyncio.run` either way.
+  end that waits for the work. Once ended, a read raises `StopAsyncIteration` and a close returns.
+  On a loop that runs on, the end's task runs it if nobody came first. A loop the interrupt stops does
+  so before that task's first step, since the task is started after the raise is due: under
+  `asyncio.run` the shutdown cancels the task before it begins, and the end is the close the shutdown
+  runs as it unwinds the tasks it cancels (`async with stream`, the client's `async with`); that
+  cancellation has already landed, so the close closes the source and the report is the interrupt's
+  alone. An end that a cancellation meets while its cleanup runs (a read or close running it is
+  cancelled, or the shutdown cancels a task running it) still publishes, the cancellation recorded as
+  cleanup's ("stream cleanup also failed (CancelledError)"). There is no report, and the source is not
+  closed, when no end ever begins: the stream is never read or closed again and the loop stops before
+  the end's task runs (a stream nobody closes, or an interrupt the loop raises out of `asyncio.run`'s
+  own shutdown, which then stops), or an end that has begun never runs again (its loop stopped while
+  it waited and is never run again). The interrupt leaves `asyncio.run` in every case.
   `OperationRunner._raise_latched` is the one raise point of an interrupt a read or close sees: after
   the report is published it closes the latch and raises its interrupt, with the report attached,
   whatever ended the stream, from every caller that sees the end (the read or close that ended it, a

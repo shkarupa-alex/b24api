@@ -968,21 +968,29 @@ with the terminal reason "operation interrupted", every violation recorded befor
 failure's first), and one `interrupted` violation last, "operation interrupted (X)", where X is
 `KeyboardInterrupt` or `SystemExit`. The raised interrupt carries that report as `.report`, as the
 `CancelledError` does. A close that fails after an interrupt ended the stream is "stream cleanup also
-failed (X)", as behind any other end that came first. An interrupt raised while no read is waiting (by a
-send the stream runs between your reads, while you work on an item) does not wait for your next read: it
+failed (X)", as behind any other end that came first. Any other `BaseException` is no interrupt but a
+failure like any other: the stream raises it to its reader as it raises any failure (`BatchFailed` or
+`ReferenceFailed`, with it as `__cause__`), or an outcome family yields a failure outcome for that item;
+it never goes to the event loop, which would only log it. An interrupt raised while no read is waiting (by
+a send the stream runs between your reads, while you work on an item) does not wait for your next read: it
 leaves the event loop at once, out of `asyncio.run`, as asyncio raises any task's, and the operation's end
 follows: its work cancelled, its source closed and its report published, attached to the interrupt as
-`.report`. A read or close you start before that end is over runs it or waits for it, then finds the stream
-ended (a read raises `StopAsyncIteration`, a close returns); neither raises the interrupt, which the loop
-has. If `asyncio.run` shuts down meanwhile, the report is what the end got to: its shutdown cancels the
-end's cleanup ("stream cleanup also failed (CancelledError)"), or stops the loop before the end began,
-leaving no report; the interrupt still leaves `asyncio.run`. An
+`.report`. A read or close you start before that end is over runs it or waits for it, then finds the
+stream ended (a read raises `StopAsyncIteration`, a close returns); neither raises the interrupt, which
+the loop has. Under `asyncio.run` the interrupt stops the loop before the end begins, and the end is the
+close that `asyncio.run`'s shutdown runs as it cancels your tasks: the exit of an `async with stream`
+around your reads, or of the client's `async with`. A read or close cancelled while it runs the end still
+lets the end publish, with "stream cleanup also failed (CancelledError)" before the `interrupted`
+violation. The stream gets no end, so its source stays open and there is no report, only when nothing
+closes it: you never close the stream nor its client, or `asyncio.run` was already shutting down (your
+main coroutine had returned) when the interrupt was raised. The interrupt leaves `asyncio.run` in every
+case. An
 interrupt raised after the operation ended (by a close or a send still running past the cleanup window) is
 never dropped either: it leaves the event loop the same way. A library
 error carries this in its report (`error.report`), not as a note; your own exception raised inside
 `async with stream` stays what is raised and carries one note, the report's `cleanup_failure` violation
-word for word. The source
-is closed in every case, even when the stream's own tasks outlast the cleanup window. A close from
+word for word. Once the
+stream ends, its source is closed, even when the stream's own tasks outlast the cleanup window. A close from
 another task while a read is in flight is an early close: the read it ends raises `CancelledError`, or
 the close's failure when the close failed (an interrupt included), which the close raises too. A
 stream its reader's cancellation ended reports `cancelled` with the terminal reason "iteration

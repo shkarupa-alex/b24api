@@ -196,9 +196,16 @@
   transport raises under a reference family, which stopped the event loop from inside a library task:
   it now reaches the read in flight, which raises it with the report. Raised between your reads, it
   leaves the event loop at once, as before, and the stream's end follows: a later read raises
-  `StopAsyncIteration` and a close returns, the report attached to the interrupt as `.report`. A loop
-  shutting down meanwhile may cancel that end ("stream cleanup also failed (CancelledError)") or stop
-  before it began, leaving no report.
+  `StopAsyncIteration` and a close returns, the report attached to the interrupt as `.report`. Under
+  `asyncio.run` the interrupt stops the loop before that end begins: the end is the close the shutdown
+  runs as it cancels your tasks (an `async with stream` or the client's `async with`), which closes the
+  source and reports the interrupt. A read or close cancelled while it runs the end still lets it publish
+  ("stream cleanup also failed (CancelledError)"). With nothing to close the stream (you never close it
+  nor its client, or `asyncio.run` was already shutting down when the interrupt was raised) it gets no
+  end: its source stays open and there is no report. Any other `BaseException` from your transport is no
+  longer treated as an interrupt, which asyncio's loop only logged and dropped between reads: it is a
+  failure like any other, which the stream raises to its reader (`BatchFailed` or `ReferenceFailed`,
+  with it as `__cause__`) or an outcome family yields as that item's failure.
 - **A cancelled stream gives the cancellation's reason.** A stream read to its end and cancelled
   while its source closed reported `cancelled` with the terminal reason "input exhausted" (or
   "reference input exhausted"). Every family now gives "iteration cancelled" whenever the reader's
@@ -1048,7 +1055,10 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   the operation's `ExecutionPolicy.max_elapsed` lasts; cleanup still running then finishes in the
   background, the close raises `BudgetExceededError` and the cancellation is delivered at the next
   await, and the report carries a `cleanup_failure` violation with the terminal reason "stream
-  cleanup failed". Without a cancellation, cleanup is still awaited to its end.
+  cleanup failed". Without a cancellation, cleanup is still awaited to its end. A read or close that
+  runs the end an interrupt between reads left is the exception: that end has no deadline of its own, so
+  the read or close defers its cancellation until the end is over, which the cleanup windows of its steps
+  bound (the operation's time left, at least the cleanup grace), not the operation's deadline.
 
 ## CLI exit code for a closed reader
 
