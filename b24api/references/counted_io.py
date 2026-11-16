@@ -12,12 +12,10 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
-from b24api.batch.outcome import settlement_of
 from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError
-from b24api.execution.facts import Execution
 from b24api.references.dispatch import _BatchPageError, _failed_page
 from b24api.traversal.counted_io import HeadAttempt, TailReceipt
 
@@ -25,7 +23,6 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
     from b24api.batch.engine import _BatchInput
-    from b24api.batch.outcome import BatchFailure
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.request import Request
     from b24api.execution import ExecutionContext
@@ -125,7 +122,6 @@ class SharedCountedWaveIO:
             None,
             dispatched.dispatch,
             dispatched.batch_index,
-            execution=Execution.ANSWERED,
             settlement=CommandSettlement.SUCCESS,
         )
 
@@ -137,7 +133,6 @@ class SharedCountedWaveIO:
             failed.error,
             self._host.page_dispatch,
             failed.batch_index,
-            execution=failed.execution,
             settlement=failed.settlement,
         )
 
@@ -344,14 +339,15 @@ class ReferenceTailStream:
         try:
             dispatched = await task
         except Exception as error:
-            failure = _failed_page(error).failure
-            if failure is None:
-                raise
-            self._take(slot)  # the command's own failure is the page's outcome
-            return TailReceipt(slot.ordinal, None, failure, failure.command_index)
+            failed = _failed_page(error)
+            if failed.settlement is CommandSettlement.NOT_EXECUTED:
+                raise  # never sent: the tail abandons the page, as it does every unsent one
+            # A sent page that failed, by its command's own failure or with its whole chunk, is the page's outcome.
+            self._take(slot)
+            return TailReceipt(slot.ordinal, None, failed.batch_index, failed.settlement, failed.error, failed.failure)
         self._take(slot)
         run.page_state += 1
-        return TailReceipt(slot.ordinal, dispatched.response, None, dispatched.batch_index)
+        return TailReceipt(slot.ordinal, dispatched.response, dispatched.batch_index, CommandSettlement.SUCCESS)
 
     def _take(self, slot: _TailSlot) -> None:
         run = self._run
@@ -362,13 +358,15 @@ class ReferenceTailStream:
 
     def settle(self, receipt: TailReceipt) -> None:
         """Record the activated page's physical command outcome."""
-        failure = receipt.failure
-        self._run.completion.settled(CommandSettlement.SUCCESS if failure is None else settlement_of(failure))
+        self._run.completion.settled(receipt.settlement)
 
-    def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
-        """Return the binding failure carrying the command's replay disposition."""
-        del receipt
-        return _BatchPageError(outcome)
+    def failure(self, receipt: TailReceipt) -> BaseException:
+        """Return the binding failure: its command's own, which carries the replay disposition, or its chunk's."""
+        if receipt.failure is not None:
+            return _BatchPageError(receipt.failure)
+        if receipt.error is None:
+            raise RuntimeError("counted tail failure lacks its error")
+        return receipt.error
 
     async def aclose(self) -> None:
         """Stop planning, then settle and release every page the binding will not commit, once."""

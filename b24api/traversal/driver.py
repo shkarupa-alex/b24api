@@ -42,7 +42,7 @@ from b24api.errors import (
     ResultShapeError,
 )
 from b24api.execution import WorkClass
-from b24api.execution.facts import execution, settlement
+from b24api.execution.facts import settlement
 from b24api.traversal.continuation import ContinuationStrategy
 from b24api.traversal.control_preflight import preflight_controls
 from b24api.traversal.counted_batch import CountedBatchStrategy, empty_source_head_eligible
@@ -302,11 +302,9 @@ class PaginationDriver:
                 recorder.settled(settlement(error))
             if reservation is not None:
                 self.context.release_page(reservation)
-            if execution(error).dispatched:
-                self.set_page_dispatch(dispatch=PageDispatch.DIRECT)
-                self.record_failed_page(
-                    dispatch=PageDispatch.DIRECT, batch_index=None, error=error, settled=settlement(error)
-                )
+            self.record_failed_page(
+                dispatch=PageDispatch.DIRECT, batch_index=None, error=error, settled=settlement(error)
+            )
             raise
         return response
 
@@ -683,7 +681,13 @@ class PaginationDriver:
         error: BaseException,
         settled: CommandSettlement,
     ) -> None:
-        """Record a dispatched page whose command failed: traced the way it settles, from what its command did."""
+        """Record a page whose command failed, traced the way it settles (``settled``), from what its command did.
+
+        The one fact decides both whether it is traced and how: a page never sent settles as not executed and is not
+        traced; a sent one is.
+        """
+        if settled is CommandSettlement.NOT_EXECUTED:
+            return
         outcome, code = failed_page(error, settled)
         self._append_page_record(
             PageRecord(

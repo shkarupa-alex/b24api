@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from b24api.batch.engine import _BatchInput
-from b24api.batch.outcome import settlement_of
 from b24api.completion.recorder import CountedCompletionRecorder
 from b24api.contracts.policy import ConfirmationPolicy, KernelState
 from b24api.contracts.report import PageDispatch
@@ -186,15 +185,12 @@ class CountedBatchStrategy:
             failed = io.head_failure(error)
             if recorder is not None:
                 recorder.settled(failed.settlement)
-            if failed.execution.dispatched:
-                report_error = failed.error if failed.error is not None else error
-                ctx.set_page_dispatch(dispatch=failed.dispatch, batch_index=failed.batch_index)
-                ctx.record_failed_page(
-                    dispatch=failed.dispatch,
-                    batch_index=failed.batch_index,
-                    error=report_error,
-                    settled=failed.settlement,
-                )
+            ctx.record_failed_page(
+                dispatch=failed.dispatch,
+                batch_index=failed.batch_index,
+                error=failed.error if failed.error is not None else error,
+                settled=failed.settlement,
+            )
             raise
         if recorder is not None:
             recorder.settled(attempt.settlement)
@@ -314,22 +310,17 @@ class CountedBatchStrategy:
         receipt: TailReceipt,
     ) -> tuple[Response, tuple[FrozenJson, ...], bool]:
         """Validate one tail page against the planned exact range, or record its rejection."""
-        failure = receipt.failure
         tail.settle(receipt)
         start = self._tail_starts[receipt.ordinal]
         ctx.schedule_page(offset=start, dispatch=PageDispatch.BATCH, batch_index=receipt.batch_index)
-        if failure is not None:
-            error = failure.error
-            recorded = (
-                error if isinstance(error, BaseException) else CapabilityError("parallel counted batch command failed")
-            )
+        if receipt.error is not None:
             ctx.record_failed_page(
                 dispatch=PageDispatch.BATCH,
                 batch_index=receipt.batch_index,
-                error=recorded,
-                settled=settlement_of(failure),
+                error=receipt.error,
+                settled=receipt.settlement,
             )
-            raise tail.failure(receipt, failure)
+            raise tail.failure(receipt)
         response, total, stride = receipt.response, self._total, self._stride
         if response is None:
             raise CapabilityError("parallel counted batch outcome lacks correlated response evidence")

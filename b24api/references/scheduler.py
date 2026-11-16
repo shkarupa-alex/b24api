@@ -657,13 +657,12 @@ class ReferenceScheduler:
             failed = _failed_page(error)
             run.completion.settled(failed.settlement)
             await self.abandon_page(run)
-            if failed.execution.dispatched:
-                run.driver.record_failed_page(
-                    dispatch=self.page_dispatch,
-                    batch_index=failed.batch_index,
-                    error=failed.error,
-                    settled=failed.settlement,
-                )
+            run.driver.record_failed_page(
+                dispatch=self.page_dispatch,
+                batch_index=failed.batch_index,
+                error=failed.error,
+                settled=failed.settlement,
+            )
             raise
         run.driver.set_page_dispatch(dispatch=dispatched.dispatch, batch_index=dispatched.batch_index)
         run.completion.settled(CommandSettlement.SUCCESS)

@@ -761,33 +761,99 @@ async def test_counted_bindings_cancelled_while_a_replay_is_on_the_wire_settle_e
     assert (CommandSettlement.NOT_EXECUTED in settled) is (stage == "tail")
 
 
+_TRAVERSALS = {"counted": CountedTraversal(page_size=WIDTH), "sequential": SequentialTraversal(page_size=WIDTH)}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("traversal", [CountedTraversal(page_size=WIDTH), SequentialTraversal(page_size=WIDTH)])
-async def test_a_reference_batch_answered_without_an_envelope_traces_each_page_by_its_envelope_failure(
-    traversal: CountedTraversal | SequentialTraversal,
+@pytest.mark.parametrize("traversal", list(_TRAVERSALS))
+@pytest.mark.parametrize(
+    ("status", "body", "outcome", "variant"),
+    [
+        # 200 with no Bitrix envelope: each page may have run.
+        (200, b'{"foo": 1}', PageOutcome.UNKNOWN, ReferenceOutcomeUnknown),
+        # 400 whose error object is malformed: the batch was answered and refused.
+        (400, b'{"error": [1]}', PageOutcome.REJECTED, ReferenceFailure),
+    ],
+)
+async def test_a_reference_batch_whose_envelope_fails_traces_each_page_by_its_envelope_failure(
+    traversal: str, status: int, body: bytes, outcome: PageOutcome, variant: type[object]
 ) -> None:
-    # Every batch answer is 200 with no Bitrix envelope: each page may have run, and its batch envelope's own
-    # protocol failure explains it, which its trace reports (a counted head, or a plain sequential page).
+    # Every batch answer is one the batch envelope's own protocol failure explains, which each page's trace
+    # reports (a counted head, or a plain sequential page): unknown when the page may have run, rejected when the
+    # batch was answered.
     portal = BatchPortal(_dense(301))
 
     async def respond(request: Request) -> WireResponse:
-        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
-        return WireResponse(200, answer.headers, b'{"foo": 1}')
+        await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        return WireResponse(status, (("content-type", "application/json"),), body)
 
     async with client_for(ResponderTransport(respond, host=portal.host)) as client:
         stream = client.iter_reference_outcomes(
-            _request(), _bindings(1, 2), traversal=traversal, dispatch=BatchDispatch()
+            _request(), _bindings(1, 2), traversal=_TRAVERSALS[traversal], dispatch=BatchDispatch()
         )
         async with stream:
-            outcomes = [outcome async for outcome in stream]
+            outcomes = [event async for event in stream]
 
     traced = Counter(
         (record.outcome, record.rejection_code)
         for record in _report(stream).page_trace
         if record.outcome is not PageOutcome.COMMITTED
     )
-    assert traced == {(PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE): 2}
-    assert [type(outcome) for outcome in outcomes] == [ReferenceOutcomeUnknown, ReferenceOutcomeUnknown]
+    assert traced == {(outcome, PageRejectionCode.BATCH_ENVELOPE): 2}
+    assert [type(event) for event in outcomes] == [variant, variant]
+
+
+_NESTED = 100_000
+_TAIL_CHUNK, _REPLAY = 2, 3  # the sends of the first tail chunk and of its refused command's replay
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["undecodable", "refuse_first"])
+async def test_a_counted_tail_page_that_fails_with_its_chunk_is_traced_the_way_it_settles(mode: str) -> None:
+    # The first tail chunk, which carries both bindings' tail pages, fails as a whole: its answer cannot be
+    # decoded, or its first command is refused (QUERY_LIMIT_EXCEEDED) and the answer of that command's replay
+    # cannot be decoded. Each binding fails at its first tail page, which is traced the way it settles: one that may
+    # have run is unknown, one whose own command succeeded is rejected with the chunk (``transaction_aborted``).
+    portal = BatchPortal(_dense(301))
+    undecodable = WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
+    sends = [0]
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        if sends[0] == (_TAIL_CHUNK if mode == "undecodable" else _REPLAY):
+            return undecodable
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        if sends[0] != _TAIL_CHUNK:
+            return answer
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        first = next(iter(commands))
+        body = json.loads(answer.body)
+        result = body["result"]
+        del result["result"][first]
+        for key in ("result_total", "result_next"):
+            if isinstance(result.get(key), dict):
+                result[key].pop(first, None)
+        result["result_error"] = {first: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        return WireResponse(200, answer.headers, json.dumps(body).encode())
+
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        stream = client.iter_reference_outcomes(
+            _request(), _bindings(1, 2), traversal=CountedTraversal(page_size=WIDTH), dispatch=BatchDispatch()
+        )
+        async with stream:
+            outcomes = [event async for event in stream]
+
+    traced = sorted(
+        (record.reference_index, record.offset, record.outcome, record.rejection_code)
+        for record in _report(stream).page_trace
+        if record.outcome is not PageOutcome.COMMITTED
+    )
+    unknown = (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
+    second = unknown if mode == "undecodable" else (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED)
+    assert traced == [(0, WIDTH, *unknown), (1, WIDTH, *second)]
+    assert [event.correlation for event in outcomes if isinstance(event, ReferenceFailure)] == [1, 2]
+    assert not any(isinstance(event, ReferenceComplete) for event in outcomes)
 
 
 @pytest.mark.asyncio

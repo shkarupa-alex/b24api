@@ -17,7 +17,7 @@ from b24api.batch.stream import _BatchOutcomeStream
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
-from b24api.execution.facts import Execution, execution, settlement
+from b24api.execution.facts import settlement
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -40,19 +40,22 @@ class HeadAttempt:
     error: BaseException | None = field(repr=False)
     dispatch: PageDispatch
     batch_index: int | None
-    # What the head's command did: its trace follows it, and only a head that may have left is traced.
-    execution: Execution
+    # How the head's command settles, which decides its trace too: a head never sent is not traced.
     settlement: CommandSettlement
 
 
 @dataclass(frozen=True, slots=True)
 class TailReceipt:
-    """One dense tail command outcome, yielded in planned offset order: a response or a failure."""
+    """One dense tail page, yielded in planned offset order: its response, or how it failed, and how it settles."""
 
     ordinal: int
     response: Response | None = field(repr=False)
-    failure: BatchFailure | None = field(repr=False)
     batch_index: int | None
+    settlement: CommandSettlement
+    # A failed page: what it reports, which its trace records, and its command's own failure when the batch
+    # answered or ended it (``None`` for a page that failed with its whole chunk).
+    error: BaseException | None = field(default=None, repr=False)
+    failure: BatchFailure | None = field(default=None, repr=False)
 
 
 class CountedRowAccount(Protocol):
@@ -83,8 +86,8 @@ class CountedTailStream(Protocol):
         """Record the receipt's settlement and focus the completion recorder on its page."""
         ...
 
-    def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
-        """Return the error a failed tail command raises."""
+    def failure(self, receipt: TailReceipt) -> BaseException:
+        """Return the error a failed tail page raises."""
         ...
 
     async def aclose(self) -> None:
@@ -183,21 +186,29 @@ class _FlatTailStream:
 
     async def __aiter__(self) -> AsyncIterator[TailReceipt]:
         async for outcome in self._outcomes:
+            index = outcome.command_index
             if isinstance(outcome, BatchFailure):
-                yield TailReceipt(outcome.command_index, None, outcome, outcome.command_index)
+                error = outcome.error
+                reported = (
+                    error
+                    if isinstance(error, BaseException)
+                    else CapabilityError("parallel counted batch command failed")
+                )
+                yield TailReceipt(index, None, index, settlement_of(outcome), reported, outcome)
                 continue
             if not isinstance(outcome, BatchSuccess) or outcome.response is None:
                 raise CapabilityError("parallel counted batch outcome lacks correlated response evidence")
-            yield TailReceipt(outcome.command_index, outcome.response, None, outcome.command_index)
+            yield TailReceipt(index, outcome.response, index, CommandSettlement.SUCCESS)
 
     def settle(self, receipt: TailReceipt) -> None:
         if self._recorder is not None:
             self._recorder.activate(receipt.ordinal + 1)
-            failure = receipt.failure
-            self._recorder.settled(CommandSettlement.SUCCESS if failure is None else settlement_of(failure))
+            self._recorder.settled(receipt.settlement)
 
-    def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
-        del receipt
+    def failure(self, receipt: TailReceipt) -> BaseException:
+        outcome = receipt.failure
+        if outcome is None:  # the flat tail yields every failed page with its command's own outcome
+            raise RuntimeError("flat counted tail failure lacks its command outcome")
         error = outcome.error
         if self._context.ended_by(error):
             # The operation's budget refused the page's send and ends the operation: its end, not a failed page.
@@ -249,7 +260,6 @@ class DirectCountedWaveIO:
             None,
             PageDispatch.DIRECT,
             None,
-            execution=Execution.ANSWERED,
             settlement=CommandSettlement.SUCCESS,
         )
 
@@ -260,7 +270,6 @@ class DirectCountedWaveIO:
             error,
             PageDispatch.DIRECT,
             None,
-            execution=execution(error),
             settlement=settlement(error),
         )
 

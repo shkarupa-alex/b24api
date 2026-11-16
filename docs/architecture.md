@@ -64,11 +64,13 @@ trace: unknown only when it may have run, otherwise rejected; a page whose own c
 rejected as `transaction_aborted`, the code of a page dropped with the unit around it, not as a
 `command_failure`. A page's trace and its settlement read the same fact, the page's own: for a page of a
 chunk that failed as a whole, its command's in the chunk's `BatchProgress`. Every failure the batch page
-dispatcher gives a page it sent carries those facts (`_FailedPage`: what it reports, what its command did,
-how it settles, and the command's own failure when the batch answered or ended it), and every caller reads a
-failed page through one function (`_failed_page`), which falls back to the facts recorded on any other
-failure: the binding's failure, a page's settlement and trace, and a wave or a counted tail that takes a
-command's own failure as its outcome. Classic and REST v3 batch, `call()`, direct and batch
+dispatcher gives a page it sent carries those facts (`_FailedPage`: what it reports, how it settles, and the
+command's own failure when the batch answered or ended it), and every caller reads a failed page through one
+function (`_failed_page`), which falls back to the facts recorded on any other failure: the binding's
+failure, a page's settlement and trace, and a wave or a counted tail that takes a command's own failure as
+its outcome. The settlement alone decides whether a failed page is traced (`record_failed_page` skips a page
+never sent) and how; a counted tail page that fails with its whole chunk reaches the tail's one trace site as
+a receipt, as one that fails by its own command does. Classic and REST v3 batch, `call()`, direct and batch
 fan-out, references and list traversal all use them, and none of them chooses from the exception type,
 which names the cause of a failure and never proves that a command did not run. A sent command is
 unknown unless a listed refusal proves it did not run or a conclusive answer settles it. A conclusive
