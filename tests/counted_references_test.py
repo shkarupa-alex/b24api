@@ -876,5 +876,10 @@ async def test_a_counted_tail_page_answered_with_a_failure_is_traced_as_rejected
         if record.outcome is not PageOutcome.COMMITTED
     ]
     assert failed == [(2 * WIDTH, PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE)]
+    # It keeps its command's index in its batch: the next after the binding's first tail page, in the same batch.
+    by_offset = {record.offset: record.batch_index for record in report.page_trace if record.reference_index == 0}
+    first = by_offset[WIDTH]
+    assert first is not None
+    assert by_offset[2 * WIDTH] == first + 1
     assert [event.correlation for event in events if isinstance(event, ReferenceFailure)] == [1]
     assert _completes(events)[2].row_count == ROWS
