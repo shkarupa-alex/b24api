@@ -550,26 +550,28 @@ class OperationRunner[T, R: _Report]:
 
         A read in flight is cancelled, unless the interrupt is ending it already, and raises it once the operation has
         ended. Without one, between reads, the interrupt goes to the event loop now, once (``InterruptLatch.hand_on``):
-        nothing waits on any later step to deliver it, and the loop raises it before any reader resumes. The end
-        (cleanup and publication) then follows in a task of its own, started first so its first step precedes that
-        raise, unless a read or close begins it first (``_end_between_reads``).
+        nothing waits on any later step to deliver it. The end (cleanup and publication) follows in a task of its own,
+        unless a read or close begins it first (``_end_between_reads``). That task is started after the interrupt is
+        handed on, so a loop the interrupt stops does so before that task's first step. Under ``asyncio.run`` the
+        shutdown then cancels the task, and the end is run by a close the shutdown runs as it unwinds a task it
+        cancelled (``async with stream``, the client's ``async with``): that cancellation has landed already, so the
+        cleanup runs to its end and closes the source. A stream nothing closes then gets no end and no report.
         """
         pull = self._pull
         if self._phase is _Phase.PULLING and pull is not None and pull is not asyncio.current_task():
             pull.cancel()
         elif self._phase is _Phase.NEW:
             self._phase = _Phase.INTERRUPTED
-            self._ending = spawn_settled(self._end_between_reads())
             if (interrupt := self._interrupts.close()) is not None:
                 self._interrupts.hand_on(interrupt)
+            self._ending = spawn_settled(self._end_between_reads())
 
     async def _end_between_reads(self) -> None:
         """Run the end of an operation an interrupt ended between reads, unless somebody began it already.
 
         Its interrupt is out (``_interrupted``): the end raises none, whoever runs it. It cleans up and publishes the
         report in the interrupt's shape, attached to the interrupt as ``.report``; a cancellation that arrived while
-        cleanup ran is raised, to a read or close that ran the end. A shutdown that cancels that cleanup leaves the
-        report what the cancelled cleanup produced, or no report if the end never began.
+        cleanup ran is raised, to a read or close that ran the end, and is recorded as cleanup's.
         """
         if self._phase is not _Phase.INTERRUPTED:
             return
