@@ -319,16 +319,16 @@ outcome.
   interrupt, or else the first undelivered escape, once, as from a `finally`, ahead of whatever else would
   leave (`OperationRunner._raise_latched`, `OperationLatch.close`): the read whose end it is, or the close
   when no read got it. A read a concurrent close ended never raises it (that close took it): the read ends
-  as the close's cancellation of it would. An inline kernel's end raises the undelivered escape without
-  taking it, so it propagates to its owner's end. A reference binding that ends in one ends its task in it
-  and puts `_EndedEvent` in its queue (`ReferenceScheduler._end_binding`), waiting for room as any
-  terminal event does, only so that a read reaches the binding's place instead of waiting for an end that
-  never comes; it raises the task's end there (`_finish_task`). A coroutine closed by hand or at
-  collection (`GeneratorExit`) ends no binding. What an end does not raise (a second escape, or one behind
-  the interrupt) and whatever is latched once the end is out (work that outlived the cleanup window) goes
-  to the event loop (`OperationLatch.hand_on`), once each: an interrupt is raised out of `asyncio.run`,
-  any other escape goes to the loop's exception handler with the operation's report. An escape delivered
-  to a read or a close never reaches the loop. The latch's state is explicit
+  as the close's cancellation of it would. Only the owner's end raises it: an inline kernel's ends as it
+  would otherwise. A reference binding that ends in one ends its task in it and puts `_EndedEvent` in its
+  queue (`ReferenceScheduler._end_binding`), waiting for room as any terminal event does, only so that a
+  read reaches the binding's place instead of waiting for an end that never comes; it raises the task's
+  end there (`_finish_task`). A coroutine closed by hand or at collection (`GeneratorExit`) ends no
+  binding. What an end does not raise (a second escape, or one behind the interrupt) and whatever is
+  latched once the end is out (work that outlived the cleanup window) goes to the event loop
+  (`OperationLatch.hand_on`), once each: an interrupt is raised out of `asyncio.run`, any other escape
+  goes to the loop's exception handler with the operation's report. An escape delivered to a read or a
+  close never reaches the loop. The latch's state is explicit
   (`LatchState`): `ARMED` while the operation runs, when the first interrupt wakes the owner; `ENDING`
   once cleanup starts, when an interrupt is latched for the end and wakes nothing (an inline kernel's
   cleanup runs in the very read a wake would cancel); `CLOSED` once the end is out. The wake
