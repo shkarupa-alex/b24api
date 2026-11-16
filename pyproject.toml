@@ -105,6 +105,8 @@ known-third-party = []
 
 [tool.mypy]
 strict = true
+# Checked as the oldest supported Python, whatever runs mypy: the stubs, and so the ratchet's count, follow it.
+python_version = "3.12"
 
 [[tool.mypy.overrides]]
 module = [
